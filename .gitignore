@@ -1,0 +1,85 @@
+# =============================================================================
+#  .gitignore — Heston Deep Learning Calibration project
+# =============================================================================
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+
+# ── Build / distribution ──────────────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ── Logs  (keep folder via .gitkeep, ignore content) ─────────────────────────
+logs/*
+!logs/.gitkeep
+
+# ── LaTeX compilation cache ──────────────────────────────────────────────────
+tex/.latex_cache/*
+!tex/.latex_cache/.gitkeep
+
+# ── LaTeX junk that sometimes escapes the cache ──────────────────────────────
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.nav
+*.out
+*.run.xml
+*.snm
+*.synctex.gz
+*.toc
+# Do NOT ignore .tex source files
+!*.tex
+
+# ── Compiled PDFs (optional — keep if you want them in the repo) ─────────────
+# Uncomment to exclude PDFs:
+# *.pdf
+
+# ── Trained model artefacts (large binary files) ─────────────────────────────
+# Keep the folder structure via .gitkeep, ignore the large binaries.
+artifacts/weights/*
+!artifacts/weights/.gitkeep
+artifacts/scalers/*
+!artifacts/scalers/.gitkeep
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+*.env
+.env.*
+mcp.json
+*.code-workspace
