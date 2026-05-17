@@ -2,14 +2,14 @@
 Heston Surrogate MLP — Training Pipeline.
 
 Trains HestonSurrogateMLP to approximate the Heston pricing function:
-    Heston parameters (5) → Implied Volatility Surface (88)
+    Heston parameters (5) → Total Variance surface (88 = W = IV² × T)
 
-Integrates with data_loader.py (Gemini) for data loading and scaler persistence.
-Saves best model weights to src/weights/heston_best.pth.
+Scalers are saved by data_loader.py; best weights are saved to
+artifacts/weights/heston_best.pth.
 
 Usage:
     cd path/to/derivatives
-    python src/train.py
+    python src/train.py [--epochs N] [--lr LR] [--batch-size B]
 """
 
 import argparse

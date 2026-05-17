@@ -47,8 +47,8 @@
 \title[Heston Deep Learning]{%
   Deep Learning Calibration of the\\
   Heston Stochastic Volatility Model}
-\subtitle{PyTorch Surrogate with C\textsuperscript{2} Activations
-          and No-Arbitrage Constraints}
+\subtitle{Total Variance Surrogate \textperiodcentered\ MC Dropout Uncertainty
+          \textperiodcentered\ LSTM Temporal Dynamics}
 \author{Biryukov Nikita}
 \date{\today}
 \institute{Moscow Institute of Physics and Technology (MIPT)}
@@ -126,7 +126,7 @@
 % ══════════════════════════════════════════════════════════════
 % Slide 3 — Two-phase pipeline
 % ══════════════════════════════════════════════════════════════
-\begin{frame}{Methodology: Two-Phase Pipeline}
+\begin{frame}{Methodology: Three-Phase Architecture}
   \begin{center}
   \begin{tikzpicture}[
     node distance=0.7cm and 2.5cm,
@@ -197,7 +197,7 @@
         Parameters      & 5\,698 \\
         Loss            & MSE + ReduceLROnPlateau \\
         Optimizer       & Adam ($\eta = 10^{-3}$) \\
-        Val RMSE        & \textbf{0.02552} \\
+        Val RMSE (W-space)   & \textbf{0.0876} \\
         Training time   & $\approx$2\,min on RTX\,3060 \\ \bottomrule
       \end{tabular}
       \end{center}
@@ -248,10 +248,11 @@
 
     \begin{column}{0.31\textwidth}
       \begin{block}{\faCalendar\ Calendar Spread}
-        \[ \frac{\partial\sigma}{\partial T} \ge 0 \]
-        \small No-decreasing variance in maturity.\\[0.4em]
+        \[ \frac{\partial W}{\partial T} \ge 0 \]
+        \small Total variance non-decreasing in $T$.\\[0.2em]
+        {\tiny (Carr--Madan condition; correct when $v_0>\theta$)}\\ [0.2em]
         \textbf{Soft} L2 penalty:
-        \[ \ell_C = \lambda_C\!\sum_i[\Delta_T\hat\sigma]_-^2 \]
+        \[ \ell_C = \lambda_C\!\sum_i[\Delta_T\hat W]_-^2 \]
         $\lambda_C = 10^{-4}$
       \end{block}
     \end{column}
@@ -300,8 +301,8 @@
         \small
         \begin{tabular}{@{}ll@{}}
           Calib.\ time & \textbf{47--135\,ms} (CPU) \\
-          Val RMSE     & \textbf{0.02552} \\
-          Feller       & $2\kappa\theta-\sigma^2 = 2.05 > 0$ \checkmark \\
+          Val RMSE (W) & \textbf{0.0876} \\
+          Feller       & $2\kappa\theta-\sigma^2 = 2.04 > 0$ \checkmark \\
           Converged    & True \\
         \end{tabular}
       \end{alertblock}
@@ -379,24 +380,222 @@
 \end{frame}
 
 % ══════════════════════════════════════════════════════════════
-% Slide 8 — Conclusion
+% Slide 8 — Total Variance
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Phase 1 Extension: Total Variance Representation}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \textbf{Why not raw IV?}\\[0.4em]
+      \begin{itemize}\small
+        \item Raw IV surfaces have sharp short-maturity spikes
+              (\emph{noise amplification} as $T\to0$)
+        \item MSE loss on IV gives disproportionate weight to the ATM region
+        \item Calendar arbitrage condition in IV-space
+              ($\partial\sigma/\partial T\ge0$) fails for valid
+              inverted term structures ($v_0>\theta$)
+      \end{itemize}
+      \vspace{0.5em}
+      \textbf{Total Variance:}  $W(K,T) = \sigma_{\mathrm{IV}}^2(K,T)\cdot T$
+      \vspace{0.3em}
+      \begin{alertblock}{Key Properties}
+        \small
+        \begin{itemize}
+          \item[$\checkmark$] Calendar arb $\Leftrightarrow$ $\partial W/\partial T \ge 0$
+                             (Carr--Madan, correct for all $v_0,\theta$)
+          \item[$\checkmark$] Linearises Dupire equation $\Rightarrow$ smoother surface
+          \item[$\checkmark$] StandardScaler on $W$ stabilises gradient magnitudes
+        \end{itemize}
+      \end{alertblock}
+    \end{column}
+
+    \begin{column}{0.45\textwidth}
+      \textbf{Surrogate now operates in $W$-space:}
+      \[
+        \mathcal{N}_w:\boldsymbol\theta\mapsto W\in\mathbb{R}^{88},
+        \quad W = \sigma^2\cdot T
+      \]
+      \[
+        \sigma_{\mathrm{IV}} = \sqrt{\tfrac{W}{T}}
+        \quad(\text{recovered at inference})
+      \]
+      \vspace{0.3em}
+      \begin{block}{No-arbitrage audit on test set}
+        \small
+        \begin{tabular}{@{}ll@{}}
+          Calendar violations & \textbf{0 / 77} \\
+          Val RMSE ($W$-space) & \textbf{0.0876} \\
+        \end{tabular}
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Slide 9 — MC Dropout Uncertainty
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Phase 2: Epistemic Uncertainty via MC Dropout}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \textbf{Motivation:} A point-estimate calibration gives no
+      indication of model confidence.\\[0.5em]
+
+      \textbf{Gal \& Ghahramani (2016):}\\
+      Dropout at test time $\approx$ Bayesian posterior inference
+      over network weights.\\[0.5em]
+
+      \begin{block}{Implementation}
+        \small
+        \begin{enumerate}
+          \item Add \texttt{Dropout(p=0.1)} after each ELU layer
+          \item At inference: call \texttt{model.train()} to keep dropout active
+          \item Run $N=100$ forward passes
+          \item Compute mean $\mu$ and std $\sigma$ across samples
+        \end{enumerate}
+        $\Rightarrow$ \textbf{free uncertainty bands} on the IV surface
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.45\textwidth}
+      \textbf{Posterior predictive distribution:}
+      \[
+        p(\boldsymbol\sigma^*\mid\boldsymbol\theta,\mathcal{D})
+        \approx \frac{1}{N}\sum_{i=1}^{N}\mathcal{N}_{w_i}(\boldsymbol\theta)
+      \]
+      \vspace{0.3em}
+      \begin{block}{Results ($N=100$ passes, same hardware)}
+        \small
+        \begin{tabular}{@{}ll@{}}
+          Mean IV (ATM, $T=1$) & $\approx$0.22 \\
+          Max $\sigma_{\text{MC}}$ & $<5\times10^{-4}$ \\
+          Overhead vs.~point & $\approx100\times$ \\
+          Typical $\pm 2\sigma$ band & $<0.1\%$ IV \\
+        \end{tabular}\\[0.4em]
+        \small The tight uncertainty bands confirm the surrogate has
+        memorised the Heston pricing map without overfitting.
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Slide 10 — LSTM Temporal Dynamics
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Phase 3: LSTM Temporal Dynamics}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \textbf{Motivation:} Heston parameters change day-to-day
+      following correlated stochastic dynamics.\\[0.4em]
+
+      \textbf{Architecture:}
+      \[
+        \underbrace{(10\times 88)}_{\text{10-day }W\text{ history}}
+        \xrightarrow{\text{LSTM}_{64}^{2}}
+        \underbrace{\hat{\boldsymbol\theta}_{t+1}}_{\text{next-day}}
+      \]
+      \begin{center}\small
+      \begin{tabular}{@{}ll@{}}
+        \toprule
+        Property       & Value \\ \midrule
+        LSTM layers    & 2, hidden = 64 \\
+        Weight init    & Xavier (input), Orthogonal (recurrent) \\
+        Forget-gate    & bias = 1 (forget-gate bias trick) \\
+        Parameters     & 73\,157 \\
+        Training data  & 102\,000 sequences \\
+        Optimizer      & AdamW + CosineAnnealingLR \\ \bottomrule
+      \end{tabular}
+      \end{center}
+    \end{column}
+
+    \begin{column}{0.45\textwidth}
+      \textbf{Data pipeline:}
+      \begin{enumerate}\small
+        \item 600 correlated OU trajectories, 180 days each
+        \item Each day: params $\to$ surrogate $\to$ $W$ surface
+        \item Sliding windows: $(W_{t-9},\ldots,W_t)\to\theta_{t+1}$
+        \item 80/10/10 split on trajectory boundaries
+              (\emph{zero data leakage})
+      \end{enumerate}
+      \vspace{0.3em}
+      \begin{block}{Test Performance}
+        \small
+        \begin{tabular}{@{}ll@{}}
+          Test RMSE (normalized) & \textbf{0.336} \\
+          $v_0$ RMSE & $\approx 0.0052$ \\
+          $\rho$ RMSE & $\approx 0.0133$ \\
+          $\sigma$ RMSE & $\approx 0.0257$ \\
+          $\theta$ RMSE & $\approx 0.0035$ \\
+          $\kappa$ RMSE & $\approx 0.1270$ \\
+        \end{tabular}
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Slide 11 — Professional UI & Architectural Visualization
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Phase 4: Professional UI \& Architectural Visualization}
+  \begin{columns}[T]
+    \begin{column}{0.54\textwidth}
+      \textbf{Motivation:} A robust mathematical pipeline requires an equally robust, transparent interface for academic demonstration.
+
+      \vspace{0.4em}
+      \begin{block}{Interface Enhancements}
+        \small
+        \begin{itemize}
+          \item \textbf{Modular Architecture:} Migrated legacy single-page layout to a clean, tabbed Streamlit interface (Demo vs. Methods).
+          \item \textbf{Interactive Visualization:} Embedded a responsive \texttt{Cytoscape.js} computational graph directly into the UI.
+          \item \textbf{Mathematical Transparency:} Integrated live \LaTeX{} (KaTeX) popups that map each neural network layer to its underlying stochastic formula and codebase snippet.
+          \item \textbf{Professional Aesthetic:} Enforced a strict, high-contrast monochrome design standard suitable for master's thesis presentation.
+        \end{itemize}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.42\textwidth}
+      \textbf{Cytoscape Computational Graph:}
+      \begin{center}
+        \includegraphics[width=\textwidth]{images/generated/architecture.png}
+      \end{center}
+      \vspace{0.2em}
+      \small
+      \begin{itemize}
+        \item \textbf{Phase 1:} MLP Surrogate (Light)
+        \item \textbf{Phase 2:} Epistemic Uncertainty (Gray)
+        \item \textbf{Phase 3:} LSTM Dynamics (Dark)
+      \end{itemize}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Slide 12 — Conclusion
 % ══════════════════════════════════════════════════════════════
 \begin{frame}{Conclusion}
   \begin{columns}[T]
     \begin{column}{0.54\textwidth}
-      \textbf{Achievements:}
+      \textbf{Phase 1 — MLP Surrogate:}
       \begin{itemize}\small
-        \item[\checkmark] ELU surrogate: C\textsuperscript{2} smooth, 5\,698 parameters
-        \item[\checkmark] Val RMSE \textbf{0.02552} — beats paper baseline (0.028)
+        \item[\checkmark] ELU surrogate: C\textsuperscript{2} smooth, 5\,698 params
+        \item[\checkmark] Val RMSE \textbf{0.0876} in $W$-space
         \item[\checkmark] Calibration in \textbf{47--135\,ms} vs.\ 10--120\,s (FFT+LM)
-        \item[\checkmark] Hard Feller barrier ($\lambda=10^3$) — always satisfied
-        \item[\checkmark] Differentiable calendar \& butterfly penalties
-        \item[\checkmark] Exact Jacobian (88$\times$5) and Hessian (5$\times$5) via autograd
-        \item[\checkmark] $\|H_\text{ELU}\|_F \gg \|H_\text{ReLU}\|_F = 0$ — formal C\textsuperscript{2} proof
+        \item[\checkmark] Hard Feller barrier ($\lambda=10^3$) always satisfied
+        \item[\checkmark] Correct calendar arb: $\partial W/\partial T\ge0$
+        \item[\checkmark] Exact Jacobian and Hessian via autograd
       \end{itemize}
-      \vspace{0.4em}
-      \textbf{Future work:} Rough Heston, log-IV training,
-      Bayesian uncertainty quantification.
+      \vspace{0.2em}
+      \textbf{Phase 2 — MC Dropout:}
+      \begin{itemize}\small
+        \item[\checkmark] Epistemic uncertainty at no extra architecture cost
+        \item[\checkmark] $\pm2\sigma$ posterior bands on full IV surface
+      \end{itemize}
+      \vspace{0.2em}
+      \textbf{Phase 3 — LSTM Dynamics:}
+      \begin{itemize}\small
+        \item[\checkmark] 2-layer LSTM forecasts next-day Heston params
+        \item[\checkmark] Orthogonal init + forget-gate bias trick
+        \item[\checkmark] Test RMSE \textbf{0.336} (normalized)
+        \item[\checkmark] MC Dropout uncertainty on parameter trajectories
+      \end{itemize}
     \end{column}
 
     \begin{column}{0.42\textwidth}
