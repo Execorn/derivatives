@@ -72,11 +72,13 @@ tex/.latex_cache/*
 # *.pdf
 
 # ── Trained model artefacts (large binary files) ─────────────────────────────
-# Keep the folder structure via .gitkeep, ignore the large binaries.
-artifacts/weights/*
-!artifacts/weights/.gitkeep
-artifacts/scalers/*
-!artifacts/scalers/.gitkeep
+# Normally we ignore these if they are very large, but since our model weights 
+# and scalers are tiny (< 500KB total) and required for the Streamlit app 
+# deployment, we will track them in Git.
+# artifacts/weights/*
+# !artifacts/weights/.gitkeep
+# artifacts/scalers/*
+# !artifacts/scalers/.gitkeep
 
 # ── Misc ─────────────────────────────────────────────────────────────────────
 *.env
