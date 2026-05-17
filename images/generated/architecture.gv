@@ -1,0 +1,84 @@
+digraph G {
+    rankdir=LR;
+    splines=line;
+    nodesep=0.4;
+    ranksep=1.5;
+    
+    node [shape=circle, fontname="Helvetica", style=filled, color="#1e50a2", fillcolor="#e0e8f5"];
+    
+    subgraph cluster_0 {
+        color=white;
+        label="Входной слой\n(5 параметров)";
+        fontname="Helvetica-Bold";
+        I1 [label="v₀"];
+        I2 [label="ρ"];
+        I3 [label="σ"];
+        I4 [label="θ"];
+        I5 [label="κ"];
+    }
+
+    subgraph cluster_1 {
+        color=white;
+        label="Скрытый слой 1\n(30 нейронов + ELU)";
+        fontname="Helvetica-Bold";
+        H1_1 [label="h¹₁"];
+        H1_2 [label="h¹₂"];
+        H1_dots [shape=none, style=none, label="⋮"];
+        H1_n [label="h¹₃₀"];
+    }
+
+    subgraph cluster_2 {
+        color=white;
+        label="Скрытый слой 2\n(30 нейронов + ELU)";
+        fontname="Helvetica-Bold";
+        H2_1 [label="h²₁"];
+        H2_2 [label="h²₂"];
+        H2_dots [shape=none, style=none, label="⋮"];
+        H2_n [label="h²₃₀"];
+    }
+    
+    subgraph cluster_3 {
+        color=white;
+        label="Скрытый слой 3\n(30 нейронов + ELU)";
+        fontname="Helvetica-Bold";
+        H3_1 [label="h³₁"];
+        H3_2 [label="h³₂"];
+        H3_dots [shape=none, style=none, label="⋮"];
+        H3_n [label="h³₃₀"];
+    }
+    
+    subgraph cluster_4 {
+        color=white;
+        label="Скрытый слой 4\n(30 нейронов + ELU)";
+        fontname="Helvetica-Bold";
+        H4_1 [label="h⁴₁"];
+        H4_2 [label="h⁴₂"];
+        H4_dots [shape=none, style=none, label="⋮"];
+        H4_n [label="h⁴₃₀"];
+    }
+
+    subgraph cluster_5 {
+        color=white;
+        label="Выходной слой\n(88 точек IV, Linear)";
+        fontname="Helvetica-Bold";
+        O1 [label="IV₁", fillcolor="#fce2d4", color="#d66428"];
+        O2 [label="IV₂", fillcolor="#fce2d4", color="#d66428"];
+        O_dots [shape=none, style=none, label="⋮"];
+        On [label="IV₈₈", fillcolor="#fce2d4", color="#d66428"];
+    }
+
+    // Connect Input to H1
+    {I1 I2 I3 I4 I5} -> {H1_1 H1_2 H1_n} [color="#a0b0d0", arrowsize=0.5];
+    
+    // Connect H1 to H2
+    {H1_1 H1_2 H1_n} -> {H2_1 H2_2 H2_n} [color="#a0b0d0", arrowsize=0.5];
+    
+    // Connect H2 to H3
+    {H2_1 H2_2 H2_n} -> {H3_1 H3_2 H3_n} [color="#a0b0d0", arrowsize=0.5];
+    
+    // Connect H3 to H4
+    {H3_1 H3_2 H3_n} -> {H4_1 H4_2 H4_n} [color="#a0b0d0", arrowsize=0.5];
+    
+    // Connect H4 to Output
+    {H4_1 H4_2 H4_n} -> {O1 O2 On} [color="#d0a0a0", arrowsize=0.5];
+}
