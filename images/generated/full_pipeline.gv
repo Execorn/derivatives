@@ -1,0 +1,70 @@
+digraph G {
+    rankdir=LR;
+    splines=polyline;
+    nodesep=0.6;
+    ranksep=1.0;
+    
+    node [shape=box, style="filled,rounded", fontname="Helvetica", fontsize=11, color="#1e50a2", fillcolor="#e0e8f5"];
+    edge [fontname="Helvetica", fontsize=10, color="#555555"];
+    
+    subgraph cluster_phase1 {
+        label="Фаза 1: MLP-Суррогат и Калибровка";
+        fontname="Helvetica-Bold";
+        fontsize=14;
+        color="#d66428";
+        style=dashed;
+        
+        P1_Input [label="Рыночные параметры\n[v₀, ρ, σ, θ, κ]", shape=cylinder, fillcolor="#f0f0f0", color="#aaaaaa"];
+        P1_Scaler [label="MinMaxScaler\n[-1, 1]"];
+        P1_MLP [label="Нейросеть (MLP)\n4 слоя × 30 нейронов (ELU)"];
+        P1_WSurface [label="Поверхность W\n(88 точек)"];
+        P1_IV [label="Поверхность IV\n(Волатильность)", fillcolor="#fce2d4", color="#d66428"];
+        P1_Opt [label="L-BFGS-B Оптимизатор\n+ Условия без арбитража", shape=octagon, fillcolor="#e8f5e9", color="#2e7d32"];
+        P1_Loss [label="Loss (MSE + Штрафы)"];
+    }
+
+    subgraph cluster_phase2 {
+        label="Фаза 2: Оценка неопределенности (MC Dropout)";
+        fontname="Helvetica-Bold";
+        fontsize=14;
+        color="#888888";
+        style=dashed;
+
+        P2_MCDropout [label="Режим обучения\n(model.train())"];
+        P2_Passes [label="100 проходов (Forward)"];
+        P2_Stats [label="Среднее IV ± 2σ\n(Эпистемическая\nнеопределенность)"];
+    }
+
+    subgraph cluster_phase3 {
+        label="Фаза 3: Временная динамика LSTM";
+        fontname="Helvetica-Bold";
+        fontsize=14;
+        color="#1e50a2";
+        style=dashed;
+
+        P3_History [label="10-дневная история W\n(Окно 10 × 88 точек)", shape=folder, fillcolor="#f0f0f0", color="#aaaaaa"];
+        P3_LSTM [label="LSTM (2 слоя, 64 нейрона)\n+ LayerNorm"];
+        P3_Head [label="Linear + Z-Score Денормализация"];
+        P3_Output [label="Прогноз параметров\nна завтра\n[v₀, ρ, σ, θ, κ]", fillcolor="#e8eaf6", color="#3f51b5"];
+    }
+
+    // Phase 1 Connections
+    P1_Input -> P1_Scaler;
+    P1_Scaler -> P1_MLP;
+    P1_MLP -> P1_WSurface;
+    P1_WSurface -> P1_IV [label=" IV = √(W/T)"];
+    P1_IV -> P1_Loss;
+    P1_Opt -> P1_Loss [dir=back];
+    P1_Opt -> P1_Input [label=" Обновление\nпараметров", style=dotted, constraint=false];
+
+    // Phase 2 Connections
+    P1_MLP -> P2_MCDropout [label=" Включение Dropout"];
+    P2_MCDropout -> P2_Passes;
+    P2_Passes -> P2_Stats;
+
+    // Phase 3 Connections
+    P1_WSurface -> P3_History [label=" Сбор истории", style=dashed];
+    P3_History -> P3_LSTM;
+    P3_LSTM -> P3_Head;
+    P3_Head -> P3_Output;
+}

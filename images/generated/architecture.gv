@@ -59,12 +59,12 @@ digraph G {
 
     subgraph cluster_5 {
         color=white;
-        label="Выходной слой\n(88 точек IV, Linear)";
+        label="Выходной слой\n(88 точек W, Linear)";
         fontname="Helvetica-Bold";
-        O1 [label="IV₁", fillcolor="#fce2d4", color="#d66428"];
-        O2 [label="IV₂", fillcolor="#fce2d4", color="#d66428"];
+        O1 [label="W₁", fillcolor="#fce2d4", color="#d66428"];
+        O2 [label="W₂", fillcolor="#fce2d4", color="#d66428"];
         O_dots [shape=none, style=none, label="⋮"];
-        On [label="IV₈₈", fillcolor="#fce2d4", color="#d66428"];
+        On [label="W₈₈", fillcolor="#fce2d4", color="#d66428"];
     }
 
     // Connect Input to H1
