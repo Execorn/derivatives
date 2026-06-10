@@ -209,7 +209,14 @@ class HestonCalibrator:
 
         Runs ``num_samples`` stochastic forward passes with dropout active
         (model.train()) to approximate the posterior predictive distribution
-        of the IV surface.
+        of the IV surface.  Based on Gal & Ghahramani (2016).
+
+        IMPORTANT: This method requires the surrogate model to contain at least
+        one nn.Dropout layer.  HestonSurrogateMLP satisfies this (p=0.1 after
+        each hidden layer).  MirrorPaddedFNO2d does NOT have dropout — calling
+        this method with FNO will produce std_iv ≈ 0 (all forward passes
+        identical in eval-like behaviour).  Use the FNO confidence scores from
+        calibrate.compute_confidence_scores() instead.
 
         Args:
             params: Heston parameters in original scale (shape: 5,).
@@ -219,6 +226,16 @@ class HestonCalibrator:
             mean_iv: Mean IV surface across MC samples (shape: 88,).
             std_iv:  Std-dev IV surface across MC samples (shape: 88,).
         """
+        # Guard: verify the model has at least one Dropout layer
+        has_dropout = any(
+            isinstance(m, torch.nn.Dropout) for m in self.surrogate_model.modules()
+        )
+        if not has_dropout:
+            raise RuntimeError(
+                "predict_with_uncertainty requires a model with nn.Dropout layers "
+                "(MC Dropout).  MirrorPaddedFNO2d has no dropout — use "
+                "calibrate.compute_confidence_scores() for FNO uncertainty instead."
+            )
         # Scale input parameters
         params_scaled = self.feature_scaler.transform(params.reshape(1, -1))
         x_tensor = torch.tensor(params_scaled, dtype=torch.float32)

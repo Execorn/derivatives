@@ -76,7 +76,6 @@ tex/.latex_cache/*
 # and scalers are tiny (< 500KB total) and required for the Streamlit app 
 # deployment, we will track them in Git.
 # artifacts/weights/*
-# !artifacts/weights/.gitkeep
 # artifacts/scalers/*
 # !artifacts/scalers/.gitkeep
 
@@ -85,3 +84,12 @@ tex/.latex_cache/*
 .env.*
 mcp.json
 *.code-workspace
+
+# Phase 7 Hardening
+__pycache__/
+*.pyc
+*.pyo
+.latex_cache/
+.pytest_cache/
+*.txt.gz
+!data/samples/*.txt.gz

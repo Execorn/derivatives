@@ -31,12 +31,15 @@ $$dv_t = \kappa(\theta - v_t)\,dt + \sigma\sqrt{v_t}\,dW_t^v, \quad dW_t^S dW_t^
 | Correlation | ρ | Asset–variance correlation |
 | Initial variance | v₀ | Variance at t = 0 |
 
-### The Feller Condition
+### Mathematical Invariants
 
+**1. The Feller Condition (Strict Positivity)**
 $$2\kappa\theta > \sigma^2$$
+Ensures the variance process $v_t$ remains strictly positive. In the Rough paradigm, it is enforced via a Sigmoid-Logit bounds mapping mechanism inside the L-BFGS online calibration framework to perfectly restrict parameter bounds.
 
-Ensures the variance process $v_t$ remains strictly positive. Enforced as a hard
-penalty in the L-BFGS-B optimizer and checked at every LSTM inference step.
+**2. Doob-Meyer Martingale Loss**
+$$E[e^{-rt} S_t] = S_0$$
+The Mirror-Padded FNO incorporates a physical Martingale Prior in its loss function. By penalizing arbitrary surfaces that imply discounting paths that are not martingales under the risk-neutral measure, the network's predictive subspace is strictly confined to realistic arbitrage-free market environments.
 
 ### Total Variance Representation
 
