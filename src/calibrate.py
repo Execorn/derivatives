@@ -216,7 +216,219 @@ def calibrate_parameters(model, target_iv_surface: np.ndarray,
     return final_params.numpy(), history, elapsed
 
 
+# ─── Reparameterized 3D calibration ──────────────────────────────────────────
+# The Lifted Rough Heston space (κ,θ,σ,ρ,v₀,H) has FIM condition number ~10⁸.
+# Three parameters are "ghost" on T∈[0.1,2.0]:
+#   κ  — fractional kernel dampens its effect to zero for T<2y
+#   H  — roughness signature lives in T<0.04 (invisible at T_min=0.1)
+#   σ,ρ individually — only ζ=σρ (skew driver) and λ=σ√(1-ρ²) are observable
+#
+# Optimising over (v₀, ζ, λ) drops condition number to ~10³–10⁴.
+# Back-transform: σ = √(ζ²+λ²), ρ = ζ/σ.
+
+_GHOST_KAPPA = 1.0
+_GHOST_THETA = 0.08
+_GHOST_H     = 0.08
+
+# 3D bounds: [v0, zeta, lambda]
+_BOUNDS_LOWER_3D = torch.tensor([0.01, -0.90, 0.01])
+_BOUNDS_UPPER_3D = torch.tensor([0.15, -0.01, 0.99])
+
+
+def _reparam_to_6d(v0: torch.Tensor, zeta: torch.Tensor,
+                   lam: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Back-transform (v₀, ζ, λ) → full 6D parameter vector (B,6)."""
+    sigma = torch.sqrt(zeta**2 + lam**2).clamp(min=0.01)
+    rho   = (zeta / sigma).clamp(-0.9, -0.1)
+    kappa = torch.full_like(v0, _GHOST_KAPPA)
+    theta = torch.full_like(v0, _GHOST_THETA)
+    H     = torch.full_like(v0, _GHOST_H)
+    return torch.stack([kappa, theta, sigma, rho, v0, H], dim=-1).to(device)
+
+
+def calibrate_reparameterized(model, target_iv_surface: np.ndarray,
+                               T_grid, K_grid,
+                               max_iter: int = 100, lr: float = 0.1) -> dict:
+    """
+    Calibrate Lifted Heston to a market IV surface in the identifiable 3D subspace.
+
+    Fixes ghost parameters κ=1.0, θ=0.08, H=0.08 and optimises (v₀, ζ=σρ, λ=σ√(1-ρ²))
+    in logit space via L-BFGS.  Back-transform: σ=√(ζ²+λ²), ρ=ζ/σ.
+
+    Returns
+    -------
+    dict with keys: v0, zeta, lambda, sigma, rho, history (list), elapsed (s)
+    """
+    model.eval()
+    _load_normalizers()
+    device = next(model.parameters()).device
+
+    spatial  = _make_spatial_input(T_grid, K_grid, device)
+    target_t = torch.tensor(target_iv_surface, dtype=torch.float32, device=device)
+
+    # ── Data-driven initial guess for v0 ─────────────────────────────────────
+    # ATM IV ≈ sqrt(v0) for short maturities under Rough Heston.
+    # (NOT divided by T — the IV level directly approximates sqrt(v0))
+    T_arr   = np.asarray(T_grid)
+    K_arr   = np.asarray(K_grid)
+    atm_idx = int(np.argmin(np.abs(K_arr)))
+    t01_idx = int(np.argmin(np.abs(T_arr - 0.1)))
+    t10_idx = int(np.argmin(np.abs(T_arr - 1.0)))
+
+    iv_atm_short = float(target_iv_surface[t01_idx, atm_idx])
+    # IV_ATM ≈ sqrt(v0)  →  v0 ≈ IV_ATM² (correct formula, no divide by T)
+    v0_est = float(np.clip(iv_atm_short ** 2, 0.01, 0.14))
+
+    # ATM numerical skew at T=1 → rough estimate of zeta direction
+    if 0 < atm_idx < len(K_arr) - 1:
+        dk      = float(K_arr[atm_idx + 1] - K_arr[atm_idx - 1])
+        iv_skew = (float(target_iv_surface[t10_idx, atm_idx + 1])
+                   - float(target_iv_surface[t10_idx, atm_idx - 1])) / (dk + 1e-9)
+        # typical C ≈ 0.5 relating skew to zeta; clip to feasible
+        zeta_dd = float(np.clip(iv_skew / 0.5, -0.89, -0.02))
+    else:
+        zeta_dd = -0.25
+
+    lo_np = _BOUNDS_LOWER_3D.numpy()
+    hi_np = _BOUNDS_UPPER_3D.numpy()
+
+    # 3 diverse starts: data-driven + two bracketing extremes
+    inits_raw = [
+        (v0_est, zeta_dd,  0.35),    # data-driven
+        (v0_est, -0.20,    0.50),    # moderate baseline
+        (v0_est, -0.40,    0.25),    # high skew / low lam
+    ]
+    inits = [
+        (
+            float(np.clip(v,  lo_np[0] + 1e-4, hi_np[0] - 1e-4)),
+            float(np.clip(z,  lo_np[1] + 1e-4, hi_np[1] - 1e-4)),
+            float(np.clip(lm, lo_np[2] + 1e-4, hi_np[2] - 1e-4)),
+        )
+        for v, z, lm in inits_raw
+    ]
+
+    def _to_logit(x, lo, hi):
+        x_c = max(min(float(x), hi - 1e-5), lo + 1e-5)
+        s   = (x_c - lo) / (hi - lo)
+        return float(np.log(s / (1.0 - s)))
+
+    def _run_lbfgs(v0_i, z_i, lm_i, n_outer):
+        """L-BFGS from (v0_i, z_i, lm_i).  n_outer outer steps × 20 LBFGS evals each."""
+        logits = torch.tensor(
+            [_to_logit(v0_i, lo_np[0], hi_np[0]),
+             _to_logit(z_i,  lo_np[1], hi_np[1]),
+             _to_logit(lm_i, lo_np[2], hi_np[2])],
+            dtype=torch.float32, requires_grad=True,
+        )
+        opt  = optim.LBFGS([logits], lr=lr, max_iter=20,
+                            tolerance_grad=1e-7, tolerance_change=1e-9, history_size=10)
+        hist = []
+
+        def closure():
+            opt.zero_grad()
+            s    = torch.sigmoid(logits)
+            lo_t = _BOUNDS_LOWER_3D.to(device)
+            hi_t = _BOUNDS_UPPER_3D.to(device)
+            p6   = _reparam_to_6d(
+                (lo_t[0] + s[0] * (hi_t[0] - lo_t[0])).unsqueeze(0),
+                (lo_t[1] + s[1] * (hi_t[1] - lo_t[1])).unsqueeze(0),
+                (lo_t[2] + s[2] * (hi_t[2] - lo_t[2])).unsqueeze(0),
+                device,
+            )
+            loss = torch.nn.functional.mse_loss(
+                _fno_predict_real_iv(model, p6, spatial), target_t)
+            loss.backward()
+            return loss
+
+        for _ in range(n_outer):
+            loss = opt.step(closure)
+            hist.append(loss.item())
+            if loss.item() < 1e-9:
+                break
+        return loss.item(), logits.detach(), hist
+
+    # Phase 1 — 3 starts × 3 outer steps (60 LBFGS evals each)
+    start_t    = time.time()
+    best_loss  = float("inf")
+    best_logits = None
+    all_hist   = []
+
+    for v0_i, z_i, lm_i in inits:
+        loss_i, logits_i, hist_i = _run_lbfgs(v0_i, z_i, lm_i, n_outer=3)
+        all_hist.extend(hist_i)
+        if loss_i < best_loss:
+            best_loss   = loss_i
+            best_logits = logits_i.clone()
+
+    # Phase 2 — refine winner with 2 more outer steps
+    with torch.no_grad():
+        s_  = torch.sigmoid(best_logits)
+        v0_r  = (lo_np[0] + s_[0].item() * (hi_np[0] - lo_np[0]))
+        z_r   = (lo_np[1] + s_[1].item() * (hi_np[1] - lo_np[1]))
+        lm_r  = (lo_np[2] + s_[2].item() * (hi_np[2] - lo_np[2]))
+    loss_f, best_logits, hist_f = _run_lbfgs(v0_r, z_r, lm_r, n_outer=2)
+    all_hist.extend(hist_f)
+
+    elapsed = time.time() - start_t
+
+    # Extract final parameters
+    with torch.no_grad():
+        s_    = torch.sigmoid(best_logits)
+        lo_t  = _BOUNDS_LOWER_3D
+        hi_t  = _BOUNDS_UPPER_3D
+        v0_f  = (lo_t[0] + s_[0] * (hi_t[0] - lo_t[0])).item()
+        zeta_f= (lo_t[1] + s_[1] * (hi_t[1] - lo_t[1])).item()
+        lam_f = (lo_t[2] + s_[2] * (hi_t[2] - lo_t[2])).item()
+        sigma_f = float(np.sqrt(zeta_f**2 + lam_f**2))
+        sigma_f = max(sigma_f, 0.01)
+        rho_f   = float(np.clip(zeta_f / sigma_f, -0.9, -0.1))
+
+    return {
+        "v0":      v0_f,
+        "zeta":    zeta_f,
+        "lambda":  lam_f,
+        "sigma":   sigma_f,
+        "rho":     rho_f,
+        "history": all_hist,
+        "elapsed": elapsed,
+    }
+
+
+def compute_confidence_reparameterized(model, v0: float, zeta: float, lam: float,
+                                        T_grid, K_grid) -> dict:
+    """
+    Jacobian column Frobenius norms in real IV space for (v₀, ζ, λ).
+
+    Returns scores normalised to [0,1]; expects all ≥ 0.7 if model works.
+    """
+    model.eval()
+    _load_normalizers()
+    device = next(model.parameters()).device
+    spatial = _make_spatial_input(T_grid, K_grid, device)
+
+    params3 = torch.tensor([v0, zeta, lam], dtype=torch.float32, requires_grad=True)
+
+    def _iv_flat(p3):
+        """(v₀, ζ, λ) → flat real IV vector."""
+        v0_  = p3[0].unsqueeze(0)
+        z_   = p3[1].unsqueeze(0)
+        l_   = p3[2].unsqueeze(0)
+        p6   = _reparam_to_6d(v0_, z_, l_, device)
+        return _fno_predict_real_iv(model, p6, spatial).reshape(-1)
+
+    J = torch.autograd.functional.jacobian(
+        _iv_flat, params3, create_graph=False, vectorize=False,
+    )   # (nT*nK, 3)
+
+    col_norms  = J.pow(2).sum(dim=0).sqrt()            # (3,)
+    max_norm   = col_norms.max().clamp(min=1e-12)
+    scores     = (col_norms / max_norm).detach().cpu().numpy()
+
+    return {"v0": float(scores[0]), "zeta": float(scores[1]), "lambda": float(scores[2])}
+
+
 if __name__ == "__main__":
+
     from fno_model import MirrorPaddedFNO2d
 
     model   = MirrorPaddedFNO2d()

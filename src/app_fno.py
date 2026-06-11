@@ -15,6 +15,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fno_model import MirrorPaddedFNO2d
 from calibrate import (calibrate_parameters, compute_confidence_scores,
+                       calibrate_reparameterized, compute_confidence_reparameterized,
                        _make_spatial_input, _fno_predict_real_iv, _load_normalizers)
 from normalizers import ParameterNormalizer, IVSurfaceNormalizer
 
@@ -49,20 +50,55 @@ st.set_page_config(page_title="Deep Rough Heston NN Calibration", layout="wide")
 st.title("Deep Learning Volatility — Rough Heston Calibration")
 st.caption("FiLM-conditioned FNO Surrogate + L-BFGS Calibration")
 
-# ─── Sidebar ───────────────────────────────────────────────────────────────
+# ─── Calibration mode ────────────────────────────────────────────────────────
+st.sidebar.divider()
+calib_mode = st.sidebar.radio(
+    "Calibration Mode",
+    ["Reparameterized 3D (recommended)", "Full 6D (experimental)"],
+    index=0,
+    key="calib_mode",
+    help="3D mode fixes ghost params (κ=1.0, θ=0.08, H=0.08) and optimises "
+         "identifiable (v₀, ζ=σρ, λ=σ√(1-ρ²)) — FIM condition number ~10³–10⁴ "
+         "vs ~10⁸ in full 6D space.",
+)
+
+# ─── Sidebar sliders (grey out ghost params in 3D mode) ──────────────────────
 st.sidebar.header("True Rough Heston Parameters")
-kappa = st.sidebar.slider("κ — Mean Reversion",   0.1,  5.0,  2.5,  step=0.1,  key="kappa")
-theta = st.sidebar.slider("θ — Long-Run Variance", 0.01, 0.15, 0.08, step=0.01, key="theta")
+if calib_mode.startswith("Reparameterized"):
+    st.sidebar.info("🔒 Ghost parameters fixed: κ=1.0, θ=0.08, H=0.08")
+    kappa = 1.0
+    theta = 0.08
+    H     = 0.08
+    st.sidebar.markdown(f"**κ (fixed)** = {kappa}")
+    st.sidebar.markdown(f"**θ (fixed)** = {theta}")
+    st.sidebar.markdown(f"**H (fixed)** = {H}")
+else:
+    kappa = st.sidebar.slider("κ — Mean Reversion",   0.1,  5.0,  2.5,  step=0.1,  key="kappa")
+    theta = st.sidebar.slider("θ — Long-Run Variance", 0.01, 0.15, 0.08, step=0.01, key="theta")
+    H     = st.sidebar.slider("H — Hurst Parameter",  0.02, 0.15, 0.08, step=0.01, key="H")
+
 sigma = st.sidebar.slider("σ — Vol of Vol",        0.1,  1.0,  0.5,  step=0.01, key="sigma")
 rho   = st.sidebar.slider("ρ — Correlation",      -0.9, -0.1, -0.5,  step=0.01, key="rho")
 v0    = st.sidebar.slider("v₀ — Initial Variance", 0.01, 0.15, 0.08, step=0.01, key="v0")
-H     = st.sidebar.slider("H — Hurst Parameter",  0.02, 0.15, 0.08, step=0.01, key="H")
 
 st.sidebar.divider()
 noise_level = st.sidebar.slider(
     "Market Noise Level (Stress Test)", 0.0, 0.10, 0.01, step=0.01, key="noise")
 
 true_params = np.array([kappa, theta, sigma, rho, v0, H])
+
+# FIM info in sidebar for reparameterized mode
+if calib_mode.startswith("Reparameterized"):
+    zeta_true_disp = sigma * rho
+    lam_true_disp  = sigma * float(np.sqrt(1.0 - rho**2))
+    st.sidebar.markdown(
+        f"**ζ = σρ** = {zeta_true_disp:.4f}  \n"
+        f"**λ = σ√(1-ρ²)** = {lam_true_disp:.4f}  \n"
+        f"---  \n"
+        f"*FIM condition number*:  \n"
+        f"6D space: **~10⁷–10⁸**  \n"
+        f"3D (ζ,λ) space: **~10³–10⁴**"
+    )
 
 # ─── Generate surface ───────────────────────────────────────────────────────
 if st.sidebar.button("Generate Target Surface", use_container_width=True):
@@ -93,13 +129,27 @@ if st.button("Calibrate", use_container_width=False, key="calibrate_btn"):
 
     init_params = np.array([1.5, 0.05, 0.4, -0.4, 0.05, 0.05])
 
-    with st.spinner("Running L-BFGS calibration..."):
-        calibrated_params, history, elapsed = calibrate_parameters(
-            model, market_iv_noisy, init_params, MATURITIES, STRIKES)
+    with st.spinner("Running calibration..."):
+        if calib_mode.startswith("Reparameterized"):
+            res3d = calibrate_reparameterized(
+                model, market_iv_noisy, MATURITIES, STRIKES)
+            calibrated_params = np.array([
+                1.0, 0.08, res3d["sigma"], res3d["rho"], res3d["v0"], 0.08
+            ])
+            history = res3d["history"]
+            elapsed = res3d["elapsed"]
+        else:
+            calibrated_params, history, elapsed = calibrate_parameters(
+                model, market_iv_noisy, init_params, MATURITIES, STRIKES)
 
-    with st.spinner("Computing parameter confidence (Jacobian norms)..."):
-        conf_scores = compute_confidence_scores(
-            model, calibrated_params, MATURITIES, STRIKES)
+    with st.spinner("Computing confidence scores..."):
+        if calib_mode.startswith("Reparameterized"):
+            conf_scores = compute_confidence_reparameterized(
+                model, res3d["v0"], res3d["zeta"], res3d["lambda"],
+                MATURITIES, STRIKES)
+        else:
+            conf_scores = compute_confidence_scores(
+                model, calibrated_params, MATURITIES, STRIKES)
 
     with torch.no_grad():
         spatial   = _make_spatial_input(MATURITIES, STRIKES, device=torch.device("cpu"))
@@ -114,6 +164,7 @@ if st.button("Calibrate", use_container_width=False, key="calibrate_btn"):
         "elapsed":           elapsed,
         "conf_scores":       conf_scores,
         "noise_level_used":  noise_level,
+        "res3d":             res3d if calib_mode.startswith("Reparameterized") else None,
     }
 
 # ─── Display results ─────────────────────────────────────────────────────────
@@ -123,6 +174,7 @@ if "calib_results" in st.session_state:
     market_iv_noisy   = res["market_iv_noisy"]
     calibrated_iv     = res["calibrated_iv"]
     history           = res["history"]
+    res3d             = res.get("res3d") or {}
     elapsed           = res["elapsed"]
     conf_scores       = res["conf_scores"]
     noise_used        = res["noise_level_used"]
@@ -134,15 +186,34 @@ if "calib_results" in st.session_state:
     )
 
     # Parameter table
-    df = pd.DataFrame({
-        "Parameter":  PARAM_NAMES_DISPLAY,
-        "True":       stored_true,
-        "Calibrated": calibrated_params,
-        "Abs Error":  np.abs(stored_true - calibrated_params),
-    })
-    st.dataframe(
-        df.style.format({"True": "{:.6f}", "Calibrated": "{:.6f}", "Abs Error": "{:.6f}"}),
-        use_container_width=True)
+    if calib_mode.startswith("Reparameterized"):
+        # Show 3D reparameterized results
+        zeta_t = stored_true[2] * stored_true[3]           # sigma*rho
+        lam_t  = stored_true[2] * np.sqrt(1 - stored_true[3]**2)
+        zeta_c = res3d["zeta"] if "calib_results" in st.session_state and "res3d" in st.session_state["calib_results"] else float(calibrated_params[2] * calibrated_params[3])
+        lam_c  = res3d["lambda"] if "calib_results" in st.session_state and "res3d" in st.session_state["calib_results"] else float(calibrated_params[2] * np.sqrt(1 - calibrated_params[3]**2))
+        df3d = pd.DataFrame({
+            "Parameter":  ["v₀", "ζ = σρ", "λ = σ√(1-ρ²)", "σ (derived)", "ρ (derived)"],
+            "True":       [stored_true[4], zeta_t, lam_t, stored_true[2], stored_true[3]],
+            "Calibrated": [calibrated_params[4], res3d["zeta"], res3d["lambda"],
+                           res3d["sigma"], res3d["rho"]],
+        })
+        df3d["Abs Error"] = np.abs(df3d["True"] - df3d["Calibrated"])
+        st.dataframe(
+            df3d.style.format({"True": "{:.6f}", "Calibrated": "{:.6f}", "Abs Error": "{:.6f}"}),
+            use_container_width=True)
+        st.caption("Ghost parameters fixed: κ=1.0, θ=0.08, H=0.08  |  "
+                   "FIM condition number: 6D ~10⁷–10⁸ → 3D ~10³–10⁴")
+    else:
+        df = pd.DataFrame({
+            "Parameter":  PARAM_NAMES_DISPLAY,
+            "True":       stored_true,
+            "Calibrated": calibrated_params,
+            "Abs Error":  np.abs(stored_true - calibrated_params),
+        })
+        st.dataframe(
+            df.style.format({"True": "{:.6f}", "Calibrated": "{:.6f}", "Abs Error": "{:.6f}"}),
+            use_container_width=True)
 
     st.download_button(
         label="Download Calibrated Params (JSON)",
@@ -153,20 +224,33 @@ if "calib_results" in st.session_state:
 
     # Confidence scores
     st.subheader("Parameter Confidence (Identifiability)")
-    st.caption(
-        "Jacobian column Frobenius norm ‖∂IV/∂θᵢ‖_F in real IV space — "
-        "measures total sensitivity of the IV surface to each parameter. "
-        "FiLM conditioning routes parameters through all Fourier modes (DC-trap fixed)."
-    )
-    for pname, score in conf_scores.items():
-        label = CONF_NAMES.get(pname, pname)
-        st.progress(score, text=f"{label}: {score:.2f}")
+    if calib_mode.startswith("Reparameterized"):
+        st.caption(
+            "Jacobian column Frobenius norm ‖∂IV/∂θᵢ‖_F for (v₀, ζ, λ) — "
+            "reparameterization isolates the 3 identifiable degrees of freedom."
+        )
+        conf_labels = {"v0": "v₀ (Initial Variance)",
+                       "zeta": "ζ = σρ (Skew Driver)",
+                       "lambda": "λ = σ√(1-ρ²) (Level Driver)"}
+        for pname, score in conf_scores.items():
+            label = conf_labels.get(pname, pname)
+            color = "🟢" if score >= 0.7 else "🟡" if score >= 0.4 else "🔴"
+            st.progress(score, text=f"{color} {label}: {score:.2f}")
+    else:
+        st.caption(
+            "Jacobian column Frobenius norm ‖∂IV/∂θᵢ‖_F in real IV space — "
+            "measures total sensitivity of the IV surface to each parameter. "
+            "FiLM conditioning routes parameters through all Fourier modes (DC-trap fixed)."
+        )
+        for pname, score in conf_scores.items():
+            label = CONF_NAMES.get(pname, pname)
+            st.progress(score, text=f"{label}: {score:.2f}")
 
-    if conf_scores.get("kappa", 1.0) < 0.3:
-        st.warning(
-            "⚠️ **κ is weakly identified** (confidence < 0.3). "
-            "In the deep-rough regime (H < 0.1), the IV surface is insensitive "
-            "to κ for T < 0.5. Consider fixing κ from historical estimation.")
+        if conf_scores.get("kappa", 1.0) < 0.3:
+            st.warning(
+                "⚠️ **κ is weakly identified** (confidence < 0.3). "
+                "In the deep-rough regime (H < 0.1), the IV surface is insensitive "
+                "to κ for T < 0.5. Consider fixing κ from historical estimation.")
 
     # 3D surface plot
     K_grid, T_grid = np.meshgrid(STRIKES, MATURITIES)
