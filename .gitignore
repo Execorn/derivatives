@@ -107,3 +107,6 @@ data/*.csv
 # ── Compiled CUDA extensions (platform-specific) ─────────────────────────────
 *.so
 *.pyd
+
+# Project-internal AI context map — not for reviewers
+CONTEXT.md

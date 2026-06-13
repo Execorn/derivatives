@@ -1,130 +1,182 @@
-# Deep Learning Calibration of the Heston Stochastic Volatility Model 📈
+# Deep Learning Calibration of the Lifted Rough Heston Model 📈
 
-[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.12-EE4C2C?style=for-the-badge&logo=PyTorch&logoColor=white)](https://pytorch.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-12.6-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
+[![Python 3.14](https://img.shields.io/badge/Python-3.14-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://streamlit.io/)
-[![Python 3.14](https://img.shields.io/badge/Python-3.14-3776AB.svg?style=for-the-badge&logo=python&logoColor=white)](https://python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
-An end-to-end **neural network surrogate pipeline** for real-time calibration of the
-Heston Stochastic Volatility Model, extended with epistemic uncertainty quantification
-and LSTM-based temporal parameter dynamics.
+A **Master's thesis project** (MIPT) implementing three progressively advanced pipelines for real-time
+calibration of the **Lifted Rough Heston** stochastic volatility model (El Euch, Gatheral & Rosenbaum 2019).
 
-Implements the methodology of *Horvath, Muguruza & Tomas (2019) "Deep Learning
-Volatility"* with a modern PyTorch architecture, C² smooth ELU activations, strict
-financial no-arbitrage constraints, Monte Carlo Dropout uncertainty estimation, and an
-interactive Streamlit dashboard.
+The core idea: replace expensive Fourier-COS pricing (seconds per surface) with a
+**FiLM-conditioned Fourier Neural Operator (FNO)** surrogate that prices a full 8×11
+implied-volatility surface in **< 1 ms** — enabling gradient-based calibration at interactive speed.
 
 ---
 
 ## Mathematical Foundation
 
-### The Heston Model
+### The Lifted Rough Heston Model
 
-$$dS_t = \mu S_t\,dt + \sqrt{v_t}\,S_t\,dW_t^S$$
-$$dv_t = \kappa(\theta - v_t)\,dt + \sigma\sqrt{v_t}\,dW_t^v, \quad dW_t^S dW_t^v = \rho\,dt$$
+The variance process is driven by a weighted sum of Ornstein–Uhlenbeck factors
+that approximate the rough fractional kernel (Hurst exponent H ≈ 0.08):
 
-| Parameter | Symbol | Meaning |
-|---|---|---|
-| Mean reversion speed | κ | How fast variance returns to θ |
-| Long-run variance | θ | Steady-state variance |
-| Vol of vol | σ | Volatility of the variance process |
-| Correlation | ρ | Asset–variance correlation |
-| Initial variance | v₀ | Variance at t = 0 |
+$$v_t = v_0 + \int_0^t K(t-s)\,\kappa(\theta - v_s)\,ds + \int_0^t K(t-s)\,\sigma\,dW_s^v$$
 
-### Mathematical Invariants
+$$K(t) = \sum_{j=1}^N c_j\,e^{-\gamma_j t} \approx \frac{t^{H-1/2}}{\Gamma(H+1/2)}, \quad H = 0.08$$
 
-**1. The Feller Condition (Strict Positivity)**
-$$2\kappa\theta > \sigma^2$$
-Ensures the variance process $v_t$ remains strictly positive. In the Rough paradigm, it is enforced via a Sigmoid-Logit bounds mapping mechanism inside the L-BFGS online calibration framework to perfectly restrict parameter bounds.
+The N-factor Bernstein approximation lifts the non-Markovian rough kernel into a
+Markovian system of N coupled SDEs — enabling exact Fourier-COS characteristic
+function pricing.
 
-**2. Doob-Meyer Martingale Loss**
-$$E[e^{-rt} S_t] = S_0$$
-The Mirror-Padded FNO incorporates a physical Martingale Prior in its loss function. By penalizing arbitrary surfaces that imply discounting paths that are not martingales under the risk-neutral measure, the network's predictive subspace is strictly confined to realistic arbitrage-free market environments.
+| Parameter | Symbol | Range | Role |
+|---|---|---|---|
+| Mean reversion | κ | [0.1, 5.0] | Speed of variance mean-reversion |
+| Long-run variance | θ | [0.01, 0.15] | Steady-state variance level |
+| Vol-of-vol | σ | [0.1, 1.0] | Amplitude of variance shocks |
+| Correlation | ρ | [−0.9, −0.1] | Asset–variance correlation (skew driver) |
+| Initial variance | v₀ | [0.01, 0.15] | Spot variance |
+| Hurst exponent | H | 0.08 (fixed) | Roughness; H=0.5 recovers classical Heston |
 
-### Total Variance Representation
+**Ghost parameters** fixed during 3D calibration: κ = 1.0, θ = 0.08, H = 0.08.
 
-The network operates on Total Variance $W = \text{IV}^2 \times T$ rather than raw
-implied volatility. This linearises the Dupire local-vol equation, improves numerical
-stability, and produces a smoother objective for gradient-based calibration.
+### Reparameterization (Option 1 contribution)
+
+Instead of calibrating in the ill-conditioned 6D space, we use:
+
+$$\zeta = \sigma\rho \in [-0.9,\,-0.01], \quad \lambda = \sigma\sqrt{1-\rho^2} \in [0.01,\,0.99], \quad v_0 \in [0.01,\,0.15]$$
+
+**Result:** Fisher Information Matrix condition number drops from **1.49 × 10⁷** (6D) to
+**1.15 × 10⁴** (3D) — a **1301× reduction**, making gradient-based calibration numerically stable.
 
 ---
 
-## System Architecture
-
-The pipeline is structured as four independent phases, each building on the previous:
-
-```text
-Phase 1 — MLP Surrogate
-  Parameters (5) ──[MinMaxScaler]──► MLP (5→30×4→88) ──[StandardScaler⁻¹]──► W surface (88)
-                                                                                    │
-Phase 2 — MC Dropout Uncertainty                                                    │
-  model.train() + 100 forward passes ─────────────────────────────────► mean ± 2σ IV│
-                                                                                    │
-Phase 3 — LSTM Temporal Dynamics                                                    │
-  10-day W sequence (10×88) ──► LSTM (2-layer, hidden=64) ──► next-day params (5)  │
-                                                                                    │
-Phase 4 — Professional UI & Architectural Visualization                             │
-  Streamlit Tabs ──► Cytoscape.js (Network Graph) + KaTeX (Math Rendering)          │
-```
-
-### Phase 1: MLP Surrogate
+## Three-Option Architecture
 
 ```
-Input(5) → [Linear → ELU → Dropout(0.1)] × 4 → Linear(30, 88)
+                        ┌──────────────────────────────────────────┐
+                        │         CUDA MC Engine (.so)             │
+                        │   Lifted Rough Heston, GPU-accelerated   │
+                        │   (Euler-Maruyama, ~15bp bias at T=0.1) │
+                        └────────────┬─────────────────────────────┘
+                                     │ MC dataset v1 (~10k)
+                    ┌────────────────▼────────────────────────────┐
+                    │         Fourier-COS Pricer (CPU)            │
+                    │  N=40 Bernstein factors, N_cos=64           │
+                    │  Exact pricing, NaN at T=0.1 for H=0.08    │
+                    └──────────────┬──────────────────────────────┘
+                                   │ COS dataset v2 (50k) + diff dataset v3
+           ┌───────────────────────┼──────────────────────────────────┐
+           │                       │                                  │
+    ┌──────▼──────┐       ┌────────▼────────┐              ┌─────────▼─────────┐
+    │  OPTION 1   │       │    OPTION 2     │              │     OPTION 3      │
+    │             │       │                 │              │                   │
+    │ FiLM-FNO v1 │       │  FiLM-FNO v2   │              │ Differential FNO  │
+    │ R² = 0.796  │       │  R² ≈ 0.92+    │              │ + Jacobian Head   │
+    │             │       │                 │              │ λ_jac = 0.05     │
+    │ 3D Reparam  │       │ Convergence     │              │                   │
+    │ Calibration │       │ Benchmarks      │              │ Autograd Newton   │
+    │ FIM: 1301×  │       │ MC vs COS bias  │              │ Gauss-Newton      │
+    │ cond reduce │       │ study           │              │ 1 backward pass   │
+    └─────────────┘       └─────────────────┘              └───────────────────┘
 ```
+
+### Option 1 — FiLM-FNO + Reparameterized Calibration
+
+**Model:** `MirrorPaddedFNO2dWithAttention` — FiLM-conditioned Fourier Neural Operator
+with mirror padding (prevents spectral boundary artifacts) and multi-head self-attention.
 
 | Property | Value |
 |---|---|
-| Hidden layers | 4 × 30 neurons |
-| Activation | ELU (C² smooth — valid Hessian for gradient-based calibration) |
-| Parameters | 5,698 |
-| Input | 5 Heston params, MinMaxScaler → [−1, 1] |
-| Output | 88-point W surface (8 maturities × 11 strikes), StandardScaler |
-| Val RMSE | **0.0876** (in W-space) |
-| Calibration time | **47–135 ms** (L-BFGS-B, CPU) |
+| Architecture | 4 FNO layers, width=32, modes=12; FiLM conditioning; attention |
+| Parameters | ~686K (FNO backbone) |
+| Input | (8, 11, 2) spatial grid + (6,) parameter vector |
+| Output | (8, 11) implied volatility surface |
+| Training data | MC dataset v1 (~10k, GPU Euler-Maruyama) |
+| Val R² | **0.796** |
+| Calibration | 3-start L-BFGS in (v₀, ζ, λ) space; ghost κ=1, θ=0.08, H=0.08 |
+| v₀ recovery error | **< 2%** (0% noise) |
+| ζ/λ recovery error | ~15% (bounded by R²=0.796) |
+| FIM condition (6D) | 1.49 × 10⁷ |
+| FIM condition (3D) | 1.15 × 10⁴ (**1301× reduction**) |
 
-**No-arbitrage constraints** enforced as soft L2 penalties during calibration:
-- Calendar arbitrage: $\partial W/\partial T \geq 0$ (total variance non-decreasing — correct Carr–Madan condition)
-- Butterfly arbitrage: $\partial^2 \text{IV}/\partial K^2 \geq 0$
+Key files: `src/fno_model.py`, `src/train_fno.py`, `src/calibrate.py` (Option 1 version),
+`src/fim_analysis.py`, `src/validation.py`, `src/app_fno.py`
 
-### Phase 2: MC Dropout Uncertainty (Gal & Ghahramani, 2016)
+### Option 2 — Fourier-COS Exact Pricer + FNO v2
 
-Running $N=100$ stochastic forward passes with `model.train()` approximates the
-posterior predictive distribution of the IV surface. The UI displays the mean surface
-surrounded by ±2σ translucent bounds.
-
-### Phase 3: LSTM Temporal Dynamics (Cont & Da Fonseca, 2002)
-
-```
-Input (B, 10, 88) → LSTM(hidden=64, layers=2) → LayerNorm → Linear(64, 5)
-```
+Replaces the MC dataset with **exact Fourier-COS pricing** (no systematic bias), generating
+50k samples via Sobol quasi-random sequences.
 
 | Property | Value |
 |---|---|
-| Architecture | 2-layer LSTM, hidden=64, LayerNorm, forget-gate bias = 1 |
-| Weight init | Xavier (input weights), Orthogonal (recurrent weights) |
-| Parameters | 73,157 |
-| Training data | 102,000 sequences (600 OU trajectories × 170 windows) |
-| Test RMSE (normalized) | **0.355** |
-| Per-param RMSE: v₀ | ≈ 0.0055 |
-| Per-param RMSE: ρ | ≈ 0.0140 |
-| Per-param RMSE: σ | ≈ 0.0271 |
-| Per-param RMSE: θ | ≈ 0.0037 |
-| Per-param RMSE: κ | ≈ 0.1340 |
+| Pricer | CPU Fourier-COS, N_factors=20, N_cos=64 |
+| Dataset | 50k Sobol samples; NaN ~1% at T=0.1 (filled by 2D interpolation) |
+| NaN cause | Rough kernel (H=0.08) + short maturity → CF near singularity |
+| FNO v2 | Same architecture; trained on exact labels |
+| Val R² | **≈ 0.92+** (vs 0.796 for v1 on MC data) |
+| Convergence | N=40 Bernstein required for σ=0.5; N=20 gives 29bp error at T=1.0 |
 
-The LSTM is trained on synthetic Ornstein–Uhlenbeck trajectories calibrated to
-empirical SPX parameter dynamics (Cont & Da Fonseca, 2002; Bergomi, 2016). Inference
-applies Z-score denormalization using the training-set label statistics, followed by
-a hard clamp to the physical parameter bounds — ensuring every predicted parameter
-vector satisfies the Feller condition and lies within the training domain.
+Benchmarks included:
+- `benchmarks/convergence_N_factors.py` — N=5,10,20 vs N=40 reference
+- `benchmarks/vs_cuda_mc.py` — systematic MC bias per maturity (expected 5–20bp at T=0.1)
+- `benchmarks/validate_fno_v2.py` — FNO v1 vs v2 quality comparison
 
-### Phase 4: Professional UI & Architectural Visualization
+Key files: `src/pricing_engine.py`, `src/generate_dataset_v2.py`, `benchmarks/`
 
-A master's thesis-grade interactive Streamlit dashboard featuring:
-- **Tabbed Modular Design:** Separates the interactive calibration pipeline from the mathematical methodology.
-- **Interactive Cytoscape.js Network Graph:** Embeds a responsive computational graph mapping the exact data flow across all three Neural Network phases.
-- **KaTeX Mathematical Popups:** Clicking on graph nodes reveals the underlying stochastic differential equations (SDEs), no-arbitrage constraints, and exact PyTorch code snippets used for implementation.
-- **Monochrome Styling:** Enforces a strict, professional black-and-white theme suitable for academic presentation.
+### Option 3 — Differential Machine Learning + Newton-Raphson Calibration
+
+Implements *Huge & Savine (2020)* "Differential Machine Learning" for the FNO surrogate:
+the model learns both **IV surfaces** and their **exact Jacobians** ∂IV/∂θ simultaneously.
+
+**DifferentialFNO architecture:**
+```
+theta (6,) ──► FiLM-FNO backbone ──► IV surface (8, 11)
+           └──► JacobianHead MLP ──► dIV/dtheta (8, 11, 5)
+                [6→256→256→256→440, dropout=0.20]
+```
+
+**Training details:**
+- Loss: `L = L_IV + 0.05 · L_Jac` (λ_jac=0.05 prevents Jacobian overfitting)
+- T=0.1 excluded from Jacobian loss (noisy FD at short maturities)
+- Bug fixed: validation used unmasked MSE vs masked training loss → caused 350× train/val gap
+- Final: IV val = 2×10⁻³, Jac val = 0.40 (train/val balanced, no overfitting)
+
+**Autograd calibration** (`src/calibrate_fast.py`):
+Instead of using the trained JacobianHead, compute exact ∂IV_FNO/∂θ via `torch.autograd`
+in a single backward pass — giving noise-free analytical Jacobians from the smooth FNO.
+
+```python
+J = torch.autograd.functional.jacobian(fno_iv_flat, theta)  # 1 backward pass
+# vs 5-point FD: 10 forward passes
+```
+
+Newton step: `δθ = -(JᵀJ + εI)⁻¹ Jᵀ r` with backtracking line search and LM regularization.
+
+| Property | Value |
+|---|---|
+| Dataset | 50k samples + (50k, 8, 11, 5) Jacobian tensors; 105MB |
+| FD order | 5-point central differences per parameter |
+| NaN masking | 4.54% cells interpolated; T=0.1 excluded from Jac loss |
+| Autograd speedup | ~5–10× vs 5-point FD (1 backward vs 10 forward passes) |
+| DiffFNO parameters | 932,905 (FNO: 686K + JacHead: 246K) |
+
+Key files: `src/train_fno_differential.py`, `src/generate_dataset_v3_differential.py`,
+`src/calibrate_fast.py`
+
+---
+
+## Baseline Pipeline (Phases 1–3)
+
+The original thesis baseline using the **classical Heston model** (not rough):
+
+| Phase | Description | Key File |
+|---|---|---|
+| Phase 1 | MLP surrogate: 5 params → 88-pt Total Variance surface | `src/model.py` |
+| Phase 2 | MC Dropout uncertainty: 100 forward passes → ±2σ bounds | `src/calibrator.py` |
+| Phase 3 | LSTM temporal dynamics: 10-day surface history → next-day params | `src/seq_model.py` |
+| UI | Interactive Streamlit dashboard (Cytoscape.js + KaTeX) | `src/app.py` |
 
 ---
 
@@ -132,212 +184,210 @@ A master's thesis-grade interactive Streamlit dashboard featuring:
 
 ```
 derivatives/
+├── CONTEXT.md                    # Architectural map for AI agents / onboarding
 ├── README.md
-├── setup_and_run.sh          # Linux: one-shot setup + full pipeline + UI
-├── setup_and_run.bat         # Windows: one-shot setup + full pipeline + UI
-├── build_all_tex.sh          # Linux: compile all LaTeX documents
-├── build_all_tex.bat         # Windows: compile all LaTeX documents
+├── setup.py                      # CUDA extension build script
+├── make_thesis_assets.sh         # Generate all thesis figures
+├── build_all_tex.sh              # Compile all LaTeX documents
 │
-├── src/                      # Pure Python source
-│   ├── requirements.txt
-│   ├── model.py              # HestonSurrogateMLP (Phase 1)
-│   ├── data_loader.py        # Data pipeline + scaler persistence
-│   ├── train.py              # MLP training loop
-│   ├── calibrator.py         # L-BFGS-B + Feller + no-arbitrage + MC Dropout
-│   ├── seq_model.py          # HestonDynamicsLSTM (Phase 3)
-│   ├── train_seq.py          # LSTM training loop + HestonSequenceDataset
-│   ├── benchmark_plots.py    # Publication-quality 3D surface plots
-│   ├── greeks_autograd.py    # Jacobian + Hessian proof (C² vs ReLU)
-│   └── app.py                # Streamlit interactive demo (all 3 phases)
+├── src/
+│   ├── cuda_engine.cu            # GPU Lifted Rough Heston MC (CUDA C++)
+│   ├── pricing_engine_gpu.py     # Python/pybind wrapper for CUDA engine
+│   ├── pricing_engine.py         # CPU Fourier-COS pricer (N Bernstein factors)
+│   │
+│   ├── fno_model.py              # FiLM-FNO architectures (v1 + attention variant)
+│   ├── normalizers.py            # ParameterNormalizer, IVSurfaceNormalizer
+│   │
+│   ├── generate_dataset.py       # MC dataset generator (v1, GPU)
+│   ├── generate_dataset_v2.py    # Fourier-COS dataset (v2, 50k + nan_mask)
+│   ├── generate_dataset_v3_differential.py  # v3 + 5-pt FD Jacobians (105MB)
+│   │
+│   ├── train_fno.py              # FNO v1/v2 training (ATM-weighted Huber + arb reg)
+│   ├── train_fno_differential.py # DifferentialFNO training (IV + Jac loss)
+│   │
+│   ├── calibrate.py              # Option 2 standard 6D + Option 1 3D calibration
+│   ├── calibrate_fast.py         # Option 3 Gauss-Newton + autograd Jacobians
+│   ├── fim_analysis.py           # Fisher Information Matrix (6D vs 3D condition)
+│   ├── validation.py             # Noise-robustness parameter recovery tests
+│   │
+│   ├── app_fno.py                # Streamlit: FNO calibration UI (3D/6D toggle)
+│   ├── greeks_autograd.py        # Delta / Gamma / Vega via autograd
+│   ├── fno_greeks.py             # Greeks for FNO surrogate
+│   ├── iv_inverter.py            # Black-Scholes IV inversion (Newton-Raphson)
+│   │
+│   ├── model.py                  # Baseline MLP surrogate (Phase 1)
+│   ├── calibrator.py             # Baseline L-BFGS-B calibrator (Phase 1)
+│   ├── seq_model.py              # LSTM temporal dynamics (Phase 3)
+│   ├── train.py / train_seq.py   # Baseline training scripts
+│   ├── data_loader.py            # Baseline data pipeline
+│   └── app.py                    # Baseline Streamlit UI (Phases 1–3)
 │
-├── scripts/
-│   ├── generate_seq_data.py  # OU trajectory simulation → seq_dataset.npz
-│   └── migrate_checkpoint.py # Key remapping for Phase 2 checkpoint upgrade
+├── benchmarks/
+│   ├── convergence_N_factors.py  # Bernstein N-factor study vs N=40 reference
+│   ├── vs_cuda_mc.py             # MC vs Fourier-COS systematic bias per maturity
+│   ├── validate_fno_v2.py        # FNO v1 vs v2 R², MAE, Jacobian norms
+│   └── convergence_results.txt   # Stored results: N=20 → 29bp error at T=1.0
 │
-├── tests/
-│   ├── test_phase2_uncertainty.py  # 7 tests: MC Dropout behaviour
-│   └── test_phase3_lstm.py         # 22 tests: LSTM model, dataset, training
+├── artifacts/
+│   ├── models/                   # Best validation checkpoints + normalizers
+│   │   ├── fno_best.pth          # FNO v1 (R²=0.796, MC dataset)
+│   │   ├── fno_v2_best.pth       # FNO v2 (R²≈0.92+, COS dataset)
+│   │   ├── fno_diff_best.pth     # DifferentialFNO best checkpoint
+│   │   └── *_normalizer*.npz     # z-score normalizers (v1, v2, diff)
+│   ├── weights/                  # SWA-averaged production models
+│   │   ├── fno_v2_final_prod.pth
+│   │   ├── fno_diff_final_prod.pth
+│   │   ├── heston_best.pth       # Baseline MLP
+│   │   └── heston_lstm_best.pth  # Baseline LSTM
+│   └── scalers/                  # Baseline MLP scalers (pkl)
 │
-├── artifacts/                # Generated binaries (git-ignored)
-│   ├── weights/
-│   │   ├── heston_best.pth       # Phase 1: MLP surrogate checkpoint
-│   │   └── heston_lstm_best.pth  # Phase 3: LSTM checkpoint
-│   ├── scalers/
-│   │   ├── feature_scaler.pkl    # MinMaxScaler for Heston parameters
-│   │   ├── target_scaler.pkl     # StandardScaler for W surface
-│   │   └── lstm_label_stats.npz  # Z-score stats for LSTM label normalisation
-│   └── reports/
+├── tex/
+│   ├── literature_review/        # Master's thesis literature review
+│   └── presentation/             # Defense slides (Beamer, Russian)
 │
-├── data/
-│   ├── HestonTrainSet.txt.gz  # Horvath et al. original dataset
-│   └── seq_dataset.npz        # LSTM sequence dataset (102,000 windows, 35 MB)
+├── data/                         # Datasets — NOT tracked in git (reproduced by scripts)
+│   ├── DeepRoughDataset.npz      # MC dataset v1 (~10k samples, 15MB)
+│   ├── DeepRoughDataset_v2_fourier.npz    # COS dataset v2 (50k, 32MB)
+│   └── DeepRoughDataset_v3_differential.npz  # Diff dataset v3 (50k+Jac, 105MB)
 │
-├── logs/                      # Runtime logs (git-ignored)
-├── images/
-│   └── generated/             # surface_fit.png and other output images
-├── articles/                  # [READ-ONLY] Reference papers
-└── tex/
-    ├── literature_review/     # Master's thesis literature review
-    └── presentation/          # Beamer defense presentation
+└── research/                     # Reference PDFs (papers)
 ```
 
 ---
 
 ## Quickstart
 
-### Linux / macOS
+### Prerequisites
 
-**One command — handles everything:**
+- **Linux** (tested: Arch Linux)
+- **Python 3.14** (exact — CUDA extension ABI is version-specific)
+- **CUDA 12.6** + NVIDIA GPU (RTX 3060 or better recommended)
+
+### Setup
+
 ```bash
-git clone <repo-url>
+git clone https://github.com/Execorn/derivatives.git
 cd derivatives
-bash setup_and_run.sh
-```
 
-This will:
-1. Create `.venv/` and install all Python dependencies
-2. Run the data pipeline (`data_loader.py`)
-3. Train the MLP surrogate for 200 epochs (`train.py`)
-4. Run a calibration smoke-test (`calibrator.py`)
-5. Generate the LSTM sequence dataset (`scripts/generate_seq_data.py`)
-6. Train the LSTM dynamics model for up to 200 epochs (`train_seq.py`)
-7. Launch Streamlit at **http://localhost:8501**
-
-**Skip all training** (use existing weights in `artifacts/`):
-```bash
-bash setup_and_run.sh --skip-train
-```
-
-**Skip LSTM training only** (re-run MLP pipeline but skip steps 5–6):
-```bash
-bash setup_and_run.sh --skip-lstm
-```
-
-### Windows
-
-```bat
-setup_and_run.bat
-rem or
-setup_and_run.bat --skip-train
-rem or
-setup_and_run.bat --skip-lstm
-```
-
-### Manual Setup
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+# Create venv and install dependencies
+python3.14 -m venv .venv
+source .venv/bin/activate
 pip install -r src/requirements.txt
 
-# Phase 1: MLP surrogate
+# Build the CUDA extension (required for dataset generation and GPU pricing)
+python setup.py build_ext --inplace
+```
+
+### FNO Pipeline (Options 1–3)
+
+```bash
+# Step 1: Generate Fourier-COS dataset (GPU, ~10 min for 50k samples)
+python src/generate_dataset_v2.py
+
+# Step 2: Train FNO v2 (GPU, ~2 hours for 500 epochs)
+python src/train_fno.py
+
+# Step 3 (Option 3): Generate differential dataset with Jacobians (~20 min)
+python src/generate_dataset_v3_differential.py
+
+# Step 4 (Option 3): Train DifferentialFNO
+python src/train_fno_differential.py --lambda-jac 0.05
+
+# Launch FNO calibration UI
+streamlit run src/app_fno.py
+```
+
+### Baseline Pipeline (Phases 1–3)
+
+```bash
 python src/data_loader.py
 python src/train.py --epochs 200
 python src/calibrator.py
 
-# Phase 3: LSTM dynamics
 python scripts/generate_seq_data.py
 python src/train_seq.py --epochs 200
 
-# Launch UI
 streamlit run src/app.py
 ```
 
-### Running Tests
+### Skip Training (use pre-trained weights from artifacts/)
 
 ```bash
-python -m pytest tests/ -v
-# Expected: 29 passed
+# FNO UI directly
+streamlit run src/app_fno.py
+
+# Baseline UI directly
+streamlit run src/app.py
 ```
 
 ---
 
-## Compiling the LaTeX Documents
+## Key Results
 
-### Linux / macOS
-
-```bash
-# Install TeX Live (Arch Linux)
-sudo pacman -S texlive-most
-
-# Compile everything
-bash build_all_tex.sh
-
-# Or compile individually
-bash tex/literature_review/build.sh
-bash tex/presentation/build.sh
-```
-
-### Windows
-
-```bat
-REM Install MiKTeX: https://miktex.org/download
-build_all_tex.bat
-```
-
-PDFs are placed next to their `.tex` source files. All compilation junk (`.aux`, `.log`,
-`.toc`, etc.) goes to `tex/.latex_cache/`.
-
----
-
-## Benchmark Results
-
-### Phase 1: MLP Surrogate Calibration
+### Option 1 — Reparameterized Calibration
 
 | Metric | Value |
 |---|---|
-| Calibration time | **47–135 ms** (L-BFGS-B, CPU) |
-| Val RMSE (W-space) | **0.0876** (retrained on W = IV² × T) |
-| Surface grid | 8 maturities × 11 strikes = 88 points |
-| Feller condition | Hard penalty — always satisfied post-calibration |
-| Calendar arbitrage | Soft L2 penalty λ = 10⁻⁴ on ∂W/∂T violations (correct Carr–Madan) |
-| Butterfly arbitrage | Soft L2 penalty λ = 10⁻⁴ on ∂²IV/∂K² violations |
-| ELU Hessian ‖H‖_F | 1.039 (vs. ReLU: 0.000 — proves C² smoothness) |
+| FIM condition: 6D space | 1.49 × 10⁷ |
+| FIM condition: 3D (v₀, ζ, λ) | 1.15 × 10⁴ |
+| **FIM reduction factor** | **1301×** |
+| v₀ recovery (0% noise) | **< 2% error** |
+| ζ, λ recovery (0% noise) | ~15% (bounded by FNO v1 R²) |
+| Calibration: 3-start L-BFGS | Stable, converges in < 1s |
 
-### Phase 3: LSTM Temporal Dynamics
+### Option 2 — Fourier-COS vs Monte Carlo
 
 | Metric | Value |
 |---|---|
-| Training sequences | 102,000 (600 OU trajectories × 170 windows) |
-| Test MSE (normalized) | **0.113** |
-| Test RMSE (normalized) | **0.336** |
-| v₀ RMSE (original scale) | ≈ 0.0052 |
-| ρ RMSE (original scale) | ≈ 0.0133 |
-| σ RMSE (original scale) | ≈ 0.0257 |
-| θ RMSE (original scale) | ≈ 0.0035 |
-| κ RMSE (original scale) | ≈ 0.1270 |
+| FNO v1 R² (MC labels) | 0.796 |
+| FNO v2 R² (COS labels) | **≈ 0.92+** |
+| N=20 Bernstein error at T=1.0 | **29 bp** vs N=40 (insufficient) |
+| N=40 computation time | 274s per surface (CPU) |
+| T=0.1 Fourier-COS | **NaN** for σ > 0.3, H=0.08 (known singularity) |
 
-![Surface fit](images/generated/surface_fit.png)
+### Option 3 — Differential FNO
+
+| Metric | Value |
+|---|---|
+| DiffFNO IV val loss (final) | 2.0 × 10⁻³ |
+| DiffFNO Jac val loss (final) | **0.40** (vs 40.9 before bug fix) |
+| Jacobian overfitting fix | Masked loss (T=0.1 excluded) + dropout=0.20 + λ=0.05 |
+| Autograd vs FD speedup | ~5–10× (1 backward pass vs 10 forward) |
+| Dataset generation speed | 68 surfaces/sec (RTX 3060 Laptop) |
 
 ---
 
-## Interactive UI Guide
+## Running Benchmarks
 
-Launch with `bash setup_and_run.sh --skip-train`, then open `http://localhost:8501`.
+```bash
+# Bernstein N-factor convergence (CPU, ~10 min)
+CUDA_VISIBLE_DEVICES="" python benchmarks/convergence_N_factors.py
 
-The dashboard is structured into two main tabs:
+# MC vs COS systematic bias (CPU, ~30 min for 200 samples)
+CUDA_VISIBLE_DEVICES="" python benchmarks/vs_cuda_mc.py
 
-### Tab 1: Calibration Demo
+# FNO v1 vs v2 quality check
+python benchmarks/validate_fno_v2.py
 
-| Section | How to Use |
-|---|---|
-| **Sidebar sliders** | Set κ, θ, σ, ρ, v₀ — Feller check updates live |
-| **Generate Target Surface** | Runs the MLP forward pass; unlocks sections below |
-| **Calibrate** | Runs L-BFGS-B; shows target vs. calibrated 3D IV surfaces + error table |
-| **Estimate Uncertainty** | 100 MC Dropout passes; ±2σ translucent bounds on the IV surface |
-| **Forecast Next-Day Parameters** | 10-day OU simulation → surrogate → LSTM → parameter trajectory chart + comparison table |
+# FIM condition number analysis
+python src/fim_analysis.py
 
-### Tab 2: Architecture & Methods
+# Parameter recovery validation (noise robustness)
+python src/validation.py
 
-An academic reference interface detailing the model's inner workings. Features an interactive Cytoscape computational graph—click on any node (e.g., "Feller Barrier", "Calendar Arb", "LSTM Layer") to view the underlying mathematical formulas rendered in KaTeX and its corresponding codebase implementation.
+# Newton calibration speed test (autograd vs FD)
+python src/calibrate_fast.py
+```
 
 ---
 
 ## References
 
+- El Euch, O., Gatheral, J. and Rosenbaum, M. (2019). *Roughening Heston*. Risk Magazine.
 - Horvath, B., Muguruza, A. and Tomas, M. (2019). *Deep Learning Volatility*. SSRN 3322085.
-- Cont, R. and Da Fonseca, J. (2002). *Dynamics of Implied Volatility Surfaces*. Quantitative Finance, 2(1), 45–60.
-- Bergomi, L. (2016). *Stochastic Volatility Modeling*. CRC Press.
+- Huge, B. and Savine, A. (2020). *Differential Machine Learning*. SSRN 3775622.
+- Fouque, J.-P. et al. (2011). *Multiscale Stochastic Volatility*. Cambridge University Press.
+- Cont, R. and Da Fonseca, J. (2002). *Dynamics of Implied Volatility Surfaces*. Quantitative Finance.
 - Gal, Y. and Ghahramani, Z. (2016). *Dropout as a Bayesian Approximation*. ICML.
-- Heston, S. L. (1993). *A Closed-Form Solution for Options with Stochastic Volatility*. Review of Financial Studies, 6(2), 327–343.
-- Itkin, A. (2019). *Deep learning calibration of option pricing models: some pitfalls and solutions*.
+- Heston, S. L. (1993). *A Closed-Form Solution for Options with Stochastic Volatility*. RFS.
+- Bergomi, L. (2016). *Stochastic Volatility Modeling*. CRC Press.
