@@ -62,24 +62,36 @@ def weighted_huber_loss(pred: torch.Tensor, target: torch.Tensor,
 # ─── Training function ────────────────────────────────────────────────────────
 
 def train_fno(epochs: int = 500, batch_size: int = 1024, lr: float = 1e-3,
-              data_path: str = "data/DeepRoughDataset.npz") -> None:
+              data_path: str = "data/DeepRoughDataset_v2_fourier.npz") -> None:
     """
-    Train the FiLM-conditioned Mirror-Padded FNO Surrogate Model.
+    Train the FiLM-conditioned Mirror-Padded FNO on the v2 Fourier-COS dataset.
+
+    Key upgrade vs previous run:
+      - Labels are exact Fourier-COS prices (no Monte-Carlo O(dt^0.08) bias)
+      - nan_mask weighting: interpolated wing cells get 0.5× loss weight
+        (K=±0.5/±0.3 at T=0.1 where option price is below float64 precision)
+
     Saves:
-      artifacts/models/fno_best.pth          — best validation checkpoint
-      artifacts/weights/fno_final_prod.pth   — SWA-averaged final model
-      artifacts/models/param_normalizer.npz  — ParameterNormalizer scalers
-      artifacts/models/iv_normalizer.npz     — IVSurfaceNormalizer scalers
+      artifacts/models/fno_v2_best.pth          — best validation checkpoint
+      artifacts/weights/fno_v2_final_prod.pth   — SWA-averaged final model
+      artifacts/models/param_normalizer_v2.npz  — ParameterNormalizer scalers
+      artifacts/models/iv_normalizer_v2.npz     — IVSurfaceNormalizer scalers
     """
     if not os.path.exists(data_path):
-        print(f"Dataset {data_path} not found. Run generate_dataset.py first.")
+        print(f"Dataset {data_path} not found. Run generate_dataset_v2.py first.")
         return
 
     # ── Load raw data ──────────────────────────────────────────────────────
     print(f"Loading dataset from {data_path}...")
-    data = np.load(data_path)["dataset"]
+    npz      = np.load(data_path)
+    data     = npz["dataset"]                              # (N, 94)
+    nan_mask = npz["nan_mask"] if "nan_mask" in npz else None  # (N, 8, 11) bool
     print(f"  Dataset shape: {data.shape}  "
           f"({data.shape[0]} samples, {data.shape[1]-6} IV grid points)")
+    if nan_mask is not None:
+        valid_pct = nan_mask.mean() * 100
+        print(f"  nan_mask valid fraction: {valid_pct:.2f}%  "
+              f"(interpolated: {100-valid_pct:.2f}%)")
 
     X_raw = data[:, :6]                               # (N, 6)
     Y_raw = np.clip(data[:, 6:], 1e-4, None)          # (N, 88)  — clip negatives
@@ -89,6 +101,12 @@ def train_fno(epochs: int = 500, batch_size: int = 1024, lr: float = 1e-3,
     split  = int(0.8 * len(X_raw))
     X_train_raw, X_val_raw = X_raw[:split], X_raw[split:]
     Y_train_raw, Y_val_raw = Y_raw[:split], Y_raw[split:]
+    if nan_mask is not None:
+        mask_train = nan_mask[:split].astype(np.float32)   # 1.0=valid, 0=interp
+        mask_val   = nan_mask[split:].astype(np.float32)
+    else:
+        mask_train = np.ones((len(X_train_raw), 8, 11), dtype=np.float32)
+        mask_val   = np.ones((len(X_val_raw),   8, 11), dtype=np.float32)
 
     # ── Fit and save normalizers on training split ONLY ───────────────────
     print("Fitting normalizers on training split...")
@@ -99,9 +117,9 @@ def train_fno(epochs: int = 500, batch_size: int = 1024, lr: float = 1e-3,
 
     os.makedirs("artifacts/models",  exist_ok=True)
     os.makedirs("artifacts/weights", exist_ok=True)
-    param_norm.save("artifacts/models/param_normalizer.npz")
-    iv_norm.save("artifacts/models/iv_normalizer.npz")
-    print("Normalizers saved.")
+    param_norm.save("artifacts/models/param_normalizer_v2.npz")
+    iv_norm.save("artifacts/models/iv_normalizer_v2.npz")
+    print("Normalizers saved (v2).")
 
     # ── Normalise inputs and outputs ──────────────────────────────────────
     X_train = param_norm.transform(X_train_raw).astype(np.float32)
@@ -127,19 +145,21 @@ def train_fno(epochs: int = 500, batch_size: int = 1024, lr: float = 1e-3,
     coord_val   = np.broadcast_to(coord_field, (N_val,   8, 11, 2)).copy()
 
     train_ds = TensorDataset(
-        torch.tensor(X_train),      # theta (normalised)
-        torch.tensor(Y_train),      # IV surface (normalised)
-        torch.tensor(coord_train),  # spatial coords
+        torch.tensor(X_train),       # theta (normalised)
+        torch.tensor(Y_train),       # IV surface (normalised)
+        torch.tensor(coord_train),   # spatial coords
+        torch.tensor(mask_train),    # nan_mask (1=valid COS, 0=interpolated)
     )
     val_ds = TensorDataset(
         torch.tensor(X_val),
         torch.tensor(Y_val),
         torch.tensor(coord_val),
+        torch.tensor(mask_val),
     )
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True)
+                              num_workers=4, pin_memory=True, persistent_workers=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                              num_workers=0, pin_memory=True)
+                              num_workers=4, pin_memory=True, persistent_workers=True)
 
     # ── Model, optimiser, scheduler ──────────────────────────────────────
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -169,23 +189,34 @@ def train_fno(epochs: int = 500, batch_size: int = 1024, lr: float = 1e-3,
         train_loss = 0.0
         t0 = time.time()
 
-        for theta_n, iv_n, coords in train_loader:
+        for theta_n, iv_n, coords, mask in train_loader:
             theta_n = theta_n.to(device)
             iv_n    = iv_n.to(device)
             coords  = coords.to(device)
+            mask    = mask.to(device)   # (B, 8, 11) 1.0=valid / 0.5=interpolated
+
+            # Interpolated cells get half the loss weight
+            cell_weights = 0.5 + 0.5 * mask             # (B, 8, 11): 0.5 or 1.0
 
             optimizer.zero_grad()
-            pred_n = model(coords, theta_n)          # (B, 8, 11) in normalised space
+            pred_n = model(coords, theta_n)              # (B, 8, 11)
 
-            # Weighted Huber loss in normalised space
-            huber = weighted_huber_loss(pred_n, iv_n, K_grid_dev)
+            # ATM-weighted Huber, further modulated by nan_mask cell weights
+            atm_mask  = (K_grid_dev.abs() < 0.1).float()
+            atm_w     = 1.0 + atm_mask.view(1, 1, 11)   # 1.0 or 2.0
+            combined_w = cell_weights * atm_w            # (B, 8, 11)
 
-            # Arbitrage regularization in REAL IV space
-            pred_real = pred_n * iv_std_t + iv_mean_t
-            pred_real = pred_real.clamp(min=1e-4)
+            huber = F.huber_loss(pred_n, iv_n, reduction='none', delta=0.05)
+            huber_loss = (combined_w * huber).mean()
+
+            # Arbitrage regularization in real IV space.
+            # Do NOT clamp pred_real before the penalty: clamping zeros gradients
+            # for cells where pred<0, removing the corrective signal.
+            # Clamp only at inference time (calibrate.py).
+            pred_real = pred_n * iv_std_t + iv_mean_t    # UN-clamped real IV
             arb = arbitrage_free_regularization(pred_real, T_grid_dev, K_grid_dev)
 
-            loss = huber + 0.05 * arb               # reduced arb weight (normalised scale)
+            loss = huber_loss + 0.05 * arb
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -197,7 +228,7 @@ def train_fno(epochs: int = 500, batch_size: int = 1024, lr: float = 1e-3,
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for theta_n, iv_n, coords in val_loader:
+            for theta_n, iv_n, coords, mask in val_loader:
                 theta_n = theta_n.to(device)
                 iv_n    = iv_n.to(device)
                 coords  = coords.to(device)
@@ -218,14 +249,14 @@ def train_fno(epochs: int = 500, batch_size: int = 1024, lr: float = 1e-3,
 
         if val_loss < best_val_loss and epoch <= swa_start:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), "artifacts/models/fno_best.pth")
+            torch.save(model.state_dict(), "artifacts/models/fno_v2_best.pth")
             print(f"  → New best: {best_val_loss:.6f} (saved)")
 
     print(f"Training Complete. Best Validation Loss: {best_val_loss:.6f}")
     torch.optim.swa_utils.update_bn(train_loader, swa_model,
                                     device=device)
-    torch.save(swa_model.module.state_dict(), "artifacts/weights/fno_final_prod.pth")
-    print("SWA Model saved to artifacts/weights/fno_final_prod.pth")
+    torch.save(swa_model.module.state_dict(), "artifacts/weights/fno_v2_final_prod.pth")
+    print("SWA Model saved to artifacts/weights/fno_v2_final_prod.pth")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,843 @@
+% ============================================================
+%  Прайсинг деривативов с помощью нейронных сетей
+%  Дипломная презентация — МФТИ
+%
+%  Compile:
+%    pdflatex -interaction=nonstopmode diploma_ru.tex
+%    (или через build.sh с параметром diploma_ru)
+% ============================================================
+
+\documentclass[aspectratio=169, 10pt]{beamer}
+
+% ── Язык ──────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+
+% ── Тема ─────────────────────────────────────────────────────
+\usetheme{Madrid}
+\usecolortheme{whale}
+\usefonttheme{professionalfonts}
+\setbeamertemplate{navigation symbols}{}
+
+% ── Пакеты ───────────────────────────────────────────────────
+\usepackage{amsmath, amssymb, bm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{fontawesome5}
+\usepackage{array}
+\usepackage{colortbl}
+\usepackage{microtype}
+\usepackage{qrcode}   % для QR-кода демо
+
+% ── Цвета ────────────────────────────────────────────────────
+\definecolor{hestonblue}{RGB}{30, 80, 162}
+\definecolor{hestonorange}{RGB}{214, 100, 40}
+\definecolor{hestongreen}{RGB}{40, 160, 80}
+\definecolor{lightgray}{RGB}{245, 245, 245}
+\definecolor{miptyellow}{RGB}{255, 200, 0}
+
+\setbeamercolor{frametitle}{bg=hestonblue, fg=white}
+\setbeamercolor{alerted text}{fg=hestonorange}
+\setbeamercolor{block title}{bg=hestonblue!85, fg=white}
+\setbeamercolor{block body}{bg=hestonblue!8}
+\setbeamercolor{block title alerted}{bg=hestonorange!85, fg=white}
+\setbeamercolor{block body alerted}{bg=hestonorange!8}
+\setbeamercolor{block title example}{bg=hestongreen!75, fg=white}
+\setbeamercolor{block body example}{bg=hestongreen!8}
+
+% ── Логотип МФТИ в шапке ─────────────────────────────────────
+\pgfdeclareimage[height=0.7cm]{mipt-logo}{../../images/generated/mipt_logo.png}
+\logo{\pgfuseimage{mipt-logo}}
+
+% ── Мета ─────────────────────────────────────────────────────
+\title[Прайсинг деривативов с нейросетями]{%
+  Прайсинг деривативов\\с помощью нейронных сетей}
+\subtitle{Нейросетевой суррогат модели Хестона:
+          калибровка, неопределённость, динамика}
+\author[Бирюков Н.А.]{Бирюков Никита Алексеевич}
+\date{\today}
+\institute[МФТИ]{%
+  Московский физико-технический институт (МФТИ)\\[0.3em]
+  {\small Научный руководитель: Андреев Михаил Владимирович}}
+
+% ─────────────────────────────────────────────────────────────
+\begin{document}
+% ─────────────────────────────────────────────────────────────
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 1 — Титульный лист
+% ══════════════════════════════════════════════════════════════
+{
+\setbeamertemplate{footline}{}
+\setbeamertemplate{logo}{}
+\begin{frame}[plain, noframenumbering]
+  \begin{columns}[c]
+    % ── Левая: логотип + реквизиты ──────────────────────────
+    \begin{column}{0.28\textwidth}
+      \begin{center}
+        \includegraphics[width=2.6cm]{../../images/generated/mipt_logo.png}\\[0.8em]
+        {\scriptsize\color{gray}
+          Московский физико-технический институт\\[0.2em]
+          Кафедра прикладной математики}
+      \end{center}
+    \end{column}
+
+    % ── Правая: название ────────────────────────────────────
+    \begin{column}{0.68\textwidth}
+      \vspace{0.5em}
+      {\color{hestonblue}\rule{\textwidth}{1.5pt}}\\[0.8em]
+      {\LARGE\bfseries\color{hestonblue}
+        Прайсинг деривативов\\[0.3em]
+        с помощью нейронных сетей}\\[0.7em]
+      {\small\color{gray}
+        Нейросетевой суррогат модели Хестона:
+        калибровка, оценка неопределённости и LSTM-динамика параметров}\\[0.9em]
+      {\color{hestonblue}\rule{\textwidth}{0.6pt}}\\[0.8em]
+      \begin{tabular}{@{}rl@{}}
+        \textbf{Студент:}            & Бирюков Никита Алексеевич \\[0.3em]
+        \textbf{Науч.\ руководитель:}& Андреев Михаил Владимирович \\[0.3em]
+        \textbf{Дата:}               & \today \\
+      \end{tabular}
+    \end{column}
+  \end{columns}
+\end{frame}
+}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 2 — Постановка задачи
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Постановка задачи}
+  \begin{columns}[T]
+
+    % ── Левая: проблема ─────────────────────────────────────
+    \begin{column}{0.50\textwidth}
+      \textbf{Проблема:} классическая калибровка медленна\\[0.5em]
+      \begin{enumerate}\small
+        \item Вычислить характеристическую функцию $\phi(u;\boldsymbol\theta)$
+        \item Оценить 88 опционов через FFT Карра--Мадана
+        \item Подать MSE в оптимизатор Левенберга--Марквардта
+        \item Повторить $\sim$10\,000 раз до сходимости
+      \end{enumerate}
+      \vspace{0.5em}
+      \alert{$\Rightarrow$ \textbf{10–120 секунд} на одну калибровку}\\[0.3em]
+      \alert{$\Rightarrow$ Нет аналитического якобиана}\\[0.5em]
+
+      \begin{block}{Практические требования}
+        \small
+        \begin{itemize}
+          \item[\faCheck] Реал-тайм трейдинг: жёсткий дедлайн $< 150$\,мс
+          \item[\faCheck] Точные производные второго порядка (Греки)
+          \item[\faCheck] Гарантия физических ограничений (усл.\ Феллера)
+        \end{itemize}
+      \end{block}
+    \end{column}
+
+    % ── Правая: идея решения ────────────────────────────────
+    \begin{column}{0.46\textwidth}
+      \begin{alertblock}{Цель дипломной работы}
+        \scriptsize
+        Создать \textbf{универсальный ML-фреймворк} для калибровки различных моделей
+        ценообразования и оценить его применимость в продакшене.\\
+        \vspace{0.3em}
+        \textit{Суррогат Хестона — первый шаг реализации (Proof of Concept).}
+      \end{alertblock}
+      \vspace{0.4em}
+      \textbf{Задачи реализации (на примере Хестона):}
+      \begin{enumerate}\scriptsize
+        \item[\textbf{Ф1}] Обучить MLP-суррогат
+                           $\mathcal{N}_w : \mathbb{R}^5 \to \mathbb{R}^{88}$
+                           в пространстве суммарной дисперсии $W$
+        \item[\textbf{Ф2}] Реализовать байесовскую оценку неопределённости
+                           (MC Dropout)
+        \item[\textbf{Ф3}] Обучить LSTM для прогнозирования
+                           динамики параметров на следующий день
+      \end{enumerate}
+      \vspace{0.4em}
+      \begin{center}
+        \begin{tikzpicture}
+          \node[draw=hestonblue, fill=hestonblue!10,
+                rounded corners=4pt, font=\small,
+                minimum width=3.8cm, minimum height=0.75cm, align=center]
+            (surr) {Нейросетевой суррогат};
+          \node[right=0.4cm of surr, font=\small\color{hestongreen},
+                align=left]
+            {\textbf{$\approx 0.1$\,мс}\\за оценку};
+        \end{tikzpicture}
+      \end{center}
+    \end{column}
+
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 3 — Обзор существующих ML-подходов
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Обзор существующих ML-подходов к прайсингу деривативов}
+  \begin{center}\small
+  \begin{tabular}{@{}p{2.8cm}p{3.4cm}p{2.6cm}p{3.4cm}@{}}
+    \toprule
+    \textbf{Метод} & \textbf{Задача} & \textbf{Архитектура} & \textbf{Сложность / Ресурсы} \\
+    \midrule
+    Deep BSDE \newline\tiny(Han et al., 2018)
+      & Прайсинг при $d\!\sim\!100$, нелинейные PDE
+      & MLP на каждом шаге времени
+      & Средняя (GPU Tesla T4) \\
+    \addlinespace
+    DGM \newline\tiny(Sirignano et al., 2018)
+      & Американские опционы, свободная граница
+      & ResNet/LSTM-слой
+      & Высокая (V100/A100) \\
+    \addlinespace
+    Deep Hedging \newline\tiny(Buehler et al., 2019)
+      & Хеджирование с транзакционными издержками
+      & LSTM (path-dependent)
+      & Средняя/Высокая \\
+    \addlinespace
+    \rowcolor{hestonblue!12}
+    \textbf{Deep Calibration} \newline\tiny\textbf{(Horvath et al., 2019)}
+      & \textbf{Мгновенная калибровка поверхности IV}
+      & \textbf{MLP-суррогат}
+      & \textbf{Низкая (любой GPU)} \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.3em}
+  \begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+      \begin{exampleblock}{\faCheckCircle\ Почему Deep Calibration?}
+        \scriptsize
+        \begin{itemize}
+          \item Обучение \textbf{один раз} — инференс мгновенный
+          \item Градиент через autograd $\Rightarrow$ точный якобиан
+          \item Малые требования к железу (RTX 3060)
+          \item Прямое расширение на LSTM (Фаза 3)
+        \end{itemize}
+      \end{exampleblock}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \begin{alertblock}{\faTimesCircle\ Почему не альтернативы?}
+        \scriptsize
+        \begin{itemize}
+          \item Deep BSDE: нет якобиана, нет поверхности
+          \item DGM: чрезмерные вычислительные ресурсы
+          \item Deep Hedging: другая задача (трения)
+        \end{itemize}
+      \end{alertblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 4 — Архитектура системы (три фазы)
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Архитектура системы: трёхфазный pipeline}
+  \begin{center}
+  \begin{tikzpicture}[
+    node distance=0.55cm and 1.8cm,
+    box/.style={rectangle, rounded corners=5pt,
+                minimum width=2.8cm, minimum height=0.85cm,
+                align=center, font=\small\bfseries},
+    io/.style={box, draw=gray!60, fill=gray!10, font=\scriptsize},
+    ph1/.style={box, draw=hestonblue, fill=hestonblue!12},
+    ph2/.style={box, draw=hestonorange, fill=hestonorange!10},
+    ph3/.style={box, draw=hestongreen!80, fill=hestongreen!10},
+    arr/.style={->, thick},
+    lbl/.style={font=\bfseries\small},
+  ]
+    % ── Фаза 1 ─────────────────────────────────────────────
+    \node[lbl, color=hestonblue] (l1) at (-4.5, 2.4) {Фаза 1 — MLP-суррогат};
+    \node[io]  (inp)  at (-4.5, 1.3) {Параметры Хестона\\$(\kappa,\theta,\sigma,\rho,v_0)$};
+    \node[ph1] (mlp)  at (-0.5, 1.3) {HestonSurrogateMLP\\$\mathbb{R}^5\!\to\!\mathbb{R}^{88}$};
+    \node[io]  (wout) at ( 3.5, 1.3) {Поверхность $W$\\(88 точек)};
+    \draw[arr, hestonblue] (inp) -- (mlp) node[midway,above,font=\tiny]{MinMax};
+    \draw[arr, hestonblue] (mlp) -- (wout) node[midway,above,font=\tiny]{Std$^{-1}$};
+
+    % ── Фаза 2 ─────────────────────────────────────────────
+    \node[lbl, color=hestonorange] (l2) at (-4.5, 0.0) {Фаза 2 — MC Dropout};
+    \node[ph2] (mcd) at (-0.5, -0.85) {100 стохастических\\forward-pass};
+    \node[io]  (unc) at ( 3.5, -0.85) {IV $\pm 2\sigma$\\(доверит.\ интервал)};
+    \draw[arr, hestonorange] (mlp.south) -- (mcd.north);
+    \draw[arr, hestonorange] (mcd) -- (unc);
+
+    % ── Фаза 3 ─────────────────────────────────────────────
+    \node[lbl, color=hestongreen!70!black] (l3) at (-4.5, -2.1) {Фаза 3 — LSTM-динамика};
+    \node[io]  (hist) at (-4.5, -3.0) {История $W_t$ за 10 дней\\$(10\times88)$};
+    \node[ph3] (lstm) at (-0.5, -3.0) {HestonDynamicsLSTM\\LSTM$_{64}^2$};
+    \node[io]  (pred) at ( 3.5, -3.0) {$\hat{\boldsymbol\theta}_{t+1}$\\(параметры завтра)};
+    \draw[arr, hestongreen!80!black] (hist) -- (lstm);
+    \draw[arr, hestongreen!80!black] (lstm) -- (pred);
+    \draw[arr, dashed, gray!50] (wout.south) to[bend right=15] (hist.north);
+  \end{tikzpicture}
+  \end{center}
+  \vspace{-0.6em}
+  \begin{center}{\scriptsize\color{gray}
+    Пунктирная стрелка: поверхности $W$ из Фазы~1 служат входом для обучения Фазы~3}
+  \end{center}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 5 — Фаза 1: MLP-суррогат
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Фаза 1: суррогатная модель MLP}
+  \begin{columns}[T]
+
+    % ── Левая: архитектура ──────────────────────────────────
+    \begin{column}{0.50\textwidth}
+      \textbf{Архитектура нейросети:}\\[0.2em]
+      \begin{center}
+      \begin{tikzpicture}[scale=0.65,
+        layer/.style={draw=hestonblue, fill=hestonblue!10,
+                      rounded corners=3pt, minimum width=1.5cm,
+                      minimum height=0.8cm, align=center, font=\tiny},
+        arr/.style={->, thick, hestonblue},
+      ]
+        \node[layer] (i)  at (0,   0) {Вход\\$\mathbb{R}^5$};
+        \node[layer] (h1) at (1.9, 0) {Linear\\(30)+ELU};
+        \node[layer] (h2) at (3.8, 0) {Linear\\(30)+ELU};
+        \node[layer] (h3) at (5.7, 0) {Linear\\(30)+ELU};
+        \node[layer] (h4) at (7.6, 0) {Linear\\(30)+ELU};
+        \node[layer, draw=hestonorange, fill=hestonorange!10]
+                     (o)  at (9.5, 0) {Выход\\$\mathbb{R}^{88}$};
+        \draw[arr] (i)--(h1); \draw[arr] (h1)--(h2);
+        \draw[arr] (h2)--(h3); \draw[arr] (h3)--(h4); \draw[arr] (h4)--(o);
+        \node[font=\tiny, color=gray] at (4.75,-0.85)
+              {Dropout(p=0.1) после каждого слоя};
+      \end{tikzpicture}
+      \end{center}
+      \vspace{0.2em}
+      \begin{center}\scriptsize
+      \begin{tabular}{@{}ll@{}}
+        \toprule
+        Параметр & Значение \\ \midrule
+        Архитектура & $4{\times}30$, ELU (C$^2$) \\
+        Параметров & 5\,698 \\
+        Оптимизатор & Adam + ReduceLROnPlateau \\
+        Эпох & 200, RTX 3060, $\approx$2\,мин \\
+        \bottomrule
+      \end{tabular}
+      \end{center}
+    \end{column}
+
+    % ── Правая: ключевые решения ────────────────────────────
+    \begin{column}{0.46\textwidth}
+      \begin{block}{Пространство суммарной дисперсии $W$}
+        \small
+        Сеть предсказывает не IV напрямую, а:
+        \[ W(K,T) = \sigma_{\mathrm{IV}}^2(K,T)\cdot T \]
+        \begin{itemize}
+          \item[\faCheck] Линеаризует уравнение Дюпира
+          \item[\faCheck] Условие без арбитража:
+                $\partial W/\partial T \ge 0$\\
+                (критерий Карра--Мадана)
+          \item[\faCheck] Стабилизирует градиенты при обучении
+        \end{itemize}
+      \end{block}
+      \vspace{0.25em}
+      \begin{alertblock}{Зачем ELU, а не ReLU?}
+        \scriptsize
+        ReLU: $f''(x) \equiv 0 \Rightarrow$ гессиан нулевой, греки \textbf{бессмысленны}\\[0.2em]
+        ELU: $f''(x) \neq 0 \Rightarrow$ корректный гессиан\\[-0.1em]
+        $\|H_\mathrm{ELU}\|_F = 1.039 \gg \|H_\mathrm{ReLU}\|_F = 0$
+      \end{alertblock}
+    \end{column}
+
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 6 — Результаты калибровки (Фаза 1)
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Результаты: калибровка поверхности волатильности}
+  \begin{columns}[T]
+
+    % ── Левая: поверхность ──────────────────────────────────
+    \begin{column}{0.52\textwidth}
+      \textbf{3D-поверхность IV: цель vs калибровка}\\[0.3em]
+      \begin{center}
+        \includegraphics[width=\linewidth,
+                         height=0.54\textheight,
+                         keepaspectratio]%
+          {../../images/generated/surface_fit.png}
+      \end{center}
+      {\tiny\color{gray}
+        Синяя поверхность — целевая рыночная IV;\quad
+        Оранжевая — откалиброванная нейросетью}
+    \end{column}
+
+    % ── Правая: числа ───────────────────────────────────────
+    \begin{column}{0.44\textwidth}
+      \textbf{Параметры (тестовый пример):}\\[0.3em]
+      \begin{center}\scriptsize
+      \begin{tabular}{@{}lrrr@{}}
+        \toprule
+        Пар-р & Истинный & NN & $|\Delta|$ \\ \midrule
+        $v_0$    & 0.00198 & 0.00236 & 0.00038 \\
+        $\rho$   & $-0.877$  & $-0.950$  & 0.073 \\
+        $\sigma$ & 0.0776  & 0.0663  & 0.011 \\
+        $\theta$ & 0.1847  & 0.1844  & 0.000 \\
+        $\kappa$ & 5.582   & 5.538   & 0.044 \\ \bottomrule
+      \end{tabular}
+      \end{center}
+
+      \vspace{0.5em}
+      \begin{block}{Итоговые метрики}
+        \small
+        \begin{tabular}{@{}ll@{}}
+          Val RMSE ($W$-пространство) & \textbf{0.0876} \\
+          Время калибровки            & \textbf{47--135\,мс} \\
+          Нарушений арбитража         & \textbf{0 / 77} \\
+          Условие Феллера             & \checkmark\ всегда \\
+        \end{tabular}
+      \end{block}
+
+      \vspace{0.4em}
+      \begin{exampleblock}{Сетка поверхности}
+        \scriptsize
+        8 сроков экспирации $\times$ 11 страйков = 88 точек\\
+        $T \in [0.1,\ldots,2.0]$;\quad $K/S \in [0.5,\ldots,1.5]$
+      \end{exampleblock}
+    \end{column}
+
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 7 — Бенчмарк скорости
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Производительность: ускорение в $\approx$160 раз}
+  \begin{columns}[T]
+
+    % ── Левая: бар-чарт ─────────────────────────────────────
+    \begin{column}{0.50\textwidth}
+      \textbf{Время одной калибровки (CPU):}\\[0.5em]
+      \begin{center}
+      \begin{tikzpicture}
+        \begin{axis}[
+          xbar,
+          width=7.0cm, height=3.5cm,
+          xmin=0, xmax=14,
+          ytick={0,1},
+          yticklabels={NN-суррогат\\(L-BFGS-B), FFT + LM\\(классика)},
+          yticklabel style={align=right, font=\scriptsize},
+          xlabel={Время (секунды)},
+          xlabel style={font=\scriptsize},
+          xticklabel style={font=\tiny},
+          bar width=0.5cm,
+          nodes near coords,
+          nodes near coords style={font=\scriptsize\bfseries},
+          enlarge y limits=0.6,
+          tick align=outside,
+        ]
+          \addplot[fill=hestongreen!80, draw=hestongreen!60!black]
+            coordinates {(0.091, 0)};
+          \addplot[fill=hestonorange!80, draw=hestonorange!60!black]
+            coordinates {(12.0, 1)};
+        \end{axis}
+      \end{tikzpicture}
+      \end{center}
+      \vspace{0em}
+      \begin{center}
+        {\large\bfseries\color{hestongreen} $\approx\mathbf{160\times}$ быстрее}
+      \end{center}
+    \end{column}
+
+    % ── Правая: детали ──────────────────────────────────────
+    \begin{column}{0.46\textwidth}
+      \begin{block}{Почему так быстро?}
+        \scriptsize
+        \begin{enumerate}
+          \item \textbf{Один forward-pass} MLP вместо
+                10\,000 итераций FFT
+          \item \textbf{Точный якобиан} через autograd
+                $\Rightarrow$ L-BFGS-B за единицы итераций
+          \item \textbf{Нет Фурье-интеграла}
+                на каждом шаге оптимизатора
+        \end{enumerate}
+      \end{block}
+
+      \vspace{0.2em}
+      \begin{center}\small
+      \begin{tabular}{@{}lcc@{}}
+        \toprule
+        Метод       & CPU & GPU \\ \midrule
+        FFT + LM    & 10--120\,с & $\sim$5\,с \\
+        NN-суррогат & \textbf{47--135\,мс} & \textbf{$<$10\,мс} \\
+        \bottomrule
+      \end{tabular}
+      \end{center}
+
+      \vspace{0.2em}
+      \begin{exampleblock}{\faRocket\ Применимость}
+        \scriptsize
+        \begin{itemize}
+          \item HFT: дедлайн $<$100\,мс \checkmark
+          \item Портфельная переоценка в реал-тайм \checkmark
+          \item Батч-калибровка тысяч инструментов \checkmark
+        \end{itemize}
+      \end{exampleblock}
+    \end{column}
+
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 8 — Фаза 2: MC Dropout / байесовская неопределённость
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Фаза 2: байесовская оценка неопределённости (MC Dropout)}
+  \begin{columns}[T]
+
+    % ── Левая: метод ────────────────────────────────────────
+    \begin{column}{0.50\textwidth}
+      \textbf{Зачем оценивать неопределённость?}\\[0.3em]
+      {\small Точечная калибровка не говорит, насколько
+      уверена модель в своём предсказании.}\\[0.5em]
+
+      \begin{block}{Алгоритм MC Dropout \small(Gal \& Ghahramani, 2016)}
+        \small
+        \begin{enumerate}
+          \item Оставить \texttt{Dropout(p=0.1)} \textbf{активным} на инференсе
+                (\texttt{model.train()})
+          \item Выполнить $N = 100$ стохастических forward-pass
+          \item Вычислить среднее $\mu$ и стд $\sigma$ по семплам
+        \end{enumerate}
+        \[\hat{\boldsymbol\sigma} \pm 2\sigma_{\mathrm{MC}}\]
+        $\Rightarrow$ \textbf{доверительный интервал} поверхности IV
+      \end{block}
+
+      \vspace{0.2em}
+      \begin{block}{Математическая интерпретация}
+        \small
+        Байесовское приближение над весами:
+        $p(\boldsymbol\sigma^*\mid\boldsymbol\theta,\mathcal{D})
+          \approx \frac{1}{N}\sum_{i=1}^{N}\mathcal{N}_{w_i}(\boldsymbol\theta)$
+      \end{block}
+    \end{column}
+
+    % ── Правая: результаты ──────────────────────────────────
+    \begin{column}{0.46\textwidth}
+      \textbf{Схема 100 forward-pass:}\\[0.4em]
+      \begin{center}
+      \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners=3pt, align=center,
+                    font=\scriptsize, minimum height=0.65cm},
+        arr/.style={->, thick},
+      ]
+        \node[box, draw=hestonblue, fill=hestonblue!10,
+              minimum width=3.2cm] (net) at (0,0)
+          {MLP с активным\\Dropout};
+        \node[box, draw=gray!50, fill=gray!8,
+              minimum width=1.3cm] (s1) at (-1.8,-1.4) {$\hat{W}^{(1)}$};
+        \node[box, draw=gray!50, fill=gray!8,
+              minimum width=1.3cm] (s2) at (0,   -1.4) {$\hat{W}^{(i)}$};
+        \node[box, draw=gray!50, fill=gray!8,
+              minimum width=1.3cm] (sN) at ( 1.8,-1.4) {$\hat{W}^{(N)}$};
+        \node[font=\tiny, color=gray] at (0.9,-1.4) {$\cdots$};
+        \node[box, draw=hestonorange, fill=hestonorange!10,
+              minimum width=3.2cm] (out) at (0,-2.7)
+          {$\mu \pm 2\sigma_{\mathrm{MC}}$\\IV-поверхность с полосами};
+        \draw[arr, hestonblue] (net) -- (s1);
+        \draw[arr, hestonblue] (net) -- (s2);
+        \draw[arr, hestonblue] (net) -- (sN);
+        \draw[arr, hestonorange] (s1) -- (out);
+        \draw[arr, hestonorange] (s2) -- (out);
+        \draw[arr, hestonorange] (sN) -- (out);
+        \node[font=\tiny, color=hestonblue, left=0.05cm of net]
+          {\rotatebox{90}{$N\!=\!100$ проходов}};
+      \end{tikzpicture}
+      \end{center}
+
+      \vspace{0.3em}
+      \begin{exampleblock}{Результаты ($N=100$)}
+        \scriptsize
+        \begin{tabular}{@{}ll@{}}
+          Макс.\ $\sigma_{\mathrm{MC}}$ (ATM, $T=1$) & $< 5\times10^{-4}$ \\
+          Ширина полос $\pm 2\sigma$                  & $< 0.1\%$ IV \\
+          Накладные расходы                           & $\approx100\times$ \\
+        \end{tabular}\\[0.3em]
+        \textit{Узкие полосы подтверждают отсутствие переобучения.}
+      \end{exampleblock}
+    \end{column}
+
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 9 — Фаза 3: LSTM-динамика параметров
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Фаза 3: LSTM-прогноз динамики параметров Хестона}
+  \begin{columns}[T]
+
+    % ── Левая: архитектура + датасет ────────────────────────
+    \begin{column}{0.50\textwidth}
+      \textbf{Задача:} предсказать $\hat{\boldsymbol\theta}_{t+1}$ по истории
+      поверхностей $W$ за 10 дней.\\[0.4em]
+
+      \textbf{Архитектура:}
+      \[
+        \underbrace{(10 \times 88)}_{\text{10-дневная история }W}
+        \xrightarrow{\;\text{LSTM}_{64}^{2}\;}
+        \underbrace{\hat{\boldsymbol\theta}_{t+1}}_{5\text{ параметров}}
+      \]
+      \begin{center}\scriptsize
+      \begin{tabular}{@{}ll@{}}
+        \toprule
+        Параметр          & Значение \\ \midrule
+        LSTM слоёв        & 2, hidden = 64 \\
+        Инициализация     & Xavier (вход), Ортогональная (рекурр.) \\
+        Forget-gate bias  & = 1 (стандартный трюк) \\
+        Нормализация      & LayerNorm после LSTM \\
+        Обучаемых пар-ов  & 73\,157 \\
+        Оптимизатор       & AdamW + CosineAnnealingLR \\
+        Ранняя остановка  & EarlyStopping (patience=20) \\
+        \bottomrule
+      \end{tabular}
+      \end{center}
+    \end{column}
+
+    % ── Правая: данные и pipeline ───────────────────────────
+    \begin{column}{0.46\textwidth}
+      \begin{block}{Генерация обучающих данных}
+        \small
+        \begin{enumerate}
+          \item \textbf{600 траекторий} параметров по процессам\\
+                Орнштейна--Уленбека (калибр.\ к SPX)
+          \item Каждый день: $\boldsymbol\theta_t
+                \xrightarrow{\text{MLP}} W_t$ (88 точек)
+          \item \textbf{102\,000 окон}: $(W_{t-9},\ldots,W_t)
+                \to \boldsymbol\theta_{t+1}$
+          \item Разбивка 80/10/10 по границам траекторий\\
+                (\textit{утечки данных нет})
+        \end{enumerate}
+      \end{block}
+
+      \vspace{0.4em}
+      \begin{alertblock}{Z-нормализация меток}
+        \small
+        Метки $\boldsymbol\theta$ нормализуются по статистике\\
+        обучающей выборки (Z-score).\\[0.2em]
+        На инференсе: обратное преобразование +\\
+        жёсткая привязка к физическим границам\\
+        (условие Феллера гарантировано).
+      \end{alertblock}
+    \end{column}
+
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 10 — Результаты LSTM
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Результаты Фазы 3: точность прогноза LSTM}
+  \begin{columns}[T]
+
+    % ── Левая: таблица RMSE ─────────────────────────────────
+    \begin{column}{0.46\textwidth}
+      \textbf{RMSE по параметрам (оригинальный масштаб):}\\[0.4em]
+      \begin{center}\small
+      \begin{tabular}{@{}llr@{}}
+        \toprule
+        Пар-р     & Физ.\ смысл          & RMSE \\ \midrule
+        $v_0$     & Нач.\ дисперсия      & \textbf{0.0052} \\
+        $\rho$    & Корреляция           & \textbf{0.0133} \\
+        $\sigma$  & Вол-ть вол-ти        & \textbf{0.0257} \\
+        $\theta$  & Долгоср.\ дисперсия  & \textbf{0.0035} \\
+        $\kappa$  & Скор.\ возврата      & \textbf{0.1270} \\
+        \midrule
+        \multicolumn{2}{@{}l}{Норм.\ RMSE (тестовая выб.)} & \textbf{0.336} \\
+        \multicolumn{2}{@{}l}{Норм.\ MSE (тестовая выб.)}  & \textbf{0.113} \\
+        \bottomrule
+      \end{tabular}
+      \end{center}
+
+      \vspace{0.4em}
+      \begin{exampleblock}{Вывод}
+        \small
+        $\kappa$ сложнее всего: быстро меняется.\\
+        $\theta$ и $v_0$ прогнозируются точнее —\\
+        медленная средняя динамика OU-процесса.
+      \end{exampleblock}
+    \end{column}
+
+    % ── Правая: pgfplots — bar по параметрам ────────────────
+    \begin{column}{0.50\textwidth}
+      \textbf{RMSE по каждому параметру:}\\[0.3em]
+      \begin{center}
+      \begin{tikzpicture}
+        \begin{axis}[
+          ybar,
+          width=7.2cm, height=4.8cm,
+          bar width=0.45cm,
+          ymin=0, ymax=0.16,
+          xtick={1,2,3,4,5},
+          xticklabels={$v_0$, $\rho$, $\sigma$, $\theta$, $\kappa$},
+          xticklabel style={font=\small},
+          ylabel={RMSE},
+          ylabel style={font=\scriptsize},
+          yticklabel style={font=\tiny},
+          nodes near coords,
+          nodes near coords style={font=\tiny, anchor=south},
+          enlarge x limits=0.18,
+          ymajorgrids=true, grid style={dashed, gray!30},
+        ]
+          \addplot[fill=hestonblue!75, draw=hestonblue!50!black]
+            coordinates {
+              (1, 0.0052)
+              (2, 0.0133)
+              (3, 0.0257)
+              (4, 0.0035)
+              (5, 0.1270)
+            };
+        \end{axis}
+      \end{tikzpicture}
+      \end{center}
+      {\scriptsize\color{gray}
+        Тестовая выборка: 10\,200 последовательностей
+        (10\% от 102\,000 окон)}
+    \end{column}
+
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 11 — Демо, тестирование, репозиторий
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Демонстрация: интерактивный Streamlit-дашборд}
+  \begin{columns}[T]
+
+    % ── Левая: описание UI ──────────────────────────────────
+    \begin{column}{0.54\textwidth}
+      \textbf{Веб-приложение (Streamlit):}\\[0.4em]
+      \begin{block}{Вкладка 1 — Демо калибровки}
+        \small
+        \begin{itemize}
+          \item Ползунки $\kappa, \theta, \sigma, \rho, v_0$
+                + живая проверка условия Феллера
+          \item \textbf{«Сгенерировать поверхность»} — MLP forward-pass
+          \item \textbf{«Откалибровать»} — L-BFGS-B, 3D-сравнение IV
+          \item \textbf{«Неопределённость»} — 100 MC Dropout passes,
+                $\pm 2\sigma$ полосы
+          \item \textbf{«Прогноз»} — OU-симуляция $\to$ LSTM
+                $\to$ траектория 5 параметров
+        \end{itemize}
+      \end{block}
+
+      \vspace{0.4em}
+      \begin{block}{Вкладка 2 — Архитектура \& Методы}
+        \small
+        \begin{itemize}
+          \item Интерактивный граф вычислений (Cytoscape.js)
+          \item Клик по узлу → формулы на KaTeX + фрагмент кода
+        \end{itemize}
+      \end{block}
+
+      \vspace{0.4em}
+      \begin{exampleblock}{\faFlask\ Тестовое покрытие}
+        \small
+        \begin{tabular}{@{}ll@{}}
+          Фаза 2 (MC Dropout) & 7 тестов \\
+          Фаза 3 (LSTM)       & 22 теста \\
+          \textbf{Итого}      & \textbf{29 тестов, 100\% pass} \\
+        \end{tabular}
+      \end{exampleblock}
+    \end{column}
+
+    % ── Правая: QR + ссылка ─────────────────────────────────
+    \begin{column}{0.42\textwidth}
+      \begin{center}
+        \textbf{Живое демо:}\\[0.3em]
+        \qrcode[height=2.6cm]{https://hestondl.streamlit.app/}\\[0.25em]
+        {\small\color{hestonblue}
+          \href{https://hestondl.streamlit.app/}%
+               {\texttt{hestondl.streamlit.app}}}\\[0.4em]
+        {\color{hestonblue}\rule{0.8\linewidth}{0.4pt}}\\[0.3em]
+        {\tiny
+          \texttt{src/app.py} --- Streamlit UI\\[0.12em]
+          \texttt{src/model.py} --- HestonSurrogateMLP\\[0.12em]
+          \texttt{src/seq\_model.py} --- HestonDynamicsLSTM\\[0.12em]
+          \texttt{tests/} --- pytest (29 тестов)}
+      \end{center}
+    \end{column}
+
+  \end{columns}
+\end{frame}
+
+% ══════════════════════════════════════════════════════════════
+% Слайд 12 — Выводы и направления развития
+% ══════════════════════════════════════════════════════════════
+\begin{frame}{Выводы и направления дальнейшего развития}
+  \begin{columns}[T]
+
+    % ── Левая: итоги ────────────────────────────────────────
+    \begin{column}{0.50\textwidth}
+      \textbf{Достигнутые результаты:}\\[0.4em]
+
+      \begin{itemize}\small
+        \item[\checkmark] \textbf{Фаза 1 — MLP-суррогат:}\\
+              Val RMSE \textbf{0.0876}; калибровка за \textbf{47–135\,мс};
+              ускорение $\approx\mathbf{160\times}$; 0 нарушений арбитража
+
+        \vspace{0.3em}
+        \item[\checkmark] \textbf{Фаза 2 — MC Dropout:}\\
+              Доверительные полосы $\pm 2\sigma < 0.1\%$ IV;
+              байесовская неопределённость без доп.\ архитектуры
+
+        \vspace{0.3em}
+        \item[\checkmark] \textbf{Фаза 3 — LSTM-динамика:}\\
+              102\,000 обучающих окон; норм.\ RMSE \textbf{0.336};
+              Феллер гарантирован на каждом инференсе
+
+        \vspace{0.3em}
+        \item[\checkmark] \textbf{Инфраструктура:}\\
+              29 pytest-тестов (100\% pass);
+              интерактивный Streamlit-дашборд;
+              живое демо \href{https://hestondl.streamlit.app/}%
+              {\texttt{hestondl.streamlit.app}}
+      \end{itemize}
+    \end{column}
+
+    % ── Правая: future work ──────────────────────────────────
+    \begin{column}{0.46\textwidth}
+      \begin{alertblock}{\faArrowRight\ Направления развития}
+        \small
+        \begin{enumerate}
+          \item \textbf{Rough Volatility:}
+                замена Heston на rBergomi / rHeston
+                (дробное броуновское движение)
+
+          \item \textbf{Реальные рыночные данные:}
+                калибровка на исторических SPX-опционах
+                вместо синтетики
+
+          \item \textbf{Deep Hedging:}
+                использование суррогата как среды
+                для обучения стратегий хеджирования
+                с транзакционными издержками
+
+          \item \textbf{REST API / облако:}
+                обёртка FastAPI + контейнеризация Docker
+                для продакшн-развёртывания
+        \end{enumerate}
+      \end{alertblock}
+
+      \vspace{0.5em}
+      \begin{center}
+        {\large\bfseries\color{hestonblue} Спасибо за внимание!}\\[0.5em]
+        {\small\color{gray}
+          Вопросы приветствуются.\\[0.3em]
+          \href{https://hestondl.streamlit.app/}%
+               {\faGlobe\ \texttt{hestondl.streamlit.app}}}
+      \end{center}
+    \end{column}
+
+  \end{columns}
+\end{frame}
+
+\end{document}
