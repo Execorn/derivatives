@@ -93,3 +93,17 @@ __pycache__/
 .pytest_cache/
 *.txt.gz
 !data/samples/*.txt.gz
+
+# ── AI agent / assistant generated files ─────────────────────────────────────
+.antigravityignore
+.gemini/
+dev/
+test_*.py
+
+# ── Large datasets (reproduced by generate scripts) ──────────────────────────
+data/*.npz
+data/*.csv
+
+# ── Compiled CUDA extensions (platform-specific) ─────────────────────────────
+*.so
+*.pyd

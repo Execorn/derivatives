@@ -1,0 +1,14 @@
+Bernstein Factor Convergence Results
+====================================================================
+Reference: N=40
+Test params: {'kappa': 1.0, 'theta': 0.08, 'sigma': 0.5, 'rho': -0.5, 'v0': 0.08, 'H': 0.08}
+
+    N    T=0.1 MaxErr(bp)    T=1.0 MaxErr(bp)   Global MaxErr(bp)   Time(s)
+---------------------------------------------------------------------------
+    5                 nan            126.6020                 nan      2.70
+   10                 nan             74.5205                 nan     15.29
+   20                 nan             29.3081                 nan     39.90
+   40              0.0000              0.0000                 nan    273.85
+
+N=20 vs N=40 error at T=0.1: nan bp
+Conclusion: N=20 is INSUFFICIENT (>1bp)

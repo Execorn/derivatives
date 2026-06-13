@@ -118,16 +118,25 @@ class HestonCalibrator:
         pred_iv = torch.sqrt(torch.clamp(pred_W / self.T_tensor, min=1e-8))
         pred_iv_2d = pred_iv.view(8, 11)
 
-        # Calendar Arbitrage: dW/dT >= 0 (total variance non-decreasing in T)
-        # Correct Carr-Madan condition: W = IV²×T must be non-decreasing in T.
-        # Checking dIV/dT >= 0 is wrong: IV can decrease (when v0 > theta) while
-        # W is still non-decreasing, giving a spurious penalty.
+        # Calendar Arbitrage: dW/dT >= 0 (total variance non-decreasing in T).
+        # Carr-Madan (1998): W(T) = IV²·T must be non-decreasing for no-calendar
+        # arbitrage.  Checking dIV/dT >= 0 is WRONG: IV can decrease in T when
+        # v0 > theta while W is still non-decreasing.  Use W directly.
+        # Normalise by T-step so the penalty scale is grid-independent.
+        T_steps = torch.tensor([0.2, 0.3, 0.3, 0.3, 0.3, 0.3, 0.2],
+                               dtype=torch.float32, device=pred_W.device).unsqueeze(-1)
         pred_W_2d = pred_W.view(8, 11)
-        diff_W = torch.diff(pred_W_2d, dim=0)  # (7, 11)
-        calendar_penalty = torch.sum(torch.relu(-diff_W) ** 2)
+        diff_W_dT = torch.diff(pred_W_2d, dim=0) / T_steps  # (7, 11) vol²/year
+        calendar_penalty = torch.sum(torch.relu(-diff_W_dT) ** 2)
 
-        # Butterfly Arbitrage: d²IV/dK² >= 0 (positive gamma — convexity in strike)
-        diff2_K = torch.diff(pred_iv_2d, n=2, dim=1)  # (8, 9)
+        # Butterfly Arbitrage: d²W/dK² >= 0 (convexity of total variance in strike).
+        # BUG FIX: was using d²IV/dK² which is a weaker, inconsistent proxy.
+        # The calendar penalty operates on W; the butterfly must too for the
+        # combined constraint to be meaningful (Gatheral 2011, Sec. 2).
+        # Note: the full Gatheral g(k)>=0 condition additionally involves dW/dK;
+        # for the calibration speed-critical inner loop this simpler d²W/dK²
+        # proxy is adequate.  The full Gatheral condition is in fno_model.py.
+        diff2_K = torch.diff(pred_W_2d, n=2, dim=1)  # (8, 9) second diff in K
         butterfly_penalty = torch.sum(torch.relu(-diff2_K) ** 2)
 
         # Combined Loss

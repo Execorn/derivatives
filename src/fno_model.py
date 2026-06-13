@@ -24,6 +24,14 @@ Additional change: removed softplus output.
     in calibrate.py and app_fno.py.
   - Removing softplus keeps the output unbounded, avoiding the 1/pred²
     Hessian explosion that made log-MSE unstable.
+
+No-arbitrage regularization (updated 2026-06-11):
+  PREVIOUS: weak proxy d²W/dK² ≥ 0 — necessary but NOT sufficient for
+            no-butterfly arbitrage. Missing the d₁ and d₂ skew terms.
+  NEW: Exact Gatheral (2011) density condition g(k) ≥ 0 where
+       g(k) = (1 - k·w'/(2w))² - (w'²/4)(1/w + 1/4) + w''/2
+       This is the iff condition for a positive risk-neutral density.
+  Calendar spread now divides by ΔT for grid-independent penalty magnitude.
 """
 
 import torch
@@ -257,21 +265,64 @@ def martingale_loss_prior(S_paths, r=0.0, dt=1/252.0):
     return F.mse_loss(E_discounted_S, S0.expand_as(E_discounted_S))
 
 
-def arbitrage_free_regularization(iv_surface, T_grid, K_grid):
+def arbitrage_free_regularization(
+    iv_surface: torch.Tensor,   # (B, T, K)  real IV space — do NOT pre-clamp
+    T_grid: torch.Tensor,       # (T,)
+    K_grid: torch.Tensor,       # (K,)
+) -> torch.Tensor:
     """
-    Soft penalties for calendar and butterfly arbitrage.
-    iv_surface : (B, T, K)   — in REAL (denormalised) IV space.
-    """
-    T_expanded = T_grid.view(1, -1, 1)
-    W = iv_surface ** 2 * T_expanded   # Total Variance
+    Exact no-arbitrage penalties: calendar spread + Gatheral butterfly.
 
-    # Calendar spread: dW/dT >= 0
-    dW_dT = W[:, 1:, :] - W[:, :-1, :]
+    Calendar spread
+    ---------------
+    Carr-Madan (1998): Total variance W(T) = IV²·T must be non-decreasing in T.
+    Divides by ΔT so the penalty is in [vol²/year] units regardless of grid.
+
+    Gatheral butterfly condition (Gatheral & Jacquier 2011)
+    -------------------------------------------------------
+    The iff condition for a positive risk-neutral density is: g(k) ≥ 0 ∀k,
+
+        g(k) = (1 - k·w'(k)/(2·w(k)))² - (w'(k)²/4)·(1/w(k) + 1/4) + w''(k)/2
+
+    k = log-moneyness, w(k) = IV²·T (total variance), w' = ∂w/∂k, w'' = ∂²w/∂k².
+
+    When g(k) < 0 a butterfly arbitrage exists (Breeden-Litzenberger density < 0).
+
+    Gradient note
+    -------------
+    iv_surface must be UN-clamped.  Pre-clamping to [1e-4, ∞) zeros out gradients
+    on negative-IV cells, removing the corrective penalty signal.
+    """
+    T_exp = T_grid.view(1, -1, 1)
+    W = iv_surface ** 2 * T_exp               # (B, T, K)
+
+    # ── 1. Calendar spread ────────────────────────────────────────────────────
+    dT = (T_grid[1:] - T_grid[:-1]).view(1, -1, 1).clamp(min=1e-8)
+    dW_dT = (W[:, 1:, :] - W[:, :-1, :]) / dT          # (B, T-1, K) vol²/year
     calendar_penalty = F.relu(-dW_dT).mean()
 
-    # Butterfly: d²W/dK² bounded (density >= 0 proxy)
-    d2W_dK2 = W[:, :, 2:] - 2 * W[:, :, 1:-1] + W[:, :, :-2]
-    butterfly_penalty = F.relu(-d2W_dK2).mean()
+    # ── 2. Gatheral butterfly: g(k) ≥ 0 ─────────────────────────────────────
+    dK = (K_grid[1] - K_grid[0]).clamp(min=1e-8)        # uniform strike grid
+    K_view = K_grid.view(1, 1, -1)                       # (1, 1, K)
+
+    # First derivative w'(k) — central differences, one-sided at boundaries
+    dW_dk = torch.zeros_like(W)
+    dW_dk[:, :, 1:-1] = (W[:, :, 2:] - W[:, :, :-2]) / (2.0 * dK)
+    dW_dk[:, :,    0] = (W[:, :,  1] - W[:, :,   0]) / dK
+    dW_dk[:, :,   -1] = (W[:, :, -1] - W[:, :,  -2]) / dK
+
+    # Second derivative w''(k) — central differences, extrapolated at boundaries
+    d2W_dk2 = torch.zeros_like(W)
+    d2W_dk2[:, :, 1:-1] = (W[:, :, 2:] - 2.0*W[:, :, 1:-1] + W[:, :, :-2]) / (dK**2)
+    d2W_dk2[:, :,    0] = d2W_dk2[:, :,  1]
+    d2W_dk2[:, :,   -1] = d2W_dk2[:, :, -2]
+
+    W_safe = W.clamp(min=1e-8)
+    term1  = (1.0 - (K_view * dW_dk) / (2.0 * W_safe)) ** 2
+    term2  = (dW_dk ** 2 / 4.0) * (1.0 / W_safe + 0.25)
+    term3  = 0.5 * d2W_dk2
+    g_k    = term1 - term2 + term3              # (B, T, K) risk-neutral density (scaled)
+    butterfly_penalty = F.relu(-g_k).mean()
 
     return calendar_penalty + butterfly_penalty
 
@@ -299,3 +350,138 @@ if __name__ == "__main__":
             print(f"  WARNING: {name} has no gradient!")
     print("Gradient check passed — all parameters have gradients.")
     print("FNO FiLM architecture test OK.")
+
+
+# ─── Post-FNO Self-Attention variant (for Differential ML training) ───────────
+
+class MirrorPaddedFNO2dWithAttention(nn.Module):
+    """
+    MirrorPaddedFNO2d + Post-FNO Multi-Head Self-Attention layer.
+
+    The original FNO uses global spectral convolutions which encode periodic
+    structure well but lose localised features (extreme wings of the vol smile,
+    short-dated roughness explosion at T=0.1).  A self-attention layer after
+    the 4 spectral blocks lets the model attend to spatially localised
+    (T, K) tokens, recovering those high-frequency edge features.
+
+    Rationale for post-FNO attention (vs. pre-FNO):
+      - Post-FNO: attention refines a feature map already enriched by spectral
+        convolutions.  The FNO provides a strong global baseline; attention adds
+        residual corrections for locally anomalous cells.
+      - Pre-FNO attention would have to attend over raw [T, K] coordinates, which
+        carry little semantic information before the FNO lifting step.
+
+    Attention sequence length: 2T × K = 16 × 11 = 176 tokens (mirrored domain).
+    This is small enough for QKV attention to be negligible vs. spectral ops.
+
+    Parameters
+    ----------
+    modes1, modes2, width, param_dim : same as MirrorPaddedFNO2d.
+    attn_heads : number of attention heads (must divide width evenly).
+
+    NOTE: This class is intentionally separate from MirrorPaddedFNO2d so that
+    the trained v2 weights (fno_v2_best.pth, fno_v2_final_prod.pth) remain
+    loadable without architecture changes.  Only DifferentialFNO uses this class.
+    """
+
+    def __init__(self, modes1: int = 8, modes2: int = 6, width: int = 40,
+                 spatial_in_channels: int = 2, param_dim: int = 6,
+                 out_channels: int = 1, attn_heads: int = 4):
+        super().__init__()
+        assert width % attn_heads == 0, (
+            f"width ({width}) must be divisible by attn_heads ({attn_heads})")
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.width  = width
+        N_LAYERS = 4
+
+        self.film = FiLMGenerator(
+            param_dim=param_dim, hidden=128, width=width, n_layers=N_LAYERS)
+        self.p = nn.Linear(spatial_in_channels, width)
+
+        self.conv0 = SpectralConv2d(width, width, modes1, modes2)
+        self.conv1 = SpectralConv2d(width, width, modes1, modes2)
+        self.conv2 = SpectralConv2d(width, width, modes1, modes2)
+        self.conv3 = SpectralConv2d(width, width, modes1, modes2)
+
+        self.w0 = nn.Conv2d(width, width, 1)
+        self.w1 = nn.Conv2d(width, width, 1)
+        self.w2 = nn.Conv2d(width, width, 1)
+        self.w3 = nn.Conv2d(width, width, 1)
+
+        # Post-FNO Multi-Head Self-Attention on the mirrored spatial sequence
+        # seq_len = 2T * K = 16 * 11 = 176  (mirrored, before truncation)
+        self.attention  = nn.MultiheadAttention(
+            embed_dim=width, num_heads=attn_heads, batch_first=True,
+            dropout=0.0)
+        self.layer_norm = nn.LayerNorm(width)
+
+        self.q = nn.Linear(width, out_channels)
+
+    @staticmethod
+    def _film_modulate(h, gamma, beta):
+        g = gamma.unsqueeze(-1).unsqueeze(-1)
+        b = beta.unsqueeze(-1).unsqueeze(-1)
+        return F.elu(g * h + b)
+
+    def forward(self, spatial: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        """
+        spatial : (B, T=8, K=11, 2)
+        theta   : (B, 6)
+        Returns : (B, T=8, K=11)  normalised IV in z-score space
+        """
+        gamma, beta = self.film(theta)        # each (B, 4, width)
+
+        original_T = spatial.size(1)
+        x_ext = torch.cat([spatial, torch.flip(spatial, dims=[1])], dim=1)  # (B, 2T, K, 2)
+
+        x_ext = self.p(x_ext).permute(0, 3, 1, 2)   # (B, width, 2T, K)
+
+        x_ext = self._film_modulate(self.conv0(x_ext) + self.w0(x_ext), gamma[:, 0], beta[:, 0])
+        x_ext = self._film_modulate(self.conv1(x_ext) + self.w1(x_ext), gamma[:, 1], beta[:, 1])
+        x_ext = self._film_modulate(self.conv2(x_ext) + self.w2(x_ext), gamma[:, 2], beta[:, 2])
+        x_ext = self._film_modulate(self.conv3(x_ext) + self.w3(x_ext), gamma[:, 3], beta[:, 3])
+
+        # Permute to (B, 2T, K, width) for attention
+        x_ext = x_ext.permute(0, 2, 3, 1)            # (B, 2T, K, width)
+        B, T_ext, K_dim, W = x_ext.shape             # T_ext = 2T = 16
+
+        # Flatten spatial dims → attention sequence of 176 tokens
+        seq = x_ext.reshape(B, T_ext * K_dim, W)      # (B, 176, width)
+        attn_out, _ = self.attention(seq, seq, seq)    # (B, 176, width)
+        seq = self.layer_norm(seq + attn_out)          # residual + LayerNorm
+        x_ext = seq.reshape(B, T_ext, K_dim, W)        # (B, 2T, K, width)
+
+        out = self.q(x_ext)                            # (B, 2T, K, 1)
+        out = out[:, :original_T, :, :]                # truncate mirror: (B, T, K, 1)
+        return out.squeeze(-1)                         # (B, T, K)
+
+
+if __name__ == '__main__':
+    # Test both architectures
+    torch.manual_seed(0)
+    B, T, K = 4, 8, 11
+    spatial = torch.randn(B, T, K, 2)
+    theta   = torch.randn(B, 6)
+
+    for cls, name in [
+        (MirrorPaddedFNO2d, 'FNO v2 (no attention)'),
+        (MirrorPaddedFNO2dWithAttention, 'FNO + Attention'),
+    ]:
+        model = cls()
+        out   = model(spatial, theta)
+        n_p   = sum(p.numel() for p in model.parameters())
+        assert out.shape == (B, T, K), f"{name}: shape mismatch {out.shape}"
+        loss  = out.mean(); loss.backward()
+        dead  = [n for n, p in model.named_parameters() if p.grad is None]
+        assert not dead, f"{name}: dead params: {dead}"
+        print(f'{name}: {n_p:,} params  OK')
+
+    # Gatheral test: uniform IV smile should have g(k) > 0
+    T_g = torch.tensor([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+    K_g = torch.linspace(-0.5, 0.5, 11)
+    iv_flat = torch.full((1, 8, 11), 0.25)   # flat smile: IV=25% everywhere
+    pen = arbitrage_free_regularization(iv_flat, T_g, K_g)
+    print(f'Flat smile arbitrage penalty (should be 0): {pen.item():.2e}')
+    assert pen.item() < 1e-6, 'Flat smile violates arbitrage conditions!'
+    print('All tests passed.')
