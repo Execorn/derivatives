@@ -202,7 +202,7 @@ FNO inference <1ms, Newton (20 GN iters) <50ms → WebSocket SPX feed, re-calibr
 ### 5.3 Greeks-Based Delta Hedging Backtest ⬜
 `greeks_autograd.py` computes Δ/Γ/Vega through FNO surrogate. Historical SPX comparison vs BS Δ-hedging.
 
-### 5.4 Streamlit UI — Option 3 Newton Tab ⬜
+### 5.4 Streamlit UI — Option 3 Newton Tab ✅ COMPLETE (2026-06-15)
 Add Newton calibration tab to `app_fno.py`: GN convergence history, autograd vs FD speedup metric, parameter trajectory per iteration.
 
 ---
@@ -220,7 +220,7 @@ Add Newton calibration tab to `app_fno.py`: GN convergence history, autograd vs 
 | Option 3: DiffFNO training | ✅ Jac val=0.40 | Write §5.2: train/val curves |
 | Option 3: Newton vs L-BFGS noise study | ✅ Newton beats L-BFGS all noise levels | Write §5.3: noise table, FIM ellipsoid |
 | Option 3: FIM confidence ellipsoid | ✅ σ(v₀)=0.0009, σ(ζ)=0.007 @1% noise | Write §5.4: corr(ζ,λ)=−0.655, ellipsoid figure |
-| Option 3: Streamlit Newton tab | ⬜ Not started | §5.4 UI: GN convergence trace |
+| Option 3: Streamlit Newton tab | ✅ COMPLETE | §5.4 UI: GN convergence trace |
 | Conclusion: All 3 options | ⬜ Not started | After all benchmarks complete |
 
 ---
@@ -250,4 +250,4 @@ Add Newton calibration tab to `app_fno.py`: GN convergence history, autograd vs 
 
 ---
 
-*Last updated: 2026-06-15 00:00 UTC — commit `b3d64c8` — FNO v2 training in progress (epoch ~103/500)*
+*Last updated: 2026-06-15 01:25 UTC — commit `2baf0f0` — Streamlit Newton tab import check completed*
