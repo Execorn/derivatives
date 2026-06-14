@@ -88,8 +88,8 @@ def fno_jacobian_autograd(model, params_3d: torch.Tensor,
         v0   = p3[0:1].clamp(lo[0], hi[0])
         zeta = p3[1:2].clamp(lo[1], hi[1])
         lam  = p3[2:3].clamp(lo[2], hi[2])
-        p6   = _reparam_to_6d(v0.unsqueeze(0), zeta.unsqueeze(0),
-                               lam.unsqueeze(0), device)
+        # p3 slices are already shape (1,) — _reparam_to_6d produces (1,6)
+        p6   = _reparam_to_6d(v0, zeta, lam, device)
         iv   = _fno_predict_real_iv(model, p6, spatial.to(device))
         return iv.reshape(-1)
 
@@ -98,8 +98,9 @@ def fno_jacobian_autograd(model, params_3d: torch.Tensor,
         _iv_flat, p3, create_graph=False, vectorize=True,
     )                                                # (nT*nK, 3)
 
-    nT = 8
-    nK = spatial.shape[0] // nT if nT > 0 else 11
+    # spatial shape: (1, nT, nK, 2) — batch dim is 0, not the grid size
+    nT = spatial.shape[1]   # 8 maturities
+    nK = spatial.shape[2]   # 11 strikes
     return J.reshape(nT, nK, 3).detach()
 
 
@@ -179,9 +180,9 @@ def calibrate_newton(model, target_iv: np.ndarray,
             theta_c = theta_t.clamp(lo_t, hi_t)
 
             with torch.no_grad():
-                p6      = _reparam_to_6d(theta_c[0:1].unsqueeze(0),
-                                         theta_c[1:2].unsqueeze(0),
-                                         theta_c[2:3].unsqueeze(0), device)
+                # theta_c slices are (1,) — correct input to _reparam_to_6d
+                p6      = _reparam_to_6d(theta_c[0:1], theta_c[1:2],
+                                         theta_c[2:3], device)
                 iv_pred = _fno_predict_real_iv(model, p6, spatial)
 
             r    = (iv_pred - target_t).reshape(-1)
@@ -211,9 +212,7 @@ def calibrate_newton(model, target_iv: np.ndarray,
                                     lo + 1e-5, hi - 1e-5)
                 tt = torch.tensor(theta_new, dtype=torch.float32, device=device)
                 with torch.no_grad():
-                    p6n  = _reparam_to_6d(tt[0:1].unsqueeze(0),
-                                          tt[1:2].unsqueeze(0),
-                                          tt[2:3].unsqueeze(0), device)
+                    p6n  = _reparam_to_6d(tt[0:1], tt[1:2], tt[2:3], device)
                     ivn  = _fno_predict_real_iv(model, p6n, spatial)
                     ln   = float(((ivn - target_t)**2).mean())
                 if ln < loss:
@@ -288,8 +287,7 @@ def benchmark_jacobian_speed(model, T_grid, K_grid,
                 pp = p3.clone()
                 pp[j] = float(np.clip(pp[j].item() + delta * eps[j],
                                       lo[j] + 1e-5, hi[j] - 1e-5))
-                p6 = _reparam_to_6d(pp[0:1].unsqueeze(0), pp[1:2].unsqueeze(0),
-                                    pp[2:3].unsqueeze(0), device)
+                p6 = _reparam_to_6d(pp[0:1], pp[1:2], pp[2:3], device)
                 with torch.no_grad():
                     _fno_predict_real_iv(model, p6, spatial)
         t_fd.append(time.perf_counter() - t0)

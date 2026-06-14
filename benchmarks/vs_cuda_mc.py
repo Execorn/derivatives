@@ -31,7 +31,10 @@ N_IV_COLS    = 88   # 8 * 11
 
 N_SAMPLES    = 200  # number of MC dataset samples to reprice
 N_FACTORS    = 20
-N_COS        = 500
+# N_COS=64 matches the COS dataset generation config and keeps the BDF ODE
+# system at 2,688 dims (state = 2·N_factors·N_cos + 2·N_cos).
+# N_COS=500 inflates it to 21,000 dims → O(N³) BDF cost → days, not minutes.
+N_COS        = 64
 
 MC_DATA_PATH = "data/DeepRoughDataset.npz"
 

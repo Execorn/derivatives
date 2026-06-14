@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 # Try to import v2-capable model and calibrate helpers
 from fno_model import MirrorPaddedFNO2d
 from normalizers import ParameterNormalizer, IVSurfaceNormalizer
+import calibrate
 from calibrate import _make_spatial_input, _fno_predict_real_iv, _load_normalizers
 
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
@@ -63,17 +64,15 @@ def predict_batch(model, params_np, spatial, param_norm, iv_norm):
     Returns (N, nT, nK) numpy array of real IV values.
     """
     with torch.no_grad():
-        params_t = torch.tensor(params_np, dtype=torch.float32)
         params_n = torch.tensor(
-            param_norm.normalize(params_np), dtype=torch.float32
+            param_norm.transform(params_np), dtype=torch.float32  # FIX: .normalize() → .transform()
         )
-        # spatial: (nT*nK, 2), params_n: (N, 6)
-        # FNO expects batched call — N independent predictions
         preds = []
         for i in range(len(params_np)):
             p = params_n[i:i+1]               # (1, 6)
             iv_norm_pred = _fno_predict_raw(model, p, spatial)   # normalized
-            iv_real = iv_norm.denormalize(iv_norm_pred.numpy().reshape(1, -1))
+            # FIX: .denormalize() → .inverse_transform()
+            iv_real = iv_norm.inverse_transform(iv_norm_pred.numpy().reshape(1, -1))
             preds.append(iv_real.reshape(len(T_GRID), len(K_GRID)))
         return np.stack(preds, axis=0)       # (N, nT, nK)
 
@@ -144,14 +143,15 @@ def validate_model(model_path, dataset_path, version_label, param_norm, iv_norm,
     params_np = samples[:, :6]
     iv_mc     = samples[:, 6:].reshape(N_TEST, len(T_GRID), len(K_GRID))
 
-    # Predict
-    spatial = _make_spatial_input(T_GRID, K_GRID, torch.device("cpu"))
-    params_t = torch.tensor(param_norm.normalize(params_np), dtype=torch.float32)
+    # Predict — pass RAW (un-normalised) params; _fno_predict_real_iv normalises
+    # internally via calibrate module globals. Do NOT pre-normalise here.
+    spatial  = _make_spatial_input(T_GRID, K_GRID, torch.device("cpu"))
+    params_raw_t = torch.tensor(params_np, dtype=torch.float32)  # shape (N, 6)
 
     preds = []
     for i in range(N_TEST):
         with torch.no_grad():
-            iv_pred = _fno_predict_real_iv(model, params_t[i:i+1], spatial)
+            iv_pred = _fno_predict_real_iv(model, params_raw_t[i:i+1], spatial)
         preds.append(iv_pred.numpy())
     iv_pred_np = np.stack(preds, axis=0)   # (N, nT, nK)
 
@@ -188,15 +188,21 @@ def run_validation():
 
     # ── v1 model on MC dataset ────────────────────────────────────────────────
     print("\n── v1 Model (trained on Monte Carlo dataset) ──")
-    _load_normalizers()   # loads v1 normalizers into calibrate module globals
+    _load_normalizers()   # prime the cache with v1 paths
     param_norm_v1 = ParameterNormalizer.load(PARAM_NORM_V1_PATH)
     iv_norm_v1    = IVSurfaceNormalizer.load(IV_NORM_V1_PATH)
+    # Inject v1 normalizers into calibrate module globals (used by _fno_predict_real_iv)
+    calibrate._param_norm = param_norm_v1
+    calibrate._iv_norm    = iv_norm_v1
     r2_v1, mae_v1 = validate_model(
         MODEL_V1_PATH, DATASET_MC_PATH, "v1", param_norm_v1, iv_norm_v1)
 
     # ── v2 model on COS dataset ───────────────────────────────────────────────
     print("\n── v2 Model (trained on Fourier-COS dataset) ──")
     param_norm_v2, iv_norm_v2, norm_version = load_normalizers_v2()
+    # Override calibrate globals so _fno_predict_real_iv uses v2 normalizers
+    calibrate._param_norm = param_norm_v2
+    calibrate._iv_norm    = iv_norm_v2
     r2_v2, mae_v2 = validate_model(
         MODEL_V2_PATH, DATASET_V2_PATH, f"v2 (norms={norm_version})",
         param_norm_v2, iv_norm_v2)
