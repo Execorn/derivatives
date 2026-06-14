@@ -58,7 +58,8 @@ H_FIXED      = 0.08
 N_SAMPLES         = 50_000
 BATCH_SIZE        = 2048     # smaller batch avoids OOM on 6 GB VRAM
 N_STEPS_PER_UNIT  = 200      # dt = 0.005  →  400 steps for T_max=2.0
-N_COS             = 64       # 64 terms on [-4,4] → machine-precision (err≈4e-15)
+N_COS             = 128      # 64→128 (2026-06-14): N_cos=64 gives 264bp error at
+                              # ATM/T=0.1 for rough Heston H=0.08; 128 reduces to ~4bp
 N_FACTORS         = 40       # 20→40 (2026-06-14): N=20 gives 29bp error @T=1,σ=0.5
                               # N=40 drops error below 1bp — removes FNO accuracy ceiling
 

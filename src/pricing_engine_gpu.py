@@ -207,6 +207,37 @@ def _riccati_rhs(psi, u_c, x, c, kappa_e, sigma_e, rho_e):
 # Mixed-precision Riccati RHS  (complex64 state for RTX 3060 Tensor Cores)
 # ---------------------------------------------------------------------------
 
+def _g_only_fp32(
+    psi:       torch.Tensor,   # (B, N_u, N) complex64
+    u_c32:     torch.Tensor,   # (N_u,)      complex64
+    j_u_c32:   torch.Tensor,   # (N_u,)      complex64
+    c_f32:     torch.Tensor,   # (N,) or (B, N) float32
+    sigma_e32: torch.Tensor,   # (B, 1, 1)   complex64
+    rho_e32:   torch.Tensor,   # (B, 1, 1)   complex64
+) -> tuple:
+    """
+    Nonlinear part of the Riccati RHS: g(u, Ψ) only (no linear −κ·x·ψ term).
+
+    Used by the exponential midpoint integrator in solve_riccati_rk4_mixed.
+    Separating the linear part lets the integrator treat it exactly via
+    exp(−κ·x·dt), making the solver unconditionally stable for any κ.
+
+    Returns g (B, N_u) and Ψ (B, N_u), both complex64.
+    """
+    if c_f32.ndim == 1:
+        Psi = (psi * c_f32).sum(dim=-1)               # (B, N_u)
+    else:
+        Psi = (psi * c_f32.unsqueeze(1)).sum(dim=-1)  # (B, N_u)
+    s2d = sigma_e32[..., 0]   # (B, 1)
+    r2d = rho_e32[..., 0]     # (B, 1)
+    g = (
+        -0.5 * (u_c32 * u_c32 + j_u_c32)
+        + r2d * s2d * j_u_c32 * Psi
+        + 0.5 * s2d * s2d * Psi * Psi
+    )
+    return g, Psi
+
+
 def _riccati_rhs_fp32(
     psi:       torch.Tensor,   # (B, N_u, N) complex64
     u_c32:     torch.Tensor,   # (N_u,)      complex64 — purely real freqs
@@ -218,30 +249,22 @@ def _riccati_rhs_fp32(
     rho_e32:   torch.Tensor,   # (B, 1, 1)   complex64
 ):
     """
-    Riccati RHS in complex64 for Tensor Core acceleration on Ampere GPUs.
-
-    Using float32 weights c_f32 keeps psi * c_f32 in complex64 (no upcast).
-    The purely-imaginary constant j_u_c32 avoids runtime Python-complex
-    promotion (Python's 1j has float64 precision and would upcast to c128).
-
-    c_f32 may be (N,) [shared across batch] or (B, N) [per-sample, variable H].
-    In the (B, N) case we unsqueeze the N_u dim before multiplying.
-
-    Returns dpsi (B, N_u, N) and Psi (B, N_u), both complex64.
+    Full Riccati RHS (nonlinear g + linear −κ·x·ψ) in complex64.
+    Kept for solve_riccati_rk4 (float64 reference path).
+    solve_riccati_rk4_mixed uses _g_only_fp32 + exponential integrator instead.
     """
-    # Aggregate V = sum_i c_i * psi_i over factor dim N
-    if c_f32.ndim == 1:                               # shared c: (N,) broadcasts
-        Psi = (psi * c_f32).sum(dim=-1)               # (B, N_u)
-    else:                                             # per-sample c: (B, N)
-        Psi = (psi * c_f32.unsqueeze(1)).sum(dim=-1)  # (B, 1, N) × (B, N_u, N)
-    s2d = sigma_e32[..., 0]              # (B, 1)   complex64
-    r2d = rho_e32[..., 0]               # (B, 1)   complex64
+    if c_f32.ndim == 1:
+        Psi = (psi * c_f32).sum(dim=-1)
+    else:
+        Psi = (psi * c_f32.unsqueeze(1)).sum(dim=-1)
+    s2d = sigma_e32[..., 0]
+    r2d = rho_e32[..., 0]
     g = (
-        -0.5 * (u_c32 * u_c32 + j_u_c32)    # (N_u,)   complex64: -0.5*(u²+iu)
-        + r2d * s2d * j_u_c32 * Psi          # (B, N_u) complex64
-        + 0.5 * s2d * s2d * Psi * Psi        # (B, N_u) complex64
+        -0.5 * (u_c32 * u_c32 + j_u_c32)
+        + r2d * s2d * j_u_c32 * Psi
+        + 0.5 * s2d * s2d * Psi * Psi
     )
-    dpsi = g.unsqueeze(-1) - kappa_e32 * x_c32 * psi   # (B, N_u, N) complex64
+    dpsi = g.unsqueeze(-1) - kappa_e32 * x_c32 * psi
     return dpsi, Psi
 
 
@@ -384,6 +407,30 @@ def solve_riccati_rk4_mixed(
     # For checkpoint Psi_T: need c in complex128, unsqueeze N_u dim if (B, N)
     c128 = c.to(torch.complex128)  # (N,) or (B, N)
 
+    # ── Exponential integrator: precompute step matrices (once per call) ──────
+    # RK4 is unstable when κ·x_max·dt >> 2.8 (e.g. κ=5, x_40=6275, dt=0.005
+    # gives stiffness ratio 156.9 — RK4 overflows float32 in ~7 steps).
+    #
+    # Exponential midpoint splits:  dψ_i/dt = g(u,Ψ) − κ·x_i·ψ_i
+    #   • Linear part  −κ·x_i·ψ_i  → exact via exp(−κ·x_i·dt)
+    #   • Nonlinear g(u,Ψ)         → explicit midpoint (bounded, smooth)
+    # Result: unconditionally stable for ANY κ, 2nd order in dt.
+    #
+    # Integral coefficient: int_coef = (1−exp(−A·h))/A = −expm1(−A·h)/A
+    #   Limit as A→0: int_coef → h  (correct; expm1 avoids catastrophic cancellation)
+    kax_r    = (kappa_e32 * x_c32).real          # (B, 1, N) float32, purely real
+    kax_dt   = kax_r * dt                         # (B, 1, N)
+    kax_dt_h = kax_r * (dt / 2.0)                # (B, 1, N) half-step
+
+    lin_half = torch.exp(-kax_dt_h).to(torch.complex64)   # exp(−κ·x·dt/2)
+    lin_full = torch.exp(-kax_dt  ).to(torch.complex64)   # exp(−κ·x·dt)
+
+    safe_kax = kax_r.clamp(min=1e-10)                     # avoid /0 for tiny x
+    int_half = (-torch.expm1(-kax_dt_h) / safe_kax        # ≈ dt/2 for small κ·x
+                ).to(torch.complex64)                      # (B, 1, N)
+    int_full = (-torch.expm1(-kax_dt  ) / safe_kax        # ≈ dt  for small κ·x
+                ).to(torch.complex64)                      # (B, 1, N)
+
     t, t_idx = 0.0, 0
     N_total = int(round(T_sorted[-1] * N_steps_per_unit))
 
@@ -404,17 +451,21 @@ def solve_riccati_rk4_mixed(
         if t_idx >= nT or step == N_total:
             break
 
-        # RK4 in complex64 (Tensor Core lane)
-        k1, P1 = _riccati_rhs_fp32(psi,              u_c32, j_u_c32, c_f32, x_c32, kappa_e32, sigma_e32, rho_e32)
-        k2, P2 = _riccati_rhs_fp32(psi + 0.5*dt*k1, u_c32, j_u_c32, c_f32, x_c32, kappa_e32, sigma_e32, rho_e32)
-        k3, P3 = _riccati_rhs_fp32(psi + 0.5*dt*k2, u_c32, j_u_c32, c_f32, x_c32, kappa_e32, sigma_e32, rho_e32)
-        k4, P4 = _riccati_rhs_fp32(psi +     dt*k3, u_c32, j_u_c32, c_f32, x_c32, kappa_e32, sigma_e32, rho_e32)
+        # ── Exponential midpoint step (2 evaluations, unconditionally stable) ──
+        # 1. Nonlinear g at current ψ
+        g_n, _ = _g_only_fp32(psi, u_c32, j_u_c32, c_f32, sigma_e32, rho_e32)
 
-        # State update in complex64 (fast)
-        psi = psi + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        # 2. Advance to midpoint: exact linear decay + g_n forcing
+        psi_h = lin_half * psi + int_half * g_n.unsqueeze(-1)  # (B, N_u, N)
 
-        # Accumulator update: upcast P to complex128 before summing
-        int_cv = int_cv + (dt / 6.0) * (P1 + 2*P2 + 2*P3 + P4).to(torch.complex128)
+        # 3. Nonlinear g at midpoint
+        g_h, P_h = _g_only_fp32(psi_h, u_c32, j_u_c32, c_f32, sigma_e32, rho_e32)
+
+        # 4. Full step from psi_n using midpoint g (exact linear + integral of g_h)
+        psi = lin_full * psi + int_full * g_h.unsqueeze(-1)    # (B, N_u, N)
+
+        # 5. int_cv ≈ ∫Ψ dt: midpoint rule (2nd order), accumulate in float128
+        int_cv = int_cv + dt * P_h.to(torch.complex128)
         t += dt
 
     return log_phi_out   # (B, nT, N_u) complex128
