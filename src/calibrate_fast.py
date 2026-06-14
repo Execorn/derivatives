@@ -169,12 +169,14 @@ def calibrate_newton(model, target_iv: np.ndarray,
     best_loss   = float("inf")
     best_params = inits[0].copy()
     best_hist   = []
+    best_theta_hist = []
     best_n      = 0
     start_t     = time.time()
 
     for init in inits:
         theta = init.copy()
         hist  = []
+        theta_hist = []
         n     = 0
 
         for it in range(max_iter):
@@ -193,6 +195,7 @@ def calibrate_newton(model, target_iv: np.ndarray,
             r    = (iv_pred - target_t).reshape(-1)
             loss = float((r**2).mean())
             hist.append(loss)
+            theta_hist.append(theta_c.cpu().numpy().copy())
 
             if verbose:
                 print(f"  [{it:2d}] loss={loss:.2e}  "
@@ -228,10 +231,11 @@ def calibrate_newton(model, target_iv: np.ndarray,
                 theta = theta_c.cpu().numpy()   # no improvement — keep current
 
         if hist and hist[-1] < best_loss:
-            best_loss   = hist[-1]
-            best_params = theta.copy()
-            best_hist   = hist
-            best_n      = n
+            best_loss       = hist[-1]
+            best_params     = theta.copy()
+            best_hist       = hist
+            best_theta_hist = theta_hist
+            best_n          = n
 
     elapsed = time.time() - start_t
     v0_f, z_f, lm_f = best_params
@@ -239,15 +243,16 @@ def calibrate_newton(model, target_iv: np.ndarray,
     rho_f   = float(np.clip(z_f / sigma_f, -0.9, -0.1))
 
     return {
-        "v0":       float(v0_f),
-        "zeta":     float(z_f),
-        "lambda":   float(lm_f),
-        "sigma":    sigma_f,
-        "rho":      rho_f,
-        "history":  best_hist,
-        "elapsed":  elapsed,
-        "n_iter":   best_n,
-        "final_mse": best_loss,
+        "v0":          float(v0_f),
+        "zeta":        float(z_f),
+        "lambda":      float(lm_f),
+        "sigma":       sigma_f,
+        "rho":         rho_f,
+        "history":     best_hist,
+        "theta_history": best_theta_hist,   # list of (3,) arrays [v0, zeta, lam]
+        "elapsed":     elapsed,
+        "n_iter":      best_n,
+        "final_mse":   best_loss,
     }
 
 

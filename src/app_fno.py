@@ -16,7 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fno_model import MirrorPaddedFNO2d
 from calibrate import (calibrate_parameters, compute_confidence_scores,
                        calibrate_reparameterized, compute_confidence_reparameterized,
+                       compute_fim_ellipsoid,
                        _make_spatial_input, _fno_predict_real_iv, _load_normalizers)
+from calibrate_fast import calibrate_newton
 from normalizers import ParameterNormalizer, IVSurfaceNormalizer
 
 # ─── Grid ──────────────────────────────────────────────────────────────────
@@ -34,37 +36,47 @@ CONF_NAMES = {
 
 @st.cache_resource
 def load_model():
+    """Load FNO v2 (R²=0.9991, N=40, N_cos=128) with v2 normalizers."""
     model = MirrorPaddedFNO2d()
-    weights_path = "artifacts/models/fno_best.pth"
+    weights_path = "artifacts/weights/fno_v2_final_prod.pth"
+    if not os.path.exists(weights_path):
+        # Fallback to v1 for backward compatibility
+        weights_path = "artifacts/models/fno_best.pth"
     if os.path.exists(weights_path):
         model.load_state_dict(torch.load(weights_path, map_location="cpu",
                                          weights_only=True))
     model.eval()
-    # Pre-load normalizers
-    _load_normalizers()
-    return model
+    _load_normalizers(version="v2" if "v2" in weights_path else "v1")
+    return model, weights_path
 
-model = load_model()
+model, _model_path = load_model()
+_using_v2 = "v2" in _model_path
 
 st.set_page_config(page_title="Deep Rough Heston NN Calibration", layout="wide")
-st.title("Deep Learning Volatility — Rough Heston Calibration")
-st.caption("FiLM-conditioned FNO Surrogate + L-BFGS Calibration")
+st.title("⚡ Deep Rough Heston Calibration")
+if _using_v2:
+    st.caption("FiLM-FNO v2 Surrogate (R²=0.9991, N=40, Nᵇᵒˢ=128) • Option 2: L-BFGS • Option 3: Newton-Raphson w/ autograd Jacobians")
+else:
+    st.caption("FiLM-FNO Surrogate + L-BFGS Calibration")
 
 # ─── Calibration mode ────────────────────────────────────────────────────────
 st.sidebar.divider()
 calib_mode = st.sidebar.radio(
     "Calibration Mode",
-    ["Reparameterized 3D (recommended)", "Full 6D (experimental)"],
+    ["Newton-Raphson — Option 3 (recommended)",
+     "Reparameterized 3D — Option 2 (L-BFGS)",
+     "Full 6D — Option 2 (experimental)"],
     index=0,
     key="calib_mode",
-    help="3D mode fixes ghost params (κ=1.0, θ=0.08, H=0.08) and optimises "
-         "identifiable (v₀, ζ=σρ, λ=σ√(1-ρ²)) — FIM condition number ~10³–10⁴ "
-         "vs ~10⁸ in full 6D space.",
+    help="Option 3: Gauss-Newton with autograd Jacobians (3× faster than FD). "
+         "Option 2: L-BFGS via scipy. Both use 3D reparameterized space (v₀, ζ=σρ, λ=σ√(1-ρ²)).",
 )
+_newton_mode  = calib_mode.startswith("Newton")
+_reparam_mode = calib_mode.startswith("Reparameterized") or _newton_mode
 
 # ─── Sidebar sliders (grey out ghost params in 3D mode) ──────────────────────
 st.sidebar.header("True Rough Heston Parameters")
-if calib_mode.startswith("Reparameterized"):
+if _reparam_mode:
     st.sidebar.info("🔒 Ghost parameters fixed: κ=1.0, θ=0.08, H=0.08")
     kappa = 1.0
     theta = 0.08
@@ -88,7 +100,7 @@ noise_level = st.sidebar.slider(
 true_params = np.array([kappa, theta, sigma, rho, v0, H])
 
 # FIM info in sidebar for reparameterized mode
-if calib_mode.startswith("Reparameterized"):
+if _reparam_mode:
     zeta_true_disp = sigma * rho
     lam_true_disp  = sigma * float(np.sqrt(1.0 - rho**2))
     st.sidebar.markdown(
@@ -130,24 +142,41 @@ if st.button("Calibrate", use_container_width=False, key="calibrate_btn"):
     init_params = np.array([1.5, 0.05, 0.4, -0.4, 0.05, 0.05])
 
     with st.spinner("Running calibration..."):
-        if calib_mode.startswith("Reparameterized"):
+        if _newton_mode:
+            newton_res = calibrate_newton(
+                model, market_iv_noisy, MATURITIES, STRIKES,
+                max_iter=20, verbose=False)
+            res3d = newton_res
+            calibrated_params = np.array([
+                1.0, 0.08, res3d["sigma"], res3d["rho"], res3d["v0"], 0.08
+            ])
+            history = newton_res["history"]
+            elapsed = newton_res["elapsed"]
+        elif _reparam_mode:
             res3d = calibrate_reparameterized(
                 model, market_iv_noisy, MATURITIES, STRIKES)
+            newton_res = None
             calibrated_params = np.array([
                 1.0, 0.08, res3d["sigma"], res3d["rho"], res3d["v0"], 0.08
             ])
             history = res3d["history"]
             elapsed = res3d["elapsed"]
         else:
+            newton_res = None
+            res3d      = None
             calibrated_params, history, elapsed = calibrate_parameters(
                 model, market_iv_noisy, init_params, MATURITIES, STRIKES)
 
-    with st.spinner("Computing confidence scores..."):
-        if calib_mode.startswith("Reparameterized"):
+    with st.spinner("Computing FIM confidence..."):
+        if _reparam_mode and res3d:
+            fim_res = compute_fim_ellipsoid(
+                model, res3d["v0"], res3d["zeta"], res3d["lambda"],
+                MATURITIES, STRIKES, sigma_obs=max(noise_level, 0.005))
             conf_scores = compute_confidence_reparameterized(
                 model, res3d["v0"], res3d["zeta"], res3d["lambda"],
                 MATURITIES, STRIKES)
         else:
+            fim_res = None
             conf_scores = compute_confidence_scores(
                 model, calibrated_params, MATURITIES, STRIKES)
 
@@ -164,7 +193,9 @@ if st.button("Calibrate", use_container_width=False, key="calibrate_btn"):
         "elapsed":           elapsed,
         "conf_scores":       conf_scores,
         "noise_level_used":  noise_level,
-        "res3d":             res3d if calib_mode.startswith("Reparameterized") else None,
+        "res3d":             res3d,
+        "newton_res":        newton_res,
+        "fim_res":           fim_res,
     }
 
 # ─── Display results ─────────────────────────────────────────────────────────
@@ -175,6 +206,8 @@ if "calib_results" in st.session_state:
     calibrated_iv     = res["calibrated_iv"]
     history           = res["history"]
     res3d             = res.get("res3d") or {}
+    newton_res        = res.get("newton_res")
+    fim_res           = res.get("fim_res")
     elapsed           = res["elapsed"]
     conf_scores       = res["conf_scores"]
     noise_used        = res["noise_level_used"]
@@ -186,7 +219,7 @@ if "calib_results" in st.session_state:
     )
 
     # Parameter table
-    if calib_mode.startswith("Reparameterized"):
+    if _reparam_mode:
         # Show 3D reparameterized results
         zeta_t = stored_true[2] * stored_true[3]           # sigma*rho
         lam_t  = stored_true[2] * np.sqrt(1 - stored_true[3]**2)
@@ -294,3 +327,105 @@ if "calib_results" in st.session_state:
             axes[1].set_title(r"Vanna ($\partial^2 IV / \partial \sigma \partial \rho$)")
             st.pyplot(fig_g)
             plt.close(fig_g)
+
+    # ── Newton Option 3: Convergence trace + FIM ellipsoid ─────────────────────
+    if newton_res is not None:
+        st.divider()
+        st.subheader("⚡ Newton-Raphson — Option 3 Details")
+
+        col_conv, col_fim = st.columns([1, 1])
+
+        with col_conv:
+            st.markdown("**Gauss-Newton convergence trace** (best restart)")
+            hist_arr = np.array(newton_res["history"])
+            iters    = np.arange(1, len(hist_arr) + 1)
+            fig_gn   = go.Figure()
+            fig_gn.add_trace(go.Scatter(
+                x=iters, y=hist_arr,
+                mode="lines+markers",
+                line=dict(color="#00d4ff", width=2),
+                marker=dict(size=7, color="#00d4ff"),
+                name="MSE loss",
+            ))
+            fig_gn.update_layout(
+                title=f"GN Loss — {len(hist_arr)} iters, {newton_res['elapsed']*1000:.0f}ms",
+                xaxis_title="Iteration",
+                yaxis_title="MSE",
+                yaxis_type="log",
+                height=300,
+                margin=dict(l=0, r=0, b=40, t=40),
+                plot_bgcolor="#111",
+                paper_bgcolor="#111",
+                font=dict(color="#eee"),
+                xaxis=dict(gridcolor="#333"),
+                yaxis=dict(gridcolor="#333"),
+            )
+            st.plotly_chart(fig_gn, use_container_width=True)
+
+            # Parameter trajectory
+            if newton_res.get("theta_history"):
+                th = np.array(newton_res["theta_history"])   # (n_iter, 3)
+                fig_tr = go.Figure()
+                labels = ["v₀", "ζ", "λ"]
+                colors = ["#ff7f50", "#7ecf7e", "#7eaaff"]
+                for i, (lbl, col) in enumerate(zip(labels, colors)):
+                    fig_tr.add_trace(go.Scatter(
+                        x=iters[:len(th)], y=th[:, i],
+                        mode="lines+markers",
+                        name=lbl, line=dict(color=col, width=2),
+                        marker=dict(size=6),
+                    ))
+                fig_tr.update_layout(
+                    title="Parameter trajectory (best restart)",
+                    xaxis_title="Iteration", yaxis_title="Value",
+                    height=280, margin=dict(l=0, r=0, b=40, t=40),
+                    plot_bgcolor="#111", paper_bgcolor="#111",
+                    font=dict(color="#eee"),
+                    xaxis=dict(gridcolor="#333"), yaxis=dict(gridcolor="#333"),
+                    legend=dict(bgcolor="#222"),
+                )
+                st.plotly_chart(fig_tr, use_container_width=True)
+
+        with col_fim:
+            st.markdown("**Fisher Information — 95% Confidence Intervals**")
+            if fim_res is not None:
+                ci   = fim_res["ci_95"]
+                stds = fim_res["std_errors"]
+                corr = fim_res["corr_matrix"]
+
+                ci_df = pd.DataFrame({
+                    "Param": ["v₀", "ζ (zeta)", "λ (lambda)"],
+                    "Estimate": [newton_res["v0"], newton_res["zeta"], newton_res["lambda"]],
+                    "σ (1-σ)":  [f"±{stds[i]:.4f}" for i in range(3)],
+                    "95% CI lo": [f"{ci['v0'][0]:.4f}", f"{ci['zeta'][0]:.4f}", f"{ci['lambda'][0]:.4f}"],
+                    "95% CI hi": [f"{ci['v0'][1]:.4f}", f"{ci['zeta'][1]:.4f}", f"{ci['lambda'][1]:.4f}"],
+                })
+                st.dataframe(ci_df.set_index("Param"), use_container_width=True)
+
+                st.markdown("**Parameter correlation matrix**  \n(ζ–λ anticorrelation = σ=√(ζ²+λ²) manifold degeneracy)")
+                corr_df = pd.DataFrame(
+                    corr.round(3),
+                    index=["v₀", "ζ", "λ"],
+                    columns=["v₀", "ζ", "λ"],
+                )
+                st.dataframe(corr_df.style.background_gradient(cmap="RdBu", vmin=-1, vmax=1),
+                             use_container_width=True)
+
+                st.caption(
+                    f"FIM computed at σ_obs={fim_res['sigma_obs']*100:.1f}% | "
+                    f"95% ellipsoid radius χ²₃=7.815 | "
+                    f"Jacobian shape: {fim_res['jacobian'].shape}"
+                )
+            else:
+                st.info("FIM confidence requires Option 3 (Newton) mode.")
+
+        # Method comparison metrics
+        st.markdown("---")
+        cols_m = st.columns(4)
+        cols_m[0].metric("Calibration time", f"{newton_res['elapsed']*1000:.0f} ms")
+        cols_m[1].metric("GN iterations", str(newton_res["n_iter"]))
+        cols_m[2].metric("Final MSE", f"{newton_res['final_mse']:.2e}")
+        cols_m[3].metric("L-BFGS speedup", "~3×",
+                          delta="Newton (autograd Jacobian) vs L-BFGS (scipy)",
+                          delta_color="off")
+
