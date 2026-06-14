@@ -457,8 +457,98 @@ def compute_confidence_reparameterized(model, v0: float, zeta: float, lam: float
     return {"v0": float(scores[0]), "zeta": float(scores[1]), "lambda": float(scores[2])}
 
 
-if __name__ == "__main__":
+def compute_fim_ellipsoid(model, v0: float, zeta: float, lam: float,
+                          T_grid, K_grid,
+                          sigma_obs: float = 0.01) -> dict:
+    """
+    Fisher Information Matrix (FIM) and 95% confidence ellipsoid for (v₀, ζ, λ).
 
+    Under a Gaussian noise model IV_obs = IV_true + ε,  ε ~ N(0, σ_obs² I),
+    the observed Fisher information matrix at the MLE estimate is:
+
+        F = (1/σ_obs²) × JᵀJ          where J = ∂IV_FNO/∂(v₀, ζ, λ)
+
+    The 3×3 covariance matrix of (v̂₀, ζ̂, λ̂) is approximately F⁻¹,
+    and the 95% confidence ellipsoid is:
+
+        { θ : (θ-θ̂)ᵀ F (θ-θ̂) ≤ χ²_{3, 0.95} }   where χ²_{3,0.95} ≈ 7.815
+
+    Parameters
+    ----------
+    model      : FiLM-FNO model (eval mode)
+    v0, zeta, lam : calibrated MLE point estimate
+    T_grid, K_grid : maturity and log-moneyness grids
+    sigma_obs  : assumed IV observation noise std (default 1% = 0.01)
+
+    Returns
+    -------
+    dict with:
+        fim_matrix  : (3,3) ndarray — F = JᵀJ / σ_obs²
+        cov_matrix  : (3,3) ndarray — F⁻¹ (Cramér-Rao lower bound)
+        std_errors  : (3,) ndarray — marginal 1-σ intervals [v₀, ζ, λ]
+        corr_matrix : (3,3) ndarray — parameter correlation matrix
+        ci_95       : dict — 95% CIs {v0, zeta, lambda} as (lo, hi) tuples
+        chi2_radius : float — χ²_{3,0.95} = 7.815 (ellipsoid threshold)
+        jacobian    : (nT*nK, 3) ndarray — raw Jacobian for custom use
+    """
+    from torch.func import jacfwd
+
+    model.eval()
+    _load_normalizers()
+    device  = next(model.parameters()).device
+    spatial = _make_spatial_input(T_grid, K_grid, device)
+
+    theta = torch.tensor([v0, zeta, lam], dtype=torch.float32, device=device)
+    lo_t  = _BOUNDS_LOWER_3D.to(device)
+    hi_t  = _BOUNDS_UPPER_3D.to(device)
+
+    def _iv_flat(p3):
+        p3_c = p3.clamp(lo_t, hi_t)
+        p6   = _reparam_to_6d(p3_c[0:1], p3_c[1:2], p3_c[2:3], device)
+        return _fno_predict_real_iv(model, p6, spatial).reshape(-1)
+
+    # Forward-mode Jacobian: (nT*nK, 3)
+    J_t = jacfwd(_iv_flat)(theta)               # (nT*nK, 3)
+    J   = J_t.detach().cpu().numpy()
+
+    # FIM and covariance
+    FIM  = (J.T @ J) / (sigma_obs ** 2)        # (3, 3)
+    try:
+        COV = np.linalg.inv(FIM)
+    except np.linalg.LinAlgError:
+        COV = np.full((3, 3), np.nan)
+
+    std_errs = np.sqrt(np.maximum(np.diag(COV), 0.0))   # (3,)
+
+    # Correlation matrix
+    d    = std_errs.copy()
+    d[d < 1e-12] = 1e-12
+    CORR = COV / np.outer(d, d)
+
+    # 95% CIs (marginal, Wald-type)
+    z95 = 1.96
+    ci  = {
+        "v0":     (v0   - z95 * std_errs[0], v0   + z95 * std_errs[0]),
+        "zeta":   (zeta - z95 * std_errs[1], zeta + z95 * std_errs[1]),
+        "lambda": (lam  - z95 * std_errs[2], lam  + z95 * std_errs[2]),
+    }
+
+    CHI2_95_3DOF = 7.815   # scipy.stats.chi2.ppf(0.95, df=3)
+
+    return {
+        "fim_matrix":  FIM,
+        "cov_matrix":  COV,
+        "std_errors":  std_errs,
+        "corr_matrix": CORR,
+        "ci_95":       ci,
+        "chi2_radius": CHI2_95_3DOF,
+        "jacobian":    J,
+        "sigma_obs":   sigma_obs,
+        "theta_hat":   np.array([v0, zeta, lam]),
+    }
+
+
+if __name__ == "__main__":
     from fno_model import MirrorPaddedFNO2d
 
     model   = MirrorPaddedFNO2d()
