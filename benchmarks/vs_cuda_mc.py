@@ -122,18 +122,25 @@ def run_benchmark():
     params_mc = samples[:, :N_PARAM_COLS]         # (200, 6)
     iv_mc     = samples[:, N_PARAM_COLS:].reshape(N_SAMPLES, len(T_GRID), len(K_GRID))
 
-    H_vals   = params_mc[:, 5]
-    unique_H = np.unique(np.round(H_vals, H_ROUND_DECIMALS))
-    print(f"\n  H range in subsample: [{H_vals.min():.3f}, {H_vals.max():.3f}]"
-          f"  ({len(unique_H)} unique H groups)")
+    H_vals = params_mc[:, 5]
+    print(f"\n  H range in subsample: [{H_vals.min():.3f}, {H_vals.max():.3f}]")
 
-    # GPU-batched repricing — all 200 surfaces in one batched GPU pass per H group
+    # Single GPU batch call: all 200 samples in one B=200 kernel
+    # H_batch enables per-sample Bernstein c=(B,N) instead of 103 separate calls
     print(f"\n  Repricing with GPU Fourier-COS (N_factors={N_FACTORS}, N_cos={N_COS}) ...")
-    t_start           = time.perf_counter()
-    iv_cos, n_failed  = _reprice_batch_variable_h(
-        params_mc, T_GRID, K_GRID,
-        device=device, N_factors=N_FACTORS, N_cos=N_COS,
-    )
+    t_start  = time.perf_counter()
+    try:
+        iv_cos = price_batch_gpu(
+            params_mc[:, :5], T_GRID, K_GRID,
+            H_batch=params_mc[:, 5],
+            N_factors=N_FACTORS, N_cos=N_COS,
+            device=device,
+        )                                     # (200, 8, 11) float32
+        n_failed = 0
+    except Exception as exc:
+        print(f"  ERROR: {exc}")
+        iv_cos   = np.full_like(iv_mc, np.nan)
+        n_failed = N_SAMPLES
     t_total = time.perf_counter() - t_start
     print(f"  Done in {t_total:.2f}s  ({N_SAMPLES - n_failed}/{N_SAMPLES} successful)"
           f"  [{t_total / N_SAMPLES * 1000:.1f} ms/sample]")

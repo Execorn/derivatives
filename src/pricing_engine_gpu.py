@@ -211,7 +211,7 @@ def _riccati_rhs_fp32(
     psi:       torch.Tensor,   # (B, N_u, N) complex64
     u_c32:     torch.Tensor,   # (N_u,)      complex64 — purely real freqs
     j_u_c32:   torch.Tensor,   # (N_u,)      complex64 — purely imaginary (i*u)
-    c_f32:     torch.Tensor,   # (N,)        float32
+    c_f32:     torch.Tensor,   # (N,) or (B, N) float32
     x_c32:     torch.Tensor,   # (N,)        complex64
     kappa_e32: torch.Tensor,   # (B, 1, 1)   complex64
     sigma_e32: torch.Tensor,   # (B, 1, 1)   complex64
@@ -224,9 +224,16 @@ def _riccati_rhs_fp32(
     The purely-imaginary constant j_u_c32 avoids runtime Python-complex
     promotion (Python's 1j has float64 precision and would upcast to c128).
 
+    c_f32 may be (N,) [shared across batch] or (B, N) [per-sample, variable H].
+    In the (B, N) case we unsqueeze the N_u dim before multiplying.
+
     Returns dpsi (B, N_u, N) and Psi (B, N_u), both complex64.
     """
-    Psi = (psi * c_f32).sum(dim=-1)      # (B, N_u) complex64
+    # Aggregate V = sum_i c_i * psi_i over factor dim N
+    if c_f32.ndim == 1:                               # shared c: (N,) broadcasts
+        Psi = (psi * c_f32).sum(dim=-1)               # (B, N_u)
+    else:                                             # per-sample c: (B, N)
+        Psi = (psi * c_f32.unsqueeze(1)).sum(dim=-1)  # (B, 1, N) × (B, N_u, N)
     s2d = sigma_e32[..., 0]              # (B, 1)   complex64
     r2d = rho_e32[..., 0]               # (B, 1)   complex64
     g = (
@@ -316,7 +323,7 @@ def solve_riccati_rk4(
         int_cv = int_cv + (dt / 6.0) * (P1 + 2*P2 + 2*P3 + P4)
         t += dt
 
-    return log_phi_out   # (B, nT, N_u)
+    return log_phi_out   # (B, nT, N_u) complex128
 
 
 def solve_riccati_rk4_mixed(
@@ -327,7 +334,7 @@ def solve_riccati_rk4_mixed(
     v0:    torch.Tensor,   # (B,) float64
     u_c:   torch.Tensor,   # (N_u,) complex128 (pre-built frequencies)
     x:     torch.Tensor,   # (N,)  float64
-    c:     torch.Tensor,   # (N,)  float64
+    c:     torch.Tensor,   # (N,) or (B, N) float64
     T_grid: np.ndarray,
     N_steps_per_unit: int = 200,
     device: str = 'cuda',
@@ -339,13 +346,9 @@ def solve_riccati_rk4_mixed(
     int_cv           : complex128 — Riemann accumulator, precision-critical
     log_phi_out      : complex128 — final result in full precision
 
-    Precision rationale:
-      int_cv accumulates ~400 terms of O(dt)=O(0.005).  In float32 the
-      sequential addition error is O(400 * eps32 * 0.005) ≈ 2.4e-7.
-      In float64 it is O(4.4e-13) — 6 orders of magnitude smaller.
-      The complex64 ODE state is accurate enough for the RK4 step (local
-      truncation error O(dt^5)≈3e-12) but the accumulation drift must
-      be held in float64.
+    c may be (N,) float64 [shared H across batch] or (B, N) float64
+    [per-sample variable H]. The variable-H path unsqueezes the N_u dim
+    before the contraction, keeping everything in one B=200 GPU call.
 
     Returns log_phi: (B, nT, N_u) complex128
     """
@@ -378,6 +381,9 @@ def solve_riccati_rk4_mixed(
     v0_c128  = v0.to(torch.complex128)
     kth_c128 = (kappa * theta).to(torch.complex128)
 
+    # For checkpoint Psi_T: need c in complex128, unsqueeze N_u dim if (B, N)
+    c128 = c.to(torch.complex128)  # (N,) or (B, N)
+
     t, t_idx = 0.0, 0
     N_total = int(round(T_sorted[-1] * N_steps_per_unit))
 
@@ -385,7 +391,11 @@ def solve_riccati_rk4_mixed(
         # Checkpoint: save log-CF at each T in T_sorted
         while t_idx < nT and abs(t - T_sorted[t_idx]) < dt * 0.5:
             # Upcast psi to complex128 for high-precision checkpoint
-            Psi_T = (psi.to(torch.complex128) * c).sum(dim=-1)   # (B, N_u) c128
+            psi_128 = psi.to(torch.complex128)             # (B, N_u, N) c128
+            if c128.ndim == 1:                             # shared c: (N,)
+                Psi_T = (psi_128 * c128).sum(dim=-1)      # (B, N_u)
+            else:                                          # per-sample: (B, N)
+                Psi_T = (psi_128 * c128.unsqueeze(1)).sum(dim=-1)
             log_phi_out[:, t_idx, :] = (
                 v0_c128[:, None] * Psi_T + kth_c128[:, None] * int_cv
             )
@@ -617,26 +627,46 @@ class BS_IV_Implicit_Inverter(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 
 def price_batch_gpu(
-    params_batch:      np.ndarray,   # (B, 5): [kappa, theta, sigma, rho, v0]
-    T_grid:            np.ndarray,   # (nT,)
-    K_grid:            np.ndarray,   # (nK,) log-moneyness
-    H_fixed:           float = 0.08,
+    params_batch:      np.ndarray,        # (B, 5): [kappa, theta, sigma, rho, v0]
+    T_grid:            np.ndarray,        # (nT,)
+    K_grid:            np.ndarray,        # (nK,) log-moneyness
+    H_fixed:           float = 0.08,      # used when H_batch is None
+    H_batch:           np.ndarray = None, # (B,) per-sample H; enables true B=200 batch
     N_factors:         int   = 20,
-    N_cos:             int   = 64,   # 64 terms on [-4,4] → machine-precision (err≈4e-15)
-    N_steps_per_unit:  int   = 200,  # dt=0.005; |A|*dt≈1.53 for u_max≈24.7 (safe for RK4)
+    N_cos:             int   = 64,
+    N_steps_per_unit:  int   = 200,
     S0:                float = 1.0,
     device:            str   = 'cuda',
 ) -> np.ndarray:
     """
     Price B IV surfaces on GPU. Returns (B, nT, nK) float32.
+
+    H_batch (optional): supply a (B,) array of per-sample Hurst exponents to
+    price all B samples in a SINGLE GPU call with variable H.  When omitted,
+    all samples use the shared H_fixed scalar.  Enabling H_batch avoids the
+    O(unique_H) kernel-launch overhead from external H-grouping loops.
     """
     dev = torch.device(device)
+    B   = params_batch.shape[0]
 
-    # Shared precomputed tensors
-    x_np, c_np = bernstein_factors(H_fixed, N_factors)
-    x  = torch.tensor(x_np, dtype=torch.float64, device=dev)
-    c  = torch.tensor(c_np, dtype=torch.float64, device=dev)
+    # ── Bernstein factors ────────────────────────────────────────────────────
+    if H_batch is not None:
+        # Per-sample c: vectorized numpy, then one GPU tensor
+        # x does not depend on H — compute once
+        r_N  = 1.0 + 10.0 * (N_factors ** -0.9)
+        x_np = np.array([r_N ** (i - 1.0 - N_factors / 2.0)
+                         for i in range(1, N_factors + 1)])  # (N,)
+        # c_np[b, i] = x_np[i]^{-(H_batch[b]+0.5)}, normalised per row
+        c_np = x_np[None, :] ** -(H_batch[:, None] + 0.5)   # (B, N)
+        c_np = c_np / c_np.sum(axis=1, keepdims=True)        # normalise
+        x    = torch.tensor(x_np, dtype=torch.float64, device=dev)  # (N,)
+        c    = torch.tensor(c_np, dtype=torch.float64, device=dev)  # (B, N)
+    else:
+        x_np, c_np = bernstein_factors(H_fixed, N_factors)
+        x = torch.tensor(x_np, dtype=torch.float64, device=dev)  # (N,)
+        c = torch.tensor(c_np, dtype=torch.float64, device=dev)  # (N,)
 
+    # ── Shared frequency / payoff tensors ────────────────────────────────────
     u_np    = np.arange(N_cos) * np.pi / (_B - _A)
     u_c     = torch.tensor(u_np + 0j, dtype=torch.complex128, device=dev)
     u_k     = torch.tensor(u_np,      dtype=torch.float64,    device=dev)
@@ -646,7 +676,7 @@ def price_batch_gpu(
     K_arr = torch.tensor(S0 * np.exp(K_grid), dtype=torch.float64, device=dev)
     T_arr = torch.tensor(T_grid,               dtype=torch.float64, device=dev)
 
-    # Parameter tensors
+    # ── Parameter tensors ────────────────────────────────────────────────────
     p     = torch.tensor(params_batch, dtype=torch.float64, device=dev)
     kappa = p[:, 0]; theta = p[:, 1]
     sigma = p[:, 2]; rho   = p[:, 3]; v0 = p[:, 4]
