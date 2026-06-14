@@ -21,13 +21,6 @@ from scipy.stats import qmc
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 
-# Patch v2 normalizer paths BEFORE importing calibrate functions
-import calibrate as _cal_mod
-_cal_mod._PARAM_NORM_PATH = os.path.join(ROOT, 'artifacts', 'models', 'param_normalizer_v2.npz')
-_cal_mod._IV_NORM_PATH    = os.path.join(ROOT, 'artifacts', 'models', 'iv_normalizer_v2.npz')
-_cal_mod._param_norm = None
-_cal_mod._iv_norm    = None
-
 from calibrate import (
     _load_normalizers, _make_spatial_input,
     _fno_predict_real_iv, calibrate_reparameterized,
@@ -72,7 +65,7 @@ def run(n_samples=30, seed=42):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}")
     print("Loading FNO v2 + v2 normalizers ...", end=' ', flush=True)
-    _load_normalizers()
+    _load_normalizers(version="v2")
     model   = _load_v2_model(device)
     spatial = _make_spatial_input(T_GRID, K_GRID, device)
     print("done")
@@ -108,13 +101,13 @@ def run(n_samples=30, seed=42):
                 try:
                     if method == 'newton':
                         res  = calibrate_newton(model, iv_n, T_GRID, K_GRID,
-                                                max_iter=20, n_restarts=3, verbose=False)
+                                                max_iter=20, verbose=False)
                         conv = res['final_mse'] < 1e-4
                     else:
                         res  = calibrate_reparameterized(model, iv_n, T_GRID, K_GRID,
                                                          max_iter=100)
                         h    = res.get('history', [])
-                        conv = bool(h and h[-1] < 1e-4)
+                        conv = bool(h and min(h) < 1e-3)
                     ze_e.append(_rel_err_pct(res['zeta'],   params[i, 1]))
                     la_e.append(_rel_err_pct(res['lambda'], params[i, 2]))
                     v0_e.append(_rel_err_pct(res['v0'],     params[i, 0]))

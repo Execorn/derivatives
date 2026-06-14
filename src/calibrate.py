@@ -26,6 +26,16 @@ _BOUNDS_LOWER = torch.tensor([0.1,  0.01, 0.1,  -0.9, 0.01, 0.02])
 _BOUNDS_UPPER = torch.tensor([5.0,  0.15, 1.0,  -0.1, 0.15, 0.15])
 _PARAM_NAMES  = ["kappa", "theta", "sigma", "rho", "v0", "H"]
 
+# Known normalizer versions — extend as new datasets are generated
+_NORM_VERSIONS = {
+    "v1": ("artifacts/models/param_normalizer.npz",
+           "artifacts/models/iv_normalizer.npz"),
+    "v2": ("artifacts/models/param_normalizer_v2.npz",
+           "artifacts/models/iv_normalizer_v2.npz"),
+    "diff": ("artifacts/models/param_normalizer_diff.npz",
+             "artifacts/models/iv_normalizer_diff.npz"),
+}
+
 # ─── Lazy-load normalizers ────────────────────────────────────────────────────
 _PARAM_NORM_PATH = "artifacts/models/param_normalizer.npz"
 _IV_NORM_PATH    = "artifacts/models/iv_normalizer.npz"
@@ -33,19 +43,39 @@ _param_norm: ParameterNormalizer | None = None
 _iv_norm:    IVSurfaceNormalizer | None = None
 
 
-def _load_normalizers():
-    global _param_norm, _iv_norm
+def _load_normalizers(version: str = "v1"):
+    """Load normalizer pair for *version* ('v1', 'v2', or 'diff').
+
+    Calling with version='v2' reloads the globals even if v1 was previously
+    loaded.  Results are cached per version; switching version invalidates the
+    cache (sets globals to None first).
+    """
+    global _param_norm, _iv_norm, _PARAM_NORM_PATH, _IV_NORM_PATH
+    param_path, iv_path = _NORM_VERSIONS.get(
+        version,
+        (_PARAM_NORM_PATH, _IV_NORM_PATH),   # caller-patched paths fallback
+    )
+    # Reload if version paths differ from current cached paths
+    if _param_norm is None or param_path != _PARAM_NORM_PATH:
+        _PARAM_NORM_PATH = param_path
+        _IV_NORM_PATH    = iv_path
+        _param_norm      = None
+        _iv_norm         = None
     if _param_norm is None:
         if os.path.exists(_PARAM_NORM_PATH):
             _param_norm = ParameterNormalizer.load(_PARAM_NORM_PATH)
         else:
-            # Fallback: identity normalizer (for models trained without normalizers)
             _param_norm = _IdentityParamNorm()
     if _iv_norm is None:
         if os.path.exists(_IV_NORM_PATH):
             _iv_norm = IVSurfaceNormalizer.load(_IV_NORM_PATH)
         else:
             _iv_norm = _IdentityIVNorm()
+
+
+def load_normalizers_v2():
+    """Convenience alias: load the v2 (Fourier-COS) normalizers."""
+    _load_normalizers(version="v2")
 
 
 class _IdentityParamNorm:

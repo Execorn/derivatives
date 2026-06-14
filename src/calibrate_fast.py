@@ -328,7 +328,7 @@ def benchmark_jacobian_speed(model, T_grid, K_grid,
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import calibrate as _cal_mod  # for patching normalizer globals
+    import calibrate as _cal_mod  # noqa: F401 (kept for type-checker)
     from fno_model import MirrorPaddedFNO2d
 
     os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -348,11 +348,7 @@ if __name__ == "__main__":
     model.eval()
 
     # Patch calibrate.py module-level paths to v2 normalizers before loading
-    _cal_mod._PARAM_NORM_PATH = "artifacts/models/param_normalizer_v2.npz"
-    _cal_mod._IV_NORM_PATH    = "artifacts/models/iv_normalizer_v2.npz"
-    _cal_mod._param_norm      = None   # force reload
-    _cal_mod._iv_norm         = None
-    _load_normalizers()
+    _load_normalizers(version="v2")
 
     spatial = _make_spatial_input(T_GRID, K_GRID, device)
 
