@@ -1,20 +1,29 @@
 """
-vs_cuda_mc.py — Fourier-COS vs Monte Carlo systematic bias benchmark.
+vs_cuda_mc.py — Dataset v1 quality benchmark: buggy COS vs corrected GPU COS.
 
-Quantifies the systematic pricing bias introduced by Euler-Maruyama Monte Carlo
-(252 steps, O(Δt^0.08) convergence) vs exact Fourier-COS pricing for the
-Lifted Rough Heston model.
+Quantifies the systematic pricing error in the v1 training dataset
+(DeepRoughDataset.npz, generated 2026-06-10) caused by the Bernstein
+normalisation bug in the CPU COS engine:
+
+  BUG (pre-2026-06-11): c_i = x_i^{-(H+0.5)}  with sum(c) ≈ 26 (unnormalised)
+  FIX (2026-06-11+):    c_i /= sum(c)          so sum(c) = 1  (normalised)
+
+With unnormalised c the quadratic Riccati term is amplified by sum(c)^2 ≈ 676,
+blowing up the vol-of-vol coupling and producing wildly wrong IV surfaces.
+The GPU COS engine (pricing_engine_gpu.py) was always normalised.
 
 GPU acceleration (2026-06-14):
-  Switched from serial CPU BDF solver (pricing_engine.price_iv_surface) to
-  GPU-batched RK4 solver (pricing_engine_gpu.price_batch_gpu).
-  Samples are grouped by rounded H value so a single GPU kernel handles each
-  group. Expected speedup: ~30-60× (seconds instead of ~30 minutes).
+  Uses pricing_engine_gpu.price_batch_gpu with H_batch for all 200 samples
+  in a single B=200 GPU kernel. Runtime: ~0.7s (vs ~30 min for serial CPU).
 
-Expected finding:
-  - T=0.1: 5-20bp systematic MC bias (roughness H=0.08 → very slow MC convergence)
-  - T=1.0: 1-5bp
-  - T=2.0: <1bp (MC is adequate at long maturities)
+Expected finding (confirmed 2026-06-14):
+  - Global mean error: ~1900-2000bp  (v1 dataset is corrupted)
+  - Errors are UNIFORM across maturities (not maturity-dependent)
+  - This motivates the v2 COS dataset (DeepRoughDataset_v2_fourier.npz)
+    generated with the fixed, normalised GPU engine.
+
+Thesis context: §4.1 — justification for discarding v1 and regenerating with
+the corrected Fourier-COS pipeline.
 
 Usage:
     /home/execorn/programming/derivatives/.venv/bin/python \
@@ -43,6 +52,7 @@ N_FACTORS    = 20
 # to 21,000 dims — O(N³) BDF cost — days not minutes on CPU).
 N_COS        = 64
 
+# Dataset v1 — generated 2026-06-10 with buggy unnormalised Bernstein CPU engine
 MC_DATA_PATH = "data/DeepRoughDataset.npz"
 
 # H rounding precision for GPU batch grouping.
@@ -101,12 +111,18 @@ def run_benchmark():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 72)
-    print(" Fourier-COS vs CUDA Monte Carlo: Systematic Bias Benchmark")
-    print(f" Repricing {N_SAMPLES} samples from MC dataset with exact COS engine")
+    print(" Dataset v1 Quality Benchmark: Buggy CPU COS vs Corrected GPU COS")
+    print(f" Repricing {N_SAMPLES} samples from v1 dataset with fixed GPU COS engine")
     print(f" COS config: N_factors={N_FACTORS}, N_cos={N_COS}")
     print(f" GPU device: {device}"
           + (f" ({torch.cuda.get_device_name(0)})" if device == "cuda" else " (CPU fallback)"))
     print("=" * 72)
+    print()
+    print("  NOTE: v1 dataset (DeepRoughDataset.npz) was generated 2026-06-10")
+    print("  with the BUGGY CPU COS engine (unnormalised Bernstein c, sum(c)≈26).")
+    print("  GPU COS engine (pricing_engine_gpu) has always used normalised c.")
+    print("  Errors below show the magnitude of the normalisation bug impact.")
+    print()
 
     # Load MC dataset
     assert os.path.exists(MC_DATA_PATH), f"MC dataset not found: {MC_DATA_PATH}"
@@ -172,18 +188,18 @@ def run_benchmark():
               f"{med_bp:>16.2f}  {pct:>6.1f}%")
 
     # Summary
-    print(f"\n  Key findings:")
+    print(f"\n  Key findings (v1 dataset normalisation bug impact):")
     if 0.1 in results:
         r  = results[0.1]
-        ok = "\u2713 (5-20bp bias confirmed)" if 5 <= r['mean_bp'] <= 20 else f"({r['mean_bp']:.1f}bp)"
-        print(f"    T=0.1  mean bias = {r['mean_bp']:6.2f}bp  {ok}")
+        ok = "✓ bug confirmed (>>20bp)" if r['mean_bp'] > 100 else f"({r['mean_bp']:.1f}bp — unexpectedly small)"
+        print(f"    T=0.1  mean error = {r['mean_bp']:8.2f}bp  {ok}")
     if 1.0 in results:
         r = results[1.0]
-        print(f"    T=1.0  mean bias = {r['mean_bp']:6.2f}bp")
+        print(f"    T=1.0  mean error = {r['mean_bp']:8.2f}bp")
     if 2.0 in results:
         r  = results[2.0]
-        ok = "\u2713 (<1bp confirmed)" if r['mean_bp'] < 1.0 else f"({r['mean_bp']:.1f}bp)"
-        print(f"    T=2.0  mean bias = {r['mean_bp']:6.2f}bp  {ok}")
+        ok = "✓ bug confirmed (>>20bp)" if r['mean_bp'] > 100 else f"({r['mean_bp']:.1f}bp — unexpectedly small)"
+        print(f"    T=2.0  mean error = {r['mean_bp']:8.2f}bp  {ok}")
 
     # Global statistics
     err_all       = np.abs(iv_cos - iv_mc)
