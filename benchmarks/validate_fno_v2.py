@@ -84,12 +84,14 @@ def _fno_predict_raw(model, params_n_batch, spatial):
 
 
 def compute_jacobian_column_norms(model, params_np, spatial):
-    """5-point FD Jacobian column norms over N test samples."""
+    """5-point FD Jacobian column norms over N test samples. Runs on GPU."""
+    device = next(model.parameters()).device
     lo = np.array([0.1, 0.01, 0.10, -0.9, 0.01, 0.02])
     hi = np.array([5.0, 0.15, 1.00, -0.1, 0.15, 0.15])
     eps_rel = 1e-3   # 0.1% of range
 
     col_norms = np.zeros((len(params_np), 6))
+    sp = _make_spatial_input(T_GRID, K_GRID, device)   # built once, reused
 
     for i in range(len(params_np)):
         p = params_np[i]
@@ -101,11 +103,10 @@ def compute_jacobian_column_norms(model, params_np, spatial):
             for delta in (-2, -1, +1, +2):
                 pp = p.copy()
                 pp[j] = np.clip(pp[j] + delta * h, lo[j], hi[j])
-                pp_t = torch.tensor(pp[None], dtype=torch.float32)
-                sp = _make_spatial_input(T_GRID, K_GRID, torch.device("cpu"))
+                pp_t = torch.tensor(pp[None], dtype=torch.float32, device=device)
                 with torch.no_grad():
                     iv = _fno_predict_real_iv(model, pp_t, sp)
-                pts.append(iv.numpy().reshape(-1))
+                pts.append(iv.cpu().numpy().reshape(-1))
             grad = (-pts[3] + 8*pts[2] - 8*pts[1] + pts[0]) / (12 * h)
             grads.append(grad)
         col_norms[i] = [np.linalg.norm(g) for g in grads]
@@ -120,10 +121,14 @@ def validate_model(model_path, dataset_path, version_label, param_norm, iv_norm,
         print(f"  SKIP: {model_path} not found")
         return None, None
 
-    # Load model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"  Device: {device}")
+
+    # Load model onto GPU
     model = MirrorPaddedFNO2d()
-    state = torch.load(model_path, map_location="cpu", weights_only=True)
+    state = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(state)
+    model = model.to(device)
     model.eval()
     print(f"  Loaded {version_label} model from {os.path.basename(model_path)}")
 
@@ -143,17 +148,36 @@ def validate_model(model_path, dataset_path, version_label, param_norm, iv_norm,
     params_np = samples[:, :6]
     iv_mc     = samples[:, 6:].reshape(N_TEST, len(T_GRID), len(K_GRID))
 
-    # Predict — pass RAW (un-normalised) params; _fno_predict_real_iv normalises
-    # internally via calibrate module globals. Do NOT pre-normalise here.
-    spatial  = _make_spatial_input(T_GRID, K_GRID, torch.device("cpu"))
-    params_raw_t = torch.tensor(params_np, dtype=torch.float32)  # shape (N, 6)
+    # Predict — batched single forward pass on GPU (not a per-sample loop).
+    # _fno_predict_real_iv handles (B,6) input and returns (B,nT,nK) when
+    # squeeze(0) is suppressed, but its current API squeezes the batch dim.
+    # We call it sample-by-sample but on GPU so transfers are negligible.
+    spatial      = _make_spatial_input(T_GRID, K_GRID, device)
+    params_raw_t = torch.tensor(params_np, dtype=torch.float32, device=device)
 
+    # Batched prediction: stack all N_TEST samples in one GPU forward pass
+    import time as _time
+    t0 = _time.perf_counter()
     preds = []
-    for i in range(N_TEST):
+    BATCH = 64   # forward pass chunk size — fits in 12GB VRAM easily
+    for start in range(0, N_TEST, BATCH):
+        end = min(start + BATCH, N_TEST)
+        batch_params = params_raw_t[start:end]   # (chunk, 6)
         with torch.no_grad():
-            iv_pred = _fno_predict_real_iv(model, params_raw_t[i:i+1], spatial)
-        preds.append(iv_pred.numpy())
-    iv_pred_np = np.stack(preds, axis=0)   # (N, nT, nK)
+            # _fno_predict_real_iv squeezes batch dim when B=1, so use B>1 path:
+            # Call directly through the FNO stack without the squeeze.
+            params_norm = calibrate._param_norm.transform_tensor(batch_params)
+            pred_norm   = model(
+                spatial.expand(batch_params.size(0), -1, -1, -1),
+                params_norm
+            )                                    # (chunk, nT, nK)
+            iv_real = calibrate._iv_norm.inverse_transform_tensor(pred_norm)
+            iv_real = iv_real.clamp(min=1e-4)
+        preds.append(iv_real.cpu().numpy())      # (chunk, nT, nK)
+    elapsed = _time.perf_counter() - t0
+    iv_pred_np = np.concatenate(preds, axis=0)  # (N_TEST, nT, nK)
+    print(f"  Inference: {N_TEST} samples in {elapsed*1000:.1f}ms "
+          f"({elapsed/N_TEST*1000:.2f}ms/sample) on {device}")
 
     # Metrics
     valid = np.isfinite(iv_mc) & np.isfinite(iv_pred_np) & (iv_mc > 0)

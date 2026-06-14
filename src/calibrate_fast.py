@@ -318,23 +318,27 @@ if __name__ == "__main__":
     T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
     K_GRID = np.linspace(-0.5, 0.5, 11)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
     print("Loading FNO v1 model ...")
     model = MirrorPaddedFNO2d()
     model.load_state_dict(torch.load("artifacts/models/fno_best.pth",
-                                     map_location="cpu", weights_only=True))
+                                     map_location=device, weights_only=True))
+    model = model.to(device)
     model.eval()
     _load_normalizers()
 
-    spatial = _make_spatial_input(T_GRID, K_GRID, torch.device("cpu"))
+    spatial = _make_spatial_input(T_GRID, K_GRID, device)
 
-    # Synthetic target from true params
-    p_true = torch.tensor([[0.06, -0.20, 0.40]], dtype=torch.float32)
+    # Synthetic target from true params — generate on GPU, move to numpy for calibrate_newton
+    p_true = torch.tensor([[0.06, -0.20, 0.40]], dtype=torch.float32, device=device)
     p6_true = _reparam_to_6d(p_true[:, 0:1], p_true[:, 1:2],
-                              p_true[:, 2:3], torch.device("cpu"))
+                              p_true[:, 2:3], device)
     with torch.no_grad():
-        iv_target = _fno_predict_real_iv(model, p6_true, spatial).numpy()
+        iv_target = _fno_predict_real_iv(model, p6_true, spatial).cpu().numpy()
 
-    # Speed benchmark
+    # Speed benchmark (device auto-detected from model.parameters())
     stats = benchmark_jacobian_speed(model, T_GRID, K_GRID, n_trials=10)
 
     # Newton calibration
