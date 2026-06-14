@@ -1,0 +1,23 @@
+import os
+import sys
+import pytest
+import torch
+
+# Inject src path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+src_path = os.path.join(project_root, "src")
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
+
+from fno_model import MirrorPaddedFNO2d
+
+@pytest.fixture(scope="module")
+def fno_v2_model():
+    model = MirrorPaddedFNO2d()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    weights_path = os.path.join(project_root, "artifacts/weights/fno_v2_final_prod.pth")
+    state_dict = torch.load(weights_path, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
