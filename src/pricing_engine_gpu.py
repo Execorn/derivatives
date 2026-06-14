@@ -677,7 +677,7 @@ class BS_IV_Implicit_Inverter(torch.autograd.Function):
 # Main batch pricing pipeline
 # ---------------------------------------------------------------------------
 
-def price_batch_gpu(
+def _price_batch_gpu_raw(
     params_batch:      np.ndarray,        # (B, 5): [kappa, theta, sigma, rho, v0]
     T_grid:            np.ndarray,        # (nT,)
     K_grid:            np.ndarray,        # (nK,) log-moneyness
@@ -747,6 +747,79 @@ def price_batch_gpu(
     iv = bs_iv_gpu(prices, S0, K_arr, T_arr)
 
     return iv.cpu().numpy()
+
+
+def price_batch_gpu(
+    params_batch:      np.ndarray,        # (B, 5): [kappa, theta, sigma, rho, v0]
+    T_grid:            np.ndarray,        # (nT,)
+    K_grid:            np.ndarray,        # (nK,) log-moneyness
+    H_fixed:           float = 0.08,      # used when H_batch is None
+    H_batch:           np.ndarray = None, # (B,) per-sample H; enables true B=200 batch
+    N_factors:         int   = 20,
+    N_cos:             int   = 64,
+    N_steps_per_unit:  int   = 200,
+    S0:                float = 1.0,
+    device:            str   = 'cuda',
+    N_cos_per_T:       dict  = None,
+) -> np.ndarray:
+    """
+    Price B IV surfaces on GPU. Returns (B, nT, nK) float32.
+    If N_cos_per_T is provided, groups maturities in T_grid and invokes
+    pricing with specific N_cos values.
+    """
+    if not N_cos_per_T:
+        return _price_batch_gpu_raw(
+            params_batch=params_batch,
+            T_grid=T_grid,
+            K_grid=K_grid,
+            H_fixed=H_fixed,
+            H_batch=H_batch,
+            N_factors=N_factors,
+            N_cos=N_cos,
+            N_steps_per_unit=N_steps_per_unit,
+            S0=S0,
+            device=device,
+        )
+
+    # Group maturities in T_grid by their corresponding N_cos values
+    groups = {}
+    for idx, T in enumerate(T_grid):
+        matched_n_cos = N_cos
+        for k, v in N_cos_per_T.items():
+            if abs(float(k) - T) < 1e-6:
+                matched_n_cos = v
+                break
+        if matched_n_cos not in groups:
+            groups[matched_n_cos] = []
+        groups[matched_n_cos].append((idx, T))
+
+    # Initialize output array
+    B = params_batch.shape[0]
+    nT = len(T_grid)
+    nK = len(K_grid)
+    out = np.empty((B, nT, nK), dtype=np.float32)
+
+    for n_cos_val, items in groups.items():
+        # Sort items by maturity to maintain chronological order in ODE solver
+        items_sorted = sorted(items, key=lambda x: x[1])
+        sub_indices = [item[0] for item in items_sorted]
+        sub_T_grid = np.array([item[1] for item in items_sorted])
+
+        sub_out = _price_batch_gpu_raw(
+            params_batch=params_batch,
+            T_grid=sub_T_grid,
+            K_grid=K_grid,
+            H_fixed=H_fixed,
+            H_batch=H_batch,
+            N_factors=N_factors,
+            N_cos=n_cos_val,
+            N_steps_per_unit=N_steps_per_unit,
+            S0=S0,
+            device=device,
+        )
+        out[:, sub_indices, :] = sub_out
+
+    return out
 
 
 # ---------------------------------------------------------------------------

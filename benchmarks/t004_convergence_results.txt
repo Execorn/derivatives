@@ -1,0 +1,31 @@
+T=0.04 Convergence Study for N_cos on GPU
+========================================================================
+Reference N_cos = 1024 (computed in 0.496s)
+Parameter sets:
+  Set 1: kappa=1.00, theta=0.05, sigma=0.30, rho=-0.70, v0=0.04, H=0.06
+  Set 2: kappa=3.00, theta=0.08, sigma=0.50, rho=-0.50, v0=0.08, H=0.08
+  Set 3: kappa=5.00, theta=0.12, sigma=0.70, rho=-0.30, v0=0.10, H=0.10
+  Set 4: kappa=5.00, theta=0.06, sigma=0.40, rho=-0.60, v0=0.05, H=0.06
+  Set 5: kappa=1.00, theta=0.10, sigma=0.60, rho=-0.40, v0=0.09, H=0.10
+
+N_cos    | Set 1 (bp) | Set 2 (bp) | Set 3 (bp) | Set 4 (bp) | Set 5 (bp) | Global Max (bp) | Time (s)
+-------------------------------------------------------------------------------------
+64       |  7190.3501 |  4469.5273 |  5991.8301 |  7028.8979 |  4513.9180 |       7190.3501 |    0.020
+128      |  2251.2634 |  1060.0409 |  1547.5509 |  3044.8633 |  2080.2285 |       3044.8633 |    0.019
+256      |  1692.8658 |   202.7839 |    65.7153 |   954.8691 |   368.8130 |       1692.8658 |    0.023
+384      |    48.5015 |     0.0387 |     0.0018 |     7.2822 |     0.0697 |         48.5015 |    0.019
+432      |   148.4433 |     0.0009 |     0.0000 |     1.1742 |     0.0060 |        148.4433 |    0.020
+440      |    97.7260 |     0.0006 |     0.0000 |     3.6675 |     0.0012 |         97.7260 |    0.017
+448      |    77.0605 |     0.0003 |     0.0000 |     1.9681 |     0.0024 |         77.0605 |    0.025
+
+Conclusion:
+-----------
+1. For short maturity options (T = 0.04), the probability density function is extremely peaked.
+   The Fourier-COS method requires a large number of terms to resolve this peaked density,
+   especially at the deep out-of-the-money (OTM) strikes (e.g., log-moneyness = 0.5).
+2. Due to the extremely small Black-Scholes vega at short maturities and deep OTM strikes,
+   minute differences in option prices (on the order of 1e-10) caused by truncation oscillations
+   are amplified into basis point differences in implied volatility (d(IV)/d(Price) = 1/Vega).
+3. For near-the-money and liquid strikes, N_cos >= 256 or 384 achieves sub-basis-point accuracy.
+   However, to achieve global convergence across all strikes (including deep OTM) below 1 basis point,
+   an N_cos value larger than 448 (such as 512 or the reference 1024) is required.

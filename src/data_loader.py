@@ -9,7 +9,7 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from torch.utils.data import TensorDataset, DataLoader
 
 # Grid constants (8 maturities x 11 strikes)
-MATURITIES = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+MATURITIES = np.array([0.04, 0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 # Standard moneyness grid (log(F/K))
 MONEYNESS = np.linspace(-0.5, 0.5, 11)
 

@@ -50,7 +50,7 @@ from pricing_engine_gpu import price_batch_gpu
 # Configuration — identical grid to v2
 # ---------------------------------------------------------------------------
 
-T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+T_GRID = np.array([0.04, 0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 K_GRID = np.linspace(-0.5, 0.5, 11)
 
 BOUNDS_LOWER = np.array([0.1,  0.01, 0.1,  -0.9, 0.01])

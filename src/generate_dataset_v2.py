@@ -45,7 +45,7 @@ from pricing_engine_gpu import price_batch_gpu
 # Dataset configuration
 # ---------------------------------------------------------------------------
 
-T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])  # 8 maturities
+T_GRID = np.array([0.04, 0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])  # 9 maturities
 K_GRID = np.linspace(-0.5, 0.5, 11)                             # 11 log-moneyness strikes
 
 # Parameter bounds: [kappa, theta, sigma, rho, v0]

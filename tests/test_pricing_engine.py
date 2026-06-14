@@ -69,3 +69,34 @@ def test_pricing_engine_batch_consistency():
             if np.any(mask):
                 max_diff = np.max(np.abs(ivs[i][mask] - ivs[j][mask]))
                 assert max_diff < 1e-6
+
+
+def test_pricing_engine_adaptive_n_cos():
+    canonical_param = np.array([[3.0, 0.08, 0.5, -0.5, 0.08]])
+    test_t_grid = np.array([0.04, 0.1, 0.3])
+    
+    # Call with adaptive N_cos_per_T dict
+    N_cos_per_T = {0.04: 128, 0.1: 64, 0.3: 64}
+    ivs_adaptive = price_batch_gpu(
+        canonical_param, test_t_grid, K_GRID,
+        N_cos=64, N_cos_per_T=N_cos_per_T,
+        device='cuda'
+    )
+    
+    # Compute manually for each sub-grid to compare
+    iv_004 = price_batch_gpu(
+        canonical_param, np.array([0.04]), K_GRID,
+        N_cos=128, device='cuda'
+    )
+    iv_others = price_batch_gpu(
+        canonical_param, np.array([0.1, 0.3]), K_GRID,
+        N_cos=64, device='cuda'
+    )
+    
+    # Verify shape
+    assert ivs_adaptive.shape == (1, 3, len(K_GRID))
+    
+    # Verify that values match the manual runs
+    np.testing.assert_allclose(ivs_adaptive[0, 0], iv_004[0, 0], rtol=1e-5, atol=1e-5, equal_nan=True)
+    np.testing.assert_allclose(ivs_adaptive[0, 1:], iv_others[0], rtol=1e-5, atol=1e-5, equal_nan=True)
+
