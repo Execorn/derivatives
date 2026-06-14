@@ -57,32 +57,6 @@ def load_normalizers_v2():
         iv_norm    = IVSurfaceNormalizer.load(IV_NORM_V1_PATH)
         return param_norm, iv_norm, "v1"
 
-
-def predict_batch(model, params_np, spatial, param_norm, iv_norm):
-    """Predict IV surfaces for a batch of parameter vectors.
-
-    Returns (N, nT, nK) numpy array of real IV values.
-    """
-    with torch.no_grad():
-        params_n = torch.tensor(
-            param_norm.transform(params_np), dtype=torch.float32  # FIX: .normalize() → .transform()
-        )
-        preds = []
-        for i in range(len(params_np)):
-            p = params_n[i:i+1]               # (1, 6)
-            iv_norm_pred = _fno_predict_raw(model, p, spatial)   # normalized
-            # FIX: .denormalize() → .inverse_transform()
-            iv_real = iv_norm.inverse_transform(iv_norm_pred.numpy().reshape(1, -1))
-            preds.append(iv_real.reshape(len(T_GRID), len(K_GRID)))
-        return np.stack(preds, axis=0)       # (N, nT, nK)
-
-
-def _fno_predict_raw(model, params_n_batch, spatial):
-    """Return normalized IV output from FNO."""
-    return model(spatial.unsqueeze(0).expand(params_n_batch.shape[0], -1, -1),
-                 params_n_batch).squeeze(-1)[0]   # (nT, nK)
-
-
 def compute_jacobian_column_norms(model, params_np, spatial):
     """5-point FD Jacobian column norms over N test samples. Runs on GPU."""
     device = next(model.parameters()).device
