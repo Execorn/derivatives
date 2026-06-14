@@ -328,6 +328,7 @@ def benchmark_jacobian_speed(model, T_grid, K_grid,
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import calibrate as _cal_mod  # for patching normalizer globals
     from fno_model import MirrorPaddedFNO2d
 
     os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -338,17 +339,24 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    print("Loading FNO v1 model ...")
+    # ── Load FNO v2 (N=40, N_cos=128, R²=0.9991) ────────────────────────────
+    print("Loading FNO v2 model (N=40, N_cos=128, R²=0.9991) ...")
     model = MirrorPaddedFNO2d()
-    model.load_state_dict(torch.load("artifacts/models/fno_best.pth",
+    model.load_state_dict(torch.load("artifacts/weights/fno_v2_final_prod.pth",
                                      map_location=device, weights_only=True))
     model = model.to(device)
     model.eval()
+
+    # Patch calibrate.py module-level paths to v2 normalizers before loading
+    _cal_mod._PARAM_NORM_PATH = "artifacts/models/param_normalizer_v2.npz"
+    _cal_mod._IV_NORM_PATH    = "artifacts/models/iv_normalizer_v2.npz"
+    _cal_mod._param_norm      = None   # force reload
+    _cal_mod._iv_norm         = None
     _load_normalizers()
 
     spatial = _make_spatial_input(T_GRID, K_GRID, device)
 
-    # Synthetic target from true params — generate on GPU, move to numpy for calibrate_newton
+    # Synthetic target from true params
     p_true = torch.tensor([[0.06, -0.20, 0.40]], dtype=torch.float32, device=device)
     p6_true = _reparam_to_6d(p_true[:, 0:1], p_true[:, 1:2],
                               p_true[:, 2:3], device)
@@ -359,7 +367,7 @@ if __name__ == "__main__":
     stats = benchmark_jacobian_speed(model, T_GRID, K_GRID, n_trials=10)
 
     # Newton calibration
-    print("\nRunning Newton calibration ...")
+    print("\nRunning Newton calibration (v2 model) ...")
     result = calibrate_newton(model, iv_target, T_GRID, K_GRID,
                               max_iter=15, verbose=True)
     print(f"\nResult:")

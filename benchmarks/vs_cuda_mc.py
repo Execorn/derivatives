@@ -46,11 +46,10 @@ N_PARAM_COLS = 6    # [kappa, theta, sigma, rho, v0, H]
 N_IV_COLS    = 88   # 8 * 11
 
 N_SAMPLES    = 200  # number of MC dataset samples to reprice
-N_FACTORS    = 20
-# N_COS=64 matches COS dataset generation and gives machine-precision IV
-# (domain [-4,4] converges in 64 terms; N_COS=500 would inflate ODE state
-# to 21,000 dims — O(N³) BDF cost — days not minutes on CPU).
-N_COS        = 64
+N_FACTORS    = 40   # 20→40 (2026-06-15): matches v2 dataset config
+# N_COS=128 matches v2 dataset generation (N_cos=64 gives 264bp error at
+# ATM/T=0.1 for rough Heston H=0.08 — CF decays too slowly for 64 terms).
+N_COS        = 128  # 64→128 (2026-06-15)
 
 # Dataset v1 — generated 2026-06-10 with buggy unnormalised Bernstein CPU engine
 MC_DATA_PATH = "data/DeepRoughDataset.npz"
