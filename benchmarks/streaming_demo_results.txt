@@ -1,0 +1,5 @@
+§5.2 Streaming Calibration Demo — 20 ticks, noise=1.0%
+Latency (ms): mean=590 median=549 p95=668 max=1242
+Throughput: 1.7 calib/sec
+v0 mean|err|%=1.0  zeta=3.2  lam=9.7
+✅  Real-time capable: p95=668ms < 1000ms  (SPX ticks ~1-2s → 1.5× headroom)

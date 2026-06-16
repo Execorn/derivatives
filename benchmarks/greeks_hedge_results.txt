@@ -1,0 +1,5 @@
+§5.3 Greeks Hedge Backtest — 30 paths, T=1.0yr, steps=52, noise=1.0%
+FNO-Δ:  mean=+0.12866  std=0.07586  var=5.75e-03
+Flat-Δ: mean=+0.12921  std=0.07789  var=6.07e-03
+Variance reduction: +5.1%  ratio=1.05x
+Avg cal time: 518ms/step
