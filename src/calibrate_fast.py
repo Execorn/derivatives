@@ -380,3 +380,136 @@ if __name__ == "__main__":
     print(f"  MSE   : {result['final_mse']:.2e}")
     print(f"  iters : {result['n_iter']}")
     print(f"  time  : {result['elapsed']:.3f}s")
+
+
+# ===========================================================================
+# §5.1 Extension — Newton Calibration for Learnable H (4D free params)
+# ===========================================================================
+
+# 4D calibration bounds: [v0, zeta, lam, H]
+_BOUNDS_LOWER_4D = torch.tensor([0.01, -0.90, 0.01, 0.04])
+_BOUNDS_UPPER_4D = torch.tensor([0.15, -0.01, 0.99, 0.15])
+
+
+def _reparam_to_6d_with_H(v0: torch.Tensor, zeta: torch.Tensor,
+                           lam: torch.Tensor, H: torch.Tensor,
+                           device) -> torch.Tensor:
+    """Back-transform (v₀, ζ, λ, H) → raw 6D parameter vector (B,6)."""
+    sigma = torch.sqrt(zeta**2 + lam**2).clamp(min=0.01)
+    rho   = (zeta / sigma).clamp(-0.9, -0.1)
+    kappa = torch.full_like(v0, _GHOST_KAPPA)
+    theta = torch.full_like(v0, _GHOST_THETA)
+    H_clp = H.clamp(0.04, 0.15)
+    return torch.stack([kappa, theta, sigma, rho, v0, H_clp], dim=-1).to(device)
+
+
+def calibrate_newton_h(model, iv_target: np.ndarray,
+                       T_grid: np.ndarray, K_grid: np.ndarray,
+                       max_iter: int = 20, tol: float = 1e-6,
+                       eps_lm: float = 1e-4, verbose: bool = False,
+                       init_v0: float = 0.07, init_zeta: float = -0.30,
+                       init_lam: float = 0.40, init_H: float = 0.08,
+                       ) -> dict:
+    """
+    Newton-Raphson calibration optimising 4D reparameterised space
+    (v₀, ζ=σρ, λ=σ√(1−ρ²), H) — requires FNO v3 (param_dim=6).
+
+    The Hurst exponent H is calibrated simultaneously with the variance
+    and correlation parameters. The Fisher information matrix is 4×4.
+
+    Parameters
+    ----------
+    model      : MirrorPaddedFNO2d(param_dim=6) loaded with v3 weights
+    iv_target  : (nT, nK) ndarray of market implied vols
+    T_grid     : (nT,) maturity grid
+    K_grid     : (nK,) log-moneyness grid
+    max_iter   : maximum Gauss-Newton iterations
+    tol        : convergence tolerance on ||residual||
+    eps_lm     : Levenberg-Marquardt regularisation
+    verbose    : print per-iteration progress
+    init_*     : starting values in (v₀, ζ, λ, H) space
+
+    Returns
+    -------
+    dict with keys: v0, sigma, rho, H, zeta, lambda, final_mse,
+                    n_iter, theta_history, converged
+    """
+    device   = next(model.parameters()).device
+    spatial  = _make_spatial_input(T_grid, K_grid, device=device)
+    iv_obs   = torch.tensor(iv_target.ravel(), dtype=torch.float32, device=device)
+    nT, nK   = len(T_grid), len(K_grid)
+
+    # Initial guess in 4D space
+    theta = torch.tensor([init_v0, init_zeta, init_lam, init_H],
+                         dtype=torch.float32, device=device, requires_grad=False)
+    lo4 = _BOUNDS_LOWER_4D.to(device)
+    hi4 = _BOUNDS_UPPER_4D.to(device)
+    theta = theta.clamp(lo4, hi4)
+
+    theta_history = [theta.detach().cpu().numpy().copy()]
+
+    def _fwd(t):
+        """Forward pass: 4D → 6D → normalised → FNO → real IV (flat)."""
+        v0, zeta, lam, H = t[0], t[1], t[2], t[3]
+        p6 = _reparam_to_6d_with_H(v0.unsqueeze(0), zeta.unsqueeze(0),
+                                    lam.unsqueeze(0), H.unsqueeze(0), device)
+        return _fno_predict_real_iv(model, p6, spatial).reshape(-1)
+
+    def _jacobian(t):
+        """(n_obs, 4) Jacobian via forward-mode AD — 4 JVPs."""
+        t_leaf = t.detach().requires_grad_(True)
+        J = torch.func.jacfwd(_fwd)(t_leaf)   # (n_obs, 4)
+        return J.detach()
+
+    converged = False
+    for it in range(max_iter):
+        iv_pred = _fwd(theta)
+        residual = iv_pred - iv_obs        # (n_obs,)
+        mse      = float((residual**2).mean().detach())
+
+        if verbose:
+            v0, ze, la, H = theta.tolist()
+            sigma = float(torch.sqrt(torch.tensor(ze**2 + la**2)).clamp(min=0.01))
+            rho   = float(torch.clamp(torch.tensor(ze / sigma), -0.9, -0.1))
+            print(f"  it={it:2d}  mse={mse:.3e}  "
+                  f"v0={v0:.4f} σ={sigma:.3f} ρ={rho:.3f} H={H:.4f}")
+
+        if mse < tol:
+            converged = True
+            break
+
+        J = _jacobian(theta)               # (n_obs, 4)
+        JtJ  = J.T @ J                     # (4, 4)
+        Jtr  = J.T @ residual              # (4,)
+
+        # Levenberg-Marquardt regularisation
+        lm   = eps_lm * torch.diag(JtJ).clamp(min=1e-8)
+        JtJr = JtJ + torch.diag(lm)
+        try:
+            delta = torch.linalg.solve(JtJr, -Jtr)
+        except torch.linalg.LinAlgError:
+            delta = -Jtr * eps_lm          # gradient step fallback
+
+        theta = (theta + delta).clamp(lo4, hi4)
+        theta_history.append(theta.detach().cpu().numpy().copy())
+
+    # Final forward pass
+    iv_final = _fwd(theta).detach().cpu().numpy().reshape(nT, nK)
+    v0, ze, la, H = [float(x) for x in theta.tolist()]
+    sigma = float(np.sqrt(ze**2 + la**2))
+    sigma = max(sigma, 0.01)
+    rho   = float(np.clip(ze / sigma, -0.9, -0.1))
+
+    return {
+        "v0":           v0,
+        "zeta":         ze,
+        "lambda":       la,
+        "sigma":        sigma,
+        "rho":          rho,
+        "H":            float(np.clip(H, 0.04, 0.15)),
+        "final_mse":    float(((iv_final - iv_target)**2).mean()),
+        "n_iter":       it + 1,
+        "converged":    converged,
+        "theta_history": theta_history,
+        "iv_fitted":    iv_final,
+    }
