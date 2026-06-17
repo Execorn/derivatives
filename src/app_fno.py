@@ -259,26 +259,43 @@ if "calib_results" in st.session_state:
     # Confidence scores
     st.subheader("Parameter Confidence (Identifiability)")
     if calib_mode.startswith("Reparameterized"):
-        st.caption(
-            "Jacobian column Frobenius norm ‖∂IV/∂θᵢ‖_F for (v₀, ζ, λ). "
-            "Scores reflect *structural* sensitivity of the IV surface on the "
-            "calibration grid — independent of noise level."
-        )
-        conf_labels = {"v0":     "v₀ (ATM Level — most identifiable)",
-                       "zeta":   "ζ = σρ (Smile Skew)",
-                       "lambda": "λ = σ√(1-ρ²) (Wing Curvature — OTM only)"}
-        for pname, score in conf_scores.items():
-            label = conf_labels.get(pname, pname)
-            color = "🟢" if score >= 0.7 else "🟡" if score >= 0.4 else "🔴"
-            st.progress(score, text=f"{color} {label}: {score:.2f}")
-        st.caption(
-            "⚠️ **λ structural note**: the strike grid k∈[−0.5, +0.5] covers "
-            "near-ATM options only. λ = σ√(1−ρ²) controls *wing curvature* which "
-            "is only visible in deep OTM options (|k| > 1). "
-            "Low λ-confidence is **expected even at zero noise** — it is a "
-            "structural feature of the parameter space, not a calibration failure. "
-            "To identify λ, you need quotes at |k| > 1 (e.g., 20-delta options)."
-        )
+        # Prefer FIM-based confidence (uses actual noise level) over Jacobian norms
+        if fim_res and "std" in fim_res:
+            stds      = fim_res["std"]
+            estimates = {"v0":     res3d.get("v0",    0),
+                         "zeta":   res3d.get("zeta",  0),
+                         "lambda": res3d.get("lambda", 0)}
+            def _fim_conf(p):
+                s = stds.get(p, 1.0)
+                v = abs(estimates.get(p, 1e-6)) or 1e-6
+                return float(np.clip(1.0 - 2*s / v, 0, 1))
+            conf_labels = {"v0":     "v₀ (ATM Level)",
+                           "zeta":   "ζ = σρ (Smile Skew)",
+                           "lambda": "λ = σ√(1-ρ²) (Wing Curvature)"}
+            st.caption(
+                "**FIM-based confidence**: 1 − 2σ(FIM) / |estimate|.  "
+                "🟢 ≥ 0.7 = well-constrained; 🔴 < 0.4 = high relative uncertainty."
+            )
+            for pname in ["v0", "zeta", "lambda"]:
+                score  = _fim_conf(pname)
+                ci_str = f"±{stds[pname]:.4f}"
+                label  = conf_labels[pname]
+                color  = "🟢" if score >= 0.7 else "🟡" if score >= 0.4 else "🔴"
+                st.progress(score, text=f"{color} {label}: {score:.2f}  (95% CI {ci_str})")
+        else:
+            # Fallback: Jacobian column norms (structural sensitivity only)
+            st.caption(
+                "Jacobian column Frobenius norm ‖∂IV/∂θᵢ‖_F for (v₀, ζ, λ). "
+                "Reflects *structural* sensitivity on the k∈[−0.5,+0.5] grid — "
+                "low λ score is expected (λ drives OTM wings only)."
+            )
+            conf_labels = {"v0":     "v₀ (ATM Level — most identifiable)",
+                           "zeta":   "ζ = σρ (Smile Skew)",
+                           "lambda": "λ = σ√(1-ρ²) (Wing Curvature — OTM only)"}
+            for pname, score in conf_scores.items():
+                label = conf_labels.get(pname, pname)
+                color = "🟢" if score >= 0.7 else "🟡" if score >= 0.4 else "🔴"
+                st.progress(score, text=f"{color} {label}: {score:.2f}")
     else:
         st.caption(
             "Jacobian column Frobenius norm ‖∂IV/∂θᵢ‖_F in real IV space — "
