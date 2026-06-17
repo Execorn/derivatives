@@ -260,28 +260,29 @@ if "calib_results" in st.session_state:
     st.subheader("Parameter Confidence (Identifiability)")
     if calib_mode.startswith("Reparameterized"):
         # Prefer FIM-based confidence (uses actual noise level) over Jacobian norms
-        if fim_res and "std" in fim_res:
-            stds      = fim_res["std"]
-            estimates = {"v0":     res3d.get("v0",    0),
-                         "zeta":   res3d.get("zeta",  0),
-                         "lambda": res3d.get("lambda", 0)}
-            def _fim_conf(p):
-                s = stds.get(p, 1.0)
-                v = abs(estimates.get(p, 1e-6)) or 1e-6
-                return float(np.clip(1.0 - 2*s / v, 0, 1))
-            conf_labels = {"v0":     "v₀ (ATM Level)",
-                           "zeta":   "ζ = σρ (Smile Skew)",
-                           "lambda": "λ = σ√(1-ρ²) (Wing Curvature)"}
+        if fim_res and "std_errors" in fim_res:
+            std_errs  = fim_res["std_errors"]   # np.array [σ_v0, σ_zeta, σ_lam]
+            ci_95     = fim_res["ci_95"]         # np.array [half-width at 95%]
+            pnames    = ["v0", "zeta", "lambda"]
+            estimates = [res3d.get("v0",0), res3d.get("zeta",0), res3d.get("lambda",0)]
+            conf_labels = ["v₀ (ATM Level)",
+                           "ζ = σρ (Smile Skew)",
+                           "λ = σ√(1-ρ²) (Wing Curvature)"]
             st.caption(
                 "**FIM-based confidence**: 1 − 2σ(FIM) / |estimate|.  "
                 "🟢 ≥ 0.7 = well-constrained; 🔴 < 0.4 = high relative uncertainty."
             )
-            for pname in ["v0", "zeta", "lambda"]:
-                score  = _fim_conf(pname)
-                ci_str = f"±{stds[pname]:.4f}"
-                label  = conf_labels[pname]
-                color  = "🟢" if score >= 0.7 else "🟡" if score >= 0.4 else "🔴"
-                st.progress(score, text=f"{color} {label}: {score:.2f}  (95% CI {ci_str})")
+            for i, (pname, label) in enumerate(zip(
+                    ["v0", "zeta", "lambda"],
+                    ["v₀ (ATM Level)", "ζ = σρ (Smile Skew)", "λ = σ√(1-ρ²) (Wing Curvature)"])):
+                s    = float(std_errs[i])                       # std_errors is a numpy array
+                lo, hi = ci_95[pname]                           # ci_95 is dict of (lo, hi) tuples
+                half = (float(hi) - float(lo)) / 2
+                est  = estimates[i]
+                v    = abs(est) or 1e-6
+                score = float(np.clip(1.0 - 2*s / v, 0, 1))
+                color = "🟢" if score >= 0.7 else "🟡" if score >= 0.4 else "🔴"
+                st.progress(score, text=f"{color} {label}: {score:.2f}  (95% CI ±{half:.4f})")
         else:
             # Fallback: Jacobian column norms (structural sensitivity only)
             st.caption(
