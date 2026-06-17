@@ -258,7 +258,7 @@ if "calib_results" in st.session_state:
 
     # Confidence scores
     st.subheader("Parameter Confidence (Identifiability)")
-    if calib_mode.startswith("Reparameterized"):
+    if _reparam_mode:
         # Prefer FIM-based confidence (uses actual noise level) over Jacobian norms
         if fim_res and "std_errors" in fim_res:
             std_errs  = fim_res["std_errors"]   # np.array [σ_v0, σ_zeta, σ_lam]
