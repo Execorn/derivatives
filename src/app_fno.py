@@ -95,7 +95,8 @@ v0    = st.sidebar.slider("v₀ — Initial Variance", 0.01, 0.15, 0.08, step=0.
 
 st.sidebar.divider()
 noise_level = st.sidebar.slider(
-    "Market Noise Level (Stress Test)", 0.0, 0.10, 0.01, step=0.01, key="noise")
+    "Market Noise Level (Stress Test)", 0.0, 0.10, 0.01, step=0.001,
+    format="%.3f", key="noise")
 
 true_params = np.array([kappa, theta, sigma, rho, v0, H])
 
@@ -259,16 +260,25 @@ if "calib_results" in st.session_state:
     st.subheader("Parameter Confidence (Identifiability)")
     if calib_mode.startswith("Reparameterized"):
         st.caption(
-            "Jacobian column Frobenius norm ‖∂IV/∂θᵢ‖_F for (v₀, ζ, λ) — "
-            "reparameterization isolates the 3 identifiable degrees of freedom."
+            "Jacobian column Frobenius norm ‖∂IV/∂θᵢ‖_F for (v₀, ζ, λ). "
+            "Scores reflect *structural* sensitivity of the IV surface on the "
+            "calibration grid — independent of noise level."
         )
-        conf_labels = {"v0": "v₀ (Initial Variance)",
-                       "zeta": "ζ = σρ (Skew Driver)",
-                       "lambda": "λ = σ√(1-ρ²) (Level Driver)"}
+        conf_labels = {"v0":     "v₀ (ATM Level — most identifiable)",
+                       "zeta":   "ζ = σρ (Smile Skew)",
+                       "lambda": "λ = σ√(1-ρ²) (Wing Curvature — OTM only)"}
         for pname, score in conf_scores.items():
             label = conf_labels.get(pname, pname)
             color = "🟢" if score >= 0.7 else "🟡" if score >= 0.4 else "🔴"
             st.progress(score, text=f"{color} {label}: {score:.2f}")
+        st.caption(
+            "⚠️ **λ structural note**: the strike grid k∈[−0.5, +0.5] covers "
+            "near-ATM options only. λ = σ√(1−ρ²) controls *wing curvature* which "
+            "is only visible in deep OTM options (|k| > 1). "
+            "Low λ-confidence is **expected even at zero noise** — it is a "
+            "structural feature of the parameter space, not a calibration failure. "
+            "To identify λ, you need quotes at |k| > 1 (e.g., 20-delta options)."
+        )
     else:
         st.caption(
             "Jacobian column Frobenius norm ‖∂IV/∂θᵢ‖_F in real IV space — "
@@ -285,19 +295,26 @@ if "calib_results" in st.session_state:
                 "In the deep-rough regime (H < 0.1), the IV surface is insensitive "
                 "to κ for T < 0.5. Consider fixing κ from historical estimation.")
 
-    # 3D surface plot
+    # 3D surface plot — clip to [0, 0.80] to prevent T=0.1 COS wing spikes
+    # distorting the view (raw model output can reach 0.7+ at extreme OTM/T=0.1)
+    PLOT_MAX_IV = 0.80
+    target_plot     = np.clip(market_iv_noisy, 0, PLOT_MAX_IV)
+    calibrated_plot = np.clip(calibrated_iv,   0, PLOT_MAX_IV)
+    z_max = min(float(max(target_plot.max(), calibrated_plot.max())) * 1.05, PLOT_MAX_IV)
+
     K_grid, T_grid = np.meshgrid(STRIKES, MATURITIES)
     fig = go.Figure()
-    fig.add_trace(go.Surface(x=K_grid, y=T_grid, z=market_iv_noisy,
+    fig.add_trace(go.Surface(x=K_grid, y=T_grid, z=target_plot,
                              colorscale="Blues", opacity=0.7, name="Target (noisy)",
                              showscale=False))
-    fig.add_trace(go.Surface(x=K_grid, y=T_grid, z=calibrated_iv,
+    fig.add_trace(go.Surface(x=K_grid, y=T_grid, z=calibrated_plot,
                              colorscale="Reds", opacity=0.7, name="Calibrated",
                              showscale=False))
     fig.update_layout(
         title=f"Target (Noise={noise_used*100:.1f}%) vs Calibrated FNO Surface",
         scene=dict(xaxis_title="Log-Moneyness", yaxis_title="Maturity",
-                   zaxis_title="IV"),
+                   zaxis_title="IV",
+                   zaxis=dict(range=[0, z_max])),
         margin=dict(l=0, r=0, b=0, t=40), height=600)
     st.plotly_chart(fig, use_container_width=True)
 
