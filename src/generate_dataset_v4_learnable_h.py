@@ -34,11 +34,11 @@ PARAM_NAMES  = ['kappa', 'theta', 'sigma', 'rho', 'v0', 'H']
 BOUNDS_LOWER = np.array([0.1,  0.01, 0.1,  -0.9, 0.01, 0.04])
 BOUNDS_UPPER = np.array([5.0,  0.15, 1.0,  -0.1, 0.15, 0.15])
 
-N_SAMPLES         = 50_000
-BATCH_SIZE        = 1024     # smaller — per-sample H makes full batch slightly heavier
+N_SAMPLES         = 65536   # next power-of-2 above 50k; Sobol requires 2^n
+BATCH_SIZE        = 512     # smaller batches reduce OOM risk at high N_steps
 N_COS             = 128
 N_FACTORS         = 40
-N_STEPS_PER_UNIT  = 200
+N_STEPS_PER_UNIT  = 500     # 200→500: H=0.04 is near-singular; needs finer grid
 
 OUTPUT_PATH = 'data/DeepRoughDataset_v4_learnable_h.npz'
 
@@ -99,12 +99,14 @@ def generate():
         total_nan  += (~nan_mask).sum()
         total_done += (e - s)
 
-        # Fill NaN cells with the median IV (per maturity) for downstream training
+        # Fill NaN rows (entire maturity slice) with the median IV for that maturity
         iv_filled = iv.copy()
         for ti in range(iv.shape[1]):
-            col = iv_filled[:, ti, :]
-            med = np.nanmedian(col)
-            iv_filled[:, ti, np.isnan(col).any(axis=1)] = med if not np.isnan(med) else 0.3
+            col      = iv_filled[:, ti, :]              # (B, 11)
+            nan_rows = np.isnan(col).any(axis=1)        # (B,) — rows with any NaN
+            if nan_rows.any():
+                med = float(np.nanmedian(col[~nan_rows])) if (~nan_rows).any() else 0.3
+                iv_filled[nan_rows, ti, :] = med if not np.isnan(med) else 0.3
 
         iv_chunks.append(iv_filled.astype(np.float32))
         nan_chunks.append(nan_mask)

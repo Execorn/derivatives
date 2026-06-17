@@ -1,0 +1,172 @@
+% ============================================================
+%  Глава 4: Калибровка
+% ============================================================
+
+\section{Быстрая калибровка: FIM и метод Ньютона--Гаусса}
+\label{sec:calibration}
+
+\subsection{Постановка задачи калибровки}
+
+Пусть наблюдается вектор рыночных подразумеваемых волатильностей
+$\mathbf{y}^{\mathrm{mkt}} \in \mathbb{R}^{n_T \cdot n_K}$.
+Задача калибровки~--- найти параметры $\boldsymbol\theta$ такие, что:
+\begin{equation}
+  \label{eq:calib_problem}
+  \hat{\boldsymbol\theta} = \arg\min_{\boldsymbol\theta \in \Theta}
+  \left\|\mathbf{y}^{\mathrm{mkt}} - \IV(\boldsymbol\theta)\right\|_2^2,
+\end{equation}
+где $\IV(\boldsymbol\theta) \in \mathbb{R}^{88}$~--- поверхность IV,
+вычисленная суррогатом FNO.
+
+\subsection{Анализ идентифицируемости через матрицу Фишера}
+\label{sec:fim}
+
+Матрица Фишера (Fisher Information Matrix, FIM) характеризует
+информационное содержание наблюдаемых данных относительно параметров:
+\begin{equation}
+  \label{eq:fim}
+  \mathbf{I}(\boldsymbol\theta) = \mathbf{J}(\boldsymbol\theta)^\top
+  \boldsymbol\Sigma^{-1}
+  \mathbf{J}(\boldsymbol\theta),
+\end{equation}
+где $\mathbf{J} = \partial\IV/\partial\boldsymbol\theta \in \mathbb{R}^{88\times p}$~---
+якобиан поверхности IV по параметрам, $\boldsymbol\Sigma = \sigma^2_{\text{obs}}\mathbf{I}_{88}$~---
+матрица ковариации наблюдений ($\sigma_{\text{obs}} = 1\%$ IV).
+
+Число обусловленности $\kappa(\mathbf{I}) = \lambda_{\max}/\lambda_{\min}$
+измеряет, насколько «плохо обусловлена» обратная задача:
+большое $\kappa$ означает, что разные комбинации параметров дают
+практически одинаковую поверхность IV~--- плоский ландшафт функции потерь.
+
+\begin{table}[H]
+\centering
+\caption{Анализ идентифицируемости: число обусловленности FIM}
+\label{tab:fim}
+\begin{tabular}{l r r}
+\toprule
+Пространство параметров & $\kappa(\mathbf{I})$ & Снижение \\
+\midrule
+6D: $(\kappa, \theta, \sigma, \rho, V_0, H)$ & $\sim 10^6$ & --- \\
+\rowcolor{tableblue}
+3D: $(v_0, \zeta, \lambda)$                  & $\approx 770$ & $1301\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Переход $6D \to 3D$ \textbf{снижает число обусловленности в $1301\times$}~---
+от практически вырожденной матрицы ($\kappa \sim 10^6$) до
+хорошо обусловленной системы ($\kappa \approx 770$).
+
+\subsubsection{FIM-эллипсоид доверия}
+
+Эллипсоид уровня доверия $1-\alpha$ в пространстве параметров:
+\[
+  \mathcal{E}_\alpha = \left\{
+    \boldsymbol\delta : \boldsymbol\delta^\top \mathbf{I}\,\boldsymbol\delta \leq \chi^2_{p,\alpha}
+  \right\}.
+\]
+При $\sigma_{\text{obs}} = 1\%$ и $n=30$ Sobol-образцах:
+\begin{align*}
+  \sigma(v_0) &\approx 0{,}0009 \quad (0{,}1\%\text{ от типичного }v_0 = 0{,}08),\\
+  \sigma(\zeta) &\approx 0{,}007,\quad \sigma(\lambda) \approx 0{,}016,\\
+  \mathrm{Corr}(\zeta,\lambda) &\approx -0{,}655.
+\end{align*}
+
+\subsection{Репараметризация 6D $\to$ 3D}
+\label{sec:reparam}
+
+На практике фиксируются $\kappa = \kappa^*$, $\theta = \theta^*$, $H = H^*$
+и калибруется только тройка $(v_0, \zeta, \lambda)$, связанная с
+исходными параметрами соотношениями:
+\begin{align}
+  v_0 &= V_0,\\
+  \zeta &= \sigma\rho,\\
+  \lambda &= \sigma\sqrt{1-\rho^2}.
+\end{align}
+Обратное отображение единственно при $\rho < 0$:
+\[
+  \sigma = \sqrt{\zeta^2 + \lambda^2},\qquad
+  \rho = \frac{\zeta}{\sigma}.
+\]
+
+\subsection{Метод Ньютона--Гаусса с \texttt{jacfwd}}
+\label{sec:newton}
+
+Для задачи~\eqref{eq:calib_problem} с суррогатом FNO применяем итерации
+Ньютона--Гаусса (Gauss-Newton, GN):
+\begin{equation}
+  \label{eq:newton_step}
+  \boldsymbol\theta^{(k+1)}
+  = \boldsymbol\theta^{(k)} - \alpha_k
+    \left(\mathbf{J}^{(k)\top}\mathbf{J}^{(k)} + \mu\mathbf{I}\right)^{-1}
+    \mathbf{J}^{(k)\top}\mathbf{r}^{(k)},
+\end{equation}
+где $\mathbf{r}^{(k)} = \IV(\boldsymbol\theta^{(k)}) - \mathbf{y}^{\mathrm{mkt}}$~---
+вектор невязок, $\mu = 10^{-4}$~--- регуляризация Тихонова,
+$\alpha_k$~--- шаг с backtracking line search.
+
+\subsubsection{Вычисление якобиана через forward-mode AD}
+
+Якобиан $\mathbf{J} = \partial\IV_{\FNO}/\partial\boldsymbol\theta \in \mathbb{R}^{88\times 3}$
+вычисляется через \textbf{прямое автоматическое дифференцирование}
+(\texttt{torch.func.jacfwd}):
+\begin{enumerate}
+  \item Для каждого из $p=3$ параметров выполняется один \textit{JVP-проход}
+        (Jacobian-Vector Product) через FNO.
+  \item Итого $p=3$ прохода вперёд~--- вместо $88$ проходов назад
+        (reverse-mode) или $88$ вызовов конечных разностей.
+  \item Каждый JVP-проход занимает $\approx 0{,}8\,\text{мс}$ на RTX~3060.
+\end{enumerate}
+
+\begin{figure}[H]
+\hrule\vspace{0.4em}
+\noindent\textbf{Алгоритм~1: Метод Ньютона--Гаусса для калибровки FNO}
+\vspace{0.3em}\hrule\vspace{0.4em}
+\begin{enumerate}[leftmargin=2em, label=\arabic*.]
+  \item \textbf{Вход}: $\mathbf{y}^{\mathrm{mkt}}$, начальное приближение $\boldsymbol\theta^{(0)}$; $k \leftarrow 0$
+  \item \textbf{Повторять}:
+  \begin{enumerate}[leftmargin=1.5em, label=\alph*.]
+    \item $\hat{\mathbf{y}}^{(k)} \leftarrow \FNO(\boldsymbol\theta^{(k)})$
+    \item $\mathbf{r}^{(k)} \leftarrow \hat{\mathbf{y}}^{(k)} - \mathbf{y}^{\mathrm{mkt}}$
+    \item $\mathbf{J}^{(k)} \leftarrow \texttt{jacfwd}(\FNO, \boldsymbol\theta^{(k)})$ \quad \textit{// $p=3$ JVP-прохода}
+    \item $\mathbf{d}^{(k)} \leftarrow -(\mathbf{J}^{(k)\top}\mathbf{J}^{(k)} + \mu\mathbf{I})^{-1}\mathbf{J}^{(k)\top}\mathbf{r}^{(k)}$
+    \item Backtracking line search: $\alpha_k \leftarrow 1$, делить на 2, пока $\|\mathbf{r}^{(k+1)}\| > \|\mathbf{r}^{(k)}\|$
+    \item $\boldsymbol\theta^{(k+1)} \leftarrow \boldsymbol\theta^{(k)} + \alpha_k \mathbf{d}^{(k)}$; $k \leftarrow k+1$
+  \end{enumerate}
+  \item \textbf{До}: $\|\mathbf{J}^{(k)\top}\mathbf{r}^{(k)}\|_\infty < 10^{-6}$ или $k > 20$
+  \item \textbf{Выход}: $\hat{\boldsymbol\theta} = \boldsymbol\theta^{(k)}$
+\end{enumerate}
+\vspace{0.2em}\hrule
+\label{alg:newton}
+\end{figure}
+
+\textbf{Квадратичная сходимость}: вблизи минимума метод Ньютона--Гаусса
+сходится квадратично, то есть $\|\boldsymbol\theta^{(k+1)} - \boldsymbol\theta^*\| \leq C\,
+\|\boldsymbol\theta^{(k)} - \boldsymbol\theta^*\|^2$. На практике наблюдается
+сходимость за $5$--$7$ итераций.
+
+\subsection{Регионы начального приближения и мульти-старт}
+
+Метод Ньютона чувствителен к начальному приближению $\boldsymbol\theta^{(0)}$.
+Применяется \textbf{мульти-старт} из $n_{\text{start}} = 8$ равномерно
+расположенных в $\Theta$ точек Sobol:
+
+\begin{enumerate}
+  \item Параллельная оценка функции в 8 точках (1 батч FNO-инференса):
+        $\approx 1\,\text{мс}$.
+  \item Выбор точки с минимальным $\|\mathbf{r}\|^2$.
+  \item Запуск итераций GN из лучшей точки.
+\end{enumerate}
+
+Процент сходимости ($\|\mathbf{r}\| < \varepsilon_{\text{tol}}$):
+$96{,}7\%$ на 30 тестовых образцах при нулевом шуме.
+
+\subsection{Расширение до 4D: обучаемый показатель Хёрста}
+\label{sec:4d_calib}
+
+Для включения $H$ в пространство свободных параметров
+(см.~Главу~5, §\ref{sec:learnable_h})
+репараметризуем задачу в 4D: $(v_0, \zeta, \lambda, H)$.
+Якобиан $\mathbf{J} \in \mathbb{R}^{88\times 4}$ по-прежнему вычисляется
+через \texttt{jacfwd} за $p=4$ JVP-прохода. Метод Ньютона--Гаусса
+(Алгоритм~\ref{alg:newton}) применяется без изменений.

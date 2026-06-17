@@ -110,3 +110,31 @@ data/*.csv
 
 # Project-internal AI context map — not for reviewers
 CONTEXT.md
+
+# ── AI-agent working directories ──────────────────────────────────────────────
+.agents/
+.gemini/
+
+# ── LaTeX thesis compiled output (keep sources, ignore aux/pdf) ───────────────
+tex/thesis/*.aux
+tex/thesis/*.bbl
+tex/thesis/*.bcf
+tex/thesis/*.blg
+tex/thesis/*.fdb_latexmk
+tex/thesis/*.fls
+tex/thesis/*.log
+tex/thesis/*.out
+tex/thesis/*.run.xml
+tex/thesis/*.toc
+
+# ── Speech notes (presenter notes, not thesis content) ───────────────────────
+speech_notes.md
+
+# ── Benchmark eval artefacts ─────────────────────────────────────────────────
+benchmarks/*.npy
+
+# ── AI-generated images (reproducible from scripts) ───────────────────────────
+images/ai_generated/
+
+# ── AI audit/analysis reports (not thesis content) ────────────────────────────
+artifacts/reports/

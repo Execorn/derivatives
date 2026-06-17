@@ -1,0 +1,212 @@
+% ============================================================
+%  Нейронные сети в прайсинге производных финансовых инструментов
+%  Магистерская диссертация — МФТИ
+%
+%  Compile:
+%    pdflatex -interaction=nonstopmode main.tex
+%    biber main
+%    pdflatex -interaction=nonstopmode main.tex
+%    pdflatex -interaction=nonstopmode main.tex
+% ============================================================
+\documentclass[12pt, a4paper]{article}
+
+% ── Кодировка и язык ─────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian, english]{babel}
+
+% ── Поля страницы ────────────────────────────────────────────
+\usepackage{geometry}
+\geometry{top=2cm, bottom=2cm, left=3cm, right=1.5cm}
+
+% ── Математика ───────────────────────────────────────────────
+\usepackage{amsmath, amsfonts, amssymb, amsthm}
+\usepackage{bm}          % жирные греческие буквы
+\usepackage{mathtools}
+
+% ── Графика ──────────────────────────────────────────────────
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\graphicspath{{../../images/}{./figures/}}
+
+% ── Таблицы ──────────────────────────────────────────────────
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{colortbl}
+\usepackage{xcolor}
+
+% ── Алгоритмы и код ──────────────────────────────────────────
+\usepackage{listings}
+% algorithm.sty not installed — use manual pseudocode with fbox
+\newenvironment{pseudocode}[1]{%
+  \vspace{0.5em}\noindent\textbf{#1}\vspace{0.3em}\hrule\vspace{0.3em}%
+  \begin{list}{}{\leftmargin=1.5em\itemsep=0pt\parsep=0pt}%
+}{\end{list}\hrule\vspace{0.5em}}
+\lstset{basicstyle=\small\ttfamily, breaklines=true, language=Python}
+
+% ── Ссылки и библиография ────────────────────────────────────
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=green!50!black,
+    urlcolor=blue!70!black,
+}
+\usepackage{csquotes}
+\usepackage[style=numeric, sorting=none, backend=biber]{biblatex}
+\addbibresource{references.bib}
+
+% ── Межстрочный интервал ─────────────────────────────────────
+\usepackage{setspace}
+\onehalfspacing
+
+% ── Разное ───────────────────────────────────────────────────
+\usepackage{microtype}
+\usepackage{indentfirst}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes}
+
+% ── Теоремы и определения ────────────────────────────────────
+\newtheorem{definition}{Определение}[section]
+\newtheorem{theorem}{Теорема}[section]
+\newtheorem{proposition}{Утверждение}[section]
+\newtheorem{remark}{Замечание}[section]
+
+% ── Сокращения ───────────────────────────────────────────────
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\EE}{\mathbb{E}}
+\newcommand{\PP}{\mathbb{P}}
+\newcommand{\QQ}{\mathbb{Q}}
+\newcommand{\FF}{\mathcal{F}}
+\newcommand{\NN}{\mathcal{N}}
+\newcommand{\IV}{\mathrm{IV}}
+\newcommand{\BS}{\mathrm{BS}}
+\newcommand{\FNO}{\mathrm{FNO}}
+\newcommand{\FiLM}{\mathrm{FiLM}}
+\newcommand{\RMSE}{\mathrm{RMSE}}
+\newcommand{\MAE}{\mathrm{MAE}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\half}{\tfrac{1}{2}}
+
+% ── Цвета таблиц ─────────────────────────────────────────────
+\definecolor{tableblue}{RGB}{220, 230, 245}
+\definecolor{tablered}{RGB}{245, 215, 215}
+\definecolor{tablegreen}{RGB}{210, 240, 215}
+
+% ============================================================
+\begin{document}
+
+% ── Титульная страница ────────────────────────────────────────
+\begin{titlepage}
+\centering
+\vspace*{1.5cm}
+
+{\Large\textbf{Московский физико-технический институт\\
+(национальный исследовательский университет)}}
+
+\vspace{0.5cm}
+{\large Факультет прикладной математики и информатики (ФПМИ)\\[4pt]
+Кафедра банковских информационных технологий (БИТ)}
+
+\vspace{2.5cm}
+
+{\Huge\bfseries Нейронные сети в прайсинге\\
+производных финансовых инструментов}
+
+\vspace{1cm}
+{\large\itshape Ускорение калибровки модели грубой волатильности\\
+с помощью операторных нейронных сетей на GPU}
+
+\vspace{2cm}
+
+\begin{tabular}{ll}
+\textbf{Направление:}          & 01.04.02 Прикладная математика и информатика \\[4pt]
+\textbf{Профиль:}              & Банковские информационные технологии \\[4pt]
+\textbf{Студент:}              & Бирюков Никита Андреевич \\[4pt]
+\textbf{Научный руководитель:} & \hspace{0pt} \\[4pt]
+\textbf{Рецензент:}            & \hspace{0pt} \\
+\end{tabular}
+
+\vfill
+
+{\large Москва, 2026}
+\end{titlepage}
+
+% ── Аннотация ────────────────────────────────────────────────
+\newpage
+\begin{abstract}
+\noindent
+\textbf{Тема:} Нейронные сети в прайсинге производных финансовых инструментов.
+
+\medskip\noindent
+\textbf{Цель работы:} Разработка и исследование системы быстрой калибровки
+модели грубой волатильности Heston (Rough Heston) с использованием
+операторных нейронных сетей (Fourier Neural Operator, FNO)
+и автоградиентного метода Ньютона--Гаусса.
+
+\medskip\noindent
+\textbf{Методы:} GPU-реализация метода Фурье--COS для точного прайсинга
+поверхности подразумеваемой волатильности; суррогатная модель FNO
+с FiLM-кондиционированием (Feature-wise Linear Modulation) по параметрам
+модели; метод Ньютона--Гаусса с якобианом, вычисленным через прямое
+автоматическое дифференцирование (forward-mode AD, \texttt{jacfwd}).
+
+\medskip\noindent
+\textbf{Основные результаты:}
+\begin{enumerate}[leftmargin=2cm]
+  \item Реализован GPU-ускоренный прайсер (exponential-midpoint RK4),
+        точность $\leq\!10\,\text{б.п.}$ при $N=40$ факторах Бернштейна.
+  \item Обучена суррогатная модель FNO~v2 (50\,000 образцов, $R^2 = 0{,}9991$,
+        $\text{MAE} = 0{,}058\%$), инференс $<\!1\,\text{мс}$.
+  \item Метод Ньютона достигает сходимости за $5$--$7$ итераций
+        ($p_{95} = 668\,\text{мс}$), что в~$3\times$ быстрее L-BFGS
+        при ошибке $v_0 < 2\%$.
+  \item Продемонстрирована реал-тайм-калибровка с частотой $1{,}7$ сделки/с
+        ($p_{95} = 668\,\text{мс} < 1000\,\text{мс}$).
+  \item Дельта-хеджирование с FNO-калибровкой снижает дисперсию P\&L на $5{,}1\%$
+        по сравнению с плоской волатильностью Блэка--Шоулса.
+  \item Расширение пространства параметров: обучена модель FNO~v3
+        с~обучаемым показателем Хёрста $H \in [0{,}04; 0{,}15]$.
+\end{enumerate}
+
+\medskip\noindent
+\textbf{Практическая значимость:} Вся система работает в реальном времени
+на потребительском GPU (NVIDIA RTX~3060), что делает её применимой
+для задач риск-менеджмента и маркет-мейкинга на рынках опционов.
+
+\medskip\noindent
+\textbf{Ключевые слова:} грубая волатильность, Rough Heston, операторные
+нейронные сети, FNO, FiLM, прайсинг деривативов, калибровка, метод Ньютона,
+автоматическое дифференцирование, показатель Хёрста.
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+
+% ============================================================
+\input{ch0_intro}
+\newpage
+\input{ch_litreview}
+\newpage
+\input{ch1_math}
+\newpage
+\input{ch2_pricing}
+\newpage
+\input{ch3_fno}
+\newpage
+\input{ch4_calibration}
+\newpage
+\input{ch5_experiments}
+\newpage
+\input{ch6_conclusion}
+\newpage
+
+\printbibliography[heading=bibintoc, title={Список литературы}]
+
+\end{document}

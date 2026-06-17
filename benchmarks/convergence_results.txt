@@ -1,14 +1,13 @@
-Bernstein Factor Convergence Results
-====================================================================
-Reference: N=40
-Test params: {'kappa': 1.0, 'theta': 0.08, 'sigma': 0.5, 'rho': -0.5, 'v0': 0.08, 'H': 0.08}
+Bernstein Factor Convergence Results (GPU, exponential midpoint)
+========================================================================
+Reference: N=128  N_cos=128
+Test params: kappa=1.0, theta=0.08, sigma=0.5, rho=-0.5, v0=0.08, H=0.08
 
     N    T=0.1 MaxErr(bp)    T=1.0 MaxErr(bp)   Global MaxErr(bp)   Time(s)
 ---------------------------------------------------------------------------
-    5                 nan            126.6020                 nan      2.70
-   10                 nan             74.5205                 nan     15.29
-   20                 nan             29.3081                 nan     39.90
-   40              0.0000              0.0000                 nan    273.85
-
-N=20 vs N=40 error at T=0.1: nan bp
-Conclusion: N=20 is INSUFFICIENT (>1bp)
+    5             40.1795            151.2897            254.5047     0.122
+   10             34.2253             99.2078            157.9088     0.122
+   20             21.5867             53.9950             83.8515     0.119
+   40             10.5223             24.6865             37.9425     0.119
+   80              3.2708              7.4518             11.4033     0.123
+  128              0.0000              0.0000              0.0000     0.592  (reference)

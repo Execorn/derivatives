@@ -1,0 +1,201 @@
+% ============================================================
+%  Глава 3: Суррогатная модель — FiLM-FNO
+% ============================================================
+
+\section{Суррогатная модель: FiLM-кондиционированный FNO}
+\label{sec:fno}
+
+\subsection{Мотивация: зачем FNO, а не MLP?}
+
+Задача суррогатного прайсинга~--- выучить отображение:
+\[
+  \mathcal{G}: \mathbb{R}^p \to L^2(\mathcal{T}\times\mathcal{K}),
+  \qquad \boldsymbol{\theta} \mapsto \IV(\cdot,\cdot;\,\boldsymbol{\theta}),
+\]
+где $\mathcal{T} = [0{,}1;\,2{,}0]$ и $\mathcal{K} = [-0{,}5;\,0{,}5]$.
+Многослойный персептрон (MLP) принимает пару $(K, T, \boldsymbol{\theta})$
+и выдаёт скалярное $\IV$~--- то есть трактует поверхность как набор
+\textit{независимых} точечных предсказаний, игнорируя её функциональную структуру.
+
+\textbf{Три преимущества FNO} (см. также~\cite{Li2021}):
+\begin{enumerate}
+  \item \textbf{Индуктивное смещение на гладкость}: спектральные слои
+        FNO работают с первыми $M_{\max}$ фурье-модами, автоматически
+        подавляя высокочастотные артефакты (эквивалент регуляризации).
+        Поверхность IV является гладкой функцией $(T,K)$~--- архитектура
+        алгоритмически выровнена с этим свойством.
+  \item \textbf{Инвариантность к разрешению}: FNO обучается на сетке
+        $8\times11$, а при инференсе может быть оценён на произвольно
+        тонкой сетке без переобучения.
+  \item \textbf{Выборочная эффективность}: на 50\,000 образцах FNO достигает
+        $R^2 = 0{,}9991$. Эквивалентный MLP требует $\approx 200$--$500$\,тыс.
+        образцов~\cite{Horvath2021}.
+\end{enumerate}
+
+\subsection{Архитектура FNO}
+
+Fourier Neural Operator (Li~et~al., 2021)~\cite{Li2021} параметризует оператор
+$\mathcal{G}$ как суперпозицию локального линейного преобразования и
+глобального спектрального фильтра. Для 2D-поля $\mathbf{v} \in \mathbb{R}^{n_T\times n_K}$
+один \textit{фурье-слой} вычисляет:
+\begin{equation}
+  \label{eq:fno_layer}
+  \mathbf{v}' = \sigma\!\left(
+    W\mathbf{v}
+    + \mathcal{F}^{-1}\!\left[R_\phi \cdot \mathcal{F}[\mathbf{v}]\right]
+  \right),
+\end{equation}
+где $W$~--- линейное преобразование (skip connection), $\mathcal{F}$~---
+двумерное дискретное преобразование Фурье, $R_\phi$~--- обучаемые комплексные
+фильтры (сохраняются только первые $M_T$ и $M_K$ мод по каждому измерению),
+$\sigma$~--- нелинейность GELU.
+
+\subsubsection{Зеркальное дополнение (Mirror Padding)}
+
+Поверхность IV~--- чётная функция страйка при симметричной волатильности:
+$\IV(K, T) \approx \IV(-K, T)$. Для корректного вычисления дискретного
+преобразования Фурье применяется \textit{зеркальное дополнение} вдоль
+оси страйка:
+\[
+  \tilde{\mathbf{v}} = [\mathbf{v}^{\mathrm{rev}}, \mathbf{v}, \mathbf{v}^{\mathrm{rev}}],
+  \quad n_K \to 3n_K,
+\]
+после чего $\mathcal{F}$ применяется к $\tilde{\mathbf{v}}$, а результат
+обрезается обратно до $n_K$. Это устраняет эффект Гиббса на границах области.
+
+\subsection{FiLM-кондиционирование}
+
+FNO работает с функциональным полем $\mathbf{v}(T,K)$, тогда как
+параметры $\boldsymbol{\theta} \in \mathbb{R}^p$ нужно «встроить» в обработку.
+Применяем \textit{Feature-wise Linear Modulation}
+(FiLM, Perez~et~al., 2018)~\cite{Perez2018}:
+
+\begin{equation}
+  \label{eq:film}
+  \mathrm{FiLM}(\mathbf{v};\,\boldsymbol{\theta}) = \gamma(\boldsymbol{\theta}) \odot \mathbf{v}
+  + \beta(\boldsymbol{\theta}),
+\end{equation}
+где $\gamma, \beta: \mathbb{R}^p \to \mathbb{R}^{d_{\mathrm{ch}}}$~---
+небольшие MLP (2 скрытых слоя, 64 нейрона), вычисляющие канал-зависимые
+масштаб и сдвиг. FiLM применяется \textbf{перед каждым фурье-слоем},
+обеспечивая параметрическую модуляцию спектральной обработки.
+
+\textbf{Интуиция}: при фиксированном $\rho$ и разных $\sigma$ FiLM
+изменяет «усиление» тех фурье-мод, которые кодируют наклон улыбки,
+без переобучения весов $R_\phi$.
+
+\subsection{Полная архитектура MirrorPaddedFNO2d}
+\label{sec:full_arch}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners=4pt, minimum width=2.8cm, minimum height=0.9cm,
+              fill=blue!10, align=center, font=\small},
+  film/.style={draw, rounded corners=4pt, minimum width=2.2cm, minimum height=0.7cm,
+               fill=orange!20, text centered, font=\footnotesize},
+  arr/.style={-Stealth, thick},
+  font=\small
+]
+  \node[box] (inp) {Пространственный вход $(T,K)$};
+  \node[box, right=1.2cm of inp] (lift) {Lift Conv $1\!\times\!1$ $\dim\to 64$};
+  \node[film, below=0.5cm of lift] (film0) {FiLM($\boldsymbol\theta$)};
+  \node[box, right=1.2cm of lift] (fl1) {FourierLayer 1 $M_T\!=\!8,M_K\!=\!6$};
+  \node[film, below=0.5cm of fl1] (film1) {FiLM($\boldsymbol\theta$)};
+  \node[box, right=1.2cm of fl1] (fl2) {FourierLayer 2};
+  \node[box, right=1.2cm of fl2] (proj) {Project $64\to 1$};
+  \node[box, right=1.2cm of proj] (out) {IV Surface $8\!\times\!11$};
+  \node[box, below=1.5cm of inp] (param) {Параметры $\boldsymbol\theta$ $\in\mathbb{R}^p$};
+
+  \draw[arr] (inp) -- (lift);
+  \draw[arr] (lift) -- (fl1);
+  \draw[arr] (fl1) -- (fl2);
+  \draw[arr] (fl2) -- (proj);
+  \draw[arr] (proj) -- (out);
+  \draw[arr] (param) -- (film0);
+  \draw[arr] (film0) -- (lift);
+  \draw[arr] (param) -- (film1);
+  \draw[arr] (film1) -- (fl1);
+\end{tikzpicture}
+\caption{Архитектура MirrorPaddedFNO2d. Параметры $\boldsymbol\theta$ вводятся
+через FiLM-блоки перед каждым фурье-слоем.}
+\label{fig:fno_arch}
+\end{figure}
+
+\textbf{Параметры модели}:
+\begin{itemize}
+  \item 4 фурье-слоя, $d_{\mathrm{ch}} = 64$ канала;
+  \item Моды: $M_T = 8$, $M_K = 6$ (из $n_T=8$, $n_K=11$);
+  \item FiLM-генератор: $p \to 64 \to 64 \to d_{\mathrm{ch}}$;
+  \item Итого параметров модели: $\approx 2{,}1\,\text{млн}$.
+\end{itemize}
+
+\subsection{Нормализация}
+
+Перед обучением оба тензора нормализуются статистиками по тренировочному набору:
+\[
+  \hat\theta_j = \frac{\theta_j - \mu_j^{\theta}}{\sigma_j^{\theta}},
+  \qquad
+  \hat y_{t,k} = \frac{y_{t,k} - \mu^y}{\sigma^y}.
+\]
+Нормализаторы сохраняются вместе с весами модели для корректного применения
+при инференсе.
+
+\subsection{Функция потерь}
+\label{sec:loss}
+
+Функция потерь состоит из двух слагаемых:
+\begin{equation}
+  \label{eq:loss}
+  \mathcal{L} = \mathcal{L}_{\mathrm{MSE}} + \lambda_{\mathrm{arb}}
+                \cdot \mathcal{L}_{\mathrm{arb}},
+\end{equation}
+где $\lambda_{\mathrm{arb}} = 10^{-4}$.
+
+\textbf{MSE в нормализованном пространстве:}
+\[
+  \mathcal{L}_{\mathrm{MSE}} = \frac{1}{B\,n_T\,n_K}\sum_{b,t,k}
+  \bigl(\hat y_{b,t,k}^{\mathrm{pred}} - \hat y_{b,t,k}\bigr)^2.
+\]
+
+\textbf{Штраф за арбитраж:}
+\begin{equation}
+  \label{eq:arb_loss}
+  \mathcal{L}_{\mathrm{arb}} = \underbrace{
+    \frac{1}{B\,n_K}\sum_{b,k}\sum_{t=1}^{n_T-1}
+    \max\!\bigl(0,\, w_{b,t,k} - w_{b,t+1,k}\bigr)
+  }_{\text{calendar spread}} +
+  \underbrace{
+    \frac{1}{B\,n_T}\sum_{b,t}
+    \max\!\bigl(0,\, -g_{b,t}\bigr)
+  }_{\text{butterfly}},
+\end{equation}
+где $w_{b,t,k} = \IV_{b,t,k}^2 \cdot T_t$ и $g_{b,t}$~--- дискретный
+аналог функции Гэтерэла--Жакье из Теоремы~1.
+
+\subsection{Обучение}
+
+\begin{table}[H]
+\centering
+\caption{Гиперпараметры обучения FNO v2}
+\label{tab:train_hp}
+\begin{tabular}{ll}
+\toprule
+Гиперпараметр & Значение \\
+\midrule
+Оптимизатор       & AdamW, $\text{wd}=10^{-4}$ \\
+Начальный LR      & $3\times10^{-4}$ \\
+Планировщик       & Cosine Annealing до эпохи 400 \\
+SWA               & эпохи 401--500, $\text{LR}_{\text{SWA}}=3\times10^{-5}$ \\
+Batch size        & 512 \\
+Эпохи             & 500 (400 + 100 SWA) \\
+Размер датасета   & 50\,000 (разбивка 80/20) \\
+Устройство        & NVIDIA RTX 3060 \\
+Время обучения    & $\approx 35\,\text{мин}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textit{Stochastic Weight Averaging} (SWA, Izmailov~et~al., 2018)~\cite{Izmailov2018}
+применяется в последние 100 эпох: усредняются веса модели по траектории
+SGD, что снижает дисперсию валидационной ошибки и улучшает обобщение.

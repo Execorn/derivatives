@@ -62,9 +62,15 @@ def train():
             "Run generate_dataset_v4_learnable_h.py first.")
 
     data = np.load(DATASET_PATH)
-    params = data['params']   # (N, 6): [kappa, theta, sigma, rho, v0, H]
-    iv     = data['iv']       # (N, 8, 11)
-    print(f"  Dataset: {params.shape[0]:,} samples  params={params.shape[1]}D")
+    params   = data['params']     # (N, 6): [kappa, theta, sigma, rho, v0, H]
+    iv       = data['iv']         # (N, 8, 11) — NaN already filled with per-maturity median
+    nan_mask = data['nan_mask']   # (N,) bool — informational only; True = genuine COS price
+
+    N_eff  = params.shape[0]
+    n_genuine = nan_mask.sum()
+    print(f"  Dataset: {N_eff:,} samples  ({n_genuine:,} genuine COS, "
+          f"{N_eff-n_genuine:,} median-filled)  params={params.shape[1]}D")
+    print(f"  Note: training on ALL {N_eff:,} samples (same strategy as v2, R²=0.9991)")
 
     # ── Train/val split (80/20) ────────────────────────────────────────────────
     N      = params.shape[0]
@@ -102,6 +108,10 @@ def train():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     swa_sched = SWALR(optimizer, swa_lr=LR * 0.1)
 
+    # ── Pre-compute T/K grid tensors for arbitrage regularizer ──────────────
+    t_grid_tensor = torch.tensor(T_GRID, dtype=torch.float32, device=device)
+    k_grid_tensor = torch.tensor(K_GRID, dtype=torch.float32, device=device)
+
     best_val = float('inf'); best_ep = 0
     t0 = time.time()
 
@@ -117,7 +127,7 @@ def train():
             sp  = spatial.expand(B, -1, -1, -1)
             pred = model(sp, X_b)          # (B, nT, nK)
             loss = F.mse_loss(pred, Y_b)
-            loss = loss + 1e-4 * arbitrage_free_regularization(pred)
+            loss = loss + 1e-4 * arbitrage_free_regularization(pred, t_grid_tensor, k_grid_tensor)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
