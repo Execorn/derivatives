@@ -1,5 +1,5 @@
 # Project Context — Deep Rough Heston Calibration
-**Last updated:** 2026-06-18 · **Status:** Thesis complete (51 pp), Tier 1 market-data work in progress
+**Last updated:** 2026-06-19 · **Status:** Thesis complete (51 pp), **Tier 1 COMPLETE** — all 5 market-data extensions implemented, 408 tests passing
 
 ---
 
@@ -211,11 +211,11 @@ PARAM_BOUNDS = {
 
 | Task | Status | Stub file | Research prompt |
 |---|---|---|---|
-| §1.1 Real SPX calibration | 🟡 Research running | `src/market/spx_data.py` | Sent to Gemini |
-| §1.2 Arbitrage-free completion | 🟡 Research running | `src/arbitrage/surface_completion.py` | Sent to Gemini |
-| §1.3 VIX + variance swaps | 🟡 Research running | `src/market/vix_pricing.py` | Sent to Gemini |
-| §1.4 Greeks at scale | 🟡 Research running | `src/greeks/portfolio_greeks.py` | Sent to Gemini |
-| §1.5 Crypto (Deribit) | 🟡 Research running | `src/market/deribit_data.py` | Sent to Gemini |
+| §1.1 Real SPX calibration | ✅ **DONE** — rmse=41.5 bps | `src/market/spx_data.py` | commit `3385f29` |
+| §1.2 Arbitrage-free completion | ✅ **DONE** — 0 butterfly violations | `src/arbitrage/surface_completion.py` | commit `48d37d4` |
+| §1.3 VIX + variance swaps | ✅ **DONE** — VIX=31.3 (kappa=1,θ=0.08) | `src/market/vix_pricing.py` | commit `f2ad787` |
+| §1.4 Greeks at scale | ✅ **DONE** — delta/gamma/vega/vanna/volga | `src/greeks/portfolio_greeks.py` | commit `3695410` |
+| §1.5 Crypto (Deribit) | ✅ **DONE** — 580 BTC options fetched | `src/market/deribit_data.py` | commit `b7736fd` |
 
 ### Live API tests (confirmed 2026-06-18):
 - **yfinance 1.4.1:** SPX chain returns 152 strikes, columns: `strike, bid, ask, impliedVolatility, openInterest`
