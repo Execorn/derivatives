@@ -1,5 +1,6 @@
 # =============================================================================
-#  .gitignore — Heston Deep Learning Calibration project
+#  .gitignore — Deep Rough Heston Calibration project
+#  Last updated: 2026-06-18
 # =============================================================================
 
 # ── Python ────────────────────────────────────────────────────────────────────
@@ -138,3 +139,23 @@ images/ai_generated/
 
 # ── AI audit/analysis reports (not thesis content) ────────────────────────────
 artifacts/reports/
+
+# ── Tier 1 market data cache (downloaded on-demand, not committed) ────────────
+data/market/**/*.parquet
+data/market/**/*.csv
+data/market/**/*.json
+
+# ── Calibration result outputs (large, reproducible) ─────────────────────────
+results/**/*.npz
+results/**/*.npy
+
+# ── Jupyter notebooks (track .ipynb files) ───────────────────────────────────
+# Overriding earlier *.ipynb exclusion — we WANT notebooks in the repo
+!notebooks/*.ipynb
+.ipynb_checkpoints/
+
+# ── Legacy weights (archived, too large for git) ─────────────────────────────
+artifacts/legacy/
+
+# ── Root pycache (escaped from src/) ─────────────────────────────────────────
+/__pycache__/
