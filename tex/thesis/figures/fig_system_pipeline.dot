@@ -1,0 +1,83 @@
+// fig_system_pipeline.dot
+// Full end-to-end system pipeline
+digraph system_pipeline {
+    graph [
+        rankdir=LR
+        fontname="Helvetica Neue"
+        fontsize=13
+        bgcolor="#FAFAFA"
+        pad=0.6
+        splines=ortho
+        nodesep=0.6
+        ranksep=1.0
+    ]
+    node [fontname="Helvetica Neue" fontsize=11 style=filled shape=box penwidth=1.5]
+    edge [fontname="Helvetica Neue" fontsize=9 penwidth=1.5]
+
+    // ── Data generation ──────────────────────────────────────────
+    subgraph cluster_data {
+        label="Генерация данных (оффлайн)"
+        style=filled color="#EFF6FF" penwidth=2
+        fontname="Helvetica Neue Bold" fontsize=12
+
+        PARAMS [label="LHS-выборка\nθ = (κ,θ,σ,ρ,V₀,H)\n50 000 точек"
+                fillcolor="#DBEAFE" color="#2563EB"]
+        BERN   [label="Подъём Бернштейна\nN=400 базисных функций\nRiccati ODE → стандарт."
+                fillcolor="#DBEAFE" color="#2563EB"]
+        COS    [label="GPU Fourier-COS\nЦены опционов\n1400× быстрее MC"
+                fillcolor="#BFDBFE" color="#1D4ED8"]
+        IV_DS  [label="IV-поверхности\n(50k × 8T × 11K)\nошибка < 0.3%"
+                fillcolor="#BFDBFE" color="#1D4ED8"]
+
+        PARAMS -> BERN -> COS -> IV_DS
+    }
+
+    // ── Training ──────────────────────────────────────────────────
+    subgraph cluster_train {
+        label="Обучение FNO (оффлайн)"
+        style=filled color="#F5F3FF" penwidth=2
+        fontname="Helvetica Neue Bold" fontsize=12
+
+        FNO    [label="FiLM-FNO\nMirrorPaddedFNO2d\n3 спект. слоя + FiLM"
+                fillcolor="#EDE9FE" color="#7C3AED" shape=box]
+        SWA    [label="SWA-усреднение\nStochastic Weight Avg\nR² = 0.9991"
+                fillcolor="#DDD6FE" color="#6D28D9"]
+        NORM   [label="Нормализаторы\nParameterNormalizer\nIVSurfaceNormalizer"
+                fillcolor="#EDE9FE" color="#7C3AED"]
+
+        FNO -> SWA [label="20 эпох"]
+        SWA -> NORM
+    }
+
+    // ── Inference / Calibration ────────────────────────────────────
+    subgraph cluster_calib {
+        label="Калибровка (онлайн, ~541 мс)"
+        style=filled color="#ECFDF5" penwidth=2
+        fontname="Helvetica Neue Bold" fontsize=12
+
+        MARKET [label="Рыночные котировки\nIV(T_i, K_j)\nфильтрация + интерп."
+                fillcolor="#D1FAE5" color="#059669"]
+        REPARM [label="Репараметризация\n(σ,ρ) → (ζ=σρ, λ=σ√1-ρ²)\n3D пространство"
+                fillcolor="#D1FAE5" color="#059669"]
+        NEWTON [label="Newton-Gauss\njacobian: jacfwd(FNO)\n5 рестартов"
+                fillcolor="#A7F3D0" color="#047857"]
+        FIM    [label="Матрица Фишера\nCI 95%\nкорреляция параметров"
+                fillcolor="#D1FAE5" color="#059669"]
+        RESULT [label="θ* = (V₀*,σ*,ρ*)\nFNO Greeks\nδ, γ, Vega, Vanna"
+                fillcolor="#A7F3D0" color="#047857"]
+
+        MARKET -> REPARM -> NEWTON -> FIM
+        NEWTON -> RESULT
+        FIM -> RESULT
+    }
+
+    // ── App ────────────────────────────────────────────────────────
+    APP [label="Streamlit App\n3D IV-поверхность\nКонфидентность\nNewton-таб"
+         fillcolor="#FEF3C7" color="#D97706" shape=box]
+
+    // Cross-cluster edges
+    IV_DS -> FNO [label="train"]
+    NORM -> NEWTON [label="нормализ."]
+    SWA -> NEWTON [label="веса"]
+    RESULT -> APP
+}

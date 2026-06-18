@@ -1,0 +1,59 @@
+// fig_old_vs_new.dot — side-by-side architecture comparison
+digraph comparison {
+    graph [
+        rankdir=TB fontname="Helvetica Neue" fontsize=13
+        bgcolor="#FAFAFA" pad=0.6 nodesep=0.4 ranksep=0.5
+        compound=true
+    ]
+    node [fontname="Helvetica Neue" fontsize=11 style=filled shape=box penwidth=1.5]
+    edge [fontname="Helvetica Neue" fontsize=10 penwidth=1.5]
+
+    // ── OLD ──────────────────────────────────────────────────
+    subgraph cluster_old {
+        label="Состояние на момент презентации" style=filled
+        color="#FEE2E2" penwidth=2.5 fontcolor="#991B1B"
+        fontname="Helvetica Neue Bold" fontsize=13
+
+        O_MC   [label="Монте-Карло\n15–30 сек / поверхность\n10 000 путей" fillcolor="#FECACA" color="#DC2626"]
+        O_MLP  [label="MLP-суррогат\nHestonSurrogateMLP\nR² ≈ 0.77, MAE ≈ 3%" fillcolor="#FECACA" color="#DC2626"]
+        O_LBFG [label="L-BFGS-B\n6D напрямую\n5–10 сек" fillcolor="#FECACA" color="#DC2626"]
+        O_MCD  [label="MC Dropout\n100 форвард-пассов\nбайесовская аппрокс." fillcolor="#FECACA" color="#DC2626"]
+        O_LSTM [label="LSTM-динамика\nHestonDynamicsLSTM\nRMSE = 0.336 (норм.)" fillcolor="#FECACA" color="#DC2626"]
+        O_APP  [label="Streamlit\nsrc/app.py\nL-BFGS + LSTM-прогноз" fillcolor="#FCA5A5" color="#B91C1C"]
+
+        O_MC -> O_MLP -> O_LBFG
+        O_MLP -> O_MCD
+        O_MLP -> O_LSTM
+        O_LBFG -> O_APP
+        O_MCD -> O_APP
+        O_LSTM -> O_APP
+    }
+
+    // ── NEW ──────────────────────────────────────────────────
+    subgraph cluster_new {
+        label="Текущее состояние" style=filled
+        color="#DCFCE7" penwidth=2.5 fontcolor="#14532D"
+        fontname="Helvetica Neue Bold" fontsize=13
+
+        N_COS  [label="GPU Fourier-COS\n10–20 мс / поверхность\nBernstein N=400\nошибка < 0.3%" fillcolor="#BBF7D0" color="#059669"]
+        N_FNO  [label="FiLM-FNO v2/v3\nMirrorPaddedFNO2d\nR² = 0.9991, MAE = 0.058%" fillcolor="#BBF7D0" color="#059669"]
+        N_NWT  [label="Newton–Gauss\n3D репараметриз.\np50 = 541 мс" fillcolor="#6EE7B7" color="#047857"]
+        N_FIM  [label="Матрица Фишера\nFIM = JtJ\nCI 95%, аналитически" fillcolor="#BBF7D0" color="#059669"]
+        N_H    [label="Rough Heston\nH свободен (0.04–0.15)\ndробная память рынка" fillcolor="#BBF7D0" color="#059669"]
+        N_APP  [label="Streamlit\nsrc/app_fno.py\n3D поверхность\nNewton-таб + FIM" fillcolor="#6EE7B7" color="#047857"]
+
+        N_COS -> N_FNO -> N_NWT
+        N_FNO -> N_H
+        N_NWT -> N_FIM
+        N_NWT -> N_APP
+        N_FIM -> N_APP
+        N_H -> N_APP
+    }
+
+    // Arrows showing replacements
+    O_MC   -> N_COS  [label="1400x быстрее" style=dashed color="#4B5563" penwidth=1.2]
+    O_MLP  -> N_FNO  [label="R^2: 0.77 -> 0.9991" style=dashed color="#4B5563" penwidth=1.2]
+    O_LBFG -> N_NWT  [label="10-20x быстрее" style=dashed color="#4B5563" penwidth=1.2]
+    O_MCD  -> N_FIM  [label="аналитически точно" style=dashed color="#4B5563" penwidth=1.2]
+    O_LSTM -> N_H    [label="качественно иная\nмодель" style=dashed color="#4B5563" penwidth=1.2]
+}
