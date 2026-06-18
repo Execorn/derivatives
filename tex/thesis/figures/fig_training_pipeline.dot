@@ -1,0 +1,47 @@
+// fig_training_pipeline.dot
+digraph training {
+    graph [
+        rankdir=LR fontname="Helvetica Neue" fontsize=13
+        bgcolor="#FAFAFA" pad=0.5 nodesep=0.55 ranksep=0.8
+    ]
+    node [fontname="Helvetica Neue" fontsize=11 style=filled shape=box penwidth=1.5]
+    edge [fontname="Helvetica Neue" fontsize=10 penwidth=1.5]
+
+    // Sampling
+    LHS [label="LHS-выборка\n50 000 точек\nkappa in [0.5,5]\ntheta in [0.01,0.25]\nsigma in [0.1,1.5]\nrho in [-0.95,0]\nV0 in [0.01,0.25]\nH in [0.04,0.15]" fillcolor="#DBEAFE" color="#2563EB"]
+
+    // Bernstein
+    subgraph cluster_bern {
+        label="Bernstein Lifting" style=filled color="#F5F3FF" penwidth=2
+        BERN [label="N=400 базисных функций\nK(t) approx sum cj*exp(-xj*t)\nКерне дробного ядра" fillcolor="#EDE9FE" color="#7C3AED"]
+        ODE [label="400 ОДУ Риккати\nd(psi_i)/dt = F(u, sum cj psi_j) - xi*psi_i\nGPU RK4 параллельно" fillcolor="#DDD6FE" color="#6D28D9"]
+        CF [label="Характеристическая функция\nphi(u; kappa,theta,sigma,rho,V0,H)\nточная для Rough Heston" fillcolor="#EDE9FE" color="#7C3AED"]
+        BERN -> ODE -> CF
+    }
+
+    // COS engine
+    COS [label="Fourier-COS движок\nCos-series expansion\n8 maturity x 11 strike\n~10-20 мс / набор параметров" fillcolor="#D1FAE5" color="#059669"]
+
+    // Dataset
+    DS [label="Датасет\n50 000 x 88 IV-поверхностей\nDeepRoughDataset_v4_learnable_h.npz\n29 MB, ошибка < 0.3%" fillcolor="#A7F3D0" color="#047857"]
+
+    // FNO training
+    subgraph cluster_train {
+        label="Обучение FNO" style=filled color="#FEF3C7" penwidth=2
+        SPLIT [label="Train/Val split\n90% / 10%" fillcolor="#FDE68A" color="#D97706"]
+        FNO [label="MirrorPaddedFNO2d\nforward pass\n(B,8,11,2) x R^6 -> (B,8,11)" fillcolor="#FDE68A" color="#D97706"]
+        LOSS [label="Huber loss\nATM-weighted\nw_ATM = 3.0" fillcolor="#FDE68A" color="#D97706"]
+        OPT [label="Adam lr=1e-3\ncosine annealing\n20 эпох" fillcolor="#FEF3C7" color="#D97706"]
+        SWA [label="SWA\nStochastic Weight Averaging\nпоследние 5 эпох" fillcolor="#FDE68A" color="#D97706"]
+        SPLIT -> FNO -> LOSS -> OPT -> SWA
+    }
+
+    // Output
+    NORM [label="Нормализаторы\nparam_normalizer_v2.npz\niv_normalizer_v2.npz" fillcolor="#BFDBFE" color="#2563EB"]
+    WEIGHTS [label="Веса модели\nfno_v2_final_prod.pth\nR^2 = 0.9991, MAE = 0.058%" fillcolor="#BFDBFE" color="#1D4ED8"]
+
+    LHS -> BERN
+    CF -> COS -> DS -> SPLIT
+    SWA -> WEIGHTS
+    SWA -> NORM
+}

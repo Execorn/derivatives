@@ -1,0 +1,79 @@
+// fig_fno_architecture.dot — FiLM-FNO internal architecture
+digraph fno_arch {
+    graph [
+        rankdir=TB
+        fontname="Helvetica Neue"
+        fontsize=13
+        bgcolor="#FAFAFA"
+        pad=0.5
+        nodesep=0.5
+        ranksep=0.7
+    ]
+    node [fontname="Helvetica Neue" fontsize=11 style=filled penwidth=1.5]
+    edge [fontname="Helvetica Neue" fontsize=10 penwidth=1.8]
+
+    // Inputs
+    THETA [label="θ ∈ ℝ⁶\n(κ, θ, σ, ρ, V₀, H)\nнормализованные"
+           shape=box fillcolor="#DBEAFE" color="#2563EB"]
+    GRID  [label="Пространственная сетка\n(B, T=8, K=11, 2)\nchannels-last"
+           shape=box fillcolor="#DBEAFE" color="#2563EB"]
+
+    // FiLM MLP
+    subgraph cluster_film {
+        label="FiLM-кондиционирование" style=filled color="#FEF3C7"
+        FILM_MLP [label="MLP\n6 → 128 → 256 → 2C\nReLU"
+                  shape=box fillcolor="#FDE68A" color="#D97706"]
+        GAMMA    [label="γ (scale)\nC-мерный вектор"
+                  shape=box fillcolor="#FEF3C7" color="#D97706"]
+        BETA     [label="β (shift)\nC-мерный вектор"
+                  shape=box fillcolor="#FEF3C7" color="#D97706"]
+        FILM_MLP -> GAMMA
+        FILM_MLP -> BETA
+    }
+
+    // Lifting
+    LIFT [label="Lifting layer\nLin: 2 → C каналов"
+          shape=box fillcolor="#EDE9FE" color="#7C3AED"]
+
+    // Spectral block
+    subgraph cluster_spec1 {
+        label="Спектральный блок × 3" style=filled color="#F0FDF4"
+        FFT1  [label="FFT2D\n(T,K) → частоты"
+               shape=box fillcolor="#D1FAE5" color="#059669"]
+        TRUNC1 [label="Truncation\n4T × 5K мод"
+                shape=box fillcolor="#D1FAE5" color="#059669"]
+        WGHT1  [label="Комплексные веса\nW ∈ ℂ^{C×C×4×5}"
+                shape=box fillcolor="#A7F3D0" color="#047857"]
+        IFFT1  [label="iFFT2D\n→ физическое пр-во"
+                shape=box fillcolor="#D1FAE5" color="#059669"]
+        DCTRAP [label="DC-trap fix\n⚡ обнуление (0,0)-моды\nустраняет неидент-сть"
+                shape=box fillcolor="#FEE2E2" color="#DC2626"]
+        LIN1   [label="Residual: Lin 1×1\nпропуск спектр. слоя"
+                shape=box fillcolor="#D1FAE5" color="#059669"]
+        ADD1   [label="⊕ Сложение" shape=circle fillcolor="#A7F3D0" color="#047857"]
+        ACT1   [label="GELU" shape=box fillcolor="#D1FAE5" color="#059669"]
+        FILM_APPLY [label="FiLM:\nγ ⊙ x + β\nмодуляция признаков"
+                    shape=box fillcolor="#FDE68A" color="#D97706"]
+
+        FFT1 -> TRUNC1 -> WGHT1 -> IFFT1 -> DCTRAP
+        DCTRAP -> ADD1
+        LIN1 -> ADD1
+        ADD1 -> ACT1 -> FILM_APPLY
+    }
+
+    // Projection
+    PROJ [label="Projection\nLin: C → 128 → 1\nдля каждой (T,K)"
+          shape=box fillcolor="#EDE9FE" color="#7C3AED"]
+
+    // Output
+    OUT [label="IV-поверхность\n(B, 8, 11)\nденормализованная"
+         shape=box fillcolor="#BFDBFE" color="#1D4ED8"]
+
+    // Edges
+    THETA -> FILM_MLP
+    GRID  -> LIFT -> FFT1
+    GRID  -> LIN1
+    GAMMA -> FILM_APPLY [style=dashed color="#D97706"]
+    BETA  -> FILM_APPLY [style=dashed color="#D97706"]
+    FILM_APPLY -> PROJ -> OUT
+}

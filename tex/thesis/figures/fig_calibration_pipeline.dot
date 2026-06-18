@@ -1,0 +1,49 @@
+// fig_calibration_pipeline.dot
+digraph calibration {
+    graph [
+        rankdir=TB fontname="Helvetica Neue" fontsize=13
+        bgcolor="#FAFAFA" pad=0.5 nodesep=0.5 ranksep=0.65
+    ]
+    node [fontname="Helvetica Neue" fontsize=11 style=filled shape=box penwidth=1.5]
+    edge [fontname="Helvetica Neue" fontsize=10 penwidth=1.5]
+
+    // Input
+    MKT [label="Рыночные котировки\nbid/ask/IV(T_i, K_j)" fillcolor="#DBEAFE" color="#2563EB"]
+
+    // Preprocessing
+    FILT [label="Фильтрация ликвидности\nbid>0, OI>=10, spread<20%\nарбитражные проверки" fillcolor="#EDE9FE" color="#7C3AED"]
+    INTERP [label="Интерполяция\nна сетку 8T x 11K\ncubic spline" fillcolor="#EDE9FE" color="#7C3AED"]
+
+    // Reparameterization
+    REPARAM [label="Репараметризация\n(sigma,rho) -> (zeta,lambda)\nzeta=sigma*rho, lambda=sigma*sqrt(1-rho^2)" fillcolor="#FEF3C7" color="#D97706" shape=box]
+
+    // Newton
+    subgraph cluster_newton {
+        label="Newton-Gauss (рекомендован)" style=filled color="#ECFDF5" penwidth=2
+        INIT [label="5 случайных рестартов\n(V0, zeta, lambda) in LHS" fillcolor="#D1FAE5" color="#059669"]
+        JAC [label="Якобиан: jacfwd(FNO)\nd(IV)/d(V0,zeta,lambda)\nАналитически, не конечные разн." fillcolor="#A7F3D0" color="#047857"]
+        STEP [label="Шаг Newton-Gauss\ntheta -= (JtJ)^-1 * Jt * r\nr = FNO(theta) - IV_market" fillcolor="#D1FAE5" color="#059669"]
+        CONV [label="Сходимость?\n||r||^2 < tol\nили max_iter=20" fillcolor="#D1FAE5" color="#059669"]
+        BEST [label="Выбор лучшего рестарта\nmin loss" fillcolor="#A7F3D0" color="#047857"]
+
+        INIT -> JAC -> STEP -> CONV
+        CONV -> JAC [label="нет" style=dashed]
+        CONV -> BEST [label="да"]
+    }
+
+    // FIM
+    FIM [label="FIM = J^T J\nCov = FIM^-1\nstd_errors, ci_95, corr" fillcolor="#FEF3C7" color="#D97706"]
+
+    // Recovery
+    REC [label="Восстановление\nsigma = sqrt(zeta^2+lambda^2)\nrho = zeta / sigma" fillcolor="#EDE9FE" color="#7C3AED"]
+
+    // Output
+    OUT [label="theta* = (kappa,theta,sigma,rho,V0,H)\n+ доверительные интервалы 95%\n+ корреляции параметров" fillcolor="#BFDBFE" color="#1D4ED8"]
+
+    MKT -> FILT -> INTERP -> REPARAM
+    REPARAM -> INIT
+    BEST -> FIM
+    BEST -> REC
+    FIM -> OUT
+    REC -> OUT
+}
