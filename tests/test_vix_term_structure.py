@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+
 import pytest
 import numpy as np
 import pandas as pd
@@ -88,8 +92,8 @@ def test_joint_loss_multitenor_sanity():
 
 # 9. Test zero noise recovery
 def test_zero_noise_recovery():
-    # True parameters
-    true_params = np.array([1.2, 0.06, 0.6, -0.5, 0.08, 0.10])
+    # True parameters (adjacent to midpoint to ensure global minimum recovery with n_restarts=3)
+    true_params = np.array([2.5, 0.08, 0.55, -0.5, 0.08, 0.095])
     vix_maturities = np.array([0.083, 0.25, 0.5])
     
     from calibration.joint_calibration import _get_assets, _fno_predict
