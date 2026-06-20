@@ -130,14 +130,9 @@ def pnl_attribution(portfolio: List[Dict[str, Any]], dS: float, d_iv_surface: np
         "actual_pnl": float(actual_pnl.item() if isinstance(actual_pnl, torch.Tensor) else actual_pnl),
         "residual": float(residual.item() if isinstance(residual, torch.Tensor) else residual),
         "breakdown": {
-            "delta": float(delta_pnl_total.item()),
-            "gamma": float(gamma_pnl_total.item()),
-            "vega": float(vega_pnl_total.item()),
-            "vanna": float(vanna_pnl_total.item()),
-            "volga": float(volga_pnl_total.item()),
             "delta_pnl": float(delta_pnl_total.item()),
             "gamma_pnl": float(gamma_pnl_total.item()),
-            "vega_pnl": float(vega_pnl_total.item()),
+            "vega_pnl":  float(vega_pnl_total.item()),
             "vanna_pnl": float(vanna_pnl_total.item()),
             "volga_pnl": float(volga_pnl_total.item()),
         }

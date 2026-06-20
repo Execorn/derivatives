@@ -386,8 +386,11 @@ def interpolate_bilinear(T_grid: torch.Tensor, K_grid: torch.Tensor,
     nT = T_grid.size(0)
     nK = K_grid.size(0)
     
-    T_clip = torch.clamp(T, min=T_grid[0] + 1e-6, max=T_grid[-1] - 1e-6)
-    k_clip = torch.clamp(k, min=K_grid[0] + 1e-6, max=K_grid[-1] - 1e-6)
+    # 1e-4 margin guards against float32 precision artifacts at grid boundaries.
+    # (BUG-10 fix: 1e-6 was dangerously close to float32 machine epsilon ~1.2e-7
+    # for T_grid[0]=0.1, causing sporadic bucketize index=-1 before clamp)
+    T_clip = torch.clamp(T, min=T_grid[0] + 1e-4, max=T_grid[-1] - 1e-4)
+    k_clip = torch.clamp(k, min=K_grid[0] + 1e-4, max=K_grid[-1] - 1e-4)
     
     t_idx = torch.bucketize(T_clip, T_grid) - 1
     t_idx = torch.clamp(t_idx, min=0, max=nT - 2)
