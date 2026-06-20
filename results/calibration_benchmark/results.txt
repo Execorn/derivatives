@@ -1,0 +1,5 @@
+Batch Calibration CPU Time  : 18.456s
+Batch Calibration GPU Time  : 0.733s
+Batch Calibration Speedup   : 25.17x
+3-Month Hurst Study Time    : 3.15s
+Study Days Processed        : 65

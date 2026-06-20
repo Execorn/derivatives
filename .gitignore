@@ -159,3 +159,8 @@ artifacts/legacy/
 
 # ── Root pycache (escaped from src/) ─────────────────────────────────────────
 /__pycache__/
+
+# AI agent work directories
+.agents/
+*.ORIGINAL_REQUEST.md
+*TIER*ORCHESTRATOR*.md
