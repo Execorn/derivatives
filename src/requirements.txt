@@ -1,19 +1,31 @@
+# ── Python dependencies ───────────────────────────────────────────────────────
+# For the CUDA extension build, use setup.py (pip install -e . or python setup.py build_ext --inplace)
+# For all other dependencies, install manually or via the one-click setup scripts:
+#   Linux:   ./setup_and_run.sh
+#   Windows: setup_and_run.bat
+#
+# Core
 --extra-index-url https://download.pytorch.org/whl/cu126
-
 torch
 torchvision
 torchaudio
-pandas
 numpy
-scikit-learn
 scipy
+pandas
+scikit-learn
 matplotlib
 seaborn
+# Pricing / finance
+torchdiffeq
+py_vollib_vectorized
+yfinance
+# Web / API
 streamlit
 plotly
-torchdiffeq
-httpx
-pytest-asyncio
 fastapi
 uvicorn
 aiohttp
+httpx
+# Testing
+pytest
+pytest-asyncio

@@ -169,3 +169,33 @@ artifacts/legacy/
 test_*.py
 !tests/
 
+
+# ── LaTeX build artifacts (not needed in git — only source + compiled PDF) ────
+tex/**/*.aux
+tex/**/*.log
+tex/**/*.toc
+tex/**/*.bbl
+tex/**/*.bcf
+tex/**/*.blg
+tex/**/*.out
+tex/**/*.run.xml
+tex/**/*.nav
+tex/**/*.snm
+tex/**/*.fls
+tex/**/*.fdb_latexmk
+tex/.latex_cache/**/*
+!tex/.latex_cache/.gitkeep
+
+# ── Editor and tool config (machine-specific, not project files) ──────────────
+*.code-workspace
+mcp.json
+.idea/
+.vscode/
+
+# ── Runtime log files ─────────────────────────────────────────────────────────
+logs/*.log
+logs/*.csv
+!logs/.gitkeep
+
+# ── Development scratch files ─────────────────────────────────────────────────
+dev/
