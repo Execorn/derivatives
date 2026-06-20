@@ -164,3 +164,8 @@ artifacts/legacy/
 .agents/
 *.ORIGINAL_REQUEST.md
 *TIER*ORCHESTRATOR*.md
+
+# Root-level ad-hoc scripts (not part of repo)
+test_*.py
+!tests/
+
