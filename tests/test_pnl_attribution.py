@@ -89,11 +89,11 @@ def test_pnl_attribution_scalar_div():
     expected_residual = expected_actual - expected_explained
     
     bd = res["breakdown"]
-    assert np.isclose(bd["delta"], expected_delta)
-    assert np.isclose(bd["gamma"], expected_gamma)
-    assert np.isclose(bd["vega"], expected_vega)
-    assert np.isclose(bd["vanna"], expected_vanna)
-    assert np.isclose(bd["volga"], expected_volga)
+    assert np.isclose(bd["delta_pnl"], expected_delta)
+    assert np.isclose(bd["gamma_pnl"], expected_gamma)
+    assert np.isclose(bd["vega_pnl"], expected_vega)
+    assert np.isclose(bd["vanna_pnl"], expected_vanna)
+    assert np.isclose(bd["volga_pnl"], expected_volga)
     
     assert np.isclose(res["explained_pnl"], expected_explained)
     assert np.isclose(res["actual_pnl"], expected_actual)
