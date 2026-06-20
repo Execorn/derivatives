@@ -15,8 +15,11 @@ from scipy.stats import linregress
 import torch
 import json
 import time
+import threading
 
 import py_vollib_vectorized
+
+_LOCK = threading.Lock()
 
 # ── Grid definition (must match FNO training grid) ──────────────────────────
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])   # years
@@ -147,22 +150,23 @@ def download_spx_chain(snapshot_date: date, cache: bool = True) -> pd.DataFrame:
         model.eval()
         
         orig_v1 = calibrate._NORM_VERSIONS["v1"]
-        try:
-            calibrate._NORM_VERSIONS["v1"] = calibrate._NORM_VERSIONS["v2"]
-            calibrate._param_norm = None
-            calibrate._iv_norm = None
-            
-            # v0=0.08, sigma=0.5, rho=-0.7, kappa=1.0, theta=0.08, H=0.08
-            theta_raw = torch.tensor([[1.0, 0.08, 0.5, -0.7, 0.08, 0.08]], dtype=torch.float32, device=device)
-            spatial = calibrate._make_spatial_input(T_GRID, K_GRID, device)
-            
-            with torch.no_grad():
-                iv_surface_t = calibrate._fno_predict_real_iv(model, theta_raw, spatial)
-            iv_surface = iv_surface_t.cpu().numpy()
-        finally:
-            calibrate._NORM_VERSIONS["v1"] = orig_v1
-            calibrate._param_norm = None
-            calibrate._iv_norm = None
+        with _LOCK:
+            try:
+                calibrate._NORM_VERSIONS["v1"] = calibrate._NORM_VERSIONS["v2"]
+                calibrate._param_norm = None
+                calibrate._iv_norm = None
+                
+                # v0=0.08, sigma=0.5, rho=-0.7, kappa=1.0, theta=0.08, H=0.08
+                theta_raw = torch.tensor([[1.0, 0.08, 0.5, -0.7, 0.08, 0.08]], dtype=torch.float32, device=device)
+                spatial = calibrate._make_spatial_input(T_GRID, K_GRID, device)
+                
+                with torch.no_grad():
+                    iv_surface_t = calibrate._fno_predict_real_iv(model, theta_raw, spatial)
+                iv_surface = iv_surface_t.cpu().numpy()
+            finally:
+                calibrate._NORM_VERSIONS["v1"] = orig_v1
+                calibrate._param_norm = None
+                calibrate._iv_norm = None
             
         strikes = S0 * np.exp(np.linspace(-0.55, 0.55, 15))
         all_options = []
@@ -404,23 +408,24 @@ def to_iv_surface(df: pd.DataFrame,
         model.eval()
         
         orig_v1 = calibrate._NORM_VERSIONS["v1"]
-        try:
-            calibrate._NORM_VERSIONS["v1"] = calibrate._NORM_VERSIONS[version]
-            calibrate._param_norm = None
-            calibrate._iv_norm = None
-            
-            # Use same parameter values for synthetic surface generation
-            # [kappa, theta, sigma, rho, v0, H]
-            theta_raw = torch.tensor([[1.0, 0.08, 0.5, -0.7, 0.08, 0.08]], dtype=torch.float32, device=device)
-            spatial = calibrate._make_spatial_input(T_GRID, K_GRID, device)
-            
-            with torch.no_grad():
-                iv_surface_t = calibrate._fno_predict_real_iv(model, theta_raw, spatial)
-            iv_surface = iv_surface_t.cpu().numpy()
-        finally:
-            calibrate._NORM_VERSIONS["v1"] = orig_v1
-            calibrate._param_norm = None
-            calibrate._iv_norm = None
+        with _LOCK:
+            try:
+                calibrate._NORM_VERSIONS["v1"] = calibrate._NORM_VERSIONS[version]
+                calibrate._param_norm = None
+                calibrate._iv_norm = None
+                
+                # Use same parameter values for synthetic surface generation
+                # [kappa, theta, sigma, rho, v0, H]
+                theta_raw = torch.tensor([[1.0, 0.08, 0.5, -0.7, 0.08, 0.08]], dtype=torch.float32, device=device)
+                spatial = calibrate._make_spatial_input(T_GRID, K_GRID, device)
+                
+                with torch.no_grad():
+                    iv_surface_t = calibrate._fno_predict_real_iv(model, theta_raw, spatial)
+                iv_surface = iv_surface_t.cpu().numpy()
+            finally:
+                calibrate._NORM_VERSIONS["v1"] = orig_v1
+                calibrate._param_norm = None
+                calibrate._iv_norm = None
             
         return iv_surface
 
