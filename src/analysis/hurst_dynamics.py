@@ -56,6 +56,11 @@ def run_historical_study(
     pd.DataFrame
         DataFrame of calibrated parameters and metrics for all dates.
     """
+    # BUG-13 fix: explicitly reload v3 normalizers before calibrating.
+    # The old code mutated calibrate._NORM_VERSIONS globally (side effect).
+    # Now we use _load_normalizers("v3") which is idempotent and safe.
+    import calibrate as _calibrate_mod
+    _calibrate_mod._load_normalizers("v3")
 
     currency_upper = currency.upper()
     results_dir = project_root / "results" / "hurst_dynamics"

@@ -664,7 +664,9 @@ def portfolio_greeks(positions: list,
     vega_bucket = vega_bucket_t.cpu().numpy().astype(np.float64)
     vega_bucket = np.nan_to_num(vega_bucket, nan=0.0, posinf=0.0, neginf=0.0)
 
-    hedge_contracts = int(np.round(-total_delta / _FUTURES_MULTIPLIER))
+    # Guard against inf/nan total_delta (e.g. from adversarial inputs) — int(inf) raises OverflowError
+    _delta_for_hedge = total_delta if np.isfinite(total_delta) else 0.0
+    hedge_contracts = int(np.round(-_delta_for_hedge / _FUTURES_MULTIPLIER))
 
     return {
         "total_delta":     float(total_delta),
