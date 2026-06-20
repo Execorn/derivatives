@@ -56,6 +56,11 @@ def run_historical_study(
     pd.DataFrame
         DataFrame of calibrated parameters and metrics for all dates.
     """
+    import calibrate
+    calibrate._NORM_VERSIONS["v1"] = calibrate._NORM_VERSIONS["v3"]
+    calibrate._param_norm = None
+    calibrate._iv_norm = None
+
     currency_upper = currency.upper()
     results_dir = project_root / "results" / "hurst_dynamics"
     results_dir.mkdir(parents=True, exist_ok=True)

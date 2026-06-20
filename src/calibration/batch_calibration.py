@@ -40,9 +40,9 @@ __all__ = [
 _MAX_BATCH_GPU  = 4        # surfaces per FNO forward pass (VRAM budget)
 _PARAM_NAMES    = ["kappa", "theta", "sigma", "rho", "v0", "H"]
 
-_WEIGHTS = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_v2_final_prod.pth"
-_PN_PATH = Path(__file__).parents[2] / "artifacts" / "models" / "param_normalizer_v2.npz"
-_YN_PATH = Path(__file__).parents[2] / "artifacts" / "models" / "iv_normalizer_v2.npz"
+_WEIGHTS = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_v3_final_prod.pth"
+_PN_PATH = Path(__file__).parents[2] / "artifacts" / "models" / "param_normalizer_v3.npz"
+_YN_PATH = Path(__file__).parents[2] / "artifacts" / "models" / "iv_normalizer_v3.npz"
 
 _MATURITIES = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0], dtype=np.float32)
 _STRIKES    = np.linspace(-0.5, 0.5, 11, dtype=np.float32)
@@ -219,7 +219,10 @@ def calibrate_newton_batch(
     
     # Differentiable forward prediction
     def fwd_fn(theta_single, spatial_single):
-        theta_norm = pn.transform_tensor(theta_single.unsqueeze(0))
+        theta_fixed = theta_single.clone()
+        theta_fixed[0] = 1.0
+        theta_fixed[1] = 0.08
+        theta_norm = pn.transform_tensor(theta_fixed.unsqueeze(0))
         # Clamp normalized parameters to prevent network explosion
         theta_norm = theta_norm.clamp(min=-3.0, max=3.0)
         spatial_input = spatial_single.unsqueeze(0)
@@ -232,9 +235,9 @@ def calibrate_newton_batch(
     
     # 3 diverse starting points
     inits = torch.tensor([
-        [2.5, 0.08, 0.5, -0.5, 0.08, 0.08],
-        [1.0, 0.04, 0.3, -0.7, 0.04, 0.06],
-        [4.0, 0.12, 0.7, -0.3, 0.12, 0.10],
+        [1.0, 0.08, 0.5, -0.5, 0.08, 0.08],
+        [1.0, 0.08, 0.3, -0.7, 0.04, 0.06],
+        [1.0, 0.08, 0.7, -0.3, 0.12, 0.10],
     ], dtype=torch.float32, device=device)
     
     num_starts = len(inits)
@@ -308,6 +311,8 @@ def calibrate_newton_batch(
             alpha = alpha * 0.5
             
         theta = theta_best.detach()
+        theta[:, 0] = 1.0
+        theta[:, 1] = 0.08
         
     loss_reshaped = loss_best.reshape(num_starts, B)
     best_start_idx = loss_reshaped.argmin(dim=0)
@@ -363,7 +368,7 @@ def calibrate_single(
             try:
                 df      = download_spx_chain(snap_date, cache=True)
                 df_c    = clean_chain(df)
-                target_surface = to_iv_surface(df_c, S0=5000.0, r=0.05, q=0.015)
+                target_surface = to_iv_surface(df_c, S=5000.0, r=0.05, q=0.015)
             except Exception as exc:
                 warnings.warn(f"Market data fetch failed: {exc} — using zeros")
                 target_surface = np.full((8, 11), 0.20)
@@ -480,7 +485,7 @@ def _fetch_target_surface(date_str: str, currency: str, preset_surface: Optional
         try:
             df      = download_spx_chain(snap_date, cache=True)
             df_c    = clean_chain(df)
-            return to_iv_surface(df_c, S0=5000.0, r=0.05, q=0.015)
+            return to_iv_surface(df_c, S=5000.0, r=0.05, q=0.015)
         except Exception as exc:
             warnings.warn(f"Market data fetch failed for {date_str}: {exc} — using zeros")
             return np.full((8, 11), 0.20, dtype=np.float32)
