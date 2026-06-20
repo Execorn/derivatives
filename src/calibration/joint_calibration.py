@@ -40,6 +40,7 @@ __all__ = [
     "joint_loss",
     "BOUNDS",
     "calibrate_joint_multitenor",
+    "joint_multitenor_loss",
 ]
 
 
@@ -429,6 +430,27 @@ def joint_loss_multitenor(
         vix_err = 1.0
 
     return w_spx * rmse + w_vix * vix_err
+
+
+def joint_multitenor_loss(
+    theta_arr: np.ndarray,
+    spx_surface: np.ndarray,
+    vix_observed: np.ndarray,
+    vix_maturities: np.ndarray,
+    model,
+    pn,
+    yn,
+    device,
+    weights: Tuple[float, float] = (1.0, 1.0),
+) -> float:
+    """
+    Wrapper mapping the argument order (vix_observed, vix_maturities)
+    to joint_loss_multitenor(theta_arr, spx_surface, vix_maturities, vix_observed, ...).
+    """
+    return joint_loss_multitenor(
+        theta_arr, spx_surface, vix_maturities, vix_observed,
+        model, pn, yn, device, weights
+    )
 
 
 def parse_tenor_to_years(tenor_str: str) -> float:
