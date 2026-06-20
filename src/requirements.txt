@@ -12,3 +12,8 @@ seaborn
 streamlit
 plotly
 torchdiffeq
+httpx
+pytest-asyncio
+fastapi
+uvicorn
+aiohttp
