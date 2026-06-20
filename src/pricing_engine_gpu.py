@@ -554,7 +554,7 @@ def bs_iv_gpu(
     S   = torch.tensor(S0, dtype=torch.float64, device=dev)
     K   = K_arr.view(1, 1, -1)          # (1, 1, nK)
     T   = T_arr.view(1, -1, 1)          # (1, nT, 1)
-    sqT = torch.sqrt(T)
+    sqT = torch.sqrt(T.clamp(min=1e-10))
 
     # ---- put-call parity: convert ITM calls to OTM puts ----
     # For K < S: P = C - (S - K).  OTM put always has stable time value.

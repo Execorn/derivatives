@@ -129,7 +129,9 @@ def _get_assets(device_str: str = "auto"):
 def _make_spatial(device: torch.device) -> torch.Tensor:
     T = torch.tensor(_MATURITIES, dtype=torch.float32)
     K = torch.tensor(_STRIKES, dtype=torch.float32)
-    T_m, K_m = torch.meshgrid(T, K, indexing="ij")
+    T_norm = (T - T.mean()) / (T.std() + 1e-8)
+    K_norm = K / 0.5
+    T_m, K_m = torch.meshgrid(T_norm, K_norm, indexing="ij")
     return torch.stack([T_m, K_m], dim=-1).unsqueeze(0).to(device)  # (1,8,11,2)
 
 

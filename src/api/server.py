@@ -156,7 +156,9 @@ def _make_spatial(device: torch.device) -> torch.Tensor:
     """Build (1, nT, nK, 2) spatial input tensor for FNO."""
     T_grid = torch.tensor(_MATURITIES, dtype=torch.float32)
     K_grid = torch.tensor(_STRIKES, dtype=torch.float32)
-    T_mesh, K_mesh = torch.meshgrid(T_grid, K_grid, indexing="ij")
+    T_norm = (T_grid - T_grid.mean()) / (T_grid.std() + 1e-8)
+    K_norm = K_grid / 0.5
+    T_mesh, K_mesh = torch.meshgrid(T_norm, K_norm, indexing="ij")
     spatial = torch.stack([T_mesh, K_mesh], dim=-1).unsqueeze(0)   # (1,8,11,2)
     return spatial.to(device)
 
