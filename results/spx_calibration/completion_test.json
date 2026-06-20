@@ -1,0 +1,17 @@
+{
+    "cubic_spline": {
+        "rmse": 0.05293759631666621,
+        "calendar_violations": 0,
+        "butterfly_violations": 0
+    },
+    "svi": {
+        "rmse": 0.054230872449895454,
+        "calendar_violations": 0,
+        "butterfly_violations": 0
+    },
+    "fno": {
+        "rmse": 0.033402140452960256,
+        "calendar_violations": 0,
+        "butterfly_violations": 0
+    }
+}

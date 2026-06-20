@@ -119,104 +119,124 @@ def bs_greeks(S: float, K: float, T: float, r: float,
     if opt_type not in ["call", "put"]:
         raise ValueError(f"Unsupported option type: {option_type}")
 
-    if (T <= 0.0 or sigma_iv <= 0.0 or S <= 0.0 or K <= 0.0 or
-        not math.isfinite(S) or not math.isfinite(K) or not math.isfinite(T) or
-        not math.isfinite(sigma_iv) or not math.isfinite(r) or not math.isfinite(q)):
-        if opt_type == "call":
-            price = max(float(S) - float(K), 0.0)
-            delta = 1.0 if S > K else (0.5 if S == K else 0.0)
-        else:
-            price = max(float(K) - float(S), 0.0)
-            delta = -1.0 if S < K else (-0.5 if S == K else 0.0)
-        return {
-            "price": price,
-            "delta": delta,
-            "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0,
-            "vanna": 0.0, "volga": 0.0, "speed": 0.0, "zomma": 0.0, "ultima": 0.0,
-        }
+    # ── Robustness guard: sanitize all inputs ──────────────────────────────────
+    # Any invalid (nan/inf/non-positive) input returns a safe zero-Greek dict.
+    # We deliberately do NOT compute intrinsic value from bad inputs because
+    # max(nan - K, 0) = nan, max(inf - K, 0) = inf — both invalid outputs.
+    _ZERO_GREEKS = {
+        "price": 0.0, "delta": 0.0, "gamma": 0.0, "vega": 0.0,
+        "theta": 0.0, "rho": 0.0, "vanna": 0.0, "volga": 0.0,
+        "speed": 0.0, "zomma": 0.0, "ultima": 0.0,
+    }
+    try:
+        _S = float(S); _K = float(K); _T = float(T)
+        _r = float(r); _q = float(q); _sig = float(sigma_iv)
+    except (TypeError, ValueError, OverflowError):
+        return _ZERO_GREEKS
+
+    if not (math.isfinite(_S) and _S > 0
+            and math.isfinite(_K) and _K > 0
+            and math.isfinite(_T) and _T > 0
+            and math.isfinite(_sig) and _sig > 0
+            and math.isfinite(_r) and math.isfinite(_q)):
+        return _ZERO_GREEKS
 
     try:
-        ratio = S / K
+        ratio = _S / _K
         if ratio <= 0.0 or not math.isfinite(ratio):
             raise ValueError()
         log_S_K = math.log(ratio)
-        
-        # Calculate d1 and d2
-        d1 = (log_S_K + (r - q + 0.5 * sigma_iv ** 2) * T) / (sigma_iv * math.sqrt(T))
-        d2 = d1 - sigma_iv * math.sqrt(T)
-        
-        if math.isnan(d1) or math.isnan(d2):
+
+        denom = _sig * math.sqrt(_T)
+        if denom == 0.0 or not math.isfinite(denom):
+            raise ZeroDivisionError()
+
+        d1 = (log_S_K + (_r - _q + 0.5 * _sig ** 2) * _T) / denom
+        d2 = d1 - denom
+
+        if not math.isfinite(d1) or not math.isfinite(d2):
             raise ValueError()
-    except (ValueError, OverflowError, ZeroDivisionError):
+    except (ValueError, OverflowError, ZeroDivisionError, ArithmeticError):
+        return _ZERO_GREEKS
+
+    # Reassign to local names expected by rest of function
+    S, K, T, r, q, sigma_iv = _S, _K, _T, _r, _q, _sig
+
+    # ── All arithmetic wrapped in outer guard ─────────────────────────────────
+    # This catches ZeroDivisionError from sigma_iv**2 underflowing to 0.0 when
+    # sigma is near subnormal range (e.g. 1e-300), OverflowError from extreme
+    # intermediate values, and any other unexpected arithmetic exceptions.
+    try:
+        # Standard normal CDF and PDF
+        N_d1 = ndtr(d1)
+        N_d2 = ndtr(d2)
+        N_minus_d1 = ndtr(-d1)
+        N_minus_d2 = ndtr(-d2)
+
+        phi_d1 = math.exp(-0.5 * d1 ** 2) / math.sqrt(2.0 * math.pi)
+
+        # Robustness guard: if phi_d1 < 1e-150, set vega and dependent Greeks to 0.0
+        is_underflow = (phi_d1 < 1e-150)
+
+        # Price, delta, rho, theta
+        exp_qT = math.exp(-q * T)
+        exp_rT = math.exp(-r * T)
+
         if opt_type == "call":
-            price = max(float(S) - float(K), 0.0)
-            delta = 1.0 if S > K else (0.5 if S == K else 0.0)
+            price = S * exp_qT * N_d1 - K * exp_rT * N_d2
+            delta = exp_qT * N_d1
+            rho = K * T * exp_rT * N_d2
+            theta = - (S * exp_qT * sigma_iv * phi_d1) / (2.0 * math.sqrt(T)) \
+                    + q * S * exp_qT * N_d1 - r * K * exp_rT * N_d2
         else:
-            price = max(float(K) - float(S), 0.0)
-            delta = -1.0 if S < K else (-0.5 if S == K else 0.0)
+            price = K * exp_rT * N_minus_d2 - S * exp_qT * N_minus_d1
+            delta = -exp_qT * N_minus_d1
+            rho = -K * T * exp_rT * N_minus_d2
+            theta = - (S * exp_qT * sigma_iv * phi_d1) / (2.0 * math.sqrt(T)) \
+                    - q * S * exp_qT * N_minus_d1 + r * K * exp_rT * N_minus_d2
+
+        if is_underflow:
+            vega = 0.0
+            gamma = 0.0
+            vanna = 0.0
+            volga = 0.0
+            speed = 0.0
+            zomma = 0.0
+            ultima = 0.0
+        else:
+            # Guard: combined denominator to avoid underflow-to-zero cascades
+            sig_sqrt_T = max(sigma_iv * math.sqrt(T), 5e-300)  # subnormal guard
+            sig_sq     = max(sigma_iv ** 2, 5e-300)            # sigma^2 underflow guard
+            S_safe     = max(S, 5e-300)
+
+            vega  = S * exp_qT * math.sqrt(T) * phi_d1
+            gamma = (exp_qT * phi_d1) / (S_safe * sig_sqrt_T)
+            vanna = -exp_qT * phi_d1 * (d2 / sigma_iv)
+            volga = vega * (d1 * d2 / sigma_iv)
+            speed = -(gamma / S_safe) * (d1 / sig_sqrt_T + 1.0)
+            zomma = gamma * (d1 * d2 - 1.0) / sigma_iv
+            ultima = (vega / sig_sq) * (d1**2 * d2**2 - d1**2 - d2**2 - d1 * d2)
+
+        # Clamp outputs to finite range; any inf/nan becomes 0.0
+        def _safe_float(x: float) -> float:
+            f = float(x)
+            return f if math.isfinite(f) else 0.0
+
         return {
-            "price": price,
-            "delta": delta,
-            "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0,
-            "vanna": 0.0, "volga": 0.0, "speed": 0.0, "zomma": 0.0, "ultima": 0.0,
+            "price": _safe_float(price),
+            "delta": _safe_float(delta),
+            "gamma": _safe_float(gamma),
+            "vega":  _safe_float(vega),
+            "theta": _safe_float(theta),
+            "rho":   _safe_float(rho),
+            "vanna": _safe_float(vanna),
+            "volga": _safe_float(volga),
+            "speed": _safe_float(speed),
+            "zomma": _safe_float(zomma),
+            "ultima":_safe_float(ultima),
         }
-
-    # Standard normal CDF and PDF
-    N_d1 = ndtr(d1)
-    N_d2 = ndtr(d2)
-    N_minus_d1 = ndtr(-d1)
-    N_minus_d2 = ndtr(-d2)
-
-    phi_d1 = math.exp(-0.5 * d1 ** 2) / math.sqrt(2.0 * math.pi)
-
-    # Robustness guard: if phi_d1 < 1e-150, set vega and dependent Greeks to exactly 0.0
-    is_underflow = (phi_d1 < 1e-150)
-
-    # Price, delta, rho, theta
-    exp_qT = math.exp(-q * T)
-    exp_rT = math.exp(-r * T)
-    
-    if opt_type == "call":
-        price = S * exp_qT * N_d1 - K * exp_rT * N_d2
-        delta = exp_qT * N_d1
-        rho = K * T * exp_rT * N_d2
-        theta = - (S * exp_qT * sigma_iv * phi_d1) / (2.0 * math.sqrt(T)) + q * S * exp_qT * N_d1 - r * K * exp_rT * N_d2
-    else:
-        price = K * exp_rT * N_minus_d2 - S * exp_qT * N_minus_d1
-        delta = -exp_qT * N_minus_d1
-        rho = -K * T * exp_rT * N_minus_d2
-        theta = - (S * exp_qT * sigma_iv * phi_d1) / (2.0 * math.sqrt(T)) - q * S * exp_qT * N_minus_d1 + r * K * exp_rT * N_minus_d2
-
-    if is_underflow:
-        vega = 0.0
-        gamma = 0.0
-        vanna = 0.0
-        volga = 0.0
-        speed = 0.0
-        zomma = 0.0
-        ultima = 0.0
-    else:
-        vega = S * exp_qT * math.sqrt(T) * phi_d1
-        gamma = (exp_qT * phi_d1) / (S * sigma_iv * math.sqrt(T))
-        vanna = - exp_qT * phi_d1 * (d2 / sigma_iv)
-        volga = vega * (d1 * d2 / sigma_iv)
-        speed = - (gamma / S) * (d1 / (sigma_iv * math.sqrt(T)) + 1.0)
-        zomma = gamma * (d1 * d2 - 1.0) / sigma_iv
-        ultima = (vega / (sigma_iv ** 2)) * (d1**2 * d2**2 - d1**2 - d2**2 - d1 * d2)
-
-    return {
-        "price": float(price),
-        "delta": float(delta),
-        "gamma": float(gamma),
-        "vega": float(vega),
-        "theta": float(theta),
-        "rho": float(rho),
-        "vanna": float(vanna),
-        "volga": float(volga),
-        "speed": float(speed),
-        "zomma": float(zomma),
-        "ultima": float(ultima),
-    }
+    except (ZeroDivisionError, OverflowError, ArithmeticError, ValueError, FloatingPointError):
+        return _ZERO_GREEKS
 
 
 # ── FNO Parameter Jacobian ────────────────────────────────────────────────────
@@ -269,13 +289,37 @@ def fno_surface_greeks(model: torch.nn.Module,
     if np.any(k_grid > 2.0):
         k_grid = np.log(k_grid / S)
 
+    # FNO training bounds — clip to prevent NaN/Inf propagation through normalizer
+    _BOUNDS_ARR = np.array([
+        [0.5, 5.0],    # kappa
+        [0.01, 0.25],  # theta
+        [0.1, 1.5],    # sigma
+        [-0.95, 0.0],  # rho
+        [0.01, 0.25],  # v0
+        [0.04, 0.15],  # H
+    ], dtype=np.float32)
+
     if isinstance(theta, dict):
         theta_arr = np.array([
             theta["kappa"], theta["theta"], theta["sigma"],
             theta["rho"],   theta["v0"],    theta["H"],
         ], dtype=np.float32)
     else:
-        theta_arr = np.asarray(theta, dtype=np.float32)
+        theta_arr = np.asarray(theta, dtype=np.float32).copy()
+
+    # Replace NaN/Inf with midpoint of training range before clipping
+    midpoints = (_BOUNDS_ARR[:, 0] + _BOUNDS_ARR[:, 1]) / 2.0
+    bad_mask = ~np.isfinite(theta_arr)
+    if bad_mask.any():
+        warnings.warn(
+            f"fno_surface_greeks received non-finite theta values at positions "
+            f"{np.where(bad_mask)[0].tolist()}; replacing with training-range midpoints.",
+            RuntimeWarning, stacklevel=2,
+        )
+        theta_arr = np.where(bad_mask, midpoints, theta_arr)
+
+    # Clip to training range (also handles huge/negative out-of-range values)
+    theta_arr = np.clip(theta_arr, _BOUNDS_ARR[:, 0], _BOUNDS_ARR[:, 1])
 
     device    = next(model.parameters()).device
     theta_t   = torch.tensor(theta_arr, dtype=torch.float32, device=device)
@@ -458,7 +502,9 @@ def portfolio_greeks(positions: list,
     """
     Aggregate Greeks across a portfolio of option positions.
     """
-    T_grid = MATURITIES
+    # Cast to float64 to prevent float32 overflow in vega_bucket accumulation
+    # MATURITIES is float32 (max ~3.4e38); large positions would overflow without cast
+    T_grid = np.array(MATURITIES, dtype=np.float64)
     K_grid = STRIKES
     nT     = len(T_grid)
 
@@ -488,6 +534,12 @@ def portfolio_greeks(positions: list,
         if opt_type not in ["call", "put"]:
             raise ValueError(f"Unsupported option type: {opt_type}")
 
+        # Guard against pathological positions (K<=0, nan, inf, T<=0)
+        if not (math.isfinite(K_pos) and K_pos > 0
+                and math.isfinite(T_pos) and T_pos > 0
+                and math.isfinite(qty) and math.isfinite(notional)):
+            continue  # skip invalid positions gracefully
+
         k_pos = np.log(K_pos / S)
         sigma = _bilinear_interp(T_grid, K_grid, iv_surface, T_pos, k_pos)
         sigma = max(sigma, 1e-4)
@@ -504,17 +556,22 @@ def portfolio_greeks(positions: list,
 
         vega_pos = g["vega"] * weight
         if T_pos <= T_grid[0]:
-            vega_bucket[0] += vega_pos
+            vega_bucket[0] += float(vega_pos)
         elif T_pos >= T_grid[-1]:
-            vega_bucket[-1] += vega_pos
+            vega_bucket[-1] += float(vega_pos)
         else:
             idx = int(np.searchsorted(T_grid, T_pos)) - 1
             idx = int(np.clip(idx, 0, nT - 2))
-            wt  = (T_pos - T_grid[idx]) / max(T_grid[idx + 1] - T_grid[idx], 1e-12)
-            vega_bucket[idx]     += vega_pos * (1.0 - wt)
-            vega_bucket[idx + 1] += vega_pos * wt
+            # Explicitly cast wt to Python float to stay in float64 throughout
+            wt  = float((T_pos - T_grid[idx]) / max(T_grid[idx + 1] - T_grid[idx], 1e-12))
+            wt  = max(0.0, min(1.0, wt))  # clamp to [0,1] for safety
+            vega_bucket[idx]     += float(vega_pos) * (1.0 - wt)
+            vega_bucket[idx + 1] += float(vega_pos) * wt
 
     hedge_contracts = int(np.round(-total_delta / _FUTURES_MULTIPLIER))
+
+    # Safety: replace any residual inf/nan with 0 (e.g. from extreme notionals)
+    vega_bucket = np.nan_to_num(vega_bucket, nan=0.0, posinf=0.0, neginf=0.0)
 
     return {
         "total_delta":     float(total_delta),

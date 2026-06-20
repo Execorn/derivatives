@@ -97,7 +97,7 @@ def download_spx_chain(snapshot_date: date, cache: bool = True) -> pd.DataFrame:
                             "openInterest": open_interest,
                             "volume": volume,
                             "T": T,
-                            "log_moneyness": np.log(strike / S0),
+                            "log_moneyness": np.log(strike / (S0 * np.exp((0.05 - 0.015) * T))),
                             "is_synthetic": False
                         })
             if all_options:
@@ -173,7 +173,9 @@ def download_spx_chain(snapshot_date: date, cache: bool = True) -> pd.DataFrame:
                                 fill_value=(iv_surface[i][0], iv_surface[i][-1]))
             
             for strike in strikes:
-                log_mon = np.log(strike / S0)
+                # Forward price F = S * exp((r-q)*T) for correct log-moneyness
+                F = S0 * np.exp((r - q) * T_val)
+                log_mon = np.log(strike / F)
                 iv = float(f_interp(log_mon))
                 
                 c_price = float(py_vollib_vectorized.vectorized_black_scholes_merton("c", S0, strike, T_val, r, iv, q, return_as="numpy")[0])
@@ -423,7 +425,13 @@ def to_iv_surface(df: pd.DataFrame,
         return iv_surface
 
     df = df.copy()
-    df["log_moneyness"] = np.log(df["strike"] / S)
+    # Compute forward price per row: F = S * exp((r-q)*T)
+    # Use slice-level r,q from put-call parity regression (default r=0.05, q=0.015)
+    if "r_slice" in df.columns and "q_slice" in df.columns:
+        df["log_moneyness"] = np.log(df["strike"] / (S * np.exp((df["r_slice"] - df["q_slice"]) * df["T"])))
+    else:
+        # Fallback: use default r=0.05, q=0.015
+        df["log_moneyness"] = np.log(df["strike"] / (S * np.exp(0.035 * df["T"])))
     
     unique_T = sorted(df["T"].unique())
     M = len(unique_T)

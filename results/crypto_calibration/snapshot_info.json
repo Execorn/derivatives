@@ -1,0 +1,19 @@
+{
+  "currency": "BTC",
+  "n_options": 580,
+  "columns": [
+    "instrument_name",
+    "coin",
+    "expiry",
+    "strike",
+    "option_type",
+    "mark_iv",
+    "bid_iv",
+    "ask_iv",
+    "underlying_price",
+    "open_interest",
+    "mark_price",
+    "log_moneyness",
+    "T"
+  ]
+}

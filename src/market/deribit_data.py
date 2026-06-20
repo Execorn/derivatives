@@ -22,7 +22,7 @@ import asyncio
 import logging
 import sys
 import warnings
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -159,7 +159,7 @@ async def fetch_option_snapshot(currency: Literal["BTC", "ETH"] = "BTC") -> pd.D
         T                 # time-to-expiry in years
     Only rows with T > 0.05 and mark_iv > 0 are returned.
     """
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     raw   = await _async_fetch_snapshot(currency)
     if not raw:
         raise RuntimeError(f"No data returned from Deribit for {currency}")
