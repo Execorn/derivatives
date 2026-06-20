@@ -226,7 +226,10 @@ def benchmark_greeks(n_positions: int = 100, S: float = 5000.0) -> dict:
         theta_norm = pn.transform_tensor(theta_t)
         
         spatial = spatial_single.expand(n_positions, -1, -1, -1)
-        pred_norm = model(spatial, theta_norm)
+        pred_norm_chunks = []
+        for i in range(0, n_positions, 4):
+            pred_norm_chunks.append(model(spatial[i:i+4], theta_norm[i:i+4]))
+        pred_norm = torch.cat(pred_norm_chunks, dim=0)
         iv_surface_batch = yn.inverse_transform_tensor(pred_norm)
         iv_surface_batch = torch.clamp(iv_surface_batch, min=1e-4)
         

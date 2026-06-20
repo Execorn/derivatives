@@ -202,7 +202,12 @@ def _fno_predict_batch(
 
     with torch.no_grad():
         norms = pn.transform_tensor(theta_t)
-        preds = model(spatial, norms)
+        preds_list = []
+        for i in range(0, B, 4):
+            spatial_chunk = spatial[i:i+4]
+            norms_chunk = norms[i:i+4]
+            preds_list.append(model(spatial_chunk, norms_chunk))
+        preds = torch.cat(preds_list, dim=0)
         ivs   = yn.inverse_transform_tensor(preds)
         return ivs.clamp(min=1e-4).cpu().numpy()
 
@@ -248,17 +253,22 @@ def calibrate_newton_batch(
     lo_t = torch.tensor([0.1, 0.01, 0.1, -0.9, 0.01, 0.04], dtype=torch.float32, device=device)
     hi_t = torch.tensor([5.0, 0.15, 1.0, -0.1, 0.15, 0.15], dtype=torch.float32, device=device)
     
+    pn_mean = torch.tensor(pn.mean, dtype=torch.float32, device=device)
+    pn_std = torch.tensor(pn.std, dtype=torch.float32, device=device)
+    yn_mean = torch.tensor(yn.mean, dtype=torch.float32, device=device)
+    yn_std = torch.tensor(yn.std, dtype=torch.float32, device=device)
+
     # Differentiable forward prediction
     def fwd_fn(theta_single, spatial_single):
         theta_fixed = theta_single.clone()
         theta_fixed[0] = 1.0
         theta_fixed[1] = 0.08
-        theta_norm = pn.transform_tensor(theta_fixed.unsqueeze(0))
+        theta_norm = (theta_fixed.unsqueeze(0) - pn_mean) / pn_std
         # Clamp normalized parameters to prevent network explosion
         theta_norm = theta_norm.clamp(min=-3.0, max=3.0)
         spatial_input = spatial_single.unsqueeze(0)
         pred = model(spatial_input, theta_norm)
-        iv = yn.inverse_transform_tensor(pred)
+        iv = pred * yn_std + yn_mean
         return iv.clamp(min=1e-4).reshape(-1)
 
     vmap_fwd = torch.vmap(fwd_fn, in_dims=(0, 0))
@@ -304,11 +314,7 @@ def calibrate_newton_batch(
         r = pred_val - target_expanded
         loss = (r**2).mean(dim=1)
         
-        # Early stopping check: break if all surfaces have at least one converged start
-        best_loss_per_surface = loss.reshape(num_starts, B).min(dim=0)[0]
-        if best_loss_per_surface.max().item() < tol:
-            loss_best = loss
-            break
+        # No early stopping check on GPU to ensure zero CPU-GPU copies inside the loop
             
         # Solve LM equations: (J^T J + epsilon * diag(J^T J)) delta = -J^T r
         JtJ = torch.bmm(jac_val.transpose(1, 2), jac_val)

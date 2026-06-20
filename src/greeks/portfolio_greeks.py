@@ -502,11 +502,37 @@ def portfolio_greeks(positions: list,
     """
     Aggregate Greeks across a portfolio of option positions.
     """
-    # Cast to float64 to prevent float32 overflow in vega_bucket accumulation
-    # MATURITIES is float32 (max ~3.4e38); large positions would overflow without cast
     T_grid = np.array(MATURITIES, dtype=np.float64)
     K_grid = STRIKES
     nT     = len(T_grid)
+
+    # Filter valid positions on CPU first
+    valid_positions = []
+    for pos in positions:
+        K_pos    = float(pos.get("K", 0.0))
+        T_pos    = float(pos.get("T", 0.0))
+        qty      = float(pos.get("quantity", 1.0))
+        notional = float(pos.get("notional", 100.0))
+        opt_type = pos.get("type", "call").lower()
+
+        if opt_type not in ["call", "put"]:
+            raise ValueError(f"Unsupported option type: {opt_type}")
+
+        # Guard against pathological positions (K<=0, nan, inf, T<=0)
+        if (math.isfinite(K_pos) and K_pos > 0
+                and math.isfinite(T_pos) and T_pos > 0
+                and math.isfinite(qty) and math.isfinite(notional)):
+            valid_positions.append((K_pos, T_pos, qty, notional, 1.0 if opt_type == "call" else 0.0))
+
+    if not valid_positions:
+        return {
+            "total_delta": 0.0,
+            "total_gamma": 0.0,
+            "vega_bucket": np.zeros(nT, dtype=np.float64),
+            "total_vanna": 0.0,
+            "total_volga": 0.0,
+            "hedge_contracts": 0,
+        }
 
     device  = next(model.parameters()).device
     theta_t = torch.tensor(np.asarray(theta, dtype=np.float32), device=device)
@@ -516,62 +542,126 @@ def portfolio_greeks(positions: list,
         theta_norm = pn.transform_tensor(theta_t.unsqueeze(0))
         pred_norm  = model(spatial, theta_norm)
         iv_tensor  = yn.inverse_transform_tensor(pred_norm).squeeze(0)
-        iv_surface = iv_tensor.clamp(min=1e-4).cpu().numpy()
+        iv_surface = iv_tensor.clamp(min=1e-4) # Keep on GPU
 
-    total_delta  = 0.0
-    total_gamma  = 0.0
-    total_vanna  = 0.0
-    total_volga  = 0.0
-    vega_bucket  = np.zeros(nT, dtype=np.float64)
+    # Parse lists to GPU tensors
+    K_t = torch.tensor([p[0] for p in valid_positions], dtype=torch.float32, device=device)
+    T_t = torch.tensor([p[1] for p in valid_positions], dtype=torch.float32, device=device)
+    qty_t = torch.tensor([p[2] for p in valid_positions], dtype=torch.float32, device=device)
+    notional_t = torch.tensor([p[3] for p in valid_positions], dtype=torch.float32, device=device)
+    is_call_t = torch.tensor([p[4] for p in valid_positions], dtype=torch.float32, device=device)
 
-    for pos in positions:
-        K_pos    = float(pos["K"])
-        T_pos    = float(pos["T"])
-        qty      = float(pos.get("quantity", 1.0))
-        opt_type = pos.get("type", "call").lower()
-        notional = float(pos.get("notional", 100.0))
+    S_t = torch.tensor(S, dtype=torch.float32, device=device)
+    r_t = torch.tensor(r, dtype=torch.float32, device=device)
+    q_t = torch.zeros_like(T_t)
 
-        if opt_type not in ["call", "put"]:
-            raise ValueError(f"Unsupported option type: {opt_type}")
+    k_t = torch.log(K_t / S_t)
 
-        # Guard against pathological positions (K<=0, nan, inf, T<=0)
-        if not (math.isfinite(K_pos) and K_pos > 0
-                and math.isfinite(T_pos) and T_pos > 0
-                and math.isfinite(qty) and math.isfinite(notional)):
-            continue  # skip invalid positions gracefully
+    T_grid_t = torch.tensor(T_grid, dtype=torch.float32, device=device)
+    K_grid_t = torch.tensor(K_grid, dtype=torch.float32, device=device)
 
-        k_pos = np.log(K_pos / S)
-        sigma = _bilinear_interp(T_grid, K_grid, iv_surface, T_pos, k_pos)
-        sigma = max(sigma, 1e-4)
+    sig_t = interpolate_bilinear(T_grid_t, K_grid_t, iv_surface, T_t, k_t)
+    sig_t = torch.clamp(sig_t, min=1e-4)
 
-        g = bs_greeks(S, K_pos, T_pos, r, sigma, option_type=opt_type)
+    # Differentiable/vectorized Black-Scholes Greeks calculation
+    normal = torch.distributions.Normal(
+        torch.tensor(0.0, dtype=torch.float32, device=device),
+        torch.tensor(1.0, dtype=torch.float32, device=device)
+    )
 
-        raw_delta = g["delta"]
-        weight    = qty * notional
+    denom = sig_t * torch.sqrt(T_t)
+    denom = torch.clamp(denom, min=1e-8)
 
-        total_delta += raw_delta * weight
-        total_gamma += g["gamma"] * weight
-        total_vanna += g["vanna"] * weight
-        total_volga += g["volga"] * weight
+    d1 = (torch.log(S_t / K_t) + (r_t - q_t + 0.5 * sig_t ** 2) * T_t) / denom
+    d2 = d1 - denom
 
-        vega_pos = g["vega"] * weight
-        if T_pos <= T_grid[0]:
-            vega_bucket[0] += float(vega_pos)
-        elif T_pos >= T_grid[-1]:
-            vega_bucket[-1] += float(vega_pos)
-        else:
-            idx = int(np.searchsorted(T_grid, T_pos)) - 1
-            idx = int(np.clip(idx, 0, nT - 2))
-            # Explicitly cast wt to Python float to stay in float64 throughout
-            wt  = float((T_pos - T_grid[idx]) / max(T_grid[idx + 1] - T_grid[idx], 1e-12))
-            wt  = max(0.0, min(1.0, wt))  # clamp to [0,1] for safety
-            vega_bucket[idx]     += float(vega_pos) * (1.0 - wt)
-            vega_bucket[idx + 1] += float(vega_pos) * wt
+    # CDF values
+    N_d1 = normal.cdf(d1)
+    N_d2 = normal.cdf(d2)
+    N_minus_d1 = normal.cdf(-d1)
+
+    phi_d1 = torch.exp(-0.5 * d1 ** 2) / math.sqrt(2.0 * math.pi)
+
+    # Underflow check: if phi_d1 < 1e-150, set vega and dependent Greeks to 0.0
+    is_underflow = phi_d1 < 1e-150
+
+    exp_qT = torch.exp(-q_t * T_t)
+
+    # Call / Put Delta selection
+    delta_call = exp_qT * N_d1
+    delta_put = -exp_qT * N_minus_d1
+    delta_raw = torch.where(is_call_t == 1.0, delta_call, delta_put)
+
+    # Common Greeks: Vega, Gamma, Vanna, Volga
+    sig_sqrt_T = torch.clamp(sig_t * torch.sqrt(T_t), min=5e-300)
+    sig_sq = torch.clamp(sig_t ** 2, min=5e-300)
+    S_safe = torch.clamp(S_t, min=5e-300)
+
+    vega_raw = S_t * exp_qT * torch.sqrt(T_t) * phi_d1
+    gamma_raw = (exp_qT * phi_d1) / (S_safe * sig_sqrt_T)
+    vanna_raw = -exp_qT * phi_d1 * (d2 / sig_t)
+    volga_raw = vega_raw * (d1 * d2 / sig_t)
+
+    # Apply underflow mask
+    vega_raw = torch.where(is_underflow, torch.zeros_like(vega_raw), vega_raw)
+    gamma_raw = torch.where(is_underflow, torch.zeros_like(gamma_raw), gamma_raw)
+    vanna_raw = torch.where(is_underflow, torch.zeros_like(vanna_raw), vanna_raw)
+    volga_raw = torch.where(is_underflow, torch.zeros_like(volga_raw), volga_raw)
+
+    # Apply nan_to_num safety check
+    delta_raw = torch.nan_to_num(delta_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    gamma_raw = torch.nan_to_num(gamma_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    vega_raw = torch.nan_to_num(vega_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    vanna_raw = torch.nan_to_num(vanna_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    volga_raw = torch.nan_to_num(volga_raw, nan=0.0, posinf=0.0, neginf=0.0)
+
+    weight = qty_t * notional_t
+    delta_weighted = delta_raw * weight
+    gamma_weighted = gamma_raw * weight
+    vanna_weighted = vanna_raw * weight
+    volga_weighted = volga_raw * weight
+    vega_weighted = vega_raw * weight
+
+    total_delta = torch.sum(delta_weighted).item()
+    total_gamma = torch.sum(gamma_weighted).item()
+    total_vanna = torch.sum(vanna_weighted).item()
+    total_volga = torch.sum(volga_weighted).item()
+
+    # Vega Bucketing
+    vega_bucket_t = torch.zeros(nT, dtype=torch.float32, device=device)
+
+    # Case 1: T_t <= T_grid_t[0]
+    mask_low = T_t <= T_grid_t[0]
+    if mask_low.any():
+        vega_bucket_t[0] = vega_bucket_t[0] + torch.sum(vega_weighted[mask_low])
+
+    # Case 2: T_t >= T_grid_t[-1]
+    mask_high = T_t >= T_grid_t[-1]
+    if mask_high.any():
+        vega_bucket_t[-1] = vega_bucket_t[-1] + torch.sum(vega_weighted[mask_high])
+
+    # Case 3: T_grid_t[0] < T_t < T_grid_t[-1]
+    mask_mid = (~mask_low) & (~mask_high)
+    if mask_mid.any():
+        T_mid = T_t[mask_mid]
+        vega_mid = vega_weighted[mask_mid]
+
+        idx = torch.bucketize(T_mid, T_grid_t) - 1
+        idx = torch.clamp(idx, min=0, max=nT - 2)
+
+        t0 = T_grid_t[idx]
+        t1 = T_grid_t[idx + 1]
+
+        wt = (T_mid - t0) / torch.clamp(t1 - t0, min=1e-12)
+        wt = torch.clamp(wt, min=0.0, max=1.0)
+
+        vega_bucket_t.index_add_(0, idx, vega_mid * (1.0 - wt))
+        vega_bucket_t.index_add_(0, idx + 1, vega_mid * wt)
+
+    vega_bucket = vega_bucket_t.cpu().numpy().astype(np.float64)
+    vega_bucket = np.nan_to_num(vega_bucket, nan=0.0, posinf=0.0, neginf=0.0)
 
     hedge_contracts = int(np.round(-total_delta / _FUTURES_MULTIPLIER))
-
-    # Safety: replace any residual inf/nan with 0 (e.g. from extreme notionals)
-    vega_bucket = np.nan_to_num(vega_bucket, nan=0.0, posinf=0.0, neginf=0.0)
 
     return {
         "total_delta":     float(total_delta),
@@ -589,48 +679,57 @@ def pnl_attribution(S_before: float, S_after: float,
                      sigma_before: float, sigma_after: float,
                      greeks: dict) -> dict:
     """
-    Decompose daily P&L using second-order Taylor expansion.
+    Decompose daily P&L using second-order Taylor expansion on GPU.
     """
-    dS     = float(S_after)     - float(S_before)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Handle both scalar and vector-based volatility shifts
-    sig_bef = np.asarray(sigma_before, dtype=np.float64)
-    sig_aft = np.asarray(sigma_after, dtype=np.float64)
-    dsigma = sig_aft - sig_bef
-
+    dS = float(S_after) - float(S_before)
+    dS_t = torch.tensor(dS, dtype=torch.float32, device=device)
+    
+    sig_bef_t = torch.tensor(np.asarray(sigma_before, dtype=np.float32), device=device)
+    sig_aft_t = torch.tensor(np.asarray(sigma_after, dtype=np.float32), device=device)
+    dsigma_t = sig_aft_t - sig_bef_t
+    
     delta = float(greeks.get("total_delta", greeks.get("delta", 0.0)))
     gamma = float(greeks.get("total_gamma", greeks.get("gamma", 0.0)))
     vanna = float(greeks.get("total_vanna", greeks.get("vanna", 0.0)))
     volga = float(greeks.get("total_volga", greeks.get("volga", 0.0)))
-
+    
+    delta_t = torch.tensor(delta, dtype=torch.float32, device=device)
+    gamma_t = torch.tensor(gamma, dtype=torch.float32, device=device)
+    vanna_t = torch.tensor(vanna, dtype=torch.float32, device=device)
+    volga_t = torch.tensor(volga, dtype=torch.float32, device=device)
+    
     vega_bucket = greeks.get("vega_bucket", None)
-    if vega_bucket is not None and dsigma.ndim > 0:
-        # Maturity-specific vega attribution
-        vega_pnl = float(np.sum(vega_bucket * dsigma))
+    if vega_bucket is not None and dsigma_t.ndim > 0:
+        vega_bucket_t = torch.tensor(np.asarray(vega_bucket, dtype=np.float32), device=device)
+        vega_pnl_t = torch.sum(vega_bucket_t * dsigma_t)
     else:
         raw_vega = greeks.get("total_vega", greeks.get("vega", None))
         if raw_vega is None and vega_bucket is not None:
             raw_vega = np.sum(vega_bucket)
         vega = float(raw_vega) if raw_vega is not None else 0.0
-        dsigma_scalar = float(np.mean(dsigma)) if dsigma.ndim > 0 else float(dsigma)
-        vega_pnl = vega * dsigma_scalar
+        vega_t = torch.tensor(vega, dtype=torch.float32, device=device)
+        dsigma_scalar = torch.mean(dsigma_t) if dsigma_t.ndim > 0 else dsigma_t
+        vega_pnl_t = vega_t * dsigma_scalar
 
-    delta_pnl = delta * dS
-    gamma_pnl = 0.5 * gamma * dS ** 2
+    delta_pnl_t = delta_t * dS_t
+    gamma_pnl_t = 0.5 * gamma_t * (dS_t ** 2)
     
-    dsigma_mean = float(np.mean(dsigma)) if dsigma.ndim > 0 else float(dsigma)
-    vanna_pnl = vanna * dS * dsigma_mean
-    volga_pnl = 0.5 * volga * (dsigma_mean ** 2)
-
-    explained   = delta_pnl + gamma_pnl + vega_pnl + vanna_pnl + volga_pnl
-    actual_pnl  = float(greeks.get("actual_pnl", explained))
-    unexplained = actual_pnl - explained
+    dsigma_mean = torch.mean(dsigma_t) if dsigma_t.ndim > 0 else dsigma_t
+    vanna_pnl_t = vanna_t * dS_t * dsigma_mean
+    volga_pnl_t = 0.5 * volga_t * (dsigma_mean ** 2)
+    
+    explained_t = delta_pnl_t + gamma_pnl_t + vega_pnl_t + vanna_pnl_t + volga_pnl_t
+    actual_pnl = float(greeks.get("actual_pnl", explained_t.item()))
+    actual_pnl_t = torch.tensor(actual_pnl, dtype=torch.float32, device=device)
+    unexplained_t = actual_pnl_t - explained_t
 
     return {
-        "delta_pnl":   float(delta_pnl),
-        "gamma_pnl":   float(gamma_pnl),
-        "vega_pnl":    float(vega_pnl),
-        "vanna_pnl":   float(vanna_pnl),
-        "volga_pnl":   float(volga_pnl),
-        "unexplained": float(unexplained),
+        "delta_pnl":   float(delta_pnl_t.item()),
+        "gamma_pnl":   float(gamma_pnl_t.item()),
+        "vega_pnl":    float(vega_pnl_t.item()),
+        "vanna_pnl":   float(vanna_pnl_t.item()),
+        "volga_pnl":   float(volga_pnl_t.item()),
+        "unexplained": float(unexplained_t.item()),
     }

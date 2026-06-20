@@ -1,119 +1,144 @@
 import numpy as np
+import torch
 from typing import List, Dict, Any, Optional
 
 def pnl_attribution(portfolio: List[Dict[str, Any]], dS: float, d_iv_surface: np.ndarray, S: Optional[float] = None) -> dict:
     """
-    Portfolio-level P&L attribution using Taylor expansion:
+    Portfolio-level P&L attribution using Taylor expansion on GPU:
     explained_pnl = Delta * dS + 0.5 * Gamma * dS^2 + Vega * dIV + Vanna * dS * dIV + Volga * dIV^2
     """
-    # Import interpolation helpers from portfolio_greeks
-    from greeks.portfolio_greeks import _bilinear_interp, MATURITIES, STRIKES
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    total_explained = 0.0
-    total_actual = 0.0
+    # Pre-extract values into lists on CPU (very fast)
+    qty_list = []
+    notional_list = []
+    delta_list = []
+    gamma_list = []
+    vega_list = []
+    vanna_list = []
+    volga_list = []
+    total_delta_flag_list = []
+    actual_pnl_list = []
+    has_actual_list = []
+    T_list = []
+    K_list = []
+    S_list = []
+
+    for pos in portfolio:
+        qty_list.append(float(pos.get("quantity", 1.0)))
+        notional_list.append(float(pos.get("notional", 1.0)))
+        
+        delta_list.append(float(pos.get("total_delta", pos.get("delta", 0.0))))
+        gamma_list.append(float(pos.get("total_gamma", pos.get("gamma", 0.0))))
+        vega_list.append(float(pos.get("total_vega", pos.get("vega", 0.0))))
+        vanna_list.append(float(pos.get("total_vanna", pos.get("vanna", 0.0))))
+        volga_list.append(float(pos.get("total_volga", pos.get("volga", 0.0))))
+        
+        total_delta_flag_list.append(1.0 if "total_delta" in pos else 0.0)
+        
+        # Actual P&L extraction
+        weight = float(pos.get("quantity", 1.0)) * float(pos.get("notional", 1.0))
+        if "actual_pnl" in pos:
+            actual_pnl_list.append(float(pos["actual_pnl"]))
+            has_actual_list.append(1.0)
+        elif "price_before" in pos and "price_after" in pos:
+            actual_pnl_list.append((float(pos["price_after"]) - float(pos["price_before"])) * weight)
+            has_actual_list.append(1.0)
+        else:
+            actual_pnl_list.append(0.0)
+            has_actual_list.append(0.0)
+            
+        T_list.append(float(pos.get("T", 0.5)))
+        K_list.append(float(pos.get("K", 100.0)))
+        
+        S_pos = S if S is not None else float(pos.get("S", pos.get("S_before", pos.get("spot", 5000.0))))
+        S_list.append(S_pos)
+
+    # Convert to GPU tensors
+    qty_t = torch.tensor(qty_list, dtype=torch.float32, device=device)
+    notional_t = torch.tensor(notional_list, dtype=torch.float32, device=device)
+    delta_t = torch.tensor(delta_list, dtype=torch.float32, device=device)
+    gamma_t = torch.tensor(gamma_list, dtype=torch.float32, device=device)
+    vega_t = torch.tensor(vega_list, dtype=torch.float32, device=device)
+    vanna_t = torch.tensor(vanna_list, dtype=torch.float32, device=device)
+    volga_t = torch.tensor(volga_list, dtype=torch.float32, device=device)
+    total_delta_flag_t = torch.tensor(total_delta_flag_list, dtype=torch.float32, device=device)
+    actual_pnl_t = torch.tensor(actual_pnl_list, dtype=torch.float32, device=device)
+    has_actual_t = torch.tensor(has_actual_list, dtype=torch.float32, device=device)
+    T_t = torch.tensor(T_list, dtype=torch.float32, device=device)
+    K_t = torch.tensor(K_list, dtype=torch.float32, device=device)
+    S_t = torch.tensor(S_list, dtype=torch.float32, device=device)
     
-    delta_pnl_total = 0.0
-    gamma_pnl_total = 0.0
-    vega_pnl_total = 0.0
-    vanna_pnl_total = 0.0
-    volga_pnl_total = 0.0
+    dS_t = torch.tensor(dS, dtype=torch.float32, device=device)
+
+    # Apply scaling weights based on "total_delta" presence
+    weight_t = qty_t * notional_t
+    w_delta_t = torch.where(total_delta_flag_t == 1.0, delta_t, delta_t * weight_t)
+    w_gamma_t = torch.where(total_delta_flag_t == 1.0, gamma_t, gamma_t * weight_t)
+    w_vega_t = torch.where(total_delta_flag_t == 1.0, vega_t, vega_t * weight_t)
+    w_vanna_t = torch.where(total_delta_flag_t == 1.0, vanna_t, vanna_t * weight_t)
+    w_volga_t = torch.where(total_delta_flag_t == 1.0, volga_t, volga_t * weight_t)
     
+    total_actual_t = torch.sum(actual_pnl_t)
+
+    # Determine dIV for each position
     is_d_iv_scalar = np.isscalar(d_iv_surface) or (isinstance(d_iv_surface, np.ndarray) and d_iv_surface.ndim == 0)
     is_d_iv_1d = isinstance(d_iv_surface, (list, np.ndarray)) and not is_d_iv_scalar and len(d_iv_surface) == len(portfolio)
+
+    if is_d_iv_scalar:
+        dIV_t = torch.tensor(float(d_iv_surface), dtype=torch.float32, device=device).expand_as(T_t)
+    elif is_d_iv_1d:
+        dIV_t = torch.tensor(d_iv_surface, dtype=torch.float32, device=device)
+    else:
+        # 2D surface interpolation vectorially on GPU
+        d_iv_surf_t = torch.tensor(d_iv_surface, dtype=torch.float32, device=device)
+        
+        # Import interpolation grid and function
+        from greeks.portfolio_greeks import interpolate_bilinear, MATURITIES, STRIKES
+        
+        T_grid_t = torch.tensor(MATURITIES, dtype=torch.float32, device=device)
+        K_grid_t = torch.tensor(STRIKES, dtype=torch.float32, device=device)
+        
+        k_t = torch.log(K_t / S_t)
+        dIV_t = interpolate_bilinear(T_grid_t, K_grid_t, d_iv_surf_t, T_t, k_t)
+
+    # Taylor expansion terms for all positions vectorially
+    delta_pnl_t = w_delta_t * dS_t
+    gamma_pnl_t = 0.5 * w_gamma_t * (dS_t ** 2)
+    vega_pnl_t = w_vega_t * dIV_t
+    vanna_pnl_t = w_vanna_t * dS_t * dIV_t
+    volga_pnl_t = w_volga_t * (dIV_t ** 2)
+
+    delta_pnl_total = torch.sum(delta_pnl_t)
+    gamma_pnl_total = torch.sum(gamma_pnl_t)
+    vega_pnl_total = torch.sum(vega_pnl_t)
+    vanna_pnl_total = torch.sum(vanna_pnl_t)
+    volga_pnl_total = torch.sum(volga_pnl_t)
     
-    for i, pos in enumerate(portfolio):
-        qty = float(pos.get("quantity", 1.0))
-        notional = float(pos.get("notional", 1.0))
-        weight = qty * notional
-        
-        # Read Greeks (handling both raw and total/pre-scaled)
-        delta = float(pos.get("total_delta", pos.get("delta", 0.0)))
-        gamma = float(pos.get("total_gamma", pos.get("gamma", 0.0)))
-        vega = float(pos.get("total_vega", pos.get("vega", 0.0)))
-        vanna = float(pos.get("total_vanna", pos.get("vanna", 0.0)))
-        volga = float(pos.get("total_volga", pos.get("volga", 0.0)))
-        
-        # Determine if the Greeks are pre-scaled or raw
-        # If "total_delta" is present in the position, we assume the Greeks are pre-scaled.
-        if "total_delta" in pos:
-            w_delta = delta
-            w_gamma = gamma
-            w_vega = vega
-            w_vanna = vanna
-            w_volga = volga
-        else:
-            w_delta = delta * weight
-            w_gamma = gamma * weight
-            w_vega = vega * weight
-            w_vanna = vanna * weight
-            w_volga = volga * weight
-            
-        # Get actual P&L for this position
-        if "actual_pnl" in pos:
-            pos_actual = float(pos["actual_pnl"])
-        elif "price_before" in pos and "price_after" in pos:
-            pos_actual = (float(pos["price_after"]) - float(pos["price_before"])) * weight
-        else:
-            pos_actual = 0.0
-            
-        total_actual += pos_actual
-        
-        # Determine dIV for this position
-        if is_d_iv_scalar:
-            dIV = float(d_iv_surface)
-        elif is_d_iv_1d:
-            dIV = float(d_iv_surface[i])
-        else:
-            # 2D surface interpolation
-            T_pos = float(pos.get("T", 0.5))
-            K_pos = float(pos.get("K", 100.0))
-            # Resolve spot price
-            S_pos = S if S is not None else float(pos.get("S", pos.get("S_before", pos.get("spot", 5000.0))))
-            k_pos = np.log(K_pos / S_pos)
-            
-            # Interpolate
-            dIV = _bilinear_interp(MATURITIES, STRIKES, d_iv_surface, T_pos, k_pos)
-            
-        # Taylor expansion terms for this position
-        delta_pnl = w_delta * dS
-        gamma_pnl = 0.5 * w_gamma * (dS ** 2)
-        vega_pnl = w_vega * dIV
-        vanna_pnl = w_vanna * dS * dIV
-        volga_pnl = w_volga * (dIV ** 2)
-        
-        # Accumulate
-        delta_pnl_total += delta_pnl
-        gamma_pnl_total += gamma_pnl
-        vega_pnl_total += vega_pnl
-        vanna_pnl_total += vanna_pnl
-        volga_pnl_total += volga_pnl
-        
     explained_pnl = delta_pnl_total + gamma_pnl_total + vega_pnl_total + vanna_pnl_total + volga_pnl_total
-    
-    # If actual P&L is explicitly passed or total_actual was computed:
-    has_actual_keys = any("actual_pnl" in pos or ("price_before" in pos and "price_after" in pos) for pos in portfolio)
+
+    has_actual_keys = torch.any(has_actual_t == 1.0).item()
     if not has_actual_keys:
-        # Default to explained_pnl so residual is 0
         actual_pnl = explained_pnl
     else:
-        actual_pnl = total_actual
+        actual_pnl = total_actual_t
         
     residual = actual_pnl - explained_pnl
-    
+
     return {
-        "explained_pnl": explained_pnl,
-        "actual_pnl": actual_pnl,
-        "residual": residual,
+        "explained_pnl": float(explained_pnl.item()),
+        "actual_pnl": float(actual_pnl.item() if isinstance(actual_pnl, torch.Tensor) else actual_pnl),
+        "residual": float(residual.item() if isinstance(residual, torch.Tensor) else residual),
         "breakdown": {
-            "delta": delta_pnl_total,
-            "gamma": gamma_pnl_total,
-            "vega": vega_pnl_total,
-            "vanna": vanna_pnl_total,
-            "volga": volga_pnl_total,
-            "delta_pnl": delta_pnl_total,
-            "gamma_pnl": gamma_pnl_total,
-            "vega_pnl": vega_pnl_total,
-            "vanna_pnl": vanna_pnl_total,
-            "volga_pnl": volga_pnl_total,
+            "delta": float(delta_pnl_total.item()),
+            "gamma": float(gamma_pnl_total.item()),
+            "vega": float(vega_pnl_total.item()),
+            "vanna": float(vanna_pnl_total.item()),
+            "volga": float(volga_pnl_total.item()),
+            "delta_pnl": float(delta_pnl_total.item()),
+            "gamma_pnl": float(gamma_pnl_total.item()),
+            "vega_pnl": float(vega_pnl_total.item()),
+            "vanna_pnl": float(vanna_pnl_total.item()),
+            "volga_pnl": float(volga_pnl_total.item()),
         }
     }
