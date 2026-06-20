@@ -171,106 +171,74 @@ def check_butterfly(iv_surface: np.ndarray,
 
 def fit_svi_slice(k: np.ndarray, total_var: np.ndarray) -> dict:
     """
-    Fit raw SVI parametrization to a single maturity slice.
+    Fit raw SVI parametrization to a single maturity slice using PyTorch on GPU.
 
     SVI: w(k) = a + b * (rho*(k-m) + sqrt((k-m)^2 + sigma^2))
     where w = sigma_IV^2 * T (total variance).
 
     Returns: {"a": ..., "b": ..., "rho": ..., "m": ..., "sigma": ...}
     """
-    def svi_fun(k_val, a, b, rho, m, sigma):
-        return a + b * (rho * (k_val - m) + np.sqrt((k_val - m)**2 + sigma**2))
-        
-    def objective(params):
-        a, b, rho, m, sigma = params
-        pred = svi_fun(k, a, b, rho, m, sigma)
-        return np.sum((pred - total_var)**2)
-        
-    a_init = np.minimum(np.max(total_var), np.maximum(0.0, np.mean(total_var)))
-    initial_guess = np.array([a_init, 0.1, -0.5, 0.0, 0.1])
-    
-    bounds = [
-        (0.0, max(10.0, np.max(total_var) * 2.0)),   # a
-        (0.0, 10.0),                                 # b
-        (-0.999, 0.999),                             # rho
-        (2.0 * np.min(k), 2.0 * np.max(k)),          # m
-        (1e-4, 5.0)                                  # sigma
-    ]
-    
-    cons = ({
-        'type': 'ineq',
-        'fun': lambda p: 4.0 - p[1] * (1.0 + np.abs(p[2]))
-    })
-    
-    res = optimize.minimize(
-        objective,
-        initial_guess,
-        method='SLSQP',
-        bounds=bounds,
-        constraints=cons,
-        options={'maxiter': 500}
-    )
-    
-    if not res.success:
-        # Fallback to Nelder-Mead with penalized objective and manual projection
-        def objective_penalized(params):
-            a, b, rho, m, sigma = params
-            pred = svi_fun(k, a, b, rho, m, sigma)
-            base_loss = np.sum((pred - total_var)**2)
-            
-            penalty = 0.0
-            if a < bounds[0][0]: penalty += 1e5 * (bounds[0][0] - a)**2
-            if a > bounds[0][1]: penalty += 1e5 * (a - bounds[0][1])**2
-            if b < bounds[1][0]: penalty += 1e5 * (bounds[1][0] - b)**2
-            if b > bounds[1][1]: penalty += 1e5 * (b - bounds[1][1])**2
-            if rho < bounds[2][0]: penalty += 1e5 * (bounds[2][0] - rho)**2
-            if rho > bounds[2][1]: penalty += 1e5 * (rho - bounds[2][1])**2
-            if m < bounds[3][0]: penalty += 1e5 * (bounds[3][0] - m)**2
-            if m > bounds[3][1]: penalty += 1e5 * (m - bounds[3][1])**2
-            if sigma < bounds[4][0]: penalty += 1e5 * (bounds[4][0] - sigma)**2
-            if sigma > bounds[4][1]: penalty += 1e5 * (sigma - bounds[4][1])**2
-            
-            c_val = b * (1.0 + np.abs(rho))
-            if c_val > 4.0:
-                penalty += 1e5 * (c_val - 4.0)**2
-            return base_loss + penalty
-            
-        res_nm = optimize.minimize(
-            objective_penalized,
-            initial_guess,
-            method='Nelder-Mead',
-            options={'maxiter': 1000}
-        )
-        
-        # Project results to bounds
-        a, b, rho, m, sigma = res_nm.x
-        a = np.clip(a, bounds[0][0], bounds[0][1])
-        b = np.clip(b, bounds[1][0], bounds[1][1])
-        rho = np.clip(rho, bounds[2][0], bounds[2][1])
-        m = np.clip(m, bounds[3][0], bounds[3][1])
-        sigma = np.clip(sigma, bounds[4][0], bounds[4][1])
-        
-        if b * (1.0 + np.abs(rho)) > 4.0:
-            b = 4.0 / (1.0 + np.abs(rho))
-            
-        params_dict = {
-            "a": float(a),
-            "b": float(b),
-            "rho": float(rho),
-            "m": float(m),
-            "sigma": float(sigma)
-        }
-    else:
-        a, b, rho, m, sigma = res.x
-        params_dict = {
-            "a": float(a),
-            "b": float(b),
-            "rho": float(rho),
-            "m": float(m),
-            "sigma": float(sigma)
-        }
-        
-    return params_dict
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    k_t = torch.as_tensor(k, dtype=torch.float32, device=device)
+    total_var_t = torch.as_tensor(total_var, dtype=torch.float32, device=device)
+
+    a_max = float(max(10.0, np.max(total_var) * 2.0))
+    b_max = 10.0
+    m_min, m_max = float(2.0 * np.min(k)), float(2.0 * np.max(k))
+    sigma_min, sigma_max = 1e-4, 5.0
+
+    a_init = float(np.minimum(np.max(total_var), np.maximum(0.0, np.mean(total_var))))
+    b_init = 0.1
+    rho_init = -0.5
+    m_init = 0.0
+    sigma_init = 0.1
+
+    def to_unconstrained(y, y_min, y_max):
+        p = (y - y_min) / (y_max - y_min)
+        p = np.clip(p, 1e-6, 1.0 - 1e-6)
+        return np.log(p / (1.0 - p))
+
+    raw_a = torch.tensor(to_unconstrained(a_init, 0.0, a_max), device=device, requires_grad=True)
+    raw_rho = torch.tensor(np.arctanh(rho_init / 0.999), device=device, requires_grad=True)
+    b_limit = 4.0 / (1.0 + abs(rho_init))
+    b_upper = min(b_max, b_limit)
+    raw_b = torch.tensor(to_unconstrained(b_init, 0.0, b_upper), device=device, requires_grad=True)
+    raw_m = torch.tensor(to_unconstrained(m_init, m_min, m_max), device=device, requires_grad=True)
+    raw_sigma = torch.tensor(to_unconstrained(sigma_init, sigma_min, sigma_max), device=device, requires_grad=True)
+
+    optimizer = torch.optim.LBFGS([raw_a, raw_b, raw_rho, raw_m, raw_sigma], lr=1.0, max_iter=100)
+
+    def get_constrained():
+        a = a_max * torch.sigmoid(raw_a)
+        rho = 0.999 * torch.tanh(raw_rho)
+        b_limit = 4.0 / (1.0 + torch.abs(rho))
+        b_upper = torch.minimum(torch.tensor(b_max, device=device), b_limit)
+        b = b_upper * torch.sigmoid(raw_b)
+        m = m_min + (m_max - m_min) * torch.sigmoid(raw_m)
+        sigma = sigma_min + (sigma_max - sigma_min) * torch.sigmoid(raw_sigma)
+        return a, b, rho, m, sigma
+
+    def closure():
+        optimizer.zero_grad()
+        a, b, rho, m, sigma = get_constrained()
+        pred = a + b * (rho * (k_t - m) + torch.sqrt((k_t - m)**2 + sigma**2))
+        loss = torch.sum((pred - total_var_t)**2)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+
+    a, b, rho, m, sigma = get_constrained()
+
+    return {
+        "a": float(a.item()),
+        "b": float(b.item()),
+        "rho": float(rho.item()),
+        "m": float(m.item()),
+        "sigma": float(sigma.item())
+    }
 
 
 def monotone_rearrangement(f: np.ndarray, axis: int = 0) -> np.ndarray:
@@ -494,28 +462,137 @@ def complete_surface(sparse_iv: np.ndarray,
         return completed_surface
 
     elif method == "svi":
+        import torch
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         completed_surface = np.zeros((nT, nK))
+
+        # 1. Identify valid slices with >= 5 observed points
+        valid_slices = []
+        max_obs = 0
         for t in range(nT):
-            observed_k = K_grid[mask[t]]
-            observed_iv = sparse_iv[t][mask[t]]
-            if len(observed_iv) >= 5:
-                observed_total_var = (observed_iv**2) * T_grid[t]
-                params = fit_svi_slice(observed_k, observed_total_var)
-                
-                # SVI parameterization w(k) = a + b * (rho*(k-m) + sqrt((k-m)^2 + sigma^2))
-                a, b, rho, m, sigma = params["a"], params["b"], params["rho"], params["m"], params["sigma"]
-                pred_total_var = a + b * (rho * (K_grid - m) + np.sqrt((K_grid - m)**2 + sigma**2))
-                completed_surface[t] = np.sqrt(np.clip(pred_total_var, 1e-8, None) / max(T_grid[t], 1e-10))
+            num_obs = np.sum(mask[t])
+            if num_obs >= 5:
+                valid_slices.append((t, num_obs))
+                if num_obs > max_obs:
+                    max_obs = num_obs
+
+        if len(valid_slices) > 0:
+            n_valid = len(valid_slices)
+            k_pad = np.zeros((n_valid, max_obs), dtype=np.float32)
+            var_pad = np.zeros((n_valid, max_obs), dtype=np.float32)
+            loss_mask = np.zeros((n_valid, max_obs), dtype=np.float32)
+
+            a_max_arr = np.zeros(n_valid, dtype=np.float32)
+            m_min_arr = np.zeros(n_valid, dtype=np.float32)
+            m_max_arr = np.zeros(n_valid, dtype=np.float32)
+
+            a_init_arr = np.zeros(n_valid, dtype=np.float32)
+            m_init_arr = np.zeros(n_valid, dtype=np.float32)
+
+            for idx, (t, num_obs) in enumerate(valid_slices):
+                if K_grid.ndim == 1:
+                    obs_k = K_grid[mask[t]]
+                else:
+                    obs_k = K_grid[t][mask[t]]
+                obs_iv = sparse_iv[t][mask[t]]
+                obs_var = (obs_iv**2) * T_grid[t]
+
+                k_pad[idx, :num_obs] = obs_k
+                var_pad[idx, :num_obs] = obs_var
+                loss_mask[idx, :num_obs] = 1.0
+
+                a_max_arr[idx] = max(10.0, np.max(obs_var) * 2.0)
+                m_min_arr[idx] = 2.0 * np.min(obs_k)
+                m_max_arr[idx] = 2.0 * np.max(obs_k)
+
+                a_init_arr[idx] = np.minimum(np.max(obs_var), np.maximum(0.0, np.mean(obs_var)))
+                m_init_arr[idx] = 0.0
+
+            # Convert parameters/bounds to GPU PyTorch tensors
+            k_t = torch.as_tensor(k_pad, device=device)
+            var_t = torch.as_tensor(var_pad, device=device)
+            mask_t = torch.as_tensor(loss_mask, device=device)
+
+            a_max_t = torch.as_tensor(a_max_arr, device=device)
+            m_min_t = torch.as_tensor(m_min_arr, device=device)
+            m_max_t = torch.as_tensor(m_max_arr, device=device)
+
+            def to_unconstrained(y, y_min, y_max):
+                p = (y - y_min) / (y_max - y_min)
+                p = np.clip(p, 1e-6, 1.0 - 1e-6)
+                return np.log(p / (1.0 - p))
+
+            # Initialize parameters
+            raw_a = torch.tensor(to_unconstrained(a_init_arr, 0.0, a_max_arr), device=device, requires_grad=True)
+            raw_rho = torch.tensor(np.full(n_valid, np.arctanh(-0.5 / 0.999), dtype=np.float32), device=device, requires_grad=True)
+
+            b_limit_arr = 4.0 / (1.0 + abs(-0.5))
+            b_upper_arr = np.minimum(10.0, b_limit_arr)
+            raw_b = torch.tensor(to_unconstrained(np.full(n_valid, 0.1, dtype=np.float32), 0.0, b_upper_arr), device=device, requires_grad=True)
+
+            raw_m = torch.tensor(to_unconstrained(m_init_arr, m_min_arr, m_max_arr), device=device, requires_grad=True)
+            raw_sigma = torch.tensor(to_unconstrained(np.full(n_valid, 0.1, dtype=np.float32), 1e-4, 5.0), device=device, requires_grad=True)
+
+            optimizer = torch.optim.LBFGS([raw_a, raw_b, raw_rho, raw_m, raw_sigma], lr=1.0, max_iter=100)
+
+            def get_constrained():
+                a = (a_max_t * torch.sigmoid(raw_a)).unsqueeze(1)
+                rho = (0.999 * torch.tanh(raw_rho)).unsqueeze(1)
+                b_limit = 4.0 / (1.0 + torch.abs(rho))
+                b_upper = torch.minimum(torch.tensor(10.0, device=device), b_limit)
+                b = b_upper * torch.sigmoid(raw_b).unsqueeze(1)
+                m = (m_min_t + (m_max_t - m_min_t) * torch.sigmoid(raw_m)).unsqueeze(1)
+                sigma = (1e-4 + (5.0 - 1e-4) * torch.sigmoid(raw_sigma)).unsqueeze(1)
+                return a, b, rho, m, sigma
+
+            def closure():
+                optimizer.zero_grad()
+                a, b, rho, m, sigma = get_constrained()
+                pred = a + b * (rho * (k_t - m) + torch.sqrt((k_t - m)**2 + sigma**2))
+                loss = torch.sum(((pred - var_t)**2) * mask_t)
+                loss.backward()
+                return loss
+
+            optimizer.step(closure)
+
+            # Get final parameter values
+            a, b, rho, m, sigma = get_constrained()
+
+            # Predict full grid for completed surface
+            K_grid_t = torch.as_tensor(K_grid, device=device, dtype=torch.float32)
+            if K_grid_t.ndim == 1:
+                K_grid_t = K_grid_t.unsqueeze(0).repeat(n_valid, 1)  # (n_valid, nK)
             else:
-                # Median fallback
+                valid_indices = [t for t, _ in valid_slices]
+                K_grid_t = K_grid_t[valid_indices]
+
+            T_grid_t = torch.as_tensor([T_grid[t] for t, _ in valid_slices], device=device, dtype=torch.float32).unsqueeze(1)
+
+            pred_var = a + b * (rho * (K_grid_t - m) + torch.sqrt((K_grid_t - m)**2 + sigma**2))
+            completed_vols = torch.sqrt(torch.clamp(pred_var, min=1e-8) / torch.clamp(T_grid_t, min=1e-10))
+            completed_vols_np = completed_vols.detach().cpu().numpy()
+
+            valid_idx = 0
+            for t in range(nT):
+                if mask[t].sum() >= 5:
+                    completed_surface[t] = completed_vols_np[valid_idx]
+                    valid_idx += 1
+                else:
+                    observed_iv = sparse_iv[t][mask[t]]
+                    if len(observed_iv) > 0:
+                        val = np.median(observed_iv)
+                    else:
+                        all_observed_vols = sparse_iv[mask]
+                        val = np.median(all_observed_vols) if len(all_observed_vols) > 0 else 0.20
+                    completed_surface[t] = np.full(nK, val)
+        else:
+            for t in range(nT):
+                observed_iv = sparse_iv[t][mask[t]]
                 if len(observed_iv) > 0:
                     val = np.median(observed_iv)
                 else:
                     all_observed_vols = sparse_iv[mask]
-                    if len(all_observed_vols) > 0:
-                        val = np.median(all_observed_vols)
-                    else:
-                        val = 0.20
+                    val = np.median(all_observed_vols) if len(all_observed_vols) > 0 else 0.20
                 completed_surface[t] = np.full(nK, val)
 
         # Apply arbitrage-free projection
