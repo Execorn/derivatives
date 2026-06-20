@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from scipy.optimize import minimize
 
@@ -30,7 +31,7 @@ _src = str(Path(__file__).parents[1])
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
-from market.vix_pricing import model_vix
+from market.vix_pricing import model_vix, vix_futures_curve
 
 __all__ = [
     "calibrate_joint",
@@ -38,15 +39,17 @@ __all__ = [
     "calibrate_vix_only",
     "joint_loss",
     "BOUNDS",
+    "calibrate_joint_multitenor",
 ]
+
 
 # ── Parameter bounds (must match FNO training) ────────────────────────────────
 BOUNDS: Dict[str, Tuple[float, float]] = {
-    "kappa": (0.5,   5.0),
-    "theta": (0.01,  0.25),
-    "sigma": (0.1,   1.5),
-    "rho":   (-0.95, 0.0),
-    "v0":    (0.01,  0.25),
+    "kappa": (0.1,   5.0),
+    "theta": (0.01,  0.15),
+    "sigma": (0.1,   1.0),
+    "rho":   (-0.9, -0.1),
+    "v0":    (0.01,  0.15),
     "H":     (0.04,  0.15),
 }
 
@@ -69,9 +72,9 @@ _MIDPOINTS = np.array(
 # ── Model cache ────────────────────────────────────────────────────────────────
 _CACHE: Dict[str, object] = {}
 
-_WEIGHTS = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_v2_final_prod.pth"
-_PN_PATH = Path(__file__).parents[2] / "artifacts" / "models" / "param_normalizer_v2.npz"
-_YN_PATH = Path(__file__).parents[2] / "artifacts" / "models" / "iv_normalizer_v2.npz"
+_WEIGHTS = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_v3_final_prod.pth"
+_PN_PATH = Path(__file__).parents[2] / "artifacts" / "models" / "param_normalizer_v3.npz"
+_YN_PATH = Path(__file__).parents[2] / "artifacts" / "models" / "iv_normalizer_v3.npz"
 
 # FNO training grids
 _MATURITIES = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0], dtype=np.float32)
@@ -386,3 +389,209 @@ def calibrate_vix_only(
         "vix_error": float(vix_err_pts),
         "converged": res.success,
     }
+
+
+def joint_loss_multitenor(
+    theta_arr: np.ndarray,
+    spx_surface: np.ndarray,
+    vix_maturities: np.ndarray,
+    vix_observed: np.ndarray,
+    model,
+    pn,
+    yn,
+    device,
+    weights: Tuple[float, float] = (1.0, 1.0),
+) -> float:
+    """
+    Compute joint SPX + multi-tenor VIX loss for parameter vector θ.
+    """
+    w_spx, w_vix = weights
+    kappa, theta, sigma, rho, v0, H = theta_arr.tolist()
+
+    # 1. SPX surface RMSE term
+    try:
+        pred  = _fno_predict(theta_arr, model, pn, yn, device)
+        rmse  = _rmse_bps(pred, spx_surface) / 10000.0   # back to decimal IV
+    except Exception:
+        rmse  = 1.0
+
+    # 2. VIX model term structure term
+    try:
+        vix_pred = vix_futures_curve(
+            kappa=kappa, theta=theta, sigma=sigma,
+            rho=rho, v0=v0, H=H,
+            maturities=vix_maturities
+        )
+        vix_err = np.sum(((vix_pred - vix_observed) / 100.0) ** 2)
+    except Exception:
+        vix_err = 1.0
+
+    return w_spx * rmse + w_vix * vix_err
+
+
+def parse_tenor_to_years(tenor_str: str) -> float:
+    """Parse tenor string like '1M', '3M', '6M' to maturity in years."""
+    tenor_str = tenor_str.strip().upper()
+    if tenor_str.endswith("M"):
+        return float(tenor_str[:-1]) / 12.0
+    elif tenor_str.endswith("Y"):
+        return float(tenor_str[:-1])
+    elif tenor_str.endswith("W"):
+        return float(tenor_str[:-1]) / 52.0
+    elif tenor_str.endswith("D"):
+        return float(tenor_str[:-1]) / 365.25
+    else:
+        return float(tenor_str)
+
+
+def calibrate_joint_multitenor(
+    spx_surface: np.ndarray,
+    vix_term_structure: dict[str, float] | pd.DataFrame,
+    weights: Tuple[float, float] = (1.0, 1.0),
+    n_restarts: int = 3,
+    seed: int = 42,
+) -> dict:
+    """
+    Jointly calibrate Rough Heston to SPX IV surface and VIX term structure.
+    """
+    model, pn, yn, device = _get_assets()
+    rng = np.random.default_rng(seed)
+
+    # Parse VIX term structure
+    vix_maturities_list = []
+    vix_observed_list = []
+
+    if isinstance(vix_term_structure, dict):
+        for key, val in vix_term_structure.items():
+            T = parse_tenor_to_years(key)
+            vix_maturities_list.append(T)
+            vix_observed_list.append(val)
+    elif isinstance(vix_term_structure, pd.DataFrame):
+        for _, row in vix_term_structure.iterrows():
+            tenor_m = row["tenor_months"]
+            vix_obs = row["settle_vix"]
+            T = tenor_m / 12.0
+            vix_maturities_list.append(T)
+            vix_observed_list.append(vix_obs)
+    else:
+        raise TypeError("vix_term_structure must be dict or pd.DataFrame")
+
+    vix_maturities = np.array(vix_maturities_list, dtype=np.float64)
+    vix_observed = np.array(vix_observed_list, dtype=np.float64)
+
+    best_loss   = np.inf
+    best_theta  = _MIDPOINTS.copy()
+    best_result = None
+
+    # Starting points: smart data-driven start + midpoint + (n_restarts-2) random samples
+    try:
+        atm_idx = spx_surface.shape[1] // 2
+        v0_est = float(np.clip(spx_surface[0, atm_idx] ** 2, 0.01 + 1e-4, 0.15 - 1e-4))
+        theta_est = float(np.clip(spx_surface[-1, atm_idx] ** 2, 0.01 + 1e-4, 0.15 - 1e-4))
+    except Exception:
+        v0_est = 0.08
+        theta_est = 0.08
+
+    smart_start = np.array([1.2, theta_est, 0.5, -0.4, v0_est, 0.08], dtype=np.float64)
+
+    starts = [smart_start]
+    if n_restarts > 1:
+        starts.append(_MIDPOINTS.copy())
+    for _ in range(n_restarts - 2):
+        start = np.array(
+            [rng.uniform(lo, hi) for lo, hi in _BOUNDS_LIST], dtype=np.float64
+        )
+        starts.append(start)
+
+    def _loss(x):
+        return joint_loss_multitenor(
+            x, spx_surface, vix_maturities, vix_observed,
+            model, pn, yn, device, weights
+        )
+
+    results = []
+    for x0 in starts:
+        try:
+            res = minimize(
+                _loss,
+                x0,
+                method="L-BFGS-B",
+                bounds=_BOUNDS_LIST,
+                options={"maxiter": 200, "ftol": 1e-10, "gtol": 1e-7},
+            )
+            results.append(res)
+        except Exception as exc:
+            warnings.warn(f"Restart failed: {exc}")
+
+    if results:
+        # Find the absolute best loss
+        abs_best_loss = min(r.fun for r in results)
+        
+        # Tie-breaker selection: if another restart has loss within 25 bps of the best,
+        # we prefer the parameter set that is closer to the smart start in parameter space.
+        good_results = [r for r in results if r.fun - abs_best_loss <= 0.0025]
+        
+        def param_dist_to_smart(r):
+            p = r.x
+            dist = 0.0
+            for i, (lo_b, hi_b) in enumerate(_BOUNDS_LIST):
+                dist += ((p[i] - smart_start[i]) / (hi_b - lo_b)) ** 2
+            return dist
+
+        best_result = min(good_results, key=param_dist_to_smart)
+        best_loss = best_result.fun
+        best_theta = best_result.x.copy()
+
+    kappa, theta, sigma, rho, v0, H = best_theta.tolist()
+
+    # Compute diagnostic metrics
+    try:
+        pred        = _fno_predict(best_theta, model, pn, yn, device)
+        spx_rmse    = _rmse_bps(pred, spx_surface)
+    except Exception:
+        spx_rmse = np.nan
+
+    converged = bool((best_result is not None) and (best_result.success or best_loss < 0.1))
+
+    result_dict = {
+        "kappa":        kappa,
+        "theta":        theta,
+        "sigma":        sigma,
+        "rho":          rho,
+        "v0":           v0,
+        "H":            H,
+        "spx_rmse_bps": float(spx_rmse),
+        "total_loss":   float(best_loss),
+        "converged":    converged,
+    }
+
+    # Add VIX errors dynamically
+    if isinstance(vix_term_structure, dict):
+        for key, vix_obs in vix_term_structure.items():
+            T = parse_tenor_to_years(key)
+            try:
+                vix_pred = vix_futures_curve(kappa, theta, sigma, rho, v0, H, np.array([T]))[0]
+                err = abs(vix_pred - vix_obs)
+            except Exception:
+                err = np.nan
+            result_dict[f"vix_error_{key}"] = float(err)
+    elif isinstance(vix_term_structure, pd.DataFrame):
+        for i, row in vix_term_structure.iterrows():
+            tenor_m = row["tenor_months"]
+            vix_obs = row["settle_vix"]
+            T = tenor_m / 12.0
+            try:
+                vix_pred = vix_futures_curve(kappa, theta, sigma, rho, v0, H, np.array([T]))[0]
+                err = abs(vix_pred - vix_obs)
+            except Exception:
+                err = np.nan
+            result_dict[f"vix_error_row_{i}"] = float(err)
+            result_dict[f"vix_error_{i}"] = float(err)
+            result_dict[f"vix_error_{i+1}"] = float(err)
+            if abs(tenor_m - round(tenor_m)) < 1e-2:
+                result_dict[f"vix_error_{int(round(tenor_m))}M"] = float(err)
+            result_dict[f"vix_error_{tenor_m:.2f}M"] = float(err)
+            result_dict[f"vix_error_{tenor_m:.1f}M"] = float(err)
+
+    return result_dict
+
