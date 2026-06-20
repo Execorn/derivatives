@@ -14,7 +14,8 @@ if os.path.join(project_root, "src") not in sys.path:
 
 from fno_model import MirrorPaddedFNO2d
 from normalizers import ParameterNormalizer, IVSurfaceNormalizer
-from pricing_engine import price_iv_surface, bs_call, bs_vega, implied_vol
+from pricing_engine import bs_call, bs_vega, implied_vol
+from pricing_engine_gpu import price_batch_gpu
 from greeks.portfolio_greeks import (
     bs_greeks,
     _make_spatial,
@@ -22,6 +23,40 @@ from greeks.portfolio_greeks import (
     bs_call_price,
     _bilinear_interp
 )
+
+def price_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0,
+                     N_factors: int = 20, N_cos: int = 64):
+    """
+    GPU-accelerated version of price_iv_surface using price_batch_gpu.
+    """
+    import torch
+    import numpy as np
+    
+    # Map dictionary params to expected (1, 5) numpy array for price_batch_gpu
+    params_batch = np.array([[
+        params['kappa'],
+        params['theta'],
+        params['sigma'],
+        params['rho'],
+        params['v0']
+    ]], dtype=np.float64)
+    
+    H_val = params.get('H', 0.08)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Call the GPU batch pricing engine
+    iv_surface = price_batch_gpu(
+        params_batch=params_batch,
+        T_grid=T_grid,
+        K_grid=K_grid,
+        H_fixed=H_val,
+        N_factors=N_factors,
+        N_cos=N_cos,
+        S0=S0,
+        device=device
+    )
+    
+    return iv_surface[0]
 
 def benchmark_greeks(n_positions: int = 100, S: float = 5000.0) -> dict:
     """
@@ -123,21 +158,23 @@ def benchmark_greeks(n_positions: int = 100, S: float = 5000.0) -> dict:
     with torch.no_grad():
         pred_norm_single = model(spatial_single, theta_norm_single)
         iv_surface_single = yn.inverse_transform_tensor(pred_norm_single).squeeze(0)
-        iv_surface_single = torch.clamp(iv_surface_single, min=1e-4).cpu().numpy()
+        iv_surface_single = torch.clamp(iv_surface_single, min=1e-4) # keep on GPU
         
-    fno_ivs = []
-    for idx in range(n_positions):
-        T_val = T_options[idx]
-        k_pos = np.log(K_options[idx] / S)
-        sigma_val = _bilinear_interp(MATURITIES, np.linspace(-0.5, 0.5, 11, dtype=np.float32), iv_surface_single, T_val, k_pos)
-        sigma_val = max(sigma_val, 1e-4)
-        fno_ivs.append(sigma_val)
+    T_grid_t = torch.tensor(MATURITIES, dtype=torch.float32, device=device)
+    K_grid_t = torch.tensor(np.linspace(-0.5, 0.5, 11, dtype=np.float32), dtype=torch.float32, device=device)
+    
+    T_t = torch.tensor(T_options, dtype=torch.float32, device=device)
+    K_t = torch.tensor(K_options, dtype=torch.float32, device=device)
+    k_t = torch.log(K_t / S)
+    
+    # Fully vectorized GPU interpolation
+    with torch.no_grad():
+        sigma_t_val = interpolate_bilinear(T_grid_t, K_grid_t, iv_surface_single, T_t, k_t)
+        sigma_t_val = torch.clamp(sigma_t_val, min=1e-4)
         
     # Batch inputs for PyTorch autograd
     S_t = torch.full((n_positions,), S, dtype=torch.float32, device=device, requires_grad=True)
-    sigma_t = torch.tensor(fno_ivs, dtype=torch.float32, device=device, requires_grad=True)
-    K_t = torch.tensor(K_options, dtype=torch.float32, device=device)
-    T_t = torch.tensor(T_options, dtype=torch.float32, device=device)
+    sigma_t = sigma_t_val.clone().detach().requires_grad_(True)
     r_t = torch.tensor([r_val] * n_positions, dtype=torch.float32, device=device)
     
     # Price
@@ -150,20 +187,25 @@ def benchmark_greeks(n_positions: int = 100, S: float = 5000.0) -> dict:
     vanna_bs = torch.autograd.grad(delta_bs, sigma_t, grad_outputs=grad_outputs, create_graph=True, retain_graph=True)[0]
     volga_bs = torch.autograd.grad(vega_bs, sigma_t, grad_outputs=grad_outputs, create_graph=False)[0]
     
-    fno_greeks_bs = []
-    for idx in range(n_positions):
-        fno_greeks_bs.append({
-            "delta": delta_bs[idx].item(),
-            "gamma": gamma_bs[idx].item(),
-            "vega": vega_bs[idx].item(),
-            "vanna": vanna_bs[idx].item(),
-            "volga": volga_bs[idx].item()
-        })
-        
     if device.type == "cuda":
         torch.cuda.synchronize()
     t1_fno = time.perf_counter()
     fno_speed = (t1_fno - t0_fno) * 1000.0 # in ms
+    
+    fno_greeks_bs = []
+    delta_bs_cpu = delta_bs.detach().cpu().numpy()
+    gamma_bs_cpu = gamma_bs.detach().cpu().numpy()
+    vega_bs_cpu = vega_bs.detach().cpu().numpy()
+    vanna_bs_cpu = vanna_bs.detach().cpu().numpy()
+    volga_bs_cpu = volga_bs.detach().cpu().numpy()
+    for idx in range(n_positions):
+        fno_greeks_bs.append({
+            "delta": float(delta_bs_cpu[idx]),
+            "gamma": float(gamma_bs_cpu[idx]),
+            "vega": float(vega_bs_cpu[idx]),
+            "vanna": float(vanna_bs_cpu[idx]),
+            "volga": float(volga_bs_cpu[idx])
+        })
     
     # --- FNO Heston-based Autograd Greeks (Computed outside the timed block) ---
     fno_greeks_heston = []
