@@ -28,20 +28,27 @@ def _fno_iv_flat(params, model, T_grid, K_grid):
     Required by torch.func.jacrev for functional transforms.
     The model is closed over so autograd can trace through it.
     """
-    T_mesh, K_mesh = torch.meshgrid(T_grid, K_grid, indexing='ij')
-    params_exp = params.view(1, 1, 1, 6).expand(1, T_grid.size(0), K_grid.size(0), 6)
-    in_tensor = torch.cat(
-        [params_exp,
-         T_mesh.unsqueeze(0).unsqueeze(-1),
-         K_mesh.unsqueeze(0).unsqueeze(-1)],
-        dim=-1
-    )
-    # FIX: model predicts IV directly — do NOT apply sqrt(W/T) here.
-    # Previous code treated model output as W = IV^2*T and back-converted,
-    # which produced sqrt(IV/T) rather than IV.
-    IV = model(in_tensor).squeeze(0)          # shape (T, K)
-    IV = torch.clamp(IV, min=1e-6)            # numerical floor
-    return IV.reshape(-1)                     # (T*K,)
+    from calibrate import _load_normalizers, _param_norm, _iv_norm
+    _load_normalizers(version="v2")
+
+    device = next(model.parameters()).device
+    pn_mean = torch.tensor(_param_norm.mean, dtype=torch.float32, device=device)
+    pn_std  = torch.tensor(_param_norm.std,  dtype=torch.float32, device=device)
+    yn_mean = torch.tensor(_iv_norm.mean, dtype=torch.float32, device=device)
+    yn_std  = torch.tensor(_iv_norm.std,  dtype=torch.float32, device=device)
+
+    # Normalize T and K coordinates matching the FNO training distribution
+    T_norm = (T_grid - T_grid.mean()) / (T_grid.std() + 1e-8)
+    K_norm = K_grid / 0.5
+    T_mesh, K_mesh = torch.meshgrid(T_norm, K_norm, indexing='ij')
+    spatial = torch.stack([T_mesh, K_mesh], dim=-1).unsqueeze(0).to(device)  # (1, T, K, 2)
+
+    p6 = params.to(device).float()
+    p_norm = (p6 - pn_mean) / pn_std
+    iv_norm = model(spatial, p_norm.unsqueeze(0))
+    iv_real = iv_norm * yn_std + yn_mean
+    iv_real = torch.clamp(iv_real, min=1e-6)
+    return iv_real.squeeze(0).reshape(-1)
 
 
 def compute_greeks(model, params, T_grid, K_grid):
@@ -99,11 +106,13 @@ def compute_greeks(model, params, T_grid, K_grid):
 def main():
     print("Testing Autograd Greeks Engine...")
     model = MirrorPaddedFNO2d()
-    weights_path = "artifacts/models/fno_best.pth"
+    weights_path = "artifacts/weights/fno_v2_final_prod.pth"
     if os.path.exists(weights_path):
-        # weights_only=True prevents arbitrary code execution via pickle (PyTorch >= 2.0)
         model.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=True))
     model.eval()
+    
+    from calibrate import _load_normalizers
+    _load_normalizers("v2")
     
     params = torch.tensor([2.5, 0.08, 0.5, -0.5, 0.08, 0.08], dtype=torch.float32)
     T_grid = torch.tensor([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0], dtype=torch.float32)

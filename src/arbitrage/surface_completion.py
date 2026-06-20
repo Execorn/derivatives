@@ -291,7 +291,7 @@ def make_arbitrage_free(iv_surface: np.ndarray, T_grid: np.ndarray, K_grid: np.n
     # 1. Calendar spread monotone rearrangement on total variance
     total_var = iv_surface**2 * T_grid[:, None]
     rearranged_var = monotone_rearrangement(total_var, axis=0)
-    iv_surface = np.sqrt(rearranged_var / T_grid[:, None])
+    iv_surface = np.sqrt(rearranged_var / np.maximum(T_grid[:, None], 1e-10))
     iv_surface = np.clip(iv_surface, 1e-4, None)
     
     # 2. Convert K_grid to absolute strikes
@@ -318,7 +318,7 @@ def make_arbitrage_free(iv_surface: np.ndarray, T_grid: np.ndarray, K_grid: np.n
     # 6. Apply calendar spread monotone rearrangement one more time to handle any tiny cross-interaction
     total_var = completed_iv**2 * T_grid[:, None]
     rearranged_var = monotone_rearrangement(total_var, axis=0)
-    completed_iv = np.sqrt(rearranged_var / T_grid[:, None])
+    completed_iv = np.sqrt(rearranged_var / np.maximum(T_grid[:, None], 1e-10))
     completed_iv = np.clip(completed_iv, 1e-4, None)
     
     return completed_iv
@@ -505,7 +505,7 @@ def complete_surface(sparse_iv: np.ndarray,
                 # SVI parameterization w(k) = a + b * (rho*(k-m) + sqrt((k-m)^2 + sigma^2))
                 a, b, rho, m, sigma = params["a"], params["b"], params["rho"], params["m"], params["sigma"]
                 pred_total_var = a + b * (rho * (K_grid - m) + np.sqrt((K_grid - m)**2 + sigma**2))
-                completed_surface[t] = np.sqrt(np.clip(pred_total_var, 1e-8, None) / T_grid[t])
+                completed_surface[t] = np.sqrt(np.clip(pred_total_var, 1e-8, None) / max(T_grid[t], 1e-10))
             else:
                 # Median fallback
                 if len(observed_iv) > 0:

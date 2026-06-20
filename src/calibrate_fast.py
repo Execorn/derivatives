@@ -210,8 +210,13 @@ def calibrate_newton(model, target_iv: np.ndarray,
 
             # Levenberg-Marquardt: (JᵀJ + ε·diag(JᵀJ)) δ = -Jᵀr
             JtJ    = J_np.T @ J_np
-            eps_lm = 1e-4 * np.diag(JtJ).mean()
-            delta  = -np.linalg.solve(JtJ + eps_lm * np.eye(3), J_np.T @ r_np)
+            eps_lm = 1e-4 * np.diag(JtJ).mean() if JtJ.size > 0 else 1e-4
+            eps_lm = max(eps_lm, 1e-12)
+            try:
+                delta  = -np.linalg.solve(JtJ + eps_lm * np.eye(3), J_np.T @ r_np)
+            except np.linalg.LinAlgError:
+                # Fallback to pseudo-inverse if singular
+                delta  = -np.linalg.pinv(JtJ + eps_lm * np.eye(3)) @ (J_np.T @ r_np)
 
             # Backtracking line search
             alpha = damping

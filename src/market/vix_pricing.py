@@ -59,6 +59,9 @@ def model_variance_swap_rate(kappa: float, theta: float, sigma: float,
     Compute the fair strike of a variance swap under Rough Heston (Lifted Heston).
     K_var = (1/T) * E[∫₀ᵀ v_t dt]
     """
+    if T <= 1e-8:
+        return float(v0)
+
     H = float(np.clip(H, 0.005, 0.495))
     kappa = float(np.clip(kappa, 1e-4, np.inf))
     theta = float(np.clip(theta, 1e-5, np.inf))
@@ -135,6 +138,7 @@ def vix_futures_curve(kappa: float, theta: float, sigma: float,
     v0 = float(np.clip(v0, 0.0, np.inf))
 
     maturities = np.asarray(maturities, dtype=float)
+    maturities = np.maximum(maturities, 0.0)  # clamp negative maturities
     if len(maturities) == 0:
         raise ValueError("Maturities array cannot be empty.")
     if np.max(maturities) == 0.0:

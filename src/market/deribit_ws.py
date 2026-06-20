@@ -294,6 +294,7 @@ class DeribitWSClient:
             log.exception("WS receive error: %s", exc)
         finally:
             self._connected = False
+            self._surface_evt.set()  # Unblock waiters if connection drops
 
     def _handle_message(self, msg: dict) -> None:
         """Route a parsed JSON message."""
@@ -364,6 +365,8 @@ async def stream_realtime_surface(
                     final_df = df
                     if asyncio.get_event_loop().time() >= deadline:
                         break
+                if not client._connected and asyncio.get_event_loop().time() < deadline:
+                    raise ConnectionError("WebSocket disconnected prematurely")
             break
         except Exception as exc:
             retries += 1
