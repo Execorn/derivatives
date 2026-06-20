@@ -102,7 +102,22 @@ class CalibrationResult:
 
 def _get_assets(device_str: str = "auto"):
     """Lazy-load FNO model + normalizers."""
-    if "model" not in _CACHE:
+    import calibrate
+    if calibrate._param_norm is None:
+        if calibrate._PARAM_NORM_PATH == "artifacts/models/param_normalizer.npz":
+            calibrate._load_normalizers()
+        else:
+            calibrate._load_normalizers("current")
+
+    active_path = calibrate._PARAM_NORM_PATH
+    version = "v3" if "v3" in str(active_path) else "v2"
+
+    if device_str == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device_str)
+
+    if "model" not in _CACHE or _CACHE.get("version") != version:
         # Patch SpectralConv2d.forward to be vmap-compatible
         import fno_model
         import torch.nn.functional as F
@@ -128,26 +143,42 @@ def _get_assets(device_str: str = "auto"):
         from fno_model import MirrorPaddedFNO2d
         from normalizers import IVSurfaceNormalizer, ParameterNormalizer
 
-        if device_str == "auto":
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        artifacts_dir = Path(__file__).parents[2] / "artifacts"
+        if version == "v3":
+            weights_name = "fno_v3_final_prod.pth"
+            pn_name = "param_normalizer_v3.npz"
+            yn_name = "iv_normalizer_v3.npz"
         else:
-            device = torch.device(device_str)
+            weights_name = "fno_v2_final_prod.pth"
+            pn_name = "param_normalizer_v2.npz"
+            yn_name = "iv_normalizer_v2.npz"
 
-        if not _WEIGHTS.exists():
-            raise FileNotFoundError(f"FNO weights not found: {_WEIGHTS}")
+        weights_path = artifacts_dir / "weights" / weights_name
+        pn_path = artifacts_dir / "models" / pn_name
+        yn_path = artifacts_dir / "models" / yn_name
+
+        if not weights_path.exists():
+            raise FileNotFoundError(f"FNO weights not found: {weights_path}")
 
         model = MirrorPaddedFNO2d()
         model.load_state_dict(
-            torch.load(_WEIGHTS, map_location=device, weights_only=True)
+            torch.load(weights_path, map_location=device, weights_only=True)
         )
         model.to(device).eval()
 
         _CACHE.update(
             model=model,
-            pn=ParameterNormalizer.load(str(_PN_PATH)),
-            yn=IVSurfaceNormalizer.load(str(_YN_PATH)),
+            pn=ParameterNormalizer.load(str(pn_path)),
+            yn=IVSurfaceNormalizer.load(str(yn_path)),
             device=device,
+            version=version,
         )
+
+    # Check the device: if _CACHE["device"] != device, move the cached model to device
+    if _CACHE["device"] != device:
+        _CACHE["model"] = _CACHE["model"].to(device)
+        _CACHE["device"] = device
+
     return _CACHE["model"], _CACHE["pn"], _CACHE["yn"], _CACHE["device"]
 
 
