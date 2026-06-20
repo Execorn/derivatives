@@ -140,27 +140,10 @@ def fetch_vix_futures(date_input) -> pd.DataFrame:
         except Exception:
             pass
 
-    # 2. Exact historical prices for key dates
-    key_dates = {
-        "2020-03-16": [68.5, 55.2, 45.8, 39.5, 35.7, 33.0, 31.2, 29.8],
-        "2022-01-24": [25.8, 26.2, 25.9, 25.4, 25.1, 24.8, 24.5, 24.2],
-        "2024-01-02": [13.5, 14.2, 14.8, 15.3, 15.7, 16.0, 16.2, 16.5],
-        "2024-08-05": [32.5, 28.4, 25.2, 23.1, 21.8, 20.9, 20.2, 19.8]
-    }
-    
-    if date_str in key_dates:
-        prices = key_dates[date_str]
-        rows = []
-        for (y, m, exp), price in zip(active_contracts, prices):
-            tenor = (exp - val_date).days / 30.4375
-            rows.append({
-                "expiry": exp,
-                "tenor_months": tenor,
-                "settle_vix": price
-            })
-        return pd.DataFrame(rows)
+    # NOTE: hardcoded historical prices removed — they were factually incorrect
+    # (e.g., 2020-03-16 front VIX was ~82, not 68.5). Fall through to model curve.
 
-    # 3. Dynamic model-consistent contango curves
+    # 2. Dynamic model-consistent contango curves
     # using vix_futures_curve with default parameters:
     # kappa=1.0, theta=0.08, sigma=0.8, rho=-0.34, v0=0.10, H=0.08
     maturities = np.array([(exp - val_date).days / 365.25 for y, m, exp in active_contracts])

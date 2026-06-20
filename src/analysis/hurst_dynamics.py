@@ -56,10 +56,8 @@ def run_historical_study(
     pd.DataFrame
         DataFrame of calibrated parameters and metrics for all dates.
     """
-    import calibrate
-    calibrate._NORM_VERSIONS["v1"] = calibrate._NORM_VERSIONS["v3"]
-    calibrate._param_norm = None
-    calibrate._iv_norm = None
+    # Force v3 normalizers via calibrate_batch's device/version selection
+    # (no global mutation needed — calibrate_batch loads v3 if weights exist)
 
     currency_upper = currency.upper()
     results_dir = project_root / "results" / "hurst_dynamics"
