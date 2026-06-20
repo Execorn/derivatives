@@ -91,8 +91,11 @@ class CalibrationResult:
 
     @classmethod
     def from_dict(cls, d: dict) -> "CalibrationResult":
-        surface = np.array(d.pop("surface")) if d.get("surface") is not None else None
-        return cls(**d, surface=surface)
+        d_copy = dict(d)
+        surface = d_copy.pop("surface", None)
+        if surface is not None:
+            surface = np.array(surface)
+        return cls(**d_copy, surface=surface)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
