@@ -668,12 +668,17 @@ def portfolio_greeks(positions: list,
     _delta_for_hedge = total_delta if np.isfinite(total_delta) else 0.0
     hedge_contracts = int(np.round(-_delta_for_hedge / _FUTURES_MULTIPLIER))
 
+    # Sanitize scalar outputs: nan/inf from pathological inputs (e.g. quantity=1e20)
+    # are clamped to 0.0 so callers always receive finite numbers.
+    def _safe(v: float) -> float:
+        return float(np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0))
+
     return {
-        "total_delta":     float(total_delta),
-        "total_gamma":     float(total_gamma),
+        "total_delta":     _safe(total_delta),
+        "total_gamma":     _safe(total_gamma),
         "vega_bucket":     vega_bucket,
-        "total_vanna":     float(total_vanna),
-        "total_volga":     float(total_volga),
+        "total_vanna":     _safe(total_vanna),
+        "total_volga":     _safe(total_volga),
         "hedge_contracts": hedge_contracts,
     }
 

@@ -1,2 +1,5 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "integration: marks tests requiring live market data / network (run with INTEGRATION=1)",
+]

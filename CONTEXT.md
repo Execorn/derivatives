@@ -1,5 +1,5 @@
 # Project Context — Deep Rough Heston Calibration
-**Last updated:** 2026-06-19 · **Status:** Thesis complete (51 pp), **Tier 1 COMPLETE** — all 5 market-data extensions implemented, 408 tests passing
+**Last updated:** 2026-06-19 · **Status:** Thesis complete (51 pp), **Tier 1 COMPLETE** — all 5 market-data extensions implemented, 537 tests passing
 
 ---
 

@@ -284,9 +284,15 @@ def test_crypto_historical_study_test_mode(tmp_path):
 # 9. Verify run_historical_study runs on SPX short subset
 # ============================================================================
 
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get("INTEGRATION"),
+    reason="Requires live SPX market data and full FNO calibration (run with INTEGRATION=1)"
+)
 def test_run_historical_study_spx_convergence_subset(tmp_path):
     """
     Verify run_historical_study runs and converges for SPX on a 3-day subset.
+    Requires live market data from yfinance. Run with INTEGRATION=1.
     """
     # We use a short 3-day subset to keep the test fast
     start_date = "2024-01-02"
@@ -315,11 +321,17 @@ def test_run_historical_study_spx_convergence_subset(tmp_path):
 # 10. Convergence rate check for a longer period
 # ============================================================================
 
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get("INTEGRATION"),
+    reason="Requires live SPX market data and full FNO calibration (run with INTEGRATION=1)"
+)
 def test_run_historical_study_spx_convergence_rate_check(tmp_path):
     """
     Verify run_historical_study runs and converges for at least 70% of days
     on a larger subset (e.g. 2024-01-01 to 2024-01-15, which has 10 business days).
     Also checks H values are within [0.04, 0.15].
+    Requires live market data from yfinance. Run with INTEGRATION=1.
     """
     start_date = "2024-01-01"
     end_date = "2024-01-15" # 10 business days
