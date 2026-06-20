@@ -147,3 +147,48 @@ pdflatex -interaction=nonstopmode main.tex && pdflatex -interaction=nonstopmode 
 ## 📄 License
 
 Research code — МФТИ Master's thesis project. Contact author for usage permissions.
+
+---
+
+## ✅ Tier 2 Extensions — Complete (2026-06-20)
+
+**511 tests passing · 0 failures · commit `23cc857`**
+
+| Module | Description |
+|--------|-------------|
+| **FastAPI REST API** (`src/api/server.py`) | `/health`, `/iv_surface`, `/greeks`, `/vix`, `/deribit/snapshot` |
+| **Variance Swaps** (`src/market/variance_swaps.py`) | Fair variance/vol swap rates under Rough Heston via Riccati ODE |
+| **Deribit WebSocket** (`src/market/deribit_ws.py`) | Real-time IV surface streaming, auto-reconnect, async generator API |
+| **Joint SPX+VIX Calibration** (`src/calibration/joint_calibration.py`) | L-BFGS-B minimising `w_spx·RMSE_SPX + w_vix·(model_vix−vix_obs)²` |
+| **GPU Batch Calibration** (`src/calibration/batch_calibration.py`) | Parallel multi-date calibration with ThreadPoolExecutor + batched FNO |
+
+### Run the REST API
+```bash
+cd /home/execorn/programming/derivatives
+.venv/bin/uvicorn api.server:app --reload --port 8000
+# → http://localhost:8000/docs  (OpenAPI / Swagger UI)
+```
+
+### Batch calibrate multiple dates
+```python
+from calibration.batch_calibration import calibrate_batch, save_results
+results = calibrate_batch(
+    ["2024-01-02", "2024-08-05", "2022-01-24"],
+    currency="SPX", device="auto"
+)
+save_results(results, "results/batch/2024.json")
+```
+
+---
+
+## 🔭 What's Next (Tier 3)
+
+| Priority | Task | Effort |
+|----------|------|--------|
+| P3-D | VIX futures term structure calibration | 2–3 days |
+| P3-E | Hurst exponent dynamics (1500-date batch study) | 3–5 days |
+| P3-F | Greeks benchmark: FNO autograd vs FD-COS | 1 day |
+| P3-A | Rough Bergomi model + FNO surrogate | 2–4 weeks |
+| P3-B | Neural SDE calibration (model-free) | 4–8 weeks |
+
+See `ROADMAP_ABSOLUTE_MAX.md` for the full technical specification.

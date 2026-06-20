@@ -335,3 +335,94 @@ uvicorn        0.46.0     ASGI server for FastAPI
 - Deribit `mark_iv` is in % (e.g., 42.63 means 42.63% = 0.4263 annualised)
 - yfinance `impliedVolatility` is often stale — recompute from bid-ask mid via py_vollib
 - BTC crypto options need extended param ranges (V₀ up to 0.6) → may need FNO retraining
+
+---
+
+## 🚀 Tier 2 Extension Status (P2) — COMPLETE 2026-06-20
+
+| Module | File | Status | Tests |
+|--------|------|--------|-------|
+| B1 FastAPI REST API | `src/api/server.py` | ✅ **DONE** | 34 |
+| B2 Variance Swap Pricing | `src/market/variance_swaps.py` | ✅ **DONE** | 36 |
+| B3 Deribit WebSocket | `src/market/deribit_ws.py` | ✅ **DONE** | 17 |
+| B4 Joint SPX+VIX Calibration | `src/calibration/joint_calibration.py` | ✅ **DONE** | 13 |
+| B5 GPU Batch Calibration | `src/calibration/batch_calibration.py` | ✅ **DONE** | 15 |
+
+**Total tests as of 2026-06-20:** 511 passing, 0 failing, 28 warnings (expected, py_vollib Below Intrinsic)
+
+### P2 Bug Fixes Applied (from P1 robustness audit)
+- `vega_bucket` silent float32 overflow: MATURITIES dtype=float32 (max 3.4e38) → cast to float64
+- `datetime.UTC` AttributeError on Python 3.14 → `timezone.utc`
+- SPX `all_options.append` indentation error
+- `bs_greeks` ZeroDivisionError / OverflowError guards added
+- `fno_surface_greeks` non-finite θ clamping + UserWarning
+
+### New Directory Structure Additions (P2)
+```
+src/
+├── api/
+│   ├── __init__.py
+│   └── server.py          ← FastAPI: /health /iv_surface /greeks /vix /deribit/snapshot
+├── calibration/
+│   ├── __init__.py
+│   ├── joint_calibration.py   ← L-BFGS-B joint SPX+VIX loss
+│   └── batch_calibration.py   ← ThreadPoolExecutor + GPU batch FNO inference
+└── market/
+    ├── variance_swaps.py  ← variance_swap_rate, realized_variance, term_structure
+    └── deribit_ws.py      ← DeribitWSClient, stream_realtime_surface (aiohttp WS)
+
+tests/
+├── test_api.py              ← 34 tests (FastAPI TestClient, mocked Deribit)
+├── test_deribit_ws.py       ← 17 tests (mocked aiohttp WS, no real network)
+├── test_joint_calibration.py ← 13 tests (synthetic FNO surface, VIX ODE)
+└── test_batch_calibration.py ← 15 tests (dataclass, JSON I/O, calibration pipeline)
+```
+
+### Key New APIs
+```python
+# FastAPI server
+from api.server import app    # uvicorn api.server:app --port 8000
+# POST /iv_surface {kappa,theta,sigma,rho,v0,H} → {surface: [[float]], T_grid, K_grid}
+# POST /greeks     {kappa,...,S} → {delta,gamma,vega,vanna,volga,iv_surface: [[float]]}
+# POST /vix        {kappa,...}   → {vix: float}
+
+# Variance swaps
+from market.variance_swaps import variance_swap_rate, variance_term_structure
+kvar = variance_swap_rate(kappa=2.5, theta=0.08, sigma=0.5, rho=-0.5, v0=0.08, H=0.08, T=1.0)
+
+# WebSocket streaming
+from market.deribit_ws import DeribitWSClient, stream_realtime_surface
+async with DeribitWSClient() as client:
+    async for df in client.stream_iv_surface("BTC"):
+        print(df.head())   # live IV surface updates
+
+# Joint calibration
+from calibration.joint_calibration import calibrate_joint, calibrate_vix_only
+result = calibrate_joint(spx_surface, vix_level=18.5, weights=(1.0, 1.0), n_restarts=3)
+# → {kappa, theta, sigma, rho, v0, H, spx_rmse_bps, vix_error, total_loss, converged}
+
+# Batch calibration
+from calibration.batch_calibration import calibrate_batch, save_results, results_to_dataframe
+results = calibrate_batch(["2024-01-02", "2024-08-05"], currency="SPX", device="auto")
+save_results(results, "results/batch/2024.json")
+```
+
+### New Packages Installed (P2)
+```
+httpx          ← FastAPI TestClient (pytest dependency)
+pytest-asyncio ← async test support
+```
+
+---
+
+## 🔭 Tier 3 Roadmap (P3) — NEXT PHASE
+
+See full plan in `ROADMAP_ABSOLUTE_MAX.md` and `implementation_plan.md`.
+
+### Priority Order
+1. **P3-Infrastructure** (30 min) — pyproject.toml asyncio mode, pin httpx in requirements.txt
+2. **P3-D: VIX Term Structure** — multi-tenor VIX futures calibration (highest thesis impact)
+3. **P3-E: Hurst Dynamics** — batch-calibrate ~1500 SPX dates, novel empirical chapter
+4. **P3-F: Greeks Benchmark** — FNO autograd vs finite-difference COS speed/accuracy
+5. **P3-A: Rough Bergomi** — Hybrid scheme MC dataset + new FNO training (~3 GPU-days)
+6. **P3-B: Neural SDE** — model-free deep learning (most research-intensive, 4–8 weeks)
