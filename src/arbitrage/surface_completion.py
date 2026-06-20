@@ -163,8 +163,9 @@ def check_butterfly(iv_surface: np.ndarray,
     
     d2C = 2.0 / (h_plus + h_minus) * (dC_plus - dC_minus)
     
-    # Butterfly spread violation: d2C < 0
-    # Use relative tolerance: violation only if d2C is negative relative to option price
+    # Use relative tolerance: a violation only counts if the second derivative
+    # is negative relative to the local option price (BUG-8 fix).
+    # Absolute tolerance -1e-6 was insufficient for deep ITM/OTM options.
     return d2C < -1e-6 * np.abs(C[:, 1:-1]).clip(1e-10)
 
 
@@ -200,8 +201,10 @@ def fit_svi_slice(k: np.ndarray, total_var: np.ndarray) -> dict:
         return np.log(p / (1.0 - p))
 
     raw_a = torch.tensor(to_unconstrained(a_init, 0.0, a_max), device=device, requires_grad=True)
+    # BUG-4 fix: use b_max for initialization so the full SVI parameter space
+    # is available at the start. get_constrained() enforces the live rho
+    # constraint dynamically during optimization.
     raw_rho = torch.tensor(np.arctanh(rho_init / 0.999), device=device, requires_grad=True)
-    # Use b_max for initialization — get_constrained() handles the live rho constraint
     raw_b = torch.tensor(to_unconstrained(b_init, 0.0, b_max), device=device, requires_grad=True)
     raw_m = torch.tensor(to_unconstrained(m_init, m_min, m_max), device=device, requires_grad=True)
     raw_sigma = torch.tensor(to_unconstrained(sigma_init, sigma_min, sigma_max), device=device, requires_grad=True)
@@ -248,10 +251,15 @@ def enforce_calendar_spread_monotonicity(f: np.ndarray, axis: int = 0) -> np.nda
     axis=0 guarantees w(T2, K) >= w(T1, K) for T2 > T1 at each strike K,
     which is equivalent to the absence of calendar spread arbitrage.
 
-    Note: this is a column-wise sort, not the full functional rearrangement
-    of Chernozhukov, Fernandez-Val & Galichon (2010).
+    Note: this is a column-wise sort, NOT the full functional rearrangement
+    of Chernozhukov, Fernandez-Val & Galichon (2010). The original name
+    'monotone_rearrangement' was misleading (BUG-7 fix).
     """
     return np.sort(f, axis=axis)
+
+
+# Backward-compatible alias (deprecated — use enforce_calendar_spread_monotonicity)
+monotone_rearrangement = enforce_calendar_spread_monotonicity
 
 
 def make_arbitrage_free(iv_surface: np.ndarray, T_grid: np.ndarray, K_grid: np.ndarray, S: float = 1.0) -> np.ndarray:
@@ -432,6 +440,7 @@ def complete_surface(sparse_iv: np.ndarray,
     nT, nK = sparse_iv.shape
 
     if method == "cubic_spline":
+        # griddata is imported locally here where it is actually used.
         # Get coordinates of observed elements
         observed_coords = []
         observed_values = []
