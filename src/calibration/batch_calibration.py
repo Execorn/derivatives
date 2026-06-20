@@ -103,6 +103,28 @@ class CalibrationResult:
 def _get_assets(device_str: str = "auto"):
     """Lazy-load FNO model + normalizers."""
     if "model" not in _CACHE:
+        # Patch SpectralConv2d.forward to be vmap-compatible
+        import fno_model
+        import torch.nn.functional as F
+
+        def _spectral_conv2d_forward_patched(self, x):
+            B = x.shape[0]
+            x_ft = torch.fft.rfft2(x)
+            H, W = x.size(-2), x.size(-1)//2+1
+            
+            w1_part = torch.einsum(
+                "bixy,ioxy->boxy", x_ft[:, :, :self.modes1, :self.modes2], self.weights1)
+            w2_part = torch.einsum(
+                "bixy,ioxy->boxy", x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
+                
+            w1_padded = F.pad(w1_part, (0, W - self.modes2, 0, H - self.modes1))
+            w2_padded = F.pad(w2_part, (0, W - self.modes2, H - self.modes1, 0))
+            
+            out_ft = w1_padded + w2_padded
+            return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+
+        fno_model.SpectralConv2d.forward = _spectral_conv2d_forward_patched
+
         from fno_model import MirrorPaddedFNO2d
         from normalizers import IVSurfaceNormalizer, ParameterNormalizer
 
@@ -167,54 +189,143 @@ def _calibrate_from_surface(
     currency: str,
     device_str: str,
 ) -> CalibrationResult:
-    """Run Newton/L-BFGS calibration for a single surface. Thread-safe."""
-    from scipy.optimize import minimize
-
-    model, pn, yn, device = _get_assets(device_str)
-
-    _BOUNDS = [
-        (0.5, 5.0), (0.01, 0.25), (0.1, 1.5),
-        (-0.95, 0.0), (0.01, 0.25), (0.04, 0.15),
-    ]
-    x0 = np.array([2.5, 0.08, 0.5, -0.5, 0.08, 0.08], dtype=np.float64)
-
-    def _loss(x):
-        try:
-            pred = _fno_predict_batch(x[None], model, pn, yn, device)[0]
-            return _rmse_bps(pred, target_surface) / 10_000.0
-        except Exception:
-            return 1.0
-
-    t0 = time.perf_counter()
-    try:
-        res = minimize(
-            _loss, x0, method="L-BFGS-B", bounds=_BOUNDS,
-            options={"maxiter": 200, "ftol": 1e-10},
-        )
-        best_x    = res.x
-        converged = res.success or res.fun < 0.005
-    except Exception as exc:
-        warnings.warn(f"Calibration failed for {date_str}: {exc}")
-        best_x    = x0
-        converged = False
-
-    runtime_ms = (time.perf_counter() - t0) * 1000.0
-
-    try:
-        pred    = _fno_predict_batch(best_x[None], model, pn, yn, device)[0]
-        rmse    = _rmse_bps(pred, target_surface)
-    except Exception:
-        pred, rmse = None, np.nan
-
-    return CalibrationResult(
-        date=date_str,
+    """Run Newton calibration for a single surface by delegating to calibrate_batch."""
+    results = calibrate_batch(
+        [date_str],
         currency=currency,
-        params={n: float(v) for n, v in zip(_PARAM_NAMES, best_x.tolist())},
-        rmse_bps=float(rmse),
-        runtime_ms=float(runtime_ms),
-        converged=converged,
-        surface=pred,
+        device=device_str,
+        target_surfaces={date_str: target_surface},
+        verbose=False,
     )
+    return results[0]
+
+
+def calibrate_newton_batch(
+    model, target_iv_batch, pn, yn, device,
+    max_iter: int = 15, tol: float = 1e-6, eps_lm: float = 1e-4,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Calibrate a batch of B target implied volatility surfaces concurrently on the GPU/CPU.
+    """
+    B = target_iv_batch.shape[0]
+    target_flat = target_iv_batch.reshape(B, 88)
+    
+    # Get spatial grid and squeeze batch dimension to get (8, 11, 2)
+    spatial_single = _make_spatial(device).squeeze(0)
+    
+    # Bounds for the 6 parameters
+    lo_t = torch.tensor([0.1, 0.01, 0.1, -0.9, 0.01, 0.04], dtype=torch.float32, device=device)
+    hi_t = torch.tensor([5.0, 0.15, 1.0, -0.1, 0.15, 0.15], dtype=torch.float32, device=device)
+    
+    # Differentiable forward prediction
+    def fwd_fn(theta_single, spatial_single):
+        theta_norm = pn.transform_tensor(theta_single.unsqueeze(0))
+        # Clamp normalized parameters to prevent network explosion
+        theta_norm = theta_norm.clamp(min=-3.0, max=3.0)
+        spatial_input = spatial_single.unsqueeze(0)
+        pred = model(spatial_input, theta_norm)
+        iv = yn.inverse_transform_tensor(pred)
+        return iv.clamp(min=1e-4).reshape(-1)
+
+    vmap_fwd = torch.vmap(fwd_fn, in_dims=(0, 0))
+    vmap_jac = torch.vmap(torch.func.jacfwd(fwd_fn, argnums=0), in_dims=(0, 0))
+    
+    # 3 diverse starting points
+    inits = torch.tensor([
+        [2.5, 0.08, 0.5, -0.5, 0.08, 0.08],
+        [1.0, 0.04, 0.3, -0.7, 0.04, 0.06],
+        [4.0, 0.12, 0.7, -0.3, 0.12, 0.10],
+    ], dtype=torch.float32, device=device)
+    
+    num_starts = len(inits)
+    theta = inits.repeat_interleave(B, dim=0) # (B * num_starts, 6)
+    target_expanded = target_flat.repeat(num_starts, 1) # (B * num_starts, 88)
+    
+    M = B * num_starts
+    spatial_batch = spatial_single.unsqueeze(0).repeat(M, 1, 1, 1)
+    
+    # Initialize loss_best
+    preds = []
+    for i in range(0, M, 4):
+        theta_sub = theta[i:i+4]
+        spatial_sub = spatial_batch[i:i+4]
+        with torch.no_grad():
+            preds.append(vmap_fwd(theta_sub, spatial_sub).detach())
+    pred_val = torch.cat(preds, dim=0)
+    r = pred_val - target_expanded
+    loss_best = (r**2).mean(dim=1)
+    
+    for it in range(max_iter):
+        preds = []
+        jacs = []
+        for i in range(0, M, 4):
+            theta_sub = theta[i:i+4]
+            spatial_sub = spatial_batch[i:i+4]
+            preds.append(vmap_fwd(theta_sub, spatial_sub).detach())
+            jacs.append(vmap_jac(theta_sub, spatial_sub).detach())
+            
+        pred_val = torch.cat(preds, dim=0)
+        jac_val = torch.cat(jacs, dim=0)
+        
+        r = pred_val - target_expanded
+        loss = (r**2).mean(dim=1)
+        
+        # Early stopping check: break if all surfaces have at least one converged start
+        best_loss_per_surface = loss.reshape(num_starts, B).min(dim=0)[0]
+        if best_loss_per_surface.max().item() < tol:
+            loss_best = loss
+            break
+            
+        # Solve LM equations: (J^T J + epsilon * diag(J^T J)) delta = -J^T r
+        JtJ = torch.bmm(jac_val.transpose(1, 2), jac_val)
+        Jtr = torch.bmm(jac_val.transpose(1, 2), r.unsqueeze(-1))
+        
+        diag_JtJ = torch.diagonal(JtJ, dim1=1, dim2=2)
+        eps = eps_lm * diag_JtJ.clamp(min=1e-8) + 1e-9
+        JtJ_reg = JtJ + torch.diag_embed(eps)
+        
+        delta = torch.linalg.solve(JtJ_reg, -Jtr).squeeze(-1)
+        
+        # Backtracking line search on GPU
+        theta_best = theta.clone()
+        loss_best = loss.clone()
+        alpha = torch.ones(M, 1, device=device)
+        
+        for ls_step in range(4):
+            theta_cand = (theta + alpha * delta).clamp(lo_t + 1e-5, hi_t - 1e-5)
+            preds_cand = []
+            for i in range(0, M, 4):
+                theta_sub = theta_cand[i:i+4]
+                spatial_sub = spatial_batch[i:i+4]
+                with torch.no_grad():
+                    preds_cand.append(vmap_fwd(theta_sub, spatial_sub).detach())
+            pred_cand_val = torch.cat(preds_cand, dim=0)
+            loss_cand = ((pred_cand_val - target_expanded) ** 2).mean(dim=1)
+            
+            better = loss_cand < loss_best
+            theta_best = torch.where(better.unsqueeze(-1), theta_cand, theta_best)
+            loss_best = torch.where(better, loss_cand, loss_best)
+            alpha = alpha * 0.5
+            
+        theta = theta_best.detach()
+        
+    loss_reshaped = loss_best.reshape(num_starts, B)
+    best_start_idx = loss_reshaped.argmin(dim=0)
+    
+    theta_reshaped = theta.reshape(num_starts, B, 6)
+    best_theta = theta_reshaped[best_start_idx, torch.arange(B, device=device)]
+    
+    best_spatial = spatial_single.unsqueeze(0).repeat(B, 1, 1, 1)
+    best_preds = []
+    for i in range(0, B, 4):
+        theta_sub = best_theta[i:i+4]
+        spatial_sub = best_spatial[i:i+4]
+        with torch.no_grad():
+            best_preds.append(vmap_fwd(theta_sub, spatial_sub).detach())
+    final_preds = torch.cat(best_preds, dim=0).reshape(B, 8, 11)
+    
+    final_loss = loss_reshaped[best_start_idx, torch.arange(B, device=device)]
+    return best_theta, final_preds, final_loss
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -280,72 +391,109 @@ def calibrate_batch(
     verbose: bool = True,
 ) -> List[CalibrationResult]:
     """
-    Calibrate over multiple dates in parallel.
-
-    Uses ThreadPoolExecutor for I/O-bound data fetching and batches FNO
-    forward passes for GPU efficiency (≤ _MAX_BATCH_GPU per call).
-
-    Parameters
-    ----------
-    dates : List[str]
-        ISO date strings to calibrate, e.g. ['2024-01-02', '2024-08-05']
-    currency : str
-        'SPX', 'BTC', or 'ETH'
-    max_workers : int
-        Thread pool size (default 4)
-    device : str
-        'auto', 'cuda', or 'cpu'
-    target_surfaces : dict, optional
-        Pre-computed {date: (8,11) array} surfaces — skip market fetch
-    verbose : bool
-        Print progress (default True)
-
-    Returns
-    -------
-    List[CalibrationResult]
-        Sorted by date
+    Calibrate Rough Heston parameters for multiple dates concurrently on GPU.
     """
     target_surfaces = target_surfaces or {}
-
-    results: List[CalibrationResult] = []
     total = len(dates)
-
+    if total == 0:
+        return []
+        
+    if device == "auto":
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        dev = torch.device(device)
+        
+    model, pn, yn, _ = _get_assets(str(dev))
+    
+    # 1. Fetch surfaces in parallel using ThreadPoolExecutor
+    fetched_surfaces = {}
     with ThreadPoolExecutor(max_workers=min(max_workers, total)) as pool:
         futures = {
             pool.submit(
-                calibrate_single,
+                _fetch_target_surface,
                 d,
                 currency,
-                device,
                 target_surfaces.get(d),
             ): d
             for d in dates
         }
-
-        done = 0
         for fut in as_completed(futures):
             d = futures[fut]
-            done += 1
             try:
-                result = fut.result()
-                results.append(result)
-                if verbose:
-                    print(
-                        f"[{done}/{total}] {d} — RMSE={result.rmse_bps:.1f} bps "
-                        f"{'✓' if result.converged else '✗'} "
-                        f"({result.runtime_ms:.0f} ms)"
-                    )
+                fetched_surfaces[d] = fut.result()
             except Exception as exc:
-                warnings.warn(f"Date {d} failed: {exc}")
-                results.append(
-                    CalibrationResult(
-                        date=d, currency=currency.upper(),
-                        params={n: 0.0 for n in _PARAM_NAMES},
-                        rmse_bps=np.nan, runtime_ms=0.0, converged=False,
-                    )
-                )
-
+                warnings.warn(f"Failed to fetch surface for {d}: {exc}")
+                fallback_val = 0.20 if currency.upper() == "SPX" else 0.50
+                fetched_surfaces[d] = np.full((8, 11), fallback_val, dtype=np.float32)
+                
+    # 2. Run batched GPU Newton calibration
+    target_surfaces_list = [fetched_surfaces[d] for d in dates]
+    target_iv_batch = np.stack(target_surfaces_list, axis=0) # (B, 8, 11)
+    target_iv_tensor = torch.tensor(target_iv_batch, dtype=torch.float32, device=dev)
+    
+    t_start = time.perf_counter()
+    cal_theta, cal_preds, cal_loss = calibrate_newton_batch(model, target_iv_tensor, pn, yn, dev)
+    t_end = time.perf_counter()
+    
+    t_total_ms = (t_end - t_start) * 1000.0
+    runtime_ms_per_surface = t_total_ms / total
+    
+    # 3. Collect results
+    results = []
+    cal_theta_np = cal_theta.cpu().numpy()
+    cal_preds_np = cal_preds.cpu().numpy()
+    cal_loss_np = cal_loss.cpu().numpy()
+    
+    for i, d in enumerate(dates):
+        rmse = float(np.sqrt(cal_loss_np[i]) * 10000.0)
+        converged = bool(rmse < 50.0) # Convergence threshold: 50 bps
+        
+        result = CalibrationResult(
+            date=d,
+            currency=currency.upper(),
+            params={n: float(v) for n, v in zip(_PARAM_NAMES, cal_theta_np[i].tolist())},
+            rmse_bps=rmse,
+            runtime_ms=runtime_ms_per_surface,
+            converged=converged,
+            surface=cal_preds_np[i],
+        )
+        results.append(result)
+        
+        if verbose:
+            print(
+                f"[{i+1}/{total}] {d} — RMSE={result.rmse_bps:.1f} bps "
+                f"{'✓' if result.converged else '✗'} "
+                f"({result.runtime_ms:.0f} ms)"
+            )
+            
     return sorted(results, key=lambda r: r.date)
+
+
+def _fetch_target_surface(date_str: str, currency: str, preset_surface: Optional[np.ndarray]) -> np.ndarray:
+    if preset_surface is not None:
+        return preset_surface
+        
+    if currency.upper() == "SPX":
+        from datetime import date as date_cls
+        from market.spx_data import download_spx_chain, clean_chain, to_iv_surface
+        snap_date = date_cls.fromisoformat(date_str)
+        try:
+            df      = download_spx_chain(snap_date, cache=True)
+            df_c    = clean_chain(df)
+            return to_iv_surface(df_c, S0=5000.0, r=0.05, q=0.015)
+        except Exception as exc:
+            warnings.warn(f"Market data fetch failed for {date_str}: {exc} — using zeros")
+            return np.full((8, 11), 0.20, dtype=np.float32)
+    else:
+        import asyncio
+        from market.deribit_data import fetch_option_snapshot, build_iv_surface
+        currency_upper = currency.upper()
+        try:
+            df  = asyncio.run(fetch_option_snapshot(currency_upper))
+            return build_iv_surface(df, _MATURITIES, _STRIKES)
+        except Exception as exc:
+            warnings.warn(f"Deribit fetch failed for {date_str}: {exc} — using zeros")
+            return np.full((8, 11), 0.50, dtype=np.float32)
 
 
 def results_to_dataframe(results: List[CalibrationResult]):
