@@ -16,13 +16,13 @@ from arbitrage.surface_completion import (
     check_calendar_spread,
     check_butterfly,
     fit_svi_slice,
-    monotone_rearrangement,
+    enforce_calendar_spread_monotonicity,
     complete_surface
 )
 from market.spx_data import T_GRID, K_GRID
 
 
-def test_monotone_rearrangement_calendar():
+def test_enforce_calendar_spread_monotonicity():
     # Setup a variance surface with calendar spread violations along T-axis (axis=0)
     var = np.array([
         [0.1, 0.1, 0.1],
@@ -30,7 +30,7 @@ def test_monotone_rearrangement_calendar():
         [0.15, 0.15, 0.15],
         [0.12, 0.12, 0.12]   # Violation: 0.12 < 0.15
     ])
-    rearranged = monotone_rearrangement(var, axis=0)
+    rearranged = enforce_calendar_spread_monotonicity(var, axis=0)
     
     # Check that it is non-decreasing along the T-axis
     diffs = np.diff(rearranged, axis=0)

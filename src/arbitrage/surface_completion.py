@@ -440,6 +440,7 @@ def complete_surface(sparse_iv: np.ndarray,
     nT, nK = sparse_iv.shape
 
     if method == "cubic_spline":
+        from scipy.interpolate import griddata
         # griddata is imported locally here where it is actually used.
         # Get coordinates of observed elements
         observed_coords = []
