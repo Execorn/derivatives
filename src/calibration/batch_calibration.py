@@ -50,6 +50,9 @@ _STRIKES    = np.linspace(-0.5, 0.5, 11, dtype=np.float32)
 # Model cache
 _CACHE: Dict[str, object] = {}
 
+# Spatial coordinate tensor cache (keyed by device string to avoid re-allocation)
+_SPATIAL_CACHE: Dict[str, torch.Tensor] = {}
+
 
 # ── Dataclass ─────────────────────────────────────────────────────────────────
 
@@ -102,15 +105,9 @@ class CalibrationResult:
 
 def _get_assets(device_str: str = "auto"):
     """Lazy-load FNO model + normalizers."""
-    import calibrate
-    if calibrate._param_norm is None:
-        if calibrate._PARAM_NORM_PATH == "artifacts/models/param_normalizer.npz":
-            calibrate._load_normalizers()
-        else:
-            calibrate._load_normalizers("current")
-
-    active_path = calibrate._PARAM_NORM_PATH
-    version = "v3" if "v3" in str(active_path) else "v2"
+    # BUG-5 fix: determine version from module-level constants, not from
+    # calibrate._PARAM_NORM_PATH which may not reflect the correct version.
+    version = "v3" if _PN_PATH.exists() else "v2"
 
     if device_str == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -183,12 +180,16 @@ def _get_assets(device_str: str = "auto"):
 
 
 def _make_spatial(device: torch.device) -> torch.Tensor:
-    T = torch.tensor(_MATURITIES, dtype=torch.float32)
-    K = torch.tensor(_STRIKES, dtype=torch.float32)
-    T_norm = (T - T.mean()) / (T.std() + 1e-8)
-    K_norm = K / 0.5
-    T_m, K_m = torch.meshgrid(T_norm, K_norm, indexing="ij")
-    return torch.stack([T_m, K_m], dim=-1).unsqueeze(0).to(device)  # (1,8,11,2)
+    """Build (1,8,11,2) spatial coordinate tensor, cached per device (R3)."""
+    key = str(device)
+    if key not in _SPATIAL_CACHE:
+        T = torch.tensor(_MATURITIES, dtype=torch.float32)
+        K = torch.tensor(_STRIKES, dtype=torch.float32)
+        T_norm = (T - T.mean()) / (T.std() + 1e-8)
+        K_norm = K / 0.5
+        T_m, K_m = torch.meshgrid(T_norm, K_norm, indexing="ij")
+        _SPATIAL_CACHE[key] = torch.stack([T_m, K_m], dim=-1).unsqueeze(0).to(device)
+    return _SPATIAL_CACHE[key]
 
 
 def _fno_predict_batch(
@@ -259,11 +260,10 @@ def calibrate_newton_batch(
     yn_std = torch.tensor(yn.std, dtype=torch.float32, device=device)
 
     # Differentiable forward prediction
+    # BUG-1 fix: all 6 parameters (kappa, theta, sigma, rho, v0, H) are now
+    # passed through the normalizer unchanged — none are pinned to constants.
     def fwd_fn(theta_single, spatial_single):
-        theta_fixed = theta_single.clone()
-        theta_fixed[0] = 1.0
-        theta_fixed[1] = 0.08
-        theta_norm = (theta_fixed.unsqueeze(0) - pn_mean) / pn_std
+        theta_norm = (theta_single.unsqueeze(0) - pn_mean) / pn_std
         # Clamp normalized parameters to prevent network explosion
         theta_norm = theta_norm.clamp(min=-3.0, max=3.0)
         spatial_input = spatial_single.unsqueeze(0)
@@ -282,29 +282,26 @@ def calibrate_newton_batch(
     ], dtype=torch.float32, device=device)
     
     num_starts = len(inits)
-    theta = inits.repeat_interleave(B, dim=0) # (B * num_starts, 6)
-    target_expanded = target_flat.repeat(num_starts, 1) # (B * num_starts, 88)
+    theta = inits.repeat_interleave(B, dim=0)       # (M=B*num_starts, 6)
+    target_expanded = target_flat.repeat(num_starts, 1)  # (M, 88)
     
     M = B * num_starts
     spatial_batch = spatial_single.unsqueeze(0).repeat(M, 1, 1, 1)
+
+    # Dynamically select chunk size based on device to maximize GPU utilization
+    chunk_sz = 4 if device.type == "cpu" else 128
     
-    # Initialize loss_best
-    preds = []
-    for i in range(0, M, 4):
-        theta_sub = theta[i:i+4]
-        spatial_sub = spatial_batch[i:i+4]
-        with torch.no_grad():
-            preds.append(vmap_fwd(theta_sub, spatial_sub).detach())
-    pred_val = torch.cat(preds, dim=0)
-    r = pred_val - target_expanded
-    loss_best = (r**2).mean(dim=1)
-    
+    # BUG-2 fix: removed dead pre-loop forward pass whose result was immediately
+    # overwritten on iteration 0. Initialize loss_best to +inf so the first
+    # iteration's line-search correctly seeds theta_best.
+    loss_best = torch.full((M,), float('inf'), device=device)
+
     for it in range(max_iter):
         preds = []
         jacs = []
-        for i in range(0, M, 4):
-            theta_sub = theta[i:i+4]
-            spatial_sub = spatial_batch[i:i+4]
+        for i in range(0, M, chunk_sz):
+            theta_sub = theta[i:i+chunk_sz]
+            spatial_sub = spatial_batch[i:i+chunk_sz]
             preds.append(vmap_fwd(theta_sub, spatial_sub).detach())
             jacs.append(vmap_jac(theta_sub, spatial_sub).detach())
             
@@ -313,8 +310,6 @@ def calibrate_newton_batch(
         
         r = pred_val - target_expanded
         loss = (r**2).mean(dim=1)
-        
-        # No early stopping check on GPU to ensure zero CPU-GPU copies inside the loop
             
         # Solve LM equations: (J^T J + epsilon * diag(J^T J)) delta = -J^T r
         JtJ = torch.bmm(jac_val.transpose(1, 2), jac_val)
@@ -328,15 +323,16 @@ def calibrate_newton_batch(
         
         # Backtracking line search on GPU
         theta_best = theta.clone()
-        loss_best = loss.clone()
+        # For initial iteration, ensure we take any improvement
+        loss_best = torch.where(loss_best == float('inf'), loss, loss_best)
         alpha = torch.ones(M, 1, device=device)
         
         for ls_step in range(4):
             theta_cand = (theta + alpha * delta).clamp(lo_t + 1e-5, hi_t - 1e-5)
             preds_cand = []
-            for i in range(0, M, 4):
-                theta_sub = theta_cand[i:i+4]
-                spatial_sub = spatial_batch[i:i+4]
+            for i in range(0, M, chunk_sz):
+                theta_sub = theta_cand[i:i+chunk_sz]
+                spatial_sub = spatial_batch[i:i+chunk_sz]
                 with torch.no_grad():
                     preds_cand.append(vmap_fwd(theta_sub, spatial_sub).detach())
             pred_cand_val = torch.cat(preds_cand, dim=0)
@@ -347,9 +343,9 @@ def calibrate_newton_batch(
             loss_best = torch.where(better, loss_cand, loss_best)
             alpha = alpha * 0.5
             
+        # BUG-1 fix: removed theta[:, 0]=1.0 and theta[:, 1]=0.08 overwrite
+        # that prevented kappa and theta from being calibrated.
         theta = theta_best.detach()
-        theta[:, 0] = 1.0
-        theta[:, 1] = 0.08
         
     loss_reshaped = loss_best.reshape(num_starts, B)
     best_start_idx = loss_reshaped.argmin(dim=0)
@@ -359,9 +355,9 @@ def calibrate_newton_batch(
     
     best_spatial = spatial_single.unsqueeze(0).repeat(B, 1, 1, 1)
     best_preds = []
-    for i in range(0, B, 4):
-        theta_sub = best_theta[i:i+4]
-        spatial_sub = best_spatial[i:i+4]
+    for i in range(0, B, chunk_sz):
+        theta_sub = best_theta[i:i+chunk_sz]
+        spatial_sub = best_spatial[i:i+chunk_sz]
         with torch.no_grad():
             best_preds.append(vmap_fwd(theta_sub, spatial_sub).detach())
     final_preds = torch.cat(best_preds, dim=0).reshape(B, 8, 11)
@@ -415,7 +411,12 @@ def calibrate_single(
 
             currency_upper = currency.upper()
             try:
-                df  = asyncio.run(fetch_option_snapshot(currency_upper))
+                # BUG-6 fix: use explicit event loop for thread safety
+                _loop = asyncio.new_event_loop()
+                try:
+                    df = _loop.run_until_complete(fetch_option_snapshot(currency_upper))
+                finally:
+                    _loop.close()
                 target_surface = build_iv_surface(df, _MATURITIES, _STRIKES)
             except Exception as exc:
                 warnings.warn(f"Deribit fetch failed: {exc} — using zeros")
@@ -531,7 +532,12 @@ def _fetch_target_surface(date_str: str, currency: str, preset_surface: Optional
         from market.deribit_data import fetch_option_snapshot, build_iv_surface
         currency_upper = currency.upper()
         try:
-            df  = asyncio.run(fetch_option_snapshot(currency_upper))
+            # BUG-6 fix: use explicit event loop for thread safety
+            _loop = asyncio.new_event_loop()
+            try:
+                df = _loop.run_until_complete(fetch_option_snapshot(currency_upper))
+            finally:
+                _loop.close()
             return build_iv_surface(df, _MATURITIES, _STRIKES)
         except Exception as exc:
             warnings.warn(f"Deribit fetch failed for {date_str}: {exc} — using zeros")
