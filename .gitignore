@@ -93,10 +93,7 @@ mcp.json
 .agents/
 dev/
 
-# ── AI-generated context and planning documents ───────────────────────────────
-CONTEXT.md
-OVERVIEW.md
-ROADMAP.md
+# ── AI-generated planning documents (not committed)
 ROADMAP_P4_ONWARDS.md
 *.ORIGINAL_REQUEST.md
 *TIER*ORCHESTRATOR*.md
