@@ -433,3 +433,207 @@ authoritative current state:
 - `notebooks/generate_notebooks.py` — end-to-end pipeline demonstration
 - This file (`CONTEXT.md`) — agent-oriented deep context
 
+
+---
+
+## 15. System Environment (CRITICAL for AI agents)
+
+### Hardware
+- **GPU**: NVIDIA RTX 3080 (10 GB VRAM) or RTX 4090 (24 GB VRAM)
+- **CUDA**: 12.6
+- **CPU**: Multi-core (12 threads available for data-fetch parallelism)
+- **OS**: Arch Linux (rolling release)
+
+### Package management rules — READ CAREFULLY
+```
+NEVER use pacman to install Python packages.
+NEVER use pip install --user or pip install globally.
+ALWAYS use the project virtual environment: .venv/
+ALWAYS activate venv before any Python work:
+
+  source .venv/bin/activate          # Linux/macOS
+  # OR: .venv/bin/python script.py   # direct invocation
+
+To install a new Python package:
+  source .venv/bin/activate
+  pip install <package>
+
+To check if a package is installed:
+  .venv/bin/pip show <package>
+
+If you need a system library (libcuda, libstdc++, etc.):
+  ASK THE USER — do not attempt to install system packages.
+```
+
+### Python version
+```
+Python 3.14 (in .venv)
+.venv/bin/python --version   # should print Python 3.14.x
+```
+
+### Running code
+```bash
+# All commands from repo root /home/execorn/programming/derivatives/
+
+# Run a script
+source .venv/bin/activate && python src/my_script.py
+
+# Run tests
+.venv/bin/pytest tests/ -q --tb=short
+
+# Run specific test
+.venv/bin/pytest tests/test_calibrate_newton_h.py -v
+
+# Run notebooks
+cd notebooks && ../.venv/bin/jupyter lab
+
+# Streamlit dashboard
+.venv/bin/streamlit run src/app_fno.py
+
+# FastAPI server
+.venv/bin/uvicorn api.server:app --reload --port 8000 --app-dir src
+```
+
+### Installed packages (key ones — do not reinstall unless broken)
+```
+torch 2.12.0+cu126          # GPU training and inference
+torchvision, torchaudio     # torch ecosystem
+torchdiffeq                 # ODE/SDE solver (for Neural SDE)
+numpy, scipy, pandas        # numerical computing
+scikit-learn                # preprocessing, metrics
+matplotlib, seaborn, plotly # visualization
+streamlit                   # dashboard
+fastapi, uvicorn            # REST API
+httpx, aiohttp              # async HTTP (Deribit WebSocket)
+py_vollib_vectorized        # Black-Scholes IV computation
+yfinance                    # SPX data download
+pytest, pytest-asyncio      # testing
+```
+
+---
+
+## 16. Git Rules and Workflow
+
+### Branch policy
+```
+Single branch: master
+Force-push is ALLOWED (and sometimes necessary for squashing)
+No pull requests, no feature branches unless explicitly requested
+```
+
+### Standard commit flow
+```bash
+# Stage specific files (preferred — never blind git add -A unless sure)
+git add src/my_file.py tests/test_my_file.py
+
+# Stage all modified tracked files
+git add -u
+
+# Stage new untracked files explicitly
+git add new_file.py
+
+# Commit
+git commit -m "feat: add Rough Bergomi GPU pricer
+
+- Implemented Bennedsen hybrid scheme for fBm simulation
+- 50k paths x 200 time steps on GPU: ~8s per surface
+- Added NaN filtering (expected ~3% NaN rate for H<0.05)"
+
+# Push
+git push origin master
+```
+
+### Squashing commits (use when you have many fix commits)
+```bash
+# Squash last N commits into one
+git reset --soft HEAD~N
+git commit -m "unified commit message"
+git push origin master --force
+```
+
+### Commit message format
+```
+<type>: <short description> (<50 chars)
+
+[optional body: what, why, expected results]
+[optional: "Result: X bps RMSE, Y ms latency"]
+
+Types:
+  feat:     new feature or model
+  fix:      bug fix
+  test:     adding/fixing tests
+  docs:     documentation only
+  chore:    cleanup, gitignore, deps
+  refactor: code restructuring, no behavior change
+  bench:    benchmark or performance measurement
+```
+
+### Important: what to commit and what NOT to
+```
+COMMIT:
+  src/**/*.py        all source code
+  tests/**/*.py      all test files
+  notebooks/generate_notebooks.py   notebook generator source
+  README.md, CONTEXT.md, OVERVIEW.md, ROADMAP.md
+  artifacts/models/*.npz            normalizer files (small, critical)
+  artifacts/weights/*.pth           model weights (if <100MB each)
+  results/**/*.json                 calibration results
+  benchmarks/*.py                   benchmark scripts
+
+DO NOT COMMIT (gitignored):
+  data/*.npz                        training datasets (100MB-5GB)
+  .venv/                            virtual environment
+  __pycache__/, *.pyc               Python cache
+  .ipynb_checkpoints/               Jupyter checkpoints
+  notebooks/*.ipynb                 generated notebooks (from generator)
+  images/ai_generated/              generated plots
+  mcp.json, .gemini/, .agents/      AI tool config
+  dev/                              scratch workspace
+  *.env                             environment variables
+```
+
+### Checking what is gitignored
+```bash
+git ls-files --others --exclude-standard    # untracked non-ignored
+git check-ignore -v <file>                  # why is this file ignored?
+git ls-files                                # all tracked files
+```
+
+### After big changes: verify clean state
+```bash
+git status --short                          # should be empty if all committed
+git diff HEAD                               # any uncommitted changes?
+```
+
+---
+
+## 17. Running Notebooks
+
+Notebooks are **generated** from source — never edit `.ipynb` directly.
+
+```bash
+# Generate/regenerate all notebooks
+cd notebooks
+../.venv/bin/python generate_notebooks.py   # creates 01_*.ipynb ... 07_*.ipynb
+
+# Execute all notebooks (non-interactively)
+../.venv/bin/jupyter nbconvert \
+    --to notebook --execute --inplace \
+    --ExecutePreprocessor.timeout=600 \
+    *.ipynb
+
+# Or launch Jupyter for interactive use
+../.venv/bin/jupyter lab
+# Open browser: http://localhost:8888
+```
+
+The notebook generator (`generate_notebooks.py`) is the source of truth.
+Each notebook corresponds to one key experiment:
+  NB01 → SPX calibration (v3, RMSE=8.9 bps)
+  NB02 → Surface completion (SVI + arbitrage)
+  NB03 → VIX term structure
+  NB04 → Portfolio Greeks
+  NB05 → BTC/ETH crypto calibration
+  NB06 → Batch multi-date calibration
+  NB07 → Joint SPX+VIX calibration
+
