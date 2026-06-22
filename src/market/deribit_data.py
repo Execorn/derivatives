@@ -475,7 +475,15 @@ def calibrate_crypto(currency: Literal["BTC", "ETH"] = "BTC",
     # ── Fetch live snapshot ───────────────────────────────────────────────────
     if verbose:
         print(f"[{currency}] Fetching Deribit option snapshot ...")
-    df = asyncio.run(fetch_option_snapshot(currency))
+    # asyncio.run() fails inside Jupyter (already has a running loop).
+    # Detect the running loop and use a dedicated thread instead.
+    try:
+        asyncio.get_running_loop()
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+            df = _pool.submit(asyncio.run, fetch_option_snapshot(currency)).result()
+    except RuntimeError:
+        df = asyncio.run(fetch_option_snapshot(currency))
     if verbose:
         print(f"[{currency}] Snapshot: {len(df)} options after filtering")
 

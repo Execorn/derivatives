@@ -127,14 +127,14 @@ def download_spx_chain(snapshot_date: date, cache: bool = True) -> pd.DataFrame:
         # Load FNO model to generate synthetic IVs
         from fno_model import MirrorPaddedFNO2d
         import calibrate
-        
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = MirrorPaddedFNO2d()
-        
-        # Check potential weights paths
+
+        # Always use v3 (6-param Rough Heston with learnable H).
+        # The is_v3 comparison was broken: _NORM_VERSIONS["v1"] path tuple
+        # never equals _NORM_VERSIONS["v3"] tuple, so version was always "v2".
+        version = "v3"
         weights_paths = [
-            "/home/execorn/programming/derivatives-w1/artifacts/weights/fno_v2_final_prod.pth",
-            "/home/execorn/programming/derivatives/artifacts/weights/fno_v2_final_prod.pth"
+            "/home/execorn/programming/derivatives-w1/artifacts/weights/fno_v3_final_prod.pth",
+            "/home/execorn/programming/derivatives/artifacts/weights/fno_v3_final_prod.pth"
         ]
         weights_path = None
         for w_p in weights_paths:
@@ -142,32 +142,41 @@ def download_spx_chain(snapshot_date: date, cache: bool = True) -> pd.DataFrame:
                 weights_path = w_p
                 break
         if weights_path is None:
-            raise FileNotFoundError("FNO v2 weights not found.")
-            
+            raise FileNotFoundError("FNO v3 weights not found.")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # param_dim=6 is required for the v3 architecture (includes H as free param)
+        model = MirrorPaddedFNO2d(param_dim=6)
         state_dict = torch.load(weights_path, map_location=device, weights_only=True)
         model.load_state_dict(state_dict)
         model.to(device)
         model.eval()
-        
+
         orig_v1 = calibrate._NORM_VERSIONS["v1"]
         with _LOCK:
             try:
-                calibrate._NORM_VERSIONS["v1"] = calibrate._NORM_VERSIONS["v2"]
-                calibrate._param_norm = None
-                calibrate._iv_norm = None
-                
-                # v0=0.08, sigma=0.5, rho=-0.7, kappa=1.0, theta=0.08, H=0.08
-                theta_raw = torch.tensor([[1.0, 0.08, 0.5, -0.7, 0.08, 0.08]], dtype=torch.float32, device=device)
+                # Redirect v1 slot to v3 paths so _fno_predict_real_iv's
+                # internal _load_normalizers("v1") call picks up v3 files.
+                calibrate._NORM_VERSIONS["v1"] = calibrate._NORM_VERSIONS[version]
+                calibrate._param_norm = None   # force reload with v3 paths
+                calibrate._iv_norm    = None
+
+                # Realistic SPX Rough Heston defaults [kappa, theta, sigma, rho, v0, H]
+                # v0=theta=0.04 → ~20% ATM vol; H=0.10 rough
+                theta_raw = torch.tensor(
+                    [[2.0, 0.04, 0.5, -0.7, 0.04, 0.10]],
+                    dtype=torch.float32, device=device
+                )
                 spatial = calibrate._make_spatial_input(T_GRID, K_GRID, device)
-                
+
                 with torch.no_grad():
                     iv_surface_t = calibrate._fno_predict_real_iv(model, theta_raw, spatial)
-                iv_surface = iv_surface_t.cpu().numpy()
+                iv_surface = iv_surface_t.squeeze().cpu().numpy()
             finally:
                 calibrate._NORM_VERSIONS["v1"] = orig_v1
                 calibrate._param_norm = None
-                calibrate._iv_norm = None
-            
+                calibrate._iv_norm    = None
+
         strikes = S0 * np.exp(np.linspace(-0.55, 0.55, 15))
         all_options = []
         
@@ -372,62 +381,57 @@ def to_iv_surface(df: pd.DataFrame,
     """
     is_synth = "is_synthetic" in df.columns and df["is_synthetic"].any()
     if is_synth:
-        # Re-generate the exact FNO surface directly to ensure zero reconstruction error
         from fno_model import MirrorPaddedFNO2d
         import calibrate
-        
-        # Check active version
-        is_v3 = calibrate._NORM_VERSIONS["v1"] == calibrate._NORM_VERSIONS["v3"]
-        version = "v3" if is_v3 else "v2"
-        
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = MirrorPaddedFNO2d()
-        
-        if is_v3:
-            weights_paths = [
-                "/home/execorn/programming/derivatives-w1/artifacts/weights/fno_v3_final_prod.pth",
-                "/home/execorn/programming/derivatives/artifacts/weights/fno_v3_final_prod.pth"
-            ]
-        else:
-            weights_paths = [
-                "/home/execorn/programming/derivatives-w1/artifacts/weights/fno_v2_final_prod.pth",
-                "/home/execorn/programming/derivatives/artifacts/weights/fno_v2_final_prod.pth"
-            ]
-            
+
+        # Always use v3 (6-param Rough Heston with learnable H).
+        version = "v3"
+        weights_paths = [
+            "/home/execorn/programming/derivatives-w1/artifacts/weights/fno_v3_final_prod.pth",
+            "/home/execorn/programming/derivatives/artifacts/weights/fno_v3_final_prod.pth"
+        ]
         weights_path = None
         for w_p in weights_paths:
             if Path(w_p).exists():
                 weights_path = w_p
                 break
         if weights_path is None:
-            raise FileNotFoundError(f"FNO {version} weights not found.")
-            
+            raise FileNotFoundError("FNO v3 weights not found.")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # param_dim=6 required for v3 architecture
+        model = MirrorPaddedFNO2d(param_dim=6)
         state_dict = torch.load(weights_path, map_location=device, weights_only=True)
         model.load_state_dict(state_dict)
         model.to(device)
         model.eval()
-        
+
         orig_v1 = calibrate._NORM_VERSIONS["v1"]
         with _LOCK:
             try:
+                # Redirect v1 slot to v3 paths so _fno_predict_real_iv's
+                # internal _load_normalizers("v1") call picks up v3 files.
                 calibrate._NORM_VERSIONS["v1"] = calibrate._NORM_VERSIONS[version]
-                calibrate._param_norm = None
-                calibrate._iv_norm = None
-                
-                # Use same parameter values for synthetic surface generation
-                # [kappa, theta, sigma, rho, v0, H]
-                theta_raw = torch.tensor([[1.0, 0.08, 0.5, -0.7, 0.08, 0.08]], dtype=torch.float32, device=device)
+                calibrate._param_norm = None   # force reload with v3 paths
+                calibrate._iv_norm    = None
+
+                # Realistic SPX Rough Heston defaults [kappa, theta, sigma, rho, v0, H]
+                theta_raw = torch.tensor(
+                    [[2.0, 0.04, 0.5, -0.7, 0.04, 0.10]],
+                    dtype=torch.float32, device=device
+                )
                 spatial = calibrate._make_spatial_input(T_GRID, K_GRID, device)
-                
+
                 with torch.no_grad():
                     iv_surface_t = calibrate._fno_predict_real_iv(model, theta_raw, spatial)
-                iv_surface = iv_surface_t.cpu().numpy()
+                iv_surface = iv_surface_t.squeeze().cpu().numpy()
             finally:
                 calibrate._NORM_VERSIONS["v1"] = orig_v1
                 calibrate._param_norm = None
-                calibrate._iv_norm = None
-            
+                calibrate._iv_norm    = None
+
         return iv_surface
+
 
     df = df.copy()
     # Compute forward price per row: F = S * exp((r-q)*T)

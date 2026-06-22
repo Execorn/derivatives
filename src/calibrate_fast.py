@@ -143,7 +143,7 @@ def calibrate_newton(model, target_iv: np.ndarray,
     dict: v0, zeta, lambda, sigma, rho, history, elapsed, n_iter, final_mse
     """
     model.eval()
-    _load_normalizers()
+    _load_normalizers("v2")  # calibrate_newton uses FNO v2 (3-param, fix_H)
     device   = next(model.parameters()).device
     spatial  = _make_spatial_input(T_grid, K_grid, device)
     target_t = torch.tensor(target_iv, dtype=torch.float32, device=device)
@@ -247,6 +247,15 @@ def calibrate_newton(model, target_iv: np.ndarray,
     sigma_f = max(float(np.sqrt(z_f**2 + lm_f**2)), 0.01)
     rho_f   = float(np.clip(z_f / sigma_f, -0.9, -0.1))
 
+    # Final forward pass to get the model-predicted IV surface
+    best_v0_t = torch.tensor([v0_f], dtype=torch.float32, device=device)
+    best_ze_t = torch.tensor([z_f], dtype=torch.float32, device=device)
+    best_lm_t = torch.tensor([lm_f], dtype=torch.float32, device=device)
+    with torch.no_grad():
+        p6_best = _reparam_to_6d(best_v0_t, best_ze_t, best_lm_t, device)
+        iv_fitted_t = _fno_predict_real_iv(model, p6_best, spatial)
+    iv_fitted = iv_fitted_t.cpu().numpy().reshape(target_iv.shape)
+
     return {
         "v0":          float(v0_f),
         "zeta":        float(z_f),
@@ -258,6 +267,7 @@ def calibrate_newton(model, target_iv: np.ndarray,
         "elapsed":     elapsed,
         "n_iter":      best_n,
         "final_mse":   best_loss,
+        "iv_fitted":   iv_fitted,
     }
 
 
@@ -439,6 +449,7 @@ def calibrate_newton_h(model, iv_target: np.ndarray,
     dict with keys: v0, sigma, rho, H, zeta, lambda, final_mse,
                     n_iter, theta_history, converged
     """
+    _load_normalizers("v3")  # calibrate_newton_h requires FNO v3 (param_dim=6)
     device   = next(model.parameters()).device
     spatial  = _make_spatial_input(T_grid, K_grid, device=device)
     iv_obs   = torch.tensor(iv_target.ravel(), dtype=torch.float32, device=device)

@@ -80,6 +80,9 @@ def fetch_vix_futures(date_input) -> pd.DataFrame:
     active_contracts = get_active_vix_months(val_date, count=8)
     
     # Try downloading via yfinance
+    # Note: delisted VIX futures tickers print 404 errors to stderr before
+    # returning empty DataFrames. Suppress that noise with redirect_stderr.
+    import io, contextlib
     df = None
     try:
         import yfinance as yf
@@ -88,18 +91,19 @@ def fetch_vix_futures(date_input) -> pd.DataFrame:
         for y, m, exp in active_contracts:
             month_code = MONTH_CODES[m]
             year_2_digits = str(y)[-2:]
-            
-            # Try .CFD first
-            ticker_symbol = f"VX{month_code}{year_2_digits}.CFD"
-            t = yf.Ticker(ticker_symbol)
-            hist = t.history(start=val_date, end=val_date + timedelta(days=1))
-            
-            if hist.empty:
-                # Try .CF
-                ticker_symbol = f"VX{month_code}{year_2_digits}.CF"
+
+            # Try .CFD first, then .CF — both may 404 for historical dates
+            hist = pd.DataFrame()
+            for suffix in (".CFD", ".CF"):
+                ticker_symbol = f"VX{month_code}{year_2_digits}{suffix}"
                 t = yf.Ticker(ticker_symbol)
-                hist = t.history(start=val_date, end=val_date + timedelta(days=1))
-                
+                _buf = io.StringIO()
+                with contextlib.redirect_stderr(_buf):
+                    hist = t.history(start=val_date,
+                                     end=val_date + timedelta(days=1))
+                if not hist.empty:
+                    break
+
             if not hist.empty:
                 prices.append(float(hist["Close"].iloc[-1]))
             else:

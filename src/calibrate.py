@@ -48,6 +48,27 @@ _param_norm: ParameterNormalizer | None = None
 _iv_norm:    IVSurfaceNormalizer | None = None
 
 
+# ─── Project-root-relative path resolution ───────────────────────────────────
+# calibrate.py lives in src/; project root is its parent.
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR   = os.path.dirname(_MODULE_DIR)   # …/derivatives/
+
+
+def _resolve_norm_path(p: str) -> str:
+    """Return an absolute path for a normalizer file.
+
+    Precedence:
+      1. Already absolute — return as-is.
+      2. Exists relative to CWD (script mode) — return as-is.
+      3. Resolve relative to project root (notebook mode, CWD = notebooks/).
+    """
+    if os.path.isabs(p):
+        return p
+    if os.path.exists(p):
+        return p
+    return os.path.join(_ROOT_DIR, p)
+
+
 def _load_normalizers(version: str = "v1"):
     """Load normalizer pair for *version* ('v1', 'v2', or 'diff').
 
@@ -67,13 +88,15 @@ def _load_normalizers(version: str = "v1"):
         _param_norm      = None
         _iv_norm         = None
     if _param_norm is None:
-        if os.path.exists(_PARAM_NORM_PATH):
-            _param_norm = ParameterNormalizer.load(_PARAM_NORM_PATH)
+        abs_p = _resolve_norm_path(_PARAM_NORM_PATH)
+        if os.path.exists(abs_p):
+            _param_norm = ParameterNormalizer.load(abs_p)
         else:
             _param_norm = _IdentityParamNorm()
     if _iv_norm is None:
-        if os.path.exists(_IV_NORM_PATH):
-            _iv_norm = IVSurfaceNormalizer.load(_IV_NORM_PATH)
+        abs_iv = _resolve_norm_path(_IV_NORM_PATH)
+        if os.path.exists(abs_iv):
+            _iv_norm = IVSurfaceNormalizer.load(abs_iv)
         else:
             _iv_norm = _IdentityIVNorm()
 
@@ -129,7 +152,12 @@ def _fno_predict_real_iv(model, params_raw: torch.Tensor,
     -------
     iv_real : (nT, nK) or (B, nT, nK) — real implied volatility ≥ 1e-4
     """
-    _load_normalizers()
+    # Normalizers must be loaded by the caller before invoking this function.
+    # Removing the auto-load here prevents downstream overrides when callers
+    # pre-load a specific version (e.g., v3) and _fno_predict_real_iv would
+    # otherwise reset them to v1/identity.
+    if _param_norm is None or _iv_norm is None:
+        _load_normalizers()   # lazy fallback — only if caller forgot
     device = spatial.device
 
     if params_raw.dim() == 1:
@@ -499,7 +527,7 @@ def compute_fim_ellipsoid(model, v0: float, zeta: float, lam: float,
     from torch.func import jacfwd
 
     model.eval()
-    _load_normalizers()
+    _load_normalizers()   # FIM uses whatever normalizer version is active
     device  = next(model.parameters()).device
     spatial = _make_spatial_input(T_grid, K_grid, device)
 

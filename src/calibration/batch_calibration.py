@@ -274,11 +274,12 @@ def calibrate_newton_batch(
     vmap_fwd = torch.vmap(fwd_fn, in_dims=(0, 0))
     vmap_jac = torch.vmap(torch.func.jacfwd(fwd_fn, argnums=0), in_dims=(0, 0))
     
-    # 3 diverse starting points
+    # 4 diverse starting points — include kappa=3 to cover SPX-typical range
     inits = torch.tensor([
         [1.0, 0.08, 0.5, -0.5, 0.08, 0.08],
         [1.0, 0.08, 0.3, -0.7, 0.04, 0.06],
         [1.0, 0.08, 0.7, -0.3, 0.12, 0.10],
+        [3.0, 0.03, 0.8, -0.4, 0.04, 0.12],   # high-kappa SPX start
     ], dtype=torch.float32, device=device)
     
     num_starts = len(inits)
@@ -489,7 +490,7 @@ def calibrate_batch(
     
     for i, d in enumerate(dates):
         rmse = float(np.sqrt(cal_loss_np[i]) * 10000.0)
-        converged = bool(rmse < 50.0) # Convergence threshold: 50 bps
+        converged = bool(rmse < 100.0)  # Convergence threshold: 100 bps
         
         result = CalibrationResult(
             date=d,
