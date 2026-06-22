@@ -30,7 +30,10 @@ The project covers the full quant stack: mathematical foundations → GPU pricin
 | FNO v2 surrogate accuracy | **R² = 0.9991, MAE = 0.058%** (5.8 bp) |
 | FNO v3 (learnable H ∈ [0.04, 0.15]) | **R² = 0.9981, MAE = 0.264%** |
 | Inference speed | **~4 ms** (batch 1024) vs 5.6 s direct COS — **1400× speedup** |
-| Newton calibration (no noise) | **541 ms**, RMSE < 50 bps, 3× faster than L-BFGS |
+| Newton calibration — SPX synthetic (NB01) | **8.9 bps RMSE**, converged in 12 iters |
+| Batch calibration — 5 dates (NB06) | **12.8 bps median RMSE**, 5/5 converged, H=0.108 |
+| Joint SPX + VIX calibration (NB07) | SPX **198.9 bps**, VIX error **0.362**, converged |
+| BTC live Deribit calibration (NB05) | **1547 bps RMSE**, v2 model, 548 contracts |
 | Streaming p95 latency (20 ticks) | **668 ms** < 1000 ms real-time threshold |
 | FIM reparameterization | Condition number **1301× lower** (κ ≈ 770) |
 | Delta hedging variance reduction | **+5.1%** vs flat Black-Scholes Δ |
@@ -45,13 +48,14 @@ The project covers the full quant stack: mathematical foundations → GPU pricin
 3. [Installation](#installation)
 4. [Quick Start](#quick-start)
 5. [Module Guide](#module-guide)
-6. [REST API](#rest-api)
-7. [Benchmarks](#benchmarks)
-8. [Test Suite](#test-suite)
-9. [Thesis & Publications](#thesis--publications)
-10. [Project Structure](#project-structure)
-11. [Roadmap](#roadmap)
-12. [License](#license)
+6. [Notebooks](#notebooks)
+7. [REST API](#rest-api)
+8. [Benchmarks](#benchmarks)
+9. [Test Suite](#test-suite)
+10. [Models & Weights](#models--weights)
+11. [Project Structure](#project-structure)
+12. [Thesis & Publications](#thesis--publications)
+13. [License](#license)
 
 ---
 
@@ -253,52 +257,85 @@ The dashboard has three tabs:
 
 ```python
 import sys; sys.path.insert(0, 'src')
-import numpy as np
 import torch
+import numpy as np
 from fno_model import MirrorPaddedFNO2d
-from normalizers import ParameterNormalizer, IVSurfaceNormalizer
-from calibrate import _load_normalizers, calibrate
+from calibrate import _load_normalizers, _fno_predict_real_iv, _make_spatial_input
+from market.spx_data import T_GRID, K_GRID
 
 # Load model and normalizers
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = MirrorPaddedFNO2d(param_dim=6).to(device)
 model.load_state_dict(torch.load("artifacts/weights/fno_v3_final_prod.pth", map_location=device))
 model.eval()
-
-_load_normalizers("v3")  # loads param + IV normalizers for v3
+_load_normalizers("v3")  # must be called before any forward pass
 
 # Parameters: κ=2.0, θ=0.04, σ=0.5, ρ=-0.7, V₀=0.04, H=0.1
-theta = np.array([2.0, 0.04, 0.5, -0.7, 0.04, 0.1])
+theta = torch.tensor([[2.0, 0.04, 0.5, -0.7, 0.04, 0.1]], dtype=torch.float32, device=device)
+spatial = _make_spatial_input(T_GRID, K_GRID, device)
 
-# Predict IV surface (8 maturities × 11 strikes)
-from calibrate import predict_surface
-iv_surface = predict_surface(theta, model)
-print(iv_surface.shape)   # (8, 11) — implied vol in decimal (0.2 = 20%)
-print(iv_surface[0, 5])   # ATM IV at shortest maturity
+with torch.no_grad():
+    iv_surface = _fno_predict_real_iv(model, theta, spatial).squeeze().cpu().numpy()
+
+print(iv_surface.shape)    # (8, 11) — implied vol in decimal (0.20 = 20%)
+print(f"ATM 6M: {iv_surface[2, 5]*100:.1f}%")  # roughly 20-25% for typical params
 ```
 
 ### 3. Calibrate to a Market Surface
 
 ```python
 import sys; sys.path.insert(0, 'src')
-import numpy as np
-from calibrate import calibrate, _load_normalizers
+import torch
+from fno_model import MirrorPaddedFNO2d
+from calibrate_fast import calibrate_newton_h
+from market.spx_data import T_GRID, K_GRID
 
-_load_normalizers("v3")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = MirrorPaddedFNO2d(param_dim=6).to(device)
+model.load_state_dict(torch.load("artifacts/weights/fno_v3_final_prod.pth", map_location=device))
+model.eval()
 
 # Market IV surface: 8 maturities × 11 strikes (in decimal vol, e.g. 0.20 = 20%)
-market_iv = np.array([...])  # shape (8, 11)
+import numpy as np
+market_iv = np.load("results/spx_calibration/2024-01-02.json")  # or your own array
 
-# Run Gauss-Newton calibration (starts from a sensible initial guess)
-result = calibrate(market_iv)
-print(f"RMSE: {result['rmse_bps']:.1f} bps")
-print(f"κ={result['kappa']:.3f}, θ={result['theta']:.4f}, H={result['H']:.3f}")
+# Gauss-Newton calibration in (v₀, ζ=σρ, λ=σ√(1-ρ²), H) space
+result = calibrate_newton_h(model, market_iv, T_GRID, K_GRID, max_iter=20, verbose=True)
+print(f"RMSE: {result['final_mse']**0.5 * 1e4:.1f} bps")
+print(f"κ={result['kappa']:.3f}  θ={result['theta']:.4f}  H={result['H']:.3f}")
+print(f"converged: {result['converged']}")
 ```
-
 
 ---
 
-## Module Guide
+## Notebooks
+
+Seven self-contained Jupyter notebooks demonstrate the full pipeline end-to-end.
+Generate (or regenerate) them from source with:
+
+```bash
+cd notebooks
+python generate_notebooks.py   # writes 01_*.ipynb ... 07_*.ipynb
+```
+
+Run in order (each is independent but uses the same trained weights):
+
+```bash
+source .venv/bin/activate
+cd notebooks
+jupyter lab   # or: jupyter nbconvert --to notebook --execute --inplace *.ipynb
+```
+
+| Notebook | Purpose | Key Output |
+|---|---|---|
+| `01_spx_calibration.ipynb` | Full SPX calibration pipeline | RMSE=8.9 bps, H=0.113 |
+| `02_surface_completion.ipynb` | SVI fit + arbitrage enforcement | Clean IV surface |
+| `03_vix_analysis.ipynb` | VIX term structure from Rough Heston | Model vs market curve |
+| `04_greeks_portfolio.ipynb` | Delta/gamma/vega/vanna/volga | Hedge portfolio |
+| `05_crypto_calibration.ipynb` | Live BTC/ETH from Deribit | RMSE=1547 bps (v2) |
+| `06_batch_calibration.ipynb` | Multi-date SPX batch + H dynamics | 12.8 bps median |
+| `07_joint_calibration.ipynb` | Joint SPX+VIX calibration | converged=True |
+
 
 ### Batch Calibration (Multi-Date)
 
@@ -652,8 +689,8 @@ derivatives/
 │   ├── normalizers.py                ParameterNormalizer, IVSurfaceNormalizer
 │   ├── pricing_engine.py             Fourier-COS pricer (CPU reference)
 │   ├── pricing_engine_gpu.py         GPU-vectorized Fourier-COS
-│   ├── calibrate.py                  L-BFGS + Gauss-Newton calibration entry
-│   ├── calibrate_fast.py             Fast approximate calibrator
+│   ├── calibrate.py                  Gauss-Newton core, normalizer loading
+│   ├── calibrate_fast.py             calibrate_newton / calibrate_newton_h
 │   ├── fim_analysis.py               Fisher Information Matrix / identifiability
 │   ├── fno_greeks.py                 Autograd Greeks from FNO
 │   ├── app_fno.py                    Streamlit dashboard
@@ -679,21 +716,21 @@ derivatives/
 │   └── api/
 │       └── server.py                 FastAPI REST server
 │
-├── tests/                            pytest suite (535 passing)
+├── notebooks/                        7 Jupyter notebooks (end-to-end demos)
+│   └── generate_notebooks.py         Notebook source — regenerates all .ipynb
+├── tests/                            pytest suite (533+ passing)
 ├── benchmarks/                       Performance and accuracy studies
-├── notebooks/                        Jupyter analysis notebooks
-├── data/
-│   ├── DeepRoughDataset_v2_fourier.npz   FNO v2 training set (N=40, N_cos=128)
-│   ├── DeepRoughDataset_v4_learnable_h.npz  FNO v3 training set (6 params)
-│   └── market/spx/*.parquet           Cached SPX option chains
+├── scripts/                          Utility scripts (batch VIX, plot generation)
+├── data/                             Training datasets and market cache (gitignored)
 ├── artifacts/
-│   ├── weights/                      Production model weights
-│   └── models/                       Normalizer .npz files
-├── tex/thesis/main.pdf               51-page LaTeX thesis
-├── results/                          Saved calibration outputs
-├── research/                         Research notes and SOTA survey
-├── ROADMAP_P4_ONWARDS.md             Future development plan
-└── CONTEXT.md                        AI agent / developer orientation map
+│   ├── weights/                      Production model weights (.pth)
+│   └── models/                       Normalizer files (.npz)
+├── tex/
+│   ├── thesis/main.pdf               51-page LaTeX thesis
+│   └── presentation/presentation.pdf Defence slides
+├── results/                          Saved calibration outputs (JSON)
+├── research/                         Research notes, PDFs, SOTA survey
+└── articles/                         Reference academic papers (PDF)
 ```
 
 ---
@@ -726,21 +763,13 @@ pdflatex -interaction=nonstopmode main.tex
 
 ---
 
-## Roadmap
-
-Completed phases:
+## Completed Phases
 
 | Phase | Status | Key Results |
 |-------|--------|-------------|
-| **P1**: FNO Surrogate | Done | FNO v1/v2/v3, FIM, Newton, Streamlit |
-| **P2**: Market Extensions | Done | FastAPI, VIX, Deribit, VarSwaps, batch calib |
-| **P3**: GPU-Native | Done | Gauss-Newton GPU, SVI GPU, portfolio Greeks GPU |
-
-See [`ROADMAP_P4_ONWARDS.md`](ROADMAP_P4_ONWARDS.md) for the full 4-tier forward plan:
-- **Tier 1** (active): Rough Bergomi surrogate, SSVI parameterization
-- **Tier 2**: Neural SDE, model-free calibration
-- **Tier 3**: Multi-asset, covariance surface
-- **Tier 4**: Production deployment (Kubernetes, Redis streaming)
+| **P1**: FNO Surrogate | Complete | FNO v1/v2/v3, FIM reparameterization, Newton calibrator, Streamlit |
+| **P2**: Market Extensions | Complete | FastAPI, VIX futures, Deribit streaming, variance swaps, batch calibration |
+| **P3**: GPU-Native | Complete | GPU Gauss-Newton, SVI arbitrage enforcement, portfolio Greeks, P&L attribution |
 
 ---
 

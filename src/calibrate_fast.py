@@ -84,7 +84,7 @@ def fno_jacobian_autograd(model, params_3d: torch.Tensor,
     -------
     J : (nT, nK, 3) Jacobian — J[t,k,j] = ∂IV[t,k]/∂params_3d[j]
     """
-    _load_normalizers()
+    _load_normalizers("v2")  # Jacobian uses same v2 normalizers as calibrate_newton
     device = next(model.parameters()).device
 
     lo = _BOUNDS_LOWER_3D.to(device)
@@ -283,7 +283,7 @@ def benchmark_jacobian_speed(model, T_grid, K_grid,
     Expected result: autograd ≈ 1 backward pass;
                      FD        ≈ 10 forward passes → 5-10× slower.
     """
-    _load_normalizers()
+    _load_normalizers("v2")  # benchmark uses v2 normalizers
     device  = next(model.parameters()).device
     spatial = _make_spatial_input(T_grid, K_grid, device)
     rng     = np.random.default_rng(42)

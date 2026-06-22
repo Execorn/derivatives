@@ -626,8 +626,7 @@ def complete_surface(sparse_iv: np.ndarray,
             "artifacts/weights/fno_v2_final_prod.pth",
             "/home/execorn/programming/derivatives-w2/artifacts/weights/fno_v2_final_prod.pth",
             "/home/execorn/programming/derivatives/artifacts/weights/fno_v2_final_prod.pth",
-            "/home/execorn/programming/derivatives-w1/artifacts/weights/fno_v2_final_prod.pth",
-        ]
+            ]
         weights_path = None
         for w_p in weights_paths:
             if Path(w_p).exists():

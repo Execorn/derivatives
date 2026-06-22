@@ -1,6 +1,5 @@
 # =============================================================================
-#  .gitignore — Deep Rough Heston Calibration project
-#  Last updated: 2026-06-18
+#  .gitignore — Rough Heston FNO Calibration project
 # =============================================================================
 
 # ── Python ────────────────────────────────────────────────────────────────────
@@ -24,10 +23,12 @@ dist/
 
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
+# NOTE: .ipynb files ARE tracked — override below
 *.ipynb
+!notebooks/*.ipynb
 
 # ── IDE / Editor ─────────────────────────────────────────────────────────────
-.vscode/settings.json
+.vscode/
 .idea/
 *.swp
 *.swo
@@ -37,110 +38,38 @@ dist/
 .DS_Store
 .DS_Store?
 ._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 Desktop.ini
+*.bak
 
-# ── Logs  (keep folder via .gitkeep, ignore content) ─────────────────────────
+# ── Logs (keep folder, ignore content) ───────────────────────────────────────
 logs/*
 !logs/.gitkeep
 
-# ── LaTeX compilation cache ──────────────────────────────────────────────────
+# ── LaTeX compilation cache and aux files ────────────────────────────────────
 tex/.latex_cache/*
 !tex/.latex_cache/.gitkeep
-
-# ── LaTeX junk that sometimes escapes the cache ──────────────────────────────
-*.aux
-*.bbl
-*.bcf
-*.blg
-*.fdb_latexmk
-*.fls
-*.log
-*.nav
-*.out
-*.run.xml
-*.snm
-*.synctex.gz
-*.toc
-# Do NOT ignore .tex source files
-!*.tex
-
-# ── Compiled PDFs (optional — keep if you want them in the repo) ─────────────
-# Uncomment to exclude PDFs:
-# *.pdf
-
-# ── Trained model artefacts (large binary files) ─────────────────────────────
-# Normally we ignore these if they are very large, but since our model weights 
-# and scalers are tiny (< 500KB total) and required for the Streamlit app 
-# deployment, we will track them in Git.
-# artifacts/weights/*
-# artifacts/scalers/*
-# !artifacts/scalers/.gitkeep
-
-# ── Misc ─────────────────────────────────────────────────────────────────────
-*.env
-.env.*
-mcp.json
-*.code-workspace
-
-# Phase 7 Hardening
-__pycache__/
-*.pyc
-*.pyo
-.latex_cache/
-.pytest_cache/
-*.txt.gz
-!data/samples/*.txt.gz
-
-# ── AI agent / assistant generated files ─────────────────────────────────────
-.antigravityignore
-.gemini/
-dev/
-test_*.py
-
-# ── Large datasets (reproduced by generate scripts) ──────────────────────────
-data/*.npz
-data/*.csv
+tex/**/*.aux
+tex/**/*.bbl
+tex/**/*.bcf
+tex/**/*.blg
+tex/**/*.fdb_latexmk
+tex/**/*.fls
+tex/**/*.log
+tex/**/*.nav
+tex/**/*.out
+tex/**/*.run.xml
+tex/**/*.snm
+tex/**/*.synctex.gz
+tex/**/*.toc
 
 # ── Compiled CUDA extensions (platform-specific) ─────────────────────────────
 *.so
 *.pyd
 
-# Project-internal AI context map — not for reviewers
-CONTEXT.md
-
-# ── AI-agent working directories ──────────────────────────────────────────────
-.agents/
-.gemini/
-
-# ── LaTeX thesis compiled output (keep sources, ignore aux/pdf) ───────────────
-tex/thesis/*.aux
-tex/thesis/*.bbl
-tex/thesis/*.bcf
-tex/thesis/*.blg
-tex/thesis/*.fdb_latexmk
-tex/thesis/*.fls
-tex/thesis/*.log
-tex/thesis/*.out
-tex/thesis/*.run.xml
-tex/thesis/*.toc
-
-# ── Speech notes (presenter notes, not thesis content) ───────────────────────
-speech_notes.md
-
-# ── Benchmark eval artefacts ─────────────────────────────────────────────────
-benchmarks/*.npy
-
-# ── AI-generated images (reproducible from scripts) ───────────────────────────
-images/ai_generated/
-
-# ── AI audit/analysis reports (not thesis content) ────────────────────────────
-artifacts/reports/
-
-# ── Tier 1 market data cache (downloaded on-demand, not committed) ────────────
+# ── Large datasets (reproduced by generate scripts) ──────────────────────────
+data/*.npz
+data/*.csv
 data/market/**/*.parquet
 data/market/**/*.csv
 data/market/**/*.json
@@ -148,54 +77,36 @@ data/market/**/*.json
 # ── Calibration result outputs (large, reproducible) ─────────────────────────
 results/**/*.npz
 results/**/*.npy
+benchmarks/*.npy
 
-# ── Jupyter notebooks (track .ipynb files) ───────────────────────────────────
-# Overriding earlier *.ipynb exclusion — we WANT notebooks in the repo
-!notebooks/*.ipynb
-.ipynb_checkpoints/
-
-# ── Legacy weights (archived, too large for git) ─────────────────────────────
+# ── Model artifacts (legacy / archived weights) ───────────────────────────────
 artifacts/legacy/
+artifacts/reports/
 
-# ── Root pycache (escaped from src/) ─────────────────────────────────────────
-/__pycache__/
+# ── pytest cache ─────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
 
-# AI agent work directories
+# ── AI agent / tool configuration ────────────────────────────────────────────
+mcp.json
+.gemini/
 .agents/
+dev/
+
+# ── AI-generated context and planning documents ───────────────────────────────
+CONTEXT.md
+OVERVIEW.md
+ROADMAP.md
+ROADMAP_P4_ONWARDS.md
 *.ORIGINAL_REQUEST.md
 *TIER*ORCHESTRATOR*.md
 
-# Root-level ad-hoc scripts (not part of repo)
-test_*.py
-!tests/
-
-
-# ── LaTeX build artifacts (not needed in git — only source + compiled PDF) ────
-tex/**/*.aux
-tex/**/*.log
-tex/**/*.toc
-tex/**/*.bbl
-tex/**/*.bcf
-tex/**/*.blg
-tex/**/*.out
-tex/**/*.run.xml
-tex/**/*.nav
-tex/**/*.snm
-tex/**/*.fls
-tex/**/*.fdb_latexmk
-tex/.latex_cache/**/*
-!tex/.latex_cache/.gitkeep
-
-# ── Editor and tool config (machine-specific, not project files) ──────────────
+# ── Editor workspace files ────────────────────────────────────────────────────
 *.code-workspace
-mcp.json
-.idea/
-.vscode/
 
-# ── Runtime log files ─────────────────────────────────────────────────────────
-logs/*.log
-logs/*.csv
-!logs/.gitkeep
+# ── Environment files ────────────────────────────────────────────────────────
+*.env
+.env.*
 
-# ── Development scratch files ─────────────────────────────────────────────────
-dev/
+# Generated images (output artifacts from fno_greeks.py etc.)
+images/ai_generated/

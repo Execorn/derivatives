@@ -111,67 +111,67 @@ class TestBounds4D:
         assert float(_BOUNDS_UPPER_4D[0]) <= 0.20  # v0 < 20% variance
 
 
-# ─── Self-consistency (requires v2 model + CUDA) ─────────────────────────────
+# ─── Self-consistency (requires v3 model + CUDA) ─────────────────────────────
 
 @pytest.mark.skipif(not CUDA_OK, reason="CUDA not available")
 class TestCalibrateNewtonH:
-    """Self-consistency: calibrate_newton_h recovers H≈0.08 from v2 surfaces."""
+    """Self-consistency: calibrate_newton_h recovers params from v3 FNO surfaces."""
 
     @pytest.fixture(scope="class")
-    def fno_v2_model(self):
-        """Load FNO v2 (trained with H fixed at 0.08)."""
+    def fno_v3_model(self):
+        """Load FNO v3 (learnable H ∈ [0.04, 0.15])."""
         from fno_model import MirrorPaddedFNO2d
-        from calibrate import _load_normalizers, _make_spatial_input, _fno_predict_real_iv
+        from calibrate import _load_normalizers
 
-        weights = "artifacts/weights/fno_v2_final_prod.pth"
+        weights = "artifacts/weights/fno_v3_final_prod.pth"
         if not os.path.exists(weights):
-            pytest.skip(f"FNO v2 weights not found: {weights}")
+            pytest.skip(f"FNO v3 weights not found: {weights}")
 
-        model = MirrorPaddedFNO2d()   # param_dim=6 by default
+        model = MirrorPaddedFNO2d(param_dim=6)
         import torch as _t
         model.load_state_dict(_t.load(weights, map_location="cpu", weights_only=True))
         model.eval()
-        _load_normalizers(version="v2")
+        _load_normalizers(version="v3")  # calibrate_newton_h requires v3
         return model
 
-    def test_self_consistency(self, fno_v2_model):
-        """calibrate_newton_h on FNO v2 surface should recover H≈0.08 with MSE<1e-3."""
+    def test_self_consistency(self, fno_v3_model):
+        """calibrate_newton_h on FNO v3 surface should recover H≈0.10 with MSE<1e-3."""
         from calibrate import _make_spatial_input, _fno_predict_real_iv
 
         spatial = _make_spatial_input(T_GRID, K_GRID, device=torch.device("cpu"))
-        true_p6 = torch.tensor([[1.0, 0.08, 0.50, -0.60, 0.07, 0.08]])
+        true_p6 = torch.tensor([[2.0, 0.04, 0.50, -0.70, 0.04, 0.10]])
         with torch.no_grad():
-            iv_target = _fno_predict_real_iv(fno_v2_model, true_p6, spatial).numpy()
+            iv_target = _fno_predict_real_iv(fno_v3_model, true_p6, spatial).numpy()
 
-        res = calibrate_newton_h(fno_v2_model, iv_target, T_GRID, K_GRID,
+        res = calibrate_newton_h(fno_v3_model, iv_target, T_GRID, K_GRID,
                                  max_iter=20, verbose=False,
                                  init_H=0.08)
 
-        # MSE should be low (FNO v2 is trained at H=0.08 exactly)
+        # MSE should be low (self-consistency on v3 FNO surface)
         assert res["final_mse"] < 1e-3, f"High MSE: {res['final_mse']:.4e}"
 
-    def test_returns_H_key(self, fno_v2_model):
+    def test_returns_H_key(self, fno_v3_model):
         """Return dict must contain 'H' key."""
         from calibrate import _make_spatial_input, _fno_predict_real_iv
 
         spatial  = _make_spatial_input(T_GRID, K_GRID, device=torch.device("cpu"))
-        true_p6  = torch.tensor([[1.0, 0.08, 0.50, -0.60, 0.07, 0.08]])
+        true_p6  = torch.tensor([[2.0, 0.04, 0.50, -0.70, 0.04, 0.10]])
         with torch.no_grad():
-            iv_target = _fno_predict_real_iv(fno_v2_model, true_p6, spatial).numpy()
+            iv_target = _fno_predict_real_iv(fno_v3_model, true_p6, spatial).numpy()
 
-        res = calibrate_newton_h(fno_v2_model, iv_target, T_GRID, K_GRID, max_iter=5)
+        res = calibrate_newton_h(fno_v3_model, iv_target, T_GRID, K_GRID, max_iter=5)
         assert "H" in res
         assert 0.04 <= res["H"] <= 0.15
 
-    def test_theta_history_has_4D(self, fno_v2_model):
+    def test_theta_history_has_4D(self, fno_v3_model):
         """theta_history entries must have shape (4,) for 4D calibration."""
         from calibrate import _make_spatial_input, _fno_predict_real_iv
 
         spatial  = _make_spatial_input(T_GRID, K_GRID, device=torch.device("cpu"))
-        true_p6  = torch.tensor([[1.0, 0.08, 0.40, -0.50, 0.08, 0.08]])
+        true_p6  = torch.tensor([[2.0, 0.04, 0.40, -0.50, 0.08, 0.10]])
         with torch.no_grad():
-            iv_target = _fno_predict_real_iv(fno_v2_model, true_p6, spatial).numpy()
+            iv_target = _fno_predict_real_iv(fno_v3_model, true_p6, spatial).numpy()
 
-        res = calibrate_newton_h(fno_v2_model, iv_target, T_GRID, K_GRID, max_iter=5)
+        res = calibrate_newton_h(fno_v3_model, iv_target, T_GRID, K_GRID, max_iter=5)
         assert "theta_history" in res
         assert all(np.asarray(h).shape == (4,) for h in res["theta_history"])
