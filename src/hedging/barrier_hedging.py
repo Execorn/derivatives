@@ -59,14 +59,19 @@ class BarrierHedgingEnv:
         Constructs boundary-aware state features for step k.
         Features: [log(S_k / K), log(S_k / B), T - t_k, active_mask, prev_delta]
         """
-        S_k = self.H[:, k, 0:1]  # (N_paths, 1)
-        log_moneyness = torch.log(torch.clamp(S_k / self.strike, min=1e-5))
-        
-        # log-distance to barrier. Clamp to prevent log(negative) if spot breaches barrier.
-        log_barrier_dist = torch.log(torch.clamp(S_k / self.barrier, min=1e-5))
-        
-        time_to_expiry = self.expiry - self.t_grid[k]
-        time_to_expiry_tensor = torch.full_like(S_k, time_to_expiry)
+        if hasattr(self, "_precomputed_log_moneyness") and self._precomputed_log_moneyness is not None:
+            log_moneyness = self._precomputed_log_moneyness[:, k]
+            log_barrier_dist = self._precomputed_log_barrier_dist[:, k]
+            time_to_expiry_tensor = self._precomputed_time_to_expiry[:, k]
+        else:
+            S_k = self.H[:, k, 0:1]  # (N_paths, 1)
+            log_moneyness = torch.log(torch.clamp(S_k / self.strike, min=1e-5))
+            
+            # log-distance to barrier. Clamp to prevent log(negative) if spot breaches barrier.
+            log_barrier_dist = torch.log(torch.clamp(S_k / self.barrier, min=1e-5))
+            
+            time_to_expiry = self.expiry - self.t_grid[k]
+            time_to_expiry_tensor = torch.full_like(S_k, time_to_expiry)
         
         # Combine log_moneyness, log_barrier_dist, time_to_expiry, active_mask, and all dimensions of prev_delta
         # shape: (N_paths, 4 + d)
@@ -84,6 +89,19 @@ class BarrierHedgingEnv:
         """
         device = self.H.device
         dtype = self.H.dtype
+        
+        # Precompute state features if enabled
+        if getattr(self, "precompute", True):
+            S = self.H[:, :, 0:1]
+            self._precomputed_log_moneyness = torch.log(torch.clamp(S / self.strike, min=1e-5))
+            self._precomputed_log_barrier_dist = torch.log(torch.clamp(S / self.barrier, min=1e-5))
+            
+            time_to_expiry_all = self.expiry - self.t_grid
+            self._precomputed_time_to_expiry = time_to_expiry_all.view(1, -1, 1).expand(self.N_paths, -1, -1)
+        else:
+            self._precomputed_log_moneyness = None
+            self._precomputed_log_barrier_dist = None
+            self._precomputed_time_to_expiry = None
         
         wealth = torch.zeros(self.N_paths, device=device, dtype=dtype)
         total_costs = torch.zeros(self.N_paths, device=device, dtype=dtype)
@@ -142,6 +160,11 @@ class BarrierHedgingEnv:
         self.payoff = payoff  # Store the dynamically computed payoff
         
         all_deltas = torch.stack(deltas, dim=1)
+        
+        # Clean up precomputed features
+        self._precomputed_log_moneyness = None
+        self._precomputed_log_barrier_dist = None
+        self._precomputed_time_to_expiry = None
         
         return wealth, total_costs, all_deltas
 

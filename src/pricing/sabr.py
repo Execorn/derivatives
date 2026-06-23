@@ -355,66 +355,52 @@ def ssvi_total_variance(k, theta, rho, eta, gamma):
 
 def sabr_iv_surface(F, T_grid, k_grid, alpha, beta, rho, nu, iv_type="lognormal"):
     """
-    Computes SABR implied volatility surface on a grid.
-    
-    Parameters
-    ----------
-    F : float
-        Forward price.
-    T_grid : ndarray of shape (nT,)
-        Maturities grid.
-    k_grid : ndarray of shape (nK,)
-        Log-moneyness grid.
-    alpha, beta, rho, nu : float
-        SABR parameters.
-    iv_type : str, optional
-        "lognormal" or "normal".
-        
-    Returns
-    -------
-    iv_surface : ndarray of shape (nT, nK)
-        Implied volatility surface.
+    Computes SABR implied volatility surface on a grid, supporting both scalar and batch inputs.
     """
-    nT = len(T_grid)
-    nK = len(k_grid)
-    
     T_mesh, k_mesh = np.meshgrid(T_grid, k_grid, indexing='ij')
     K_mesh = F * np.exp(k_mesh)
     
+    alpha = np.asarray(alpha)
+    is_batched = alpha.ndim > 0
+    
+    if is_batched:
+        K_mesh = K_mesh[np.newaxis, :, :]
+        T_mesh = T_mesh[np.newaxis, :, :]
+        alpha = alpha[:, np.newaxis, np.newaxis]
+        beta = np.asarray(beta)[:, np.newaxis, np.newaxis]
+        rho = np.asarray(rho)[:, np.newaxis, np.newaxis]
+        nu = np.asarray(nu)[:, np.newaxis, np.newaxis]
+        
     if iv_type == "lognormal":
-        return sabr_iv_lognormal(F, K_mesh, T_mesh, alpha, beta, rho, nu)
+        res = sabr_iv_lognormal(F, K_mesh, T_mesh, alpha, beta, rho, nu)
     elif iv_type == "normal":
-        return sabr_iv_normal(F, K_mesh, T_mesh, alpha, beta, rho, nu)
+        res = sabr_iv_normal(F, K_mesh, T_mesh, alpha, beta, rho, nu)
     else:
         raise ValueError(f"Unknown iv_type: {iv_type}")
+        
+    return res
 
 
 def ssvi_iv_surface(T_grid, k_grid, theta_grid, rho, eta, gamma):
     """
-    Computes SSVI implied volatility surface on a grid.
-    
-    Parameters
-    ----------
-    T_grid : ndarray of shape (nT,)
-        Maturities grid.
-    k_grid : ndarray of shape (nK,)
-        Log-moneyness grid.
-    theta_grid : ndarray of shape (nT,)
-        ATM total variance for each maturity.
-    rho, eta, gamma : float
-        SSVI surface parameters.
-        
-    Returns
-    -------
-    iv_surface : ndarray of shape (nT, nK)
-        Implied volatility surface.
+    Computes SSVI implied volatility surface on a grid, supporting both scalar and batch inputs.
     """
-    nT = len(T_grid)
-    nK = len(k_grid)
-    
     T_mesh, k_mesh = np.meshgrid(T_grid, k_grid, indexing='ij')
-    theta_mesh, _ = np.meshgrid(theta_grid, k_grid, indexing='ij')
     
+    theta_grid = np.asarray(theta_grid)
+    rho = np.asarray(rho)
+    is_batched = rho.ndim > 0
+    
+    if is_batched:
+        T_mesh = T_mesh[np.newaxis, :, :]
+        k_mesh = k_mesh[np.newaxis, :, :]
+        theta_mesh = theta_grid[:, :, np.newaxis]
+        rho = rho[:, np.newaxis, np.newaxis]
+        eta = np.asarray(eta)[:, np.newaxis, np.newaxis]
+        gamma = np.asarray(gamma)[:, np.newaxis, np.newaxis]
+    else:
+        theta_mesh, _ = np.meshgrid(theta_grid, k_grid, indexing='ij')
+        
     w = ssvi_total_variance(k_mesh, theta_mesh, rho, eta, gamma)
     
     w_safe = np.maximum(w, 0.0)

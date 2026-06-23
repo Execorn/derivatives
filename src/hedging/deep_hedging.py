@@ -105,20 +105,25 @@ class DeepHedgingEnv:
         Constructs the state feature vector for time step k.
         State features: [log(S_k / K), T - t_k, vol_proxy (local standard deviation), prev_delta]
         """
-        S_k = self.H[:, k, 0:1]  # (N_paths, 1)
-        log_moneyness = torch.log(torch.clamp(S_k / self.strike, min=1e-5))
-        time_to_expiry = self.expiry - self.t_grid[k]
-        time_to_expiry_tensor = torch.full_like(S_k, time_to_expiry)
-        
-        # Volatility proxy: local rolling standard deviation of underlying log returns
-        # For simplicity, if k < 5, we use a default volatility proxy (0.2),
-        # otherwise we calculate standard deviation of past 5 log returns.
-        if k < 5:
-            vol_proxy = torch.full_like(S_k, 0.2)
+        if hasattr(self, "_precomputed_log_moneyness") and self._precomputed_log_moneyness is not None:
+            log_moneyness = self._precomputed_log_moneyness[:, k]
+            time_to_expiry_tensor = self._precomputed_time_to_expiry[:, k]
+            vol_proxy = self._precomputed_vol_proxy[:, k]
         else:
-            past_S = self.H[:, k-5:k+1, 0]  # (N_paths, 6)
-            log_returns = torch.log(torch.clamp(past_S[:, 1:] / torch.clamp(past_S[:, :-1], min=1e-5), min=1e-5))  # (N_paths, 5)
-            vol_proxy = torch.std(log_returns, dim=-1, keepdim=True) * np.sqrt(252)
+            S_k = self.H[:, k, 0:1]  # (N_paths, 1)
+            log_moneyness = torch.log(torch.clamp(S_k / self.strike, min=1e-5))
+            time_to_expiry = self.expiry - self.t_grid[k]
+            time_to_expiry_tensor = torch.full_like(S_k, time_to_expiry)
+            
+            # Volatility proxy: local rolling standard deviation of underlying log returns
+            # For simplicity, if k < 5, we use a default volatility proxy (0.2),
+            # otherwise we calculate standard deviation of past 5 log returns.
+            if k < 5:
+                vol_proxy = torch.full_like(S_k, 0.2)
+            else:
+                past_S = self.H[:, k-5:k+1, 0]  # (N_paths, 6)
+                log_returns = torch.log(torch.clamp(past_S[:, 1:] / torch.clamp(past_S[:, :-1], min=1e-5), min=1e-5))  # (N_paths, 5)
+                vol_proxy = torch.std(log_returns, dim=-1, keepdim=True) * np.sqrt(252)
             
         # Concatenate features: log_moneyness, time_to_expiry, vol_proxy, and all dimensions of prev_delta
         # shape: (N_paths, 3 + d)
@@ -138,6 +143,26 @@ class DeepHedgingEnv:
         device = self.H.device
         dtype = self.H.dtype
         
+        # Precompute state features if enabled
+        if getattr(self, "precompute", True):
+            S = self.H[:, :, 0:1]
+            self._precomputed_log_moneyness = torch.log(torch.clamp(S / self.strike, min=1e-5))
+            
+            time_to_expiry_all = self.expiry - self.t_grid
+            self._precomputed_time_to_expiry = time_to_expiry_all.view(1, -1, 1).expand(self.N_paths, -1, -1)
+            
+            self._precomputed_vol_proxy = torch.full_like(S, 0.2)
+            if self.N_t >= 5:
+                S_0 = self.H[:, :, 0]
+                log_returns = torch.log(torch.clamp(S_0[:, 1:] / torch.clamp(S_0[:, :-1], min=1e-5), min=1e-5))  # (N_paths, N_t)
+                windows = log_returns.unfold(dimension=-1, size=5, step=1)  # (N_paths, N_t - 4, 5)
+                vol_proxy_windows = torch.std(windows, dim=-1, keepdim=True) * np.sqrt(252)  # (N_paths, N_t - 4, 1)
+                self._precomputed_vol_proxy[:, 5:self.N_t + 1] = vol_proxy_windows
+        else:
+            self._precomputed_log_moneyness = None
+            self._precomputed_time_to_expiry = None
+            self._precomputed_vol_proxy = None
+            
         # Initial wealth is set to 0.0 (indifference pricing baseline)
         wealth = torch.zeros(self.N_paths, device=device, dtype=dtype)
         total_costs = torch.zeros(self.N_paths, device=device, dtype=dtype)
@@ -177,6 +202,11 @@ class DeepHedgingEnv:
         wealth = wealth - terminal_unwind_cost
         
         all_deltas = torch.stack(deltas, dim=1)  # shape: (N_paths, N_t, d)
+        
+        # Clean up precomputed features
+        self._precomputed_log_moneyness = None
+        self._precomputed_time_to_expiry = None
+        self._precomputed_vol_proxy = None
         
         return wealth, total_costs, all_deltas
 

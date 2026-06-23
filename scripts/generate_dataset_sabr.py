@@ -61,23 +61,17 @@ def generate_sabr_dataset():
         s, e = b * BATCH_SIZE, min((b + 1) * BATCH_SIZE, N_SAMPLES)
         batch_params = params[s:e]
         
-        for i in range(e - s):
-            alpha = batch_params[i, 0]
-            rho = batch_params[i, 1]
-            nu = batch_params[i, 2]
-            
-            # Compute SABR lognormal surface (beta=1.0 fixed)
-            surface = sabr_iv_surface(
-                F=1.0,
-                T_grid=T_GRID,
-                k_grid=K_GRID,
-                alpha=alpha,
-                beta=1.0,
-                rho=rho,
-                nu=nu,
-                iv_type="lognormal"
-            )
-            iv_surfaces[s + i] = surface.astype(np.float32)
+        # Compute SABR lognormal surfaces in batch
+        iv_surfaces[s:e] = sabr_iv_surface(
+            F=1.0,
+            T_grid=T_GRID,
+            k_grid=K_GRID,
+            alpha=batch_params[:, 0],
+            beta=np.ones(e - s),
+            rho=batch_params[:, 1],
+            nu=batch_params[:, 2],
+            iv_type="lognormal"
+        ).astype(np.float32)
             
         if (b + 1) % 10 == 0 or b == n_batches - 1:
             print(f"  Processed {e:,} / {N_SAMPLES:,} samples...")
@@ -166,21 +160,15 @@ def generate_ssvi_dataset():
         s, e = b * BATCH_SIZE, min((b + 1) * BATCH_SIZE, N_SAMPLES)
         batch_params = params[s:e]
         
-        for i in range(e - s):
-            theta_sample = batch_params[i, 0:8]
-            rho_val = batch_params[i, 8]
-            eta_val = batch_params[i, 9]
-            gamma_val = batch_params[i, 10]
-            
-            surface = ssvi_iv_surface(
-                T_grid=T_GRID,
-                k_grid=K_GRID,
-                theta_grid=theta_sample,
-                rho=rho_val,
-                eta=eta_val,
-                gamma=gamma_val
-            )
-            iv_surfaces[s + i] = surface.astype(np.float32)
+        # Compute SSVI surfaces in batch
+        iv_surfaces[s:e] = ssvi_iv_surface(
+            T_grid=T_GRID,
+            k_grid=K_GRID,
+            theta_grid=batch_params[:, 0:8],
+            rho=batch_params[:, 8],
+            eta=batch_params[:, 9],
+            gamma=batch_params[:, 10]
+        ).astype(np.float32)
             
         if (b + 1) % 10 == 0 or b == n_batches - 1:
             print(f"  Processed {e:,} / {N_SAMPLES:,} samples...")

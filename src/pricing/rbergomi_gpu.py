@@ -72,17 +72,13 @@ def simulate_rbergomi_paths(
     w_full = torch.cat([zeros, w], dim=1)   # (B, N_t)
     w_rev = torch.flip(w_full, dims=[1]).unsqueeze(1)   # (B, 1, N_t)
 
-    # 3. Perform batched convolution
+    # 3. Perform FFT-based causal convolution
     # Z1 shape: (B, N_paths, N_t)
-    # We reshape to (1, B * N_paths, N_t) to do a single group convolution
-    Z1_reshaped = Z1.view(1, B * N_paths, N_t)
-    Z1_padded = F.pad(Z1_reshaped, (N_t - 1, 0))   # (1, B * N_paths, 2 * N_t - 1)
-
-    # Repeat w_rev along the batch dimension to match B * N_paths
-    w_rev_repeated = w_rev.repeat_interleave(N_paths, dim=0)   # (B * N_paths, 1, N_t)
-
-    conv_out = F.conv1d(Z1_padded, w_rev_repeated, groups=B * N_paths)   # (1, B * N_paths, N_t)
-    conv_out = conv_out.view(B, N_paths, N_t)
+    # w_full shape: (B, N_t)
+    fft_len = 2 * N_t
+    Z1_fft = torch.fft.rfft(Z1, n=fft_len, dim=-1)
+    w_fft = torch.fft.rfft(w_full, n=fft_len, dim=-1)
+    conv_out = torch.fft.irfft(Z1_fft * w_fft.unsqueeze(1), n=fft_len, dim=-1)[..., :N_t]
 
     # 4. Singular components
     # c1 = 1.0 / (H + 0.5)

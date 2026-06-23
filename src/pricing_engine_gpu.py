@@ -677,6 +677,54 @@ class BS_IV_Implicit_Inverter(torch.autograd.Function):
 # Main batch pricing pipeline
 # ---------------------------------------------------------------------------
 
+_vk_cache = {}
+
+def get_cos_payoff_coeffs_gpu(N_cos: int, a: float = _A, b: float = _B, device='cuda', is_put: bool = False) -> torch.Tensor:
+    key = (N_cos, a, b, str(device), is_put)
+    if key in _vk_cache:
+        return _vk_cache[key]
+    
+    k = torch.arange(N_cos, dtype=torch.float64, device=device)
+    uk = k * np.pi / (b - a)
+    uk_c = uk.to(torch.complex128)
+    
+    if is_put:
+        chi_put = torch.real(
+            torch.exp(-1j * uk_c * a)
+            * (1.0 - torch.exp((1.0 + 1j * uk_c) * a))
+            / (1.0 + 1j * uk_c)
+        )
+        chi_put[0] = 1.0 - np.exp(a)
+        
+        safe_uk = torch.where(k == 0, torch.tensor(1.0, dtype=torch.float64, device=device), uk)
+        psi_put = torch.where(
+            k == 0,
+            torch.tensor(-a, dtype=torch.float64, device=device),
+            -torch.sin(uk * a) / safe_uk,
+        )
+        Vk = (2.0 / (b - a)) * (psi_put - chi_put)
+        Vk[0] *= 0.5
+    else:
+        chi = torch.real(
+            torch.exp(-1j * uk_c * a)
+            * (torch.exp((1.0 + 1j * uk_c) * b) - 1.0)
+            / (1.0 + 1j * uk_c)
+        )
+        chi[0] = np.exp(b) - 1.0
+        
+        safe_uk = torch.where(k == 0, torch.tensor(1.0, dtype=torch.float64, device=device), uk)
+        psi = torch.where(
+            k == 0,
+            torch.tensor(b, dtype=torch.float64, device=device),
+            (torch.sin(uk * (b - a)) + torch.sin(uk * a)) / safe_uk,
+        )
+        Vk = (2.0 / (b - a)) * (chi - psi)
+        Vk[0] *= 0.5
+        
+    _vk_cache[key] = Vk
+    return Vk
+
+
 def _price_batch_gpu_raw(
     params_batch:      np.ndarray,        # (B, 5): [kappa, theta, sigma, rho, v0]
     T_grid:            np.ndarray,        # (nT,)
@@ -721,8 +769,8 @@ def _price_batch_gpu_raw(
     u_np    = np.arange(N_cos) * np.pi / (_B - _A)
     u_c     = torch.tensor(u_np + 0j, dtype=torch.complex128, device=dev)
     u_k     = torch.tensor(u_np,      dtype=torch.float64,    device=dev)
-    Vk_call = torch.tensor(cos_payoff_coeffs(N_cos),     dtype=torch.float64, device=dev)
-    Vk_put  = torch.tensor(cos_payoff_coeffs_put(N_cos), dtype=torch.float64, device=dev)
+    Vk_call = get_cos_payoff_coeffs_gpu(N_cos, _A, _B, dev, is_put=False)
+    Vk_put  = get_cos_payoff_coeffs_gpu(N_cos, _A, _B, dev, is_put=True)
 
     K_arr = torch.tensor(S0 * np.exp(K_grid), dtype=torch.float64, device=dev)
     T_arr = torch.tensor(T_grid,               dtype=torch.float64, device=dev)

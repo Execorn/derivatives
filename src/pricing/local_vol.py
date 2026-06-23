@@ -85,6 +85,82 @@ def check_arbitrage_free(T_grid: np.ndarray, K_grid: np.ndarray, svi_params: np.
             
     return True
 
+
+def check_arbitrage_free_batch(T_grid: np.ndarray, K_grid: np.ndarray, svi_params: np.ndarray) -> np.ndarray:
+    """
+    Checks calendar spread and butterfly arbitrage in batch.
+    
+    Parameters:
+    -----------
+    T_grid : np.ndarray
+        Maturities grid, shape (nT,)
+    K_grid : np.ndarray
+        Strikes grid, shape (nK,)
+    svi_params : np.ndarray
+        SVI parameters, shape (B, nT, 5) -> [a, b, rho, m, sigma] for each slice.
+        
+    Returns:
+    --------
+    is_arbitrage_free : np.ndarray of bool, shape (B,)
+    """
+    B = svi_params.shape[0]
+    nT = len(T_grid)
+    
+    k_min = min(K_grid.min(), -2.0)
+    k_max = max(K_grid.max(), 2.0)
+    K_dense = np.linspace(k_min, k_max, 400)
+    
+    # 0. Basic parameter checks (b >= 0, sigma > 0, |rho| <= 1.0)
+    b = svi_params[..., 1]      # (B, nT)
+    sigma = svi_params[..., 4]  # (B, nT)
+    rho = svi_params[..., 2]    # (B, nT)
+    
+    param_ok = np.all((b >= 0) & (sigma > 0) & (np.abs(rho) <= 1.0), axis=1) # (B,)
+    
+    valid_mask = param_ok.copy()
+    if not np.any(valid_mask):
+        return valid_mask
+        
+    active_indices = np.where(valid_mask)[0]
+    sub_svi = svi_params[active_indices] # (B_active, nT, 5)
+    
+    # 1. Compute total variance for all slices on K_dense
+    a = sub_svi[..., 0, np.newaxis] # (B_active, nT, 1)
+    b = sub_svi[..., 1, np.newaxis] # (B_active, nT, 1)
+    rho = sub_svi[..., 2, np.newaxis] # (B_active, nT, 1)
+    m = sub_svi[..., 3, np.newaxis] # (B_active, nT, 1)
+    sigma = sub_svi[..., 4, np.newaxis] # (B_active, nT, 1)
+    
+    k_exp = K_dense[np.newaxis, np.newaxis, :] # (1, 1, 400)
+    
+    u = k_exp - m # (B_active, nT, 400)
+    sqrt_term = np.sqrt(u ** 2 + sigma ** 2) # (B_active, nT, 400)
+    w_all = a + b * (rho * u + sqrt_term) # (B_active, nT, 400)
+    
+    # 2. Check positivity of total variance
+    positivity_ok = ~np.any(w_all < 0, axis=(1, 2)) # (B_active,)
+    
+    # 3. Calendar spread check: w(k, T_i) <= w(k, T_{i+1})
+    calendar_ok = ~np.any(w_all[:, 1:, :] < w_all[:, :-1, :] - 1e-10, axis=(1, 2)) # (B_active,)
+    
+    # 4. Butterfly arbitrage check: g(k) >= 0 for all slices
+    w_prime = b * (rho + u / sqrt_term) # (B_active, nT, 400)
+    w_prime2 = b * (sigma ** 2) / (sqrt_term ** 3) # (B_active, nT, 400)
+    
+    w_safe = np.maximum(w_all, 1e-8)
+    term1 = (1.0 - (k_exp * w_prime) / (2.0 * w_safe)) ** 2
+    term2 = (w_prime ** 2 / 4.0) * (1.0 / w_safe + 0.25)
+    term3 = 0.5 * w_prime2
+    g_k = term1 - term2 + term3 # (B_active, nT, 400)
+    
+    butterfly_ok = ~np.any(g_k < -1e-10, axis=(1, 2)) # (B_active,)
+    
+    active_valid = positivity_ok & calendar_ok & butterfly_ok
+    valid_mask[active_indices] = active_valid
+    
+    return valid_mask
+
+
 def svi_to_lv_surface(
     T_grid,
     K_grid,

@@ -244,6 +244,54 @@ def heston_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0, N_cos: int 
     return iv_surface
 
 
+_vk_cache = {}
+
+def get_cos_payoff_coeffs_gpu(N_cos: int, a: float, b: float, device, is_put: bool = False) -> torch.Tensor:
+    key = (N_cos, a, b, str(device), is_put)
+    if key in _vk_cache:
+        return _vk_cache[key]
+    
+    k = torch.arange(N_cos, dtype=torch.float64, device=device)
+    uk = k * np.pi / (b - a)
+    uk_c = uk.to(torch.complex128)
+    
+    if is_put:
+        chi_put = torch.real(
+            torch.exp(-1j * uk_c * a)
+            * (1.0 - torch.exp((1.0 + 1j * uk_c) * a))
+            / (1.0 + 1j * uk_c)
+        )
+        chi_put[0] = 1.0 - np.exp(a)
+        
+        safe_uk = torch.where(k == 0, torch.tensor(1.0, dtype=torch.float64, device=device), uk)
+        psi_put = torch.where(
+            k == 0,
+            torch.tensor(-a, dtype=torch.float64, device=device),
+            -torch.sin(uk * a) / safe_uk,
+        )
+        Vk = (2.0 / (b - a)) * (psi_put - chi_put)
+        Vk[0] *= 0.5
+    else:
+        chi = torch.real(
+            torch.exp(-1j * uk_c * a)
+            * (torch.exp((1.0 + 1j * uk_c) * b) - 1.0)
+            / (1.0 + 1j * uk_c)
+        )
+        chi[0] = np.exp(b) - 1.0
+        
+        safe_uk = torch.where(k == 0, torch.tensor(1.0, dtype=torch.float64, device=device), uk)
+        psi = torch.where(
+            k == 0,
+            torch.tensor(b, dtype=torch.float64, device=device),
+            (torch.sin(uk * (b - a)) + torch.sin(uk * a)) / safe_uk,
+        )
+        Vk = (2.0 / (b - a)) * (chi - psi)
+        Vk[0] *= 0.5
+        
+    _vk_cache[key] = Vk
+    return Vk
+
+
 def batch_heston_iv_surface(
     params: torch.Tensor,
     T_grid: torch.Tensor,
@@ -269,8 +317,8 @@ def batch_heston_iv_surface(
     k = torch.arange(N_cos, dtype=torch.float64, device=device)
     u_k = k * np.pi / (b - a)
     
-    Vk_call = torch.tensor(cos_payoff_coeffs_np(N_cos, a, b), dtype=torch.float64, device=device)
-    Vk_put = torch.tensor(cos_payoff_coeffs_put_np(N_cos, a, b), dtype=torch.float64, device=device)
+    Vk_call = get_cos_payoff_coeffs_gpu(N_cos, a, b, device, is_put=False)
+    Vk_put = get_cos_payoff_coeffs_gpu(N_cos, a, b, device, is_put=True)
     
     kappa = params[:, 0:1]
     theta = params[:, 1:2]

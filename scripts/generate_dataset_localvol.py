@@ -14,7 +14,7 @@ import numpy as np
 
 # Ensure project root is on PATH
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.pricing.local_vol import svi_to_lv_surface, check_arbitrage_free
+from src.pricing.local_vol import svi_to_lv_surface, check_arbitrage_free, check_arbitrage_free_batch
 
 # Config
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
@@ -76,14 +76,15 @@ def generate():
         valid_mask = (min_vals >= 0.0) & (max_vals <= 3.0) & (~has_nan)
         
         # Double check with analytical no-arbitrage check
-        for idx in np.where(valid_mask)[0]:
-            if len(saved_params) >= N_TARGET_SAMPLES:
-                break
-            if check_arbitrage_free(T_GRID, K_GRID, svi_params[idx]):
-                # Reshape SVI parameters to flat vector of size 40
-                flat_params = svi_params[idx].flatten()
-                saved_params.append(flat_params)
-                saved_lv.append(lv_surfaces[idx])
+        valid_indices = np.where(valid_mask)[0]
+        if len(valid_indices) > 0:
+            arbitrage_free_mask = check_arbitrage_free_batch(T_GRID, K_GRID, svi_params[valid_indices])
+            for idx, is_free in zip(valid_indices, arbitrage_free_mask):
+                if is_free:
+                    if len(saved_params) >= N_TARGET_SAMPLES:
+                        break
+                    saved_params.append(svi_params[idx].flatten())
+                    saved_lv.append(lv_surfaces[idx])
                 
         print(f"  Progress: {len(saved_params):,}/{N_TARGET_SAMPLES:,} valid samples | "
               f"Yield: {len(saved_params)/total_sampled * 100:.1f}% | "

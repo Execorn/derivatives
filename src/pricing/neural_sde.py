@@ -195,16 +195,19 @@ class NeuralSDEPricer(nn.Module):
         device = strikes.device
         dtype = strikes.dtype
         
-        # 1. Identify unique sorted maturities
-        unique_maturities, inverse_indices = torch.unique(maturities, return_inverse=True)
+        # 1. Identify unique sorted maturities on CPU to prevent CPU-GPU synchronization barrier
+        maturities_cpu = maturities.to("cpu")
+        unique_maturities, inverse_indices = torch.unique(maturities_cpu, return_inverse=True)
         unique_maturities_sorted, sort_indices = torch.sort(unique_maturities)
         
         # 2. Build simulation evaluation time grid starting at 0.0
-        if unique_maturities_sorted[0] > 0.0:
-            ts = torch.cat([torch.tensor([0.0], device=device, dtype=dtype), unique_maturities_sorted])
+        # Since unique_maturities_sorted is on CPU, indexing and comparison are on CPU
+        t0_val = unique_maturities_sorted[0].item()
+        if t0_val > 0.0:
+            ts_cpu = torch.cat([torch.tensor([0.0], dtype=dtype), unique_maturities_sorted])
             shift = 1
         else:
-            ts = unique_maturities_sorted
+            ts_cpu = unique_maturities_sorted
             shift = 0
             
         # 3. Setup initial state
@@ -214,12 +217,14 @@ class NeuralSDEPricer(nn.Module):
         # 4. Handle Brownian Interval
         if bm is None:
             bm = torchsde.BrownianInterval(
-                t0=ts[0].item(),
-                t1=ts[-1].item(),
+                t0=ts_cpu[0].item(),
+                t1=ts_cpu[-1].item(),
                 size=(N_paths, 2),
                 device=device,
                 dtype=dtype
             )
+            
+        ts = ts_cpu.to(device)
             
         # 5. Run SDE integration
         ys = torchsde.sdeint_adjoint(
@@ -236,7 +241,7 @@ class NeuralSDEPricer(nn.Module):
         
         # 6. Map options to output states
         mapped_indices = sort_indices[inverse_indices] + shift
-        ys_options = ys_clamped[mapped_indices]  # Shape: (N_options, N_paths, 2)
+        ys_options = ys_clamped[mapped_indices.to(device)]  # Shape: (N_options, N_paths, 2)
         
         X_T = ys_options[:, :, 0]  # (N_options, N_paths)
         S_T = S0 * torch.exp(X_T)

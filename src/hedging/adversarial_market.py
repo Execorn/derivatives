@@ -295,6 +295,11 @@ def train_robust_minimax_hedger(
             # --- 2. TRAIN GENERATOR (Minimax Adversary) ---
             opt_g.zero_grad()
             
+            # Freeze policy parameters to optimize backpropagation
+            policy_grad_states = [p.requires_grad for p in policy.parameters()]
+            for p in policy.parameters():
+                p.requires_grad = False
+                
             z = torch.randn(batch_size, generator.latent_dim, device=device)
             fake_samples = generator(z)
             fake_ret = fake_samples[:, 0, :]
@@ -334,6 +339,10 @@ def train_robust_minimax_hedger(
             g_total_loss.backward()
             opt_g.step()
             gen_loss_val += g_total_loss.item()
+            
+            # Restore policy parameter requires_grad state
+            for p, state in zip(policy.parameters(), policy_grad_states):
+                p.requires_grad = state
             
             # --- 3. TRAIN HEDGER POLICY ---
             opt_p.zero_grad()

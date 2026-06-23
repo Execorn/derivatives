@@ -112,13 +112,14 @@ def simulate_signature_vol_paths(
     dt = 1.0 / steps_per_unit
     sqrt_dt = np.sqrt(dt)
     
-    t_grid = torch.linspace(0.0, T, N_steps + 1, device=device)
+    dtype = v0.dtype
+    t_grid = torch.linspace(0.0, T, N_steps + 1, device=device, dtype=dtype)
     
     # Path dimension is 2: (time, W^1)
-    S1 = torch.zeros(N_paths, 2, device=device)
-    S2 = torch.zeros(N_paths, 2, 2, device=device)
-    S3 = torch.zeros(N_paths, 2, 2, 2, device=device)
-    S4 = torch.zeros(N_paths, 2, 2, 2, 2, device=device)
+    S1 = torch.zeros(N_paths, 2, device=device, dtype=dtype)
+    S2 = torch.zeros(N_paths, 2, 2, device=device, dtype=dtype)
+    S3 = torch.zeros(N_paths, 2, 2, 2, device=device, dtype=dtype)
+    S4 = torch.zeros(N_paths, 2, 2, 2, 2, device=device, dtype=dtype)
     
     # Extract linear coefficients for each level
     ell1 = ell[0:2]
@@ -129,23 +130,23 @@ def simulate_signature_vol_paths(
     # Setup Brownian increment generators
     if antithetic:
         half_paths = N_paths // 2
-        Z1_half = torch.randn(half_paths, N_steps, device=device)
-        Z2_half = torch.randn(half_paths, N_steps, device=device)
+        Z1_half = torch.randn(half_paths, N_steps, device=device, dtype=dtype)
+        Z2_half = torch.randn(half_paths, N_steps, device=device, dtype=dtype)
         Z1 = torch.cat([Z1_half, -Z1_half], dim=0)
         Z2 = torch.cat([Z2_half, -Z2_half], dim=0)
     else:
-        Z1 = torch.randn(N_paths, N_steps, device=device)
-        Z2 = torch.randn(N_paths, N_steps, device=device)
+        Z1 = torch.randn(N_paths, N_steps, device=device, dtype=dtype)
+        Z2 = torch.randn(N_paths, N_steps, device=device, dtype=dtype)
         
     dW1 = Z1 * sqrt_dt
     dW2 = Z2 * sqrt_dt
     
     # Log asset return initialization
-    X = torch.zeros(N_paths, N_steps + 1, device=device)
+    X = torch.zeros(N_paths, N_steps + 1, device=device, dtype=dtype)
     X[:, 0] = np.log(S0)
     
-    V = torch.zeros(N_paths, N_steps + 1, device=device)
-    V_raw = torch.zeros(N_paths, N_steps + 1, device=device)
+    V = torch.zeros(N_paths, N_steps + 1, device=device, dtype=dtype)
+    V_raw = torch.zeros(N_paths, N_steps + 1, device=device, dtype=dtype)
     V[:, 0] = v0
     V_raw[:, 0] = v0
     
@@ -157,6 +158,10 @@ def simulate_signature_vol_paths(
     else:
         raise ValueError(f"Unknown positivity function: {positivity_func}")
         
+    # Pre-allocate delta
+    delta = torch.zeros(N_paths, 2, device=device, dtype=dtype)
+    delta[:, 0] = dt
+        
     for i in range(N_steps):
         v_curr = V[:, i]
         
@@ -165,38 +170,35 @@ def simulate_signature_vol_paths(
         diffusion = torch.sqrt(v_curr) * (rho * dW1[:, i] + torch.sqrt(1.0 - rho**2) * dW2[:, i])
         X[:, i+1] = X[:, i] + drift + diffusion
         
-        # Path increment for Z_t = (t, W_t^1)
-        delta = torch.zeros(N_paths, 2, device=device)
-        delta[:, 0] = dt
+        # Update path increment for Z_t = (t, W_t^1)
         delta[:, 1] = dW1[:, i]
         
-        # Segment signature
-        A1 = delta
-        A2 = 0.5 * torch.einsum('bi,bj->bij', delta, delta)
-        A3 = (1.0 / 6.0) * torch.einsum('bi,bj,bk->bijk', delta, delta, delta)
-        A4 = (1.0 / 24.0) * torch.einsum('bi,bj,bk,bl->bijkl', delta, delta, delta, delta)
+        # Segment signature using elementwise, broadcasting, and sums to avoid einsum launcher overhead
+        A2 = 0.5 * (delta.unsqueeze(2) * delta.unsqueeze(1))
+        A3 = (1.0 / 6.0) * (delta.view(N_paths, 2, 1, 1) * delta.view(N_paths, 1, 2, 1) * delta.view(N_paths, 1, 1, 2))
+        A4 = (1.0 / 24.0) * (delta.view(N_paths, 2, 1, 1, 1) * delta.view(N_paths, 1, 2, 1, 1) * delta.view(N_paths, 1, 1, 2, 1) * delta.view(N_paths, 1, 1, 1, 2))
         
         # Recursive signature updates
         S4 = (S4 + 
-              torch.einsum('bijk,bl->bijkl', S3, A1) + 
-              torch.einsum('bij,bkl->bijkl', S2, A2) + 
-              torch.einsum('bi,bjkl->bijkl', S1, A3) + 
+              S3.unsqueeze(4) * delta.view(N_paths, 1, 1, 1, 2) + 
+              S2.view(N_paths, 2, 2, 1, 1) * A2.view(N_paths, 1, 1, 2, 2) + 
+              S1.view(N_paths, 2, 1, 1, 1) * A3.view(N_paths, 1, 2, 2, 2) + 
               A4)
               
         S3 = (S3 + 
-              torch.einsum('bij,bk->bijk', S2, A1) + 
-              torch.einsum('bi,bjk->bijk', S1, A2) + 
+              S2.unsqueeze(3) * delta.view(N_paths, 1, 1, 2) + 
+              S1.view(N_paths, 2, 1, 1) * A2.view(N_paths, 1, 2, 2) + 
               A3)
               
-        S2 = S2 + torch.einsum('bi,bj->bij', S1, A1) + A2
+        S2 = S2 + S1.unsqueeze(2) * delta.unsqueeze(1) + A2
         
-        S1 = S1 + A1
+        S1 = S1 + delta
         
-        # Compute raw and thresholded variance
-        term1 = torch.einsum('bi,i->b', S1, ell1)
-        term2 = torch.einsum('bij,ij->b', S2, ell2)
-        term3 = torch.einsum('bijk,ijk->b', S3, ell3)
-        term4 = torch.einsum('bijkl,ijkl->b', S4, ell4)
+        # Compute raw and thresholded variance using sum along non-batch dimensions
+        term1 = (S1 * ell1).sum(dim=1)
+        term2 = (S2 * ell2).sum(dim=(1, 2))
+        term3 = (S3 * ell3).sum(dim=(1, 2, 3))
+        term4 = (S4 * ell4).sum(dim=(1, 2, 3, 4))
         
         v_raw = v0 + term1 + term2 + term3 + term4
         V_raw[:, i+1] = v_raw

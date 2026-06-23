@@ -1,27 +1,20 @@
-# Project: Phase 4 Model Zoo Calibration Framework
+# Project: Phase 4-6 Stochastic Volatility & Deep Hedging Pipeline Optimization
 
 ## Architecture
-The framework is a production-grade pricing and calibration library using conditioning FNO neural surrogates.
-- `src/pricing/`: Contains parametric SV model pricers (COS, hybrid fBm path simulator, analytical).
-- `src/calibrate_fast.py`: Contains Gauss-Newton calibrators using forward-mode automatic differentiation through FNO surrogates.
-- `src/app_fno.py`: Streamlit UI.
-- `src/api/server.py`: FastAPI server.
+- `src/pricing/`: Parametric models (Classic Heston, SABR, SSVI, Local Volatility, Rough Bergomi, Neural SDE, Signature Vol).
+- `src/hedging/`: Deep Hedging recurrent policy and environments.
+- `src/calibrate_fast.py`: Gauss-Newton calibration leveraging FNO surrogates.
+- `tests/`: 582 unit and integration tests for validation.
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|---|---|---|---|
-| M1 | Heston Training Verification | Check if task-994 completed and saved weights | None | DONE (Best val loss: 0.008695 @ epoch 149, saved to artifacts/weights/fno_heston_final_prod.pth) |
-| M2 | SABR Training | Train FNO model for SABR model | M1 | DONE (Best val loss: 0.000022 @ epoch 150, saved to artifacts/weights/fno_sabr_final_prod.pth) |
-| M3 | SSVI Training | Train FNO model for SSVI model | M2 | DONE (Best val loss: 0.000404 @ epoch 150, saved to artifacts/weights/fno_ssvi_final_prod.pth) |
-| M3.5 | Code Audit & Real Data Validation | Run deep code audit and validate models on real SPX/VIX data | M3 | DONE (Conv: 2137a1c4, FNO SPX RMSE: 0.0334, 0 arb violations) |
-| M4 | Notebook Generation & Exec | Generate & execute NB08-NB11 | M3.5 | DONE (NB08-NB11 written & executed end-to-end) |
-| M5 | Test suite validation | Run pytest on unit and integration tests | M4 | DONE (556 unit/integration tests passed) |
-| M6 | UI/API Integration | Verify Streamlit dashboard & FastAPI endpoint | M5 | DONE (Streamlit UI and FastAPI server validated) |
+| M1 | Bottleneck Profiling | Profile and identify bottlenecks in FNO Zoo (P4), Neural SDE/Signature Vol (P5), and Deep Hedging/GAN (P6) pipelines. | None | DONE |
+| M2 | FNO Zoo Optimization | Vectorize and GPU-accelerate FNO Zoo data generation & FNO training (Fourier-COS, fBm path simulation). | M1 | DONE |
+| M3 | Neural SDE & SigVol Optimization | Optimize on-the-fly path integration, signature extraction, eliminate host-device copies. | M2 | DONE |
+| M4 | Deep Hedging & GAN Optimization | Optimize LSTM policy rollouts, state precomputation, minimax training, double-backward. | M3 | DONE |
+| M5 | End-to-End Verification & Benchmarking | Run full validation, regression tests, and benchmarking to confirm speedups and zero regressions. | M4 | DONE |
 
 ## Interface Contracts
-### Model surrogate input shape
-- Heston: `(B, 5)` parameters -> `[kappa, theta, sigma, rho, v0]`
-- SABR: `(B, 3)` parameters -> `[alpha, rho, nu]`
-- SSVI: `(B, 11)` parameters -> `[rho, eta, gamma, theta_1, ..., theta_8]`
-- Rough Bergomi: `(B, 4)` parameters -> `[H, eta, rho, v0]`
-- Output grid size: `(B, 8, 11)` implied volatility surface (8 maturities, 11 log-moneyness strikes).
+- Ensure existing public APIs in `src/pricing/`, `src/hedging/`, `src/calibrate_fast.py` remain fully backwards compatible.
+- All optimizations must preserve output shapes and float/double value ranges.
