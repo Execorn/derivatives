@@ -51,6 +51,7 @@ def main():
                         help="Option contract style to hedge")
     parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=1024, help="Batch size for training paths")
+    parser.add_argument("--num_paths", type=int, default=10240, help="Number of training paths")
     parser.add_argument("--lr", type=float, default=5e-3, help="Learning rate")
     parser.add_argument("--strike", type=float, default=100.0, help="Option strike price K")
     parser.add_argument("--barrier", type=float, default=85.0, help="Exotic barrier knock-out level B")
@@ -63,7 +64,7 @@ def main():
     
     args = parser.parse_args()
     print(f"=== Starting Deep Hedging Production Training ({args.option_type.upper()}) ===")
-    print(f"Device: {args.device} | Epochs: {args.epochs} | Batch Size: {args.batch_size}")
+    print(f"Device: {args.device} | Epochs: {args.epochs} | Training Paths: {args.num_paths} | Batch Size: {args.batch_size}")
     
     # 1. Simulate paths for training and testing
     torch.manual_seed(42)
@@ -77,7 +78,7 @@ def main():
     
     print("Simulating paths...")
     # Training paths
-    H_train, t_grid = simulate_gbm_paths(S0, mu, sigma, args.expiry, args.steps, args.batch_size, d, args.device)
+    H_train, t_grid = simulate_gbm_paths(S0, mu, sigma, args.expiry, args.steps, args.num_paths, d, args.device)
     # Validation/Test paths (10,000 paths for accurate evaluation)
     H_test, _ = simulate_gbm_paths(S0, mu, sigma, args.expiry, args.steps, 10000, d, args.device)
     

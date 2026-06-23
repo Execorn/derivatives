@@ -54,6 +54,12 @@ class BarrierHedgingEnv:
         else:
             self.t_grid = t_grid.to(device=H.device, dtype=H.dtype)
             
+        # Precompute terminal payoff under knockout conditions
+        # running minimum along the spot path (dim 1, column 0 of H)
+        running_min, _ = torch.min(H[:, :, 0], dim=1)
+        final_active_mask = (running_min > barrier).float()
+        self.payoff = torch.clamp(H[:, -1, 0] - strike, min=0.0) * final_active_mask
+            
     def get_state(self, k: int, prev_delta: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
         """
         Constructs boundary-aware state features for step k.

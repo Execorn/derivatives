@@ -268,16 +268,28 @@ def train_deep_hedger(
             batch_payoff = env.payoff[batch_idx]
             
             # Create a local sub-env for this batch
-            sub_env = DeepHedgingEnv(
-                H=batch_H,
-                payoff=batch_payoff,
-                cost_coeffs=env.cost_coeffs,
-                risk_aversion=env.risk_aversion,
-                risk_measure=env.risk_measure,
-                strike=env.strike,
-                expiry=env.expiry,
-                t_grid=env.t_grid
-            )
+            if env.__class__.__name__ == "BarrierHedgingEnv":
+                sub_env = env.__class__(
+                    H=batch_H,
+                    cost_coeffs=env.cost_coeffs,
+                    strike=env.strike,
+                    barrier=env.barrier,
+                    expiry=env.expiry,
+                    risk_aversion=env.risk_aversion,
+                    risk_measure=env.risk_measure,
+                    t_grid=env.t_grid
+                )
+            else:
+                sub_env = DeepHedgingEnv(
+                    H=batch_H,
+                    payoff=batch_payoff,
+                    cost_coeffs=env.cost_coeffs,
+                    risk_aversion=env.risk_aversion,
+                    risk_measure=env.risk_measure,
+                    strike=env.strike,
+                    expiry=env.expiry,
+                    t_grid=env.t_grid
+                )
             
             # Run simulation episode
             wealth, _, _ = sub_env.simulate_hedging_episode(policy)
