@@ -97,8 +97,8 @@ def bs_vega_cpu(S, K, T, sigma):
     return S * np.sqrt(T) * norm.pdf(d1)
 
 
-def implied_vol_cpu(price, S, K, T, max_iter=50):
-    is_put = K < S
+def implied_vol_cpu(price, S, K, T, max_iter=50, r=0.0, q=0.0):
+    is_put = K < S * np.exp((r - q) * T)  # use forward for correct OTM selection
     if is_put:
         eff_price = price - S + K
         intrinsic = max(K - S, 0.0)
@@ -183,12 +183,19 @@ def heston_cf(u, T, kappa, theta, sigma, rho, v0):
     
     Using log1p to avoid complex branch-cut issues.
     """
+    if sigma <= 0: raise ValueError(f"sigma must be > 0, got {sigma}")
+    if v0 <= 0: raise ValueError(f"v0 must be > 0, got {v0}")
+    if kappa <= 0: raise ValueError(f"kappa must be > 0, got {kappa}")
+    if theta <= 0: raise ValueError(f"theta must be > 0, got {theta}")
+    if not (-1.0 <= rho <= 1.0): raise ValueError(f"rho must be in [-1,1], got {rho}")
     xi = kappa - 1j * rho * sigma * u
     d = np.sqrt(xi**2 + sigma**2 * (u**2 + 1j * u))
     g = (xi - d) / (xi + d)
     
     exp_mindT = np.exp(-d * T)
-    z = g * (1.0 - exp_mindT) / (1.0 - g)
+    denom = 1.0 - g
+    denom_safe = np.where(np.abs(denom) < 1e-12, 1e-12 + 0j, denom)
+    z = g * (1.0 - exp_mindT) / denom_safe
     
     C = (kappa * theta / sigma**2) * ((xi - d) * T - 2.0 * np.log1p(z))
     D = ((xi - d) / sigma**2) * ((1.0 - exp_mindT) / (1.0 - g * exp_mindT))
@@ -225,7 +232,7 @@ def heston_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0, N_cos: int 
     
     for i, T in enumerate(T_grid):
         phi_k = heston_cf(u_k, T, kappa, theta, sigma, rho, v0)
-        phi_k[0] = 1.0 + 0j  # Martingale condition
+        phi_k[0] = 1.0 + 0j  # Normalization: E[e^{i·0·X}] = 1 by definition (Martingale condition)
         
         for j, log_moneyness in enumerate(K_grid):
             K = S0 * np.exp(log_moneyness)
@@ -244,13 +251,11 @@ def heston_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0, N_cos: int 
     return iv_surface
 
 
-_vk_cache = {}
+from functools import lru_cache
 
-def get_cos_payoff_coeffs_gpu(N_cos: int, a: float, b: float, device, is_put: bool = False) -> torch.Tensor:
-    key = (N_cos, a, b, str(device), is_put)
-    if key in _vk_cache:
-        return _vk_cache[key]
-    
+@lru_cache(maxsize=128)
+def _get_cos_payoff_coeffs_gpu_cached(N_cos: int, a: float, b: float, device_str: str, is_put: bool = False) -> torch.Tensor:
+    device = torch.device(device_str)
     k = torch.arange(N_cos, dtype=torch.float64, device=device)
     uk = k * np.pi / (b - a)
     uk_c = uk.to(torch.complex128)
@@ -288,8 +293,10 @@ def get_cos_payoff_coeffs_gpu(N_cos: int, a: float, b: float, device, is_put: bo
         Vk = (2.0 / (b - a)) * (chi - psi)
         Vk[0] *= 0.5
         
-    _vk_cache[key] = Vk
     return Vk
+
+def get_cos_payoff_coeffs_gpu(N_cos: int, a: float, b: float, device, is_put: bool = False) -> torch.Tensor:
+    return _get_cos_payoff_coeffs_gpu_cached(N_cos, a, b, str(device), is_put)
 
 
 def batch_heston_iv_surface(
@@ -340,7 +347,10 @@ def batch_heston_iv_surface(
     g = (xi - d) / (xi + d)
     
     exp_mindT = torch.exp(-d * T_c)
-    z = g * (1.0 - exp_mindT) / (1.0 - g)
+    denom = 1.0 - g
+    denom_safe = torch.where(denom.abs() < 1e-12,
+        torch.tensor(1e-12 + 0j, dtype=denom.dtype, device=denom.device), denom)
+    z = g * (1.0 - exp_mindT) / denom_safe
     log_term = torch.log1p(z)
     
     C = (kappa_e * theta_e / sigma_e**2) * ((xi - d) * T_c - 2.0 * log_term)

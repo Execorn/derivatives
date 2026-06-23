@@ -112,13 +112,16 @@ class StylizedFactsAlignmentGAN:
         discriminator: WGAN_GP_Discriminator,
         latent_dim: int = 100,
         lambda_gp: float = 10.0,
-        weights: List[float] = [1.0, 1.0, 1.0, 1.0]  # [GPD, ACF, Leverage, CFVC]
+        weights: Optional[List[float]] = None  # [GPD, ACF, Leverage, CFVC]
     ):
         self.generator = generator
         self.discriminator = discriminator
         self.latent_dim = latent_dim
         self.lambda_gp = lambda_gp
         
+        if weights is None:
+            weights = [1.0, 1.0, 1.0, 1.0]
+            
         self.w_gpd = weights[0]
         self.w_acf = weights[1]
         self.w_lev = weights[2]
@@ -209,8 +212,11 @@ def convert_returns_to_prices(returns: torch.Tensor, vol_paths: torch.Tensor, S_
     S_0_tensor = torch.full((batch_size, 1), S_0, device=device, dtype=dtype)
     S_full = torch.cat([S_0_tensor, S], dim=-1)  # (batch_size, seq_len + 1)
     
-    # Prepend initial volatility V_0 to the vol paths
-    V_0_tensor = vol_paths[:, 0:1]
+    # Extrapolate V_0 from V_1 and V_2 to avoid artificial flat start, clamp to positive floor
+    if seq_len > 1:
+        V_0_tensor = torch.clamp(2.0 * vol_paths[:, 0:1] - vol_paths[:, 1:2], min=1e-4)
+    else:
+        V_0_tensor = vol_paths[:, 0:1]
     V_full = torch.cat([V_0_tensor, vol_paths], dim=-1)  # (batch_size, seq_len + 1)
     
     # Stack stock and vol into a single instrument paths tensor
@@ -231,7 +237,9 @@ def train_robust_minimax_hedger(
     critic_steps: int = 5,
     minimax_coeff: float = 0.05,  # scale of the adversarial hedging loss in generator
     device: str = "cuda",
-    risk_measure: str = "entropic"
+    risk_measure: str = "entropic",
+    strike: float = 100.0,
+    cost_coeffs_list: list = None
 ):
     """
     Runs the minimax robust deep hedging training loop.
@@ -270,7 +278,8 @@ def train_robust_minimax_hedger(
             # of rolling realized standard deviations for discriminator training
             unfolded = real_ret_batch.unfold(dimension=-1, size=5, step=1)
             real_vol_batch = torch.std(unfolded, dim=-1, unbiased=False)
-            real_vol_batch = torch.cat([real_vol_batch[:, 0:1].repeat(1, 4), real_vol_batch], dim=-1)
+            # Use native replication padding to prevent structural artifacts
+            real_vol_batch = torch.nn.functional.pad(real_vol_batch, (4, 0), mode='replicate')
             real_samples = torch.stack([real_ret_batch, real_vol_batch], dim=1)  # (batch_size, 2, seq_len)
             
             # --- 1. TRAIN DISCRIMINATOR ---
@@ -322,12 +331,14 @@ def train_robust_minimax_hedger(
             
             # Evaluate option payoff (e.g. Call option)
             S_T = H[:, -1, 0]
-            payoff = torch.clamp(S_T - 100.0, min=0.0)
+            payoff = torch.clamp(S_T - strike, min=0.0)
             
             # Sub-environment for minimax calculation
             # Cost coeffs: 1 bp on stock, 5 bps on vol option
-            cost_coeffs = torch.tensor([0.0001, 0.0005], device=device)
-            env = DeepHedgingEnv(H=H, payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure)
+            if cost_coeffs_list is None:
+                cost_coeffs_list = [0.0001, 0.0005]
+            cost_coeffs = torch.tensor(cost_coeffs_list, device=device)
+            env = DeepHedgingEnv(H=H, payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure, strike=strike)
             
             # Run simulation with the CURRENT policy
             # (Generator tries to MAXIMIZE this loss to find worst-case paths)

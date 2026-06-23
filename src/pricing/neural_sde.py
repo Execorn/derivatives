@@ -36,7 +36,8 @@ class DriftMLP(nn.Module):
                 t = t.unsqueeze(-1)
             
         x = torch.cat([t, v], dim=-1)
-        return self.net(x)
+        raw = self.net(x)
+        return torch.clamp(raw, -50.0, 50.0)
 
 
 class DiffusionMLP(nn.Module):
@@ -95,8 +96,8 @@ class NeuralSDE(torchsde.SDEIto):
 
     @property
     def rho(self) -> torch.Tensor:
-        # Constrain correlation to [-0.95, 0.0]
-        return -0.95 * torch.sigmoid(self.raw_rho)
+        # Constrain correlation to (-1.0, 0.0)
+        return -1.0 * torch.sigmoid(self.raw_rho)
 
     def f(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         # y: (N_paths, 2)

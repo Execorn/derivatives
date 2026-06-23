@@ -3,8 +3,10 @@ rbergomi_gpu.py — GPU-accelerated Monte Carlo pricing for the Rough Bergomi mo
 Uses the Bennedsen, Lunde & Pakkanen (2017) hybrid scheme with F.conv1d for fast fBm simulation.
 """
 
-import os
-os.environ["NUMBA_DISABLE_JIT"] = "1"
+import sys
+if sys.version_info >= (3, 14):
+    import os
+    os.environ["NUMBA_DISABLE_JIT"] = "1"
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -38,6 +40,10 @@ def simulate_rbergomi_paths(
       V : torch.Tensor of shape (B, N_paths, N_t + 1), variance paths
       t_grid : torch.Tensor of shape (N_t + 1,), time grid
     """
+    assert (params[:, 0] > 0).all(), "v0 must be > 0"
+    assert ((params[:, 1] > 0) & (params[:, 1] < 0.5)).all(), "H must be in (0, 0.5)"
+    assert (params[:, 2] > 0).all(), "eta must be > 0"
+    assert ((params[:, 3] >= -1) & (params[:, 3] <= 0)).all(), "rho must be in [-1, 0]"
     B = params.shape[0]
     v0 = params[:, 0:1].unsqueeze(-1).to(device=device, dtype=dtype)   # (B, 1, 1)
     H = params[:, 1:2].unsqueeze(-1).to(device=device, dtype=dtype)    # (B, 1, 1)
@@ -224,43 +230,12 @@ def batch_rbergomi_iv_surface(
     price_subbatch(idx_200, 200)
     # Black-Scholes inversion using py_vollib_vectorized
     S0 = 1.0
-    r = 0.0
-    q = 0.0
+    from pricing.heston import bs_iv_gpu
+    K_tensor = torch.exp(torch.tensor(K_grid, device=device, dtype=torch.float64))
+    T_tensor = torch.tensor(T_grid, device=device, dtype=torch.float64)
 
-    strikes = np.exp(K_grid)
-    strikes_3d = np.broadcast_to(strikes[None, None, :], (B, M, L))
-    maturities_3d = np.broadcast_to(T_grid[None, :, None], (B, M, L))
-    flags_3d = np.broadcast_to(np.where(strikes >= 1.0, "c", "p")[None, None, :], (B, M, L))
-
-    flat_prices = prices.cpu().numpy().flatten()
-    flat_strikes = strikes_3d.flatten()
-    flat_maturities = maturities_3d.flatten()
-    flat_flags = flags_3d.flatten()
-
-    # Clamp prices to strictly avoid intrinsic and maximum price boundary violations
-    # to prevent triggering Numba-compiled fallback paths that fail on Python 3.14
-    is_call_flat = (flat_flags == "c")
-    intrinsic = np.where(is_call_flat, np.maximum(1.0 - flat_strikes, 0.0), np.maximum(flat_strikes - 1.0, 0.0))
-    max_price = np.where(is_call_flat, 1.0, flat_strikes)
-    flat_prices = np.clip(flat_prices, intrinsic + 1e-4, max_price - 1e-4)
-
-    flat_prices_f64 = flat_prices.astype(np.float64)
-    flat_strikes_f64 = flat_strikes.astype(np.float64)
-    flat_maturities_f64 = flat_maturities.astype(np.float64)
-
-    flat_ivs = py_vollib_vectorized.vectorized_implied_volatility(
-        flat_prices_f64,
-        float(S0),
-        flat_strikes_f64,
-        flat_maturities_f64,
-        float(r),
-        flat_flags,
-        q=float(q),
-        return_as="numpy",
-        dtype=np.float64
-    )
-
-    ivs = flat_ivs.reshape(B, M, L)
+    ivs_gpu = bs_iv_gpu(prices.double(), float(S0), K_tensor, T_tensor)
+    ivs = ivs_gpu.cpu().numpy()
     ivs = fill_nans(ivs)
     return ivs
 
