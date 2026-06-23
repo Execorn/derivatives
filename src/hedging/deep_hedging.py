@@ -123,7 +123,8 @@ class DeepHedgingEnv:
             else:
                 past_S = self.H[:, k-5:k+1, 0]  # (N_paths, 6)
                 log_returns = torch.log(torch.clamp(past_S[:, 1:] / torch.clamp(past_S[:, :-1], min=1e-5), min=1e-5))  # (N_paths, 5)
-                vol_proxy = torch.std(log_returns, dim=-1, keepdim=True) * 15.874507866387544
+                annualization = np.sqrt(1.0 / self.dt)
+                vol_proxy = torch.std(log_returns, dim=-1, keepdim=True) * annualization
             
         # Concatenate features: log_moneyness, time_to_expiry, vol_proxy, and all dimensions of prev_delta
         # shape: (N_paths, 3 + d)
@@ -268,7 +269,8 @@ def train_deep_hedger(
             batch_payoff = env.payoff[batch_idx]
             
             # Create a local sub-env for this batch
-            if env.__class__.__name__ == "BarrierHedgingEnv":
+            from hedging.barrier_hedging import BarrierHedgingEnv
+            if isinstance(env, BarrierHedgingEnv):
                 sub_env = env.__class__(
                     H=batch_H,
                     cost_coeffs=env.cost_coeffs,
@@ -405,6 +407,8 @@ def compute_leverage_loss(returns, target_leverage, vol_window=20):
     unfolded = returns.unfold(dimension=-1, size=vol_window, step=1)
     future_vol = torch.std(unfolded, dim=-1, unbiased=False)
     
+    # Shift future vol by 1 step to ensure strict causality (volatility from step j+1 onwards)
+    future_vol = future_vol[:, 1:]
     past_returns = returns[:, :future_vol.shape[-1]]
     
     mean_ret = torch.mean(past_returns, dim=-1, keepdim=True)

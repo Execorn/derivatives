@@ -50,6 +50,12 @@ def sabr_iv_lognormal(F, K, T, alpha, beta, rho, nu):
     F, K, T, alpha, beta, rho, nu = np.broadcast_arrays(F, K, T, alpha, beta, rho, nu)
     shape = F.shape
     
+    # SABR parameter validation
+    if np.any(alpha <= 0): raise ValueError("alpha must be > 0")
+    if np.any((beta < 0) | (beta > 1)): raise ValueError("beta must be in [0, 1]")
+    if np.any(nu <= 0): raise ValueError("nu must be > 0")
+    if np.any(np.abs(rho) > 1.0): raise ValueError("|rho| must be <= 1")
+    
     # Lognormal SABR requires F > 0, K > 0, and T > 0
     valid = (F > 0.0) & (K > 0.0) & (T > 0.0)
     out = np.full(shape, np.nan)
@@ -70,7 +76,7 @@ def sabr_iv_lognormal(F, K, T, alpha, beta, rho, nu):
     res = np.zeros_like(F_v)
     
     # ATM check
-    atm = np.abs(F_v - K_v) < 1e-8
+    atm = np.abs(F_v - K_v) < 1e-8 * np.maximum(np.abs(F_v), 1e-10)
     not_atm = ~atm
     
     # ── ATM Case ──
@@ -117,7 +123,13 @@ def sabr_iv_lognormal(F, K, T, alpha, beta, rho, nu):
         z = (nu_natm / alpha_natm) * fk_pow * log_fk
         
         # z / x(z)
-        val = (np.sqrt(1.0 - 2.0 * rho_natm * z + z ** 2) + z - rho_natm) / (1.0 - rho_natm)
+        # Avoid 0/0 floating-point cancellation in standard SABR formula by using the mathematically equivalent conjugate formula when rho is near 1
+        denom_rho = 1.0 - rho_natm
+        standard_val = (np.sqrt(1.0 - 2.0 * rho_natm * z + z ** 2) + z - rho_natm) / np.where(np.abs(denom_rho) < 1e-12, 1e-12, denom_rho)
+        denom_conj = np.sqrt(1.0 - 2.0 * rho_natm * z + z ** 2) - z + rho_natm
+        safe_denom_conj = np.where(np.abs(denom_conj) < 1e-12, 1e-12, denom_conj)
+        conjugate_val = (1.0 + rho_natm) / safe_denom_conj
+        val = np.where(rho_natm > 0.9, conjugate_val, standard_val)
         val = np.maximum(val, 1e-15)
         xz = np.log(val)
         xz_safe = np.where(np.abs(z) < 1e-8, 1.0, xz)
@@ -175,6 +187,12 @@ def sabr_iv_normal(F, K, T, alpha, beta, rho, nu):
     F, K, T, alpha, beta, rho, nu = np.broadcast_arrays(F, K, T, alpha, beta, rho, nu)
     shape = F.shape
     
+    # SABR parameter validation
+    if np.any(alpha <= 0): raise ValueError("alpha must be > 0")
+    if np.any((beta < 0) | (beta > 1)): raise ValueError("beta must be in [0, 1]")
+    if np.any(nu <= 0): raise ValueError("nu must be > 0")
+    if np.any(np.abs(rho) > 1.0): raise ValueError("|rho| must be <= 1")
+    
     # Normal SABR allows negative rates/strikes only if beta == 0.
     # If beta > 0, we require F > 0, K > 0.
     valid = np.where(beta > 0.0, (F > 0.0) & (K > 0.0), True) & (T > 0.0)
@@ -195,7 +213,7 @@ def sabr_iv_normal(F, K, T, alpha, beta, rho, nu):
     
     res = np.zeros_like(F_v)
     
-    atm = np.abs(F_v - K_v) < 1e-8
+    atm = np.abs(F_v - K_v) < 1e-8 * np.maximum(np.abs(F_v), 1e-10)
     not_atm = ~atm
     
     # ── ATM Case ──
@@ -246,7 +264,13 @@ def sabr_iv_normal(F, K, T, alpha, beta, rho, nu):
         zeta = (nu_natm / alpha_natm) * I_0
         
         # D(zeta)
-        val = (np.sqrt(1.0 - 2.0 * rho_natm * zeta + zeta ** 2) + zeta - rho_natm) / (1.0 - rho_natm)
+        # Avoid 0/0 floating-point cancellation in standard SABR formula by using the mathematically equivalent conjugate formula when rho is near 1
+        denom_rho = 1.0 - rho_natm
+        standard_val = (np.sqrt(1.0 - 2.0 * rho_natm * zeta + zeta ** 2) + zeta - rho_natm) / np.where(np.abs(denom_rho) < 1e-12, 1e-12, denom_rho)
+        denom_conj = np.sqrt(1.0 - 2.0 * rho_natm * zeta + zeta ** 2) - zeta + rho_natm
+        safe_denom_conj = np.where(np.abs(denom_conj) < 1e-12, 1e-12, denom_conj)
+        conjugate_val = (1.0 + rho_natm) / safe_denom_conj
+        val = np.where(rho_natm > 0.9, conjugate_val, standard_val)
         val = np.maximum(val, 1e-15)
         D_zeta = np.log(val)
         D_zeta_safe = np.where(np.abs(zeta) < 1e-8, 1.0, D_zeta)
@@ -340,6 +364,7 @@ def ssvi_total_variance(k, theta, rho, eta, gamma):
         
         # phi(theta)
         phi = eta_nz / (theta_nz ** gamma_nz * (1.0 + theta_nz) ** (1.0 - gamma_nz))
+        phi = np.clip(phi, 0.0, 1e6)
         
         inside = (phi * k_nz + rho_nz) ** 2 + 1.0 - rho_nz ** 2
         inside = np.maximum(inside, 0.0)

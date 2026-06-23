@@ -34,6 +34,8 @@ def check_arbitrage_free(T_grid: np.ndarray, K_grid: np.ndarray, svi_params: np.
     svi_params : np.ndarray
         SVI parameters, shape (nT, 5) -> [a, b, rho, m, sigma] for each slice.
     """
+    assert np.all(np.diff(T_grid) > 0), "T_grid must be strictly increasing and sorted"
+    
     # Use a dense strike grid to ensure we don't miss arbitrage between grid points
     k_min = min(K_grid.min(), -2.0)
     k_max = max(K_grid.max(), 2.0)
@@ -194,15 +196,15 @@ def svi_to_lv_surface(
     is_numpy = isinstance(svi_params, np.ndarray)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 1. Convert to PyTorch tensors on GPU/CPU
+    # 1. Convert to PyTorch tensors on GPU/CPU (with float64 precision to prevent FD noise)
     if is_numpy:
-        T_t = torch.tensor(T_grid, dtype=torch.float32, device=device)
-        K_t = torch.tensor(K_grid, dtype=torch.float32, device=device)
-        svi_params_t = torch.tensor(svi_params, dtype=torch.float32, device=device)
+        T_t = torch.tensor(T_grid, dtype=torch.float64, device=device)
+        K_t = torch.tensor(K_grid, dtype=torch.float64, device=device)
+        svi_params_t = torch.tensor(svi_params, dtype=torch.float64, device=device)
     else:
-        T_t = T_grid.to(device)
-        K_t = K_grid.to(device)
-        svi_params_t = svi_params.to(device)
+        T_t = T_grid.to(device=device, dtype=torch.float64)
+        K_t = K_grid.to(device=device, dtype=torch.float64)
+        svi_params_t = svi_params.to(device=device, dtype=torch.float64)
         
     # Check if input is batched or single
     is_batched = (svi_params_t.ndim == 3)
@@ -264,8 +266,9 @@ def svi_to_lv_surface(
     
     d2W_dk2 = torch.zeros_like(W)
     d2W_dk2[:, :, 1:-1] = (W[:, :, 2:] - 2.0 * W[:, :, 1:-1] + W[:, :, :-2]) / (dK ** 2)
-    d2W_dk2[:, :, 0] = d2W_dk2[:, :, 1]
-    d2W_dk2[:, :, -1] = d2W_dk2[:, :, -2]
+    # First-order linear boundary extrapolation to improve stability
+    d2W_dk2[:, :, 0] = 2.0 * d2W_dk2[:, :, 1] - d2W_dk2[:, :, 2]
+    d2W_dk2[:, :, -1] = 2.0 * d2W_dk2[:, :, -2] - d2W_dk2[:, :, -3]
     
     # 6. Compute density condition denominator g(k)
     W_safe = torch.clamp(W, min=1e-8)

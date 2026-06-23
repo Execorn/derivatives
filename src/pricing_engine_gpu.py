@@ -677,13 +677,11 @@ class BS_IV_Implicit_Inverter(torch.autograd.Function):
 # Main batch pricing pipeline
 # ---------------------------------------------------------------------------
 
-_vk_cache = {}
+from functools import lru_cache
 
-def get_cos_payoff_coeffs_gpu(N_cos: int, a: float = _A, b: float = _B, device='cuda', is_put: bool = False) -> torch.Tensor:
-    key = (N_cos, a, b, str(device), is_put)
-    if key in _vk_cache:
-        return _vk_cache[key]
-    
+@lru_cache(maxsize=128)
+def _get_cos_payoff_coeffs_gpu_cached(N_cos: int, a: float = _A, b: float = _B, device_str: str = 'cuda', is_put: bool = False) -> torch.Tensor:
+    device = torch.device(device_str)
     k = torch.arange(N_cos, dtype=torch.float64, device=device)
     uk = k * np.pi / (b - a)
     uk_c = uk.to(torch.complex128)
@@ -721,8 +719,10 @@ def get_cos_payoff_coeffs_gpu(N_cos: int, a: float = _A, b: float = _B, device='
         Vk = (2.0 / (b - a)) * (chi - psi)
         Vk[0] *= 0.5
         
-    _vk_cache[key] = Vk
     return Vk
+
+def get_cos_payoff_coeffs_gpu(N_cos: int, a: float = _A, b: float = _B, device='cuda', is_put: bool = False) -> torch.Tensor:
+    return _get_cos_payoff_coeffs_gpu_cached(N_cos, a, b, str(device), is_put)
 
 
 def _price_batch_gpu_raw(

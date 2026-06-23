@@ -122,10 +122,11 @@ def simulate_signature_vol_paths(
     S4 = torch.zeros(N_paths, 2, 2, 2, 2, device=device, dtype=dtype)
     
     # Extract linear coefficients for each level
-    ell1 = ell[0:2]
-    ell2 = ell[2:6].view(2, 2)
-    ell3 = ell[6:14].view(2, 2, 2)
-    ell4 = ell[14:30].view(2, 2, 2, 2)
+    ell_t = torch.as_tensor(ell, device=device, dtype=dtype)
+    ell1 = ell_t[0:2]
+    ell2 = ell_t[2:6].view(2, 2)
+    ell3 = ell_t[6:14].view(2, 2, 2)
+    ell4 = ell_t[14:30].view(2, 2, 2, 2)
     
     # Setup Brownian increment generators
     if antithetic:
@@ -142,13 +143,14 @@ def simulate_signature_vol_paths(
     dW2 = Z2 * sqrt_dt
     
     # Log asset return initialization
-    X = torch.zeros(N_paths, N_steps + 1, device=device, dtype=dtype)
-    X[:, 0] = np.log(S0)
+    X_list = [torch.full((N_paths,), np.log(S0), device=device, dtype=dtype)]
     
-    V = torch.zeros(N_paths, N_steps + 1, device=device, dtype=dtype)
-    V_raw = torch.zeros(N_paths, N_steps + 1, device=device, dtype=dtype)
-    V[:, 0] = v0
-    V_raw[:, 0] = v0
+    v0_t = torch.as_tensor(v0, device=device, dtype=dtype)
+    if v0_t.dim() == 0:
+        v0_t = v0_t.unsqueeze(0)
+    v0_path = v0_t.expand(N_paths)
+    V_list = [v0_path]
+    V_raw_list = [v0_path]
     
     # Select thresholding activation
     if positivity_func == "relu":
@@ -158,53 +160,72 @@ def simulate_signature_vol_paths(
     else:
         raise ValueError(f"Unknown positivity function: {positivity_func}")
         
-    # Pre-allocate delta
-    delta = torch.zeros(N_paths, 2, device=device, dtype=dtype)
-    delta[:, 0] = dt
-        
-    for i in range(N_steps):
-        v_curr = V[:, i]
-        
-        # Log stock price step update
-        drift = (r - q - 0.5 * v_curr) * dt
-        diffusion = torch.sqrt(v_curr) * (rho * dW1[:, i] + torch.sqrt(1.0 - rho**2) * dW2[:, i])
-        X[:, i+1] = X[:, i] + drift + diffusion
-        
-        # Update path increment for Z_t = (t, W_t^1)
-        delta[:, 1] = dW1[:, i]
+    def sim_step(S1_c, S2_c, S3_c, S4_c, X_c, V_c, dW1_i, dW2_i, v0_val, ell1_val, ell2_val, ell3_val, ell4_val, rho_val):
+        delta_step = torch.stack([torch.full((N_paths,), dt, device=device, dtype=dtype), dW1_i], dim=1)
         
         # Segment signature using elementwise, broadcasting, and sums to avoid einsum launcher overhead
-        A2 = 0.5 * (delta.unsqueeze(2) * delta.unsqueeze(1))
-        A3 = (1.0 / 6.0) * (delta.view(N_paths, 2, 1, 1) * delta.view(N_paths, 1, 2, 1) * delta.view(N_paths, 1, 1, 2))
-        A4 = (1.0 / 24.0) * (delta.view(N_paths, 2, 1, 1, 1) * delta.view(N_paths, 1, 2, 1, 1) * delta.view(N_paths, 1, 1, 2, 1) * delta.view(N_paths, 1, 1, 1, 2))
+        A2 = 0.5 * (delta_step.unsqueeze(2) * delta_step.unsqueeze(1))
+        A3 = (1.0 / 6.0) * (delta_step.view(N_paths, 2, 1, 1) * delta_step.view(N_paths, 1, 2, 1) * delta_step.view(N_paths, 1, 1, 2))
+        A4 = (1.0 / 24.0) * (delta_step.view(N_paths, 2, 1, 1, 1) * delta_step.view(N_paths, 1, 2, 1, 1) * delta_step.view(N_paths, 1, 1, 2, 1) * delta_step.view(N_paths, 1, 1, 1, 2))
         
         # Recursive signature updates
-        S4 = (S4 + 
-              S3.unsqueeze(4) * delta.view(N_paths, 1, 1, 1, 2) + 
-              S2.view(N_paths, 2, 2, 1, 1) * A2.view(N_paths, 1, 1, 2, 2) + 
-              S1.view(N_paths, 2, 1, 1, 1) * A3.view(N_paths, 1, 2, 2, 2) + 
-              A4)
-              
-        S3 = (S3 + 
-              S2.unsqueeze(3) * delta.view(N_paths, 1, 1, 2) + 
-              S1.view(N_paths, 2, 1, 1) * A2.view(N_paths, 1, 2, 2) + 
-              A3)
-              
-        S2 = S2 + S1.unsqueeze(2) * delta.unsqueeze(1) + A2
+        S4_n = (S4_c + 
+                S3_c.unsqueeze(4) * delta_step.view(N_paths, 1, 1, 1, 2) + 
+                S2_c.view(N_paths, 2, 2, 1, 1) * A2.view(N_paths, 1, 1, 2, 2) + 
+                S1_c.view(N_paths, 2, 1, 1, 1) * A3.view(N_paths, 1, 2, 2, 2) + 
+                A4)
+                
+        S3_n = (S3_c + 
+                S2_c.unsqueeze(3) * delta_step.view(N_paths, 1, 1, 2) + 
+                S1_c.view(N_paths, 2, 1, 1) * A2.view(N_paths, 1, 2, 2) + 
+                A3)
+                
+        S2_n = S2_c + S1_c.unsqueeze(2) * delta_step.unsqueeze(1) + A2
         
-        S1 = S1 + delta
+        S1_n = S1_c + delta_step
         
         # Compute raw and thresholded variance using sum along non-batch dimensions
-        term1 = (S1 * ell1).sum(dim=1)
-        term2 = (S2 * ell2).sum(dim=(1, 2))
-        term3 = (S3 * ell3).sum(dim=(1, 2, 3))
-        term4 = (S4 * ell4).sum(dim=(1, 2, 3, 4))
+        term1 = (S1_n * ell1_val).sum(dim=1)
+        term2 = (S2_n * ell2_val).sum(dim=(1, 2))
+        term3 = (S3_n * ell3_val).sum(dim=(1, 2, 3))
+        term4 = (S4_n * ell4_val).sum(dim=(1, 2, 3, 4))
         
-        v_raw = v0 + term1 + term2 + term3 + term4
-        V_raw[:, i+1] = v_raw
-        V[:, i+1] = pos_fn(v_raw)
+        v_raw_val = v0_val + term1 + term2 + term3 + term4
+        V_n = pos_fn(v_raw_val)
         
-    return torch.exp(X), V, V_raw, t_grid
+        # Log stock price step update
+        drift = (r - q - 0.5 * V_c) * dt
+        diffusion = torch.sqrt(V_c) * (rho_val * dW1_i + torch.sqrt(1.0 - rho_val**2) * dW2_i)
+        X_n = X_c + drift + diffusion
+        
+        return S1_n, S2_n, S3_n, S4_n, X_n, V_n, v_raw_val
+
+    rho_t = torch.as_tensor(rho, device=device, dtype=dtype)
+
+    for i in range(N_steps):
+        if torch.is_grad_enabled():
+            S1, S2, S3, S4, X_next, V_next, v_raw = torch.utils.checkpoint.checkpoint(
+                sim_step,
+                S1, S2, S3, S4, X_list[-1], V_list[-1],
+                dW1[:, i], dW2[:, i],
+                v0_t, ell1, ell2, ell3, ell4, rho_t,
+                use_reentrant=False
+            )
+        else:
+            S1, S2, S3, S4, X_next, V_next, v_raw = sim_step(
+                S1, S2, S3, S4, X_list[-1], V_list[-1],
+                dW1[:, i], dW2[:, i],
+                v0_t, ell1, ell2, ell3, ell4, rho_t
+            )
+        X_list.append(X_next)
+        V_list.append(V_next)
+        V_raw_list.append(v_raw)
+        
+    X_stacked = torch.stack(X_list, dim=1)
+    V_stacked = torch.stack(V_list, dim=1)
+    V_raw_stacked = torch.stack(V_raw_list, dim=1)
+    
+    return torch.exp(X_stacked), V_stacked, V_raw_stacked, t_grid
 
 
 class SignatureVolatilityModel(nn.Module):
