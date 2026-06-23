@@ -33,6 +33,8 @@ def main():
     parser.add_argument("--seq_len", type=int, default=252, help="Sequence length of path (days)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to train on")
+    parser.add_argument("--risk_measure", type=str, default="quad", choices=["entropic", "quad"],
+                        help="Risk measure for DeepHedgingEnv")
     
     args = parser.parse_args()
     print("=== Starting Minimax Adversarial Market Production Training ===")
@@ -74,9 +76,11 @@ def main():
         discriminator=discriminator,
         policy=policy,
         epochs=args.epochs,
+        batch_size=args.batch_size,
         critic_steps=args.critic_steps,
         minimax_coeff=args.minimax_coeff,
-        device=args.device
+        device=args.device,
+        risk_measure=args.risk_measure
     )
     elapsed = time.time() - t0
     print(f"Training completed in {elapsed:.2f} seconds.")

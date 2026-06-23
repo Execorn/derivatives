@@ -227,9 +227,11 @@ def train_robust_minimax_hedger(
     discriminator: WGAN_GP_Discriminator,
     policy: nn.Module,
     epochs: int = 50,
+    batch_size: int = 256,
     critic_steps: int = 5,
     minimax_coeff: float = 0.05,  # scale of the adversarial hedging loss in generator
-    device: str = "cuda"
+    device: str = "cuda",
+    risk_measure: str = "entropic"
 ):
     """
     Runs the minimax robust deep hedging training loop.
@@ -248,7 +250,6 @@ def train_robust_minimax_hedger(
     opt_d = optim.Adam(discriminator.parameters(), lr=1e-4, betas=(0.5, 0.9))
     opt_p = optim.Adam(policy.parameters(), lr=5e-4)
     
-    batch_size = 256
     num_paths = real_returns.shape[0]
     num_batches = num_paths // batch_size
     
@@ -326,7 +327,7 @@ def train_robust_minimax_hedger(
             # Sub-environment for minimax calculation
             # Cost coeffs: 1 bp on stock, 5 bps on vol option
             cost_coeffs = torch.tensor([0.0001, 0.0005], device=device)
-            env = DeepHedgingEnv(H=H, payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0)
+            env = DeepHedgingEnv(H=H, payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure)
             
             # Run simulation with the CURRENT policy
             # (Generator tries to MAXIMIZE this loss to find worst-case paths)
@@ -358,7 +359,7 @@ def train_robust_minimax_hedger(
                 S_T = H[:, -1, 0]
                 payoff = torch.clamp(S_T - 100.0, min=0.0)
                 
-            env_hedger = DeepHedgingEnv(H=H, payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0)
+            env_hedger = DeepHedgingEnv(H=H, payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure)
             
             # Optimize policy parameters to MINIMIZE hedging loss
             wealth, _, _ = env_hedger.simulate_hedging_episode(policy)
@@ -368,7 +369,7 @@ def train_robust_minimax_hedger(
             opt_p.step()
             hedge_loss_val += p_loss.item()
             
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:02d} | Disc: {disc_loss_val/num_batches:.4f} | Gen: {gen_loss_val/num_batches:.4f} | Hedge: {hedge_loss_val/num_batches:.4f}")
+        # Print progress every epoch to monitor training speed and metrics dynamically
+        print(f"Epoch {epoch+1:03d}/{epochs:03d} | Disc: {disc_loss_val/num_batches:.4f} | Gen: {gen_loss_val/num_batches:.4f} | Hedge: {hedge_loss_val/num_batches:.4f}")
             
     print("Minimax Deep Hedging Training COMPLETE.")
