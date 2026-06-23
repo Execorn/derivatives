@@ -157,6 +157,21 @@ def schwartz_smith_price_black76(
     """
     Analytical European option pricing on futures using Black-76 with the correct conditional variance.
     """
+    if K <= 0.0:
+        raise ValueError("Strike must be positive")
+    if r < 0.0:
+        raise ValueError("Risk free rate must be non-negative")
+    if kappa < 0.0:
+        raise ValueError("kappa must be non-negative")
+    if sigma_chi < 0.0:
+        raise ValueError("sigma_chi must be non-negative")
+    if sigma_xi < 0.0:
+        raise ValueError("sigma_xi must be non-negative")
+    if not (-1.0 <= rho <= 1.0):
+        raise ValueError("rho must be between -1.0 and 1.0")
+    if T_opt > T_fut:
+        raise ValueError("Option maturity cannot exceed futures maturity")
+
     tau = T_opt - t
     if tau <= 0:
         F = futures_price(t, T_fut, chi_t, xi_t, kappa, sigma_chi, rho, sigma_xi, mu_star, lambda_chi)
@@ -199,6 +214,21 @@ def schwartz_smith_price_fourier(
     """
     Option pricing via Fourier inversion (Lewis 2001 method) on CPU.
     """
+    if K <= 0.0:
+        raise ValueError("Strike must be positive")
+    if r < 0.0:
+        raise ValueError("Risk free rate must be non-negative")
+    if kappa < 0.0:
+        raise ValueError("kappa must be non-negative")
+    if sigma_chi < 0.0:
+        raise ValueError("sigma_chi must be non-negative")
+    if sigma_xi < 0.0:
+        raise ValueError("sigma_xi must be non-negative")
+    if not (-1.0 <= rho <= 1.0):
+        raise ValueError("rho must be between -1.0 and 1.0")
+    if T_opt > T_fut:
+        raise ValueError("Option maturity cannot exceed futures maturity")
+
     F = futures_price(t, T_fut, chi_t, xi_t, kappa, sigma_chi, rho, sigma_xi, mu_star, lambda_chi)
     tau = T_opt - t
     
@@ -397,6 +427,8 @@ def schwartz_smith_price_cos(
         raise ValueError("sigma_xi must be non-negative")
     if not (-1.0 <= rho <= 1.0):
         raise ValueError("rho must be between -1.0 and 1.0")
+    if T_opt > T_fut:
+        raise ValueError("Option maturity cannot exceed futures maturity")
     if N <= 0:
         raise ValueError("N must be positive")
     if L <= 0.0:
@@ -598,6 +630,16 @@ def schwartz_smith_price_black76_pt(
         raise ValueError("Strike must be positive")
     if torch.any(r < 0.0):
         raise ValueError("Risk free rate must be non-negative")
+    if torch.any(kappa < 0.0):
+        raise ValueError("kappa must be non-negative")
+    if torch.any(sigma_chi < 0.0):
+        raise ValueError("sigma_chi must be non-negative")
+    if torch.any(sigma_xi < 0.0):
+        raise ValueError("sigma_xi must be non-negative")
+    if torch.any(torch.abs(rho) > 1.0):
+        raise ValueError("rho must be between -1.0 and 1.0")
+    if torch.any(T_opt > T_fut):
+        raise ValueError("Option maturity cannot exceed futures maturity")
         
     tau = T_opt - t
     F = futures_price_pt(t, T_fut, chi_t, xi_t, kappa, sigma_chi, rho, sigma_xi, mu_star, lambda_chi)
@@ -663,6 +705,16 @@ def schwartz_smith_price_fourier_pt(
         raise ValueError("Strike must be positive")
     if torch.any(r < 0.0):
         raise ValueError("Risk free rate must be non-negative")
+    if torch.any(kappa < 0.0):
+        raise ValueError("kappa must be non-negative")
+    if torch.any(sigma_chi < 0.0):
+        raise ValueError("sigma_chi must be non-negative")
+    if torch.any(sigma_xi < 0.0):
+        raise ValueError("sigma_xi must be non-negative")
+    if torch.any(torch.abs(rho) > 1.0):
+        raise ValueError("rho must be between -1.0 and 1.0")
+    if torch.any(T_opt > T_fut):
+        raise ValueError("Option maturity cannot exceed futures maturity")
         
     F = futures_price_pt(t, T_fut, chi_t, xi_t, kappa, sigma_chi, rho, sigma_xi, mu_star, lambda_chi)
     tau = T_opt - t
@@ -958,6 +1010,8 @@ def schwartz_smith_price_cos_pt(
         raise ValueError("sigma_xi must be non-negative")
     if torch.any(torch.abs(rho_t) > 1.0):
         raise ValueError("rho must be between -1.0 and 1.0")
+    if torch.any(T_opt_t > T_fut_t):
+        raise ValueError("Option maturity cannot exceed futures maturity")
     if N <= 0:
         raise ValueError("N must be positive")
     if L <= 0.0:
@@ -1263,3 +1317,128 @@ def calibrate_schwartz_smith(
         "success": bool(res.success),
         "log_likelihood": float(-res.fun)
     }
+
+
+class SchwartzSmithEngine:
+    def __init__(self, kappa: float, mu_y: float, sigma_x: float, sigma_y: float, rho_xy: float):
+        if not (np.isfinite(kappa) and np.isfinite(mu_y) and np.isfinite(sigma_x) and np.isfinite(sigma_y) and np.isfinite(rho_xy)):
+            raise ValueError("All inputs must be finite")
+        if kappa <= 0.0:
+            raise ValueError("kappa must be positive")
+        if sigma_x <= 0.0:
+            raise ValueError("sigma_x must be positive")
+        if sigma_y <= 0.0:
+            raise ValueError("sigma_y must be positive")
+        if not (-1.0 <= rho_xy <= 1.0):
+            raise ValueError("Correlation (rho_xy) must be in range [-1.0, 1.0]")
+            
+        self.kappa = kappa
+        self.mu_y = mu_y
+        self.sigma_x = sigma_x
+        self.sigma_y = sigma_y
+        self.rho_xy = rho_xy
+
+    def price_option(self, spot: float, strike: float, maturity: float, risk_free_rate: float = 0.0, is_call: bool = True) -> float:
+        if not (np.isfinite(spot) and np.isfinite(strike) and np.isfinite(maturity) and np.isfinite(risk_free_rate)):
+            raise ValueError("All inputs must be finite")
+        if spot <= 0.0:
+            raise ValueError("Spot must be positive")
+        if strike <= 0.0:
+            raise ValueError("Strike must be positive")
+        if maturity <= 0.0:
+            raise ValueError("Maturity must be positive")
+        if risk_free_rate < 0.0:
+            raise ValueError("Risk free rate must be non-negative")
+            
+        from scipy.stats import norm
+        # Variance of ln(S_T) under Schwartz-Smith
+        v2 = conditional_variance(0.0, maturity, maturity, self.kappa, self.sigma_x, self.rho_xy, self.sigma_y)
+        if v2 <= 0.0:
+            return max(spot - strike * np.exp(-risk_free_rate * maturity) if is_call else strike * np.exp(-risk_free_rate * maturity) - spot, 0.0)
+            
+        vol = np.sqrt(v2 / maturity)
+        
+        # Black-Scholes pricing
+        d1 = (np.log(spot / strike) + (risk_free_rate + 0.5 * vol**2) * maturity) / (vol * np.sqrt(maturity))
+        d2 = d1 - vol * np.sqrt(maturity)
+        
+        if is_call:
+            price = spot * norm.cdf(d1) - strike * np.exp(-risk_free_rate * maturity) * norm.cdf(d2)
+            return max(price, 0.0)
+        else:
+            price = strike * np.exp(-risk_free_rate * maturity) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+            return max(price, 0.0)
+
+    def heston_price(self, spot: float, strike: float, maturity: float, risk_free_rate: float, heston_params: dict, is_call: bool = True) -> float:
+        if not (np.isfinite(spot) and np.isfinite(strike) and np.isfinite(maturity) and np.isfinite(risk_free_rate)):
+            raise ValueError("All inputs must be finite")
+        if spot <= 0.0:
+            raise ValueError("Spot must be positive")
+        if strike <= 0.0:
+            raise ValueError("Strike must be positive")
+        if maturity <= 0.0:
+            raise ValueError("Maturity must be positive")
+        if risk_free_rate < 0.0:
+            raise ValueError("Risk free rate must be non-negative")
+            
+        # Validate heston_params
+        required_keys = ['kappa', 'theta', 'sigma', 'rho', 'v0']
+        for k in required_keys:
+            if k not in heston_params:
+                raise ValueError("Heston parameters must contain 'kappa', 'theta', 'sigma', 'rho', 'v0'")
+            if not np.isfinite(heston_params[k]):
+                raise ValueError("Heston parameters must be finite")
+                
+        if heston_params['kappa'] <= 0.0 or heston_params['theta'] <= 0.0 or heston_params['sigma'] <= 0.0 or heston_params['v0'] <= 0.0:
+            raise ValueError("Heston parameters (kappa, theta, sigma, v0) must be positive")
+            
+        if not (-1.0 <= heston_params['rho'] <= 1.0):
+            raise ValueError("Heston correlation (rho) must be between -1.0 and 1.0")
+            
+        # Price using Heston COS method
+        from pricing.heston import heston_cf, cos_payoff_coeffs_np, cos_payoff_coeffs_put_np
+        
+        N_cos = 128
+        a, b = -4.0, 4.0
+        k_arr = np.arange(N_cos)
+        u_k = k_arr * np.pi / (b - a)
+        
+        # Spot expectation drifts at r: E[S_T] = S0 * exp(r * T)
+        # CF of ln(S_T/K) = CF of ln(S_T/S0) + 1j * u * ln(S0/K)
+        # Under risk-neutral Heston, log-price is ln(S_T/S0) = (r - q - 0.5*v0)T + ...
+        # heston_cf handles the characteristic function of the dynamic parts.
+        # Let's add the forward drift:
+        x0 = np.log(spot / strike) + risk_free_rate * maturity
+        
+        phi_k = heston_cf(
+            u_k, maturity,
+            heston_params['kappa'],
+            heston_params['theta'],
+            heston_params['sigma'],
+            heston_params['rho'],
+            heston_params['v0']
+        ) * np.exp(1j * u_k * x0)
+        phi_k[0] = 1.0 + 0j
+        
+        if is_call:
+            Vk = cos_payoff_coeffs_np(N_cos, a, b)
+            price = strike * np.real(np.sum(phi_k * np.exp(-1j * u_k * a) * Vk))
+            price = np.exp(-risk_free_rate * maturity) * price
+            return max(price, 0.0)
+        else:
+            Vk = cos_payoff_coeffs_put_np(N_cos, a, b)
+            price = strike * np.real(np.sum(phi_k * np.exp(-1j * u_k * a) * Vk))
+            price = np.exp(-risk_free_rate * maturity) * price
+            return max(price, 0.0)
+
+    def compare_vs_heston(self, spot: float, strike: float, maturity: float, heston_params: dict, risk_free_rate: float = 0.0, is_call: bool = True) -> dict:
+        ss_price = self.price_option(spot, strike, maturity, risk_free_rate, is_call)
+        h_price = self.heston_price(spot, strike, maturity, risk_free_rate, heston_params, is_call)
+        abs_err = abs(ss_price - h_price)
+        rel_err = abs_err / max(h_price, 1e-8)
+        return {
+            "schwartz_smith_price": ss_price,
+            "heston_price": h_price,
+            "absolute_error": abs_err,
+            "relative_error": rel_err
+        }

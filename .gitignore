@@ -108,3 +108,18 @@ ROADMAP_P4_ONWARDS.md
 # Generated images (output artifacts from fno_greeks.py etc.)
 images/ai_generated/
 P4_MODEL_ZOO_TASK.md
+
+# ── Phase 7 temporary and research artifacts ─────────────────────────────────
+CONTEXT.md
+ORIGINAL_REQUEST.md
+OVERVIEW.md
+P5_ROADMAP.md
+P6_ROADMAP.md
+ROADMAP.md
+scratch/
+articles/
+research/
+notebooks/generate_notebooks.py
+notebooks/generate_p5_notebooks.py
+notebooks/generate_p6_notebooks.py
+

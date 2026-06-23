@@ -21,6 +21,15 @@ def sabr_iv_lognormal_pytorch(
     Computes Hagan's approximate lognormal implied volatility for beta=1.0 in PyTorch.
     Differentiable and robust near ATM (K -> F).
     """
+    if isinstance(rho, torch.Tensor):
+        rho = torch.clamp(rho, min=-0.9999, max=0.9999)
+    else:
+        rho = max(-0.9999, min(0.9999, rho))
+        
+    if isinstance(alpha, torch.Tensor):
+        alpha = torch.clamp(alpha, min=1e-8)
+    else:
+        alpha = max(1e-8, alpha)
     # z = (nu / alpha) * ln(F/K)
     log_FK = torch.log(F / K)
     z = (nu / alpha) * log_FK
@@ -209,7 +218,13 @@ def solve_sabr_alpha(
     discriminant = b**2 + 4.0 * a * sigma_atm
     discriminant_safe = torch.clamp(discriminant, min=1e-15)
     
-    alpha = (2.0 * sigma_atm) / (b + torch.sqrt(discriminant_safe))
+    denom = b + torch.sqrt(discriminant_safe)
+    if isinstance(denom, torch.Tensor):
+        denom = torch.clamp(denom, min=1e-10)
+    else:
+        denom = max(1e-10, denom)
+        
+    alpha = (2.0 * sigma_atm) / denom
     return alpha
 
 
@@ -223,6 +238,8 @@ def sabr_initial_guess(
     Generates initial guesses for rho and nu from market strikes and vols using
     25-Delta Risk Reversals and Butterfly quotes.
     """
+    if T <= 0:
+        raise ValueError("T must be positive")
     strikes_arr = np.asarray(market_strikes)
     vols_arr = np.asarray(market_vols)
     
@@ -452,3 +469,92 @@ def calibrate_sabr_fx_2d(
         "rho": rho_cal,
         "nu": nu_cal
     }
+
+
+class FXSABRCalibrator:
+    def delta_to_strike(self, spot, r_d, r_f, t, delta, vol, option_type="call"):
+        if not (np.isfinite(spot) and np.isfinite(r_d) and np.isfinite(r_f) and np.isfinite(t)
+                and np.isfinite(delta) and np.isfinite(vol)):
+            raise ValueError("All inputs must be finite")
+        if spot <= 0.0:
+            raise ValueError("Spot must be positive")
+        if t <= 0.0:
+            raise ValueError("Time to maturity must be positive")
+        if vol <= 0.0:
+            raise ValueError("Volatility must be positive")
+            
+        opt_type = option_type.lower()
+        if opt_type not in ("call", "c", "put", "p"):
+            raise ValueError("option_type must be 'call' or 'put'")
+            
+        if opt_type in ("call", "c"):
+            if not (0.0 < delta < 1.0):
+                raise ValueError("Call delta must be in (0, 1)")
+        else:
+            if not (-1.0 < delta < 0.0):
+                raise ValueError("Put delta must be in (-1, 0)")
+                
+        from market.fx_data import invert_gk_delta
+        F = spot * np.exp((r_d - r_f) * t)
+        return invert_gk_delta(F, delta, t, r_d, r_f, vol, option_type=opt_type, delta_type="spot_pna")
+        
+    def calibrate(self, spot, r_d, r_f, t, atm_vol, rr25, bf25, rr10, bf10):
+        if not (np.isfinite(spot) and np.isfinite(r_d) and np.isfinite(r_f) and np.isfinite(t)
+                and np.isfinite(atm_vol) and np.isfinite(rr25) and np.isfinite(bf25)
+                and np.isfinite(rr10) and np.isfinite(bf10)):
+            raise ValueError("All inputs must be finite")
+        if spot <= 0.0:
+            raise ValueError("Spot must be positive")
+        if t <= 0.0:
+            raise ValueError("Time to maturity must be positive")
+        if atm_vol <= 0.0:
+            raise ValueError("ATM volatility must be positive")
+        if bf25 <= 0.0 or bf10 <= 0.0:
+            raise ValueError("Butterfly volatilities must be positive")
+            
+        vol_atm = atm_vol
+        vol_25C = atm_vol + bf25 + 0.5 * rr25
+        vol_25P = atm_vol + bf25 - 0.5 * rr25
+        vol_10C = atm_vol + bf10 + 0.5 * rr10
+        vol_10P = atm_vol + bf10 - 0.5 * rr10
+        
+        K_ATM = spot * np.exp((r_d - r_f) * t)
+        K_25C = self.delta_to_strike(spot, r_d, r_f, t, 0.25, vol_25C, "call")
+        K_25P = self.delta_to_strike(spot, r_d, r_f, t, -0.25, vol_25P, "put")
+        K_10C = self.delta_to_strike(spot, r_d, r_f, t, 0.10, vol_10C, "call")
+        K_10P = self.delta_to_strike(spot, r_d, r_f, t, -0.10, vol_10P, "put")
+        
+        strikes = [K_10P, K_25P, K_ATM, K_25C, K_10C]
+        market_vols = [vol_10P, vol_25P, vol_atm, vol_25C, vol_10C]
+        
+        sorted_indices = np.argsort(strikes)
+        strikes = np.array(strikes)[sorted_indices]
+        market_vols = np.array(market_vols)[sorted_indices]
+        
+        res = calibrate_sabr_fx_2d(spot * np.exp((r_d - r_f) * t), strikes, market_vols, t, r_d, r_f)
+        return res["alpha"], res["rho"], res["nu"]
+        
+    def extract_strike_vol_grid(self, spot, r_d, r_f, t, sabr_params, strikes):
+        if not (np.isfinite(spot) and np.isfinite(r_d) and np.isfinite(r_f) and np.isfinite(t)
+                and all(np.isfinite(x) for x in sabr_params) and np.all(np.isfinite(strikes))):
+            raise ValueError("All inputs must be finite")
+        if len(strikes) == 0:
+            raise ValueError("Strikes grid cannot be empty")
+        if np.any(strikes <= 0.0):
+            raise ValueError("Strike values must be positive")
+            
+        alpha, rho, nu = sabr_params
+        F = spot * np.exp((r_d - r_f) * t)
+        
+        F_t = torch.tensor(F, dtype=torch.float64)
+        alpha_t = torch.tensor(alpha, dtype=torch.float64)
+        rho_t = torch.tensor(rho, dtype=torch.float64)
+        nu_t = torch.tensor(nu, dtype=torch.float64)
+        T_t = torch.tensor(t, dtype=torch.float64)
+        
+        vols = []
+        for K in strikes:
+            K_t = torch.tensor(K, dtype=torch.float64)
+            vol = sabr_iv_lognormal_pytorch(F_t, K_t, T_t, alpha_t, rho_t, nu_t)
+            vols.append(vol.item())
+        return np.array(vols)

@@ -14,7 +14,7 @@
 | M3 | FX SABR (W2) | Delta-to-strike inversion, SABR calibration to EUR/USD smile, validation notebook. | M1 | DONE (d812462c-557f-4e3e-b4dc-b7883df77796) |
 | M4 | Rates LMM-SABR (W3) | Displaced SABR pricing, SOFR swaption cube interpolation, validation notebook. | M1 | DONE (849b328c-3b8a-4416-9ebf-82e1b6e8a8cb) |
 | M5 | Commodity Schwartz-Smith (W4) | CME futures options cleaning, Schwartz-Smith pricing vs Heston, validation notebook. | M1 | DONE (5b0f0963-bd5a-4133-900f-b3e407d694dc) |
-| M6 | Integration & Hardening (Tier 5) | Final E2E pass, adversarial testing and coverage hardening. | M2, M3, M4, M5 | PLANNED |
+| M6 | Integration & Hardening (Tier 5) | Final E2E pass, adversarial testing and coverage hardening. | M2, M3, M4, M5 | DONE (fa264af5-48a5-4fbe-9a2f-c8ae0af25573) |
 
 ## Interface Contracts
 ### Equity MLSV Engine

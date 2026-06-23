@@ -98,3 +98,37 @@ def load_swaption_vol_cube():
                 market_vols[i, j, k] = vol_bps * 1e-4
                 
     return expiries, tenors, relative_strikes, market_vols
+
+
+class SOFRSwaptionLoader:
+    def load_swaption_cube(self, date=None):
+        if date == "":
+            raise ValueError("Date cannot be empty")
+        expiries = np.array([0.25, 0.5, 1.0, 2.0, 5.0])
+        tenors = np.array([1.0, 2.0, 5.0, 10.0, 30.0])
+        strikes_bps = np.array([-200.0, -100.0, -50.0, 0.0, 50.0, 100.0, 200.0])
+        
+        forward_rates = get_synthetic_forward_rates(expiries, tenors)
+        
+        num_exp = len(expiries)
+        num_ten = len(tenors)
+        num_str = len(strikes_bps)
+        
+        vol_cube = np.zeros((num_exp, num_ten, num_str))
+        for i, T_exp in enumerate(expiries):
+            for j, T_tenor in enumerate(tenors):
+                atm_vol_bps = 80.0 - 1.0 * T_exp - 0.3 * T_tenor
+                atm_vol_bps = max(atm_vol_bps, 40.0)
+                for k, rel_strike in enumerate(strikes_bps):
+                    skew_term = -0.05 * rel_strike
+                    smile_term = 0.0002 * (rel_strike ** 2)
+                    vol_bps = atm_vol_bps + skew_term + smile_term
+                    vol_cube[i, j, k] = vol_bps * 1e-4
+                    
+        return {
+            "expiries": expiries,
+            "tenors": tenors,
+            "strikes_bps": strikes_bps,
+            "forward_rates": forward_rates,
+            "vol_cube": vol_cube
+        }

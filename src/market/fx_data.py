@@ -3,6 +3,7 @@ fx_data.py — Garman-Kohlhagen pricing, delta conventions, strike inversion, an
 """
 
 import os
+import warnings
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
@@ -76,6 +77,18 @@ def gk_delta(
     - forward_pna  : Forward Delta Premium-Non-Adjusted
     - forward_pa   : Forward Delta Premium-Adjusted
     """
+    if T < 0.0 or vol < 0.0:
+        raise ValueError("T and vol must be non-negative")
+    if T == 0.0 or vol == 0.0:
+        is_call = option_type.lower() in ("call", "c")
+        factor = np.exp(-r_f * T) if "spot" in delta_type else 1.0
+        if F > K:
+            return factor if is_call else 0.0
+        elif F < K:
+            return 0.0 if is_call else -factor
+        else:
+            return 0.5 * factor if is_call else -0.5 * factor
+
     phi = 1.0 if option_type.lower() in ("call", "c") else -1.0
     d1 = (np.log(F / K) + 0.5 * vol**2 * T) / (vol * np.sqrt(T))
     d2 = d1 - vol * np.sqrt(T)
@@ -105,6 +118,11 @@ def gk_delta_dk(
     """
     Computes the exact analytical derivative of delta with respect to strike (dDelta / dK).
     """
+    if T < 0.0 or vol < 0.0:
+        raise ValueError("T and vol must be non-negative")
+    if T == 0.0 or vol == 0.0:
+        return 0.0
+
     phi = 1.0 if option_type.lower() in ("call", "c") else -1.0
     d1 = (np.log(F / K) + 0.5 * vol**2 * T) / (vol * np.sqrt(T))
     d2 = d1 - vol * np.sqrt(T)
@@ -203,6 +221,7 @@ def invert_gk_delta(
             
         K = K_new
         
+    warnings.warn("Newton-Raphson failed to converge within max_iter iterations", UserWarning)
     return K
 
 
@@ -295,3 +314,42 @@ class FXMarketDataLoader:
             df.to_csv(file_path, index=False)
             
         return pd.read_csv(file_path)
+
+
+class FXDataLoader:
+    def __init__(self):
+        self._db = {
+            "EUR/USD": {
+                "spot": 1.10,
+                "domestic_rate": 0.03,
+                "foreign_rate": 0.01,
+                "tenors": [0.25, 0.5, 1.0],
+                "atm": [0.08, 0.08, 0.08],
+                "rr25": [-0.005, -0.005, -0.005],
+                "bf25": [0.002, 0.002, 0.002],
+                "rr10": [-0.010, -0.010, -0.010],
+                "bf10": [0.004, 0.004, 0.004],
+            },
+            "GBP/USD": {
+                "spot": 1.30,
+                "domestic_rate": 0.03,
+                "foreign_rate": 0.02,
+                "tenors": [0.25, 0.5, 1.0],
+                "atm": [0.09, 0.09, 0.09],
+                "rr25": [-0.003, -0.003, -0.003],
+                "bf25": [0.002, 0.002, 0.002],
+                "rr10": [-0.006, -0.006, -0.006],
+                "bf10": [0.003, 0.003, 0.003],
+            }
+        }
+        
+    def load_quotes(self, pair: str) -> dict:
+        if not pair:
+            raise ValueError("Currency pair cannot be empty")
+        import re
+        if not re.match(r"^[A-Z]{3}/[A-Z]{3}$", pair):
+            raise ValueError("FX pair must be in format 'XXX/YYY'")
+        if pair not in self._db:
+            raise ValueError(f"No quotes available for currency pair: {pair}")
+        import copy
+        return copy.deepcopy(self._db[pair])

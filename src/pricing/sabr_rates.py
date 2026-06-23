@@ -14,7 +14,7 @@ def sabr_iv_normal_internal(F, K, T, alpha, beta, rho, nu):
     T = np.asarray(T, dtype=float)
     alpha = np.asarray(alpha, dtype=float)
     beta = np.asarray(beta, dtype=float)
-    rho = np.asarray(rho, dtype=float)
+    rho = np.clip(np.asarray(rho, dtype=float), -0.9999, 0.9999)
     nu = np.asarray(nu, dtype=float)
     
     # Broadcast to same shape
@@ -120,7 +120,7 @@ def sabr_iv_lognormal_internal(F, K, T, alpha, beta, rho, nu):
     T = np.asarray(T, dtype=float)
     alpha = np.asarray(alpha, dtype=float)
     beta = np.asarray(beta, dtype=float)
-    rho = np.asarray(rho, dtype=float)
+    rho = np.clip(np.asarray(rho, dtype=float), -0.9999, 0.9999)
     nu = np.asarray(nu, dtype=float)
     
     # Broadcast to same shape
@@ -352,6 +352,14 @@ def calibrate_sabr_node(F, strikes, market_vols, T, beta, shift, vol_type='norma
     # Good default initialization
     atm_idx = np.argmin(np.abs(strikes - F))
     atm_vol = market_vols[atm_idx]
+    
+    if np.isnan(atm_vol):
+        non_nan_indices = np.where(~np.isnan(market_vols))[0]
+        if len(non_nan_indices) > 0:
+            closest_idx = non_nan_indices[np.argmin(np.abs(strikes[non_nan_indices] - F))]
+            atm_vol = market_vols[closest_idx]
+        else:
+            atm_vol = 0.2 if vol_type.lower() == 'normal' else 0.3
     
     F_s = F + shift
     if vol_type.lower() == 'normal':
@@ -653,3 +661,73 @@ class SwaptionVolCube:
             return shifted_black_price(forward, strike, T_exp, iv, shift, option_type=option_type)
         else:
             raise ValueError(f"Unknown vol_type: {vol_type}")
+
+
+class RatesSABREngine:
+    def bachelier_price(self, F, K, T, vol, is_call=True):
+        if not (np.isfinite(F) and np.isfinite(K) and np.isfinite(T) and np.isfinite(vol)):
+            raise ValueError("All inputs must be finite")
+        if T <= 0.0:
+            raise ValueError("Maturity T must be positive")
+        if vol <= 0.0:
+            raise ValueError("Normal volatility must be positive")
+            
+        from pricing.bachelier import bachelier_price
+        option_type = "call" if is_call else "put"
+        return bachelier_price(F, K, T, vol, option_type=option_type)
+        
+    def black_price(self, F, K, T, vol, is_call=True):
+        if not (np.isfinite(F) and np.isfinite(K) and np.isfinite(T) and np.isfinite(vol)):
+            raise ValueError("All inputs must be finite")
+        if F <= 0.0 or K <= 0.0:
+            raise ValueError("Forward and strike must be positive")
+        if T <= 0.0:
+            raise ValueError("Maturity T must be positive")
+        if vol <= 0.0:
+            raise ValueError("Lognormal volatility must be positive")
+            
+        from pricing.bachelier import black_price
+        option_type = "call" if is_call else "put"
+        return black_price(F, K, T, vol, option_type=option_type)
+        
+    def displaced_sabr_vol(self, F, K, T, alpha, beta, rho, nu, shift, vol_type='normal'):
+        if not (np.isfinite(F) and np.isfinite(K) and np.isfinite(T) and np.isfinite(alpha)
+                and np.isfinite(beta) and np.isfinite(rho) and np.isfinite(nu) and np.isfinite(shift)):
+            raise ValueError("All inputs must be finite")
+        if F + shift <= 0.0 or K + shift <= 0.0:
+            raise ValueError("Shifted forward and strike must be positive")
+            
+        return displaced_sabr_vol(F, K, T, alpha, beta, rho, nu, shift, vol_type=vol_type)
+        
+    def displaced_sabr_price(self, F, K, T, alpha, beta, rho, nu, shift, is_call=True, vol_type='normal'):
+        iv = self.displaced_sabr_vol(F, K, T, alpha, beta, rho, nu, shift, vol_type)
+        option_type = "call" if is_call else "put"
+        if vol_type.lower() == 'normal':
+            from pricing.bachelier import bachelier_price
+            return bachelier_price(F, K, T, iv, option_type=option_type)
+        elif vol_type.lower() == 'lognormal':
+            from pricing.bachelier import shifted_black_price
+            return shifted_black_price(F, K, T, iv, shift, option_type=option_type)
+        else:
+            raise ValueError(f"Unknown vol_type: {vol_type}")
+            
+    def interpolate_vol_cube(self, expiries, tenors, strikes_bps, vol_cube, t_exp, t_ten, strike_bps):
+        if not (np.all(np.isfinite(expiries)) and np.all(np.isfinite(tenors)) and np.all(np.isfinite(strikes_bps))
+                and np.all(np.isfinite(vol_cube)) and np.isfinite(t_exp) and np.isfinite(t_ten) and np.isfinite(strike_bps)):
+            raise ValueError("All inputs must be finite")
+            
+        if t_exp <= 0.0:
+            raise ValueError("Expiry t_exp must be positive")
+            
+        if vol_cube.shape != (len(expiries), len(tenors), len(strikes_bps)):
+            raise ValueError(f"Vol cube shape must match. Expected {(len(expiries), len(tenors), len(strikes_bps))}, got {vol_cube.shape}")
+            
+        t_exp_clamped = np.clip(t_exp, expiries[0], expiries[-1])
+        t_ten_clamped = np.clip(t_ten, tenors[0], tenors[-1])
+        strike_bps_clamped = np.clip(strike_bps, strikes_bps[0], strikes_bps[-1])
+        
+        from scipy.interpolate import interpn
+        points = (expiries, tenors, strikes_bps)
+        xi = np.array([t_exp_clamped, t_ten_clamped, strike_bps_clamped])
+        res = interpn(points, vol_cube, xi)
+        return float(res[0])

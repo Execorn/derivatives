@@ -103,7 +103,7 @@ def compute_conditional_expectation(
     if method == "nadaraya_watson":
         # Silverman's rule of thumb bandwidth: h = 1.06 * std(X_t) * N^(-1/5)
         std_X = torch.std(X_t)
-        std_X = torch.clamp(std_X, min=1e-6)
+        std_X = torch.nan_to_num(torch.clamp(std_X, min=1e-6), nan=1e-6)
         h = 1.06 * std_X * (N_paths ** (-0.2))
         
         # Precompute unsqueezed tensors outside loop
@@ -290,7 +290,7 @@ class MLSVSolverGPU:
         self.vol_boundary_style = vol_boundary_style
         
         # Grid setup
-        self.N_steps = int(round(T * steps_per_unit))
+        self.N_steps = max(1, int(round(T * steps_per_unit)))
         self.dt = float(T) / self.N_steps
         self.t_grid = torch.linspace(0.0, T, self.N_steps + 1, device=self.device, dtype=self.dtype)
         
@@ -320,6 +320,7 @@ class MLSVSolverGPU:
             If provided, overrides self.vol_boundary_style
         """
         boundary_style = vol_boundary_style or self.vol_boundary_style
+        torch.manual_seed(42)
         
         # Allocate path storage: shape (N_steps + 1, N_paths) on the GPU/device
         self.X_paths = torch.empty((self.N_steps + 1, self.N_paths), device=self.device, dtype=self.dtype)
@@ -513,3 +514,125 @@ class MLSVSolverGPU:
             return option_prices[:, 0]
         else:
             return option_prices
+
+
+class MLSVEngine:
+    def __init__(self, kappa: float, theta: float, epsilon: float, rho: float, dupire_grid: dict = None):
+        if not (np.isfinite(kappa) and np.isfinite(theta) and np.isfinite(epsilon) and np.isfinite(rho)):
+            raise ValueError("All inputs must be finite")
+        if kappa <= 0.0:
+            raise ValueError("kappa must be positive")
+        if not (-1.0 <= rho <= 1.0):
+            raise ValueError("rho must be between -1.0 and 1.0")
+            
+        self.kappa = kappa
+        self.theta = theta
+        self.epsilon = epsilon
+        self.rho = rho
+        self.dupire_grid = dupire_grid
+        
+    def price_option(self, spot: float, strike: float, maturity: float, vol: float, is_call: bool = True) -> float:
+        if not (np.isfinite(spot) and np.isfinite(strike) and np.isfinite(maturity) and np.isfinite(vol)):
+            raise ValueError("All inputs must be finite")
+        if spot <= 0.0:
+            raise ValueError("Spot must be positive")
+        if strike <= 0.0:
+            raise ValueError("Strike must be positive")
+        if maturity <= 0.0:
+            raise ValueError("Maturity must be positive")
+        if vol <= 0.0:
+            raise ValueError("Volatility must be positive")
+            
+        if not is_call:
+            # Use call-put parity: C - P = S - K * exp(-r*T) = S - K (since r=0, q=0 in solver)
+            call_price = self.price_option(spot=spot, strike=strike, maturity=maturity, vol=vol, is_call=True)
+            return call_price - spot + strike
+
+        if self.dupire_grid is not None:
+            if isinstance(self.dupire_grid, dict):
+                vol_grid = np.array(self.dupire_grid["vol"])
+            else:
+                vol_grid = np.array(self.dupire_grid)
+            dupire_vol_fn = lambda t, s: torch.full_like(s, float(vol_grid[0, 0]))
+        else:
+            dupire_vol_fn = lambda t, s: torch.full_like(s, vol)
+            
+        solver = MLSVSolverGPU(
+            S0=spot,
+            r=0.0,
+            q=0.0,
+            v0=vol**2,
+            kappa=self.kappa,
+            theta=self.theta,
+            xi=self.epsilon,
+            rho=self.rho,
+            T=maturity,
+            steps_per_unit=50,
+            N_paths=2000,
+            dupire_vol_fn=dupire_vol_fn,
+            device="cpu",
+            dtype=torch.float64
+        )
+        solver.simulate(method="nadaraya_watson")
+        return solver.price_european_option(strike=strike, maturity=maturity, is_call=is_call)
+        
+    def conditional_expectation(self, spot_grid: np.ndarray, current_spot: float, current_vol: float) -> np.ndarray:
+        solver = MLSVSolverGPU(
+            S0=current_spot,
+            r=0.0,
+            q=0.0,
+            v0=current_vol**2,
+            kappa=self.kappa,
+            theta=self.theta,
+            xi=self.epsilon,
+            rho=self.rho,
+            T=0.1,
+            steps_per_unit=10,
+            N_paths=5000,
+            dupire_vol_fn=lambda t, s: torch.full_like(s, current_vol),
+            device="cpu",
+            dtype=torch.float64
+        )
+        solver.simulate(method="nadaraya_watson")
+        X_t = solver.X_paths[-1]
+        V_t = solver.V_paths[-1]
+        targets = torch.tensor(np.log(spot_grid), device="cpu", dtype=torch.float64)
+        expectations_t = compute_conditional_expectation(X_t, V_t, targets, method="nadaraya_watson")
+        return expectations_t.cpu().numpy()
+        
+    def calibrate_local_vol(self, spot_grid: np.ndarray, time_grid: np.ndarray, market_prices: np.ndarray) -> np.ndarray:
+        M, N = len(spot_grid), len(time_grid)
+        local_vol = np.zeros((N, M))
+        
+        solver = MLSVSolverGPU(
+            S0=100.0,
+            r=0.0,
+            q=0.0,
+            v0=0.04,
+            kappa=self.kappa,
+            theta=self.theta,
+            xi=self.epsilon,
+            rho=self.rho,
+            T=max(time_grid),
+            steps_per_unit=50,
+            N_paths=2000,
+            dupire_vol_fn=lambda t, s: torch.full_like(s, 0.2),
+            device="cpu",
+            dtype=torch.float64
+        )
+        solver.simulate(method="nadaraya_watson")
+        
+        for j, t in enumerate(time_grid):
+            t_idx = int(torch.argmin(torch.abs(solver.t_grid - t)).item())
+            X_t = solver.X_paths[t_idx]
+            V_t = solver.V_paths[t_idx]
+            targets = torch.tensor(np.log(spot_grid), device="cpu", dtype=torch.float64)
+            expectations = compute_conditional_expectation(X_t, V_t, targets, method="nadaraya_watson").cpu().numpy()
+            expectations = np.maximum(expectations, 1e-6)
+            
+            for i, S in enumerate(spot_grid):
+                dup_vol = 0.20
+                lv = dup_vol / np.sqrt(expectations[i])
+                local_vol[j, i] = np.clip(lv, 0.05, 1.5)
+                
+        return local_vol

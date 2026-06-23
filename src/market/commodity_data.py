@@ -547,3 +547,29 @@ def generate_synthetic_options_data(
     futures_df = pd.DataFrame(futures_records)
     options_df = pd.DataFrame(options_records)
     return options_df, futures_df
+
+
+class CommodityDataLoader:
+    def __init__(self):
+        self._db = {
+            "WTI": {
+                "spot": 78.50,
+                "futures_maturities": np.array([0.08, 0.25, 0.5, 0.75, 1.0]),
+                "strikes": np.array([60.0, 70.0, 75.0, 80.0, 90.0, 100.0]),
+                "vols": np.full((5, 6), 0.28)
+            },
+            "GC": {
+                "spot": 2050.0,
+                "futures_maturities": np.array([0.08, 0.25, 0.5, 0.75, 1.0]),
+                "strikes": np.array([1800.0, 1900.0, 2000.0, 2050.0, 2100.0, 2200.0]),
+                "vols": np.full((5, 6), 0.16)
+            }
+        }
+        
+    def load_commodity_data(self, symbol: str) -> dict:
+        if symbol == "":
+            raise ValueError("Commodity symbol cannot be empty")
+        if symbol not in self._db:
+            raise ValueError(f"Symbol {symbol} not found in mock database")
+        import copy
+        return copy.deepcopy(self._db[symbol])
