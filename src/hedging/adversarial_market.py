@@ -276,9 +276,10 @@ def train_robust_minimax_hedger(
             for _ in range(critic_steps):
                 opt_d.zero_grad()
                 
-                # Generate fake paths
-                z = torch.randn(batch_size, generator.latent_dim, device=device)
-                fake_samples = generator(z)  # (batch_size, 2, seq_len)
+                # Generate fake paths without tracking generator gradients
+                with torch.no_grad():
+                    z = torch.randn(batch_size, generator.latent_dim, device=device)
+                    fake_samples = generator(z)  # (batch_size, 2, seq_len)
                 
                 # Score real and fake
                 d_real = discriminator(real_samples)

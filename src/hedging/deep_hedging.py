@@ -123,7 +123,7 @@ class DeepHedgingEnv:
             else:
                 past_S = self.H[:, k-5:k+1, 0]  # (N_paths, 6)
                 log_returns = torch.log(torch.clamp(past_S[:, 1:] / torch.clamp(past_S[:, :-1], min=1e-5), min=1e-5))  # (N_paths, 5)
-                vol_proxy = torch.std(log_returns, dim=-1, keepdim=True) * np.sqrt(252)
+                vol_proxy = torch.std(log_returns, dim=-1, keepdim=True) * 15.874507866387544
             
         # Concatenate features: log_moneyness, time_to_expiry, vol_proxy, and all dimensions of prev_delta
         # shape: (N_paths, 3 + d)
@@ -156,7 +156,7 @@ class DeepHedgingEnv:
                 S_0 = self.H[:, :, 0]
                 log_returns = torch.log(torch.clamp(S_0[:, 1:] / torch.clamp(S_0[:, :-1], min=1e-5), min=1e-5))  # (N_paths, N_t)
                 windows = log_returns.unfold(dimension=-1, size=5, step=1)  # (N_paths, N_t - 4, 5)
-                vol_proxy_windows = torch.std(windows, dim=-1, keepdim=True) * np.sqrt(252)  # (N_paths, N_t - 4, 1)
+                vol_proxy_windows = torch.std(windows, dim=-1, keepdim=True) * 15.874507866387544  # (N_paths, N_t - 4, 1)
                 self._precomputed_vol_proxy[:, 5:self.N_t + 1] = vol_proxy_windows
         else:
             self._precomputed_log_moneyness = None
