@@ -83,6 +83,13 @@ class ParameterNormalizer:
         return "\n".join(lines)
 
 
+class ParameterNormalizerHeston(ParameterNormalizer):
+    """
+    Z-score normalizer for the 5-dimensional Classic Heston parameter vector.
+    """
+    PARAM_NAMES = ["kappa", "theta", "sigma", "rho", "v0"]
+
+
 class IVSurfaceNormalizer:
     """
     Per-grid-point z-score normalizer for the (8, 11) implied volatility surface.
