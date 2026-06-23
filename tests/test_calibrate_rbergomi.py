@@ -159,3 +159,40 @@ def test_variance_reduction_antithetic():
     print(f"Antithetic MC Estimator Variance: {var_anti:.8e}")
 
     assert var_anti < var_std, "Antithetic variables should reduce estimator variance"
+
+
+def test_calibrate_rbergomi_fast_self_consistency():
+    """Verify that calibrate_rbergomi (Newton) recovers synthetic parameters."""
+    from calibrate_fast import calibrate_rbergomi as calibrate_rbergomi_fast
+    from fno_model import MirrorPaddedFNO2d
+    from calibrate import _load_normalizers, _make_spatial_input, _fno_predict_real_iv
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MirrorPaddedFNO2d(param_dim=4).to(device)
+    model.load_state_dict(torch.load("artifacts/weights/fno_rbergomi_final_prod.pth", map_location=device, weights_only=True))
+    model.eval()
+    
+    T_grid = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+    K_grid = np.linspace(-0.5, 0.5, 11)
+    
+    v0_t = 0.04
+    H_t = 0.07
+    eta_t = 1.5
+    rho_t = -0.7
+    
+    _load_normalizers("rbergomi")
+    spatial = _make_spatial_input(T_grid, K_grid, device)
+    
+    raw_params = torch.tensor([[v0_t, H_t, eta_t, rho_t]], dtype=torch.float32, device=device)
+    with torch.no_grad():
+        target_iv_t = _fno_predict_real_iv(model, raw_params, spatial)
+    target_iv = target_iv_t.cpu().numpy()
+    
+    res = calibrate_rbergomi_fast(model, target_iv, T_grid, K_grid, max_iter=25, n_starts=2)
+    
+    assert res["final_mse"] < 1e-4
+    assert abs(res["v0"] - v0_t) < 0.015
+    assert abs(res["H"] - H_t) < 0.02
+    assert abs(res["eta"] - eta_t) < 0.20
+    assert abs(res["rho"] - rho_t) < 0.15
+

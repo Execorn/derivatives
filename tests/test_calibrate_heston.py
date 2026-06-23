@@ -140,3 +140,45 @@ def test_self_consistency():
     assert res['loss'] < 1e-4, f"Calibration loss is too high: {res['loss']}"
     assert error[1] < 0.02, f"Theta error too high: {error[1]}"
     assert error[4] < 0.015, f"v0 error too high: {error[4]}"
+
+
+def test_calibrate_heston_fast_self_consistency():
+    """Verify that calibrate_heston (Newton) recovers synthetic parameters."""
+    from calibrate_fast import calibrate_heston as calibrate_heston_fast
+    from fno_model import MirrorPaddedFNO2d
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MirrorPaddedFNO2d(param_dim=5).to(device)
+    model.load_state_dict(torch.load("artifacts/weights/fno_heston_final_prod.pth", map_location=device, weights_only=True))
+    model.eval()
+    
+    T_grid_fno = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+    K_grid_fno = np.linspace(-0.5, 0.5, 11)
+    
+    params_true = {
+        'kappa': 2.5,
+        'theta': 0.08,
+        'sigma': 0.3,
+        'rho': -0.6,
+        'v0': 0.05
+    }
+    
+    from calibrate_fast import _fno_predict_real_iv, _make_spatial_input, _load_normalizers
+    _load_normalizers("heston")
+    spatial = _make_spatial_input(T_grid_fno, K_grid_fno, device)
+    params_tensor = torch.tensor([[
+        params_true['kappa'],
+        params_true['theta'],
+        params_true['sigma'],
+        params_true['rho'],
+        params_true['v0']
+    ]], dtype=torch.float32, device=device)
+    with torch.no_grad():
+        iv_target = _fno_predict_real_iv(model, params_tensor, spatial).cpu().numpy()
+    
+    res = calibrate_heston_fast(model, iv_target, T_grid_fno, K_grid_fno, max_iter=20, n_starts=2)
+    
+    assert res["loss"] < 1.5e-3
+    assert abs(res["params"]["theta"] - params_true["theta"]) < 0.06
+    assert abs(res["params"]["v0"] - params_true["v0"]) < 0.015
+

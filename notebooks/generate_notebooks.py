@@ -857,6 +857,294 @@ plt.tight_layout(); plt.show()
 # ---------------------------------------------------------------------------
 # Save all notebooks
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# NB 08 — Classic Heston vs Rough Heston
+# ---------------------------------------------------------------------------
+NB_08 = nb([
+  md(["# Notebook 08 — Classic Heston vs Rough Heston Implied Volatility Skew\n\n",
+      "Compares the implied volatility surface shapes of the Classic Heston model\n",
+      "and the Rough Heston model (v3 Learnable H). Under Rough Heston, the short-maturity\n",
+      "implied volatility skew blowup exhibits power-law behavior $\\sim T^{H-1/2}$, whereas\n",
+      "Classic Heston shows a bounded flat skew as $T \\to 0$."]),
+  code(COMMON_SETUP + """
+from pricing.heston import heston_iv_surface
+from fno_model import MirrorPaddedFNO2d
+from calibrate import _load_normalizers, _fno_predict_real_iv, _make_spatial_input
+"""),
+  md(["## 1. Load the FNO surrogates"]),
+  code("""\
+# Heston
+model_heston = MirrorPaddedFNO2d(param_dim=5).to(DEVICE)
+model_heston.load_state_dict(torch.load("../artifacts/weights/fno_heston_final_prod.pth", map_location=DEVICE))
+model_heston.eval()
+
+# Rough Heston
+model_rheston = MirrorPaddedFNO2d(param_dim=6).to(DEVICE)
+model_rheston.load_state_dict(torch.load("../artifacts/weights/fno_v3_final_prod.pth", map_location=DEVICE))
+model_rheston.eval()
+print("Models loaded successfully.")
+"""),
+  md(["## 2. Compare Short-Maturity Skew (T=0.1 vs T=2.0)"]),
+  code("""\
+# Classic Heston parameters: kappa, theta, sigma, rho, v0
+params_heston = {"kappa": 2.5, "theta": 0.08, "sigma": 0.3, "rho": -0.6, "v0": 0.05}
+
+# Rough Heston parameters: kappa, theta, sigma, rho, v0, H
+params_rheston = torch.tensor([[2.5, 0.08, 0.3, -0.6, 0.05, 0.05]], dtype=torch.float32, device=DEVICE)
+
+T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+K_GRID = np.linspace(-0.5, 0.5, 11)
+
+# Pricing Heston
+iv_heston = heston_iv_surface(params_heston, T_GRID, K_GRID)
+
+# Pricing Rough Heston (via FNO)
+_load_normalizers("v3")
+spatial = _make_spatial_input(T_GRID, K_GRID, DEVICE)
+from calibrate import _param_norm
+p_norm = _param_norm.transform_tensor(params_rheston)
+with torch.no_grad():
+    iv_rheston_t = _fno_predict_real_iv(model_rheston, p_norm, spatial)
+iv_rheston = iv_rheston_t.squeeze().cpu().numpy()
+
+# Plot skew at T=0.1 (first slice) and T=2.0 (last slice)
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].plot(K_GRID, iv_heston[0], "o-", label="Classic Heston")
+axes[0].plot(K_GRID, iv_rheston[0], "s-", label="Rough Heston (H=0.05)")
+axes[0].set_title("Implied Volatility Smile (T=0.1)")
+axes[0].set_xlabel("Log-moneyness")
+axes[0].set_ylabel("Implied Volatility")
+axes[0].legend()
+
+axes[1].plot(K_GRID, iv_heston[-1], "o-", label="Classic Heston")
+axes[1].plot(K_GRID, iv_rheston[-1], "s-", label="Rough Heston (H=0.05)")
+axes[1].set_title("Implied Volatility Smile (T=2.0)")
+axes[1].set_xlabel("Log-moneyness")
+axes[1].legend()
+
+plt.tight_layout()
+plt.show()
+"""),
+])
+
+
+# ---------------------------------------------------------------------------
+# NB 09 — SABR / SSVI Calibration
+# ---------------------------------------------------------------------------
+NB_09 = nb([
+  md(["# Notebook 09 — SABR / SSVI Model Calibration and Comparison\n\n",
+      "Calibrates the SABR and SSVI models to the implied volatility surface.\n",
+      "SSVI is guaranteed to be arbitrage-free under Gatheral-Jacquier parametric constraints,\n",
+      "whereas SABR Hagan approximation can exhibit calendar/butterfly arbitrage at extreme strikes."]),
+  code(COMMON_SETUP + """
+from pricing.sabr import sabr_iv_surface, ssvi_iv_surface
+from fno_model import MirrorPaddedFNO2d
+from calibrate_fast import calibrate_sabr, calibrate_ssvi
+"""),
+  md(["## 1. Load FNO surrogates"]),
+  code("""\
+model_sabr = MirrorPaddedFNO2d(param_dim=3).to(DEVICE)
+model_sabr.load_state_dict(torch.load("../artifacts/weights/fno_sabr_final_prod.pth", map_location=DEVICE))
+model_sabr.eval()
+
+model_ssvi = MirrorPaddedFNO2d(param_dim=11).to(DEVICE)
+model_ssvi.load_state_dict(torch.load("../artifacts/weights/fno_ssvi_final_prod.pth", map_location=DEVICE))
+model_ssvi.eval()
+print("SABR & SSVI FNO models loaded.")
+"""),
+  md(["## 2. Generate a Target Implied Volatility Surface"]),
+  code("""\
+T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+K_GRID = np.linspace(-0.5, 0.5, 11)
+
+# True SABR parameters
+alpha_t = 0.08
+rho_t = -0.4
+nu_t = 0.3
+
+# Target SABR surface
+iv_target = sabr_iv_surface(
+    F=1.0, T_grid=T_GRID, k_grid=K_GRID,
+    alpha=alpha_t, beta=1.0, rho=rho_t, nu=nu_t,
+    iv_type="lognormal"
+)
+
+# Plot target surface
+plt.figure(figsize=(7, 4))
+for i, T in enumerate([0.1, 0.5, 1.0, 2.0]):
+    idx = np.abs(T_GRID - T).argmin()
+    plt.plot(K_GRID, iv_target[idx], label=f"T={T_GRID[idx]:.1f}")
+plt.title("Target SABR IV Surface Slices")
+plt.xlabel("Log-moneyness")
+plt.ylabel("IV")
+plt.legend()
+plt.show()
+"""),
+  md(["## 3. Fast Gauss-Newton Calibration"]),
+  code("""\
+# Calibrate SABR
+res_sabr = calibrate_sabr(model_sabr, iv_target, T_GRID, K_GRID, max_iter=20)
+print("SABR Calibrated Params:")
+print(f"  alpha = {res_sabr['alpha']:.4f} (true={alpha_t})")
+print(f"  rho   = {res_sabr['rho']:.4f} (true={rho_t})")
+print(f"  nu    = {res_sabr['nu']:.4f} (true={nu_t})")
+print(f"  MSE   = {res_sabr['final_mse']:.2e}")
+
+# Calibrate SSVI
+theta_atm_init = iv_target[:, 5] ** 2 * T_GRID
+res_ssvi = calibrate_ssvi(model_ssvi, iv_target, T_GRID, K_GRID, theta_atm_init=theta_atm_init, max_iter=20)
+print("\\nSSVI Calibrated Params:")
+print(f"  rho   = {res_ssvi['rho']:.4f}")
+print(f"  eta   = {res_ssvi['eta']:.4f}")
+print(f"  gamma = {res_ssvi['gamma']:.4f}")
+print(f"  MSE   = {res_ssvi['final_mse']:.2e}")
+"""),
+])
+
+
+# ---------------------------------------------------------------------------
+# NB 10 — Local Volatility
+# ---------------------------------------------------------------------------
+NB_10 = nb([
+  md(["# Notebook 10 — Dupire Local Volatility Surface Extraction\n\n",
+      "Extracts the Dupire Local Volatility surface from SVI implied variance slices.\n",
+      "Compares the exact Dupire finite difference formulation against the fast FNO surrogate."]),
+  code(COMMON_SETUP + """
+from pricing.local_vol import svi_slice, svi_to_lv_surface, check_arbitrage_free
+from fno_model import MirrorPaddedFNO2d
+from calibrate_fast import compute_local_vol_surface
+"""),
+  md(["## 1. Define SVI surface"]),
+  code("""\
+# SVI params: a, b, rho, m, sigma per maturity slice
+np.random.seed(42)
+T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+K_GRID = np.linspace(-0.5, 0.5, 11)
+
+svi_params = np.zeros((8, 5))
+for i, T in enumerate(T_GRID):
+    a = 0.02 + 0.01 * T
+    b = 0.05 + 0.02 * T
+    rho = -0.4
+    m = -0.05
+    sigma = 0.1 + 0.05 * T
+    svi_params[i] = [a, b, rho, m, sigma]
+
+# Check no-arbitrage bounds
+is_arb_free = check_arbitrage_free(T_GRID, K_GRID, svi_params)
+print(f"Surface is arbitrage-free: {is_arb_free}")
+"""),
+  md(["## 2. Compute Exact Dupire LV Surface"]),
+  code("""\
+lv_exact = svi_to_lv_surface(T_GRID, K_GRID, svi_params)
+print("Exact Local Vol Surface shape:", lv_exact.shape)
+"""),
+  md(["## 3. Compare with FNO Local Vol Surrogate"]),
+  code("""\
+model_lv = MirrorPaddedFNO2d(param_dim=40).to(DEVICE)
+model_lv.load_state_dict(torch.load("../artifacts/weights/fno_localvol_final_prod.pth", map_location=DEVICE))
+model_lv.eval()
+
+# Calibrate/Evaluate via surrogate
+from calibrate import _load_normalizers
+_load_normalizers("localvol")
+res_lv = compute_local_vol_surface(svi_params.flatten(), T_GRID, K_GRID, use_fno=True, model=model_lv)
+lv_pred = res_lv
+
+# Compute MSE
+mse = np.mean((lv_exact - lv_pred) ** 2)
+print(f"FNO Local Vol Surface MSE vs Exact: {mse:.2e}")
+
+# Plot
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+im0 = axes[0].imshow(lv_exact, aspect="auto", cmap="viridis", extent=[K_GRID[0], K_GRID[-1], T_GRID[-1], T_GRID[0]])
+axes[0].set_title("Exact Dupire LV Surface")
+axes[0].set_xlabel("Log-moneyness")
+axes[0].set_ylabel("Maturity (years)")
+plt.colorbar(im0, ax=axes[0])
+
+im1 = axes[1].imshow(lv_pred, aspect="auto", cmap="viridis", extent=[K_GRID[0], K_GRID[-1], T_GRID[-1], T_GRID[0]])
+axes[1].set_title("FNO Local Vol Surface")
+axes[1].set_xlabel("Log-moneyness")
+plt.colorbar(im1, ax=axes[1])
+plt.tight_layout()
+plt.show()
+"""),
+])
+
+
+# ---------------------------------------------------------------------------
+# NB 11 — Rough Bergomi Calibration and Comparisons
+# ---------------------------------------------------------------------------
+NB_11 = nb([
+  md(["# Notebook 11 — Rough Bergomi Calibration and Path Simulation\n\n",
+      "Simulates stock price and variance paths under the Rough Bergomi model\n",
+      "and calibrates parameters using the FNO surrogate."]),
+  code(COMMON_SETUP + """
+from pricing.rbergomi_gpu import simulate_rbergomi_paths, rbergomi_iv_surface
+from fno_model import MirrorPaddedFNO2d
+from calibrate_fast import calibrate_rbergomi
+"""),
+  md(["## 1. Simulate Rough Bergomi Paths"]),
+  code("""\
+H = 0.07
+params = torch.tensor([[0.04, H, 1.5, -0.7]], device=DEVICE, dtype=torch.float32)
+T = 1.0
+steps = 200
+paths = 1000
+
+# Simulate paths on GPU using Bennedsen hybrid scheme
+S, V, t = simulate_rbergomi_paths(params, T, steps, paths, antithetic=True, device=DEVICE)
+S_np = S[0].cpu().numpy()
+V_np = V[0].cpu().numpy()
+t_np = t.cpu().numpy()
+
+# Plot paths
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].plot(t_np, S_np[:10].T)
+axes[0].set_title("Stock Price Paths")
+axes[0].set_xlabel("Time (years)")
+axes[0].set_ylabel("Stock Price")
+
+axes[1].plot(t_np, V_np[:10].T)
+axes[1].set_title(f"Instantaneous Variance Paths (H={H})")
+axes[1].set_xlabel("Time (years)")
+axes[1].set_ylabel("Variance")
+plt.tight_layout()
+plt.show()
+"""),
+  md(["## 2. Load Rough Bergomi FNO Model and Calibrate"]),
+  code("""\
+model_rb = MirrorPaddedFNO2d(param_dim=4).to(DEVICE)
+model_rb.load_state_dict(torch.load("../artifacts/weights/fno_rbergomi_final_prod.pth", map_location=DEVICE))
+model_rb.eval()
+
+# Generate target IV surface
+T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+K_GRID = np.linspace(-0.5, 0.5, 11)
+
+from calibrate import _load_normalizers, _fno_predict_real_iv, _make_spatial_input
+_load_normalizers("rbergomi")
+spatial = _make_spatial_input(T_GRID, K_GRID, DEVICE)
+from calibrate import _param_norm
+p_norm = _param_norm.transform_tensor(params)
+with torch.no_grad():
+    iv_target_t = _fno_predict_real_iv(model_rb, p_norm, spatial)
+iv_target = iv_target_t.squeeze().cpu().numpy()
+
+# Calibrate
+res_rb = calibrate_rbergomi(model_rb, iv_target, T_GRID, K_GRID, max_iter=20)
+print("Rough Bergomi Calibrated Params:")
+print(f"  v0  = {res_rb['v0']:.4f} (true=0.04)")
+print(f"  H   = {res_rb['H']:.4f} (true=0.07)")
+print(f"  eta = {res_rb['eta']:.4f} (true=1.5)")
+print(f"  rho = {res_rb['rho']:.4f} (true=-0.7)")
+print(f"  MSE = {res_rb['final_mse']:.2e}")
+"""),
+])
+
 NOTEBOOKS = {
     "01_spx_calibration.ipynb":       NB_01,
     "02_surface_completion.ipynb":    NB_02,
@@ -865,6 +1153,10 @@ NOTEBOOKS = {
     "05_crypto_calibration.ipynb":    NB_05,
     "06_batch_calibration.ipynb":     NB_06,
     "07_joint_calibration.ipynb":     NB_07,
+    "08_heston_vs_rheston.ipynb":     NB_08,
+    "09_sabr_ssvi_calibration.ipynb":  NB_09,
+    "10_local_vol_dupire.ipynb":       NB_10,
+    "11_rbergomi_calibration.ipynb":  NB_11,
 }
 
 # Old notebooks to delete

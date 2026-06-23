@@ -3,6 +3,8 @@ rbergomi_gpu.py — GPU-accelerated Monte Carlo pricing for the Rough Bergomi mo
 Uses the Bennedsen, Lunde & Pakkanen (2017) hybrid scheme with F.conv1d for fast fBm simulation.
 """
 
+import os
+os.environ["NUMBA_DISABLE_JIT"] = "1"
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -151,6 +153,7 @@ def fill_nans(ivs: np.ndarray, default_val: float = 0.3) -> np.ndarray:
     return ivs
 
 
+@torch.no_grad()
 def batch_rbergomi_iv_surface(
     params,
     T_grid: np.ndarray,
@@ -191,37 +194,38 @@ def batch_rbergomi_iv_surface(
     idx_200 = np.where(H_vals >= 0.07)[0]
 
     prices = torch.zeros((B, M, L), device=device, dtype=dtype)
-
     def price_subbatch(sub_indices, steps_per_unit):
         if len(sub_indices) == 0:
             return
-        sub_params = params_t[sub_indices]
-        S, _, _ = simulate_rbergomi_paths(
-            sub_params,
-            T_max,
-            steps_per_unit=steps_per_unit,
-            N_paths=N_paths,
-            antithetic=antithetic,
-            device=device,
-            dtype=dtype,
-        )
+        chunk_size = max(1, 40000 // N_paths)
+        for i in range(0, len(sub_indices), chunk_size):
+            chunk_idx = sub_indices[i:i+chunk_size]
+            sub_params = params_t[chunk_idx]
+            S, _, _ = simulate_rbergomi_paths(
+                sub_params,
+                T_max,
+                steps_per_unit=steps_per_unit,
+                N_paths=N_paths,
+                antithetic=antithetic,
+                device=device,
+                dtype=dtype,
+            )
 
-        step_indices = [int(round(T * steps_per_unit)) for T in T_grid]
-        S_maturities = S[:, :, step_indices].permute(0, 2, 1)  # (sub_B, M, N_paths)
+            step_indices = [int(round(T * steps_per_unit)) for T in T_grid]
+            S_maturities = S[:, :, step_indices].permute(0, 2, 1)  # (chunk_B, M, N_paths)
 
-        K_tensor = torch.exp(torch.tensor(K_grid, device=device, dtype=dtype))  # (L,)
-        is_call = (K_tensor >= 1.0).view(1, 1, L, 1)  # (1, 1, L, 1)
+            K_tensor = torch.exp(torch.tensor(K_grid, device=device, dtype=dtype))  # (L,)
+            is_call = (K_tensor >= 1.0).view(1, 1, L, 1)  # (1, 1, L, 1)
 
-        payoffs = torch.where(
-            is_call,
-            torch.clamp(S_maturities.unsqueeze(2) - K_tensor.view(1, 1, L, 1), min=0.0),
-            torch.clamp(K_tensor.view(1, 1, L, 1) - S_maturities.unsqueeze(2), min=0.0),
-        )  # (sub_B, M, L, N_paths)
-        prices[sub_indices] = payoffs.mean(dim=-1)
+            payoffs = torch.where(
+                is_call,
+                torch.clamp(S_maturities.unsqueeze(2) - K_tensor.view(1, 1, L, 1), min=0.0),
+                torch.clamp(K_tensor.view(1, 1, L, 1) - S_maturities.unsqueeze(2), min=0.0),
+            )  # (chunk_B, M, L, N_paths)
+            prices[chunk_idx] = payoffs.mean(dim=-1)
 
     price_subbatch(idx_500, 500)
     price_subbatch(idx_200, 200)
-
     # Black-Scholes inversion using py_vollib_vectorized
     S0 = 1.0
     r = 0.0
@@ -237,15 +241,27 @@ def batch_rbergomi_iv_surface(
     flat_maturities = maturities_3d.flatten()
     flat_flags = flags_3d.flatten()
 
+    # Clamp prices to strictly avoid intrinsic and maximum price boundary violations
+    # to prevent triggering Numba-compiled fallback paths that fail on Python 3.14
+    is_call_flat = (flat_flags == "c")
+    intrinsic = np.where(is_call_flat, np.maximum(1.0 - flat_strikes, 0.0), np.maximum(flat_strikes - 1.0, 0.0))
+    max_price = np.where(is_call_flat, 1.0, flat_strikes)
+    flat_prices = np.clip(flat_prices, intrinsic + 1e-4, max_price - 1e-4)
+
+    flat_prices_f64 = flat_prices.astype(np.float64)
+    flat_strikes_f64 = flat_strikes.astype(np.float64)
+    flat_maturities_f64 = flat_maturities.astype(np.float64)
+
     flat_ivs = py_vollib_vectorized.vectorized_implied_volatility(
-        flat_prices,
-        S0,
-        flat_strikes,
-        flat_maturities,
-        r,
+        flat_prices_f64,
+        float(S0),
+        flat_strikes_f64,
+        flat_maturities_f64,
+        float(r),
         flat_flags,
-        q=q,
+        q=float(q),
         return_as="numpy",
+        dtype=np.float64
     )
 
     ivs = flat_ivs.reshape(B, M, L)

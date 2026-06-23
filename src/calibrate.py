@@ -39,6 +39,16 @@ _NORM_VERSIONS = {
     # Trained by:   src/train_fno_v3_learnable_h.py (param_dim=6)
     "v3": ("artifacts/models/param_normalizer_v3.npz",
            "artifacts/models/iv_normalizer_v3.npz"),
+    "heston": ("artifacts/models/param_normalizer_heston.npz",
+               "artifacts/models/iv_normalizer_heston.npz"),
+    "sabr": ("artifacts/models/param_normalizer_sabr.npz",
+             "artifacts/models/iv_normalizer_sabr.npz"),
+    "ssvi": ("artifacts/models/param_normalizer_ssvi.npz",
+             "artifacts/models/iv_normalizer_ssvi.npz"),
+    "localvol": ("artifacts/models/param_normalizer_localvol.npz",
+                 "artifacts/models/lv_normalizer_localvol.npz"),
+    "rbergomi": ("artifacts/models/param_normalizer_rbergomi.npz",
+                 "artifacts/models/iv_normalizer_rbergomi.npz"),
 }
 
 # ─── Lazy-load normalizers ────────────────────────────────────────────────────

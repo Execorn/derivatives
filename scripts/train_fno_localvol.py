@@ -25,10 +25,10 @@ DATASET_PATH = 'data/LocalVolDataset_v1.npz'
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 K_GRID = np.linspace(-0.5, 0.5, 11)
 N_PARAMS = 40  # 8 slices * 5 SVI params
-EPOCHS = 100  # Default to 100 for testability, can be increased by user
-BATCH_SIZE = 256
-LR = 5e-4
-SWA_START = 80
+EPOCHS = 3 if '--smoke' in sys.argv else 150
+BATCH_SIZE = 4096
+LR = 8e-4
+SWA_START = 2 if '--smoke' in sys.argv else 120
 
 WEIGHTS_BEST = 'artifacts/weights/fno_localvol_best.pth'
 WEIGHTS_PROD = 'artifacts/weights/fno_localvol_final_prod.pth'

@@ -5,6 +5,7 @@ Uses adaptive steps per unit: 500 for H < 0.07, 200 for H >= 0.07.
 """
 
 import os
+os.environ["NUMBA_DISABLE_JIT"] = "1"
 import sys
 import time
 import numpy as np
@@ -24,8 +25,8 @@ PARAM_NAMES = ["v0", "H", "eta", "rho"]
 BOUNDS_LOWER = np.array([0.01, 0.04, 0.5, -0.95], dtype=np.float32)
 BOUNDS_UPPER = np.array([0.20, 0.15, 4.0, 0.0], dtype=np.float32)
 
-N_TRAIN_SAMPLES = 50000
-N_VAL_SAMPLES = 10000
+N_TRAIN_SAMPLES = 1024 if '--smoke' in sys.argv else 50000
+N_VAL_SAMPLES = 256 if '--smoke' in sys.argv else 10000
 BATCH_SIZE = 512
 
 OUTPUT_PATH = os.path.join(repo_root, "data", "rBergomiDataset_v1.npz")

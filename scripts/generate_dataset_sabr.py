@@ -27,7 +27,7 @@ from pricing.sabr import sabr_iv_surface, ssvi_iv_surface
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 K_GRID = np.linspace(-0.5, 0.5, 11)
 
-N_SAMPLES = 65536  # 2^16 samples
+N_SAMPLES = 2048 if '--smoke' in sys.argv else 65536  # 2^16 samples
 BATCH_SIZE = 1024
 
 SABR_OUT_PATH = "data/SABRDataset_v1.npz"

@@ -75,3 +75,29 @@ def test_fno_forward_pass():
     loss.backward()
     assert params_tensor.grad is not None
     assert not torch.isnan(params_tensor.grad).any()
+
+
+def test_compute_local_vol_surface():
+    from calibrate_fast import compute_local_vol_surface
+    
+    T_grid = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+    K_grid = np.linspace(-0.5, 0.5, 11)
+    
+    # 40 SVI parameters representing flat 0.20
+    svi_params = np.zeros((len(T_grid), 5))
+    for i, T in enumerate(T_grid):
+        svi_params[i] = [0.20**2 * T, 0.0, 0.0, 0.0, 0.1]
+        
+    # Test analytic computation
+    lv_surf_analytic = compute_local_vol_surface(svi_params, T_grid, K_grid, use_fno=False)
+    np.testing.assert_allclose(lv_surf_analytic, 0.20, rtol=1e-2, atol=1e-2)
+    
+    # Test FNO surrogate computation
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = MirrorPaddedFNO2d(param_dim=40).to(device)
+    model.load_state_dict(torch.load("artifacts/weights/fno_localvol_final_prod.pth", map_location=device, weights_only=True))
+    model.eval()
+    
+    lv_surf_fno = compute_local_vol_surface(svi_params, T_grid, K_grid, use_fno=True, model=model)
+    assert lv_surf_fno.shape == (len(T_grid), len(K_grid))
+

@@ -210,3 +210,84 @@ def test_ssvi_iv_surface_shape():
     assert surface.shape == (3, 3)
     assert np.all(surface > 0)
     assert not np.any(np.isnan(surface))
+
+
+def test_calibrate_sabr_fast_self_consistency():
+    """Verify that calibrate_sabr (Newton) recovers synthetic parameters."""
+    from calibrate_fast import calibrate_sabr as calibrate_sabr_fast
+    from fno_model import MirrorPaddedFNO2d
+    import torch
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MirrorPaddedFNO2d(param_dim=3).to(device)
+    model.load_state_dict(torch.load("artifacts/weights/fno_sabr_final_prod.pth", map_location=device, weights_only=True))
+    model.eval()
+    
+    T_grid = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+    K_grid = np.linspace(-0.5, 0.5, 11)
+    
+    alpha_t = 0.08
+    rho_t = -0.4
+    nu_t = 0.3
+    
+    # Generate target using pricing formula
+    iv_target = sabr_iv_surface(
+        F=1.0,
+        T_grid=T_grid,
+        k_grid=K_grid,
+        alpha=alpha_t,
+        beta=1.0,
+        rho=rho_t,
+        nu=nu_t,
+        iv_type="lognormal"
+    )
+    
+    res = calibrate_sabr_fast(model, iv_target, T_grid, K_grid, max_iter=25, n_starts=2)
+    
+    assert res["final_mse"] < 1e-4
+    assert abs(res["alpha"] - alpha_t) < 0.015
+    assert abs(res["rho"] - rho_t) < 0.15
+    assert abs(res["nu"] - nu_t) < 0.10
+
+
+def test_calibrate_ssvi_fast_self_consistency():
+    """Verify that calibrate_ssvi (Newton) recovers synthetic parameters."""
+    from calibrate_fast import calibrate_ssvi as calibrate_ssvi_fast
+    from fno_model import MirrorPaddedFNO2d
+    import torch
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MirrorPaddedFNO2d(param_dim=11).to(device)
+    model.load_state_dict(torch.load("artifacts/weights/fno_ssvi_final_prod.pth", map_location=device, weights_only=True))
+    model.eval()
+    
+    T_grid = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+    K_grid = np.linspace(-0.5, 0.5, 11)
+    
+    rho_t = -0.3
+    eta_t = 0.6
+    gamma_t = 0.3
+    # Monotone increasing ATM variances
+    theta_grid = np.array([0.01, 0.02, 0.035, 0.05, 0.065, 0.08, 0.09, 0.10])
+    
+    from calibrate_fast import _fno_predict_real_iv, _make_spatial_input, _load_normalizers
+    _load_normalizers("ssvi")
+    spatial = _make_spatial_input(T_grid, K_grid, device)
+    
+    raw_params = torch.cat([
+        torch.tensor(theta_grid, dtype=torch.float32, device=device),
+        torch.tensor([rho_t, eta_t, gamma_t], dtype=torch.float32, device=device)
+    ]).unsqueeze(0)
+    
+    with torch.no_grad():
+        iv_target = _fno_predict_real_iv(model, raw_params, spatial).cpu().numpy()
+    
+    # Decoupled calibration with known theta_atm_init
+    res = calibrate_ssvi_fast(model, iv_target, T_grid, K_grid, theta_atm_init=theta_grid, max_iter=25, n_starts=2)
+    
+    assert res["final_mse"] < 1e-4
+    assert abs(res["rho"] - rho_t) < 0.05
+    assert abs(res["eta"] - eta_t) < 0.05
+    assert abs(res["gamma"] - gamma_t) < 0.05
+
+

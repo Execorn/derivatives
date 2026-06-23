@@ -28,7 +28,7 @@ PARAM_NAMES = ['kappa', 'theta', 'sigma', 'rho', 'v0']
 BOUNDS_LOWER = np.array([0.1, 0.01, 0.1, -0.9, 0.01])
 BOUNDS_UPPER = np.array([5.0, 0.15, 1.0, -0.1, 0.15])
 
-N_SOBOL_SAMPLES = 131072  # 2^17
+N_SOBOL_SAMPLES = 2048 if '--smoke' in sys.argv else 131072  # 2^17
 BATCH_SIZE = 4096  # Classic Heston is very fast, large batches are efficient
 N_COS = 128
 OUTPUT_PATH = 'data/HestonDataset_v1.npz'

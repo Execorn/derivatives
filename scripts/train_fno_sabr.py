@@ -26,10 +26,10 @@ T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 K_GRID = np.linspace(-0.5, 0.5, 11)
 N_PARAMS = 3  # alpha, rho, nu
 
-EPOCHS = 500
-BATCH_SIZE = 512
-LR = 3e-4
-SWA_START = 400
+EPOCHS = 3 if '--smoke' in sys.argv else 150
+BATCH_SIZE = 4096
+LR = 8e-4
+SWA_START = 2 if '--smoke' in sys.argv else 120
 
 WEIGHTS_BEST = "artifacts/weights/fno_sabr_best.pth"
 WEIGHTS_PROD = "artifacts/weights/fno_sabr_final_prod.pth"
@@ -134,8 +134,11 @@ def train():
             sp = spatial.expand(B, -1, -1, -1)
             pred = model(sp, X_b)  # (B, nT, nK)
             
-            loss = F.mse_loss(pred, Y_b)
-            loss = loss + 1e-4 * arbitrage_free_regularization(pred, t_grid_tensor, k_grid_tensor)
+            # MSE loss + Arbitrage Regularization on denormalized predictions
+            loss_mse = F.mse_loss(pred, Y_b)
+            pred_denorm = iv_norm.inverse_transform_tensor(pred)
+            loss_arb = arbitrage_free_regularization(pred_denorm, t_grid_tensor, k_grid_tensor)
+            loss = loss_mse + 1e-4 * loss_arb
             
             optimizer.zero_grad(set_to_none=True)
             loss.backward()

@@ -344,3 +344,110 @@ async def deribit_snapshot(
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ── Calibration Schemas & Route ───────────────────────────────────────────────
+
+class CalibrateRequest(BaseModel):
+    market_iv: List[List[float]] = Field(..., description="8x11 implied volatility surface in decimal")
+    n_starts: int = Field(default=2, ge=1, le=5)
+
+
+class CalibrateResponse(BaseModel):
+    params: Dict[str, float]
+    final_mse: float
+    rmse_bps: float
+    elapsed_ms: float
+    converged: bool
+
+
+_MODEL_CACHE: Dict[str, Any] = {}
+
+def _get_model(model_name: str):
+    if model_name not in _MODEL_CACHE:
+        from fno_model import MirrorPaddedFNO2d
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if model_name == "heston":
+            model = MirrorPaddedFNO2d(param_dim=5)
+            path = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_heston_final_prod.pth"
+        elif model_name == "sabr":
+            model = MirrorPaddedFNO2d(param_dim=3)
+            path = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_sabr_final_prod.pth"
+        elif model_name == "ssvi":
+            model = MirrorPaddedFNO2d(param_dim=11)
+            path = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_ssvi_final_prod.pth"
+        elif model_name == "rbergomi":
+            model = MirrorPaddedFNO2d(param_dim=4)
+            path = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_rbergomi_final_prod.pth"
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported model: {model_name}")
+            
+        if not path.exists():
+            raise HTTPException(status_code=500, detail=f"Weights not found for {model_name} at {path}")
+            
+        state = torch.load(path, map_location=device, weights_only=True)
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval()
+        _MODEL_CACHE[model_name] = model
+        
+    return _MODEL_CACHE[model_name]
+
+
+@app.post("/calibrate/{model_name}", response_model=CalibrateResponse, tags=["Calibration"])
+async def calibrate_route(model_name: str, req: CalibrateRequest) -> CalibrateResponse:
+    """
+    Calibrate model parameters to an 8x11 market implied volatility surface.
+
+    Supported model names: heston, sabr, ssvi, rbergomi
+    """
+    model_name = model_name.lower()
+    if model_name not in ("heston", "sabr", "ssvi", "rbergomi"):
+        raise HTTPException(status_code=400, detail=f"Unsupported model name: {model_name}")
+
+    try:
+        model = _get_model(model_name)
+        iv_target = np.array(req.market_iv, dtype=np.float32)
+        if iv_target.shape != (8, 11):
+            raise HTTPException(status_code=422, detail="market_iv must have shape (8, 11)")
+
+        from calibrate_fast import (calibrate_heston, calibrate_sabr,
+                                    calibrate_ssvi, calibrate_rbergomi)
+
+        def _run():
+            if model_name == "heston":
+                return calibrate_heston(model, iv_target, _MATURITIES, _STRIKES, max_iter=25, n_starts=req.n_starts)
+            elif model_name == "sabr":
+                return calibrate_sabr(model, iv_target, _MATURITIES, _STRIKES, max_iter=25, n_starts=req.n_starts)
+            elif model_name == "ssvi":
+                return calibrate_ssvi(model, iv_target, _MATURITIES, _STRIKES, max_iter=25, n_starts=req.n_starts)
+            elif model_name == "rbergomi":
+                return calibrate_rbergomi(model, iv_target, _MATURITIES, _STRIKES, max_iter=25, n_starts=req.n_starts)
+            
+        res = await asyncio.get_event_loop().run_in_executor(None, _run)
+
+        # Build response parameters dictionary
+        if model_name == "heston":
+            p_dict = res["params"]
+        elif model_name == "sabr":
+            p_dict = {"alpha": res["alpha"], "rho": res["rho"], "nu": res["nu"]}
+        elif model_name == "ssvi":
+            p_dict = {"rho": res["rho"], "eta": res["eta"], "gamma": res["gamma"]}
+            for i, val in enumerate(res["theta_atm"]):
+                p_dict[f"theta_atm_{i+1}"] = float(val)
+        elif model_name == "rbergomi":
+            p_dict = {"v0": res["v0"], "H": res["H"], "eta": res["eta"], "rho": res["rho"]}
+
+        return CalibrateResponse(
+            params=p_dict,
+            final_mse=float(res["final_mse"]),
+            rmse_bps=float(res["rmse_bps"]),
+            elapsed_ms=float(res["elapsed_ms"]),
+            converged=bool(res["converged"]),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

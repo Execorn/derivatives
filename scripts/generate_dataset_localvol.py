@@ -19,8 +19,8 @@ from src.pricing.local_vol import svi_to_lv_surface, check_arbitrage_free
 # Config
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 K_GRID = np.linspace(-0.5, 0.5, 11)
-N_TARGET_SAMPLES = 10000
-BATCH_SIZE = 5000
+N_TARGET_SAMPLES = 2048 if '--smoke' in sys.argv else 60000
+BATCH_SIZE = 2048 if '--smoke' in sys.argv else 1000
 OUTPUT_PATH = 'data/LocalVolDataset_v1.npz'
 
 def generate():

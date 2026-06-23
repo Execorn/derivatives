@@ -58,6 +58,11 @@ __all__ = [
     "calibrate_newton",
     "fno_jacobian_autograd",
     "benchmark_jacobian_speed",
+    "calibrate_heston",
+    "calibrate_sabr",
+    "calibrate_ssvi",
+    "calibrate_rbergomi",
+    "compute_local_vol_surface",
 ]
 
 # ---------------------------------------------------------------------------
@@ -529,3 +534,851 @@ def calibrate_newton_h(model, iv_target: np.ndarray,
         "theta_history": theta_history,
         "iv_fitted":    iv_final,
     }
+
+
+# ---------------------------------------------------------------------------
+# §5.2 Phase 4 Model Zoo Calibrators
+# ---------------------------------------------------------------------------
+
+# ── Heston bounds and starts ────────────────────────────────────────────────
+_BOUNDS_LOWER_HESTON = torch.tensor([0.5,  0.01, 0.1,  -0.95, 0.01])
+_BOUNDS_UPPER_HESTON = torch.tensor([10.0, 0.25, 2.0,  -0.01, 0.25])
+
+HESTON_STARTS = np.array([
+    [2.0,  0.04, 0.50, -0.70, 0.04],   # typical SPX (low vol)
+    [1.0,  0.15, 1.00, -0.80, 0.10],   # high vol regime
+    [5.0,  0.08, 0.80, -0.60, 0.06],   # fast mean-reversion
+    [0.8,  0.05, 0.30, -0.90, 0.03],   # low vol-of-vol
+    [3.0,  0.10, 1.50, -0.50, 0.08],   # high vol-of-vol
+], dtype=np.float32)
+
+def calibrate_heston(model, iv_target: np.ndarray,
+                     T_grid, K_grid,
+                     max_iter: int = 30,
+                     n_starts: int = 5,
+                     verbose: bool = False) -> dict:
+    """
+    Calibrate Classic Heston to observed IV surface via Gauss-Newton on FNO surrogate.
+    Optimizes: kappa, theta, log(sigma), rho, log(v0)
+    """
+    model.eval()
+    _load_normalizers("heston")
+    device = next(model.parameters()).device
+    spatial = _make_spatial_input(T_grid, K_grid, device)
+    target_t = torch.tensor(iv_target, dtype=torch.float32, device=device)
+    iv_obs = target_t.reshape(-1)
+    
+    lo = _BOUNDS_LOWER_HESTON.to(device)
+    hi = _BOUNDS_UPPER_HESTON.to(device)
+    
+    starts = HESTON_STARTS[:n_starts]
+    if len(starts) < n_starts:
+        np.random.seed(42)
+        extra_starts = []
+        for _ in range(n_starts - len(starts)):
+            kappa_s = np.random.uniform(0.5, 10.0)
+            theta_s = np.random.uniform(0.01, 0.25)
+            sigma_s = np.exp(np.random.uniform(np.log(0.1), np.log(2.0)))
+            rho_s = np.random.uniform(-0.95, -0.01)
+            v0_s = np.exp(np.random.uniform(np.log(0.01), np.log(0.25)))
+            extra_starts.append([kappa_s, theta_s, sigma_s, rho_s, v0_s])
+        starts = np.vstack([starts, np.array(extra_starts, dtype=np.float32)])
+        
+    best_loss = float("inf")
+    best_params = None
+    best_hist = []
+    best_loss_hist = []
+    best_n = 0
+    start_t = time.time()
+    
+    for init_idx, start in enumerate(starts):
+        kappa_0, theta_0, sigma_0, rho_0, v0_0 = start
+        p = torch.tensor([
+            kappa_0,
+            theta_0,
+            np.log(max(sigma_0, 0.1)),
+            rho_0,
+            np.log(max(v0_0, 0.01))
+        ], dtype=torch.float32, device=device)
+        
+        hist = []
+        loss_hist = []
+        n = 0
+        
+        for it in range(max_iter):
+            n = it + 1
+            
+            kappa = p[0]
+            theta = p[1]
+            sigma = torch.exp(p[2])
+            rho = p[3]
+            v0 = torch.exp(p[4])
+            
+            kappa = torch.clamp(kappa, lo[0], hi[0])
+            theta = torch.clamp(theta, lo[1], hi[1])
+            sigma = torch.clamp(sigma, lo[2], hi[2])
+            rho = torch.clamp(rho, lo[3], hi[3])
+            v0 = torch.clamp(v0, lo[4], hi[4])
+            
+            p = torch.stack([kappa, theta, torch.log(sigma), rho, torch.log(v0)])
+            
+            with torch.no_grad():
+                raw_params = torch.stack([kappa, theta, sigma, rho, v0]).unsqueeze(0)
+                iv_pred = _fno_predict_real_iv(model, raw_params, spatial)
+                r_pred = (iv_pred - target_t).reshape(-1)
+                feller_viol = F.relu(sigma**2 - 2.0 * kappa * theta)
+                loss = float((r_pred**2).mean().item() + 10.0 * (feller_viol**2).item())
+                
+            hist.append(p.detach().cpu().numpy().copy())
+            loss_hist.append(loss)
+            
+            if verbose:
+                print(f"  Start {init_idx} [{it:2d}] loss={loss:.2e}  "
+                      f"θ=[{kappa:.4f},{theta:.4f},{sigma:.4f},{rho:.4f},{v0:.4f}]")
+                      
+            if loss < 1e-6:
+                break
+                
+            def _res_vec(p_t):
+                kp = p_t[0]
+                th = p_t[1]
+                sg = torch.exp(p_t[2])
+                rh = p_t[3]
+                v0_v = torch.exp(p_t[4])
+                
+                kp = torch.clamp(kp, lo[0], hi[0])
+                th = torch.clamp(th, lo[1], hi[1])
+                sg = torch.clamp(sg, lo[2], hi[2])
+                rh = torch.clamp(rh, lo[3], hi[3])
+                v0_v = torch.clamp(v0_v, lo[4], hi[4])
+                
+                raw = torch.stack([kp, th, sg, rh, v0_v]).unsqueeze(0)
+                iv = _fno_predict_real_iv(model, raw, spatial).reshape(-1)
+                r = iv - iv_obs
+                
+                f_viol = F.relu(sg**2 - 2.0 * kp * th)
+                return torch.cat([r, 10.0 * f_viol.unsqueeze(0)])
+                
+            J = jacfwd(_res_vec)(p.detach())
+            J_np = J.detach().cpu().numpy()
+            
+            with torch.no_grad():
+                r_np = _res_vec(p.detach()).detach().cpu().numpy()
+                
+            JtJ = J_np.T @ J_np
+            eps_lm = 1e-4 * np.diag(JtJ).mean() if JtJ.size > 0 else 1e-4
+            eps_lm = max(eps_lm, 1e-12)
+            
+            try:
+                delta = -np.linalg.solve(JtJ + eps_lm * np.eye(5), J_np.T @ r_np)
+            except np.linalg.LinAlgError:
+                delta = -np.linalg.pinv(JtJ + eps_lm * np.eye(5)) @ (J_np.T @ r_np)
+                
+            alpha = 0.5
+            for _ in range(8):
+                p_new_np = p.detach().cpu().numpy() + alpha * delta
+                kp_new = np.clip(p_new_np[0], lo[0].item(), hi[0].item())
+                th_new = np.clip(p_new_np[1], lo[1].item(), hi[1].item())
+                sg_new = np.clip(np.exp(p_new_np[2]), lo[2].item(), hi[2].item())
+                rh_new = np.clip(p_new_np[3], lo[3].item(), hi[3].item())
+                v0_new = np.clip(np.exp(p_new_np[4]), lo[4].item(), hi[4].item())
+                
+                with torch.no_grad():
+                    raw_new = torch.tensor([[kp_new, th_new, sg_new, rh_new, v0_new]], dtype=torch.float32, device=device)
+                    ivn = _fno_predict_real_iv(model, raw_new, spatial)
+                    r_new = (ivn - target_t).reshape(-1)
+                    f_viol_new = max(0.0, sg_new**2 - 2.0 * kp_new * th_new)
+                    loss_new = float((r_new**2).mean().item() + 10.0 * (f_viol_new**2))
+                    
+                if loss_new < loss:
+                    p = torch.tensor([
+                        kp_new,
+                        th_new,
+                        np.log(sg_new),
+                        rh_new,
+                        np.log(v0_new)
+                    ], dtype=torch.float32, device=device)
+                    break
+                alpha *= 0.5
+                
+        kappa_f = float(np.clip(p[0].item(), lo[0].item(), hi[0].item()))
+        theta_f = float(np.clip(p[1].item(), lo[1].item(), hi[1].item()))
+        sigma_f = float(np.clip(np.exp(p[2].item()), lo[2].item(), hi[2].item()))
+        rho_f = float(np.clip(p[3].item(), lo[3].item(), hi[3].item()))
+        v0_f = float(np.clip(np.exp(p[4].item()), lo[4].item(), hi[4].item()))
+        
+        final_mse = loss_hist[-1]
+        
+        if final_mse < best_loss:
+            best_loss = final_mse
+            best_params = [kappa_f, theta_f, sigma_f, rho_f, v0_f]
+            best_hist = hist
+            best_loss_hist = loss_hist
+            best_n = n
+            
+    elapsed = time.time() - start_t
+    kappa_f, theta_f, sigma_f, rho_f, v0_f = best_params
+    
+    with torch.no_grad():
+        raw_best = torch.tensor([[kappa_f, theta_f, sigma_f, rho_f, v0_f]], dtype=torch.float32, device=device)
+        iv_fitted_t = _fno_predict_real_iv(model, raw_best, spatial)
+    iv_fitted = iv_fitted_t.cpu().numpy().reshape(iv_target.shape)
+    
+    rmse_bps = float(np.sqrt(best_loss) * 10000.0)
+    
+    return {
+        "params": {
+            "kappa": kappa_f,
+            "theta": theta_f,
+            "sigma": sigma_f,
+            "rho": rho_f,
+            "v0": v0_f,
+        },
+        "param_vector": np.array(best_params),
+        "loss": float(best_loss),
+        "final_mse": float(best_loss),
+        "rmse_bps": rmse_bps,
+        "converged": bool(rmse_bps < 100.0),
+        "message": "Optimization completed successfully" if rmse_bps < 100.0 else "Optimization did not converge within tolerance",
+        "n_iter": best_n,
+        "elapsed_ms": float(elapsed * 1000.0),
+        "theta_history": [np.array([np.clip(x[0], lo[0].item(), hi[0].item()),
+                                    np.clip(x[1], lo[1].item(), hi[1].item()),
+                                    np.clip(np.exp(x[2]), lo[2].item(), hi[2].item()),
+                                    np.clip(x[3], lo[3].item(), hi[3].item()),
+                                    np.clip(np.exp(x[4]), lo[4].item(), hi[4].item())]) for x in best_hist],
+        "loss_history": best_loss_hist,
+        "iv_fitted": iv_fitted,
+    }
+
+
+# ── SABR bounds and starts ──────────────────────────────────────────────────
+_BOUNDS_LOWER_SABR = torch.tensor([0.005, -0.95, 0.05])
+_BOUNDS_UPPER_SABR = torch.tensor([0.5, 0.3, 1.5])
+
+SABR_STARTS = np.array([
+    [0.05, -0.5, 0.4],
+    [0.15, -0.7, 0.8],
+    [0.30, -0.3, 0.2]
+], dtype=np.float32)
+
+def calibrate_sabr(model, iv_target: np.ndarray,
+                   T_grid, K_grid,
+                   max_iter: int = 20,
+                   n_starts: int = 3,
+                   verbose: bool = False) -> dict:
+    """
+    Calibrate SABR model (beta=0.0) to observed IV surface.
+    Optimizes: log(alpha), rho, log(nu)
+    """
+    model.eval()
+    _load_normalizers("sabr")
+    device = next(model.parameters()).device
+    spatial = _make_spatial_input(T_grid, K_grid, device)
+    target_t = torch.tensor(iv_target, dtype=torch.float32, device=device)
+    iv_obs = target_t.reshape(-1)
+    
+    lo = _BOUNDS_LOWER_SABR.to(device)
+    hi = _BOUNDS_UPPER_SABR.to(device)
+    
+    starts = SABR_STARTS[:n_starts]
+    if len(starts) < n_starts:
+        np.random.seed(42)
+        extra_starts = []
+        for _ in range(n_starts - len(starts)):
+            alpha_s = np.exp(np.random.uniform(np.log(0.005), np.log(0.5)))
+            rho_s = np.random.uniform(-0.95, 0.3)
+            nu_s = np.exp(np.random.uniform(np.log(0.05), np.log(1.5)))
+            extra_starts.append([alpha_s, rho_s, nu_s])
+        starts = np.vstack([starts, np.array(extra_starts, dtype=np.float32)])
+        
+    best_loss = float("inf")
+    best_params = None
+    best_hist = []
+    best_loss_hist = []
+    best_n = 0
+    start_t = time.time()
+    
+    for init_idx, start in enumerate(starts):
+        alpha_0, rho_0, nu_0 = start
+        p = torch.tensor([
+            np.log(max(alpha_0, 0.005)),
+            rho_0,
+            np.log(max(nu_0, 0.05))
+        ], dtype=torch.float32, device=device)
+        
+        hist = []
+        loss_hist = []
+        n = 0
+        
+        for it in range(max_iter):
+            n = it + 1
+            
+            alpha = torch.exp(p[0])
+            rho = p[1]
+            nu = torch.exp(p[2])
+            
+            alpha = torch.clamp(alpha, lo[0], hi[0])
+            rho = torch.clamp(rho, lo[1], hi[1])
+            nu = torch.clamp(nu, lo[2], hi[2])
+            
+            p = torch.stack([torch.log(alpha), rho, torch.log(nu)])
+            
+            with torch.no_grad():
+                raw_params = torch.stack([alpha, rho, nu]).unsqueeze(0)
+                iv_pred = _fno_predict_real_iv(model, raw_params, spatial)
+                r_pred = (iv_pred - target_t).reshape(-1)
+                loss = float((r_pred**2).mean().item())
+                
+            hist.append(p.detach().cpu().numpy().copy())
+            loss_hist.append(loss)
+            
+            if verbose:
+                print(f"  Start {init_idx} [{it:2d}] loss={loss:.2e}  "
+                      f"θ=[{alpha:.4f},{rho:.4f},{nu:.4f}]")
+                      
+            if loss < 1e-6:
+                break
+                
+            def _res_vec(p_t):
+                a_v = torch.exp(p_t[0])
+                r_v = p_t[1]
+                n_v = torch.exp(p_t[2])
+                
+                a_v = torch.clamp(a_v, lo[0], hi[0])
+                r_v = torch.clamp(r_v, lo[1], hi[1])
+                n_v = torch.clamp(n_v, lo[2], hi[2])
+                
+                raw = torch.stack([a_v, r_v, n_v]).unsqueeze(0)
+                return _fno_predict_real_iv(model, raw, spatial).reshape(-1) - iv_obs
+                
+            J = jacfwd(_res_vec)(p.detach())
+            J_np = J.detach().cpu().numpy()
+            
+            with torch.no_grad():
+                r_np = _res_vec(p.detach()).detach().cpu().numpy()
+                
+            JtJ = J_np.T @ J_np
+            eps_lm = 1e-4 * np.diag(JtJ).mean() if JtJ.size > 0 else 1e-4
+            eps_lm = max(eps_lm, 1e-12)
+            
+            try:
+                delta = -np.linalg.solve(JtJ + eps_lm * np.eye(3), J_np.T @ r_np)
+            except np.linalg.LinAlgError:
+                delta = -np.linalg.pinv(JtJ + eps_lm * np.eye(3)) @ (J_np.T @ r_np)
+                
+            alpha_d = 0.5
+            for _ in range(8):
+                p_new_np = p.detach().cpu().numpy() + alpha_d * delta
+                a_new = np.clip(np.exp(p_new_np[0]), lo[0].item(), hi[0].item())
+                r_new = np.clip(p_new_np[1], lo[1].item(), hi[1].item())
+                n_new = np.clip(np.exp(p_new_np[2]), lo[2].item(), hi[2].item())
+                
+                with torch.no_grad():
+                    raw_new = torch.tensor([[a_new, r_new, n_new]], dtype=torch.float32, device=device)
+                    ivn = _fno_predict_real_iv(model, raw_new, spatial)
+                    loss_new = float(((ivn - target_t)**2).mean().item())
+                    
+                if loss_new < loss:
+                    p = torch.tensor([
+                        np.log(a_new),
+                        r_new,
+                        np.log(n_new)
+                    ], dtype=torch.float32, device=device)
+                    break
+                alpha_d *= 0.5
+                
+        alpha_f = float(np.clip(np.exp(p[0].item()), lo[0].item(), hi[0].item()))
+        rho_f = float(np.clip(p[1].item(), lo[1].item(), hi[1].item()))
+        nu_f = float(np.clip(np.exp(p[2].item()), lo[2].item(), hi[2].item()))
+        
+        final_mse = loss_hist[-1]
+        
+        if final_mse < best_loss:
+            best_loss = final_mse
+            best_params = [alpha_f, rho_f, nu_f]
+            best_hist = hist
+            best_loss_hist = loss_hist
+            best_n = n
+            
+    elapsed = time.time() - start_t
+    alpha_f, rho_f, nu_f = best_params
+    
+    with torch.no_grad():
+        raw_best = torch.tensor([[alpha_f, rho_f, nu_f]], dtype=torch.float32, device=device)
+        iv_fitted_t = _fno_predict_real_iv(model, raw_best, spatial)
+    iv_fitted = iv_fitted_t.cpu().numpy().reshape(iv_target.shape)
+    
+    rmse_bps = float(np.sqrt(best_loss) * 10000.0)
+    
+    return {
+        "alpha": alpha_f,
+        "rho": rho_f,
+        "nu": nu_f,
+        "final_mse": float(best_loss),
+        "rmse_bps": rmse_bps,
+        "converged": bool(rmse_bps < 100.0),
+        "n_iter": best_n,
+        "elapsed_ms": float(elapsed * 1000.0),
+        "theta_history": [np.array([np.clip(np.exp(x[0]), lo[0].item(), hi[0].item()),
+                                    np.clip(x[1], lo[1].item(), hi[1].item()),
+                                    np.clip(np.exp(x[2]), lo[2].item(), hi[2].item())]) for x in best_hist],
+        "loss_history": best_loss_hist,
+        "iv_fitted": iv_fitted,
+    }
+
+
+# ── SSVI bounds and starts ──────────────────────────────────────────────────
+_BOUNDS_LOWER_SSVI = torch.tensor([-0.9, 0.05, 0.1])
+_BOUNDS_UPPER_SSVI = torch.tensor([0.9, 4.0, 0.5])
+
+SSVI_STARTS = np.array([
+    [-0.4, 0.5, 0.3],
+    [-0.7, 0.8, 0.45],
+    [-0.1, 0.3, 0.15],
+    [-0.5, 1.2, 0.25],
+    [-0.3, 0.6, 0.35]
+], dtype=np.float32)
+
+def calibrate_ssvi(model, iv_target: np.ndarray,
+                   T_grid, K_grid,
+                   theta_atm_init: np.ndarray = None,
+                   max_iter: int = 20,
+                   n_starts: int = 5,
+                   verbose: bool = False) -> dict:
+    """
+    Calibrate SSVI to observed IV surface.
+    theta_atm_init: optional pre-extracted ATM total variance per maturity.
+                    If None, it is estimated from iv_target[:, K=0] * T_grid.
+    Optimizes: rho, log(eta), gamma
+    """
+    model.eval()
+    _load_normalizers("ssvi")
+    device = next(model.parameters()).device
+    spatial = _make_spatial_input(T_grid, K_grid, device)
+    target_t = torch.tensor(iv_target, dtype=torch.float32, device=device)
+    iv_obs = target_t.reshape(-1)
+    
+    if theta_atm_init is None:
+        T_arr = np.asarray(T_grid)
+        K_arr = np.asarray(K_grid)
+        atm_idx = int(np.argmin(np.abs(K_arr)))
+        iv_atm = iv_target[:, atm_idx]
+        theta_atm_init = (iv_atm ** 2) * T_arr
+        theta_atm_init = np.maximum.accumulate(theta_atm_init)
+        theta_atm_init = np.clip(theta_atm_init, 1e-6, None)
+        
+    theta_atm_t = torch.tensor(theta_atm_init, dtype=torch.float32, device=device)
+    
+    lo = _BOUNDS_LOWER_SSVI.to(device)
+    hi = _BOUNDS_UPPER_SSVI.to(device)
+    
+    starts = SSVI_STARTS[:n_starts]
+    if len(starts) < n_starts:
+        np.random.seed(42)
+        extra_starts = []
+        for _ in range(n_starts - len(starts)):
+            rho_s = np.random.uniform(-0.9, 0.9)
+            eta_s = np.exp(np.random.uniform(np.log(0.05), np.log(4.0)))
+            gamma_s = np.random.uniform(0.1, 0.5)
+            extra_starts.append([rho_s, eta_s, gamma_s])
+        starts = np.vstack([starts, np.array(extra_starts, dtype=np.float32)])
+        
+    best_loss = float("inf")
+    best_params = None
+    best_hist = []
+    best_loss_hist = []
+    best_n = 0
+    start_t = time.time()
+    
+    for init_idx, start in enumerate(starts):
+        rho_0, eta_0, gamma_0 = start
+        p = torch.tensor([
+            rho_0,
+            np.log(max(eta_0, 0.05)),
+            gamma_0
+        ], dtype=torch.float32, device=device)
+        
+        hist = []
+        loss_hist = []
+        n = 0
+        
+        for it in range(max_iter):
+            n = it + 1
+            
+            rho = p[0]
+            eta = torch.exp(p[1])
+            gamma = p[2]
+            
+            rho = torch.clamp(rho, lo[0], hi[0])
+            eta = torch.clamp(eta, lo[1], hi[1])
+            gamma = torch.clamp(gamma, lo[2], hi[2])
+            
+            p = torch.stack([rho, torch.log(eta), gamma])
+            
+            with torch.no_grad():
+                raw_params = torch.cat([theta_atm_t, torch.stack([rho, eta, gamma])])
+                iv_pred = _fno_predict_real_iv(model, raw_params.unsqueeze(0), spatial)
+                r_pred = (iv_pred - target_t).reshape(-1)
+                arb_viol = F.relu(eta * (1.0 + torch.abs(rho)) - 2.0)
+                loss = float((r_pred**2).mean().item() + 10.0 * (arb_viol**2).item())
+                
+            hist.append(p.detach().cpu().numpy().copy())
+            loss_hist.append(loss)
+            
+            if verbose:
+                print(f"  Start {init_idx} [{it:2d}] loss={loss:.2e}  "
+                      f"θ=[{rho:.4f},{eta:.4f},{gamma:.4f}]")
+                      
+            if loss < 1e-6:
+                break
+                
+            def _res_vec(p_t):
+                rh = p_t[0]
+                et = torch.exp(p_t[1])
+                gm = p_t[2]
+                
+                rh = torch.clamp(rh, lo[0], hi[0])
+                et = torch.clamp(et, lo[1], hi[1])
+                gm = torch.clamp(gm, lo[2], hi[2])
+                
+                raw = torch.cat([theta_atm_t, torch.stack([rh, et, gm])]).unsqueeze(0)
+                iv = _fno_predict_real_iv(model, raw, spatial).reshape(-1)
+                r = iv - iv_obs
+                
+                arb_v = F.relu(et * (1.0 + torch.abs(rh)) - 2.0)
+                return torch.cat([r, 10.0 * arb_v.unsqueeze(0)])
+                
+            J = jacfwd(_res_vec)(p.detach())
+            J_np = J.detach().cpu().numpy()
+            
+            with torch.no_grad():
+                r_np = _res_vec(p.detach()).detach().cpu().numpy()
+                
+            JtJ = J_np.T @ J_np
+            eps_lm = 1e-4 * np.diag(JtJ).mean() if JtJ.size > 0 else 1e-4
+            eps_lm = max(eps_lm, 1e-12)
+            
+            try:
+                delta = -np.linalg.solve(JtJ + eps_lm * np.eye(3), J_np.T @ r_np)
+            except np.linalg.LinAlgError:
+                delta = -np.linalg.pinv(JtJ + eps_lm * np.eye(3)) @ (J_np.T @ r_np)
+                
+            alpha_d = 0.5
+            for _ in range(8):
+                p_new_np = p.detach().cpu().numpy() + alpha_d * delta
+                rh_new = np.clip(p_new_np[0], lo[0].item(), hi[0].item())
+                et_new = np.clip(np.exp(p_new_np[1]), lo[1].item(), hi[1].item())
+                gm_new = np.clip(p_new_np[2], lo[2].item(), hi[2].item())
+                
+                with torch.no_grad():
+                    raw_new = torch.cat([theta_atm_t, torch.tensor([rh_new, et_new, gm_new], dtype=torch.float32, device=device)]).unsqueeze(0)
+                    ivn = _fno_predict_real_iv(model, raw_new, spatial)
+                    r_new = (ivn - target_t).reshape(-1)
+                    arb_viol_new = max(0.0, et_new * (1.0 + abs(rh_new)) - 2.0)
+                    loss_new = float((r_new**2).mean().item() + 10.0 * (arb_viol_new**2))
+                    
+                if loss_new < loss:
+                    p = torch.tensor([
+                        rh_new,
+                        np.log(et_new),
+                        gm_new
+                    ], dtype=torch.float32, device=device)
+                    break
+                alpha_d *= 0.5
+                
+        rho_f = float(np.clip(p[0].item(), lo[0].item(), hi[0].item()))
+        eta_f = float(np.clip(np.exp(p[1].item()), lo[1].item(), hi[1].item()))
+        gamma_f = float(np.clip(p[2].item(), lo[2].item(), hi[2].item()))
+        
+        final_mse = loss_hist[-1]
+        
+        if final_mse < best_loss:
+            best_loss = final_mse
+            best_params = [rho_f, eta_f, gamma_f]
+            best_hist = hist
+            best_loss_hist = loss_hist
+            best_n = n
+            
+    elapsed = time.time() - start_t
+    rho_f, eta_f, gamma_f = best_params
+    
+    with torch.no_grad():
+        raw_best = torch.cat([theta_atm_t, torch.tensor([rho_f, eta_f, gamma_f], dtype=torch.float32, device=device)]).unsqueeze(0)
+        iv_fitted_t = _fno_predict_real_iv(model, raw_best, spatial)
+    iv_fitted = iv_fitted_t.cpu().numpy().reshape(iv_target.shape)
+    
+    rmse_bps = float(np.sqrt(best_loss) * 10000.0)
+    
+    return {
+        "rho": rho_f,
+        "eta": eta_f,
+        "gamma": gamma_f,
+        "theta_atm": theta_atm_init,
+        "final_mse": float(best_loss),
+        "rmse_bps": rmse_bps,
+        "converged": bool(rmse_bps < 100.0),
+        "n_iter": best_n,
+        "elapsed_ms": float(elapsed * 1000.0),
+        "theta_history": [np.array([np.clip(x[0], lo[0].item(), hi[0].item()),
+                                    np.clip(np.exp(x[1]), lo[1].item(), hi[1].item()),
+                                    np.clip(x[2], lo[2].item(), hi[2].item())]) for x in best_hist],
+        "loss_history": best_loss_hist,
+        "iv_fitted": iv_fitted,
+    }
+
+
+# ── Rough Bergomi bounds and starts ─────────────────────────────────────────
+_BOUNDS_LOWER_RBERGOMI = torch.tensor([0.01, 0.04, 0.5, -0.95])
+_BOUNDS_UPPER_RBERGOMI = torch.tensor([0.20, 0.15, 4.0, 0.0])
+
+RBERGOMI_STARTS = np.array([
+    [0.04, 0.07, 1.5, -0.7],
+    [0.09, 0.10, 2.5, -0.6],
+    [0.15, 0.05, 3.2, -0.85],
+    [0.02, 0.12, 0.8, -0.5]
+], dtype=np.float32)
+
+def calibrate_rbergomi(model, iv_target: np.ndarray,
+                       T_grid, K_grid,
+                       max_iter: int = 20,
+                       n_starts: int = 3,
+                       verbose: bool = False) -> dict:
+    """
+    Calibrate Rough Bergomi to observed IV surface via Gauss-Newton on FNO surrogate.
+    Optimizes: log(v0), H, log(eta), rho
+    """
+    model.eval()
+    _load_normalizers("rbergomi")
+    device = next(model.parameters()).device
+    spatial = _make_spatial_input(T_grid, K_grid, device)
+    target_t = torch.tensor(iv_target, dtype=torch.float32, device=device)
+    iv_obs = target_t.reshape(-1)
+    
+    lo = _BOUNDS_LOWER_RBERGOMI.to(device)
+    hi = _BOUNDS_UPPER_RBERGOMI.to(device)
+    
+    starts = RBERGOMI_STARTS[:n_starts]
+    if len(starts) < n_starts:
+        np.random.seed(42)
+        extra_starts = []
+        for _ in range(n_starts - len(starts)):
+            v0_s = np.exp(np.random.uniform(np.log(0.01), np.log(0.20)))
+            H_s = np.random.uniform(0.04, 0.15)
+            eta_s = np.exp(np.random.uniform(np.log(0.5), np.log(4.0)))
+            rho_s = np.random.uniform(-0.95, 0.0)
+            extra_starts.append([v0_s, H_s, eta_s, rho_s])
+        starts = np.vstack([starts, np.array(extra_starts, dtype=np.float32)])
+        
+    best_loss = float("inf")
+    best_params = None
+    best_hist = []
+    best_loss_hist = []
+    best_n = 0
+    start_t = time.time()
+    
+    for init_idx, start in enumerate(starts):
+        v0_0, H_0, eta_0, rho_0 = start
+        p = torch.tensor([
+            np.log(max(v0_0, 0.01)),
+            H_0,
+            np.log(max(eta_0, 0.5)),
+            rho_0
+        ], dtype=torch.float32, device=device)
+        
+        hist = []
+        loss_hist = []
+        n = 0
+        
+        for it in range(max_iter):
+            n = it + 1
+            
+            v0 = torch.exp(p[0])
+            H = p[1]
+            eta = torch.exp(p[2])
+            rho = p[3]
+            
+            v0 = torch.clamp(v0, lo[0], hi[0])
+            H = torch.clamp(H, lo[1], hi[1])
+            eta = torch.clamp(eta, lo[2], hi[2])
+            rho = torch.clamp(rho, lo[3], hi[3])
+            
+            p = torch.stack([torch.log(v0), H, torch.log(eta), rho])
+            
+            with torch.no_grad():
+                raw_params = torch.stack([v0, H, eta, rho]).unsqueeze(0)
+                iv_pred = _fno_predict_real_iv(model, raw_params, spatial)
+                r_pred = (iv_pred - target_t).reshape(-1)
+                loss = float((r_pred**2).mean().item())
+                
+            hist.append(p.detach().cpu().numpy().copy())
+            loss_hist.append(loss)
+            
+            if verbose:
+                print(f"  Start {init_idx} [{it:2d}] loss={loss:.2e}  "
+                      f"θ=[{v0:.4f},{H:.4f},{eta:.4f},{rho:.4f}]")
+                      
+            if loss < 1e-6:
+                break
+                
+            def _res_vec(p_t):
+                v_v = torch.exp(p_t[0])
+                h_v = p_t[1]
+                e_v = torch.exp(p_t[2])
+                r_v = p_t[3]
+                
+                v_v = torch.clamp(v_v, lo[0], hi[0])
+                h_v = torch.clamp(h_v, lo[1], hi[1])
+                e_v = torch.clamp(e_v, lo[2], hi[2])
+                r_v = torch.clamp(r_v, lo[3], hi[3])
+                
+                raw = torch.stack([v_v, h_v, e_v, r_v]).unsqueeze(0)
+                return _fno_predict_real_iv(model, raw, spatial).reshape(-1) - iv_obs
+                
+            J = jacfwd(_res_vec)(p.detach())
+            J_np = J.detach().cpu().numpy()
+            
+            with torch.no_grad():
+                r_np = _res_vec(p.detach()).detach().cpu().numpy()
+                
+            JtJ = J_np.T @ J_np
+            eps_lm = 1e-4 * np.diag(JtJ).mean() if JtJ.size > 0 else 1e-4
+            eps_lm = max(eps_lm, 1e-12)
+            
+            try:
+                delta = -np.linalg.solve(JtJ + eps_lm * np.eye(4), J_np.T @ r_np)
+            except np.linalg.LinAlgError:
+                delta = -np.linalg.pinv(JtJ + eps_lm * np.eye(4)) @ (J_np.T @ r_np)
+                
+            alpha_d = 0.5
+            for _ in range(8):
+                p_new_np = p.detach().cpu().numpy() + alpha_d * delta
+                v_new = np.clip(np.exp(p_new_np[0]), lo[0].item(), hi[0].item())
+                h_new = np.clip(p_new_np[1], lo[1].item(), hi[1].item())
+                e_new = np.clip(np.exp(p_new_np[2]), lo[2].item(), hi[2].item())
+                r_new = np.clip(p_new_np[3], lo[3].item(), hi[3].item())
+                
+                with torch.no_grad():
+                    raw_new = torch.tensor([[v_new, h_new, e_new, r_new]], dtype=torch.float32, device=device)
+                    ivn = _fno_predict_real_iv(model, raw_new, spatial)
+                    loss_new = float(((ivn - target_t)**2).mean().item())
+                    
+                if loss_new < loss:
+                    p = torch.tensor([
+                        np.log(v_new),
+                        h_new,
+                        np.log(e_new),
+                        r_new
+                    ], dtype=torch.float32, device=device)
+                    break
+                alpha_d *= 0.5
+                
+        v0_f = float(np.clip(np.exp(p[0].item()), lo[0].item(), hi[0].item()))
+        H_f = float(np.clip(p[1].item(), lo[1].item(), hi[1].item()))
+        eta_f = float(np.clip(np.exp(p[2].item()), lo[2].item(), hi[2].item()))
+        rho_f = float(np.clip(p[3].item(), lo[3].item(), hi[3].item()))
+        
+        final_mse = loss_hist[-1]
+        
+        if final_mse < best_loss:
+            best_loss = final_mse
+            best_params = [v0_f, H_f, eta_f, rho_f]
+            best_hist = hist
+            best_loss_hist = loss_hist
+            best_n = n
+            
+    elapsed = time.time() - start_t
+    v0_f, H_f, eta_f, rho_f = best_params
+    
+    with torch.no_grad():
+        raw_best = torch.tensor([[v0_f, H_f, eta_f, rho_f]], dtype=torch.float32, device=device)
+        iv_fitted_t = _fno_predict_real_iv(model, raw_best, spatial)
+    iv_fitted = iv_fitted_t.cpu().numpy().reshape(iv_target.shape)
+    
+    rmse_bps = float(np.sqrt(best_loss) * 10000.0)
+    
+    return {
+        "v0": v0_f,
+        "H": H_f,
+        "eta": eta_f,
+        "rho": rho_f,
+        "final_mse": float(best_loss),
+        "rmse_bps": rmse_bps,
+        "converged": bool(rmse_bps < 100.0),
+        "n_iter": best_n,
+        "elapsed_ms": float(elapsed * 1000.0),
+        "theta_history": [np.array([np.clip(np.exp(x[0]), lo[0].item(), hi[0].item()),
+                                    np.clip(x[1], lo[1].item(), hi[1].item()),
+                                    np.clip(np.exp(x[2]), lo[2].item(), hi[2].item()),
+                                    np.clip(x[3], lo[3].item(), hi[3].item())]) for x in best_hist],
+        "loss_history": best_loss_hist,
+        "iv_fitted": iv_fitted,
+    }
+
+
+# ── Local Volatility helper ─────────────────────────────────────────────────
+
+def compute_local_vol_surface(svi_params, T_grid, K_grid, use_fno: bool = False, model = None):
+    """
+    Compute Local Volatility surface from SVI parameters.
+    
+    Parameters:
+    -----------
+    svi_params : np.ndarray or torch.Tensor
+        SVI parameters, shape (8, 5) or (40,) or (B, 8, 5) or (B, 40)
+    T_grid : np.ndarray
+        Maturity grid
+    K_grid : np.ndarray
+        Log-moneyness grid
+    use_fno : bool
+        If True, use the FNO surrogate model to predict the local vol surface.
+        If False, apply the Dupire formula analytically.
+    model : MirrorPaddedFNO2d, optional
+        Loaded FNO surrogate model for local volatility (required if use_fno=True)
+    """
+    if not use_fno:
+        is_numpy = isinstance(svi_params, np.ndarray)
+        if is_numpy:
+            if svi_params.ndim == 1:
+                svi_params = svi_params.reshape(8, 5)
+            elif svi_params.ndim == 2 and svi_params.shape[1] == 40:
+                svi_params = svi_params.reshape(-1, 8, 5)
+        else:
+            if svi_params.ndim == 1:
+                svi_params = svi_params.reshape(8, 5)
+            elif svi_params.ndim == 2 and svi_params.shape[1] == 40:
+                svi_params = svi_params.reshape(-1, 8, 5)
+        
+        from pricing.local_vol import svi_to_lv_surface
+        return svi_to_lv_surface(T_grid, K_grid, svi_params)
+    
+    else:
+        assert model is not None, "FNO model must be provided when use_fno=True"
+        device = next(model.parameters()).device
+        
+        if isinstance(svi_params, np.ndarray):
+            svi_params_t = torch.tensor(svi_params, dtype=torch.float32, device=device)
+        else:
+            svi_params_t = svi_params.to(device)
+            
+        is_batched = (svi_params_t.ndim == 3) or (svi_params_t.ndim == 2 and svi_params_t.shape[0] > 1 and svi_params_t.shape[1] != 40)
+        if svi_params_t.ndim == 3:
+            svi_params_t = svi_params_t.reshape(svi_params_t.shape[0], -1)
+        elif svi_params_t.ndim == 2 and svi_params_t.shape[1] == 5:
+            svi_params_t = svi_params_t.reshape(-1).unsqueeze(0)
+        elif svi_params_t.ndim == 1:
+            svi_params_t = svi_params_t.unsqueeze(0)
+            
+        _load_normalizers("localvol")
+        spatial = _make_spatial_input(T_grid, K_grid, device)
+        
+        with torch.no_grad():
+            lv_surf_t = _fno_predict_real_iv(model, svi_params_t, spatial)
+            
+        if not is_batched:
+            lv_surf_t = lv_surf_t.squeeze(0)
+            
+        if isinstance(svi_params, np.ndarray):
+            return lv_surf_t.cpu().numpy()
+        return lv_surf_t
+
