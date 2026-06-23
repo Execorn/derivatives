@@ -60,7 +60,7 @@ class BarrierHedgingEnv:
         Features: [log(S_k / K), log(S_k / B), T - t_k, active_mask, prev_delta]
         """
         S_k = self.H[:, k, 0:1]  # (N_paths, 1)
-        log_moneyness = torch.log(S_k / self.strike)
+        log_moneyness = torch.log(torch.clamp(S_k / self.strike, min=1e-5))
         
         # log-distance to barrier. Clamp to prevent log(negative) if spot breaches barrier.
         log_barrier_dist = torch.log(torch.clamp(S_k / self.barrier, min=1e-5))
@@ -109,6 +109,10 @@ class BarrierHedgingEnv:
             
             # 2. Get hedge action
             delta, lstm_state = policy(state, lstm_state)  # delta shape: (N_paths, d)
+            
+            # Force delta to zero if option has knocked out
+            delta = delta * active_mask
+            
             deltas.append(delta)
             
             # 3. Calculate cost

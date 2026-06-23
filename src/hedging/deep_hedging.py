@@ -106,7 +106,7 @@ class DeepHedgingEnv:
         State features: [log(S_k / K), T - t_k, vol_proxy (local standard deviation), prev_delta]
         """
         S_k = self.H[:, k, 0:1]  # (N_paths, 1)
-        log_moneyness = torch.log(S_k / self.strike)
+        log_moneyness = torch.log(torch.clamp(S_k / self.strike, min=1e-5))
         time_to_expiry = self.expiry - self.t_grid[k]
         time_to_expiry_tensor = torch.full_like(S_k, time_to_expiry)
         
@@ -117,13 +117,14 @@ class DeepHedgingEnv:
             vol_proxy = torch.full_like(S_k, 0.2)
         else:
             past_S = self.H[:, k-5:k+1, 0]  # (N_paths, 6)
-            log_returns = torch.log(past_S[:, 1:] / past_S[:, :-1])  # (N_paths, 5)
+            log_returns = torch.log(torch.clamp(past_S[:, 1:] / torch.clamp(past_S[:, :-1], min=1e-5), min=1e-5))  # (N_paths, 5)
             vol_proxy = torch.std(log_returns, dim=-1, keepdim=True) * np.sqrt(252)
             
         # Concatenate features: log_moneyness, time_to_expiry, vol_proxy, and all dimensions of prev_delta
         # shape: (N_paths, 3 + d)
         state = torch.cat([log_moneyness, time_to_expiry_tensor, vol_proxy, prev_delta], dim=-1)
         return state
+
 
     def simulate_hedging_episode(self, policy: nn.Module) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -278,15 +279,14 @@ def estimate_gpd_tail_index_pwm(returns, threshold_quantile=0.95):
     """
     batch_size, seq_len = returns.shape
     
-    # Compute threshold for each path
-    q = torch.quantile(returns, threshold_quantile, dim=-1, keepdim=True)
-    mask = returns > q
-    
     # Calculate exact number of exceedances per path
     n_exceed = int(round((1.0 - threshold_quantile) * seq_len))
     
-    # Extract exceedances. To maintain differentiability and batch shape, we
-    # sort the return deviations and take the top n_exceed.
+    # Guard 1: Handle case where no exceedances exist to avoid tensor shape mismatch and NaN
+    if n_exceed <= 1:
+        return torch.zeros(batch_size, device=returns.device, dtype=returns.dtype)
+        
+    q = torch.quantile(returns, threshold_quantile, dim=-1, keepdim=True)
     deviations = returns - q
     sorted_dev, _ = torch.sort(deviations, dim=-1, descending=False)
     y = sorted_dev[:, -n_exceed:]  # shape: (batch_size, n_exceed)
@@ -302,11 +302,16 @@ def estimate_gpd_tail_index_pwm(returns, threshold_quantile=0.95):
     a1 = torch.sum(weight * y, dim=-1) / n_exceed  # shape: (batch_size,)
     
     # Shape parameter xi
+    # Guard 2: Prevent near-zero division by clamping denominator absolute value
     denominator = a0 - 2.0 * a1
-    denominator = torch.where(denominator == 0.0, torch.tensor(1e-8, device=returns.device), denominator)
+    denom_sign = torch.sign(denominator)
+    denom_sign = torch.where(denom_sign == 0.0, torch.tensor(1.0, device=returns.device), denom_sign)
+    denominator = denom_sign * torch.clamp(torch.abs(denominator), min=1e-8)
+    
     xi = 2.0 - a0 / denominator
     
     return xi
+
 
 
 def compute_autocorrelation(x, lag):
