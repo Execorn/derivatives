@@ -29,12 +29,359 @@ from pricing.sabr import sabr_iv_surface, ssvi_iv_surface
 from pricing.local_vol import check_arbitrage_free
 
 # ─── Grid ──────────────────────────────────────────────────────────────────
+
+import requests
+
+def render_neural_sde_panel():
+    st.header("🔮 Neural SDE Calibration")
+    st.markdown("""
+    This panel calibrates a **Non-parametric Neural SDE** model to an implied volatility surface.
+    The drift $f_\\theta(t, V_t)$ and diffusion $g_\\theta(t, V_t)$ are parameterized as neural networks 
+    and calibrated using the SDE Adjoint method.
+    """)
+    
+    # Check if we have an active target IV surface in session state, if not, generate a mock Heston surface
+    if "target_iv" in st.session_state:
+        target_iv = st.session_state["target_iv"]
+        st.info(f"Using active target surface from **{st.session_state.get('active_model')}**")
+    else:
+        st.warning("No target surface found. Generating a default Classic Heston target surface...")
+        # Generate default surface
+        p_dict = {'kappa': 2.0, 'theta': 0.05, 'sigma': 0.3, 'rho': -0.6, 'v0': 0.05}
+        target_iv = heston_iv_surface(p_dict, MATURITIES, STRIKES)
+        # Fill NaNs
+        for t_idx in range(len(MATURITIES)):
+            slice_t = target_iv[t_idx, :]
+            valid_vals = slice_t[np.isfinite(slice_t)]
+            med = np.median(valid_vals) if len(valid_vals) > 0 else 0.3
+            slice_t[~np.isfinite(slice_t)] = med
+            target_iv[t_idx, :] = slice_t
+        st.session_state["target_iv"] = target_iv
+        st.session_state["active_model"] = "Default Heston"
+        st.session_state["true_params"] = np.array([2.0, 0.05, 0.3, -0.6, 0.05])
+    
+    # Inputs
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        S0 = st.number_input("S₀ — Initial Stock Price", value=100.0, step=5.0)
+        epochs = st.slider("Training Epochs", min_value=5, max_value=100, value=30, step=5)
+    with col2:
+        r = st.number_input("r — Risk-free Rate", value=0.05, step=0.01)
+        N_paths = st.slider("Paths for Monte Carlo", min_value=128, max_value=5000, value=1024, step=128)
+    with col3:
+        q = st.number_input("q — Dividend Yield", value=0.015, step=0.005)
+        
+    api_url = st.text_input("FastAPI Server URL", value="http://localhost:8000")
+    
+    if st.button("Run Neural SDE Calibration", use_container_width=True):
+        payload = {
+            "market_iv": target_iv.tolist(),
+            "S0": S0,
+            "r": r,
+            "q": q,
+            "epochs": epochs,
+            "N_paths": N_paths
+        }
+        
+        with st.spinner("Calibrating Neural SDE via Adjoint Method on FastAPI server..."):
+            try:
+                response = requests.post(f"{api_url}/calibrate_neural_sde", json=payload, timeout=600)
+                if response.status_code == 200:
+                    res_data = response.json()
+                    st.success(f"Calibration completed in **{res_data['elapsed_ms']:.1f} ms**!")
+                    st.session_state["sde_results"] = res_data
+                else:
+                    st.error(f"Calibration failed: {response.text}")
+            except Exception as e:
+                st.error(f"Error calling API at {api_url}: {e}")
+                
+    if "sde_results" in st.session_state:
+        res = st.session_state["sde_results"]
+        
+        # Display parameters
+        st.subheader("Calibrated Parameters")
+        p_df = pd.DataFrame({
+            "Parameter": ["Initial Variance (v0)", "Correlation (rho)", "Final Option Price RMSE"],
+            "Value": [f"{res['v0']:.6f}", f"{res['rho']:.6f}", f"${res['final_rmse']:.6f}"]
+        })
+        st.dataframe(p_df, use_container_width=True)
+        
+        # Convergence and surface comparison
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### Loss Convergence History")
+            fig_loss = go.Figure()
+            fig_loss.add_trace(go.Scatter(x=np.arange(1, len(res["loss_history"]) + 1), y=res["loss_history"],
+                                          mode="lines+markers", line=dict(color="#00d4ff", width=2)))
+            fig_loss.update_layout(
+                xaxis_title="Epoch", yaxis_title="Loss", yaxis_type="log",
+                height=350, margin=dict(l=0, r=0, b=40, t=40)
+            )
+            st.plotly_chart(fig_loss, use_container_width=True)
+            
+        with c2:
+            st.markdown("### Calibrated SDE Volatility Smile")
+            # We can select a maturity slice to plot
+            mat_idx = st.selectbox("Select Maturity to Compare", range(8), format_func=lambda idx: f"T = {MATURITIES[idx]:.2f}")
+            
+            # Target IV for this maturity
+            target_slice = target_iv[mat_idx, :]
+            
+            fig_smile = go.Figure()
+            fig_smile.add_trace(go.Scatter(x=STRIKES, y=target_slice, mode="lines+markers", name="Target (Market)", line=dict(color="#00d4ff")))
+            
+            if "fitted_iv" in res and res["fitted_iv"] is not None:
+                fitted_slice = np.array(res["fitted_iv"])[mat_idx, :]
+                fig_smile.add_trace(go.Scatter(x=STRIKES, y=fitted_slice, mode="lines+markers", name="Fitted Neural SDE", line=dict(color="#ff3366", dash="dash")))
+                
+            fig_smile.update_layout(
+                xaxis_title="Log-Moneyness", yaxis_title="Implied Volatility",
+                height=350, margin=dict(l=0, r=0, b=40, t=40)
+            )
+            st.plotly_chart(fig_smile, use_container_width=True)
+
+        if "fitted_iv" in res and res["fitted_iv"] is not None:
+            # 3D surface comparison
+            st.subheader("3D Surface: Target vs Fitted Neural SDE")
+            K_grid, T_grid = np.meshgrid(STRIKES, MATURITIES)
+            fig_3d = go.Figure()
+            fig_3d.add_trace(go.Surface(x=K_grid, y=T_grid, z=target_iv,
+                                     colorscale="Blues", opacity=0.7, name="Target", showscale=False))
+            fig_3d.add_trace(go.Surface(x=K_grid, y=T_grid, z=np.array(res["fitted_iv"]),
+                                     colorscale="Reds", opacity=0.7, name="Neural SDE", showscale=False))
+            fig_3d.update_layout(
+                scene=dict(xaxis_title="Log-Moneyness", yaxis_title="Maturity", zaxis_title="IV"),
+                margin=dict(l=0, r=0, b=0, t=40), height=550
+            )
+            st.plotly_chart(fig_3d, use_container_width=True)
+
+
+def render_signature_vol_panel():
+    st.header("🖋️ Signature Volatility Smile Forecasting")
+    st.markdown("""
+    This panel simulates pathwise stock and variance dynamics under the **Signature Volatility** model,
+    forecasting option smiles from path signatures of time-extended Brownian motion (up to depth 4).
+    """)
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        v0 = st.slider("v₀ — Initial Variance", 0.01, 0.15, 0.04, step=0.01)
+        rho = st.slider("ρ — Correlation", -1.0, 0.0, -0.5, step=0.05)
+    with col2:
+        T = st.slider("T — Maturity (Years)", 0.05, 2.0, 0.25, step=0.05)
+        S0 = st.number_input("S₀ — Stock Price", value=100.0, step=5.0)
+    with col3:
+        r = st.number_input("r — Interest Rate", value=0.0, step=0.01)
+        N_paths = st.slider("Simulation Path Count", min_value=500, max_value=20000, value=4096, step=500)
+        
+    st.subheader("Signature Volatility Coefficients (ell)")
+    st.markdown("We parameterize a subset of the 30 coefficients for intuitive control:")
+    
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        ell_0 = st.slider("Level 1: Time coefficient (l₁)", -0.05, 0.05, 0.01, step=0.001)
+        ell_1 = st.slider("Level 1: Brownian motion coefficient (l₂)", -0.1, 0.1, -0.02, step=0.005)
+    with cc2:
+        ell_7 = st.slider("Level 3: Cross coefficient (l₈)", -0.05, 0.05, 0.0, step=0.001)
+        ell_8 = st.slider("Level 3: Volatility clustering coeff (l₉)", -0.05, 0.05, 0.0, step=0.001)
+        
+    # Construct the full 30-element ell vector
+    ell = [0.0] * 30
+    ell[0] = ell_0
+    ell[1] = ell_1
+    ell[7] = ell_7
+    ell[8] = ell_8
+    
+    api_url = st.text_input("FastAPI Server URL", value="http://localhost:8000", key="sig_url")
+    
+    if st.button("Generate Volatility Smile & Paths", use_container_width=True):
+        # Grid of strikes around S0
+        strikes = [float(x) for x in np.linspace(0.8 * S0, 1.2 * S0, 11)]
+        
+        payload = {
+            "v0": v0,
+            "ell": ell,
+            "rho": rho,
+            "T": T,
+            "S0": S0,
+            "r": r,
+            "q": 0.0,
+            "N_paths": N_paths,
+            "strikes": strikes
+        }
+        
+        with st.spinner("Simulating signature paths and calculating IV smile..."):
+            try:
+                response = requests.post(f"{api_url}/predict/signature_vol", json=payload, timeout=300)
+                if response.status_code == 200:
+                    st.session_state["sig_results"] = response.json()
+                    st.success("Simulation and option pricing completed successfully.")
+                else:
+                    st.error(f"API call failed: {response.text}")
+            except Exception as e:
+                st.error(f"Error calling API at {api_url}: {e}")
+                
+    if "sig_results" in st.session_state:
+        res = st.session_state["sig_results"]
+        
+        # Display 2D Smile Chart
+        st.subheader("Forecasted Option Smile")
+        fig_smile = go.Figure()
+        fig_smile.add_trace(go.Scatter(x=res["strikes"], y=res["implied_vols"], mode="lines+markers",
+                                      line=dict(color="#00d4ff", width=2), name="Forecasted Smile"))
+        fig_smile.update_layout(
+            xaxis_title="Strike Price", yaxis_title="Implied Volatility",
+            height=350, margin=dict(l=0, r=0, b=40, t=40)
+        )
+        st.plotly_chart(fig_smile, use_container_width=True)
+        
+        # Plot 3D Paths if returned
+        if "paths_S" in res and res["paths_S"] is not None:
+            st.subheader("Sample Simulated 3D Paths")
+            st.markdown("Plots joint trajectories of **Stock Price** (X), **Volatility** (Z) and **Time** (Y).")
+            
+            fig_3d = go.Figure()
+            steps = len(res["paths_S"][0])
+            t_grid = np.linspace(0.0, T, steps)
+            
+            for path_idx in range(len(res["paths_S"])):
+                S_path = res["paths_S"][path_idx]
+                vol_path = np.sqrt(res["paths_vol"][path_idx])
+                
+                fig_3d.add_trace(go.Scatter3d(
+                    x=S_path,
+                    y=t_grid,
+                    z=vol_path,
+                    mode="lines",
+                    line=dict(width=3),
+                    name=f"Path {path_idx + 1}"
+                ))
+                
+            fig_3d.update_layout(
+                scene=dict(
+                    xaxis_title="Stock Price",
+                    yaxis_title="Time (t)",
+                    zaxis_title="Volatility (sqrt(V))"
+                ),
+                margin=dict(l=0, r=0, b=0, t=40), height=550
+            )
+            st.plotly_chart(fig_3d, use_container_width=True)
+
+
+def render_deep_hedging_panel():
+    st.header("🛡️ Deep Hedging Policy Simulation")
+    st.markdown("""
+    This panel evaluates **recurrent LSTM-based optimal deep hedging policies** under proportional transaction costs.
+    It simulates asset paths and applies the pre-trained neural policy to compute dynamic rebalancing delta decisions.
+    """)
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        option_type = st.selectbox("Option Style", ["european", "barrier", "minimax"])
+        S0 = st.number_input("S₀ — Initial Spot Price", value=100.0, step=5.0)
+        strike = st.number_input("Strike Price (K)", value=100.0, step=5.0)
+    with col2:
+        expiry = st.slider("Maturity (T)", 0.05, 0.5, 0.1, step=0.01)
+        sigma = st.slider("Asset Volatility (σ)", 0.05, 0.6, 0.2, step=0.01)
+        mu = st.number_input("Asset Drift (μ)", value=0.0, step=0.05)
+    with col3:
+        steps = st.slider("Rebalancing Steps", min_value=5, max_value=100, value=30, step=5)
+        N_paths = st.slider("Path Count", min_value=5, max_value=500, value=100, step=5)
+        barrier = st.number_input("Barrier level (B)", value=85.0, step=1.0) if option_type == "barrier" else 85.0
+        
+    st.subheader("Proportional Transaction Costs")
+    cost_stock = st.slider("Stock Transaction Cost Coefficient (c_stock)", 0.0, 0.005, 0.0001, step=0.0001, format="%.5f")
+    cost_vol = st.slider("Vol Instrument Transaction Cost Coefficient (c_vol)", 0.0, 0.01, 0.0005, step=0.0001, format="%.5f")
+    
+    api_url = st.text_input("FastAPI Server URL", value="http://localhost:8000", key="hedge_url")
+    
+    if st.button("Run Deep Hedging Policy Simulation", use_container_width=True):
+        payload = {
+            "option_type": option_type,
+            "S0": S0,
+            "strike": strike,
+            "barrier": barrier,
+            "expiry": expiry,
+            "mu": mu,
+            "sigma": sigma,
+            "steps": steps,
+            "N_paths": N_paths,
+            "cost_stock": cost_stock,
+            "cost_vol": cost_vol
+        }
+        
+        with st.spinner("Simulating paths and optimal delta rebalancing..."):
+            try:
+                response = requests.post(f"{api_url}/hedge/simulate", json=payload, timeout=300)
+                if response.status_code == 200:
+                    st.session_state["hedge_results"] = response.json()
+                    st.success("Hedging simulation completed.")
+                else:
+                    st.error(f"API call failed: {response.text}")
+            except Exception as e:
+                st.error(f"Error calling API at {api_url}: {e}")
+                
+    if "hedge_results" in st.session_state:
+        res = st.session_state["hedge_results"]
+        
+        # Display summary metrics
+        st.subheader("Performance Metrics")
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("P&L Standard Deviation (Hedged)", f"{res['std_pnl']:.4f}")
+        with m2:
+            avg_cost = np.mean(res["costs"])
+            st.metric("Average Transaction Cost", f"${avg_cost:.4f}")
+        with m3:
+            st.metric("Total Entropic/Quadratic Loss", f"{res['final_loss']:.4f}")
+            
+        # P&L Distribution overlay vs unhedged baseline
+        st.subheader("Hedged P&L Distribution")
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(x=res["pnl"], name="Hedged P&L", marker_color="#ff3366", opacity=0.75))
+        unhedged_pnl = [-p for p in res["payoff"]]
+        fig_hist.add_trace(go.Histogram(x=unhedged_pnl, name="Unhedged Baseline", marker_color="#00d4ff", opacity=0.6))
+        
+        fig_hist.update_layout(
+            barmode="overlay",
+            xaxis_title="Final P&L",
+            yaxis_title="Count",
+            height=350,
+            margin=dict(l=0, r=0, b=40, t=40)
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+        
+        # Hedging corridors
+        st.subheader("Optimal Delta Hedging Corridors")
+        st.markdown("Scatter plot of LSTM-generated stock hedge ratio (Delta) vs asset spot price across all steps.")
+        
+        fig_corr = go.Figure()
+        spots_flat = []
+        deltas_flat = []
+        for path_idx in range(len(res["paths_S"])):
+            spots_flat.extend(res["paths_S"][path_idx][:-1])
+            deltas_flat.extend(res["deltas_stock"][path_idx])
+            
+        fig_corr.add_trace(go.Scatter(x=spots_flat, y=deltas_flat, mode="markers",
+                                      marker=dict(size=4, color="#00ffcc", opacity=0.5),
+                                      name="Stock Delta"))
+        
+        fig_corr.update_layout(
+            xaxis_title="Underlying Asset Spot Price",
+            yaxis_title="Hedging Ratio (Delta)",
+            height=400,
+            margin=dict(l=0, r=0, b=40, t=40)
+        )
+        st.plotly_chart(fig_corr, use_container_width=True)
 STRIKES    = np.linspace(-0.5, 0.5, 11)
 MATURITIES = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 
 @st.cache_resource
 def load_model(model_name: str):
     """Load the appropriate FNO surrogate and load corresponding normalizers."""
+    if model_name in ("Neural SDE", "Signature Volatility", "Deep Hedging"):
+        return None
+        
     if model_name == "Rough Heston":
         model = MirrorPaddedFNO2d(param_dim=6)
         path = "artifacts/weights/fno_v2_final_prod.pth"
@@ -74,7 +421,7 @@ st.title("⚡ Deep Volatility Model Zoo Calibration")
 # ─── Sidebar Model Selector ─────────────────────────────────────────────────
 model_name = st.sidebar.selectbox(
     "Volatility Model Type",
-    ["Rough Heston", "Classic Heston", "SABR", "SSVI", "Local Volatility", "Rough Bergomi"],
+    ["Rough Heston", "Classic Heston", "SABR", "SSVI", "Local Volatility", "Rough Bergomi", "Neural SDE", "Signature Volatility", "Deep Hedging"],
     index=0,
     key="model_selector"
 )
@@ -83,7 +430,28 @@ model_name = st.sidebar.selectbox(
 model = load_model(model_name)
 device = torch.device("cpu")
 
-st.caption(f"FiLM-FNO Surrogate for {model_name} • Optimized Gauss-Newton autograd Jacobians")
+if model is not None:
+    st.caption(f"FiLM-FNO Surrogate for {model_name} • Optimized Gauss-Newton autograd Jacobians")
+else:
+    st.caption(f"Interactive Panel for {model_name}")
+
+if model_name in ("Neural SDE", "Signature Volatility", "Deep Hedging"):
+    if "active_model" in st.session_state and st.session_state["active_model"] != model_name:
+        st.session_state.pop("target_iv", None)
+        st.session_state.pop("true_params", None)
+        st.session_state.pop("calib_results", None)
+        st.session_state.pop("sde_results", None)
+        st.session_state.pop("sig_results", None)
+        st.session_state.pop("hedge_results", None)
+    st.session_state["active_model"] = model_name
+
+    if model_name == "Neural SDE":
+        render_neural_sde_panel()
+    elif model_name == "Signature Volatility":
+        render_signature_vol_panel()
+    elif model_name == "Deep Hedging":
+        render_deep_hedging_panel()
+    st.stop()
 
 # ─── Sidebar Parameters ─────────────────────────────────────────────────────
 st.sidebar.header(f"True {model_name} Parameters")
@@ -151,65 +519,66 @@ elif model_name == "Rough Bergomi":
     rho = st.sidebar.slider("ρ — Correlation", -0.95, 0.0, -0.7, step=0.01)
     true_params = np.array([v0, H, eta, rho])
 
-noise_level = st.sidebar.slider(
-    "Market Noise Level (Stress Test)", 0.0, 0.10, 0.01, step=0.01, key="noise")
+if model_name not in ("Neural SDE", "Signature Volatility", "Deep Hedging"):
+    noise_level = st.sidebar.slider(
+        "Market Noise Level (Stress Test)", 0.0, 0.10, 0.01, step=0.01, key="noise")
 
-# ─── Target Surface Generation ──────────────────────────────────────────────
-if st.sidebar.button("Generate Target Surface", use_container_width=True):
-    with torch.no_grad():
-        if model_name == "Rough Heston":
-            spatial = _make_spatial_input(MATURITIES, STRIKES, device=device)
-            params_t = torch.tensor(true_params, dtype=torch.float32).unsqueeze(0)
-            target_iv = _fno_predict_real_iv(model, params_t, spatial).numpy()
-        elif model_name == "Classic Heston":
-            p_dict = {
-                'kappa': true_params[0], 'theta': true_params[1],
-                'sigma': true_params[2], 'rho': true_params[3], 'v0': true_params[4]
-            }
-            target_iv = heston_iv_surface(p_dict, MATURITIES, STRIKES)
-            # Fill NaNs
-            for t_idx in range(len(MATURITIES)):
-                slice_t = target_iv[t_idx, :]
-                valid_vals = slice_t[np.isfinite(slice_t)]
-                med = np.median(valid_vals) if len(valid_vals) > 0 else 0.3
-                slice_t[~np.isfinite(slice_t)] = med
-                target_iv[t_idx, :] = slice_t
-        elif model_name == "SABR":
-            target_iv = sabr_iv_surface(
-                F=1.0, T_grid=MATURITIES, k_grid=STRIKES,
-                alpha=true_params[0], beta=1.0, rho=true_params[1], nu=true_params[2],
-                iv_type="lognormal"
-            )
-        elif model_name == "SSVI":
-            target_iv = ssvi_iv_surface(
-                T_grid=MATURITIES, k_grid=STRIKES,
-                theta_grid=true_params[:8], rho=true_params[8], eta=true_params[9], gamma=true_params[10]
-            )
-        elif model_name == "Local Volatility":
-            target_iv = compute_local_vol_surface(true_params, MATURITIES, STRIKES, use_fno=False)
-        elif model_name == "Rough Bergomi":
-            spatial = _make_spatial_input(MATURITIES, STRIKES, device=device)
-            params_t = torch.tensor(true_params, dtype=torch.float32).unsqueeze(0)
-            target_iv = _fno_predict_real_iv(model, params_t, spatial).numpy()
+    # ─── Target Surface Generation ──────────────────────────────────────────────
+    if st.sidebar.button("Generate Target Surface", use_container_width=True):
+        with torch.no_grad():
+            if model_name == "Rough Heston":
+                spatial = _make_spatial_input(MATURITIES, STRIKES, device=device)
+                params_t = torch.tensor(true_params, dtype=torch.float32).unsqueeze(0)
+                target_iv = _fno_predict_real_iv(model, params_t, spatial).numpy()
+            elif model_name == "Classic Heston":
+                p_dict = {
+                    'kappa': true_params[0], 'theta': true_params[1],
+                    'sigma': true_params[2], 'rho': true_params[3], 'v0': true_params[4]
+                }
+                target_iv = heston_iv_surface(p_dict, MATURITIES, STRIKES)
+                # Fill NaNs
+                for t_idx in range(len(MATURITIES)):
+                    slice_t = target_iv[t_idx, :]
+                    valid_vals = slice_t[np.isfinite(slice_t)]
+                    med = np.median(valid_vals) if len(valid_vals) > 0 else 0.3
+                    slice_t[~np.isfinite(slice_t)] = med
+                    target_iv[t_idx, :] = slice_t
+            elif model_name == "SABR":
+                target_iv = sabr_iv_surface(
+                    F=1.0, T_grid=MATURITIES, k_grid=STRIKES,
+                    alpha=true_params[0], beta=1.0, rho=true_params[1], nu=true_params[2],
+                    iv_type="lognormal"
+                )
+            elif model_name == "SSVI":
+                target_iv = ssvi_iv_surface(
+                    T_grid=MATURITIES, k_grid=STRIKES,
+                    theta_grid=true_params[:8], rho=true_params[8], eta=true_params[9], gamma=true_params[10]
+                )
+            elif model_name == "Local Volatility":
+                target_iv = compute_local_vol_surface(true_params, MATURITIES, STRIKES, use_fno=False)
+            elif model_name == "Rough Bergomi":
+                spatial = _make_spatial_input(MATURITIES, STRIKES, device=device)
+                params_t = torch.tensor(true_params, dtype=torch.float32).unsqueeze(0)
+                target_iv = _fno_predict_real_iv(model, params_t, spatial).numpy()
 
-    st.session_state["target_iv"] = target_iv
-    st.session_state["true_params"] = true_params.copy()
-    st.session_state["active_model"] = model_name
-    st.session_state.pop("calib_results", None)
-    st.success(f"{model_name} target surface generated.")
+        st.session_state["target_iv"] = target_iv
+        st.session_state["true_params"] = true_params.copy()
+        st.session_state["active_model"] = model_name
+        st.session_state.pop("calib_results", None)
+        st.success(f"{model_name} target surface generated.")
 
-# Check if model selection has changed
-if "active_model" in st.session_state and st.session_state["active_model"] != model_name:
-    st.session_state.pop("target_iv", None)
-    st.session_state.pop("true_params", None)
-    st.session_state.pop("calib_results", None)
+    # Check if model selection has changed
+    if "active_model" in st.session_state and st.session_state["active_model"] != model_name:
+        st.session_state.pop("target_iv", None)
+        st.session_state.pop("true_params", None)
+        st.session_state.pop("calib_results", None)
 
-if "target_iv" not in st.session_state:
-    st.info("👈 Set parameters in the sidebar and click **Generate Target Surface** to begin.")
-    st.stop()
+    if "target_iv" not in st.session_state:
+        st.info("👈 Set parameters in the sidebar and click **Generate Target Surface** to begin.")
+        st.stop()
 
-target_iv = st.session_state["target_iv"]
-stored_true = st.session_state["true_params"]
+    target_iv = st.session_state["target_iv"]
+    stored_true = st.session_state["true_params"]
 
 # ─── Calibration Section ────────────────────────────────────────────────────
 st.subheader("Calibration")

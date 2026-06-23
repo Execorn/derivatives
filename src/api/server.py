@@ -451,3 +451,374 @@ async def calibrate_route(model_name: str, req: CalibrateRequest) -> CalibrateRe
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ── Phase 5-6 REST Endpoints ──────────────────────────────────────────────────
+
+class CalibrateNeuralSDERequest(BaseModel):
+    market_iv: List[List[float]] = Field(..., description="8x11 market implied volatility surface in decimal")
+    S0: float = Field(default=100.0, gt=0, description="Initial stock price")
+    r: float = Field(default=0.05, ge=0, description="Risk-free interest rate")
+    q: float = Field(default=0.015, ge=0, description="Dividend yield")
+    epochs: int = Field(default=30, ge=1, le=100, description="Number of training epochs")
+    N_paths: int = Field(default=1024, ge=128, le=10000, description="Number of simulated paths")
+
+
+class CalibrateNeuralSDEResponse(BaseModel):
+    v0: float
+    rho: float
+    final_rmse: float
+    loss_history: List[float]
+    elapsed_ms: float
+    fitted_iv: Optional[List[List[float]]] = None
+
+
+class PredictSignatureVolRequest(BaseModel):
+    v0: float = Field(default=0.04, gt=0, description="Initial variance")
+    ell: List[float] = Field(..., description="Signature volatility coefficients (30 elements)")
+    rho: float = Field(default=-0.5, le=0, ge=-1, description="Correlation parameter")
+    T: float = Field(default=0.25, gt=0, description="Option maturity in years")
+    S0: float = Field(default=100.0, gt=0, description="Initial stock price")
+    r: float = Field(default=0.0, ge=0, description="Risk-free rate")
+    q: float = Field(default=0.0, ge=0, description="Dividend yield")
+    N_paths: int = Field(default=4096, ge=100, le=50000, description="Path simulation count")
+    strikes: List[float] = Field(default_factory=lambda: [80.0, 85.0, 90.0, 95.0, 100.0, 105.0, 110.0, 115.0, 120.0])
+
+
+class PredictSignatureVolResponse(BaseModel):
+    strikes: List[float]
+    implied_vols: List[float]
+    option_prices: List[float]
+    paths_S: Optional[List[List[float]]] = None
+    paths_vol: Optional[List[List[float]]] = None
+
+
+class HedgeSimulateRequest(BaseModel):
+    option_type: str = Field(..., description="Option type: 'european', 'barrier', or 'minimax'")
+    S0: float = Field(default=100.0, gt=0, description="Initial spot price")
+    strike: float = Field(default=100.0, gt=0, description="Option strike price")
+    barrier: float = Field(default=85.0, gt=0, description="Option knock-out barrier (for barrier style)")
+    expiry: float = Field(default=0.1, gt=0, description="Maturity in years")
+    mu: float = Field(default=0.0, description="Underlying drift")
+    sigma: float = Field(default=0.2, gt=0, description="Asset volatility")
+    steps: int = Field(default=30, ge=5, le=100, description="Rebalancing step frequency")
+    N_paths: int = Field(default=100, ge=1, le=1000, description="Path simulation count")
+    cost_stock: float = Field(default=0.0001, description="Stock transaction cost coeff")
+    cost_vol: float = Field(default=0.0005, description="Volatility option transaction cost coeff")
+
+
+class HedgeSimulateResponse(BaseModel):
+    paths_S: List[List[float]]
+    paths_vol: List[List[float]]
+    deltas_stock: List[List[float]]
+    deltas_vol: List[List[float]]
+    costs: List[float]
+    wealth: List[float]
+    payoff: List[float]
+    pnl: List[float]
+    std_pnl: float
+    final_loss: float
+
+
+def _pytorch_black_scholes_call(S0, K, T, sigma, r, q):
+    d1 = (torch.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * torch.sqrt(T) + 1e-8)
+    d2 = d1 - sigma * torch.sqrt(T)
+    normal = torch.distributions.Normal(0.0, 1.0)
+    return S0 * torch.exp(-q * T) * normal.cdf(d1) - K * torch.exp(-r * T) * normal.cdf(d2)
+
+
+def _black_scholes_call_price_numpy(S0, K, T, sigma, r, q=0.0):
+    from scipy.stats import norm
+    if T <= 0:
+        return max(S0 - K, 0.0)
+    d1 = (np.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T) + 1e-8)
+    d2 = d1 - sigma * np.sqrt(T)
+    return S0 * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+
+
+def _black_scholes_vega_numpy(S0, K, T, sigma, r, q=0.0):
+    from scipy.stats import norm
+    if T <= 0:
+        return 0.0
+    d1 = (np.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T) + 1e-8)
+    return S0 * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
+
+
+def _implied_volatility_newton(price, S0, K, T, r, q=0.0, max_iter=100, tol=1e-6):
+    intrinsic = max(S0 - K, 0.0)
+    if price <= intrinsic + 1e-6:
+        return 0.0
+    sigma = 0.3
+    for _ in range(max_iter):
+        p = _black_scholes_call_price_numpy(S0, K, T, sigma, r, q)
+        diff = p - price
+        if abs(diff) < tol:
+            return float(sigma)
+        vega = _black_scholes_vega_numpy(S0, K, T, sigma, r, q)
+        if vega < 1e-6:
+            sigma = sigma - 0.5 * diff / S0
+        else:
+            sigma = sigma - diff / vega
+        sigma = np.clip(sigma, 1e-4, 5.0)
+    return float(sigma)
+
+
+@app.post("/calibrate_neural_sde", response_model=CalibrateNeuralSDEResponse, tags=["Calibration"])
+async def calibrate_neural_sde(req: CalibrateNeuralSDERequest) -> CalibrateNeuralSDEResponse:
+    """
+    Calibrate a non-parametric Neural SDE model to an 8x11 market implied volatility surface.
+    """
+    try:
+        if len(req.market_iv) != 8 or any(len(row) != 11 for row in req.market_iv):
+            raise HTTPException(status_code=400, detail="market_iv must be an 8x11 surface")
+
+        from src.pricing.neural_sde import NeuralSDE, NeuralSDEPricer, compute_calibration_loss
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Build option price target grid
+        S0 = req.S0
+        r = req.r
+        q = req.q
+        
+        T_mkt_list = []
+        K_mkt_list = []
+        prices_mkt_list = []
+        
+        for i, t in enumerate(_MATURITIES):
+            for j, k in enumerate(_STRIKES):
+                strike_val = S0 * np.exp(k)
+                iv_val = req.market_iv[i][j]
+                
+                T_mkt_list.append(t)
+                K_mkt_list.append(strike_val)
+                prices_mkt_list.append(
+                    _pytorch_black_scholes_call(
+                        torch.tensor(S0, dtype=torch.float32, device=device),
+                        torch.tensor(strike_val, dtype=torch.float32, device=device),
+                        torch.tensor(t, dtype=torch.float32, device=device),
+                        torch.tensor(iv_val, dtype=torch.float32, device=device),
+                        r, q
+                    ).item()
+                )
+                
+        strikes_mkt = torch.tensor(K_mkt_list, dtype=torch.float32, device=device)
+        prices_mkt = torch.tensor(prices_mkt_list, dtype=torch.float32, device=device)
+        maturities_mkt = torch.tensor(T_mkt_list, dtype=torch.float32, device=device)
+        
+        # Initialize NeuralSDE and pricer
+        epsilon = 1e-4
+        sde = NeuralSDE(r=r, q=q, rho_init=-0.7, hidden_dim=16, epsilon=epsilon)
+        pricer = NeuralSDEPricer(sde, v0_init=0.04)
+        pricer.to(device)
+        
+        optimizer = torch.optim.Adam(pricer.parameters(), lr=0.01)
+        loss_history = []
+        
+        t0 = time.time()
+        
+        # Optimization Loop running asynchronously in threadpool to prevent blocking FastAPI main thread loop
+        def _run_optimization():
+            for epoch in range(req.epochs):
+                optimizer.zero_grad()
+                pred, ys = pricer.price_options(
+                    S0=S0, strikes=strikes_mkt, maturities=maturities_mkt,
+                    N_paths=req.N_paths, dt=0.01, method="euler"
+                )
+                loss_dict = compute_calibration_loss(
+                    model_prices=pred, market_prices=prices_mkt,
+                    vegas=torch.ones_like(prices_mkt), ys=ys,
+                    lambda_bound=0.01, epsilon=epsilon
+                )
+                loss = loss_dict["loss"]
+                loss.backward()
+                optimizer.step()
+                loss_history.append(loss.item())
+            
+            # Predict final prices for final RMSE
+            with torch.no_grad():
+                pred_final, _ = pricer.price_options(
+                    S0=S0, strikes=strikes_mkt, maturities=maturities_mkt,
+                    N_paths=req.N_paths, dt=0.01, method="euler"
+                )
+                final_rmse = torch.sqrt(torch.mean((pred_final - prices_mkt) ** 2)).item()
+                
+                # Invert final predicted option prices to implied volatility surface (8x11)
+                pred_final_np = pred_final.detach().cpu().numpy()
+                fitted_iv = []
+                idx = 0
+                for i, t in enumerate(_MATURITIES):
+                    row_iv = []
+                    for j, k in enumerate(_STRIKES):
+                        strike_val = S0 * np.exp(k)
+                        price_val = float(pred_final_np[idx])
+                        idx += 1
+                        iv_val = _implied_volatility_newton(price_val, S0, strike_val, t, r, q)
+                        row_iv.append(iv_val)
+                    fitted_iv.append(row_iv)
+                
+            return float(pricer.v0.item()), float(sde.rho.item()), final_rmse, fitted_iv
+
+        v0_fitted, rho_fitted, rmse_fitted, fitted_iv = await asyncio.get_event_loop().run_in_executor(None, _run_optimization)
+        elapsed_ms = (time.time() - t0) * 1000.0
+        
+        return CalibrateNeuralSDEResponse(
+            v0=v0_fitted,
+            rho=rho_fitted,
+            final_rmse=rmse_fitted,
+            loss_history=loss_history,
+            elapsed_ms=elapsed_ms,
+            fitted_iv=fitted_iv
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/predict/signature_vol", response_model=PredictSignatureVolResponse, tags=["Pricing"])
+async def predict_signature_vol(req: PredictSignatureVolRequest) -> PredictSignatureVolResponse:
+    """
+    Forecasting options smile using the Signature Volatility model.
+    """
+    try:
+        if len(req.ell) != 30:
+            raise HTTPException(status_code=400, detail="ell coefficients must have exactly 30 elements")
+
+        from src.pricing.signature_vol import simulate_signature_vol_paths
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        ell_tensor = torch.tensor(req.ell, dtype=torch.float32, device=device)
+        
+        t0 = time.time()
+        
+        def _run_pricing():
+            S, V, _, _ = simulate_signature_vol_paths(
+                v0=torch.tensor(req.v0, dtype=torch.float32, device=device),
+                ell=ell_tensor,
+                rho=torch.tensor(req.rho, dtype=torch.float32, device=device),
+                T=req.T,
+                steps_per_unit=252,
+                N_paths=req.N_paths,
+                S0=req.S0,
+                r=req.r,
+                q=req.q,
+                antithetic=True,
+                device=device
+            )
+            
+            S_T = S[:, -1].detach().cpu().numpy()
+            
+            prices = []
+            for strike in req.strikes:
+                payoff = np.maximum(S_T - strike, 0.0)
+                prices.append(float(payoff.mean() * np.exp(-req.r * req.T)))
+                
+            # Invert call prices to implied volatility using the robust Newton solver
+            implied_vols = []
+            for strike, price in zip(req.strikes, prices):
+                iv = _implied_volatility_newton(price, req.S0, strike, req.T, req.r, req.q)
+                implied_vols.append(iv)
+                
+            # Extract first 5 sample paths for visualization
+            paths_S = S[:5].detach().cpu().numpy().tolist()
+            paths_vol = V[:5].detach().cpu().numpy().tolist()
+            
+            return implied_vols, prices, paths_S, paths_vol
+
+        implied_vols, prices, paths_S, paths_vol = await asyncio.get_event_loop().run_in_executor(None, _run_pricing)
+        
+        return PredictSignatureVolResponse(
+            strikes=req.strikes,
+            implied_vols=implied_vols,
+            option_prices=prices,
+            paths_S=paths_S,
+            paths_vol=paths_vol
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/hedge/simulate", response_model=HedgeSimulateResponse, tags=["Hedging"])
+async def hedge_simulate(req: HedgeSimulateRequest) -> HedgeSimulateResponse:
+    """
+    Evaluate optimal deep hedging policy rebalancing simulation and output metrics.
+    """
+    try:
+        from src.hedging.deep_hedging import HedgingPolicy, DeepHedgingEnv
+        from src.hedging.barrier_hedging import BarrierHedgingEnv
+        from scripts.train_deep_hedging import simulate_gbm_paths
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        option_type = req.option_type.lower()
+        
+        # 1. Initialize policy and load weights
+        if option_type == "european":
+            policy = HedgingPolicy(input_dim=5, hidden_dim=64, output_dim=2).to(device)
+            path = Path(__file__).parents[2] / "artifacts" / "weights" / "deep_hedger_european_prod.pth"
+        elif option_type == "barrier":
+            policy = HedgingPolicy(input_dim=6, hidden_dim=64, output_dim=2).to(device)
+            path = Path(__file__).parents[2] / "artifacts" / "weights" / "deep_hedger_barrier_prod.pth"
+        elif option_type == "minimax":
+            policy = HedgingPolicy(input_dim=5, hidden_dim=64, output_dim=2).to(device)
+            path = Path(__file__).parents[2] / "artifacts" / "weights" / "minimax_policy_prod.pth"
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported option type: {option_type}")
+            
+        if not path.exists():
+            raise HTTPException(status_code=500, detail=f"Policy weights not found at {path}")
+            
+        policy.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+        policy.eval()
+        
+        # 2. Simulate asset paths
+        H, t_grid = simulate_gbm_paths(
+            S0=req.S0, mu=req.mu, sigma=req.sigma,
+            T=req.expiry, steps=req.steps, N_paths=req.N_paths,
+            d=2, device=device
+        )
+        
+        cost_coeffs = torch.tensor([req.cost_stock, req.cost_vol], device=device)
+        
+        # 3. Initialize Env
+        if option_type in ("european", "minimax"):
+            payoff = torch.clamp(H[:, -1, 0] - req.strike, min=0.0)
+            env = DeepHedgingEnv(
+                H=H, payoff=payoff, cost_coeffs=cost_coeffs,
+                strike=req.strike, expiry=req.expiry, risk_aversion=1.0,
+                risk_measure="quad", t_grid=t_grid
+            )
+        else:
+            env = BarrierHedgingEnv(
+                H=H, cost_coeffs=cost_coeffs, strike=req.strike,
+                barrier=req.barrier, expiry=req.expiry, risk_aversion=1.0,
+                risk_measure="quad", t_grid=t_grid
+            )
+            
+        # 4. Simulate optimal hedging
+        with torch.no_grad():
+            wealth, costs, deltas = env.simulate_hedging_episode(policy)
+            loss = env.compute_loss(wealth).item()
+            
+        pnl = (wealth - env.payoff).cpu().numpy()
+        std_pnl = float(np.std(pnl))
+        
+        return HedgeSimulateResponse(
+            paths_S=H[:, :, 0].cpu().numpy().tolist(),
+            paths_vol=H[:, :, 1].cpu().numpy().tolist(),
+            deltas_stock=deltas[:, :, 0].cpu().numpy().tolist(),
+            deltas_vol=deltas[:, :, 1].cpu().numpy().tolist(),
+            costs=costs.cpu().numpy().tolist(),
+            wealth=wealth.cpu().numpy().tolist(),
+            payoff=env.payoff.cpu().numpy().tolist(),
+            pnl=pnl.tolist(),
+            std_pnl=std_pnl,
+            final_loss=loss
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+

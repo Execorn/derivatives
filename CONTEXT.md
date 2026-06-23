@@ -38,10 +38,22 @@ derivatives/
 │   │                             fno_jacobian_autograd
 │   ├── fim_analysis.py           Fisher Information Matrix, reparameterization
 │   ├── fno_greeks.py             Autograd Greeks (delta/gamma/vega/vanna/volga)
-│   ├── app_fno.py                Streamlit dashboard
+│   ├── app_fno.py                Streamlit dashboard (with Neural SDE, Signature, Hedging panels)
 │   ├── cuda_engine.cu            CUDA C++ Lifted Heston kernel
 │   ├── pricing_engine.py         CPU Fourier-COS pricer (reference)
 │   ├── pricing_engine_gpu.py     GPU Fourier-COS pricer (vectorized)
+│   ├── pricing/                  Phase 4-5 Pricing Model Zoo
+│   │   ├── heston.py             Classic Heston Fourier-COS
+│   │   ├── sabr.py               SABR Hagan & SSVI surfaces
+│   │   ├── local_vol.py          SVI to Dupire Local Volatility mapping
+│   │   ├── rbergomi_gpu.py       Rough Bergomi hybrid Monte Carlo on GPU
+│   │   ├── neural_sde.py         MLP-parameterized Neural SDE model prior
+│   │   ├── signature_vol.py      Signature Volatility pathwise smile forecasting
+│   │   └── lifted_heston_study.py Lifted Heston factor study engine
+│   ├── hedging/                  Phase 6 Recurrent Deep Hedging & GANs
+│   │   ├── deep_hedging.py       European Deep Hedging Env & LSTM Policy
+│   │   ├── barrier_hedging.py    Exotic DOBC Barrier Hedging Env
+│   │   └── adversarial_market.py WGAN-GP / Stylized Facts minimax training
 │   ├── calibration/
 │   │   ├── batch_calibration.py  Multi-date Gauss-Newton calibration
 │   │   └── joint_calibration.py  Joint SPX + VIX calibration
@@ -61,17 +73,19 @@ derivatives/
 │   │   ├── hurst_dynamics.py     Historical H study (SPX)
 │   │   └── crypto_hurst.py       Historical H study (BTC/ETH)
 │   └── api/
-│       └── server.py             FastAPI REST server
-├── tests/                        535 tests, pytest, no live-network dependencies
+│       └── server.py             FastAPI REST server (with SDE, Signature, Hedging endpoints)
+├── tests/                        585 tests, pytest, no live-network dependencies
 ├── notebooks/
-│   ├── generate_notebooks.py     Source of truth — regenerates all .ipynb
-│   └── *.ipynb                   01-07: SPX, surface, VIX, greeks, BTC, batch, joint
+│   ├── generate_notebooks.py     Source of truth — regenerates 01-11
+│   ├── generate_p5_notebooks.py  Source of truth — regenerates 12-13
+│   ├── generate_p6_notebooks.py  Source of truth — regenerates 14-16
+│   └── *.ipynb                   01-16: SPX, surface, VIX, greeks, BTC, batch, joint, SDE, signature, hedging
 ├── benchmarks/                   Accuracy and speed studies
 ├── scripts/                      Utility scripts
 ├── data/                         GITIGNORED — large training datasets
 ├── artifacts/
-│   ├── weights/                  fno_v2_final_prod.pth, fno_v3_final_prod.pth
-│   └── models/                   param_normalizer_v{2,3}.npz, iv_normalizer_v{2,3}.npz
+│   ├── weights/                  fno_v{2,3}_final_prod.pth, deep_hedger_*, minimax_policy_*
+│   └── models/                   param_normalizer_*, iv_normalizer_*
 ├── results/                      JSON calibration outputs
 ├── research/                     Research notes + reference PDFs
 ├── tex/                          LaTeX thesis (main.pdf) + presentation slides

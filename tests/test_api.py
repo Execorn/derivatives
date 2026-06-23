@@ -190,3 +190,86 @@ def test_openapi_schema(client):
     assert "/greeks" in paths
     assert "/vix" in paths
     assert "/deribit/snapshot" in paths
+
+
+# ── Phase 5-6 Endpoints Tests ──────────────────────────────────────────────────
+
+def test_calibrate_neural_sde(client):
+    # Setup dummy market IV surface (8x11)
+    market_iv = [[0.2] * 11 for _ in range(8)]
+    payload = {
+        "market_iv": market_iv,
+        "S0": 100.0,
+        "r": 0.05,
+        "q": 0.015,
+        "epochs": 2,      # keep it very small for fast unit test
+        "N_paths": 128    # small path count
+    }
+    resp = client.post("/calibrate_neural_sde", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "v0" in body
+    assert "rho" in body
+    assert "final_rmse" in body
+    assert "loss_history" in body
+    assert len(body["loss_history"]) == 2
+    assert body["v0"] > 0.0
+    assert body["rho"] <= 0.0
+
+
+def test_predict_signature_vol(client):
+    # Dummy coefficients (30 elements)
+    ell = [0.0] * 30
+    ell[0] = 0.01   # level 1 time
+    ell[1] = -0.02  # level 1 W
+    payload = {
+        "v0": 0.04,
+        "ell": ell,
+        "rho": -0.5,
+        "T": 0.25,
+        "S0": 100.0,
+        "r": 0.05,
+        "q": 0.015,
+        "N_paths": 128,
+        "strikes": [90.0, 100.0, 110.0]
+    }
+    resp = client.post("/predict/signature_vol", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "strikes" in body
+    assert "implied_vols" in body
+    assert "option_prices" in body
+    assert len(body["implied_vols"]) == 3
+    assert len(body["option_prices"]) == 3
+
+
+def test_hedge_simulate_european(client):
+    payload = {
+        "option_type": "european",
+        "S0": 100.0,
+        "strike": 100.0,
+        "expiry": 0.1,
+        "mu": 0.0,
+        "sigma": 0.2,
+        "steps": 10,
+        "N_paths": 5,
+        "cost_stock": 0.0001,
+        "cost_vol": 0.0005
+    }
+    resp = client.post("/hedge/simulate", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "paths_S" in body
+    assert "paths_vol" in body
+    assert "deltas_stock" in body
+    assert "deltas_vol" in body
+    assert "costs" in body
+    assert "wealth" in body
+    assert "payoff" in body
+    assert "pnl" in body
+    assert "std_pnl" in body
+    assert "final_loss" in body
+    assert len(body["paths_S"]) == 5
+    assert len(body["paths_S"][0]) == 11
+    assert len(body["deltas_stock"][0]) == 10
+

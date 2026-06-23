@@ -6,7 +6,7 @@ MATHEMATICAL CORRECTIONS (all bugs fixed):
   Bug 1 FIXED: kappa NOW appears in Riccati decay: -kappa*x_i*psi_i
                (was missing entirely -- broke all samples with kappa != 1)
   Bug 2 FIXED: kappa*theta integral uses c-WEIGHTED sum (Sigma c_i*psi_i),
-               not unweighted (Sigma psi_i) as Gemini had it.
+               not unweighted (Sigma psi_i) as initially implemented.
   Bug 3 FIXED: BDF solver on 21k-dim state replaced with batched PyTorch RK4.
   Bug 4 FIXED: N_cos reduced 500->64 (domain [-4,4] converges in 64 terms).
   Bug 5 FIXED (2026-06-11): bernstein_factors now normalises c (sum(c)=1) in
@@ -196,7 +196,7 @@ def _riccati_rhs(psi, u_c, x, c, kappa_e, sigma_e, rho_e):
         + 0.5 * sigma_2d ** 2 * Psi ** 2          # (B, N_u)
     )                                              # -> (B, N_u)
 
-    # CRITICAL BUG FIX: multiply decay by kappa (was '-x*psi' in Gemini)
+    # CRITICAL BUG FIX: multiply decay by kappa (was '-x*psi' in initial implementation)
     # x cast to complex for mixed-type mul with complex psi
     dpsi = g.unsqueeze(-1) - kappa_e * x.to(torch.complex128) * psi   # (B, N_u, N)
 
