@@ -12,21 +12,21 @@ from unittest.mock import patch
 # Inject src path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from pricing.bachelier import (
+from deepvol.models.bachelier import (
     bachelier_price,
     black_price,
     shifted_black_price,
     bachelier_implied_vol,
     black_implied_vol
 )
-from pricing.sabr_rates import (
+from deepvol.models.sabr_rates import (
     displaced_sabr_vol,
     calibrate_sabr_node,
     SwaptionVolCube,
     bilinear_interpolate,
     solve_alpha_from_atm
 )
-from market.rates_data import (
+from deepvol.market.rates_data import (
     get_synthetic_forward_rates,
     load_swaption_vol_cube
 )
@@ -338,7 +338,7 @@ def test_calibration_robustness():
     
     # 1. Fallback via exception in solve_alpha_from_atm
     market_vols_normal = np.array([0.0085, 0.0082, 0.0080, 0.0082, 0.0085])
-    with patch('pricing.sabr_rates.solve_alpha_from_atm', side_effect=RuntimeError("2D failed")):
+    with patch('deepvol.models.sabr_rates.solve_alpha_from_atm', side_effect=RuntimeError("2D failed")):
         alpha, rho, nu = calibrate_sabr_node(F, strikes, market_vols_normal, T, beta, shift, vol_type)
         assert alpha > 0.0
         assert -0.999 <= rho <= 0.999

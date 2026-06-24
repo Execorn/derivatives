@@ -10,19 +10,19 @@ import pytest
 # Inject src path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from pricing.bachelier import (
+from deepvol.models.bachelier import (
     bachelier_price,
     black_price,
     shifted_black_price,
     bachelier_implied_vol,
     black_implied_vol
 )
-from market.rates_data import (
+from deepvol.market.rates_data import (
     load_sofr_swap_rates,
     get_synthetic_forward_rates,
     load_swaption_vol_cube
 )
-from pricing.sabr_rates import (
+from deepvol.models.sabr_rates import (
     displaced_sabr_vol,
     calibrate_sabr_node,
     SwaptionVolCube,
@@ -313,7 +313,7 @@ def test_optimizations():
     """
     Verify the optimized engine components: ATM alpha solver, and parallel calibration equivalence.
     """
-    from pricing.sabr_rates import solve_alpha_from_atm
+    from deepvol.models.sabr_rates import solve_alpha_from_atm
     
     # 1. Test solve_alpha_from_atm
     F = 0.03

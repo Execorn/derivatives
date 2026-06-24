@@ -1,9 +1,9 @@
 import pytest
 import torch
 import numpy as np
-import calibrate
-from calibrate import _make_spatial_input, _fno_predict_real_iv, compute_fim_ellipsoid
-from calibrate_fast import _reparam_to_6d, calibrate_newton
+import deepvol.calibration.calibrate_bfgs as calibrate
+from deepvol.calibration.calibrate_bfgs import _make_spatial_input, _fno_predict_real_iv, compute_fim_ellipsoid
+from deepvol.calibration.calibrate_newton import _reparam_to_6d, calibrate_newton
 
 # Mark the whole module to skip if CUDA is not available
 pytestmark = pytest.mark.skipif(

@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from scipy.stats import norm
 
-from greeks.portfolio_greeks import (
+from deepvol.greeks.portfolio_greeks import (
     bs_call_price,
     bs_greeks,
     fno_parameter_jacobian,
@@ -11,7 +11,7 @@ from greeks.portfolio_greeks import (
     portfolio_greeks,
     pnl_attribution
 )
-from normalizers import ParameterNormalizer, IVSurfaceNormalizer
+from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
 
 def test_bs_analytical_vs_autograd():
     S_val = 100.0
@@ -98,7 +98,7 @@ def test_fno_parameter_jacobian_vs_fd(fno_v2_model):
     T_grid = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
     K_grid = np.linspace(-0.5, 0.5, 11)
     
-    from calibrate import _make_spatial_input
+    from deepvol.calibration.calibrate_bfgs import _make_spatial_input
     spatial = _make_spatial_input(T_grid, K_grid, device)
     
     J_autograd = fno_parameter_jacobian(model, theta_t, spatial)

@@ -12,8 +12,8 @@ import pytest
 # Ensure src path is in sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from market.fx_data import gk_delta, invert_gk_delta, gk_price, FXMarketDataLoader
-from calibration.fx_calibration import (
+from deepvol.market.fx_data import gk_delta, invert_gk_delta, gk_price, FXMarketDataLoader
+from deepvol.calibration.fx_calibration import (
     sabr_iv_lognormal_pytorch,
     calibrate_sabr_fx,
     solve_sabr_alpha,

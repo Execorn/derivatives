@@ -11,21 +11,21 @@ import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
 
-from pricing.bachelier import (
+from deepvol.models.bachelier import (
     bachelier_price,
     black_price,
     shifted_black_price,
     bachelier_implied_vol,
     black_implied_vol
 )
-from pricing.sabr_rates import (
+from deepvol.models.sabr_rates import (
     displaced_sabr_vol,
     calibrate_sabr_node,
     SwaptionVolCube,
     bilinear_interpolate,
     solve_alpha_from_atm
 )
-from pricing.schwartz_smith import (
+from deepvol.models.schwartz_smith import (
     schwartz_smith_price_black76,
     schwartz_smith_price_fourier,
     schwartz_smith_price_black76_pt,

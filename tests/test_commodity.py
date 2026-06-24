@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 import torch
 
-from src.market.commodity_data import (
+from deepvol.market.commodity_data import (
     CMECommodityDataAdapter,
     generate_synthetic_options_data,
     wti_futures_expiry,
@@ -19,7 +19,7 @@ from src.market.commodity_data import (
     parse_options_code,
     clean_strike
 )
-from src.pricing.schwartz_smith import (
+from deepvol.models.schwartz_smith import (
     schwartz_smith_price_black76,
     schwartz_smith_price_fourier,
     schwartz_smith_price_black76_pt,

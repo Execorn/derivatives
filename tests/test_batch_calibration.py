@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from calibration.batch_calibration import (
+from deepvol.calibration.batch_calibration import (
     CalibrationResult,
     calibrate_batch,
     calibrate_single,
@@ -168,10 +168,10 @@ def test_load_results_json_is_valid():
 def synthetic_surface():
     """Generate a (8,11) surface from known FNO params."""
     import torch
-    import calibrate
+    import deepvol.calibration.calibrate_bfgs as calibrate
     calibrate._load_normalizers("v3")
-    from fno_model import MirrorPaddedFNO2d
-    from normalizers import IVSurfaceNormalizer, ParameterNormalizer
+    from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
+    from deepvol.surrogates.normalizers import IVSurfaceNormalizer, ParameterNormalizer
 
     weights  = Path(__file__).parents[1] / "artifacts/weights/fno_v3_final_prod.pth"
     pn_path  = Path(__file__).parents[1] / "artifacts/models/param_normalizer_v3.npz"
@@ -219,7 +219,7 @@ def test_calibrate_single_with_surface(synthetic_surface):
 
 
 def test_calibrate_single_params_in_bounds(synthetic_surface):
-    from calibration.joint_calibration import BOUNDS
+    from deepvol.calibration.joint_calibration import BOUNDS
     result = calibrate_single("2024-01-02", target_surface=synthetic_surface, device="cpu")
     for name, (lo, hi) in BOUNDS.items():
         val = result.params[name]

@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 import torch
 import time
-from src.pricing.schwartz_smith import (
+from deepvol.models.schwartz_smith import (
     schwartz_smith_price_black76,
     schwartz_smith_price_black76_pt,
     schwartz_smith_price_cos,

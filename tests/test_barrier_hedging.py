@@ -1,8 +1,8 @@
 import torch
 import numpy as np
 import pytest
-from hedging.deep_hedging import HedgingPolicy
-from hedging.barrier_hedging import BarrierHedgingEnv
+from deepvol.hedging.deep_hedging import HedgingPolicy
+from deepvol.hedging.barrier_hedging import BarrierHedgingEnv
 
 
 def simulate_gbm_paths(S0, mu, sigma, T, steps, N_paths, device="cpu"):

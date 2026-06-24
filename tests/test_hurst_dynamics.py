@@ -12,17 +12,17 @@ import pytest
 project_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(project_root / "src"))
 
-from analysis.hurst_dynamics import (
+from deepvol.analysis.hurst_dynamics import (
     run_historical_study,
     compute_hurst_statistics,
     detect_regime_changes,
 )
-from analysis.crypto_hurst import (
+from deepvol.analysis.crypto_hurst import (
     align_crypto_inputs,
     generate_mock_crypto_data,
     run_crypto_historical_study,
 )
-from calibration.batch_calibration import CalibrationResult
+from deepvol.calibration.batch_calibration import CalibrationResult
 
 
 # ============================================================================
@@ -146,8 +146,8 @@ def test_incremental_resume_functionality(tmp_path):
         converged=True,
     )
     
-    with patch("analysis.hurst_dynamics.project_root", tmp_path), \
-         patch("analysis.hurst_dynamics.calibrate_batch", return_value=[mock_new_result]) as mock_calib:
+    with patch("deepvol.analysis.hurst_dynamics.project_root", tmp_path), \
+         patch("deepvol.analysis.hurst_dynamics.calibrate_batch", return_value=[mock_new_result]) as mock_calib:
          
         # Run study from 2024-01-02 to 2024-01-03.
         # 2024-01-02 is already present, so it should only calibrate 2024-01-03.
@@ -221,8 +221,8 @@ def test_crypto_v0_clipping_and_warning(tmp_path):
         converged=True,
     )
     
-    with patch("analysis.crypto_hurst.project_root", tmp_path), \
-         patch("analysis.crypto_hurst.calibrate_batch", return_value=[mock_res]):
+    with patch("deepvol.analysis.crypto_hurst.project_root", tmp_path), \
+         patch("deepvol.analysis.crypto_hurst.calibrate_batch", return_value=[mock_res]):
          
         # Expect warning about clipping
         with pytest.warns(UserWarning, match="exceeds FNO training range bounds"):
@@ -256,8 +256,8 @@ def test_crypto_historical_study_test_mode(tmp_path):
         converged=True,
     )
     
-    with patch("analysis.crypto_hurst.project_root", tmp_path), \
-         patch("analysis.crypto_hurst.calibrate_batch", return_value=[mock_res]) as mock_calib:
+    with patch("deepvol.analysis.crypto_hurst.project_root", tmp_path), \
+         patch("deepvol.analysis.crypto_hurst.calibrate_batch", return_value=[mock_res]) as mock_calib:
          
         df = run_crypto_historical_study(
             start="2027-01-04",
@@ -299,7 +299,7 @@ def test_run_historical_study_spx_convergence_subset(tmp_path):
     end_date = "2024-01-04"
     
     # Use patch to store results in tmp_path
-    with patch("analysis.hurst_dynamics.project_root", tmp_path):
+    with patch("deepvol.analysis.hurst_dynamics.project_root", tmp_path):
         df = run_historical_study(
             start=start_date,
             end=end_date,
@@ -336,7 +336,7 @@ def test_run_historical_study_spx_convergence_rate_check(tmp_path):
     start_date = "2024-01-01"
     end_date = "2024-01-15" # 10 business days
     
-    with patch("analysis.hurst_dynamics.project_root", tmp_path):
+    with patch("deepvol.analysis.hurst_dynamics.project_root", tmp_path):
         df = run_historical_study(
             start=start_date,
             end=end_date,

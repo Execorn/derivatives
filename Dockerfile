@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install python dependencies to user directory
 COPY src/requirements.txt /build/src/requirements.txt
 RUN pip install --user --no-cache-dir -r src/requirements.txt && \
-    pip install --user --no-cache-dir torchsde iisignature scipy seaborn plotly streamlit fastapi uvicorn cachetools
+    pip install --user --no-cache-dir torchsde iisignature scipy seaborn plotly streamlit fastapi uvicorn cachetools confluent-kafka redis
 
 # Copy source and setup.py to build the CUDA extension
 COPY setup.py /build/setup.py
@@ -31,7 +31,8 @@ FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/root/.local/bin:${PATH}"
+    PATH="/root/.local/bin:${PATH}" \
+    PYTHONPATH="/app/src:${PYTHONPATH}"
 
 WORKDIR /app
 
@@ -46,4 +47,4 @@ EXPOSE 8000
 EXPOSE 8501
 
 # Start the uvicorn API server by default
-CMD ["uvicorn", "src.api.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "deepvol.api.server:app", "--host", "0.0.0.0", "--port", "8000"]

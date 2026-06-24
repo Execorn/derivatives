@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.pricing.rbergomi_gpu import (
+from deepvol.models.rbergomi_gpu import (
     simulate_rbergomi_paths,
     batch_rbergomi_iv_surface,
     rbergomi_iv_surface,
@@ -163,9 +163,9 @@ def test_variance_reduction_antithetic():
 
 def test_calibrate_rbergomi_fast_self_consistency():
     """Verify that calibrate_rbergomi (Newton) recovers synthetic parameters."""
-    from calibrate_fast import calibrate_rbergomi as calibrate_rbergomi_fast
-    from fno_model import MirrorPaddedFNO2d
-    from calibrate import _load_normalizers, _make_spatial_input, _fno_predict_real_iv
+    from deepvol.calibration.calibrate_newton import calibrate_rbergomi as calibrate_rbergomi_fast
+    from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
+    from deepvol.calibration.calibrate_bfgs import _load_normalizers, _make_spatial_input, _fno_predict_real_iv
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MirrorPaddedFNO2d(param_dim=4).to(device)

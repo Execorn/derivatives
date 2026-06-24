@@ -7,13 +7,13 @@ import numpy as np
 from scipy.stats import norm
 
 # Import Phase 7 classes
-from src.pricing.mlsv_gpu import MLSVEngine
-from src.market.fx_data import FXDataLoader
-from src.calibration.fx_calibration import FXSABRCalibrator
-from src.market.rates_data import SOFRSwaptionLoader
-from src.pricing.sabr_rates import RatesSABREngine
-from src.market.commodity_data import CommodityDataLoader
-from src.pricing.schwartz_smith import SchwartzSmithEngine
+from deepvol.models.mlsv_gpu import MLSVEngine
+from deepvol.market.fx_data import FXDataLoader
+from deepvol.calibration.fx_calibration import FXSABRCalibrator
+from deepvol.market.rates_data import SOFRSwaptionLoader
+from deepvol.models.sabr_rates import RatesSABREngine
+from deepvol.market.commodity_data import CommodityDataLoader
+from deepvol.models.schwartz_smith import SchwartzSmithEngine
 
 
 # ==============================================================================

@@ -1,44 +1,41 @@
-# Project: Phase 7 (P7) Multi-Asset Calibration Framework
+# Project: Phase 8 (P8) Production Framework
 
 ## Architecture
-- `src/pricing/mlsv_gpu.py`: McKean-Vlasov SDE particle solver with kernel density regression on GPU.
-- `src/market/fx_data.py` & `src/calibration/fx_calibration.py`: Garman-Kohlhagen delta-to-strike converters, Bloomberg/FRED loaders, and SABR ($\beta=1$) calibration pipeline.
-- `src/market/rates_data.py` & `src/pricing/sabr_rates.py` (and `src/pricing/bachelier.py` if needed): SOFR swaption cube loaders, displaced/normal SABR pricing engines, and bilinear parameter interpolation.
-- `src/market/commodity_data.py` & `src/pricing/schwartz_smith.py`: CME Crude Oil / Gold loaders, Schwartz-Smith two-factor pricing, and Heston comparison.
+Transitioning the pricing and calibration research codebase into an enterprise-grade package named `deepvol`.
+- `deepvol/`: Root package containing:
+  - `models/`: Option pricing engines (Heston, SABR, rBergomi, NeuralSDE, MLSV, Schwartz-Smith)
+  - `surrogates/`: FNO surrogate architectures & normalizers
+  - `calibration/`: Fast calibrator implementations (LM, Gauss-Newton, Joint SPX+VIX)
+  - `market/`: Data feeds (yfinance, Deribit WS, Bloomberg/SOFR)
+  - `hedging/`: Deep hedging environments and policy networks
+- `deepvol/app/`: Streamlit dashboard v2
+- `deepvol/api/`: REST API v2 (FastAPI)
+- `deploy/`: Cloud configs (Kubernetes manifests + Docker Compose stack)
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
-|---|---|---|---|---|
-| M1 | E2E Test Suite | Build opaque-box E2E test suite (Tiers 1-4) for all 4 models and publish `TEST_READY.md`. | None | DONE (fbbbd5ae-0f5c-43d2-99c3-ce6561095e8a) |
-| M2 | Equity MLSV (W1) | GPU McKean-Vlasov particle solver, SPX calibration, validation notebook. | M1 | DONE (3a6c1f89-b413-4af8-adcc-4b6d984df51b) |
-| M3 | FX SABR (W2) | Delta-to-strike inversion, SABR calibration to EUR/USD smile, validation notebook. | M1 | DONE (d812462c-557f-4e3e-b4dc-b7883df77796) |
-| M4 | Rates LMM-SABR (W3) | Displaced SABR pricing, SOFR swaption cube interpolation, validation notebook. | M1 | DONE (849b328c-3b8a-4416-9ebf-82e1b6e8a8cb) |
-| M5 | Commodity Schwartz-Smith (W4) | CME futures options cleaning, Schwartz-Smith pricing vs Heston, validation notebook. | M1 | DONE (5b0f0963-bd5a-4133-900f-b3e407d694dc) |
-| M6 | Integration & Hardening (Tier 5) | Final E2E pass, adversarial testing and coverage hardening. | M2, M3, M4, M5 | DONE (fa264af5-48a5-4fbe-9a2f-c8ae0af25573) |
+|---|---|---|-------------|--------|
+| M1 | Python Package & CLI | Set up pyproject.toml, restructure codebase to `deepvol/`, expose clean developer APIs and CLI. | None | DONE (4c4d3009) |
+| M2 | Streamlit Dashboard v2 | Implement multi-model selector, CSV/Excel surface uploader, Plotly 3D charts, parameter trajectories, PDF reports. | M1 | DONE (625310a0) |
+| M3 | REST API v2 & Docker | Expand FastAPI routes to all models + Greeks, async training trigger, multi-stage CUDA runtime Dockerfile. | M1 | DONE (9fc43d6a) |
+| M4 | Cloud Deployment | Design Kafka + Redis + DB + API docker-compose, write Kubernetes manifests for autoscaling GPU pods. | M3 | DONE (317e70f7) |
+| M5 | Integration & Validation | Sequentially merge all branches, run tests (regression, latency, memory), perform Forensic Audit. | M1, M2, M3, M4 | IN_PROGRESS (3aa66a0b) |
 
 ## Interface Contracts
-### Equity MLSV Engine
-- Module: `src/pricing/mlsv_gpu.py`
-- Inputs: Spot $S_t$, Volatility $V_t$, parameters $(\kappa, \theta, \epsilon, \rho)$, Dupire local variance function/grid.
-- Outputs: Option prices, conditional expectation $\mathbb{E}[V_t \mid S_t = S]$ curves, calibrated local volatility grid.
+### Public Developer API
+- `deepvol.calibrate(market_iv_surface, model_name, method, device)` -> `CalibrationResult`
+- `deepvol.compute_greeks(model_name, parameters, spot, strikes, maturities)` -> `dict`
 
-### FX SABR Engine
-- Module: `src/market/fx_data.py`, `src/calibration/fx_calibration.py`
-- Inputs: Spot, domestic/foreign rates, RR/BF volatility quotes.
-- Outputs: Strike-volatility grid, calibrated SABR parameters $\theta = (\alpha, \rho, \nu)$ for $\beta=1$.
-
-### Rates LMM-SABR Engine
-- Module: `src/pricing/sabr_rates.py`
-- Inputs: Forward rates, SOFR swap rates, swaption market datasets.
-- Outputs: Bachelier/normal SABR prices, interpolated swaption vol cube slices.
-
-### Commodity Schwartz-Smith Engine
-- Module: `src/pricing/schwartz_smith.py`
-- Inputs: Spot price, futures maturities, short-term/long-term parameters $(\kappa, \mu_y, \sigma_x, \sigma_y, \rho_{xy})$.
-- Outputs: Option prices, comparative pricing errors against Heston model.
+### REST API v2 Endpoints
+- `GET /health` -> `{status: "ok"}`
+- `GET /models` -> list of available models and accuracy stats
+- `POST /calibrate/{model_name}` -> JSON option grid input -> calibrated params, RMSE, elapsed time
+- `POST /greeks/{model_name}` -> model parameters + spot/grid input -> calculated Greeks
+- `POST /train` -> trigger asynchronous FNO surrogate training -> `{job_id}`
+- `GET /jobs/{job_id}` -> status of training run
 
 ## Code Layout
-- Worktree 1 (feat/mlsv): `/home/execorn/programming/derivatives-w1`
-- Worktree 2 (feat/fx-sabr): `/home/execorn/programming/derivatives-w2`
-- Worktree 3 (feat/rates-sabr): `/home/execorn/programming/derivatives-w3`
-- Worktree 4 (feat/commodity-schwartz-smith): `/home/execorn/programming/derivatives-w4`
+- Worktree 1 (feat/p8-package): `/home/execorn/programming/derivatives-w1`
+- Worktree 2 (feat/p8-dashboard): `/home/execorn/programming/derivatives-w2`
+- Worktree 3 (feat/p8-api): `/home/execorn/programming/derivatives-w3`
+- Worktree 4 (feat/p8-cloud): `/home/execorn/programming/derivatives-w4`

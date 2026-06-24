@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 calibrate.py — L-BFGS calibration using the FiLM-conditioned FNO surrogate.
 

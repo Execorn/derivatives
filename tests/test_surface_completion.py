@@ -12,14 +12,14 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from arbitrage.surface_completion import (
+from deepvol.arbitrage.surface_completion import (
     check_calendar_spread,
     check_butterfly,
     fit_svi_slice,
     enforce_calendar_spread_monotonicity,
     complete_surface
 )
-from market.spx_data import T_GRID, K_GRID
+from deepvol.market.spx_data import T_GRID, K_GRID
 
 
 def test_enforce_calendar_spread_monotonicity():
@@ -88,7 +88,7 @@ def test_complete_surface_cubic_spline():
 def test_mask_completion_and_rmse(fno_v2_model):
     device = next(fno_v2_model.parameters()).device
     
-    import calibrate
+    import deepvol.calibration.calibrate_bfgs as calibrate
     orig_v1 = calibrate._NORM_VERSIONS["v1"]
     try:
         # Load v2 normalizers and generate synthetic target surface for 2024-01-02 using FNO v2

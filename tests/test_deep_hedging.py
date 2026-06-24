@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import pytest
 from scipy.stats import norm
-from hedging.deep_hedging import HedgingPolicy, DeepHedgingEnv, train_deep_hedger
+from deepvol.hedging.deep_hedging import HedgingPolicy, DeepHedgingEnv, train_deep_hedger
 
 
 def bs_delta_cpu(S, K, T, t, sigma):

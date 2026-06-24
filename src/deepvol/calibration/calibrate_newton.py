@@ -172,7 +172,7 @@ def calibrate_newton(model, target_iv: np.ndarray,
     inits = np.clip(inits, lo + 1e-4, hi - 1e-4)
 
     best_loss   = float("inf")
-    best_params = inits[0].copy()
+    best_params = None
     best_hist   = []
     best_theta_hist = []
     best_n      = 0
@@ -248,6 +248,23 @@ def calibrate_newton(model, target_iv: np.ndarray,
             best_n          = n
 
     elapsed = time.time() - start_t
+    if best_params is None:
+        return {
+            "status": "failed",
+            "v0": np.nan,
+            "zeta": np.nan,
+            "lambda": np.nan,
+            "sigma": np.nan,
+            "rho": np.nan,
+            "params": np.array([np.nan, np.nan, np.nan], dtype=np.float32),
+            "rmse": np.nan,
+            "rmse_bps": np.nan,
+            "final_mse": np.nan,
+            "converged": False,
+            "n_iter": 0,
+            "elapsed": elapsed,
+            "iv_fitted": np.full_like(target_iv, np.nan),
+        }
     v0_f, z_f, lm_f = best_params
     sigma_f = max(float(np.sqrt(z_f**2 + lm_f**2)), 0.01)
     rho_f   = float(np.clip(z_f / sigma_f, -0.9, -0.1))
@@ -267,6 +284,8 @@ def calibrate_newton(model, target_iv: np.ndarray,
         "lambda":      float(lm_f),
         "sigma":       sigma_f,
         "rho":         rho_f,
+        "params":      np.array([v0_f, z_f, lm_f], dtype=np.float32),
+        "rmse":        float(np.sqrt(best_loss)),
         "history":     best_hist,
         "theta_history": best_theta_hist,   # list of (3,) arrays [v0, zeta, lam]
         "elapsed":     elapsed,
@@ -528,9 +547,12 @@ def calibrate_newton_h(model, iv_target: np.ndarray,
         "sigma":        sigma,
         "rho":          rho,
         "H":            float(np.clip(H, 0.04, 0.15)),
+        "params":       np.array([v0, ze, la, H], dtype=np.float32),
+        "rmse":         float(np.sqrt(((iv_final - iv_target)**2).mean())),
         "final_mse":    float(((iv_final - iv_target)**2).mean()),
         "n_iter":       it + 1,
         "converged":    converged,
+        "status":       "converged" if converged else "failed",
         "theta_history": theta_history,
         "iv_fitted":    iv_final,
     }
@@ -717,6 +739,26 @@ def calibrate_heston(model, iv_target: np.ndarray,
             best_n = n
             
     elapsed = time.time() - start_t
+    if best_params is None:
+        return {
+            "status": "failed",
+            "params": {
+                "kappa": np.nan,
+                "theta": np.nan,
+                "sigma": np.nan,
+                "rho": np.nan,
+                "v0": np.nan,
+            },
+            "param_vector": np.array([np.nan, np.nan, np.nan, np.nan, np.nan], dtype=np.float32),
+            "rmse": np.nan,
+            "rmse_bps": np.nan,
+            "loss": np.nan,
+            "final_mse": np.nan,
+            "converged": False,
+            "n_iter": 0,
+            "elapsed_ms": float(elapsed * 1000.0),
+            "iv_fitted": np.full_like(iv_target, np.nan),
+        }
     kappa_f, theta_f, sigma_f, rho_f, v0_f = best_params
     
     with torch.no_grad():
@@ -735,6 +777,7 @@ def calibrate_heston(model, iv_target: np.ndarray,
             "v0": v0_f,
         },
         "param_vector": np.array(best_params),
+        "rmse": float(np.sqrt(best_loss)),
         "loss": float(best_loss),
         "final_mse": float(best_loss),
         "rmse_bps": rmse_bps,
@@ -902,6 +945,21 @@ def calibrate_sabr(model, iv_target: np.ndarray,
             best_n = n
             
     elapsed = time.time() - start_t
+    if best_params is None:
+        return {
+            "status": "failed",
+            "alpha": np.nan,
+            "rho": np.nan,
+            "nu": np.nan,
+            "params": np.array([np.nan, np.nan, np.nan], dtype=np.float32),
+            "rmse": np.nan,
+            "rmse_bps": np.nan,
+            "final_mse": np.nan,
+            "converged": False,
+            "n_iter": 0,
+            "elapsed_ms": float(elapsed * 1000.0),
+            "iv_fitted": np.full_like(iv_target, np.nan),
+        }
     alpha_f, rho_f, nu_f = best_params
     
     with torch.no_grad():
@@ -915,6 +973,8 @@ def calibrate_sabr(model, iv_target: np.ndarray,
         "alpha": alpha_f,
         "rho": rho_f,
         "nu": nu_f,
+        "params": np.array([alpha_f, rho_f, nu_f], dtype=np.float32),
+        "rmse": float(np.sqrt(best_loss)),
         "final_mse": float(best_loss),
         "rmse_bps": rmse_bps,
         "converged": bool(rmse_bps < 100.0),
@@ -1101,6 +1161,22 @@ def calibrate_ssvi(model, iv_target: np.ndarray,
             best_n = n
             
     elapsed = time.time() - start_t
+    if best_params is None:
+        return {
+            "status": "failed",
+            "rho": np.nan,
+            "eta": np.nan,
+            "gamma": np.nan,
+            "theta_atm": theta_atm_init,
+            "params": np.concatenate([np.atleast_1d(theta_atm_init), np.array([np.nan, np.nan, np.nan], dtype=np.float32)]),
+            "rmse": np.nan,
+            "rmse_bps": np.nan,
+            "final_mse": np.nan,
+            "converged": False,
+            "n_iter": 0,
+            "elapsed_ms": float(elapsed * 1000.0),
+            "iv_fitted": np.full_like(iv_target, np.nan),
+        }
     rho_f, eta_f, gamma_f = best_params
     
     with torch.no_grad():
@@ -1115,6 +1191,8 @@ def calibrate_ssvi(model, iv_target: np.ndarray,
         "eta": eta_f,
         "gamma": gamma_f,
         "theta_atm": theta_atm_init,
+        "params": np.concatenate([np.atleast_1d(theta_atm_init), np.array([rho_f, eta_f, gamma_f], dtype=np.float32)]),
+        "rmse": float(np.sqrt(best_loss)),
         "final_mse": float(best_loss),
         "rmse_bps": rmse_bps,
         "converged": bool(rmse_bps < 100.0),
@@ -1288,6 +1366,22 @@ def calibrate_rbergomi(model, iv_target: np.ndarray,
             best_n = n
             
     elapsed = time.time() - start_t
+    if best_params is None:
+        return {
+            "status": "failed",
+            "v0": np.nan,
+            "H": np.nan,
+            "eta": np.nan,
+            "rho": np.nan,
+            "params": np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float32),
+            "rmse": np.nan,
+            "rmse_bps": np.nan,
+            "final_mse": np.nan,
+            "converged": False,
+            "n_iter": 0,
+            "elapsed_ms": float(elapsed * 1000.0),
+            "iv_fitted": np.full_like(iv_target, np.nan),
+        }
     v0_f, H_f, eta_f, rho_f = best_params
     
     with torch.no_grad():
@@ -1302,6 +1396,8 @@ def calibrate_rbergomi(model, iv_target: np.ndarray,
         "H": H_f,
         "eta": eta_f,
         "rho": rho_f,
+        "params": np.array([v0_f, H_f, eta_f, rho_f], dtype=np.float32),
+        "rmse": float(np.sqrt(best_loss)),
         "final_mse": float(best_loss),
         "rmse_bps": rmse_bps,
         "converged": bool(rmse_bps < 100.0),

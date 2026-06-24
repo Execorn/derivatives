@@ -13,7 +13,7 @@ if project_root not in sys.path:
 if os.path.join(project_root, "src") not in sys.path:
     sys.path.insert(0, os.path.join(project_root, "src"))
 
-from pricing_engine_gpu import price_batch_gpu
+from deepvol.models.lifted_heston_gpu import price_batch_gpu
 
 def test_script_execution_and_report_generation():
     # Path to report
@@ -23,7 +23,7 @@ def test_script_execution_and_report_generation():
     if os.path.exists(report_path):
         os.remove(report_path)
         
-    script_path = os.path.join(project_root, "src", "pricing", "lifted_heston_study.py")
+    script_path = os.path.join(project_root, "src", "deepvol", "models", "lifted_heston_study.py")
     python_exe = os.path.join(project_root, ".venv", "bin", "python")
     
     # Run the script

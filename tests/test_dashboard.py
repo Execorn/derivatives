@@ -79,3 +79,36 @@ def test_dashboard_synthetic_surface_generation(app_path):
     # Check that the target surface is successfully created
     assert "target_iv" in at.session_state
     assert at.session_state["active_model"] == "SABR"
+
+
+@pytest.mark.parametrize("model_name", [
+    "SABR",
+    "Classic Heston",
+    "Rough Bergomi",
+    "Neural SDE",
+    "McKean-Vlasov SDE (MLSV)",
+    "Schwartz-Smith (2-Factor)"
+])
+def test_dashboard_calibration(app_path, model_name):
+    """Verify that calibration can be run for each model in the zoo without crashing."""
+    at = AppTest.from_file(app_path)
+    at.run(timeout=30)
+    
+    # Select the model from sidebar selectbox
+    at.sidebar.selectbox("model_selector").select(model_name).run(timeout=30)
+    assert not at.exception
+    
+    # Generate target surface from presets
+    gen_buttons = [b for b in at.button if "Generate Target Surface" in b.label]
+    assert len(gen_buttons) > 0
+    gen_buttons[0].click().run(timeout=30)
+    assert not at.exception
+    
+    # Trigger calibration
+    calib_buttons = [b for b in at.button if "Calibrate / Reconstruct" in b.label]
+    assert len(calib_buttons) > 0
+    calib_buttons[0].click().run(timeout=180)
+    
+    # Assert no crash and correct state population
+    assert not at.exception, f"Calibration crashed for {model_name}: {at.exception}"
+    assert "calib_results" in at.session_state

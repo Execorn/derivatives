@@ -9,7 +9,7 @@ import pytest
 
 # Ensure src path is in sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-from pricing.sabr import (
+from deepvol.models.sabr import (
     sabr_iv_lognormal,
     sabr_iv_normal,
     ssvi_total_variance,
@@ -214,8 +214,8 @@ def test_ssvi_iv_surface_shape():
 
 def test_calibrate_sabr_fast_self_consistency():
     """Verify that calibrate_sabr (Newton) recovers synthetic parameters."""
-    from calibrate_fast import calibrate_sabr as calibrate_sabr_fast
-    from fno_model import MirrorPaddedFNO2d
+    from deepvol.calibration.calibrate_newton import calibrate_sabr as calibrate_sabr_fast
+    from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
     import torch
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -252,8 +252,8 @@ def test_calibrate_sabr_fast_self_consistency():
 
 def test_calibrate_ssvi_fast_self_consistency():
     """Verify that calibrate_ssvi (Newton) recovers synthetic parameters."""
-    from calibrate_fast import calibrate_ssvi as calibrate_ssvi_fast
-    from fno_model import MirrorPaddedFNO2d
+    from deepvol.calibration.calibrate_newton import calibrate_ssvi as calibrate_ssvi_fast
+    from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
     import torch
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -270,7 +270,7 @@ def test_calibrate_ssvi_fast_self_consistency():
     # Monotone increasing ATM variances
     theta_grid = np.array([0.01, 0.02, 0.035, 0.05, 0.065, 0.08, 0.09, 0.10])
     
-    from calibrate_fast import _fno_predict_real_iv, _make_spatial_input, _load_normalizers
+    from deepvol.calibration.calibrate_newton import _fno_predict_real_iv, _make_spatial_input, _load_normalizers
     _load_normalizers("ssvi")
     spatial = _make_spatial_input(T_grid, K_grid, device)
     

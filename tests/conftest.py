@@ -9,7 +9,7 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from fno_model import MirrorPaddedFNO2d
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 
 @pytest.fixture(scope="module")
 def fno_v2_model():

@@ -110,7 +110,7 @@ def calibrate(
             if use_h:
                 res = calibrate_newton_h(model, iv_np, T_grid, K_grid, **kwargs)
             else:
-                res = calibrate_newton(model, iv_np, **kwargs)
+                res = calibrate_newton(model, iv_np, T_grid, K_grid, **kwargs)
         else:
             raise ValueError(f"Unknown model_name: {model_name} for method {method}")
             
@@ -120,14 +120,16 @@ def calibrate(
             calibrate_reparameterized
         )
         
+        use_reparam = kwargs.pop("reparameterized", False)
         init_params = kwargs.pop("init_params", None)
         if init_params is None:
-            # Default initial guess depending on model
-            init_params = np.array([1.5, 0.1, 0.04], dtype=np.float32)  # Default for FNO/Rough Heston (eta, H, v0)
+            if use_reparam:
+                init_params = np.array([0.04, -0.4, 0.4], dtype=np.float32) # length 3 for [v0, zeta, lambda]
+            else:
+                init_params = np.array([1.0, 0.08, 0.3, -0.6, 0.04, 0.08], dtype=np.float32)  # length 6 for [kappa, theta, sigma, rho, v0, H]
             
-        use_reparam = kwargs.pop("reparameterized", False)
         if use_reparam:
-            res = calibrate_reparameterized(model, iv_np, init_params, T_grid, K_grid, **kwargs)
+            res = calibrate_reparameterized(model, iv_np, T_grid, K_grid, **kwargs)
         else:
             res = calibrate_parameters(model, iv_np, init_params, T_grid, K_grid, **kwargs)
             
@@ -137,8 +139,25 @@ def calibrate(
     # 5. Extract values and construct CalibrationResult
     elapsed = time.time() - t_start
     
+    if isinstance(res, tuple):
+        # res is (final_params, history, elapsed) from calibrate_parameters
+        params = res[0]
+        rmse = float(res[1][-1]) if len(res[1]) > 0 else 0.0
+        elapsed_val = res[2]
+        status = "converged"
+        info = {"loss_history": res[1]}
+        return CalibrationResult(
+            parameters=params,
+            rmse=rmse,
+            elapsed_time=elapsed_val,
+            status=status,
+            info=info
+        )
+
     # Standardise return formats
-    params = res.get("params") if res.get("params") is not None else res.get("parameters")
+    params = res.get("params") if res.get("params") is not None else res.get("parameters") if res.get("parameters") is not None else res.get("param_vector") if res.get("param_vector") is not None else res.get("theta_hat")
+    if params is None and "v0" in res and "zeta" in res and "lambda" in res:
+        params = np.array([res["v0"], res["zeta"], res["lambda"]], dtype=np.float32)
     rmse = float(res.get("rmse", 0.0))
     status = res.get("status", "converged")
     

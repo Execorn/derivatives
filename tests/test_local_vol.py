@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 import torch
-from src.pricing.local_vol import svi_slice, svi_to_lv_surface, check_arbitrage_free
-from src.fno_model import MirrorPaddedFNO2d
+from deepvol.models.local_vol import svi_slice, svi_to_lv_surface, check_arbitrage_free
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 
 def test_flat_surface_identity():
     # If the implied volatility surface is completely flat, local volatility = implied volatility
@@ -78,7 +78,7 @@ def test_fno_forward_pass():
 
 
 def test_compute_local_vol_surface():
-    from calibrate_fast import compute_local_vol_surface
+    from deepvol.calibration.calibrate_newton import compute_local_vol_surface
     
     T_grid = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
     K_grid = np.linspace(-0.5, 0.5, 11)

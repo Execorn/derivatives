@@ -24,7 +24,7 @@ import os, sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from market.deribit_data import (
+from deepvol.market.deribit_data import (
     parse_instrument_name,
     build_iv_surface,
     estimate_hurst_exponent,
@@ -100,7 +100,7 @@ def test_fetch_option_snapshot_schema():
     """
     fake_data = _make_fake_api_response(150)
 
-    with patch("market.deribit_data._async_fetch_snapshot",
+    with patch("deepvol.market.deribit_data._async_fetch_snapshot",
                new=AsyncMock(return_value=fake_data)):
         df = asyncio.run(fetch_option_snapshot("BTC"))
 
@@ -121,7 +121,7 @@ def test_fetch_option_snapshot_filters():
     """
     fake_data = _make_fake_api_response(150)
 
-    with patch("market.deribit_data._async_fetch_snapshot",
+    with patch("deepvol.market.deribit_data._async_fetch_snapshot",
                new=AsyncMock(return_value=fake_data)):
         df = asyncio.run(fetch_option_snapshot("BTC"))
 
@@ -139,7 +139,7 @@ def test_fetch_option_snapshot_min_rows():
     """
     fake_data = _make_fake_api_response(150)
 
-    with patch("market.deribit_data._async_fetch_snapshot",
+    with patch("deepvol.market.deribit_data._async_fetch_snapshot",
                new=AsyncMock(return_value=fake_data)):
         df = asyncio.run(fetch_option_snapshot("BTC"))
 

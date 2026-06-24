@@ -3,22 +3,22 @@ import torch
 import numpy as np
 import math
 import warnings
-from src.pricing.mlsv_gpu import MLSVSolverGPU, compute_conditional_expectation
-from src.pricing_engine_gpu import (
+from deepvol.models.mlsv_gpu import MLSVSolverGPU, compute_conditional_expectation
+from deepvol.models.lifted_heston_gpu import (
     solve_riccati_rk4,
     solve_riccati_rk4_mixed,
     price_batch_gpu,
     _riccati_rhs,
     bs_iv_gpu
 )
-from src.calibration.fx_calibration import (
+from deepvol.calibration.fx_calibration import (
     sabr_iv_lognormal_pytorch,
     calibrate_sabr_fx,
     calibrate_sabr_fx_2d,
     solve_sabr_alpha,
     sabr_initial_guess
 )
-from src.market.fx_data import (
+from deepvol.market.fx_data import (
     gk_price,
     gk_delta,
     gk_delta_dk,

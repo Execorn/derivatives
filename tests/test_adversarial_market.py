@@ -1,14 +1,14 @@
 import torch
 import numpy as np
 import pytest
-from hedging.deep_hedging import (
+from deepvol.hedging.deep_hedging import (
     HedgingPolicy,
     estimate_gpd_tail_index_pwm,
     compute_acf_loss,
     compute_leverage_loss,
     compute_cfvc_loss
 )
-from hedging.adversarial_market import (
+from deepvol.hedging.adversarial_market import (
     WGAN_GP_Generator,
     WGAN_GP_Discriminator,
     train_robust_minimax_hedger

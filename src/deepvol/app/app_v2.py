@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 import os
 import sys
+import plotly.graph_objects as go
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from components.uploader import parse_iv_sheet, interpolate_to_model_grid, check_arbitrage
@@ -23,6 +24,9 @@ from components.models import (
     reconstruct_mlsv_surface,
     calibrate_neural_sde_local,
     invert_implied_vol,
+    calibrate_heston,
+    calibrate_sabr,
+    calibrate_rbergomi,
     MATURITIES,
     STRIKES
 )

@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 import torch
 import time
-from greeks.portfolio_greeks import (
+from deepvol.greeks.portfolio_greeks import (
     bs_greeks,
     fno_parameter_jacobian,
     fno_surface_greeks,
@@ -12,7 +12,7 @@ from greeks.portfolio_greeks import (
     interpolate_bilinear,
     _bilinear_interp
 )
-from normalizers import ParameterNormalizer, IVSurfaceNormalizer
+from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
 
 def test_adversarial_bs_greeks_failures():
     """Systematically explore failure modes of bs_greeks under extreme inputs."""

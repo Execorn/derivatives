@@ -6,12 +6,12 @@ import numpy as np
 import torch
 import pytest
 
-from src.pricing.heston import heston_cf, heston_iv_surface, batch_heston_iv_surface
-from src.pricing.sabr import sabr_iv_lognormal, sabr_iv_normal, ssvi_total_variance
-from src.pricing.local_vol import svi_to_lv_surface, check_arbitrage_free
-from src.pricing.rbergomi_gpu import simulate_rbergomi_paths, rbergomi_iv_surface
-from src.pricing.neural_sde import NeuralSDE, NeuralSDEPricer, compute_calibration_loss
-from src.pricing.signature_vol import SignatureVolatilityModel, compute_path_signature
+from deepvol.models.heston import heston_cf, heston_iv_surface, batch_heston_iv_surface
+from deepvol.models.sabr import sabr_iv_lognormal, sabr_iv_normal, ssvi_total_variance
+from deepvol.models.local_vol import svi_to_lv_surface, check_arbitrage_free
+from deepvol.models.rbergomi_gpu import simulate_rbergomi_paths, rbergomi_iv_surface
+from deepvol.models.neural_sde import NeuralSDE, NeuralSDEPricer, compute_calibration_loss
+from deepvol.models.signature_vol import SignatureVolatilityModel, compute_path_signature
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 

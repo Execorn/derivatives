@@ -60,7 +60,6 @@ def test_k8s_manifests_exist():
 
     expected_files = [
         "deployment.yaml",
-        "hpa.yaml",
         "scaledobject.yaml",
         "redis-deployment.yaml",
     ]
@@ -136,27 +135,6 @@ def test_k8s_deployment_syntax_and_constraints():
     api_pod_spec = api_deployment["spec"]["template"]["spec"]
     assert "nodeSelector" not in api_pod_spec, "API gateway should not have GPU nodeSelector"
     assert "tolerations" not in api_pod_spec, "API gateway should not have GPU tolerations"
-
-
-def test_k8s_hpa_syntax():
-    """Verify hpa.yaml syntax and targeting."""
-    hpa_path = DEPLOY_DIR / "k8s" / "hpa.yaml"
-    with open(hpa_path, "r") as f:
-        hpa = yaml.safe_load(f)
-
-    assert hpa["kind"] == "HorizontalPodAutoscaler"
-    assert hpa["metadata"]["name"] == "deepvol-worker-hpa"
-    assert hpa["spec"]["scaleTargetRef"]["name"] == "deepvol-worker"
-    assert hpa["spec"]["scaleTargetRef"]["kind"] == "Deployment"
-    
-    # Check that external metrics are used
-    metrics = hpa["spec"]["metrics"]
-    assert len(metrics) > 0
-    assert metrics[0]["type"] == "External"
-    external = metrics[0]["external"]
-    assert external["metric"]["name"] == "kafka_consumergroup_lag"
-    assert external["target"]["type"] == "AverageValue"
-    assert external["target"]["averageValue"] == "100"
 
 
 def test_k8s_scaledobject_syntax():

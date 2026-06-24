@@ -2,7 +2,7 @@ import pytest
 import torch
 import numpy as np
 import math
-from src.pricing.mlsv_gpu import MLSVSolverGPU, compute_conditional_expectation
+from deepvol.models.mlsv_gpu import MLSVSolverGPU, compute_conditional_expectation
 
 
 def test_mlsv_solver_initialization():

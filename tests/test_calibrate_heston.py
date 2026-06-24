@@ -9,7 +9,7 @@ import torch
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-from pricing.heston import (
+from deepvol.models.heston import (
     heston_cf,
     heston_iv_surface,
     batch_heston_iv_surface,
@@ -144,8 +144,8 @@ def test_self_consistency():
 
 def test_calibrate_heston_fast_self_consistency():
     """Verify that calibrate_heston (Newton) recovers synthetic parameters."""
-    from calibrate_fast import calibrate_heston as calibrate_heston_fast
-    from fno_model import MirrorPaddedFNO2d
+    from deepvol.calibration.calibrate_newton import calibrate_heston as calibrate_heston_fast
+    from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MirrorPaddedFNO2d(param_dim=5).to(device)
@@ -163,7 +163,7 @@ def test_calibrate_heston_fast_self_consistency():
         'v0': 0.05
     }
     
-    from calibrate_fast import _fno_predict_real_iv, _make_spatial_input, _load_normalizers
+    from deepvol.calibration.calibrate_newton import _fno_predict_real_iv, _make_spatial_input, _load_normalizers
     _load_normalizers("heston")
     spatial = _make_spatial_input(T_grid_fno, K_grid_fno, device)
     params_tensor = torch.tensor([[

@@ -21,7 +21,7 @@ _src_dir = str(Path(__file__).parents[1] / "src")
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
-from market.variance_swaps import (
+from deepvol.market.variance_swaps import (
     realized_variance,
     variance_swap_pnl,
     variance_swap_rate,

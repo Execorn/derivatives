@@ -18,7 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from fastapi.testclient import TestClient
-from api.server import app, _MODEL_STATE
+from deepvol.api.server import app, _MODEL_STATE
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -163,7 +163,7 @@ def test_deribit_snapshot_btc_mocked(client):
         "option_type":     ["C", "P"],
     })
 
-    with patch("market.deribit_data.fetch_option_snapshot", new=AsyncMock(return_value=mock_df)):
+    with patch("deepvol.market.deribit_data.fetch_option_snapshot", new=AsyncMock(return_value=mock_df)):
         resp = client.get("/deribit/snapshot?currency=BTC")
 
     assert resp.status_code == 200, resp.text

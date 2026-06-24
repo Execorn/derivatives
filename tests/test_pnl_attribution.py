@@ -9,7 +9,7 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from greeks.pnl_attribution import pnl_attribution
+from deepvol.greeks.pnl_attribution import pnl_attribution
 
 def test_pnl_attribution_scalar_div():
     """

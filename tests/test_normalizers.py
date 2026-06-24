@@ -2,8 +2,8 @@ import os
 import pytest
 import numpy as np
 import torch
-import calibrate
-from normalizers import ParameterNormalizer, IVSurfaceNormalizer
+import deepvol.calibration.calibrate_bfgs as calibrate
+from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
 
 def test_parameter_normalizer_roundtrip():
     path = "artifacts/models/param_normalizer_v2.npz"

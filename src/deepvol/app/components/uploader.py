@@ -219,11 +219,11 @@ def interpolate_to_model_grid(T_src, K_src, iv_src, S0=100.0) -> np.ndarray:
     grid_tgt = np.stack([T_tgt_mesh.ravel(), K_tgt_mesh.ravel()], axis=-1)
     
     # Run linear interpolation
-    iv_tgt = grid_data(points_log, values, grid_tgt, method="linear")
+    iv_tgt = griddata(points_log, values, grid_tgt, method="linear")
     
     # Fill any NaNs (due to extrapolation) with nearest neighbor
     if np.any(np.isnan(iv_tgt)):
-        iv_nearest = grid_data(points_log, values, grid_tgt, method="nearest")
+        iv_nearest = griddata(points_log, values, grid_tgt, method="nearest")
         iv_tgt = np.where(np.isnan(iv_tgt), iv_nearest, iv_tgt)
         
     # Reshape back to target grid shape (8, 11)
