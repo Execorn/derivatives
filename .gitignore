@@ -70,6 +70,7 @@ tex/**/*.toc
 # ── Large datasets (reproduced by generate scripts) ──────────────────────────
 data/*.npz
 data/*.csv
+data/cache/
 data/market/**/*.parquet
 data/market/**/*.csv
 data/market/**/*.json
