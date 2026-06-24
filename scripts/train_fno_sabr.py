@@ -21,15 +21,15 @@ from fno_model import MirrorPaddedFNO2d, arbitrage_free_regularization
 from normalizers import ParameterNormalizer, IVSurfaceNormalizer
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-DATASET_PATH = "data/SABRDataset_v1.npz"
+DATASET_PATH = os.environ.get("DATASET_PATH", "data/SABRDataset_v1.npz")
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 K_GRID = np.linspace(-0.5, 0.5, 11)
 N_PARAMS = 3  # alpha, rho, nu
 
-EPOCHS = 3 if '--smoke' in sys.argv else 150
-BATCH_SIZE = 4096
-LR = 8e-4
-SWA_START = 2 if '--smoke' in sys.argv else 120
+EPOCHS = int(os.environ.get("EPOCHS", 3 if '--smoke' in sys.argv else 150))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 4096))
+LR = float(os.environ.get("LR", 8e-4))
+SWA_START = int(os.environ.get("SWA_START", 2 if '--smoke' in sys.argv else 120))
 
 WEIGHTS_BEST = "artifacts/weights/fno_sabr_best.pth"
 WEIGHTS_PROD = "artifacts/weights/fno_sabr_final_prod.pth"

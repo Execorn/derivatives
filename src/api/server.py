@@ -18,12 +18,19 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+import os
+import uuid
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+from cachetools import TTLCache
 
 import numpy as np
 import torch
+
+# Limit intra-op threads to prevent CPU core thrashing when executing in thread pools
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,7 +63,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Global model cache ─────────────────────────────────────────────────────────
+# ── Global model cache & Lock Management ───────────────────────────────────────
+
+class AsyncReadWriteLock:
+    """Non-blocking, asyncio-compatible Read-Write Lock."""
+    def __init__(self):
+        self._readers = 0
+        self._write_lock = asyncio.Lock()
+        self._read_ready = asyncio.Condition()
+
+    async def acquire_read(self):
+        async with self._read_ready:
+            while self._write_lock.locked():
+                await self._read_ready.wait()
+            self._readers += 1
+
+    async def release_read(self):
+        async with self._read_ready:
+            self._readers -= 1
+            if self._readers == 0:
+                self._read_ready.notify_all()
+
+    async def acquire_write(self):
+        await self._write_lock.acquire()
+        async with self._read_ready:
+            while self._readers > 0:
+                await self._read_ready.wait()
+
+    async def release_write(self):
+        if self._write_lock.locked():
+            self._write_lock.release()
+        async with self._read_ready:
+            self._read_ready.notify_all()
+
+    class ReaderContext:
+        def __init__(self, rwlock):
+            self.rwlock = rwlock
+        async def __aenter__(self):
+            await self.rwlock.acquire_read()
+        async def __aexit__(self, exc_type, exc, tb):
+            await self.rwlock.release_read()
+
+    class WriterContext:
+        def __init__(self, rwlock):
+            self.rwlock = rwlock
+        async def __aenter__(self):
+            await self.rwlock.acquire_write()
+        async def __aexit__(self, exc_type, exc, tb):
+            await self.rwlock.release_write()
+
+    def reader(self):
+        return self.ReaderContext(self)
+    def writer(self):
+        return self.WriterContext(self)
+
+
+class CachedModel:
+    def __init__(self, model_name: str, model: torch.nn.Module, pn: Any, yn: Any, path: Path):
+        self.name = model_name
+        self.model = model
+        self.pn = pn
+        self.yn = yn
+        self.path = path
+        self.rwlock = AsyncReadWriteLock()
+        self.last_loaded = time.time()
+
+
+_MODEL_CACHE: Dict[str, CachedModel] = {}
 _MODEL_STATE: Dict[str, Any] = {
     "model":  None,
     "pn":     None,
@@ -74,29 +147,124 @@ _MATURITIES = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0], dtype=np.float3
 _STRIKES    = np.linspace(-0.5, 0.5, 11, dtype=np.float32)
 
 
-def _load_model() -> None:
-    """Lazy-load FNO model and normalizers on first request."""
-    if _MODEL_STATE["loaded"]:
+def _get_cached_container(model_name: str) -> CachedModel:
+    model_name = model_name.lower()
+    if model_name not in _MODEL_CACHE:
+        from fno_model import MirrorPaddedFNO2d
+        from normalizers import IVSurfaceNormalizer, ParameterNormalizer
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        if model_name == "heston":
+            param_dim = 5
+            weights_file = "fno_heston_final_prod.pth"
+            pn_file = "param_normalizer_heston.npz"
+            yn_file = "iv_normalizer_heston.npz"
+        elif model_name == "sabr":
+            param_dim = 3
+            weights_file = "fno_sabr_final_prod.pth"
+            pn_file = "param_normalizer_sabr.npz"
+            yn_file = "iv_normalizer_sabr.npz"
+        elif model_name == "ssvi":
+            param_dim = 11
+            weights_file = "fno_ssvi_final_prod.pth"
+            pn_file = "param_normalizer_ssvi.npz"
+            yn_file = "iv_normalizer_ssvi.npz"
+        elif model_name == "rbergomi":
+            param_dim = 4
+            weights_file = "fno_rbergomi_final_prod.pth"
+            pn_file = "param_normalizer_rbergomi.npz"
+            yn_file = "iv_normalizer_rbergomi.npz"
+        elif model_name in ("rough_heston", "v2", "default"):
+            param_dim = 6
+            weights_file = "fno_v2_final_prod.pth"
+            pn_file = "param_normalizer_v2.npz"
+            yn_file = "iv_normalizer_v2.npz"
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported model: {model_name}")
+
+        artifacts_dir = Path(__file__).parents[2] / "artifacts"
+        path = artifacts_dir / "weights" / weights_file
+        pn_path = artifacts_dir / "models" / pn_file
+        yn_path = artifacts_dir / "models" / yn_file
+
+        if not path.exists():
+            raise HTTPException(status_code=500, detail=f"Weights not found for {model_name} at {path}")
+        if not pn_path.exists():
+            raise HTTPException(status_code=500, detail=f"Parameter normalizer not found for {model_name} at {pn_path}")
+        if not yn_path.exists():
+            raise HTTPException(status_code=500, detail=f"IV normalizer not found for {model_name} at {yn_path}")
+
+        model = MirrorPaddedFNO2d(param_dim=param_dim)
+        state = torch.load(path, map_location=device, weights_only=True)
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval()
+
+        pn = ParameterNormalizer.load(str(pn_path))
+        yn = IVSurfaceNormalizer.load(str(yn_path))
+
+        container = CachedModel(model_name, model, pn, yn, path)
+        _MODEL_CACHE[model_name] = container
+        
+        # Populate _MODEL_STATE for backward compatibility if default model is loaded
+        if model_name in ("rough_heston", "default"):
+            _MODEL_STATE.update(model=model, pn=pn, yn=yn, device=device, loaded=True)
+
+    return _MODEL_CACHE[model_name]
+
+
+async def _hot_reload_model_weights(model_name: str):
+    """
+    Acquires exclusive write lock and reloads the model parameters from disk.
+    This runs with ZERO server downtime.
+    """
+    model_name = model_name.lower()
+    if model_name not in _MODEL_CACHE:
         return
+        
+    cached_container = _MODEL_CACHE[model_name]
+    
+    async with cached_container.rwlock.writer():
+        from normalizers import IVSurfaceNormalizer, ParameterNormalizer
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        state = torch.load(cached_container.path, map_location=device, weights_only=True)
+        cached_container.model.load_state_dict(state)
+        cached_container.model.to(device)
+        cached_container.model.eval()
+        
+        if model_name == "heston":
+            pn_file = "param_normalizer_heston.npz"
+            yn_file = "iv_normalizer_heston.npz"
+        elif model_name == "sabr":
+            pn_file = "param_normalizer_sabr.npz"
+            yn_file = "iv_normalizer_sabr.npz"
+        elif model_name == "ssvi":
+            pn_file = "param_normalizer_ssvi.npz"
+            yn_file = "iv_normalizer_ssvi.npz"
+        elif model_name == "rbergomi":
+            pn_file = "param_normalizer_rbergomi.npz"
+            yn_file = "iv_normalizer_rbergomi.npz"
+        else:
+            pn_file = "param_normalizer_v2.npz"
+            yn_file = "iv_normalizer_v2.npz"
 
-    from fno_model import MirrorPaddedFNO2d
-    from normalizers import IVSurfaceNormalizer, ParameterNormalizer
+        artifacts_dir = Path(__file__).parents[2] / "artifacts"
+        pn_path = artifacts_dir / "models" / pn_file
+        yn_path = artifacts_dir / "models" / yn_file
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = MirrorPaddedFNO2d()
+        cached_container.pn = ParameterNormalizer.load(str(pn_path))
+        cached_container.yn = IVSurfaceNormalizer.load(str(yn_path))
+        cached_container.last_loaded = time.time()
+        
+        if model_name in ("rough_heston", "default"):
+            _MODEL_STATE.update(model=cached_container.model, pn=cached_container.pn, yn=cached_container.yn, device=device, loaded=True)
 
-    if not _WEIGHTS_PATH.exists():
-        raise RuntimeError(f"FNO weights not found at {_WEIGHTS_PATH}")
 
-    state = torch.load(_WEIGHTS_PATH, map_location=device, weights_only=True)
-    model.load_state_dict(state)
-    model.to(device)
-    model.eval()
-
-    pn = ParameterNormalizer.load(str(_PARAM_NORM))
-    yn = IVSurfaceNormalizer.load(str(_IV_NORM))
-
-    _MODEL_STATE.update(model=model, pn=pn, yn=yn, device=device, loaded=True)
+def _load_model() -> None:
+    """Lazy-load FNO model for backward compatibility."""
+    _get_cached_container("rough_heston")
 
 
 # ── Pydantic schemas ───────────────────────────────────────────────────────────
@@ -165,11 +333,11 @@ def _make_spatial(device: torch.device) -> torch.Tensor:
 
 def _fno_forward(params: HestonParams) -> np.ndarray:
     """Run FNO forward pass, return (8,11) IV surface in decimal."""
-    _load_model()
-    model  = _MODEL_STATE["model"]
-    pn     = _MODEL_STATE["pn"]
-    yn     = _MODEL_STATE["yn"]
-    device = _MODEL_STATE["device"]
+    container = _get_cached_container("rough_heston")
+    model  = container.model
+    pn     = container.pn
+    yn     = container.yn
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     theta_arr = np.array(
         [params.kappa, params.theta, params.sigma, params.rho, params.v0, params.H],
@@ -192,10 +360,14 @@ def _fno_forward(params: HestonParams) -> np.ndarray:
 @app.get("/health", response_model=HealthResponse, tags=["Infrastructure"])
 async def health() -> HealthResponse:
     """Liveness probe — always returns 200 even before model is loaded."""
-    device_str = str(_MODEL_STATE.get("device") or "not_loaded")
+    loaded = "rough_heston" in _MODEL_CACHE
+    device_str = "not_loaded"
+    if loaded:
+        container = _MODEL_CACHE["rough_heston"]
+        device_str = str(next(container.model.parameters()).device)
     return HealthResponse(
         status="ok",
-        model_loaded=_MODEL_STATE["loaded"],
+        model_loaded=loaded,
         uptime_s=round(time.time() - _START_TIME, 2),
         device=device_str,
     )
@@ -210,9 +382,11 @@ async def iv_surface(params: HestonParams) -> IVSurfaceResponse:
     in decimal (e.g., 0.20 = 20% IV).
     """
     try:
-        surface = await asyncio.get_event_loop().run_in_executor(
-            None, _fno_forward, params
-        )
+        container = _get_cached_container("rough_heston")
+        async with container.rwlock.reader():
+            surface = await asyncio.get_event_loop().run_in_executor(
+                None, _fno_forward, params
+            )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -223,52 +397,163 @@ async def iv_surface(params: HestonParams) -> IVSurfaceResponse:
     )
 
 
+# ── Polymorphic Greeks Request Schemas ──────────────────────────────────────────
+
+class BaseGreeksRequest(BaseModel):
+    S: float = Field(default=100.0, gt=0, description="Spot price of the underlying asset")
+    r: float = Field(default=0.05, ge=0, description="Risk-free interest rate")
+    q: float = Field(default=0.0, ge=0, description="Dividend yield")
+
+class HestonGreeksRequest(BaseGreeksRequest):
+    kappa: float = Field(..., gt=0.1, le=10.0, description="Mean-reversion speed")
+    theta: float = Field(..., gt=0.01, le=0.5, description="Long-run variance")
+    sigma: float = Field(..., gt=0.05, le=2.0, description="Vol-of-vol")
+    rho: float = Field(..., ge=-0.99, le=0.0, description="Asset-vol correlation")
+    v0: float = Field(..., gt=0.01, le=0.5, description="Initial variance")
+    H: Optional[float] = Field(default=None, description="Hurst exponent (optional for Rough Heston)")
+
+class SABRGreeksRequest(BaseGreeksRequest):
+    alpha: float = Field(..., gt=0.001, description="Initial volatility parameter")
+    rho: float = Field(..., ge=-0.99, le=0.99, description="Correlation parameter")
+    nu: float = Field(..., gt=0.001, description="Volatility of volatility")
+
+class SSVIGreeksRequest(BaseGreeksRequest):
+    rho: float = Field(..., ge=-0.99, le=0.99, description="Correlation")
+    eta: float = Field(..., gt=0, description="SSVI slope parameters")
+    gamma: float = Field(..., gt=0, description="Power exponent")
+    theta_atm: List[float] = Field(..., description="8 ATM variance values")
+
+    @field_validator("theta_atm")
+    @classmethod
+    def validate_theta_atm(cls, v: List[float]) -> List[float]:
+        if len(v) != 8:
+            raise ValueError("theta_atm must have exactly 8 values")
+        return v
+
+class RBergomiGreeksRequest(BaseGreeksRequest):
+    v0: float = Field(..., gt=0.0, description="Initial variance")
+    H: float = Field(..., gt=0.0, lt=0.5, description="Hurst index")
+    eta: float = Field(..., gt=0.0, description="Vol-of-vol")
+    rho: float = Field(..., ge=-0.99, le=0.0, description="Correlation")
+
+
+def _compute_greeks_from_surface(iv_surface: np.ndarray, S: float, r: float, q: float) -> dict:
+    from greeks.portfolio_greeks import bs_greeks
+    T_grid = _MATURITIES
+    k_grid = _STRIKES
+    nT, nK = len(T_grid), len(k_grid)
+
+    delta_surf  = np.zeros((nT, nK), dtype=np.float32)
+    gamma_surf  = np.zeros((nT, nK), dtype=np.float32)
+    vega_surf   = np.zeros((nT, nK), dtype=np.float32)
+    vanna_surf  = np.zeros((nT, nK), dtype=np.float32)
+    volga_surf  = np.zeros((nT, nK), dtype=np.float32)
+
+    for i in range(nT):
+        for j in range(nK):
+            T_val   = float(T_grid[i])
+            kk_val   = float(k_grid[j])
+            K_val   = float(S) * float(np.exp(kk_val))
+            sig_val = float(iv_surface[i, j])
+
+            g = bs_greeks(float(S), K_val, T_val, r, sig_val, q=q)
+
+            delta_surf[i, j] = g["delta"]
+            gamma_surf[i, j] = g["gamma"]
+            vega_surf[i, j]  = g["vega"]
+            vanna_surf[i, j] = g["vanna"]
+            volga_surf[i, j] = g["volga"]
+
+    gamma_max = np.percentile(np.abs(gamma_surf[np.isfinite(gamma_surf)]), 99.5)
+    if gamma_max > 1e6:
+        gamma_surf = np.clip(gamma_surf, -1e6, 1e6)
+
+    return {
+        "delta": delta_surf.tolist(),
+        "gamma": gamma_surf.tolist(),
+        "vega": vega_surf.tolist(),
+        "vanna": vanna_surf.tolist(),
+        "volga": volga_surf.tolist(),
+        "iv_surface": iv_surface.tolist(),
+    }
+
+
+@app.post("/greeks/{model_name}", response_model=GreeksResponse, tags=["Risk"])
+async def compute_model_greeks(
+    model_name: str,
+    req: Dict[str, Any]
+) -> GreeksResponse:
+    """
+    Compute per-strike Greeks surfaces for a specific model name.
+    Supported models: heston, sabr, ssvi, rbergomi, rough_heston
+    """
+    model_name = model_name.lower()
+    try:
+        if model_name == "heston":
+            parsed_req = HestonGreeksRequest(**req)
+        elif model_name == "sabr":
+            parsed_req = SABRGreeksRequest(**req)
+        elif model_name == "ssvi":
+            parsed_req = SSVIGreeksRequest(**req)
+        elif model_name == "rbergomi":
+            parsed_req = RBergomiGreeksRequest(**req)
+        elif model_name in ("rough_heston", "default", "v2"):
+            parsed_req = HestonGreeksRequest(**req)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported model name: {model_name}")
+    except ValueError as err:
+        raise HTTPException(status_code=422, detail=str(err))
+
+    try:
+        cached_container = _get_cached_container(model_name)
+        
+        async with cached_container.rwlock.reader():
+            # Build the model parameter array/tensor
+            if model_name in ("heston", "rough_heston", "default", "v2"):
+                if cached_container.model.film.mlp[0].in_features == 5:
+                    # Classic Heston (5 params)
+                    theta_arr = np.array([parsed_req.kappa, parsed_req.theta, parsed_req.sigma, parsed_req.rho, parsed_req.v0], dtype=np.float32)
+                else:
+                    # Rough Heston (6 params)
+                    H_val = parsed_req.H if parsed_req.H is not None else 0.08
+                    theta_arr = np.array([parsed_req.kappa, parsed_req.theta, parsed_req.sigma, parsed_req.rho, parsed_req.v0, H_val], dtype=np.float32)
+            elif model_name == "sabr":
+                theta_arr = np.array([parsed_req.alpha, parsed_req.rho, parsed_req.nu], dtype=np.float32)
+            elif model_name == "ssvi":
+                theta_arr = np.array(parsed_req.theta_atm + [parsed_req.rho, parsed_req.eta, parsed_req.gamma], dtype=np.float32)
+            elif model_name == "rbergomi":
+                theta_arr = np.array([parsed_req.v0, parsed_req.H, parsed_req.eta, parsed_req.rho], dtype=np.float32)
+            
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            theta_t = torch.tensor(theta_arr, dtype=torch.float32, device=device)
+            spatial = _make_spatial(device)
+
+            def _run_forward():
+                with torch.no_grad():
+                    theta_norm = cached_container.pn.transform_tensor(theta_t.unsqueeze(0))
+                    pred_norm  = cached_container.model(spatial, theta_norm)
+                    iv_tensor  = cached_container.yn.inverse_transform_tensor(pred_norm).squeeze(0)
+                    return iv_tensor.clamp(min=1e-4).cpu().numpy()
+
+            iv_surface = await asyncio.get_event_loop().run_in_executor(None, _run_forward)
+
+            g_results = await asyncio.get_event_loop().run_in_executor(
+                None, _compute_greeks_from_surface, iv_surface, parsed_req.S, parsed_req.r, parsed_req.q
+            )
+            return GreeksResponse(**g_results)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/greeks", response_model=GreeksResponse, tags=["Risk"])
 async def greeks(req: GreeksRequest) -> GreeksResponse:
     """
-    Compute per-strike Greeks surfaces via FNO + Black-Scholes.
-
-    Returns 8×11 matrices for delta, gamma, vega, vanna, volga
-    and the underlying IV surface.
+    Compute per-strike Greeks surfaces via FNO + Black-Scholes (default Rough Heston model).
     """
-    try:
-        from greeks.portfolio_greeks import fno_surface_greeks
-
-        params = HestonParams(
-            kappa=req.kappa, theta=req.theta, sigma=req.sigma,
-            rho=req.rho, v0=req.v0, H=req.H,
-        )
-        theta_dict = dict(
-            kappa=req.kappa, theta=req.theta, sigma=req.sigma,
-            rho=req.rho, v0=req.v0, H=req.H,
-        )
-        _load_model()
-        model  = _MODEL_STATE["model"]
-        pn     = _MODEL_STATE["pn"]
-        yn     = _MODEL_STATE["yn"]
-
-        def _run():
-            return fno_surface_greeks(model, theta_dict, pn, yn, S=req.S)
-
-        g = await asyncio.get_event_loop().run_in_executor(None, _run)
-
-        # fno_surface_greeks returns dict with (8,11) numpy arrays
-        def _to_list(key: str) -> List[List[float]]:
-            v = g.get(key)
-            if isinstance(v, np.ndarray):
-                return v.tolist()
-            return v
-
-        return GreeksResponse(
-            delta=_to_list("delta"),
-            gamma=_to_list("gamma"),
-            vega=_to_list("vega"),
-            vanna=_to_list("vanna"),
-            volga=_to_list("volga"),
-            iv_surface=_to_list("iv_surface"),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    req_dict = req.dict()
+    return await compute_model_greeks("rough_heston", req_dict)
 
 
 @app.post("/vix", response_model=VIXResponse, tags=["Pricing"])
@@ -348,51 +633,34 @@ async def deribit_snapshot(
 
 # ── Calibration Schemas & Route ───────────────────────────────────────────────
 
+# ── Calibration Schemas & Route ───────────────────────────────────────────────
+
 class CalibrateRequest(BaseModel):
-    market_iv: List[List[float]] = Field(..., description="8x11 implied volatility surface in decimal")
-    n_starts: int = Field(default=2, ge=1, le=5)
+    market_iv: List[List[float]] = Field(
+        ..., 
+        description="8x11 implied volatility surface in decimal (e.g., 0.20 = 20% IV)"
+    )
+    n_starts: int = Field(default=2, ge=1, le=5, description="Number of random restarts for solver")
+    max_iter: int = Field(default=25, ge=5, le=100, description="Max iterations per optimization run")
+    tol: float = Field(default=1e-5, gt=0, description="MSE convergence tolerance")
+
+    @field_validator("market_iv")
+    @classmethod
+    def validate_surface(cls, v: List[List[float]]) -> List[List[float]]:
+        if len(v) != 8 or any(len(row) != 11 for row in v):
+            raise ValueError("implied volatility surface must have dimensions (8, 11)")
+        return v
 
 
 class CalibrateResponse(BaseModel):
-    params: Dict[str, float]
-    final_mse: float
-    rmse_bps: float
-    elapsed_ms: float
-    converged: bool
+    params: Dict[str, float] = Field(..., description="Calibrated model-specific parameters")
+    final_mse: float = Field(..., description="Mean squared error of calibrated surface vs target")
+    rmse_bps: float = Field(..., description="Root mean squared error in basis points")
+    elapsed_ms: float = Field(..., description="Optimization execution time in milliseconds")
+    converged: bool = Field(..., description="True if optimization converged within tolerance")
 
 
-_MODEL_CACHE: Dict[str, Any] = {}
-
-def _get_model(model_name: str):
-    if model_name not in _MODEL_CACHE:
-        from fno_model import MirrorPaddedFNO2d
-        
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if model_name == "heston":
-            model = MirrorPaddedFNO2d(param_dim=5)
-            path = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_heston_final_prod.pth"
-        elif model_name == "sabr":
-            model = MirrorPaddedFNO2d(param_dim=3)
-            path = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_sabr_final_prod.pth"
-        elif model_name == "ssvi":
-            model = MirrorPaddedFNO2d(param_dim=11)
-            path = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_ssvi_final_prod.pth"
-        elif model_name == "rbergomi":
-            model = MirrorPaddedFNO2d(param_dim=4)
-            path = Path(__file__).parents[2] / "artifacts" / "weights" / "fno_rbergomi_final_prod.pth"
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported model: {model_name}")
-            
-        if not path.exists():
-            raise HTTPException(status_code=500, detail=f"Weights not found for {model_name} at {path}")
-            
-        state = torch.load(path, map_location=device, weights_only=True)
-        model.load_state_dict(state)
-        model.to(device)
-        model.eval()
-        _MODEL_CACHE[model_name] = model
-        
-    return _MODEL_CACHE[model_name]
+_GPU_CALIBRATION_SEMAPHORE = asyncio.Semaphore(1)
 
 
 @app.post("/calibrate/{model_name}", response_model=CalibrateResponse, tags=["Calibration"])
@@ -407,7 +675,7 @@ async def calibrate_route(model_name: str, req: CalibrateRequest) -> CalibrateRe
         raise HTTPException(status_code=400, detail=f"Unsupported model name: {model_name}")
 
     try:
-        model = _get_model(model_name)
+        cached_container = _get_cached_container(model_name)
         iv_target = np.array(req.market_iv, dtype=np.float32)
         if iv_target.shape != (8, 11):
             raise HTTPException(status_code=422, detail="market_iv must have shape (8, 11)")
@@ -415,17 +683,21 @@ async def calibrate_route(model_name: str, req: CalibrateRequest) -> CalibrateRe
         from calibrate_fast import (calibrate_heston, calibrate_sabr,
                                     calibrate_ssvi, calibrate_rbergomi)
 
-        def _run():
-            if model_name == "heston":
-                return calibrate_heston(model, iv_target, _MATURITIES, _STRIKES, max_iter=25, n_starts=req.n_starts)
-            elif model_name == "sabr":
-                return calibrate_sabr(model, iv_target, _MATURITIES, _STRIKES, max_iter=25, n_starts=req.n_starts)
-            elif model_name == "ssvi":
-                return calibrate_ssvi(model, iv_target, _MATURITIES, _STRIKES, max_iter=25, n_starts=req.n_starts)
-            elif model_name == "rbergomi":
-                return calibrate_rbergomi(model, iv_target, _MATURITIES, _STRIKES, max_iter=25, n_starts=req.n_starts)
-            
-        res = await asyncio.get_event_loop().run_in_executor(None, _run)
+        # Acquire GPU semaphore to serialize calibration and avoid VRAM exhaustion
+        async with _GPU_CALIBRATION_SEMAPHORE:
+            # Acquire Read Lock on model weights to prevent reload crashes
+            async with cached_container.rwlock.reader():
+                def _run():
+                    if model_name == "heston":
+                        return calibrate_heston(cached_container.model, iv_target, _MATURITIES, _STRIKES, max_iter=req.max_iter, n_starts=req.n_starts)
+                    elif model_name == "sabr":
+                        return calibrate_sabr(cached_container.model, iv_target, _MATURITIES, _STRIKES, max_iter=req.max_iter, n_starts=req.n_starts)
+                    elif model_name == "ssvi":
+                        return calibrate_ssvi(cached_container.model, iv_target, _MATURITIES, _STRIKES, max_iter=req.max_iter, n_starts=req.n_starts)
+                    elif model_name == "rbergomi":
+                        return calibrate_rbergomi(cached_container.model, iv_target, _MATURITIES, _STRIKES, max_iter=req.max_iter, n_starts=req.n_starts)
+                    
+                res = await asyncio.get_event_loop().run_in_executor(None, _run)
 
         # Build response parameters dictionary
         if model_name == "heston":
@@ -821,4 +1093,225 @@ async def hedge_simulate(req: HedgeSimulateRequest) -> HedgeSimulateResponse:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ── Process-Isolated Training Background Task Manager ─────────────────────────
+
+_TRAINING_TASKS: Dict[str, Dict[str, Any]] = {}
+
+class TrainRequest(BaseModel):
+    epochs: int = Field(default=150, ge=1, le=1000)
+    batch_size: int = Field(default=4096, ge=32)
+    lr: float = Field(default=8e-4, gt=0)
+    use_swa: bool = Field(default=True)
+    dataset_path: Optional[str] = Field(default=None)
+
+class TrainResponse(BaseModel):
+    task_id: str
+    status: str
+    message: str
+
+class TrainStatusResponse(BaseModel):
+    task_id: str
+    model_name: str
+    status: str  # "queued", "running", "completed", "failed"
+    started_at: float
+    completed_at: Optional[float] = None
+    elapsed_seconds: float
+    error_message: Optional[str] = None
+    recent_logs: List[str]
+
+
+async def _run_training_subprocess(task_id: str, model_name: str, req: TrainRequest):
+    """Spawns scripts/train_fno_{model_name}.py in an isolated OS process."""
+    os.makedirs("logs", exist_ok=True)
+    log_path = f"logs/train_{task_id}.log"
+
+    # Determine command (running with active virtual environment python if possible)
+    python_exe = sys.executable
+    script_path = str(Path(__file__).parents[2] / "scripts" / f"train_fno_{model_name}.py")
+
+    cmd = [python_exe, script_path]
+    
+    # Check for smoke test
+    if req.epochs <= 3:
+        cmd.append("--smoke")
+
+    # Set up environment variables for training configuration
+    env = os.environ.copy()
+    env["EPOCHS"] = str(req.epochs)
+    env["BATCH_SIZE"] = str(req.batch_size)
+    env["LR"] = str(req.lr)
+    # Compute reasonable SWA start
+    swa_start = int(0.8 * req.epochs) if req.epochs >= 10 else 2
+    env["SWA_START"] = str(swa_start)
+    if req.dataset_path:
+        env["DATASET_PATH"] = req.dataset_path
+
+    try:
+        with open(log_path, "w") as log_file:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=log_file,
+                stderr=log_file,
+                env=env,
+                cwd=str(Path(__file__).parents[2])
+            )
+            
+            exit_code = await process.wait()
+
+        if exit_code == 0:
+            _TRAINING_TASKS[task_id]["status"] = "completed"
+            _TRAINING_TASKS[task_id]["completed_at"] = time.time()
+            # Hot-reload hook: dynamically load new weights into API server
+            await _hot_reload_model_weights(model_name)
+        else:
+            _TRAINING_TASKS[task_id]["status"] = "failed"
+            _TRAINING_TASKS[task_id]["completed_at"] = time.time()
+            _TRAINING_TASKS[task_id]["error_message"] = f"Subprocess exited with code {exit_code}"
+
+    except Exception as exc:
+        _TRAINING_TASKS[task_id]["status"] = "failed"
+        _TRAINING_TASKS[task_id]["completed_at"] = time.time()
+        _TRAINING_TASKS[task_id]["error_message"] = str(exc)
+
+
+@app.post("/train/{model_name}", response_model=TrainResponse, tags=["Training"])
+async def trigger_training(model_name: str, req: TrainRequest) -> TrainResponse:
+    model_name = model_name.lower()
+    if model_name not in ("heston", "sabr", "ssvi", "rbergomi"):
+        raise HTTPException(status_code=400, detail=f"Unsupported model: {model_name}")
+
+    # Check for active training task of this model
+    for tid, tstate in _TRAINING_TASKS.items():
+        if tstate["model_name"] == model_name and tstate["status"] == "running":
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Training for {model_name} is already in progress (Task ID: {tid})"
+            )
+
+    task_id = str(uuid.uuid4())
+    _TRAINING_TASKS[task_id] = {
+        "model_name": model_name,
+        "status": "running",
+        "started_at": time.time(),
+        "completed_at": None,
+        "error_message": None,
+    }
+
+    # Spawn training as a non-blocking background task
+    asyncio.create_task(_run_training_subprocess(task_id, model_name, req))
+
+    return TrainResponse(
+        task_id=task_id,
+        status="running",
+        message=f"Training started for {model_name}. Check progress at /train/status/{task_id}"
+    )
+
+
+@app.get("/train/status/{task_id}", response_model=TrainStatusResponse, tags=["Training"])
+async def get_train_status(task_id: str) -> TrainStatusResponse:
+    if task_id not in _TRAINING_TASKS:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    state = _TRAINING_TASKS[task_id]
+    log_path = f"logs/train_{task_id}.log"
+    
+    recent_logs = []
+    if os.path.exists(log_path):
+        with open(log_path, "r") as f:
+            recent_logs = f.readlines()[-20:]
+
+    elapsed = (state["completed_at"] or time.time()) - state["started_at"]
+
+    return TrainStatusResponse(
+        task_id=task_id,
+        model_name=state["model_name"],
+        status=state["status"],
+        started_at=state["started_at"],
+        completed_at=state["completed_at"],
+        elapsed_seconds=round(elapsed, 2),
+        error_message=state["error_message"],
+        recent_logs=[line.strip() for line in recent_logs]
+    )
+
+
+# ── Session-Based Calibration Cache ───────────────────────────────────────────
+
+# Thread-safe in-memory session cache with 1-hour expiration
+_SESSION_CACHE = TTLCache(maxsize=10000, ttl=3600)
+
+class SessionCalibrateResponse(BaseModel):
+    session_id: str
+    model_name: str
+    params: Dict[str, float]
+    rmse_bps: float
+    expires_in_seconds: int = 3600
+
+class SessionGreeksRequest(BaseModel):
+    S: float = Field(default=100.0, gt=0, description="Spot price of the underlying asset")
+    r: float = Field(default=0.05, ge=0, description="Risk-free interest rate")
+    q: float = Field(default=0.0, ge=0, description="Dividend yield")
+
+
+@app.post("/session/calibrate/{model_name}", response_model=SessionCalibrateResponse, tags=["Session"])
+async def session_calibrate(model_name: str, req: CalibrateRequest) -> SessionCalibrateResponse:
+    """
+    Run standard calibration for a model name and cache the resulting parameters in a session.
+    """
+    calib_res = await calibrate_route(model_name, req)
+    
+    session_id = str(uuid.uuid4())
+    _SESSION_CACHE[session_id] = {
+        "model_name": model_name,
+        "params": calib_res.params,
+        "last_accessed": time.time()
+    }
+    
+    return SessionCalibrateResponse(
+        session_id=session_id,
+        model_name=model_name,
+        params=calib_res.params,
+        rmse_bps=calib_res.rmse_bps
+    )
+
+
+@app.post("/session/{session_id}/greeks", response_model=GreeksResponse, tags=["Session"])
+async def session_greeks(session_id: str, req: SessionGreeksRequest) -> GreeksResponse:
+    """
+    Compute Greeks surface using calibrated parameters saved under session_id.
+    """
+    if session_id not in _SESSION_CACHE:
+        raise HTTPException(status_code=404, detail="Session expired or not found")
+        
+    session_data = _SESSION_CACHE[session_id]
+    session_data["last_accessed"] = time.time()  # Update access time
+    
+    model_name = session_data["model_name"]
+    params = session_data["params"]
+    
+    greeks_req = {
+        "S": req.S,
+        "r": req.r,
+        "q": req.q
+    }
+    
+    if model_name == "ssvi":
+        # Extract theta_atm_1...8 from params
+        theta_atm_list = []
+        for i in range(1, 9):
+            key = f"theta_atm_{i}"
+            if key in params:
+                theta_atm_list.append(params[key])
+            else:
+                theta_atm_list.append(0.1)
+        greeks_req["theta_atm"] = theta_atm_list
+        greeks_req["rho"] = params["rho"]
+        greeks_req["eta"] = params["eta"]
+        greeks_req["gamma"] = params["gamma"]
+    else:
+        for k, v in params.items():
+            greeks_req[k] = v
+
+    return await compute_model_greeks(model_name, greeks_req)
 
