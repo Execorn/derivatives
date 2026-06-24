@@ -10,7 +10,6 @@ if sys.version_info >= (3, 14):
 import numpy as np
 import torch
 import torch.nn.functional as F
-import py_vollib_vectorized
 
 
 def simulate_rbergomi_paths(
