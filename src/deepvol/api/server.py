@@ -86,9 +86,20 @@ class AsyncReadWriteLock:
 
     async def acquire_write(self):
         await self._write_lock.acquire()
+        t0 = asyncio.get_event_loop().time()
+        _WRITE_STARVATION_WARN_S = 30.0
         async with self._read_ready:
             while self._readers > 0:
                 await self._read_ready.wait()
+                elapsed = asyncio.get_event_loop().time() - t0
+                if elapsed > _WRITE_STARVATION_WARN_S:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        "AsyncReadWriteLock: writer waiting >%.0fs for readers to drain "
+                        "(%d active reader(s)). Consider reducing concurrent read load.",
+                        elapsed, self._readers,
+                    )
+                    t0 = asyncio.get_event_loop().time()  # reset to avoid log spam
 
     async def release_write(self):
         if self._write_lock.locked():
@@ -556,7 +567,7 @@ async def greeks(req: GreeksRequest) -> GreeksResponse:
     """
     Compute per-strike Greeks surfaces via FNO + Black-Scholes (default Rough Heston model).
     """
-    req_dict = req.dict()
+    req_dict = req.model_dump()  # Pydantic V2: model_dump() replaces deprecated .dict()
     return await compute_model_greeks("rough_heston", req_dict)
 
 
