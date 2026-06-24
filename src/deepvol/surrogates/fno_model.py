@@ -57,12 +57,20 @@ class SpectralConv2d(nn.Module):
     def forward(self, x):
         B = x.shape[0]
         x_ft  = torch.fft.rfft2(x)
-        out_ft = torch.zeros(B, self.out_channels, x.size(-2), x.size(-1)//2+1,
-                             dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :self.modes1, :self.modes2] = torch.einsum(
+        
+        part1 = torch.einsum(
             "bixy,ioxy->boxy", x_ft[:, :, :self.modes1, :self.modes2], self.weights1)
-        out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
+        part2 = torch.einsum(
             "bixy,ioxy->boxy", x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
+        
+        H = x.size(-2)
+        W = x.size(-1) // 2 + 1
+        
+        modes1_eff = min(self.modes1, H)
+        slice1 = part1[:, :, :H - modes1_eff]
+        column = torch.cat([slice1, part2], dim=2)
+        
+        out_ft = torch.nn.functional.pad(column, (0, W - self.modes2))
         return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
 
 
