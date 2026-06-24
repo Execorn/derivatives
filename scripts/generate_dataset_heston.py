@@ -17,8 +17,8 @@ import numpy as np
 import torch
 from scipy.stats import qmc
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.pricing.heston import batch_heston_iv_surface
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
+from deepvol.models.heston import batch_heston_iv_surface
 
 # --- Config ---
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
@@ -28,7 +28,7 @@ PARAM_NAMES = ['kappa', 'theta', 'sigma', 'rho', 'v0']
 BOUNDS_LOWER = np.array([0.1, 0.01, 0.1, -0.9, 0.01])
 BOUNDS_UPPER = np.array([5.0, 0.15, 1.0, -0.1, 0.15])
 
-N_SOBOL_SAMPLES = 2048 if '--smoke' in sys.argv else 131072  # 2^17
+N_SOBOL_SAMPLES = 2048 if '--smoke' in sys.argv else int(os.environ.get("N_SOBOL_SAMPLES", 1000000))
 BATCH_SIZE = 4096  # Classic Heston is very fast, large batches are efficient
 N_COS = 128
 OUTPUT_PATH = 'data/HestonDataset_v1.npz'
