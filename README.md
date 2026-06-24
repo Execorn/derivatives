@@ -38,6 +38,12 @@ The project covers the full quant stack: mathematical foundations → GPU pricin
 | FIM reparameterization | Condition number **1301× lower** (κ ≈ 770) |
 | Delta hedging variance reduction | **+5.1%** vs flat Black-Scholes Δ |
 | NaN rate (exponential midpoint integrator) | **2.76%** (was 70.4% with Euler) |
+| Neural SDE Adjoint Calibration (NB12) | **8.1 bps final option price RMSE** |
+| Signature Vol martingale error (NB13) | **0.11 bps** (well within 10 bps limit) |
+| Recurrent Deep Hedging (NB14-15) | **0.4388 European, 0.4349 Barrier P&L std** |
+| Minimax GAN market generation (NB16) | **0.0003 final tracking error** |
+| FastAPI Deep Hedging throughput | **132.91 RPS (p50 = 6.57 ms)** on GPU |
+| FastAPI FNO Calibration throughput | **353.42 RPS (p50 = 80.01 ms)** |
 
 ---
 
@@ -310,15 +316,17 @@ print(f"converged: {result['converged']}")
 
 ## Notebooks
 
-Seven self-contained Jupyter notebooks demonstrate the full pipeline end-to-end.
+Sixteen self-contained Jupyter notebooks demonstrate the full pipeline end-to-end.
 Generate (or regenerate) them from source with:
 
 ```bash
 cd notebooks
-python generate_notebooks.py   # writes 01_*.ipynb ... 07_*.ipynb
+python generate_notebooks.py       # writes 01_*.ipynb ... 11_*.ipynb
+python generate_p5_notebooks.py    # writes 12_*.ipynb and 13_*.ipynb
+python generate_p6_notebooks.py    # writes 14_*.ipynb ... 16_*.ipynb
 ```
 
-Run in order (each is independent but uses the same trained weights):
+Run in order:
 
 ```bash
 source .venv/bin/activate
@@ -335,6 +343,15 @@ jupyter lab   # or: jupyter nbconvert --to notebook --execute --inplace *.ipynb
 | `05_crypto_calibration.ipynb` | Live BTC/ETH from Deribit | RMSE=1547 bps (v2) |
 | `06_batch_calibration.ipynb` | Multi-date SPX batch + H dynamics | 12.8 bps median |
 | `07_joint_calibration.ipynb` | Joint SPX+VIX calibration | converged=True |
+| `08_heston_vs_rheston.ipynb` | Classic Heston vs Rough Heston pricing | Hurst parameter influence |
+| `09_sabr_ssvi_calibration.ipynb` | SABR & SSVI calibration | Synthetic smiles |
+| `10_local_vol_dupire.ipynb` | SVI-to-Dupire Local Volatility mapping | Clean LV surface |
+| `11_rbergomi_calibration.ipynb` | Rough Bergomi HMC calibration | Model vs COS comparison |
+| `12_neural_sde_calibration.ipynb` | SDE Adjoint calibration | SDE drift/diffusion prior |
+| `13_signature_forecasting.ipynb` | Signature Volatility Forecasting | Out-of-sample smile forecast |
+| `14_deep_hedging_european.ipynb` | Recurrent European Deep Hedging | Delta hedging variance reduction |
+| `15_barrier_hedging_costs.ipynb` | Recurrent Barrier Deep Hedging | Optimal rebalancing corridors |
+| `16_adversarial_market_gen.ipynb` | WGAN-GP and stylized facts alignment | Minimax robust generation |
 
 
 ### Batch Calibration (Multi-Date)
@@ -559,6 +576,9 @@ uvicorn api.server:app --reload --port 8000 --app-dir src
 | `GET` | `/vix` | VIX futures term structure for a date |
 | `GET` | `/deribit/snapshot` | Live BTC/ETH IV surface snapshot |
 | `POST` | `/calibrate` | Full calibration: market IV → θ* |
+| `POST` | `/calibrate_neural_sde` | Adjoint calibration of non-parametric Neural SDE prior |
+| `POST` | `/predict/signature_vol` | Signature Volatility weekly options smile forecasting |
+| `POST` | `/hedge/simulate` | Recurrent Deep Hedging delta-hedging simulation |
 
 ### Example: POST /iv_surface
 
@@ -770,6 +790,10 @@ pdflatex -interaction=nonstopmode main.tex
 | **P1**: FNO Surrogate | Complete | FNO v1/v2/v3, FIM reparameterization, Newton calibrator, Streamlit |
 | **P2**: Market Extensions | Complete | FastAPI, VIX futures, Deribit streaming, variance swaps, batch calibration |
 | **P3**: GPU-Native | Complete | GPU Gauss-Newton, SVI arbitrage enforcement, portfolio Greeks, P&L attribution |
+| **P4**: Model Zoo | Complete | Standalone Classic Heston, SABR (Hagan/Normal) & SSVI, Local Volatility (Dupire), and Rough Bergomi (Bennedsen hybrid scheme on GPU) |
+| **P5**: Neural SDE & Signature | Complete | Lifted Heston factor study, Neural SDE (prior training + adjoint calibration), and Signature Volatility (pathwise smile forecasting) |
+| **P6**: Recurrent Deep Hedging | Complete | Recurrent Deep Hedging (European/DOBC Barrier LSTM policy) and Robust Minimax GAN market generation |
+
 
 ---
 

@@ -9,7 +9,7 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from fno_model import MirrorPaddedFNO2d
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 
 @pytest.fixture(scope="module")
 def fno_v2_model():
@@ -21,3 +21,11 @@ def fno_v2_model():
     model.to(device)
     model.eval()
     return model
+
+
+@pytest.fixture(autouse=True)
+def clear_cuda_cache():
+    yield
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+

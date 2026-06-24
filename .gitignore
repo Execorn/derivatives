@@ -77,11 +77,16 @@ data/market/**/*.json
 # ── Calibration result outputs (large, reproducible) ─────────────────────────
 results/**/*.npz
 results/**/*.npy
+results/model_comparison_cache/
+results/size_*.json
+results/spx_calibration/
+results/vix_term_structure/
 benchmarks/*.npy
 
 # ── Model artifacts (legacy / archived weights) ───────────────────────────────
 artifacts/legacy/
 artifacts/reports/
+artifacts/models/fno_v2_best.pth
 
 # ── pytest cache ─────────────────────────────────────────────────────────────
 .pytest_cache/
@@ -97,6 +102,9 @@ dev/
 ROADMAP_P4_ONWARDS.md
 *.ORIGINAL_REQUEST.md
 *TIER*ORCHESTRATOR*.md
+PROJECT.md
+TEST_INFRA.md
+TEST_READY.md
 
 # ── Editor workspace files ────────────────────────────────────────────────────
 *.code-workspace
@@ -108,3 +116,18 @@ ROADMAP_P4_ONWARDS.md
 # Generated images (output artifacts from fno_greeks.py etc.)
 images/ai_generated/
 P4_MODEL_ZOO_TASK.md
+
+# ── Phase 7 temporary and research artifacts ─────────────────────────────────
+CONTEXT.md
+ORIGINAL_REQUEST.md
+OVERVIEW.md
+P5_ROADMAP.md
+P6_ROADMAP.md
+ROADMAP.md
+scratch/
+articles/
+research/
+notebooks/generate_notebooks.py
+notebooks/generate_p5_notebooks.py
+notebooks/generate_p6_notebooks.py
+

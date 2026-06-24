@@ -2,7 +2,7 @@ import pytest
 import time
 import numpy as np
 from scipy.integrate import solve_ivp
-from market.vix_pricing import (
+from deepvol.market.vix_pricing import (
     model_vix,
     vix_futures_curve,
     model_variance_swap_rate,
@@ -161,7 +161,7 @@ def test_vix_ode_convergence():
     # We do a manual ODE solve inside to replicate and compare.
     kappa, theta, v0, H = 1.0, 0.08, 0.10, 0.08
     delta = 30/365
-    from pricing_engine import bernstein_factors
+    from deepvol.models.lifted_heston import bernstein_factors
     x, c = bernstein_factors(H, N=20)
     N = len(x)
     
@@ -212,7 +212,7 @@ def test_vix_futures_zero_vol_lower_bound():
 
 
 def test_vix_calibration_normalizer_mismatch():
-    import calibrate
+    import deepvol.calibration.calibrate_bfgs as calibrate
     # Initialise/clear cached normalizers
     calibrate._param_norm = None
     calibrate._iv_norm = None

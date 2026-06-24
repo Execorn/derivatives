@@ -18,7 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from fastapi.testclient import TestClient
-from api.server import app, _MODEL_STATE
+from deepvol.api.server import app, _MODEL_STATE
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -163,7 +163,7 @@ def test_deribit_snapshot_btc_mocked(client):
         "option_type":     ["C", "P"],
     })
 
-    with patch("market.deribit_data.fetch_option_snapshot", new=AsyncMock(return_value=mock_df)):
+    with patch("deepvol.market.deribit_data.fetch_option_snapshot", new=AsyncMock(return_value=mock_df)):
         resp = client.get("/deribit/snapshot?currency=BTC")
 
     assert resp.status_code == 200, resp.text
@@ -190,3 +190,234 @@ def test_openapi_schema(client):
     assert "/greeks" in paths
     assert "/vix" in paths
     assert "/deribit/snapshot" in paths
+
+
+# ── Phase 5-6 Endpoints Tests ──────────────────────────────────────────────────
+
+def test_calibrate_neural_sde(client):
+    # Setup dummy market IV surface (8x11)
+    market_iv = [[0.2] * 11 for _ in range(8)]
+    payload = {
+        "market_iv": market_iv,
+        "S0": 100.0,
+        "r": 0.05,
+        "q": 0.015,
+        "epochs": 2,      # keep it very small for fast unit test
+        "N_paths": 128    # small path count
+    }
+    resp = client.post("/calibrate_neural_sde", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "v0" in body
+    assert "rho" in body
+    assert "final_rmse" in body
+    assert "loss_history" in body
+    assert len(body["loss_history"]) == 2
+    assert body["v0"] > 0.0
+    assert body["rho"] <= 0.0
+
+
+def test_predict_signature_vol(client):
+    # Dummy coefficients (30 elements)
+    ell = [0.0] * 30
+    ell[0] = 0.01   # level 1 time
+    ell[1] = -0.02  # level 1 W
+    payload = {
+        "v0": 0.04,
+        "ell": ell,
+        "rho": -0.5,
+        "T": 0.25,
+        "S0": 100.0,
+        "r": 0.05,
+        "q": 0.015,
+        "N_paths": 128,
+        "strikes": [90.0, 100.0, 110.0]
+    }
+    resp = client.post("/predict/signature_vol", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "strikes" in body
+    assert "implied_vols" in body
+    assert "option_prices" in body
+    assert len(body["implied_vols"]) == 3
+    assert len(body["option_prices"]) == 3
+
+
+def test_hedge_simulate_european(client):
+    payload = {
+        "option_type": "european",
+        "S0": 100.0,
+        "strike": 100.0,
+        "expiry": 0.1,
+        "mu": 0.0,
+        "sigma": 0.2,
+        "steps": 10,
+        "N_paths": 5,
+        "cost_stock": 0.0001,
+        "cost_vol": 0.0005
+    }
+    resp = client.post("/hedge/simulate", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "paths_S" in body
+    assert "paths_vol" in body
+    assert "deltas_stock" in body
+    assert "deltas_vol" in body
+    assert "costs" in body
+    assert "wealth" in body
+    assert "payoff" in body
+    assert "pnl" in body
+    assert "std_pnl" in body
+    assert "final_loss" in body
+    assert len(body["paths_S"]) == 5
+    assert len(body["paths_S"][0]) == 11
+    assert len(body["deltas_stock"][0]) == 10
+
+
+# ── Phase 8 Endpoints Tests ───────────────────────────────────────────────────
+
+def test_greeks_heston_v2(client):
+    payload = {
+        "S": 100.0,
+        "kappa": 1.5,
+        "theta": 0.08,
+        "sigma": 0.5,
+        "rho": -0.7,
+        "v0": 0.08,
+        "H": 0.08
+    }
+    resp = client.post("/greeks/heston", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "delta" in body
+    assert "gamma" in body
+    assert "vega" in body
+    assert len(body["delta"]) == 8
+    assert len(body["delta"][0]) == 11
+
+
+def test_greeks_sabr(client):
+    payload = {
+        "S": 100.0,
+        "alpha": 0.05,
+        "rho": -0.5,
+        "nu": 0.4
+    }
+    resp = client.post("/greeks/sabr", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "delta" in body
+    assert "gamma" in body
+    assert "vega" in body
+
+
+def test_greeks_ssvi(client):
+    payload = {
+        "S": 100.0,
+        "rho": -0.4,
+        "eta": 0.5,
+        "gamma": 0.3,
+        "theta_atm": [0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16]
+    }
+    resp = client.post("/greeks/ssvi", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "delta" in body
+
+
+def test_greeks_rbergomi(client):
+    payload = {
+        "S": 100.0,
+        "v0": 0.04,
+        "H": 0.07,
+        "eta": 1.9,
+        "rho": -0.7
+    }
+    resp = client.post("/greeks/rbergomi", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "delta" in body
+
+
+def test_greeks_invalid_model(client):
+    payload = {
+        "S": 100.0,
+        "alpha": 0.05,
+        "rho": -0.5,
+        "nu": 0.4
+    }
+    resp = client.post("/greeks/invalid_model", json=payload)
+    assert resp.status_code == 400
+
+
+def test_calibrate_heston_extended(client):
+    market_iv = [[0.2] * 11 for _ in range(8)]
+    payload = {
+        "market_iv": market_iv,
+        "n_starts": 1,
+        "max_iter": 5,
+        "tol": 1e-4
+    }
+    resp = client.post("/calibrate/heston", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "params" in body
+    assert "final_mse" in body
+    assert "rmse_bps" in body
+
+
+def test_train_isolated_subprocess(client):
+    payload = {
+        "epochs": 1,
+        "batch_size": 256,
+        "lr": 1e-3
+    }
+    resp = client.post("/train/sabr", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "task_id" in body
+    assert body["status"] == "running"
+    task_id = body["task_id"]
+
+    status_resp = client.get(f"/train/status/{task_id}")
+    assert status_resp.status_code == 200, status_resp.text
+    status_body = status_resp.json()
+    assert status_body["task_id"] == task_id
+    assert status_body["model_name"] == "sabr"
+    assert status_body["status"] in ("running", "completed", "failed")
+
+
+def test_session_calibration_cache_flow(client):
+    market_iv = [[0.2] * 11 for _ in range(8)]
+    payload = {
+        "market_iv": market_iv,
+        "n_starts": 1,
+        "max_iter": 5
+    }
+    resp = client.post("/session/calibrate/sabr", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "session_id" in body
+    assert "params" in body
+    session_id = body["session_id"]
+
+    greeks_payload = {
+        "S": 100.0,
+        "r": 0.05,
+        "q": 0.01
+    }
+    greeks_resp = client.post(f"/session/{session_id}/greeks", json=greeks_payload)
+    assert greeks_resp.status_code == 200, greeks_resp.text
+    greeks_body = greeks_resp.json()
+    assert "delta" in greeks_body
+    assert "gamma" in greeks_body
+    assert "vega" in greeks_body
+
+
+def test_session_not_found(client):
+    greeks_payload = {
+        "S": 100.0
+    }
+    greeks_resp = client.post("/session/non_existent_session_id/greeks", json=greeks_payload)
+    assert greeks_resp.status_code == 404
+

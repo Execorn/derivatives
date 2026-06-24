@@ -15,7 +15,7 @@ CUDA_OK = torch.cuda.is_available()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from calibrate_fast import (
+from deepvol.calibration.calibrate_newton import (
     _reparam_to_6d_with_H,
     _BOUNDS_LOWER_4D,
     _BOUNDS_UPPER_4D,
@@ -120,8 +120,8 @@ class TestCalibrateNewtonH:
     @pytest.fixture(scope="class")
     def fno_v3_model(self):
         """Load FNO v3 (learnable H ∈ [0.04, 0.15])."""
-        from fno_model import MirrorPaddedFNO2d
-        from calibrate import _load_normalizers
+        from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
+        from deepvol.calibration.calibrate_bfgs import _load_normalizers
 
         weights = "artifacts/weights/fno_v3_final_prod.pth"
         if not os.path.exists(weights):
@@ -136,7 +136,7 @@ class TestCalibrateNewtonH:
 
     def test_self_consistency(self, fno_v3_model):
         """calibrate_newton_h on FNO v3 surface should recover H≈0.10 with MSE<1e-3."""
-        from calibrate import _make_spatial_input, _fno_predict_real_iv
+        from deepvol.calibration.calibrate_bfgs import _make_spatial_input, _fno_predict_real_iv
 
         spatial = _make_spatial_input(T_GRID, K_GRID, device=torch.device("cpu"))
         true_p6 = torch.tensor([[2.0, 0.04, 0.50, -0.70, 0.04, 0.10]])
@@ -152,7 +152,7 @@ class TestCalibrateNewtonH:
 
     def test_returns_H_key(self, fno_v3_model):
         """Return dict must contain 'H' key."""
-        from calibrate import _make_spatial_input, _fno_predict_real_iv
+        from deepvol.calibration.calibrate_bfgs import _make_spatial_input, _fno_predict_real_iv
 
         spatial  = _make_spatial_input(T_GRID, K_GRID, device=torch.device("cpu"))
         true_p6  = torch.tensor([[2.0, 0.04, 0.50, -0.70, 0.04, 0.10]])
@@ -165,7 +165,7 @@ class TestCalibrateNewtonH:
 
     def test_theta_history_has_4D(self, fno_v3_model):
         """theta_history entries must have shape (4,) for 4D calibration."""
-        from calibrate import _make_spatial_input, _fno_predict_real_iv
+        from deepvol.calibration.calibrate_bfgs import _make_spatial_input, _fno_predict_real_iv
 
         spatial  = _make_spatial_input(T_GRID, K_GRID, device=torch.device("cpu"))
         true_p6  = torch.tensor([[2.0, 0.04, 0.40, -0.50, 0.08, 0.10]])

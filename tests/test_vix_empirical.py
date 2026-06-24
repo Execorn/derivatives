@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 import time
-from market.vix_pricing import (
+from deepvol.market.vix_pricing import (
     model_vix,
     vix_futures_curve,
     model_variance_swap_rate

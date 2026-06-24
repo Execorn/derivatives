@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from market.deribit_ws import (
+from deepvol.market.deribit_ws import (
     DeribitWSClient,
     _parse_tick,
     _tte_years,
@@ -219,7 +219,7 @@ async def test_connect_disconnect_mock():
     mock_session.ws_connect = AsyncMock(return_value=mock_ws)
     mock_session.closed = False
 
-    with patch("market.deribit_ws.aiohttp.ClientSession", return_value=mock_session):
+    with patch("deepvol.market.deribit_ws.aiohttp.ClientSession", return_value=mock_session):
         client = DeribitWSClient()
         await client.connect()
         assert client._connected
@@ -245,7 +245,7 @@ async def test_subscribe_ticker_sends_jsonrpc():
     mock_session.ws_connect = AsyncMock(return_value=mock_ws)
     mock_session.closed = False
 
-    with patch("market.deribit_ws.aiohttp.ClientSession", return_value=mock_session):
+    with patch("deepvol.market.deribit_ws.aiohttp.ClientSession", return_value=mock_session):
         client = DeribitWSClient()
         client._ws = mock_ws
         client._connected = True

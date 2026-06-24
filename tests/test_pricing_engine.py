@@ -2,7 +2,7 @@ import pytest
 import torch
 import numpy as np
 from scipy.stats import qmc
-from pricing_engine_gpu import price_batch_gpu
+from deepvol.models.lifted_heston_gpu import price_batch_gpu
 
 # Mark the whole module to skip if CUDA is not available
 pytestmark = pytest.mark.skipif(

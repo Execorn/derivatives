@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from market.vix_pricing import (
+from deepvol.market.vix_pricing import (
     model_vix,
     vix_futures_curve,
     download_vix_futures,

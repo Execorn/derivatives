@@ -6,7 +6,7 @@ from datetime import date
 from pathlib import Path
 import json
 
-from market.spx_data import download_spx_chain, clean_chain, to_iv_surface, calibrate_to_market
+from deepvol.market.spx_data import download_spx_chain, clean_chain, to_iv_surface, calibrate_to_market
 
 # Mark the whole module to skip if CUDA is not available
 # Wait, FNO calibration runs on CPU as well if CUDA is not available.

@@ -1,6 +1,6 @@
 import torch
 import pytest
-from calibrate_fast import _reparam_to_6d
+from deepvol.calibration.calibrate_newton import _reparam_to_6d
 
 def test_reparam_to_6d_values():
     device = torch.device("cpu")

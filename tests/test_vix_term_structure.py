@@ -6,12 +6,12 @@ import pytest
 import numpy as np
 import pandas as pd
 from datetime import date, datetime
-from market.vix_futures import (
+from deepvol.market.vix_futures import (
     get_vix_expiry,
     get_active_vix_months,
     fetch_vix_futures
 )
-from calibration.joint_calibration import (
+from deepvol.calibration.joint_calibration import (
     joint_multitenor_loss,
     calibrate_joint_multitenor,
     BOUNDS
@@ -83,7 +83,7 @@ def test_joint_loss_multitenor_sanity():
     dummy_vix_fut = np.array([14.0, 15.0, 16.0])
     vix_maturities = np.array([0.1, 0.3, 0.5])
     
-    from calibration.joint_calibration import _get_assets
+    from deepvol.calibration.joint_calibration import _get_assets
     model, pn, yn, device = _get_assets()
     
     params = np.array([1.0, 0.08, 0.8, -0.34, 0.10, 0.08])
@@ -100,8 +100,8 @@ def test_zero_noise_recovery():
     true_params = np.array([2.5, 0.08, 0.55, -0.5, 0.08, 0.095])
     vix_maturities = np.array([0.083, 0.25, 0.5])
     
-    from calibration.joint_calibration import _get_assets, _fno_predict
-    from market.vix_pricing import vix_futures_curve
+    from deepvol.calibration.joint_calibration import _get_assets, _fno_predict
+    from deepvol.market.vix_pricing import vix_futures_curve
     model, pn, yn, device = _get_assets()
     
     target_spx = _fno_predict(true_params, model, pn, yn, device)

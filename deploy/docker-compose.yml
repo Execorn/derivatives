@@ -1,0 +1,133 @@
+version: '3.8'
+
+services:
+  # Kafka in KRaft mode (single broker, no Zookeeper required)
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: deepvol-kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:29092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    restart: unless-stopped
+
+  # Redis Cache Layer
+  redis:
+    image: redis:7.2-alpine
+    container_name: deepvol-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    restart: unless-stopped
+
+  # PostgreSQL Database (Archive Store) - Tuned for connection pool scaling
+  postgres:
+    image: postgres:16-alpine
+    container_name: deepvol-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: deepvol
+      POSTGRES_PASSWORD: deepvol_password
+      POSTGRES_DB: deepvol_archive
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=512MB
+      -c work_mem=16MB
+      -c maintenance_work_mem=64MB
+      -c effective_cache_size=1536MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deepvol -d deepvol_archive"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # FastAPI Gateway Server
+  api:
+    image: deepvol-api:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: deepvol-api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DB_URL=postgresql://deepvol:deepvol_password@postgres:5432/deepvol_archive
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      # PostgreSQL Connection Pool configuration
+      - PG_POOL_MIN_SIZE=10
+      - PG_POOL_MAX_SIZE=50
+      - PG_POOL_TIMEOUT=30.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      kafka:
+        condition: service_started
+    restart: unless-stopped
+
+  # GPU Worker / Calibration Service
+  worker:
+    image: deepvol-worker:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: deepvol-worker
+    command: python -m deepvol.calibration.worker
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=option-quotes
+      - DEVICE=cuda
+      # PostgreSQL Connection Pool configuration (if worker writes directly to DB)
+      - PG_POOL_MIN_SIZE=5
+      - PG_POOL_MAX_SIZE=20
+      - PG_POOL_TIMEOUT=30.0
+      # Kafka Consumer Performance Tuning
+      - KAFKA_MAX_POLL_RECORDS=500
+      - KAFKA_FETCH_MIN_BYTES=1024
+      - KAFKA_FETCH_MAX_WAIT_MS=100
+      - KAFKA_SESSION_TIMEOUT_MS=30000
+      - KAFKA_MAX_POLL_INTERVAL_MS=300000
+      - KAFKA_AUTO_OFFSET_RESET=latest
+      - KAFKA_ENABLE_AUTO_COMMIT=false
+      - KAFKA_PARTITION_ASSIGNMENT_STRATEGY=org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      - kafka
+      - redis
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  postgres_data:

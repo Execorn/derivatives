@@ -2,14 +2,14 @@ import pytest
 import numpy as np
 import torch
 import time
-from greeks.portfolio_greeks import (
+from deepvol.greeks.portfolio_greeks import (
     bs_greeks,
     fno_parameter_jacobian,
     fno_surface_greeks,
     portfolio_greeks,
     pnl_attribution
 )
-from normalizers import ParameterNormalizer, IVSurfaceNormalizer
+from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
 
 def test_bs_greeks_extreme_t_sigma():
     """Test bs_greeks for extreme small and large inputs to check robustness."""

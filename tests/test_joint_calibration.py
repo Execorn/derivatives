@@ -14,14 +14,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from calibration.joint_calibration import (
+from deepvol.calibration.joint_calibration import (
     BOUNDS,
     calibrate_joint,
     calibrate_spx_only,
     calibrate_vix_only,
     joint_loss,
 )
-from market.vix_pricing import model_vix
+from deepvol.market.vix_pricing import model_vix
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -41,7 +41,7 @@ _VIX_OBSERVED = model_vix(**_TRUE_THETA)   # ground-truth VIX level
 @pytest.fixture(scope="module")
 def synthetic_surface():
     """Generate a synthetic (8,11) IV surface from the ground-truth parameters."""
-    from calibration.joint_calibration import _fno_predict, _get_assets
+    from deepvol.calibration.joint_calibration import _fno_predict, _get_assets
     model, pn, yn, device = _get_assets()
     surface = _fno_predict(_TRUE_ARR, model, pn, yn, device)
     assert surface.shape == (8, 11)
@@ -66,7 +66,7 @@ def test_true_params_within_bounds():
 # ── joint_loss ────────────────────────────────────────────────────────────────
 
 def test_joint_loss_returns_finite(synthetic_surface):
-    from calibration.joint_calibration import _get_assets
+    from deepvol.calibration.joint_calibration import _get_assets
     model, pn, yn, device = _get_assets()
     loss = joint_loss(
         _TRUE_ARR, synthetic_surface, _VIX_OBSERVED,
@@ -77,7 +77,7 @@ def test_joint_loss_returns_finite(synthetic_surface):
 
 def test_joint_loss_lower_at_true_params(synthetic_surface):
     """Loss should be lower at the true params than at a random point."""
-    from calibration.joint_calibration import _get_assets
+    from deepvol.calibration.joint_calibration import _get_assets
     model, pn, yn, device = _get_assets()
 
     rng = np.random.default_rng(0)
@@ -101,7 +101,7 @@ def test_joint_loss_lower_at_true_params(synthetic_surface):
 
 def test_joint_loss_vix_weight_zero(synthetic_surface):
     """With w_vix=0, loss should equal the SPX-only RMSE term."""
-    from calibration.joint_calibration import _get_assets, _fno_predict, _rmse_bps
+    from deepvol.calibration.joint_calibration import _get_assets, _fno_predict, _rmse_bps
     model, pn, yn, device = _get_assets()
     loss = joint_loss(
         _TRUE_ARR, synthetic_surface, 9999.0,   # absurd VIX — should not matter
