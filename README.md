@@ -790,6 +790,10 @@ pdflatex -interaction=nonstopmode main.tex
 | **P1**: FNO Surrogate | Complete | FNO v1/v2/v3, FIM reparameterization, Newton calibrator, Streamlit |
 | **P2**: Market Extensions | Complete | FastAPI, VIX futures, Deribit streaming, variance swaps, batch calibration |
 | **P3**: GPU-Native | Complete | GPU Gauss-Newton, SVI arbitrage enforcement, portfolio Greeks, P&L attribution |
+| **P4**: Model Zoo | Complete | Standalone Classic Heston, SABR (Hagan/Normal) & SSVI, Local Volatility (Dupire), and Rough Bergomi (Bennedsen hybrid scheme on GPU) |
+| **P5**: Neural SDE & Signature | Complete | Lifted Heston factor study, Neural SDE (prior training + adjoint calibration), and Signature Volatility (pathwise smile forecasting) |
+| **P6**: Recurrent Deep Hedging | Complete | Recurrent Deep Hedging (European/DOBC Barrier LSTM policy) and Robust Minimax GAN market generation |
+
 
 ---
 

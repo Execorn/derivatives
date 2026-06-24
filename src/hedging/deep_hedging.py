@@ -157,7 +157,7 @@ class DeepHedgingEnv:
                 S_0 = self.H[:, :, 0]
                 log_returns = torch.log(torch.clamp(S_0[:, 1:] / torch.clamp(S_0[:, :-1], min=1e-5), min=1e-5))  # (N_paths, N_t)
                 windows = log_returns.unfold(dimension=-1, size=5, step=1)  # (N_paths, N_t - 4, 5)
-                vol_proxy_windows = torch.std(windows, dim=-1, keepdim=True) * 15.874507866387544  # (N_paths, N_t - 4, 1)
+                vol_proxy_windows = torch.std(windows, dim=-1, keepdim=True) * np.sqrt(1.0 / self.dt)  # (N_paths, N_t - 4, 1)
                 self._precomputed_vol_proxy[:, 5:self.N_t + 1] = vol_proxy_windows
         else:
             self._precomputed_log_moneyness = None
@@ -220,7 +220,7 @@ class DeepHedgingEnv:
         
         if self.risk_measure == "entropic":
             # Entropy / Exponential utility loss: E[exp(-lambda * HE)]
-            loss = torch.mean(torch.exp(-self.risk_aversion * hedging_error))
+            loss = torch.mean(torch.exp(torch.clamp(-self.risk_aversion * hedging_error, max=20.0)))
         elif self.risk_measure == "quad":
             # Mean Squared Error: E[HE^2]
             loss = torch.mean(hedging_error ** 2)
@@ -266,7 +266,7 @@ def train_deep_hedger(
             
             # Slice H and payoff for the current batch
             batch_H = env.H[batch_idx]
-            batch_payoff = env.payoff[batch_idx]
+            batch_payoff = env.payoff[batch_idx] if env.payoff is not None else None
             
             # Create a local sub-env for this batch
             from hedging.barrier_hedging import BarrierHedgingEnv
@@ -309,7 +309,9 @@ def train_deep_hedger(
         losses.append(avg_loss)
         
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:03d}/{epochs:03d} | Loss: {avg_loss:.6f}")
+            mem_allocated = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0.0
+            mem_reserved = torch.cuda.max_memory_reserved() / 1e6 if torch.cuda.is_available() else 0.0
+            print(f"Epoch {epoch+1:03d}/{epochs:03d} | Loss: {avg_loss:.6f} | GPU Mem: {mem_allocated:.1f}MB/{mem_reserved:.1f}MB")
             
     return losses
 

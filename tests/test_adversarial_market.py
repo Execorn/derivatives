@@ -66,7 +66,7 @@ def test_minimax_training_step():
     # Initialize networks
     generator = WGAN_GP_Generator(latent_dim=latent_dim, seq_len=seq_len, hidden_dim=16)
     discriminator = WGAN_GP_Discriminator(seq_len=seq_len, hidden_dim=16)
-    policy = HedgingPolicy(input_dim=5, hidden_dim=16, output_dim=2)  # d = 2 instruments
+    policy = HedgingPolicy(input_dim=4, hidden_dim=16, output_dim=1)  # d = 1 instrument (stock price only)
     
     # Run a single epoch of minimax training
     train_robust_minimax_hedger(

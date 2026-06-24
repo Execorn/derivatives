@@ -15,12 +15,38 @@ import numpy as np
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, repo_root)
 
-from src.hedging.deep_hedging import HedgingPolicy
-from src.hedging.adversarial_market import (
+from hedging.deep_hedging import HedgingPolicy
+from hedging.adversarial_market import (
     WGAN_GP_Generator,
     WGAN_GP_Discriminator,
     train_robust_minimax_hedger
 )
+
+
+def simulate_heston_returns(num_paths, seq_len, device):
+    """
+    Simulates log-returns under the Heston model to act as a target dataset
+    possessing realistic stylized facts (fat tails, mean-reverting vol, leverage effect).
+    """
+    v0 = 0.000225    # daily variance (standard deviation of 1.5%)
+    kappa = 0.05     # daily mean reversion
+    theta = 0.000225
+    sigma_v = 0.0005 # daily vol of vol
+    rho = -0.6       # correlation (leverage effect)
+    
+    V = torch.full((num_paths,), v0, device=device)
+    returns = torch.zeros(num_paths, seq_len, device=device)
+    
+    for t in range(seq_len):
+        Z1 = torch.randn(num_paths, device=device)
+        Z2 = torch.randn(num_paths, device=device)
+        W_S = Z1
+        W_v = rho * Z1 + np.sqrt(1 - rho**2) * Z2
+        
+        returns[:, t] = -0.5 * V + torch.sqrt(torch.clamp(V, min=1e-8)) * W_S
+        V = torch.clamp(V + kappa * (theta - V) + sigma_v * torch.sqrt(torch.clamp(V, min=1e-8)) * W_v, min=1e-8)
+        
+    return returns
 
 
 def main():
@@ -33,7 +59,7 @@ def main():
     parser.add_argument("--seq_len", type=int, default=252, help="Sequence length of path (days)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to train on")
-    parser.add_argument("--risk_measure", type=str, default="quad", choices=["entropic", "quad"],
+    parser.add_argument("--risk_measure", type=str, default="entropic", choices=["entropic", "quad"],
                         help="Risk measure for DeepHedgingEnv")
     
     args = parser.parse_args()
@@ -45,8 +71,8 @@ def main():
     np.random.seed(42)
     
     print("Generating mock historical returns data...")
-    # Simulate stylized returns (GBM returns with small noise)
-    real_returns = torch.randn(10000, args.seq_len, device=args.device) * 0.015 - 0.0001
+    # Simulate stylized returns under the Heston model
+    real_returns = simulate_heston_returns(80000, args.seq_len, args.device)
     
     # Target stylized facts stats calculated from real market returns:
     # Autocorrelation of absolute returns (ACF) target (lag 1 to 20 decay)
@@ -57,12 +83,12 @@ def main():
     real_cfvc_matrix = torch.eye(4, device=args.device) * 0.8 + 0.2
     
     # 2. Initialize Networks
-    # d = 2 instruments (stock price and vol proxy)
-    d = 2
+    # d = 1 tradeable instrument (stock price only, vol proxy is purely a state variable)
+    d = 1
     generator = WGAN_GP_Generator(latent_dim=args.latent_dim, seq_len=args.seq_len, hidden_dim=64).to(args.device)
     discriminator = WGAN_GP_Discriminator(seq_len=args.seq_len, hidden_dim=64).to(args.device)
-    # State dimension: log_moneyness (1), time_to_expiry (1), vol_proxy (1), prev_delta (d=2) = 5
-    policy = HedgingPolicy(input_dim=5, hidden_dim=64, output_dim=d).to(args.device)
+    # State dimension: log_moneyness (1), time_to_expiry (1), vol_proxy (1), prev_delta (d=1) = 4
+    policy = HedgingPolicy(input_dim=4, hidden_dim=64, output_dim=d).to(args.device)
     
     # 3. Train
     print("Training minimax robust networks...")

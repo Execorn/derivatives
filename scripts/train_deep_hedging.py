@@ -16,8 +16,8 @@ import numpy as np
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, repo_root)
 
-from src.hedging.deep_hedging import HedgingPolicy, DeepHedgingEnv, train_deep_hedger
-from src.hedging.barrier_hedging import BarrierHedgingEnv
+from hedging.deep_hedging import HedgingPolicy, DeepHedgingEnv, train_deep_hedger
+from hedging.barrier_hedging import BarrierHedgingEnv
 
 
 def simulate_gbm_paths(S0, mu, sigma, T, steps, N_paths, d=1, device="cpu"):

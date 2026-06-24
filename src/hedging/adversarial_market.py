@@ -52,9 +52,8 @@ class WGAN_GP_Generator(nn.Module):
         paths = self.conv(x)  # (batch_size, 2, seq_len)
         
         # Apply physical constraints:
-        # Returns: unconstrained
-        # Volatility: positive, constrained via softplus to avoid collapse
-        ret = paths[:, 0, :]
+        # Returns: bounded to [-0.1, 0.1] to prevent exponential price explosion in minimax training
+        ret = torch.clamp(paths[:, 0, :], min=-0.1, max=0.1)
         vol = torch.clamp(torch.nn.functional.softplus(paths[:, 1, :]), min=1e-4, max=2.0)
         
         return torch.stack([ret, vol], dim=1)
@@ -154,7 +153,7 @@ class StylizedFactsAlignmentGAN:
         )[0]
         
         gradients = gradients.view(batch_size, -1)
-        gradient_norm = gradients.norm(2, dim=-1)
+        gradient_norm = torch.sqrt(torch.sum(gradients ** 2, dim=-1) + 1e-8)
         gp = torch.mean((gradient_norm - 1.0) ** 2)
         return gp
 
@@ -316,6 +315,10 @@ def train_robust_minimax_hedger(
             fake_ret = fake_samples[:, 0, :]
             fake_vol = fake_samples[:, 1, :]
             
+            # Enforce mean return alignment (martingale drift constraint)
+            real_mean = torch.mean(real_ret_batch, dim=-1, keepdim=True)
+            fake_ret = fake_ret - torch.mean(fake_ret, dim=-1, keepdim=True) + real_mean
+            
             # WGAN generator loss
             d_fake = discriminator(fake_samples)
             g_loss_adv = -torch.mean(d_fake)
@@ -326,19 +329,25 @@ def train_robust_minimax_hedger(
             )
             g_loss_sf = sfag.w_gpd * l_gpd + sfag.w_acf * l_acf + sfag.w_lev * l_lev + sfag.w_cfvc * l_cfvc
             
+            # Prevent scale collapse by penalizing standard deviation and mean mismatch (L2 loss)
+            loss_scale = torch.mean((torch.std(fake_ret, dim=-1) - torch.std(real_ret_batch, dim=-1)) ** 2)
+            loss_mean = torch.mean((torch.mean(fake_ret, dim=-1) - torch.mean(real_ret_batch, dim=-1)) ** 2)
+            g_loss_sf = g_loss_sf + 100.0 * loss_scale + 100.0 * loss_mean
+            
             # Convert generated paths to prices for hedging evaluation
             H = convert_returns_to_prices(fake_ret, fake_vol)
             
             # Evaluate option payoff (e.g. Call option)
             S_T = H[:, -1, 0]
-            payoff = torch.clamp(S_T - strike, min=0.0)
+            # Cap payoff to prevent generator from exploiting infinite payoff limits in minimax training
+            payoff = torch.clamp(S_T - strike, min=0.0, max=500.0)
             
             # Sub-environment for minimax calculation
-            # Cost coeffs: 1 bp on stock, 5 bps on vol option
+            # Cost coeffs: 1 bp on stock
             if cost_coeffs_list is None:
-                cost_coeffs_list = [0.0001, 0.0005]
+                cost_coeffs_list = [0.0001]
             cost_coeffs = torch.tensor(cost_coeffs_list, device=device)
-            env = DeepHedgingEnv(H=H, payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure, strike=strike)
+            env = DeepHedgingEnv(H=H[:, :, 0:1], payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure, strike=strike)
             
             # Run simulation with the CURRENT policy
             # (Generator tries to MAXIMIZE this loss to find worst-case paths)
@@ -366,11 +375,17 @@ def train_robust_minimax_hedger(
                 fake_samples = generator(z)
                 fake_ret = fake_samples[:, 0, :]
                 fake_vol = fake_samples[:, 1, :]
+                
+                # Enforce mean return alignment (martingale drift constraint)
+                real_mean = torch.mean(real_ret_batch, dim=-1, keepdim=True)
+                fake_ret = fake_ret - torch.mean(fake_ret, dim=-1, keepdim=True) + real_mean
+                
                 H = convert_returns_to_prices(fake_ret, fake_vol)
                 S_T = H[:, -1, 0]
-                payoff = torch.clamp(S_T - 100.0, min=0.0)
+                # Cap payoff to prevent generator from exploiting infinite payoff limits in minimax training
+                payoff = torch.clamp(S_T - 100.0, min=0.0, max=500.0)
                 
-            env_hedger = DeepHedgingEnv(H=H, payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure)
+            env_hedger = DeepHedgingEnv(H=H[:, :, 0:1], payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure)
             
             # Optimize policy parameters to MINIMIZE hedging loss
             wealth, _, _ = env_hedger.simulate_hedging_episode(policy)
@@ -381,6 +396,8 @@ def train_robust_minimax_hedger(
             hedge_loss_val += p_loss.item()
             
         # Print progress every epoch to monitor training speed and metrics dynamically
-        print(f"Epoch {epoch+1:03d}/{epochs:03d} | Disc: {disc_loss_val/num_batches:.4f} | Gen: {gen_loss_val/num_batches:.4f} | Hedge: {hedge_loss_val/num_batches:.4f}")
+        mem_allocated = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0.0
+        mem_reserved = torch.cuda.max_memory_reserved() / 1e6 if torch.cuda.is_available() else 0.0
+        print(f"Epoch {epoch+1:03d}/{epochs:03d} | Disc: {disc_loss_val/num_batches:.4f} | Gen: {gen_loss_val/num_batches:.4f} | Hedge: {hedge_loss_val/num_batches:.4f} | GPU Mem: {mem_allocated:.1f}MB/{mem_reserved:.1f}MB")
             
     print("Minimax Deep Hedging Training COMPLETE.")
