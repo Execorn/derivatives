@@ -1,0 +1,305 @@
+{
+  "metadata": {
+    "os": "Linux",
+    "python_version": "3.9.25",
+    "cpu": "AMD Ryzen 5 5600H with Radeon Graphics",
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "cuda_available": true
+  },
+  "results": {
+    "calibrate_newton": {
+      "cpu": {
+        "full_calibration": {
+          "mean_ms": 1217.3044870000012,
+          "std_ms": 8.624030940138997,
+          "min_ms": 1207.0730369996454,
+          "max_ms": 1231.972014999883,
+          "median_ms": 1214.0700359996117
+        },
+        "breakdown_ms": {
+          "fno_forward": 3.997339399984412,
+          "jacobian": 16.354271349882765,
+          "lm_solver": 0.2294288999564742,
+          "parameter_update": 4.388359899940042,
+          "total_step": 24.969399549763697
+        }
+      },
+      "cuda": {
+        "full_calibration": {
+          "mean_ms": 721.9305376002012,
+          "std_ms": 0.35689643604178295,
+          "min_ms": 721.4175389999582,
+          "max_ms": 722.3917560004338,
+          "median_ms": 721.8464349998612
+        },
+        "breakdown_ms": {
+          "fno_forward": 2.082245699921259,
+          "jacobian": 9.937707450035305,
+          "lm_solver": 0.1692607000222779,
+          "parameter_update": 2.2301316501852853,
+          "total_step": 14.419345500164127
+        },
+        "speedups": {
+          "full_calibration": 1.6861795194957299,
+          "fno_forward": 1.9197251314460984,
+          "jacobian": 1.6456784859192715,
+          "lm_solver": 1.3554764923356517,
+          "parameter_update": 1.9677582261008875,
+          "total_step": 1.7316597032423895
+        }
+      }
+    },
+    "calibrate_newton_h": {
+      "cpu": {
+        "full_calibration": {
+          "mean_ms": 52.82249040010356,
+          "std_ms": 0.6487870421667543,
+          "min_ms": 52.15588300052332,
+          "max_ms": 53.9191670004584,
+          "median_ms": 52.49391499910416
+        },
+        "breakdown_ms": {
+          "fno_forward": 4.813337250061522,
+          "jacobian": 17.48107005005295,
+          "lm_solver": 0.3646623998974974,
+          "parameter_update": 0.020435550050024176,
+          "total_step": 22.679505250061993
+        }
+      },
+      "cuda": {
+        "full_calibration": {
+          "mean_ms": 31.60621419974632,
+          "std_ms": 2.3667477157679295,
+          "min_ms": 29.668225999557762,
+          "max_ms": 36.20894699997734,
+          "median_ms": 30.580773999645317
+        },
+        "breakdown_ms": {
+          "fno_forward": 2.3828921500353317,
+          "jacobian": 9.652880049816304,
+          "lm_solver": 0.3727751500264276,
+          "parameter_update": 0.04657019999285694,
+          "total_step": 12.45511754987092
+        },
+        "speedups": {
+          "full_calibration": 1.671269139235522,
+          "fno_forward": 2.01995598079844,
+          "jacobian": 1.810969364566549,
+          "lm_solver": 0.978236880520724,
+          "parameter_update": 0.43881173053065337,
+          "total_step": 1.8208985310055974
+        }
+      }
+    },
+    "calibrate_batch_1": {
+      "cpu": {
+        "full_calibration": {
+          "mean_ms": 1095.923734599819,
+          "std_ms": 15.621592364138968,
+          "min_ms": 1076.1990350001724,
+          "max_ms": 1112.872088999211,
+          "median_ms": 1098.0256969996844
+        },
+        "breakdown_ms": {
+          "fno_forward": 6.421440850044746,
+          "jacobian": 49.515148549971855,
+          "lm_solver": 0.19393875004425354,
+          "parameter_update": 16.692468700102836,
+          "total_step": 72.82299685016369
+        }
+      },
+      "cuda": {
+        "full_calibration": {
+          "mean_ms": 386.1584648002463,
+          "std_ms": 1.9875988767932586,
+          "min_ms": 383.8121830003729,
+          "max_ms": 389.5396010002514,
+          "median_ms": 385.38885400066647
+        },
+        "breakdown_ms": {
+          "fno_forward": 3.2109463000324467,
+          "jacobian": 10.941451200005758,
+          "lm_solver": 0.2639971499775129,
+          "parameter_update": 11.454890650202287,
+          "total_step": 25.871285300218005
+        },
+        "speedups": {
+          "full_calibration": 2.8380155674347916,
+          "fno_forward": 1.9998593093817412,
+          "jacobian": 4.525464460321844,
+          "lm_solver": 0.7346244081073342,
+          "parameter_update": 1.4572350980764759,
+          "total_step": 2.814819441906508
+        }
+      }
+    },
+    "calibrate_batch_4": {
+      "cpu": {
+        "full_calibration": {
+          "mean_ms": 4353.18522960024,
+          "std_ms": 11.93512185601161,
+          "min_ms": 4340.996466000433,
+          "max_ms": 4368.012068000098,
+          "median_ms": 4345.0613720006
+        },
+        "breakdown_ms": {
+          "fno_forward": 29.731944450077208,
+          "jacobian": 197.28366719991755,
+          "lm_solver": 0.21951480011921376,
+          "parameter_update": 63.3426392999354,
+          "total_step": 290.5777657500494
+        }
+      },
+      "cuda": {
+        "full_calibration": {
+          "mean_ms": 394.5574748000581,
+          "std_ms": 9.77246955938023,
+          "min_ms": 387.5942410004427,
+          "max_ms": 413.8368140002058,
+          "median_ms": 390.7245349992081
+        },
+        "breakdown_ms": {
+          "fno_forward": 3.2573314500496053,
+          "jacobian": 11.010451149877554,
+          "lm_solver": 0.27018169998882513,
+          "parameter_update": 11.583433899886586,
+          "total_step": 26.12139819980257
+        },
+        "speedups": {
+          "full_calibration": 11.033082649888245,
+          "fno_forward": 9.127700053252003,
+          "jacobian": 17.917855001074276,
+          "lm_solver": 0.8124710153511249,
+          "parameter_update": 5.468381815564691,
+          "total_step": 11.1241275649726
+        }
+      }
+    },
+    "calibrate_batch_16": {
+      "cpu": {
+        "full_calibration": {
+          "mean_ms": 17836.78292880013,
+          "std_ms": 770.4355689658152,
+          "min_ms": 16987.10939099965,
+          "max_ms": 19105.908844000624,
+          "median_ms": 17493.01789600031
+        },
+        "breakdown_ms": {
+          "fno_forward": 113.73505995006781,
+          "jacobian": 719.6893951498623,
+          "lm_solver": 0.22950124985072762,
+          "parameter_update": 253.0090747000486,
+          "total_step": 1086.6630310498294
+        }
+      },
+      "cuda": {
+        "full_calibration": {
+          "mean_ms": 645.6604657998469,
+          "std_ms": 7.651267543011381,
+          "min_ms": 639.8056709995217,
+          "max_ms": 660.4482880002251,
+          "median_ms": 643.2610060001025
+        },
+        "breakdown_ms": {
+          "fno_forward": 4.100939500040113,
+          "jacobian": 27.24401284999658,
+          "lm_solver": 0.2882322000004933,
+          "parameter_update": 14.579743949889235,
+          "total_step": 46.21292849992642
+        },
+        "speedups": {
+          "full_calibration": 27.62563897528378,
+          "fno_forward": 27.73390340163646,
+          "jacobian": 26.41642400891588,
+          "lm_solver": 0.7962373733758228,
+          "parameter_update": 17.353464887287732,
+          "total_step": 23.51426465110428
+        }
+      }
+    },
+    "calibrate_batch_32": {
+      "cpu": {
+        "full_calibration": {
+          "mean_ms": 33309.72272280014,
+          "std_ms": 655.2960818339017,
+          "min_ms": 32499.42328399993,
+          "max_ms": 34410.331887999746,
+          "median_ms": 33061.88463000035
+        },
+        "breakdown_ms": {
+          "fno_forward": 234.4525428999532,
+          "jacobian": 1461.2213178499132,
+          "lm_solver": 0.27595699980338395,
+          "parameter_update": 517.0915611000055,
+          "total_step": 2213.0413788496753
+        }
+      },
+      "cuda": {
+        "full_calibration": {
+          "mean_ms": 1276.1015238002074,
+          "std_ms": 2.082136924190776,
+          "min_ms": 1272.3787420000008,
+          "max_ms": 1278.1944320004186,
+          "median_ms": 1277.1015510006691
+        },
+        "breakdown_ms": {
+          "fno_forward": 7.570833700083313,
+          "jacobian": 50.58552465015964,
+          "lm_solver": 0.2965501500057144,
+          "parameter_update": 29.897604299912928,
+          "total_step": 88.3505128001616
+        },
+        "speedups": {
+          "full_calibration": 26.102721532378073,
+          "fno_forward": 30.967863274737255,
+          "jacobian": 28.886155238192273,
+          "lm_solver": 0.9305576132673222,
+          "parameter_update": 17.295417917532323,
+          "total_step": 25.04842709691242
+        }
+      }
+    },
+    "calibrate_batch_64": {
+      "cpu": {
+        "full_calibration": {
+          "mean_ms": 66254.78829279964,
+          "std_ms": 917.4353431147612,
+          "min_ms": 65334.63296899936,
+          "max_ms": 67935.48926399945,
+          "median_ms": 66139.41764899937
+        },
+        "breakdown_ms": {
+          "fno_forward": 481.6901024999879,
+          "jacobian": 3052.4180473000342,
+          "lm_solver": 0.34925599989037437,
+          "parameter_update": 1074.3376410500332,
+          "total_step": 4608.795046849946
+        }
+      },
+      "cuda": {
+        "full_calibration": {
+          "mean_ms": 2529.18678979986,
+          "std_ms": 1.680843915372692,
+          "min_ms": 2526.354191999417,
+          "max_ms": 2531.3829070000793,
+          "median_ms": 2529.5221819997096
+        },
+        "breakdown_ms": {
+          "fno_forward": 14.313195299973813,
+          "jacobian": 98.82835610005714,
+          "lm_solver": 0.314942949989927,
+          "parameter_update": 57.68192519981312,
+          "total_step": 171.138419549834
+        },
+        "speedups": {
+          "full_calibration": 26.196083484226378,
+          "fno_forward": 33.65356878075081,
+          "jacobian": 30.88605505296136,
+          "lm_solver": 1.1089500492122297,
+          "parameter_update": 18.625204296293386,
+          "total_step": 26.930218585476098
+        }
+      }
+    }
+  }
+}
