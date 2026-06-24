@@ -111,11 +111,11 @@ class IVSurfaceNormalizer:
 
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-DATASET_PATH = os.path.join(repo_root, "data", "rBergomiDataset_v1.npz")
-EPOCHS = 3 if '--smoke' in sys.argv else 500
-BATCH_SIZE = 512
-LR = 3e-4
-SWA_START = 2 if '--smoke' in sys.argv else 400
+DATASET_PATH = os.environ.get("DATASET_PATH", os.path.join(repo_root, "data", "rBergomiDataset_v1.npz"))
+EPOCHS = int(os.environ.get("EPOCHS", 3 if '--smoke' in sys.argv else 500))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 512))
+LR = float(os.environ.get("LR", 3e-4))
+SWA_START = int(os.environ.get("SWA_START", 2 if '--smoke' in sys.argv else 400))
 
 WEIGHTS_BEST = os.path.join(repo_root, "artifacts", "weights", "fno_rbergomi_best.pth")
 WEIGHTS_PROD = os.path.join(repo_root, "artifacts", "weights", "fno_rbergomi_final_prod.pth")

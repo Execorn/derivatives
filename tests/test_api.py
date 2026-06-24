@@ -273,3 +273,151 @@ def test_hedge_simulate_european(client):
     assert len(body["paths_S"][0]) == 11
     assert len(body["deltas_stock"][0]) == 10
 
+
+# ── Phase 8 Endpoints Tests ───────────────────────────────────────────────────
+
+def test_greeks_heston_v2(client):
+    payload = {
+        "S": 100.0,
+        "kappa": 1.5,
+        "theta": 0.08,
+        "sigma": 0.5,
+        "rho": -0.7,
+        "v0": 0.08,
+        "H": 0.08
+    }
+    resp = client.post("/greeks/heston", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "delta" in body
+    assert "gamma" in body
+    assert "vega" in body
+    assert len(body["delta"]) == 8
+    assert len(body["delta"][0]) == 11
+
+
+def test_greeks_sabr(client):
+    payload = {
+        "S": 100.0,
+        "alpha": 0.05,
+        "rho": -0.5,
+        "nu": 0.4
+    }
+    resp = client.post("/greeks/sabr", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "delta" in body
+    assert "gamma" in body
+    assert "vega" in body
+
+
+def test_greeks_ssvi(client):
+    payload = {
+        "S": 100.0,
+        "rho": -0.4,
+        "eta": 0.5,
+        "gamma": 0.3,
+        "theta_atm": [0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16]
+    }
+    resp = client.post("/greeks/ssvi", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "delta" in body
+
+
+def test_greeks_rbergomi(client):
+    payload = {
+        "S": 100.0,
+        "v0": 0.04,
+        "H": 0.07,
+        "eta": 1.9,
+        "rho": -0.7
+    }
+    resp = client.post("/greeks/rbergomi", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "delta" in body
+
+
+def test_greeks_invalid_model(client):
+    payload = {
+        "S": 100.0,
+        "alpha": 0.05,
+        "rho": -0.5,
+        "nu": 0.4
+    }
+    resp = client.post("/greeks/invalid_model", json=payload)
+    assert resp.status_code == 400
+
+
+def test_calibrate_heston_extended(client):
+    market_iv = [[0.2] * 11 for _ in range(8)]
+    payload = {
+        "market_iv": market_iv,
+        "n_starts": 1,
+        "max_iter": 5,
+        "tol": 1e-4
+    }
+    resp = client.post("/calibrate/heston", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "params" in body
+    assert "final_mse" in body
+    assert "rmse_bps" in body
+
+
+def test_train_isolated_subprocess(client):
+    payload = {
+        "epochs": 1,
+        "batch_size": 256,
+        "lr": 1e-3
+    }
+    resp = client.post("/train/sabr", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "task_id" in body
+    assert body["status"] == "running"
+    task_id = body["task_id"]
+
+    status_resp = client.get(f"/train/status/{task_id}")
+    assert status_resp.status_code == 200, status_resp.text
+    status_body = status_resp.json()
+    assert status_body["task_id"] == task_id
+    assert status_body["model_name"] == "sabr"
+    assert status_body["status"] in ("running", "completed", "failed")
+
+
+def test_session_calibration_cache_flow(client):
+    market_iv = [[0.2] * 11 for _ in range(8)]
+    payload = {
+        "market_iv": market_iv,
+        "n_starts": 1,
+        "max_iter": 5
+    }
+    resp = client.post("/session/calibrate/sabr", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "session_id" in body
+    assert "params" in body
+    session_id = body["session_id"]
+
+    greeks_payload = {
+        "S": 100.0,
+        "r": 0.05,
+        "q": 0.01
+    }
+    greeks_resp = client.post(f"/session/{session_id}/greeks", json=greeks_payload)
+    assert greeks_resp.status_code == 200, greeks_resp.text
+    greeks_body = greeks_resp.json()
+    assert "delta" in greeks_body
+    assert "gamma" in greeks_body
+    assert "vega" in greeks_body
+
+
+def test_session_not_found(client):
+    greeks_payload = {
+        "S": 100.0
+    }
+    greeks_resp = client.post("/session/non_existent_session_id/greeks", json=greeks_payload)
+    assert greeks_resp.status_code == 404
+
