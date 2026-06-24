@@ -644,17 +644,17 @@ def run_all_and_write_report():
     
     # Run tests sequentially
     test_extreme_volatility()
-    print("✓ test_extreme_volatility passed")
+    print("[PASS] test_extreme_volatility")
     test_extreme_correlation()
-    print("✓ test_extreme_correlation passed")
+    print("[PASS] test_extreme_correlation")
     test_zero_transaction_costs()
-    print("✓ test_zero_transaction_costs passed")
+    print("[PASS] test_zero_transaction_costs")
     test_large_transaction_costs()
-    print("✓ test_large_transaction_costs passed")
+    print("[PASS] test_large_transaction_costs")
     test_financial_checks()
-    print("✓ test_financial_checks passed")
+    print("[PASS] test_financial_checks")
     test_scalability()
-    print("✓ test_scalability passed")
+    print("[PASS] test_scalability")
     
     # Generate Markdown Report
     report_dir = "/home/execorn/programming/derivatives/.agents/challenger_m5_stress_tests"

@@ -164,8 +164,8 @@ def validate_model(model_path, dataset_path, version_label, param_norm, iv_norm,
     mae = float(np.mean(np.abs(y_true - y_pred))) * 100   # in vol-% units
 
     print(f"\n  {version_label} Quality Metrics (N={N_TEST} test samples):")
-    print(f"    R²  = {r2:.4f}  ({'✓ > 0.92' if r2 > 0.92 else '✗ < 0.92'})")
-    print(f"    MAE = {mae:.4f}%  ({'✓ < 0.5%' if mae < 0.5 else '✗ > 0.5%'})")
+    print(f"    R²  = {r2:.4f}  ({'PASS (>0.92)' if r2 > 0.92 else 'FAIL (<0.92)'})")
+    print(f"    MAE = {mae:.4f}%  ({'PASS (<0.5%)' if mae < 0.5 else 'FAIL (>0.5%)'})")
 
     # Jacobian column norms (on 20 samples for speed)
     print(f"\n  Jacobian column norms ‖∂IV/∂θᵢ‖_F (20 samples):")
@@ -173,7 +173,7 @@ def validate_model(model_path, dataset_path, version_label, param_norm, iv_norm,
     col_norms = compute_jacobian_column_norms(model, params_np[jac_idx], spatial)
     mean_norms = col_norms.mean(axis=0)
     for j, (name, nm) in enumerate(zip(PARAM_NAMES, mean_norms)):
-        flag = "✓" if nm > 0.01 else "✗ ZERO"
+        flag = "OK" if nm > 0.01 else "ZERO"
         print(f"    ‖∂IV/∂{name}‖ = {nm:.4f}  {flag}")
 
     return r2, mae

@@ -105,7 +105,7 @@ class CalibrationResult:
 
 def _get_assets(device_str: str = "auto"):
     """Lazy-load FNO model + normalizers."""
-    # BUG-5 fix: determine version from module-level constants, not from
+    # Determine version from module-level constants, not from
     # calibrate._PARAM_NORM_PATH which may not reflect the correct version.
     version = "v3" if _PN_PATH.exists() else "v2"
 
@@ -260,7 +260,7 @@ def calibrate_newton_batch(
     yn_std = torch.tensor(yn.std, dtype=torch.float32, device=device)
 
     # Differentiable forward prediction
-    # BUG-1 fix: all 6 parameters (kappa, theta, sigma, rho, v0, H) are now
+    # All 6 parameters (kappa, theta, sigma, rho, v0, H) are now
     # passed through the normalizer unchanged — none are pinned to constants.
     def fwd_fn(theta_single, spatial_single):
         theta_norm = (theta_single.unsqueeze(0) - pn_mean) / pn_std
@@ -292,7 +292,7 @@ def calibrate_newton_batch(
     # Dynamically select chunk size based on device to maximize GPU utilization
     chunk_sz = 4 if device.type == "cpu" else 128
     
-    # BUG-2 fix: removed dead pre-loop forward pass whose result was immediately
+    # Removed dead pre-loop forward pass whose result was immediately
     # overwritten on iteration 0. Initialize loss_best to +inf so the first
     # iteration's line-search correctly seeds theta_best.
     loss_best = torch.full((M,), float('inf'), device=device)
@@ -344,7 +344,7 @@ def calibrate_newton_batch(
             loss_best = torch.where(better, loss_cand, loss_best)
             alpha = alpha * 0.5
             
-        # BUG-1 fix: removed theta[:, 0]=1.0 and theta[:, 1]=0.08 overwrite
+        # Removed theta[:, 0]=1.0 and theta[:, 1]=0.08 overwrite
         # that prevented kappa and theta from being calibrated.
         theta = theta_best.detach()
         
@@ -412,7 +412,7 @@ def calibrate_single(
 
             currency_upper = currency.upper()
             try:
-                # BUG-6 fix: use explicit event loop for thread safety
+                # Use explicit event loop for thread safety
                 _loop = asyncio.new_event_loop()
                 try:
                     df = _loop.run_until_complete(fetch_option_snapshot(currency_upper))
@@ -506,7 +506,7 @@ def calibrate_batch(
         if verbose:
             print(
                 f"[{i+1}/{total}] {d} — RMSE={result.rmse_bps:.1f} bps "
-                f"{'✓' if result.converged else '✗'} "
+                f"{'PASS' if result.converged else 'FAIL'} "
                 f"({result.runtime_ms:.0f} ms)"
             )
             
@@ -533,7 +533,7 @@ def _fetch_target_surface(date_str: str, currency: str, preset_surface: Optional
         from deepvol.market.deribit_data import fetch_option_snapshot, build_iv_surface
         currency_upper = currency.upper()
         try:
-            # BUG-6 fix: use explicit event loop for thread safety
+            # Use explicit event loop for thread safety
             _loop = asyncio.new_event_loop()
             try:
                 df = _loop.run_until_complete(fetch_option_snapshot(currency_upper))

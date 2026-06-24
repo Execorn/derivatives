@@ -1,5 +1,5 @@
 """
-src/pricing/signature_vol.py - Signature-Based Volatility Model.
+src/deepvol/models/signature_vol.py - Signature-Based Volatility Model.
 Implements dependency-free, GPU-accelerated signature path simulations,
 martingale property enforcement, and positivity constraints.
 """

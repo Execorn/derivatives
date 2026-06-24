@@ -352,3 +352,25 @@ def test_optimizations():
     assert np.allclose(cube_seq.rho, cube_par.rho, atol=1e-15)
     assert np.allclose(cube_seq.nu, cube_par.nu, atol=1e-15)
 
+
+def test_sabr_rates_otm_sign_preservation():
+    """
+    Verify that out-of-the-money options (K > F) where I_0 is negative
+    preserve the correct sign and do not fail with negative volatilities.
+    """
+    from deepvol.models.sabr_rates import displaced_sabr_vol
+    F = 0.03
+    T = 1.0
+    alpha = 0.015
+    beta = 0.5
+    rho = -0.3
+    nu = 0.4
+    shift = 0.01
+    
+    # K > F leads to negative I_0 in the normal model.
+    # The implied normal vol should be strictly positive.
+    for K in [0.035, 0.04, 0.05]:
+        vol = displaced_sabr_vol(F, K, T, alpha, beta, rho, nu, shift, 'normal')
+        assert vol > 0.0
+        assert np.isfinite(vol)
+

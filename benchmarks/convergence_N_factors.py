@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
-from pricing_engine_gpu import price_batch_gpu
+from deepvol.models.lifted_heston_gpu import price_batch_gpu
 
 # Fixed test parameters (representative Rough Heston point)
 TEST_PARAMS = np.array([[1.0, 0.08, 0.5, -0.5, 0.08]], dtype=np.float64)
@@ -81,7 +81,7 @@ def run_convergence():
 
         flag = ""
         if N < 40:
-            flag = " ✓" if bp01 < 1.0 else " ✗ (>1bp)"
+            flag = " PASS" if bp01 < 1.0 else " FAIL (>1bp)"
         elif N == 40:
             flag = " ← PRODUCTION"
 
@@ -96,7 +96,7 @@ def run_convergence():
     print(f"\n  Conclusion:")
     if n40:
         print(f"    N=40 global max error   : {n40['err_global']*10000:.4f} bp  "
-              f"({('<1bp ✓' if n40['err_global'] < 1e-4 else '>1bp ✗')})")
+              f"({('<1bp PASS' if n40['err_global'] < 1e-4 else '>1bp FAIL')})")
     if n20:
         print(f"    N=20 global max error   : {n20['err_global']*10000:.4f} bp")
     print("=" * 72)

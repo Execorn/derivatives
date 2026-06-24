@@ -50,18 +50,20 @@ The project covers the full quant stack: mathematical foundations → GPU pricin
 ## Table of Contents
 
 1. [Mathematical Background](#mathematical-background)
-2. [Architecture](#architecture)
-3. [Installation](#installation)
-4. [Quick Start](#quick-start)
-5. [Module Guide](#module-guide)
-6. [Notebooks](#notebooks)
-7. [REST API](#rest-api)
-8. [Benchmarks](#benchmarks)
-9. [Test Suite](#test-suite)
-10. [Models & Weights](#models--weights)
-11. [Project Structure](#project-structure)
-12. [Thesis & Publications](#thesis--publications)
-13. [License](#license)
+2. [DeepVol Model Zoo](#deepvol-model-zoo)
+3. [Monte Carlo Risk Engine (VaR/ES)](#monte-carlo-risk-engine-vares)
+4. [Architecture](#architecture)
+5. [Installation](#installation)
+6. [Quick Start](#quick-start)
+7. [Module Guide](#module-guide)
+8. [Notebooks](#notebooks)
+9. [REST API](#rest-api)
+10. [Benchmarks](#benchmarks)
+11. [Test Suite](#test-suite)
+12. [Models & Weights](#models--weights)
+13. [Project Structure](#project-structure)
+14. [Thesis & Publications](#thesis--publications)
+15. [License](#license)
 
 ---
 
@@ -123,6 +125,36 @@ surface (88 options) in **< 6 ms** using vectorized CUDA kernels.
 The 5-parameter Heston system is poorly identified — the FIM condition number exceeds
 $10^6$. We apply a **reparameterization** $(v_0, \zeta, \lambda)$ reducing it by
 **1301×**, making gradient-based calibration far more stable.
+
+## DeepVol Model Zoo
+
+The DeepVol framework contains a diverse "Zoo" of 10 volatility and derivatives models, implemented with high-performance CPU/GPU solvers and integrated with real-time calibration:
+
+1. **Classic Heston Model**: Traditional stochastic volatility model where variance follows a Cox-Ingersoll-Ross (CIR) process. Option pricing is performed using the exact Fourier-COS series expansion method.
+2. **SABR Model (Hagan/Displaced)**: Industry-standard smile model for FX and interest rates. Supports normal (Bachelier) and lognormal (Black) implied volatility via Hagan (2002) asymptotic expansions with displacement shifts.
+3. **SSVI (Surface SVI) Model**: Parameterizes the entire volatility surface using Gatheral's SVI slices under strict calendar and butterfly no-arbitrage guarantees.
+4. **Local Volatility (Dupire SVI) Model**: Extract state-dependent local volatility $\sigma_{\text{loc}}(T, K)$ by applying Dupire's formula via finite differences to a calibrated SVI surface.
+5. **Rough Bergomi (rBergomi) Model**: SOTA rough volatility model where variance is driven by a fractional Brownian motion ($H < 0.5$). Simulated on GPU using the Bennedsen-Lunde-Pakkanen (2017) hybrid convolution scheme.
+6. **Neural SDE**: Data-driven generative pricing model where drift and diffusion coefficients of the SDE are parameterized by neural networks and calibrated via adjoint sensitivity.
+7. **Signature Volatility**: Model path-dependency using rough path theory, where the asset volatility is represented as a linear function of the signature of historical prices.
+8. **McKean-Vlasov SDE (MLSV) Model**: Local stochastic volatility model where the volatility coefficient depends on the probability distribution (marginal laws) of the spot process.
+9. **Schwartz-Smith (2-Factor Commodity) Model**: Captures short-term mean-reverting deviations and long-term equilibrium price factors to model commodity futures curves and options.
+10. **LMM-SABR Model**: Combines the Libor Market Model (LMM) with SABR stochastic volatility to model the evolution of interest rate forward curves and swaption cubes.
+
+---
+
+## Monte Carlo Risk Engine (VaR/ES)
+
+DeepVol includes a high-performance **GPU-accelerated Monte Carlo Risk Engine** to compute portfolio-level risk metrics:
+
+* **Value-at-Risk (VaR)**: The maximum expected loss at a given confidence level $\alpha$ (e.g., $95\%$ or $99\%$) over a time horizon $\Delta t$.
+* **Expected Shortfall (ES)**: Also known as Conditional VaR (CVaR), measuring the average loss in the worst $(1-\alpha)\%$ tail scenarios.
+
+### Methodology
+1. **Scenario Generation**: Jointly simulate spot and variance paths under the Heston model using a stable **full-truncation Euler-Maruyama scheme** (Lord, Koekkoek & van Dijk 2010) on GPU to ensure non-negative variance:
+   $$dX_t = (r - \tfrac{1}{2} V^+_t) dt + \sqrt{V^+_t} dW_1, \qquad dV_t = \kappa(\theta - V^+_t) dt + \sigma \sqrt{V^+_t} dW_2$$
+2. **Accelerated Revaluation**: For each simulated path, the entire option portfolio is revalued using the fast FiLM-FNO pricing surrogate and 2D bilinear interpolation, enabling $10^7$ portfolio valuations per second.
+3. **Loss Aggregation**: Compute the portfolio loss distribution, sorting to extract the VaR and Expected Shortfall at the targeted quantiles.
 
 ---
 
@@ -223,8 +255,8 @@ pip install pandas numpy scipy scikit-learn matplotlib seaborn \
 
 # 4. (Optional) Build the CUDA extension for direct kernel access
 python setup.py build_ext --inplace
-# This compiles src/cuda_engine.cu → lifted_heston_cuda.so
-# The pure-Python GPU pricer (src/pricing_engine_gpu.py) works without this.
+# This compiles src/deepvol/models/cuda/cuda_engine.cu → lifted_heston_cuda.so
+# The pure-Python GPU pricer (src/deepvol/models/lifted_heston_gpu.py) works without this.
 
 # 5. Verify installation
 python -c "import torch; print('CUDA:', torch.cuda.is_available())"
@@ -246,18 +278,29 @@ chmod +x setup_and_run.sh
 
 ### 1. Interactive Streamlit Dashboard
 
-```bash
-source .venv/bin/activate
-streamlit run src/app_fno.py
-# Opens http://localhost:8501
-```
+* **Main Calibration Dashboard**:
+  ```bash
+  source .venv/bin/activate
+  streamlit run src/deepvol/app/app_v2.py
+  # Opens http://localhost:8501
+  ```
+  The calibration dashboard has three tabs:
+  - **IV Surface**: Adjust sliders for all 6 parameters, see the real-time FNO-predicted
+    implied-volatility surface update in < 1 ms.
+  - **Newton Calibration**: Upload or paste a market IV surface, run Gauss-Newton
+    calibration, watch the parameter trajectory converge.
+  - **Greeks**: Compute portfolio delta/gamma/vega for a set of positions.
 
-The dashboard has three tabs:
-- **IV Surface**: Adjust sliders for all 6 parameters, see the real-time FNO-predicted
-  implied-volatility surface update in < 1 ms.
-- **Newton Calibration**: Upload or paste a market IV surface, run Gauss-Newton
-  calibration, watch the parameter trajectory converge.
-- **Greeks**: Compute portfolio delta/gamma/vega for a set of positions.
+* **Risk Management Dashboard**:
+  ```bash
+  source .venv/bin/activate
+  streamlit run src/deepvol/app/app_v3_risk.py
+  # Opens http://localhost:8501
+  ```
+  The risk dashboard provides:
+  - **Live Risk Telemetry**: Streaming Greeks, latency timelines, and spot updates.
+  - **Scenario Stress Testing**: Stress testing spot/vol shocks on 3D Greeks grids.
+  - **Audit Logs**: Scrolling historical telemetry reports and CSV downloads.
 
 ### 2. Single Surface Pricing (Python API)
 
@@ -705,36 +748,16 @@ production but kept for reproducibility.
 ```
 derivatives/
 ├── src/                              Core library
-│   ├── fno_model.py                  FiLM-FNO architecture (MirrorPaddedFNO2d)
-│   ├── normalizers.py                ParameterNormalizer, IVSurfaceNormalizer
-│   ├── pricing_engine.py             Fourier-COS pricer (CPU reference)
-│   ├── pricing_engine_gpu.py         GPU-vectorized Fourier-COS
-│   ├── calibrate.py                  Gauss-Newton core, normalizer loading
-│   ├── calibrate_fast.py             calibrate_newton / calibrate_newton_h
-│   ├── fim_analysis.py               Fisher Information Matrix / identifiability
-│   ├── fno_greeks.py                 Autograd Greeks from FNO
-│   ├── app_fno.py                    Streamlit dashboard
-│   ├── cuda_engine.cu                CUDA C++ kernel source
-│   ├── calibration/
-│   │   ├── batch_calibration.py      GPU Gauss-Newton multi-date calibrator
-│   │   └── joint_calibration.py      Joint SPX+VIX calibration
-│   ├── market/
-│   │   ├── spx_data.py               SPX options chain (yfinance + parquet cache)
-│   │   ├── vix_futures.py            VIX futures term structure
-│   │   ├── vix_pricing.py            Model VIX from Rough Heston
-│   │   ├── deribit_data.py           Deribit REST API client
-│   │   ├── deribit_ws.py             Deribit WebSocket streaming
-│   │   └── variance_swaps.py         Variance/vol swap pricing
-│   ├── arbitrage/
-│   │   └── surface_completion.py     SVI fitting + arbitrage enforcement
-│   ├── greeks/
-│   │   ├── portfolio_greeks.py       GPU portfolio delta/gamma/vega/vanna/volga
-│   │   └── pnl_attribution.py        Taylor P&L decomposition
-│   ├── analysis/
-│   │   ├── hurst_dynamics.py         Historical Hurst exponent study
-│   │   └── crypto_hurst.py           Same study for BTC/ETH
-│   └── api/
-│       └── server.py                 FastAPI REST server
+│   └── deepvol/                      Main module package
+│       ├── surrogates/               FiLM-FNO models (fno_model.py, etc.)
+│       ├── models/                   Stochastic vol models (lifted_heston_gpu.py, heston.py, local_vol.py, rbergomi_gpu.py, etc.)
+│       ├── calibration/              Autograd Newton & joint calibrators (calibrate_newton.py, joint_calibration.py, etc.)
+│       ├── market/                   Data integration (spx_data.py, deribit_ws.py, etc.)
+│       ├── arbitrage/                SVI & arbitrage completion (surface_completion.py)
+│       ├── greeks/                   Greeks & PnL attribution (portfolio_greeks.py, pnl_attribution.py)
+│       ├── analysis/                 Hurst dynamics & research (hurst_dynamics.py, crypto_hurst.py)
+│       ├── api/                      FastAPI REST server (server.py, websocket.py)
+│       └── app/                      Streamlit risk dashboards (app_v2.py, app_v3_risk.py, dashboard.py)
 │
 ├── notebooks/                        7 Jupyter notebooks (end-to-end demos)
 │   └── generate_notebooks.py         Notebook source — regenerates all .ipynb

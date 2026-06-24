@@ -64,7 +64,7 @@ def migrate() -> None:
 
     # ── Detect whether migration is already done ───────────────────────────────
     if "network.3.weight" in old_sd:
-        print("✓ Checkpoint already uses the new (dropout) key layout. Nothing to do.")
+        print("Checkpoint already uses the new (dropout) key layout. Nothing to do.")
         return
 
     # ── Validate we recognise every key in the checkpoint ─────────────────────
@@ -107,11 +107,11 @@ def migrate() -> None:
             )
 
     model.load_state_dict(new_sd, strict=True)
-    print("\n✓ State dict loaded into model successfully (strict=True).")
+    print("\nState dict loaded into model successfully (strict=True).")
 
     # ── Save migrated checkpoint ───────────────────────────────────────────────
     torch.save(new_sd, NEW_CKPT)
-    print(f"✓ Migrated checkpoint saved → {NEW_CKPT}")
+    print(f"Migrated checkpoint saved → {NEW_CKPT}")
 
 
 if __name__ == "__main__":

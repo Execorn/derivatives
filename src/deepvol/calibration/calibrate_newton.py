@@ -359,7 +359,7 @@ def benchmark_jacobian_speed(model, T_grid, K_grid,
     print(f"  Trials           : {n_trials}")
     print(f"  jacfwd mean      : {np.mean(t_autograd)*1e3:.2f} ms  (3 JVPs)")
     print(f"  FD (5-pt) mean   : {np.mean(t_fd)*1e3:.2f} ms  (12 fwd passes)")
-    print(f"  Speedup          : {speedup:.1f}×  ({'✓' if speedup > 1.0 else '?'})")
+    print(f"  Speedup          : {speedup:.1f}×  ({'PASS' if speedup > 1.0 else 'FAIL'})")
     print("=" * 56)
     return {"t_autograd_ms": float(np.mean(t_autograd)*1e3),
             "t_fd_ms":       float(np.mean(t_fd)*1e3),

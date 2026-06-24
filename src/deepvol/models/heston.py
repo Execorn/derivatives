@@ -7,9 +7,12 @@ Implements:
   3. batch_heston_iv_surface: GPU-batched vectorized version using PyTorch.
 """
 
+from typing import Union, Dict, Any, Tuple, Optional
 import numpy as np
 import torch
 from scipy.stats import norm
+from scipy.optimize import minimize
+from functools import lru_cache
 
 _A = -4.0
 _B = 4.0
@@ -21,7 +24,31 @@ _INVSQRT2PI = 0.3989422804014327
 # ---------------------------------------------------------------------------
 
 def cos_payoff_coeffs_np(N_cos: int, a: float = _A, b: float = _B) -> np.ndarray:
-    """Exact COS CALL payoff coefficients on [0, b]."""
+    """
+    Exact COS call option payoff coefficients on [0, b].
+    
+    Formula:
+      V_k = \\frac{2}{b-a} (\\chi_k(0, b) - \\psi_k(0, b))
+      
+    Academic Reference:
+      Fang, F., & Oosterlee, C. W. (2008). A novel pricing method for European options 
+      based on Fourier-cosine series expansions. SIAM Journal on Scientific Computing, 
+      31(2), 826-848.
+      
+    Parameters
+    ----------
+    N_cos : int
+        Number of cosine terms.
+    a : float
+        Lower integration boundary.
+    b : float
+        Upper integration boundary.
+        
+    Returns
+    -------
+    coefficients : np.ndarray
+        Payoff coefficients of shape (N_cos,).
+    """
     k = np.arange(N_cos, dtype=np.float64)
     uk = k * np.pi / (b - a)
 
@@ -46,7 +73,31 @@ def cos_payoff_coeffs_np(N_cos: int, a: float = _A, b: float = _B) -> np.ndarray
 
 
 def cos_payoff_coeffs_put_np(N_cos: int, a: float = _A, b: float = _B) -> np.ndarray:
-    """Exact COS PUT payoff coefficients on [a, 0]."""
+    """
+    Exact COS put option payoff coefficients on [a, 0].
+    
+    Formula:
+      V_k = \\frac{2}{b-a} (\\psi_k(a, 0) - \\chi_k(a, 0))
+      
+    Academic Reference:
+      Fang, F., & Oosterlee, C. W. (2008). A novel pricing method for European options 
+      based on Fourier-cosine series expansions. SIAM Journal on Scientific Computing, 
+      31(2), 826-848.
+      
+    Parameters
+    ----------
+    N_cos : int
+        Number of cosine terms.
+    a : float
+        Lower integration boundary.
+    b : float
+        Upper integration boundary.
+        
+    Returns
+    -------
+    coefficients : np.ndarray
+        Payoff coefficients of shape (N_cos,).
+    """
     k = np.arange(N_cos, dtype=np.float64)
     uk = k * np.pi / (b - a)
 
@@ -74,30 +125,67 @@ def cos_payoff_coeffs_put_np(N_cos: int, a: float = _A, b: float = _B) -> np.nda
 # Black-Scholes helpers (CPU)
 # ---------------------------------------------------------------------------
 
-def bs_call_cpu(S, K, T, sigma):
-    if sigma < 1e-10 or T < 1e-10:
+def bs_call_cpu(
+    S: float,
+    K: float,
+    T: float,
+    sigma: float
+) -> float:
+    """
+    Black-Scholes analytical call price.
+    """
+    if sigma <= 1e-10 or T <= 1e-10:
         return max(S - K, 0.0)
     d1 = (np.log(S / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
-    return S * norm.cdf(d1) - K * norm.cdf(d2)
+    return float(S * norm.cdf(d1) - K * norm.cdf(d2))
 
 
-def bs_put_cpu(S, K, T, sigma):
-    if sigma < 1e-10 or T < 1e-10:
+def bs_put_cpu(
+    S: float,
+    K: float,
+    T: float,
+    sigma: float
+) -> float:
+    """
+    Black-Scholes analytical put price.
+    """
+    if sigma <= 1e-10 or T <= 1e-10:
         return max(K - S, 0.0)
     d1 = (np.log(S / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
-    return K * norm.cdf(-d2) - S * norm.cdf(-d1)
+    return float(K * norm.cdf(-d2) - S * norm.cdf(-d1))
 
 
-def bs_vega_cpu(S, K, T, sigma):
-    if sigma < 1e-10 or T < 1e-10:
+def bs_vega_cpu(
+    S: float,
+    K: float,
+    T: float,
+    sigma: float
+) -> float:
+    """
+    Black-Scholes option vega.
+    """
+    if sigma <= 1e-10 or T <= 1e-10:
         return 0.0
     d1 = (np.log(S / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
-    return S * np.sqrt(T) * norm.pdf(d1)
+    return float(S * np.sqrt(T) * norm.pdf(d1))
 
 
-def implied_vol_cpu(price, S, K, T, max_iter=50, r=0.0, q=0.0):
+def implied_vol_cpu(
+    price: float,
+    S: float,
+    K: float,
+    T: float,
+    max_iter: int = 50,
+    r: float = 0.0,
+    q: float = 0.0
+) -> float:
+    """
+    Solve for Black-Scholes implied volatility on CPU.
+    """
+    if T <= 1e-10:
+        return np.nan
     is_put = K < S * np.exp((r - q) * T)  # use forward for correct OTM selection
     if is_put:
         eff_price = price - S + K
@@ -121,7 +209,7 @@ def implied_vol_cpu(price, S, K, T, max_iter=50, r=0.0, q=0.0):
         sigma = np.clip(sigma, 1e-6, 5.0)
         if abs(p - eff_price) < 1e-10:
             break
-    return sigma if 1e-6 < sigma < 5.0 else np.nan
+    return float(sigma) if 1e-6 < sigma < 5.0 else np.nan
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +231,9 @@ def bs_iv_gpu(
     T_arr: torch.Tensor,
     n_iter: int = 40,
 ) -> torch.Tensor:
+    """
+    Solve for Black-Scholes implied volatility on GPU.
+    """
     dev = prices.device
     S = torch.tensor(S0, dtype=torch.float64, device=dev)
     K = K_arr.view(1, 1, -1)
@@ -159,7 +250,8 @@ def bs_iv_gpu(
 
     for _ in range(n_iter):
         s = sigma.clamp(min=1e-8)
-        d1 = (torch.log(S / K) + 0.5 * s**2 * T) / (s * sqT)
+        denom_d1 = (s * sqT).clamp(min=1e-15)
+        d1 = (torch.log(S / K) + 0.5 * s**2 * T) / denom_d1
         d2 = d1 - s * sqT
         call_p = S * _ncdf(d1) - K * _ncdf(d2)
         put_p = K * _ncdf(-d2) - S * _ncdf(-d1)
@@ -177,20 +269,66 @@ def bs_iv_gpu(
 # Heston Characteristic Function
 # ---------------------------------------------------------------------------
 
-def heston_cf(u, T, kappa, theta, sigma, rho, v0):
+def heston_cf(
+    u: np.ndarray,
+    T: float,
+    kappa: float,
+    theta: float,
+    sigma: float,
+    rho: float,
+    v0: float
+) -> np.ndarray:
     """
     Stable Gatheral formulation of the characteristic function for Heston model on CPU (NumPy).
+    Uses log1p to avoid complex branch-cut issues.
     
-    Using log1p to avoid complex branch-cut issues.
+    Formula:
+      \\phi_t(u) = \\exp(C(u, T) + D(u, T) v_0)
+      
+    Academic Reference:
+      Gatheral, J. (2006). The Volatility Surface: A Practitioner's Guide. John Wiley & Sons.
+      
+    Parameters
+    ----------
+    u : np.ndarray
+        Fourier transform variable.
+    T : float
+        Maturity time.
+    kappa : float
+        Mean reversion speed.
+    theta : float
+        Long-term variance.
+    sigma : float
+        Volatility of volatility.
+    rho : float
+        Correlation coefficient.
+    v0 : float
+        Initial variance.
+        
+    Returns
+    -------
+    cf_values : np.ndarray
+        Characteristic function values.
     """
-    if sigma <= 0: raise ValueError(f"sigma must be > 0, got {sigma}")
-    if v0 <= 0: raise ValueError(f"v0 must be > 0, got {v0}")
-    if kappa <= 0: raise ValueError(f"kappa must be > 0, got {kappa}")
-    if theta <= 0: raise ValueError(f"theta must be > 0, got {theta}")
-    if not (-1.0 <= rho <= 1.0): raise ValueError(f"rho must be in [-1,1], got {rho}")
+    # Guard against invalid inputs and numerical issues
+    if kappa <= 0.0 or theta <= 0.0 or sigma <= 0.0 or v0 <= 0.0:
+        raise ValueError("Heston parameters kappa, theta, sigma, v0 must be strictly positive.")
+    if not (-1.0 <= rho <= 1.0):
+        raise ValueError("Heston correlation rho must be in [-1, 1].")
+
+    sigma = max(sigma, 1e-8)
+    v0 = max(v0, 1e-8)
+    kappa = max(kappa, 1e-8)
+    theta = max(theta, 1e-8)
+    rho = np.clip(rho, -0.9999, 0.9999)
+    
     xi = kappa - 1j * rho * sigma * u
     d = np.sqrt(xi**2 + sigma**2 * (u**2 + 1j * u))
-    g = (xi - d) / (xi + d)
+    
+    # Avoid division by zero when xi + d is zero
+    denom_g = xi + d
+    denom_g = np.where(np.abs(denom_g) < 1e-12, 1e-12 + 0j, denom_g)
+    g = (xi - d) / denom_g
     
     exp_mindT = np.exp(-d * T)
     denom = 1.0 - g
@@ -198,7 +336,10 @@ def heston_cf(u, T, kappa, theta, sigma, rho, v0):
     z = g * (1.0 - exp_mindT) / denom_safe
     
     C = (kappa * theta / sigma**2) * ((xi - d) * T - 2.0 * np.log1p(z))
-    D = ((xi - d) / sigma**2) * ((1.0 - exp_mindT) / (1.0 - g * exp_mindT))
+    
+    denom_D = 1.0 - g * exp_mindT
+    denom_D_safe = np.where(np.abs(denom_D) < 1e-12, 1e-12 + 0j, denom_D)
+    D = ((xi - d) / sigma**2) * ((1.0 - exp_mindT) / denom_D_safe)
     
     return np.exp(C + D * v0)
 
@@ -207,19 +348,44 @@ def heston_cf(u, T, kappa, theta, sigma, rho, v0):
 # Heston Pricing Engines
 # ---------------------------------------------------------------------------
 
-def heston_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0, N_cos: int = 128) -> np.ndarray:
+def heston_iv_surface(
+    params: dict,
+    T_grid: np.ndarray,
+    K_grid: np.ndarray,
+    S0: float = 1.0,
+    N_cos: int = 128
+) -> np.ndarray:
     """
     Computes option implied volatility surface on CPU for a single Heston parameter set.
     
-    params: dict with keys ['kappa', 'theta', 'sigma', 'rho', 'v0']
-    T_grid: array of maturities
-    K_grid: array of log-moneyness K = log(Strike / S0)
+    Parameters
+    ----------
+    params : dict
+        Dict with keys ['kappa', 'theta', 'sigma', 'rho', 'v0']
+    T_grid : np.ndarray
+        Maturities.
+    K_grid : np.ndarray
+        Log-moneyness K = log(Strike / S0).
+    S0 : float
+        Spot price.
+    N_cos : int
+        Number of terms in Fourier series.
+        
+    Returns
+    -------
+    iv_surface : np.ndarray
+        Implied volatility surface.
     """
     kappa = params['kappa']
     theta = params['theta']
     sigma = params['sigma']
     rho = params['rho']
     v0 = params['v0']
+    
+    if kappa <= 0.0 or theta <= 0.0 or sigma <= 0.0 or v0 <= 0.0:
+        raise ValueError("Heston parameters kappa, theta, sigma, v0 must be strictly positive.")
+    if not (-1.0 <= rho <= 1.0):
+        raise ValueError("Heston correlation rho must be in [-1, 1].")
     
     a, b = _A, _B
     k_arr = np.arange(N_cos)
@@ -250,8 +416,6 @@ def heston_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0, N_cos: int 
             
     return iv_surface
 
-
-from functools import lru_cache
 
 @lru_cache(maxsize=128)
 def _get_cos_payoff_coeffs_gpu_cached(N_cos: int, a: float, b: float, device_str: str, is_put: bool = False) -> torch.Tensor:
@@ -295,7 +459,11 @@ def _get_cos_payoff_coeffs_gpu_cached(N_cos: int, a: float, b: float, device_str
         
     return Vk
 
-def get_cos_payoff_coeffs_gpu(N_cos: int, a: float, b: float, device, is_put: bool = False) -> torch.Tensor:
+
+def get_cos_payoff_coeffs_gpu(N_cos: int, a: float, b: float, device: torch.device, is_put: bool = False) -> torch.Tensor:
+    """
+    Get GPU COS payoff coefficients.
+    """
     return _get_cos_payoff_coeffs_gpu_cached(N_cos, a, b, str(device), is_put)
 
 
@@ -305,33 +473,50 @@ def batch_heston_iv_surface(
     K_grid: torch.Tensor,
     S0: float = 1.0,
     N_cos: int = 128,
-    device='cuda',
+    device: str = 'cuda',
 ) -> torch.Tensor:
     """
-    GPU-batched vectorized version to compute implied volatility surfaces.
+    GPU-batched vectorized version to compute Heston implied volatility surfaces.
     
-    params: Tensor of shape (B, 5): [kappa, theta, sigma, rho, v0]
-    T_grid: Tensor of shape (nT,)
-    K_grid: Tensor of shape (nK,) (log-moneyness)
+    Parameters
+    ----------
+    params : torch.Tensor
+        Tensor of shape (B, 5): [kappa, theta, sigma, rho, v0]
+    T_grid : torch.Tensor
+        Maturities of shape (nT,).
+    K_grid : torch.Tensor
+        Log-moneyness of shape (nK,).
+    S0 : float
+        Spot price.
+    N_cos : int
+        Number of terms in Fourier series.
+    device : str
+        Target hardware device ('cuda' or 'cpu').
+        
+    Returns
+    -------
+    ivs : torch.Tensor
+        Implied volatility surfaces of shape (B, nT, nK).
     """
-    params = params.to(device)
-    T_grid = torch.as_tensor(T_grid, dtype=torch.float64, device=device)
-    K_grid = torch.as_tensor(K_grid, dtype=torch.float64, device=device)
+    device_obj = torch.device(device)
+    params = params.to(device_obj)
+    T_grid = torch.as_tensor(T_grid, dtype=torch.float64, device=device_obj)
+    K_grid = torch.as_tensor(K_grid, dtype=torch.float64, device=device_obj)
     
     B = params.shape[0]
     
     a, b = _A, _B
-    k = torch.arange(N_cos, dtype=torch.float64, device=device)
+    k = torch.arange(N_cos, dtype=torch.float64, device=device_obj)
     u_k = k * np.pi / (b - a)
     
-    Vk_call = get_cos_payoff_coeffs_gpu(N_cos, a, b, device, is_put=False)
-    Vk_put = get_cos_payoff_coeffs_gpu(N_cos, a, b, device, is_put=True)
+    Vk_call = get_cos_payoff_coeffs_gpu(N_cos, a, b, device_obj, is_put=False)
+    Vk_put = get_cos_payoff_coeffs_gpu(N_cos, a, b, device_obj, is_put=True)
     
-    kappa = params[:, 0:1]
-    theta = params[:, 1:2]
-    sigma = params[:, 2:3]
-    rho = params[:, 3:4]
-    v0 = params[:, 4:5]
+    kappa = params[:, 0:1].clamp(min=1e-8)
+    theta = params[:, 1:2].clamp(min=1e-8)
+    sigma = params[:, 2:3].clamp(min=1e-8)
+    rho = params[:, 3:4].clamp(-0.9999, 0.9999)
+    v0 = params[:, 4:5].clamp(min=1e-8)
     
     u_c = u_k.view(1, 1, -1)
     T_c = T_grid.view(1, -1, 1)
@@ -344,7 +529,11 @@ def batch_heston_iv_surface(
     
     xi = kappa_e - 1j * rho_e * sigma_e * u_c
     d = torch.sqrt(xi**2 + sigma_e**2 * (u_c**2 + 1j * u_c))
-    g = (xi - d) / (xi + d)
+    
+    denom_g = xi + d
+    denom_g = torch.where(denom_g.abs() < 1e-12,
+        torch.tensor(1e-12 + 0j, dtype=denom_g.dtype, device=denom_g.device), denom_g)
+    g = (xi - d) / denom_g
     
     exp_mindT = torch.exp(-d * T_c)
     denom = 1.0 - g
@@ -354,12 +543,16 @@ def batch_heston_iv_surface(
     log_term = torch.log1p(z)
     
     C = (kappa_e * theta_e / sigma_e**2) * ((xi - d) * T_c - 2.0 * log_term)
-    D = ((xi - d) / sigma_e**2) * ((1.0 - exp_mindT) / (1.0 - g * exp_mindT))
+    
+    denom_D = 1.0 - g * exp_mindT
+    denom_D_safe = torch.where(denom_D.abs() < 1e-12,
+        torch.tensor(1e-12 + 0j, dtype=denom_D.dtype, device=denom_D.device), denom_D)
+    D = ((xi - d) / sigma_e**2) * ((1.0 - exp_mindT) / denom_D_safe)
     
     phi = torch.exp(C + D * v0_e)
     phi[:, :, 0] = 1.0 + 0.0j
     
-    S0t = torch.tensor(S0, dtype=torch.float64, device=device)
+    S0t = torch.tensor(S0, dtype=torch.float64, device=device_obj)
     K_arr = S0t * torch.exp(K_grid)
     x0 = -K_grid
     phase = torch.exp(1j * u_k.unsqueeze(1) * (x0 - a).unsqueeze(0))
@@ -389,24 +582,33 @@ def batch_heston_iv_surface(
 # Heston Calibration
 # ---------------------------------------------------------------------------
 
-from scipy.optimize import minimize
-
 def calibrate_heston(
     iv_target: np.ndarray,
     T_grid: np.ndarray,
     K_grid: np.ndarray,
-    init_guess: np.ndarray = None,
+    init_guess: Optional[np.ndarray] = None,
     max_iter: int = 100,
 ) -> dict:
     """
     Calibrate Classic Heston parameters to a market IV surface using L-BFGS-B.
     
-    Returns a dict with:
-      - 'params': dict of calibrated parameters
-      - 'param_vector': array of shape (5,)
-      - 'loss': final objective value
-      - 'converged': bool
-      - 'message': str
+    Parameters
+    ----------
+    iv_target : np.ndarray
+        Target market implied volatility surface.
+    T_grid : np.ndarray
+        Maturities.
+    K_grid : np.ndarray
+        Log-strikes.
+    init_guess : np.ndarray, optional
+        Initial parameters guess.
+    max_iter : int
+        Maximum iterations.
+        
+    Returns
+    -------
+    calibration_result : dict
+        Dict with keys ['params', 'param_vector', 'loss', 'converged', 'message'].
     """
     bounds = [
         (0.1, 5.0),    # kappa
@@ -475,12 +677,45 @@ def calibrate_heston(
 
 
 class HestonEngine:
-    def price_surface(self, params: dict, T_grid, K_grid, S0: float = 1.0, N_cos: int = 128) -> np.ndarray:
+    """
+    Heston Engine wrapper class.
+    """
+    def price_surface(
+        self,
+        params: dict,
+        T_grid: np.ndarray,
+        K_grid: np.ndarray,
+        S0: float = 1.0,
+        N_cos: int = 128
+    ) -> np.ndarray:
+        """
+        Price single Heston implied volatility surface.
+        """
         return heston_iv_surface(params, T_grid, K_grid, S0, N_cos)
         
-    def batch_price_surface(self, kappa, theta, sigma, rho, v0, T_grid, K_grid, S0: float = 1.0, N_cos: int = 128, device="cpu") -> torch.Tensor:
-        return batch_heston_iv_surface(kappa, theta, sigma, rho, v0, T_grid, K_grid, S0, N_cos, device)
+    def batch_price_surface(
+        self,
+        params: torch.Tensor,
+        T_grid: torch.Tensor,
+        K_grid: torch.Tensor,
+        S0: float = 1.0,
+        N_cos: int = 128,
+        device: str = "cpu"
+    ) -> torch.Tensor:
+        """
+        Price batched Heston implied volatility surfaces on CPU or GPU.
+        """
+        return batch_heston_iv_surface(params, T_grid, K_grid, S0, N_cos, device)
         
-    def calibrate(self, iv_target: np.ndarray, T_grid, K_grid, init_guess=None, max_iter=100) -> dict:
+    def calibrate(
+        self,
+        iv_target: np.ndarray,
+        T_grid: np.ndarray,
+        K_grid: np.ndarray,
+        init_guess: Optional[np.ndarray] = None,
+        max_iter: int = 100
+    ) -> dict:
+        """
+        Calibrate Heston model parameters to target surface.
+        """
         return calibrate_heston(iv_target, T_grid, K_grid, init_guess, max_iter)
-

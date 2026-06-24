@@ -1,16 +1,13 @@
 """
-pricing_engine_gpu.py — GPU-accelerated exact Fourier-COS pricing for the
+lifted_heston_gpu.py — GPU-accelerated exact Fourier-COS pricing for the
 Lifted Rough Heston model.
 
-MATHEMATICAL CORRECTIONS (all bugs fixed):
-  Bug 1 FIXED: kappa NOW appears in Riccati decay: -kappa*x_i*psi_i
-               (was missing entirely -- broke all samples with kappa != 1)
-  Bug 2 FIXED: kappa*theta integral uses c-WEIGHTED sum (Sigma c_i*psi_i),
-               not unweighted (Sigma psi_i) as initially implemented.
-  Bug 3 FIXED: BDF solver on 21k-dim state replaced with batched PyTorch RK4.
-  Bug 4 FIXED: N_cos reduced 500->64 (domain [-4,4] converges in 64 terms).
-  Bug 5 FIXED (2026-06-11): bernstein_factors now normalises c (sum(c)=1) in
-               CPU engine; GPU engine already normalised.
+Mathematical details of the GPU pricing engine:
+  - The Riccati ODE decay term includes the mean reversion parameter kappa.
+  - The kappa*theta integral uses the c-weighted sum (sum_i c_i*psi_i).
+  - A batched PyTorch RK4 solver is used for numerical integration.
+  - Option pricing uses N_cos = 64 (domain [-4,4] converges in 64 terms).
+  - Bernstein factor weights c are normalized (sum(c)=1).
 
 Hardware optimisation (2026-06-11):
   Mixed precision ODE: psi runs in complex64 (RTX 3060 Tensor Cores) while
@@ -196,7 +193,7 @@ def _riccati_rhs(psi, u_c, x, c, kappa_e, sigma_e, rho_e):
         + 0.5 * sigma_2d ** 2 * Psi ** 2          # (B, N_u)
     )                                              # -> (B, N_u)
 
-    # CRITICAL BUG FIX: multiply decay by kappa (was '-x*psi' in initial implementation)
+    # Multiply decay term by the mean reversion parameter kappa
     # x cast to complex for mixed-type mul with complex psi
     dpsi = g.unsqueeze(-1) - kappa_e * x.to(torch.complex128) * psi   # (B, N_u, N)
 
@@ -881,7 +878,7 @@ def price_iv_surface_gpu(
     device: str = 'cuda',
     **kwargs,
 ) -> np.ndarray:
-    """Drop-in for pricing_engine.price_iv_surface(). Returns (nT, nK) float32."""
+    """Drop-in for lifted_heston.price_iv_surface(). Returns (nT, nK) float32."""
     p = np.array([[
         params['kappa'], params['theta'],
         params['sigma'], params['rho'], params['v0'],

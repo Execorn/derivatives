@@ -89,6 +89,21 @@ class TestCalibrationStressEmpirical:
             surf = reconstruct_heston_surface(kappa, theta, sigma, rho, v0)
             surfaces.append(surf)
             
+        # Warm-up run to initialize CUDA context and PyTorch graph
+        calibrate(
+            market_iv_surface=surfaces[0],
+            model_name="heston",
+            method="newton",
+            T_grid=T_grid,
+            K_grid=K_grid,
+            model=model,
+            device=device_name,
+            max_iter=3,
+            n_starts=1
+        )
+        if device_name == "cuda":
+            torch.cuda.synchronize()
+
         t0 = time.time()
         for surf in surfaces:
             # We use low starts/iterations to keep throughput high-throughput test quick
@@ -106,6 +121,8 @@ class TestCalibrationStressEmpirical:
             # Ensure it is a valid result
             assert isinstance(res, CalibrationResult)
             
+        if device_name == "cuda":
+            torch.cuda.synchronize()
         elapsed = time.time() - t0
         avg_time_ms = (elapsed / 10) * 1000.0
         print(f"Average Newton-FNO Heston calibration time on {device_name.upper()}: {avg_time_ms:.2f}ms")

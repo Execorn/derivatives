@@ -36,7 +36,7 @@ from components.exporter import generate_pdf_report, generate_html_report
 # Page Config
 st.set_page_config(page_title="Deep Volatility Model Zoo v2", layout="wide")
 
-st.title("⚡ Deep Volatility Model Zoo Calibration & Dashboard v2")
+st.title("Deep Volatility Model Zoo Calibration & Dashboard v2")
 st.markdown("""
 Welcome to the **Upgraded Volatility Model Zoo Dashboard (v2)**. 
 Configure model parameters to generate synthetic volatility surfaces, or upload custom CSV/Excel implied volatility sheets to validate and calibrate across six models:
@@ -44,7 +44,7 @@ Configure model parameters to generate synthetic volatility surfaces, or upload 
 """)
 
 # ─── Sidebar Model Selector ─────────────────────────────────────────────────
-st.sidebar.header("🕹️ Control Panel")
+st.sidebar.header("Control Panel")
 model_name = st.sidebar.selectbox(
     "Volatility Model Selection",
     ["SABR", "Classic Heston", "Rough Bergomi", "Neural SDE", "McKean-Vlasov SDE (MLSV)", "Schwartz-Smith (2-Factor)"],
@@ -122,7 +122,7 @@ noise_level = st.sidebar.slider("Market Noise Level (Stress Test)", 0.0, 0.10, 0
 col_left, col_right = st.columns([1, 1])
 
 with col_left:
-    st.subheader("📤 Custom Volatility Sheet Uploader")
+    st.subheader("Custom Volatility Sheet Uploader")
     st.markdown("Upload your own implied volatility surface sheet (.csv or .xlsx).")
     uploaded_file = st.file_uploader("Choose a CSV/Excel file", type=["csv", "xlsx"])
 
@@ -136,9 +136,9 @@ with col_left:
             
             st.markdown("### Arbitrage Audit Results:")
             if arb_res["is_free"]:
-                st.success("🟢 Calendar & Butterfly Arbitrage Free (Pass)")
+                st.success("Calendar & Butterfly Arbitrage Free (Pass)")
             else:
-                st.error("🔴 Arbitrage Violations Detected! (Fail)")
+                st.error("Arbitrage Violations Detected! (Fail)")
                 
             with st.expander("Show Arbitrage Details"):
                 st.markdown(f"**Calendar Spread Violations:** {len(arb_res['calendar_violations'])}")
@@ -163,7 +163,7 @@ with col_left:
             st.error(f"Error parsing uploaded file: {e}")
 
 with col_right:
-    st.subheader("🎯 Target Surface Generation")
+    st.subheader("Target Surface Generation")
     st.markdown("Generate a synthetic target surface using the preset model parameters in the sidebar.")
     
     if st.button("Generate Target Surface from Sidebar Presets", use_container_width=True):
@@ -205,7 +205,7 @@ with col_right:
 
 # Check if target surface exists
 if "target_iv" not in st.session_state:
-    st.info("👈 Please generate a target surface or upload an implied volatility sheet to start.")
+    st.info("Please generate a target surface or upload an implied volatility sheet to start.")
     st.stop()
 
 target_iv = st.session_state["target_iv"]
@@ -214,7 +214,7 @@ active_model = st.session_state["active_model"]
 st.divider()
 
 # ─── Model Info & Run Calibration ─────────────────────────────────────────────
-st.header(f"🔧 Model zoo Calibration: {model_name}")
+st.header(f"Model zoo Calibration: {model_name}")
 st.info(f"Active Target Volatility Surface: **{active_model}**")
 
 if st.button(f"Calibrate / Reconstruct {model_name} Surface", use_container_width=True):
@@ -301,7 +301,7 @@ if "calib_results" in st.session_state:
     res = st.session_state["calib_results"]
     fitted_iv = res["iv_fitted"]
     
-    st.subheader("📊 Calibration Performance Summary")
+    st.subheader("Calibration Performance Summary")
     
     # Compute error metrics in IV space
     rmse = float(np.sqrt(np.mean((fitted_iv - target_iv)**2)))
@@ -319,7 +319,7 @@ if "calib_results" in st.session_state:
         st.metric("Max Error (bps)", f"{max_err * 10000.0:.2f} bps")
 
     # Render Calibrated Parameters Table
-    st.subheader("🔧 Parameter Details")
+    st.subheader("Parameter Details")
     p_names = list(res["params"].keys())
     p_vals = list(res["params"].values())
     
@@ -345,11 +345,11 @@ if "calib_results" in st.session_state:
     }), use_container_width=True)
 
     # 3D interactive comparison plot
-    st.subheader("🌐 3D Volatility Surface Comparison")
+    st.subheader("3D Volatility Surface Comparison")
     st.plotly_chart(plot_3d_surfaces(MATURITIES, STRIKES, target_iv, fitted_iv, market_name="Target / Market", reconstructed_name="Fitted Zoo Model"), use_container_width=True)
 
     # Convergence Plot and 2D Smile slice side-by-side
-    st.subheader("📈 Smile Alignment & Optimization History")
+    st.subheader("Smile Alignment & Optimization History")
     col_vis1, col_vis2 = st.columns(2)
     
     with col_vis1:
@@ -374,7 +374,7 @@ if "calib_results" in st.session_state:
 
     # ─── Report Exporter Section ──────────────────────────────────────────────
     st.divider()
-    st.header("📄 Downloadable Report Exporter")
+    st.header("Downloadable Report Exporter")
     st.markdown("Export a compiled version of the calibration results, error tables, and smile fits.")
     
     err_metrics = {"RMSE": rmse, "MAE": mae, "Max Error": max_err}

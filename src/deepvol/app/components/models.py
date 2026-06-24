@@ -108,6 +108,10 @@ def reconstruct_sabr_surface(alpha, rho, nu, F0=1.0):
 
 def reconstruct_heston_surface(kappa, theta, sigma, rho, v0):
     """Direct pricing of Classic Heston surface."""
+    if kappa <= 0.0 or theta <= 0.0 or sigma <= 0.0 or v0 <= 0.0:
+        raise ValueError("Heston parameters kappa, theta, sigma, v0 must be strictly positive.")
+    if not (-1.0 <= rho <= 1.0):
+        raise ValueError("Heston correlation rho must be in [-1, 1].")
     p_dict = {'kappa': kappa, 'theta': theta, 'sigma': sigma, 'rho': rho, 'v0': v0}
     target_iv = heston_iv_surface(p_dict, MATURITIES, STRIKES)
     # Fill NaNs

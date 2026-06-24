@@ -25,7 +25,7 @@ from websockets.sync.client import connect
 # ── Page Configuration ────────────────────────────────────────────────────────
 st.set_page_config(page_title="DeepVol Live Risk Dashboard", layout="wide")
 
-st.title("⚡ DeepVol Real-Time Risk Dashboard & Stress Testing")
+st.title("DeepVol Real-Time Risk Dashboard & Stress Testing")
 st.markdown("""
 Monitor live options Greeks and implied volatility surfaces computed via FNO models.
 Simulate macro stress scenarios, analyze high-frequency calculation telemetry, and audit all risk events.
@@ -124,9 +124,13 @@ def ws_listener_thread(url: str, currency: str, model: str, params: dict, interv
             _ = json.loads(confirm_str)
             
             # Signal run success to session state
-            st.session_state["stream_running"] = True
+            with _session_lock:
+                st.session_state["stream_running"] = True
             
-            while st.session_state.get("stream_running", False):
+            while True:
+                with _session_lock:
+                    if not st.session_state.get("stream_running", False):
+                        break
                 try:
                     msg_str = ws.recv(timeout=1.0)
                     msg = json.loads(msg_str)
@@ -164,36 +168,40 @@ def ws_listener_thread(url: str, currency: str, model: str, params: dict, interv
                                         })
                                     break
                     elif msg.get("type") == "error":
-                        st.session_state["audit_log"].append({
-                            "Timestamp": time.strftime("%H:%M:%S"),
-                            "Action": "Error Alert",
-                            "Severity": "WARNING",
-                            "Spot Price": 0.0,
-                            "Latency (ms)": 0.0,
-                            "Details": msg.get("message")
-                        })
+                        with _session_lock:
+                            st.session_state["audit_log"].append({
+                                "Timestamp": time.strftime("%H:%M:%S"),
+                                "Action": "Error Alert",
+                                "Severity": "WARNING",
+                                "Spot Price": 0.0,
+                                "Latency (ms)": 0.0,
+                                "Details": msg.get("message")
+                            })
                 except TimeoutError:
                     continue
                 except Exception:
                     break
     except Exception as e:
-        st.session_state["audit_log"].append({
-            "Timestamp": time.strftime("%H:%M:%S"),
-            "Action": "Disconnect Alert",
-            "Severity": "HIGH",
-            "Spot Price": 0.0,
-            "Latency (ms)": 0.0,
-            "Details": f"WebSocket failure: {e}"
-        })
+        with _session_lock:
+            st.session_state["audit_log"].append({
+                "Timestamp": time.strftime("%H:%M:%S"),
+                "Action": "Disconnect Alert",
+                "Severity": "HIGH",
+                "Spot Price": 0.0,
+                "Latency (ms)": 0.0,
+                "Details": f"WebSocket failure: {e}"
+            })
     finally:
-        st.session_state["stream_running"] = False
+        with _session_lock:
+            st.session_state["stream_running"] = False
+
 
 
 # ── Sidebar Configurations ────────────────────────────────────────────────────
-st.sidebar.header("🔌 Connection Setup")
+st.sidebar.header("Connection Setup")
 ws_url = st.sidebar.text_input("FastAPI WebSocket URL", value="ws://localhost:8000/ws/risk")
 
-st.sidebar.header("🎯 Stream Configuration")
+st.sidebar.header("Stream Configuration")
 currency = st.sidebar.selectbox("Currency Profile", ["BTC", "ETH"], index=0)
 model_name = st.sidebar.selectbox(
     "Risk Pricing Model",
@@ -203,7 +211,7 @@ model_name = st.sidebar.selectbox(
 stream_interval = st.sidebar.slider("Stream Tick Interval (s)", 0.2, 5.0, 1.0, step=0.1)
 
 # Dynamic parameter inputs based on model in the sidebar
-st.sidebar.subheader("📐 Model Target Parameters")
+st.sidebar.subheader("Model Target Parameters")
 base_params = {}
 maturities, strikes = get_grid_coordinates()
 
@@ -233,15 +241,15 @@ elif model_name == "rbergomi":
 
 # ── Tabs Configuration ────────────────────────────────────────────────────────
 tab_live, tab_stress, tab_audit = st.tabs([
-    "📈 Live Volatility & Greeks Streaming",
-    "💥 Stress Testing & Scenario Analysis",
-    "📋 Audit logs & Telemetry"
+    "Live Volatility & Greeks Streaming",
+    "Stress Testing & Scenario Analysis",
+    "Audit Logs & Telemetry"
 ])
 
 
 # ── TAB 1: LIVE VOLATILITY & GREEKS STREAMING (SOTA Fragmented UI) ─────────────
 with tab_live:
-    st.header("📈 Real-Time Options Risk Metrics Stream")
+    st.header("Real-Time Options Risk Metrics Stream")
 
     col_btn1, col_btn2, col_info = st.columns([1, 1, 4])
     
@@ -250,9 +258,9 @@ with tab_live:
     
     with col_info:
         if st.session_state["stream_running"]:
-            st.success("🟢 Connected and streaming risk telemetry.")
+            st.success("Connected and streaming risk telemetry.")
         else:
-            st.info("⚪ Offline. Toggle the checkbox to begin streaming.")
+            st.info("Offline. Toggle the checkbox to begin streaming.")
 
     # Control connection thread lifecycle
     if run_stream:
@@ -285,8 +293,10 @@ with tab_live:
             kpi_col4.metric("Last Update", time.strftime("%H:%M:%S", time.localtime(latest["timestamp"])))
 
             # Latency graph
-            if st.session_state["telemetry_history"]:
-                tel_df = pd.DataFrame(st.session_state["telemetry_history"])
+            with _session_lock:
+                telemetry_history_copy = list(st.session_state["telemetry_history"])
+            if telemetry_history_copy:
+                tel_df = pd.DataFrame(telemetry_history_copy)
                 tel_df["Relative Time (s)"] = tel_df["Timestamp"] - tel_df["Timestamp"].iloc[0]
                 
                 fig_tel = go.Figure()
@@ -326,7 +336,7 @@ with tab_live:
 
             st.plotly_chart(fig_3d, use_container_width=True)
         else:
-            st.warning("⚠️ No streaming data received yet. Toggle checkbox to start.")
+            st.warning("No streaming data received yet. Toggle checkbox to start.")
 
     render_live_greeks_fragment()
 
@@ -335,7 +345,7 @@ with tab_live:
 with tab_stress:
     @st.fragment
     def render_scenario_analysis() -> None:
-        st.header("💥 Stress Testing & Macro Scenarios")
+        st.header("Stress Testing & Macro Scenarios")
         st.markdown("""
         Configure severe shocks to market underlying prices and option parameters. 
         Send the scenario to the FNO risk engine to evaluate the instantaneous shift in the volatility and Greeks surfaces.
@@ -412,7 +422,7 @@ with tab_stress:
         # Visualizing stress test results (contained inside fragment)
         stress_res = st.session_state["stress_data"]
         if stress_res is not None:
-            st.subheader("📊 Stress Test Greeks Surfaces")
+            st.subheader("Stress Test Greeks Surfaces")
             st.info(f"Stress computation completed in: {stress_res['latency_ms']:.2f} ms")
             
             s_greeks = stress_res["greeks"]
@@ -431,14 +441,14 @@ with tab_stress:
                 fig_s_vega = plot_3d_risk_surface(s_greeks["vega"], "Stressed Option Vega Surface", "Vega", "Cividis")
                 st.plotly_chart(fig_s_vega, use_container_width=True)
         else:
-            st.info("💡 Trigger a stress test to view stressed 3D risk grids.")
+            st.info("Trigger a stress test to view stressed 3D risk grids.")
 
     render_scenario_analysis()
 
 
 # ── TAB 3: AUDIT LOGS & TELEMETRY (SOTA Fragmented HTML UI) ────────────────────
 with tab_audit:
-    st.header("📋 Risk Audit Log & Telemetry Reports")
+    st.header("Risk Audit Log & Telemetry Reports")
     
     @st.fragment(run_every=1.0)
     def render_audit_log_fragment() -> None:
@@ -451,9 +461,12 @@ with tab_audit:
             "border:1px solid #262730; display: flex; flex-direction: column-reverse;"
         )
         
+        with _session_lock:
+            audit_log_copy = list(st.session_state["audit_log"])
+
         log_lines = []
         # Display reverse chronological
-        for alert in reversed(st.session_state["audit_log"]):
+        for alert in reversed(audit_log_copy):
             color = "#ff4b4b" if alert["Severity"] == "HIGH" else ("#ffa500" if alert["Severity"] == "WARNING" else "#00ff66")
             line = f'<div style="color:{color}; margin-bottom:4px;">[{alert["Timestamp"]}] [{alert["Action"]}] [{alert["Severity"]}] Latency: {alert["Latency (ms)"]:.2f}ms | Spot: ${alert["Spot Price"]:.2f} | {alert["Details"]}</div>'
             log_lines.append(line)
@@ -461,15 +474,15 @@ with tab_audit:
         log_content = "".join(log_lines)
         st.markdown(f'<div style="{log_style}">{log_content}</div>', unsafe_allow_html=True)
 
-        if st.session_state["audit_log"]:
+        if audit_log_copy:
             # Display spreadsheet table below
-            audit_df = pd.DataFrame(list(st.session_state["audit_log"]))
+            audit_df = pd.DataFrame(audit_log_copy)
             st.dataframe(audit_df, use_container_width=True)
             
             # Download to CSV
             csv_data = audit_df.to_csv(index=False).encode('utf-8')
             st.download_button(
-                label="📥 Download Audit Log as CSV",
+                label="Download Audit Log as CSV",
                 data=csv_data,
                 file_name="deepvol_risk_audit_log.csv",
                 mime="text/csv",

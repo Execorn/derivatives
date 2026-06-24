@@ -10,10 +10,10 @@ normalisation bug in the CPU COS engine:
 
 With unnormalised c the quadratic Riccati term is amplified by sum(c)^2 ≈ 676,
 blowing up the vol-of-vol coupling and producing wildly wrong IV surfaces.
-The GPU COS engine (pricing_engine_gpu.py) was always normalised.
+The GPU COS engine (lifted_heston_gpu.py) was always normalised.
 
 GPU acceleration (2026-06-14):
-  Uses pricing_engine_gpu.price_batch_gpu with H_batch for all 200 samples
+  Uses lifted_heston_gpu.price_batch_gpu with H_batch for all 200 samples
   in a single B=200 GPU kernel. Runtime: ~0.7s (vs ~30 min for serial CPU).
 
 Expected finding (confirmed 2026-06-14):
@@ -37,7 +37,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
-from pricing_engine_gpu import price_batch_gpu
+from deepvol.models.lifted_heston_gpu import price_batch_gpu
 
 # Grid — must match MC dataset
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
@@ -118,8 +118,8 @@ def run_benchmark():
     print("=" * 72)
     print()
     print("  NOTE: v1 dataset (DeepRoughDataset.npz) was generated 2026-06-10")
-    print("  with the BUGGY CPU COS engine (unnormalised Bernstein c, sum(c)≈26).")
-    print("  GPU COS engine (pricing_engine_gpu) has always used normalised c.")
+    print("  with the unnormalized CPU COS engine (unnormalised Bernstein c, sum(c)≈26).")
+    print("  GPU COS engine (lifted_heston_gpu) has always used normalised c.")
     print("  Errors below show the magnitude of the normalisation bug impact.")
     print()
 
@@ -190,14 +190,14 @@ def run_benchmark():
     print(f"\n  Key findings (v1 dataset normalisation bug impact):")
     if 0.1 in results:
         r  = results[0.1]
-        ok = "✓ bug confirmed (>>20bp)" if r['mean_bp'] > 100 else f"({r['mean_bp']:.1f}bp — unexpectedly small)"
+        ok = "[CONFIRMED] bug (>>20bp)" if r['mean_bp'] > 100 else f"({r['mean_bp']:.1f}bp — unexpectedly small)"
         print(f"    T=0.1  mean error = {r['mean_bp']:8.2f}bp  {ok}")
     if 1.0 in results:
         r = results[1.0]
         print(f"    T=1.0  mean error = {r['mean_bp']:8.2f}bp")
     if 2.0 in results:
         r  = results[2.0]
-        ok = "✓ bug confirmed (>>20bp)" if r['mean_bp'] > 100 else f"({r['mean_bp']:.1f}bp — unexpectedly small)"
+        ok = "[CONFIRMED] bug (>>20bp)" if r['mean_bp'] > 100 else f"({r['mean_bp']:.1f}bp — unexpectedly small)"
         print(f"    T=2.0  mean error = {r['mean_bp']:8.2f}bp  {ok}")
 
     # Global statistics

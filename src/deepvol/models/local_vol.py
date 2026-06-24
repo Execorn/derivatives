@@ -7,32 +7,83 @@ Contains:
 - `check_arbitrage_free`: checks calendar spread and butterfly arbitrage (g(k) >= 0).
 """
 
+from typing import Union
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-def svi_slice(k, a, b, rho, m, sigma):
+def svi_slice(
+    k: Union[float, np.ndarray, torch.Tensor],
+    a: Union[float, np.ndarray, torch.Tensor],
+    b: Union[float, np.ndarray, torch.Tensor],
+    rho: Union[float, np.ndarray, torch.Tensor],
+    m: Union[float, np.ndarray, torch.Tensor],
+    sigma: Union[float, np.ndarray, torch.Tensor]
+) -> Union[float, np.ndarray, torch.Tensor]:
     """
     Computes total variance w(k) for a single SVI slice.
     Supports both NumPy arrays and PyTorch tensors.
+    
+    Formula:
+      w(k) = a + b * (\\rho * (k - m) + \\sqrt{(k - m)^2 + \\sigma^2})
+      
+    Academic Reference:
+      Gatheral, J. (2004). A arbitrage-free SVI volatility surface. Presentation at 
+      Global Derivatives.
+      
+    Parameters
+    ----------
+    k : float, np.ndarray, or torch.Tensor
+        Log-moneyness k = log(Strike / Spot).
+    a : float, np.ndarray, or torch.Tensor
+        SVI parameter controlling general level of variance.
+    b : float, np.ndarray, or torch.Tensor
+        SVI parameter controlling slope/angle of wings.
+    rho : float, np.ndarray, or torch.Tensor
+        SVI parameter controlling rotation/skewness.
+    m : float, np.ndarray, or torch.Tensor
+        SVI parameter controlling horizontal translation.
+    sigma : float, np.ndarray, or torch.Tensor
+        SVI parameter controlling curvature at ATM.
+        
+    Returns
+    -------
+    w : float, np.ndarray, or torch.Tensor
+        Total variance at k.
     """
+    # Guard to prevent division by zero in SVI square root and SVI parameters
     if isinstance(k, torch.Tensor):
-        return a + b * (rho * (k - m) + torch.sqrt((k - m) ** 2 + sigma ** 2))
+        sigma_safe = torch.clamp(torch.as_tensor(sigma), min=1e-8)
+        return a + b * (rho * (k - m) + torch.sqrt((k - m) ** 2 + sigma_safe ** 2))
     else:
-        return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + sigma ** 2))
+        sigma_safe = np.maximum(np.asarray(sigma), 1e-8)
+        return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + sigma_safe ** 2))
 
-def check_arbitrage_free(T_grid: np.ndarray, K_grid: np.ndarray, svi_params: np.ndarray) -> bool:
+
+def check_arbitrage_free(
+    T_grid: np.ndarray,
+    K_grid: np.ndarray,
+    svi_params: np.ndarray
+) -> bool:
     """
     Checks if the SVI surface defined by svi_params is free of calendar spread and butterfly arbitrage.
     
-    Parameters:
-    -----------
+    Academic Reference:
+      Gatheral, J., & Jacquier, A. (2014). Arbitrage-free SVI volatility surfaces. 
+      Quantitative Finance, 14(1), 59-71.
+      
+    Parameters
+    ----------
     T_grid : np.ndarray
         Maturities grid, shape (nT,)
     K_grid : np.ndarray
         Strikes grid, shape (nK,)
     svi_params : np.ndarray
         SVI parameters, shape (nT, 5) -> [a, b, rho, m, sigma] for each slice.
+        
+    Returns
+    -------
+    is_arbitrage_free : bool
+        True if the surface has no static arbitrage.
     """
     assert np.all(np.diff(T_grid) > 0), "T_grid must be strictly increasing and sorted"
     
@@ -69,6 +120,7 @@ def check_arbitrage_free(T_grid: np.ndarray, K_grid: np.ndarray, svi_params: np.
     for i in range(nT):
         a, b, rho, m, sigma = svi_params[i]
         u = K_dense - m
+        sigma = max(sigma, 1e-8)
         sqrt_term = np.sqrt(u ** 2 + sigma ** 2)
         
         # Analytical derivatives
@@ -88,12 +140,16 @@ def check_arbitrage_free(T_grid: np.ndarray, K_grid: np.ndarray, svi_params: np.
     return True
 
 
-def check_arbitrage_free_batch(T_grid: np.ndarray, K_grid: np.ndarray, svi_params: np.ndarray) -> np.ndarray:
+def check_arbitrage_free_batch(
+    T_grid: np.ndarray,
+    K_grid: np.ndarray,
+    svi_params: np.ndarray
+) -> np.ndarray:
     """
     Checks calendar spread and butterfly arbitrage in batch.
     
-    Parameters:
-    -----------
+    Parameters
+    ----------
     T_grid : np.ndarray
         Maturities grid, shape (nT,)
     K_grid : np.ndarray
@@ -101,9 +157,10 @@ def check_arbitrage_free_batch(T_grid: np.ndarray, K_grid: np.ndarray, svi_param
     svi_params : np.ndarray
         SVI parameters, shape (B, nT, 5) -> [a, b, rho, m, sigma] for each slice.
         
-    Returns:
-    --------
-    is_arbitrage_free : np.ndarray of bool, shape (B,)
+    Returns
+    -------
+    is_arbitrage_free : np.ndarray
+        Boolean array of shape (B,) indicating which batch items are arbitrage-free.
     """
     B = svi_params.shape[0]
     nT = len(T_grid)
@@ -132,6 +189,8 @@ def check_arbitrage_free_batch(T_grid: np.ndarray, K_grid: np.ndarray, svi_param
     rho = sub_svi[..., 2, np.newaxis] # (B_active, nT, 1)
     m = sub_svi[..., 3, np.newaxis] # (B_active, nT, 1)
     sigma = sub_svi[..., 4, np.newaxis] # (B_active, nT, 1)
+    
+    sigma = np.maximum(sigma, 1e-8)
     
     k_exp = K_dense[np.newaxis, np.newaxis, :] # (1, 1, 400)
     
@@ -164,19 +223,25 @@ def check_arbitrage_free_batch(T_grid: np.ndarray, K_grid: np.ndarray, svi_param
 
 
 def svi_to_lv_surface(
-    T_grid,
-    K_grid,
-    svi_params,
+    T_grid: Union[np.ndarray, torch.Tensor],
+    K_grid: Union[np.ndarray, torch.Tensor],
+    svi_params: Union[np.ndarray, torch.Tensor],
     fine_T_points: int = 100,
     fine_K_points: int = 200
-):
+) -> Union[np.ndarray, torch.Tensor]:
     """
     Computes local volatility surface by applying Dupire formula to SVI representation
     using PyTorch (GPU/CPU) tensor operations.
     Supports both numpy arrays and PyTorch tensors, single and batched inputs.
     
-    Parameters:
-    -----------
+    Formula:
+      \\sigma^2_{loc}(T, K) = \\frac{\\partial W / \\partial T}{g(k)}
+      
+    Academic Reference:
+      Dupire, B. (1994). Pricing with a smile. Risk, 7(1), 18-20.
+      
+    Parameters
+    ----------
     T_grid : np.ndarray or torch.Tensor
         Target maturities grid, shape (nT,)
     K_grid : np.ndarray or torch.Tensor
@@ -188,10 +253,10 @@ def svi_to_lv_surface(
     fine_K_points : int
         Number of points in the fine strike grid.
         
-    Returns:
-    --------
+    Returns
+    -------
     lv_surface : np.ndarray or torch.Tensor
-        Local volatility surface of shape (nT, nK) or (B, nT, nK)
+        Local volatility surface of shape (nT, nK) or (B, nT, nK).
     """
     is_numpy = isinstance(svi_params, np.ndarray)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -231,7 +296,8 @@ def svi_to_lv_surface(
     
     T_left = T_t[indices]
     T_right = T_t[indices + 1]
-    weights = (fine_T - T_left) / (T_right - T_left)
+    T_diff = torch.clamp(T_right - T_left, min=1e-8)
+    weights = (fine_T - T_left) / T_diff
     weights = torch.clamp(weights, 0.0, 1.0)
     
     # Interpolated parameters of shape (B, fine_T_points)
@@ -246,7 +312,7 @@ def svi_to_lv_surface(
     b_exp = b_fine.unsqueeze(-1)      # (B, fine_T_points, 1)
     rho_exp = rho_fine.unsqueeze(-1)  # (B, fine_T_points, 1)
     m_exp = m_fine.unsqueeze(-1)      # (B, fine_T_points, 1)
-    sigma_exp = sigma_fine.unsqueeze(-1)  # (B, fine_T_points, 1)
+    sigma_exp = sigma_fine.unsqueeze(-1).clamp(min=1e-8)  # (B, fine_T_points, 1)
     k_exp = fine_K.unsqueeze(0).unsqueeze(0)  # (1, 1, fine_K_points)
     
     u = k_exp - m_exp
@@ -293,14 +359,16 @@ def svi_to_lv_surface(
     t_indices = torch.clamp(t_indices, 0, fine_T_points - 2)
     t_left = fine_T[t_indices]
     t_right = fine_T[t_indices + 1]
-    t_weights = (T_t - t_left) / (t_right - t_left)
+    t_diff = torch.clamp(t_right - t_left, min=1e-8)
+    t_weights = (T_t - t_left) / t_diff
     t_weights = torch.clamp(t_weights, 0.0, 1.0)
     
     k_indices = torch.bucketize(K_t, fine_K) - 1
     k_indices = torch.clamp(k_indices, 0, fine_K_points - 2)
     k_left = fine_K[k_indices]
     k_right = fine_K[k_indices + 1]
-    k_weights = (K_t - k_left) / (k_right - k_left)
+    k_diff = torch.clamp(k_right - k_left, min=1e-8)
+    k_weights = (K_t - k_left) / k_diff
     k_weights = torch.clamp(k_weights, 0.0, 1.0)
     
     # Advanced indexing to extract the 4 corners for all batch elements

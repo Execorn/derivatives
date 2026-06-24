@@ -232,10 +232,10 @@ def main():
           f"(p95={np.percentile(cal_ms,95):.0f}ms)")
 
     if reduction > 0:
-        print(f"\n  ✅  FNO-Δ hedge is better: {reduction:.1f}% lower P&L variance")
+        print(f"\n  [SUCCESS] FNO-Δ hedge is better: {reduction:.1f}% lower P&L variance")
         print(f"      FNO re-calibration captures stochastic vol — flat-σ cannot.")
     else:
-        print(f"\n  ⚠️  Flat-vol slightly better ({-reduction:.1f}%)")
+        print(f"\n  [WARNING] Flat-vol slightly better ({-reduction:.1f}%)")
         print(f"      Likely noise-induced mis-calibration at short T.  Reduce --noise or increase --paths.")
     print("─" * 90)
 

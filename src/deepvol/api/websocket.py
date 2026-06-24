@@ -42,6 +42,8 @@ MAX_MESSAGES_PER_WINDOW = 30
 
 
 
+import threading
+
 class ConflatedQueue:
     """
     Thread-safe, async-native queue that retains only the latest update per key.
@@ -50,37 +52,70 @@ class ConflatedQueue:
     def __init__(self) -> None:
         self._data: Dict[str, Any] = {}
         self._event = asyncio.Event()
+        self._lock = threading.Lock()
 
     def put(self, key: str, value: Any) -> None:
         """Upsert the latest value for the specified key and trigger wait event."""
-        self._data[key] = value
+        with self._lock:
+            self._data[key] = value
         self._event.set()
 
     async def get(self) -> Dict[str, Any]:
         """Wait until data is available, then drain and return the current batch."""
-        while not self._data:
+        while True:
+            with self._lock:
+                if self._data:
+                    batch = self._data.copy()
+                    self._data.clear()
+                    return batch
             self._event.clear()
             await self._event.wait()
-        
-        # Conflated batch retrieval
-        batch = self._data.copy()
-        self._data.clear()
-        return batch
 
 
 class ConnectionManager:
-    """Manages active WebSocket connections, rate limits, and TCP optimization."""
+    """Manages active WebSocket connections, rate limits, and TCP optimization with thread-safety."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self.active_connections: Set[WebSocket] = set()
         self.connection_queues: Dict[WebSocket, ConflatedQueue] = {}
         self.connection_tasks: Dict[WebSocket, List[asyncio.Task]] = {}
         # Client rate limiting: websocket -> list of message timestamps
         self.message_timestamps: Dict[WebSocket, List[float]] = {}
 
+    def is_active(self, websocket: WebSocket) -> bool:
+        """Checks if connection is active."""
+        with self._lock:
+            return websocket in self.active_connections
+
+    def get_queue(self, websocket: WebSocket) -> Optional[ConflatedQueue]:
+        """Retrieves conflated queue for a connection."""
+        with self._lock:
+            return self.connection_queues.get(websocket)
+
+    def set_queue(self, websocket: WebSocket, queue: ConflatedQueue) -> None:
+        """Sets conflated queue for a connection."""
+        with self._lock:
+            self.connection_queues[websocket] = queue
+
+    def add_task(self, websocket: WebSocket, task: asyncio.Task) -> None:
+        """Adds async task to a connection."""
+        with self._lock:
+            if websocket in self.connection_tasks:
+                self.connection_tasks[websocket].append(task)
+
+    def clear_tasks(self, websocket: WebSocket) -> List[asyncio.Task]:
+        """Clears and returns connection tasks."""
+        with self._lock:
+            tasks = self.connection_tasks.get(websocket, [])
+            self.connection_tasks[websocket] = []
+            return tasks
+
     async def connect(self, websocket: WebSocket) -> None:
         """Accepts a new connection and enforces limits."""
-        if len(self.active_connections) >= MAX_CONNECTIONS:
+        with self._lock:
+            conn_count = len(self.active_connections)
+        if conn_count >= MAX_CONNECTIONS:
             await websocket.accept()
             await websocket.send_json({
                 "type": "error",
@@ -102,19 +137,24 @@ class ConnectionManager:
         except Exception as exc:
             log.debug("Failed to set TCP_NODELAY on WebSocket socket: %s", exc)
 
-        self.active_connections.add(websocket)
-        self.connection_queues[websocket] = ConflatedQueue()
-        self.connection_tasks[websocket] = []
-        self.message_timestamps[websocket] = []
-        log.info("New WebSocket connection accepted. Active: %d", len(self.active_connections))
+        with self._lock:
+            self.active_connections.add(websocket)
+            self.connection_queues[websocket] = ConflatedQueue()
+            self.connection_tasks[websocket] = []
+            self.message_timestamps[websocket] = []
+            active_count = len(self.active_connections)
+        log.info("New WebSocket connection accepted. Active: %d", active_count)
 
     async def disconnect(self, websocket: WebSocket) -> None:
         """Cleans up connection resources and cancels associated tasks."""
-        self.active_connections.discard(websocket)
-        self.connection_queues.pop(websocket, None)
+        with self._lock:
+            self.active_connections.discard(websocket)
+            self.connection_queues.pop(websocket, None)
+            tasks = self.connection_tasks.pop(websocket, [])
+            self.message_timestamps.pop(websocket, None)
+            active_count = len(self.active_connections)
         
         # Cancel any active tasks for this connection
-        tasks = self.connection_tasks.pop(websocket, [])
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -123,8 +163,7 @@ class ConnectionManager:
                 except asyncio.CancelledError:
                     pass
 
-        self.message_timestamps.pop(websocket, None)
-        log.info("WebSocket disconnected. Active: %d", len(self.active_connections))
+        log.info("WebSocket disconnected. Active: %d", active_count)
 
     async def check_rate_limit(self, websocket: WebSocket) -> bool:
         """
@@ -132,20 +171,23 @@ class ConnectionManager:
         Returns True if allowed, False if throttled.
         """
         now = time.time()
-        timestamps = self.message_timestamps.get(websocket, [])
-        # Filter timestamps within current window
-        timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
-        self.message_timestamps[websocket] = timestamps
+        with self._lock:
+            timestamps = self.message_timestamps.get(websocket, [])
+            # Filter timestamps within current window
+            timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+            self.message_timestamps[websocket] = timestamps
 
-        if len(timestamps) >= MAX_MESSAGES_PER_WINDOW:
-            return False
+            if len(timestamps) >= MAX_MESSAGES_PER_WINDOW:
+                return False
 
-        self.message_timestamps[websocket].append(now)
-        return True
+            self.message_timestamps[websocket].append(now)
+            return True
 
     async def send_json(self, websocket: WebSocket, data: dict) -> None:
         """Sends JSON payload safely to a single connection."""
-        if websocket in self.active_connections:
+        with self._lock:
+            active = websocket in self.active_connections
+        if active:
             try:
                 # SOTA: Use fast orjson serialization directly to bytes
                 binary_frame = orjson_dumps(data)
@@ -153,6 +195,7 @@ class ConnectionManager:
             except Exception as exc:
                 log.warning("Failed to send message over WebSocket: %s", exc)
                 await self.disconnect(websocket)
+
 
 
 class JSONRouter:
@@ -222,10 +265,10 @@ class JSONRouter:
         # Seed initial spot price based on currency
         spot = 65000.0 if currency == "BTC" else 3500.0
 
-        conflated_queue = self.manager.connection_queues.get(websocket)
+        conflated_queue = self.manager.get_queue(websocket)
         if not conflated_queue:
             conflated_queue = ConflatedQueue()
-            self.manager.connection_queues[websocket] = conflated_queue
+            self.manager.set_queue(websocket, conflated_queue)
 
         # 1. Producer Task: Simulates spot, perturbs parameters, computes Greeks, puts to ConflatedQueue
         async def risk_metrics_producer() -> None:
@@ -235,7 +278,7 @@ class JSONRouter:
             q = 0.0
             
             try:
-                while websocket in self.manager.active_connections:
+                while self.manager.is_active(websocket):
                     t_start = time.perf_counter()
                     
                     # Simulate spot price movement via GBM discretization step
@@ -298,7 +341,7 @@ class JSONRouter:
         # 2. Consumer Task: Reads from ConflatedQueue and sends over physical socket
         async def socket_writer_consumer() -> None:
             try:
-                while websocket in self.manager.active_connections:
+                while self.manager.is_active(websocket):
                     batch = await conflated_queue.get()
                     # Broadcast/send each item in conflate batch
                     for item in batch.values():
@@ -311,7 +354,8 @@ class JSONRouter:
         # Run tasks under structured concurrency with Python version fallback
         producer_task = asyncio.create_task(risk_metrics_producer())
         consumer_task = asyncio.create_task(socket_writer_consumer())
-        self.manager.connection_tasks[websocket].extend([producer_task, consumer_task])
+        self.manager.add_task(websocket, producer_task)
+        self.manager.add_task(websocket, consumer_task)
 
         await self.manager.send_json(websocket, {
             "type": "subscribed",
@@ -322,7 +366,7 @@ class JSONRouter:
 
     async def _handle_unsubscribe(self, websocket: WebSocket, send_ack: bool = True) -> None:
         """Cancels any stream loop tasks for this connection."""
-        tasks = self.manager.connection_tasks.get(websocket, [])
+        tasks = self.manager.clear_tasks(websocket)
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -330,7 +374,6 @@ class JSONRouter:
                     await task
                 except asyncio.CancelledError:
                     pass
-        self.manager.connection_tasks[websocket] = []
         if send_ack:
             await self.manager.send_json(websocket, {"type": "unsubscribed"})
 

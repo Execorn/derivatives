@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
-from pricing_engine_gpu import price_batch_gpu
+from deepvol.models.lifted_heston_gpu import price_batch_gpu
 
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

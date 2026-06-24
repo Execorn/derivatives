@@ -1,4 +1,4 @@
-# pricing package
+# deepvol.models package
 from .neural_sde import NeuralSDE, NeuralSDEPricer, compute_calibration_loss
 from .schwartz_smith import (
     schwartz_smith_price_black76,

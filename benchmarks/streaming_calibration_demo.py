@@ -132,10 +132,10 @@ def main():
     print(f"  MSE           : mean={np.mean(mses):.2e}  max={np.max(mses):.2e}")
 
     p95 = np.percentile(lat, 95)
-    verdict = (f"  ✅  Real-time capable: p95={p95:.0f}ms < 1000ms"
+    verdict = (f"  [SUCCESS] Real-time capable: p95={p95:.0f}ms < 1000ms"
                f"  (SPX ticks ~1-2s → {1000/p95:.1f}× headroom)")
     if p95 >= 1000:
-        verdict = f"  ⚠️  Borderline: p95={p95:.0f}ms — consider reducing GN iterations"
+        verdict = f"  [WARNING] Borderline: p95={p95:.0f}ms — consider reducing GN iterations"
     print(verdict)
     print("─" * 130)
 

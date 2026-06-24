@@ -131,7 +131,7 @@ def main():
     
     # Handle smoke mode defaults
     if args.smoke:
-        print("⚡ Running in SMOKE mode: forcing minimal epochs and data on CPU")
+        print("Running in SMOKE mode: forcing minimal epochs and data on CPU")
         args.n_samples = 100
         args.epochs = 2
         args.gp_epochs = 2

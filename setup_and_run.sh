@@ -48,8 +48,7 @@ fi
 # ── 1. Dependencies FIRST (torch headers must exist before compiling CUDA ext) ─
 echo ""
 echo "[setup] Step 1: Installing requirements (must precede CUDA compilation)..."
-$PIP install -r "$ROOT/src/requirements.txt" || true
-$PIP install seaborn plotly streamlit scipy
+$PIP install -e .[app,api,test]
 
 # ── 2. Compile CUDA Extension ──────────────────────────────────────────────────
 echo ""
@@ -70,10 +69,10 @@ fi
 if [ "$SKIP_TRAIN" = false ]; then
   echo ""
   echo "[pipeline] Step 3: Deep Rough LHS Dataset Generation..."
-  $PYTHON src/generate_dataset.py || echo "Dataset generation skipped/failed"
+  $PYTHON scripts/generate_dataset_heston.py || echo "Dataset generation skipped/failed"
 
-  echo "[pipeline] Step 4: Training MFNO surrogate (500 epochs with SWA)..."
-  $PYTHON src/train_fno.py
+  echo "[pipeline] Step 4: Training MFNO surrogate..."
+  $PYTHON scripts/train_fno_heston.py
 else
   echo "[pipeline] Training skipped (--skip-train)"
 fi
@@ -83,7 +82,7 @@ mkdir -p "$ROOT/logs"
 echo ""
 echo "[ui] Starting Streamlit app at http://localhost:8501"
 echo "[ui] Logs -> logs/streamlit.log"
-nohup "$VENV/bin/streamlit" run src/app_fno.py \
+nohup "$VENV/bin/streamlit" run src/deepvol/app/dashboard.py \
     --server.headless true \
     --browser.gatherUsageStats false \
     > "$ROOT/logs/streamlit.log" 2>&1 </dev/null &

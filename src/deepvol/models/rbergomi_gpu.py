@@ -268,12 +268,79 @@ def rbergomi_iv_surface(
 
 
 class rBergomiEngine:
-    def simulate_paths(self, H, eta, T, N_steps, N_paths, antithetic=True, device="cpu"):
-        return simulate_rbergomi_paths(H, eta, T, N_steps, N_paths, antithetic, device)
+    def simulate_paths(
+        self,
+        params: torch.Tensor,
+        T: float,
+        steps_per_unit: int = 200,
+        N_paths: int = 10000,
+        antithetic: bool = True,
+        device: str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Simulates Rough Bergomi stock and variance paths on GPU/CPU.
+        """
+        return simulate_rbergomi_paths(
+            params=params,
+            T=T,
+            steps_per_unit=steps_per_unit,
+            N_paths=N_paths,
+            antithetic=antithetic,
+            device=device,
+            dtype=dtype,
+        )
         
-    def price_surface(self, v0, H, eta, rho, T_grid, K_grid, N_paths=10000, antithetic=True, device="cpu") -> np.ndarray:
-        return rbergomi_iv_surface(v0, H, eta, rho, T_grid, K_grid, N_paths, antithetic, device)
+    def price_surface(
+        self,
+        v0: float,
+        H: float,
+        eta: float,
+        rho: float,
+        T_grid: np.ndarray,
+        K_grid: np.ndarray,
+        N_paths: int = 10000,
+        antithetic: bool = True,
+        device: str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> np.ndarray:
+        """
+        Computes a single Rough Bergomi implied volatility surface.
+        """
+        return rbergomi_iv_surface(
+            v0=v0,
+            H=H,
+            eta=eta,
+            rho=rho,
+            T_grid=T_grid,
+            K_grid=K_grid,
+            N_paths=N_paths,
+            antithetic=antithetic,
+            device=device,
+            dtype=dtype,
+        )
         
-    def batch_price_surface(self, params, T_grid, K_grid, N_paths=10000, antithetic=True, device="cpu") -> np.ndarray:
-        return batch_rbergomi_iv_surface(params, T_grid, K_grid, N_paths, antithetic, device)
+    def batch_price_surface(
+        self,
+        params: np.ndarray,
+        T_grid: np.ndarray,
+        K_grid: np.ndarray,
+        N_paths: int = 10000,
+        antithetic: bool = True,
+        device: str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> np.ndarray:
+        """
+        Computes batched Rough Bergomi implied volatility surfaces.
+        """
+        return batch_rbergomi_iv_surface(
+            params=params,
+            T_grid=T_grid,
+            K_grid=K_grid,
+            N_paths=N_paths,
+            antithetic=antithetic,
+            device=device,
+            dtype=dtype,
+        )
+
 

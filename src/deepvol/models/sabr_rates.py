@@ -2,12 +2,28 @@
 sabr_rates.py — Displaced SABR pricing and calibration for Interest Rate Swaptions.
 """
 
+from typing import Union, Tuple
 import numpy as np
 import scipy.optimize as opt
 
-def sabr_iv_normal_internal(F, K, T, alpha, beta, rho, nu):
+def sabr_iv_normal_internal(
+    F: Union[float, np.ndarray],
+    K: Union[float, np.ndarray],
+    T: Union[float, np.ndarray],
+    alpha: Union[float, np.ndarray],
+    beta: Union[float, np.ndarray],
+    rho: Union[float, np.ndarray],
+    nu: Union[float, np.ndarray]
+) -> Union[float, np.ndarray]:
     """
-    Hagan (2002) approximate normal (Bachelier) implied volatility.
+    Hagan (2002) approximate normal (Bachelier) implied volatility for SABR.
+
+    Formula:
+      \\sigma_N = \\frac{\\alpha (F-K)}{I_0} \\cdot \\frac{\\zeta}{D(\\zeta)} \\cdot \\left[ 1 + \\left( \\frac{-\\beta(2-\\beta)\\alpha^2}{24(FK)^{1-\\beta}} + \\frac{\\rho\\beta\\nu\\alpha}{4(FK)^{(1-\\beta)/2}} + \\frac{2-3\\rho^2}{24}\\nu^2 \\right) T \\right]
+      
+    Academic Reference:
+      Hagan, P. S., Kumar, D., Lesniewski, A. S., & Woodward, D. E. (2002).
+      Managing smile risk. Wilmott Magazine, September, 84-108.
     """
     F = np.asarray(F, dtype=float)
     K = np.asarray(K, dtype=float)
@@ -52,9 +68,9 @@ def sabr_iv_normal_internal(F, K, T, alpha, beta, rho, nu):
         rho_atm = rho_v[atm]
         nu_atm = nu_v[atm]
         
-        term1 = alpha_atm * (F_atm ** beta_atm)
-        T1 = np.where(beta_atm > 0, -beta_atm * (2.0 - beta_atm) * (alpha_atm ** 2) / (24.0 * (F_atm ** (2.0 - 2.0 * beta_atm))), 0.0)
-        T2 = np.where(beta_atm > 0, rho_atm * beta_atm * nu_atm * alpha_atm / (4.0 * (F_atm ** (1.0 - beta_atm))), 0.0)
+        term1 = alpha_atm * (np.maximum(F_atm, 1e-15) ** beta_atm)
+        T1 = np.where(beta_atm > 0, -beta_atm * (2.0 - beta_atm) * (alpha_atm ** 2) / (24.0 * (np.maximum(F_atm, 1e-15) ** (2.0 - 2.0 * beta_atm))), 0.0)
+        T2 = np.where(beta_atm > 0, rho_atm * beta_atm * nu_atm * alpha_atm / (4.0 * (np.maximum(F_atm, 1e-15) ** (1.0 - beta_atm))), 0.0)
         T3 = ((2.0 - 3.0 * rho_atm ** 2) / 24.0) * (nu_atm ** 2)
         
         res[atm] = term1 * (1.0 + (T1 + T2 + T3) * T_atm)
@@ -76,22 +92,23 @@ def sabr_iv_normal_internal(F, K, T, alpha, beta, rho, nu):
         if np.any(is_beta_zero):
             I_0[is_beta_zero] = F_natm[is_beta_zero] - K_natm[is_beta_zero]
         if np.any(is_beta_pos):
-            F_p = F_natm[is_beta_pos]
-            K_p = K_natm[is_beta_pos]
+            F_p = np.maximum(F_natm[is_beta_pos], 1e-15)
+            K_p = np.maximum(K_natm[is_beta_pos], 1e-15)
             beta_p = beta_natm[is_beta_pos]
-            I_0_pos = np.where(beta_p == 1.0, np.log(F_p / K_p), (F_p ** (1.0 - beta_p) - K_p ** (1.0 - beta_p)) / (1.0 - beta_p))
+            I_0_pos = np.where(beta_p == 1.0, np.log(F_p / K_p), (F_p ** (1.0 - beta_p) - K_p ** (1.0 - beta_p)) / np.maximum(1.0 - beta_p, 1e-8))
             I_0[is_beta_pos] = I_0_pos
             
-        zeta = (nu_natm / alpha_natm) * I_0
+        zeta = (nu_natm / np.maximum(alpha_natm, 1e-15)) * I_0
         
-        val = (np.sqrt(1.0 - 2.0 * rho_natm * zeta + zeta ** 2) + zeta - rho_natm) / (1.0 - rho_natm)
+        val = (np.sqrt(1.0 - 2.0 * rho_natm * zeta + zeta ** 2) + zeta - rho_natm) / np.maximum(1.0 - rho_natm, 1e-12)
         val = np.maximum(val, 1e-15)
         D_zeta = np.log(val)
         D_zeta_safe = np.where(np.abs(zeta) < 1e-8, 1.0, D_zeta)
         zeta_over_D = np.where(np.abs(zeta) < 1e-8, 1.0, zeta / D_zeta_safe)
         
-        term1 = alpha_natm * (F_natm - K_natm) / I_0
-        fk = F_natm * K_natm
+        I_0_safe = np.where(I_0 >= 0, np.maximum(I_0, 1e-15), np.minimum(I_0, -1e-15))
+        term1 = alpha_natm * (F_natm - K_natm) / I_0_safe
+        fk = np.maximum(F_natm, 1e-15) * np.maximum(K_natm, 1e-15)
         T1 = np.zeros_like(F_natm)
         T2 = np.zeros_like(F_natm)
         if np.any(is_beta_pos):
@@ -100,8 +117,8 @@ def sabr_iv_normal_internal(F, K, T, alpha, beta, rho, nu):
             alpha_p = alpha_natm[is_beta_pos]
             rho_p = rho_natm[is_beta_pos]
             nu_p = nu_natm[is_beta_pos]
-            T1[is_beta_pos] = -beta_p * (2.0 - beta_p) * (alpha_p ** 2) / (24.0 * (fk_p ** (1.0 - beta_p)))
-            T2[is_beta_pos] = rho_p * beta_p * nu_p * alpha_p / (4.0 * (fk_p ** ((1.0 - beta_p) / 2.0)))
+            T1[is_beta_pos] = -beta_p * (2.0 - beta_p) * (alpha_p ** 2) / (24.0 * (np.maximum(fk_p, 1e-15) ** (1.0 - beta_p)))
+            T2[is_beta_pos] = rho_p * beta_p * nu_p * alpha_p / (4.0 * (np.maximum(fk_p, 1e-15) ** ((1.0 - beta_p) / 2.0)))
             
         T3 = ((2.0 - 3.0 * rho_natm ** 2) / 24.0) * (nu_natm ** 2)
         res[not_atm] = term1 * zeta_over_D * (1.0 + (T1 + T2 + T3) * T_natm)
@@ -111,9 +128,24 @@ def sabr_iv_normal_internal(F, K, T, alpha, beta, rho, nu):
         return float(out)
     return out
 
-def sabr_iv_lognormal_internal(F, K, T, alpha, beta, rho, nu):
+def sabr_iv_lognormal_internal(
+    F: Union[float, np.ndarray],
+    K: Union[float, np.ndarray],
+    T: Union[float, np.ndarray],
+    alpha: Union[float, np.ndarray],
+    beta: Union[float, np.ndarray],
+    rho: Union[float, np.ndarray],
+    nu: Union[float, np.ndarray]
+) -> Union[float, np.ndarray]:
     """
-    Hagan (2002) approximate lognormal (Black) implied volatility.
+    Hagan (2002) approximate lognormal (Black) implied volatility for SABR.
+
+    Formula:
+      \\sigma_B = \\frac{\\alpha}{(FK)^{(1-\\beta)/2} [1 + \\frac{(1-\\beta)^2}{24}\\log^2(F/K) + \\frac{(1-\\beta)^4}{1920}\\log^4(F/K)]} \\cdot \\frac{z}{x(z)} \\cdot \\left[ 1 + \\left( \\frac{(1-\\beta)^2\\alpha^2}{24(FK)^{1-\\beta}} + \\frac{\\rho\\beta\\nu\\alpha}{4(FK)^{(1-\\beta)/2}} + \\frac{2-3\\rho^2}{24}\\nu^2 \\right) T \\right]
+
+    Academic Reference:
+      Hagan, P. S., Kumar, D., Lesniewski, A. S., & Woodward, D. E. (2002).
+      Managing smile risk. Wilmott Magazine, September, 84-108.
     """
     F = np.asarray(F, dtype=float)
     K = np.asarray(K, dtype=float)
@@ -157,9 +189,9 @@ def sabr_iv_lognormal_internal(F, K, T, alpha, beta, rho, nu):
         nu_atm = nu_v[atm]
         
         one_minus_beta = 1.0 - beta_atm
-        term1 = alpha_atm / (F_atm ** one_minus_beta)
-        num_c1 = ((one_minus_beta ** 2) / 24.0) * (alpha_atm ** 2) / (F_atm ** (2.0 * one_minus_beta))
-        num_c2 = 0.25 * rho_atm * beta_atm * nu_atm * alpha_atm / (F_atm ** one_minus_beta)
+        term1 = alpha_atm / (np.maximum(F_atm, 1e-15) ** one_minus_beta)
+        num_c1 = ((one_minus_beta ** 2) / 24.0) * (alpha_atm ** 2) / (np.maximum(F_atm, 1e-15) ** (2.0 * one_minus_beta))
+        num_c2 = 0.25 * rho_atm * beta_atm * nu_atm * alpha_atm / (np.maximum(F_atm, 1e-15) ** one_minus_beta)
         num_c3 = ((2.0 - 3.0 * rho_atm ** 2) / 24.0) * (nu_atm ** 2)
         res[atm] = term1 * (1.0 + (num_c1 + num_c2 + num_c3) * T_atm)
         
@@ -176,21 +208,21 @@ def sabr_iv_lognormal_internal(F, K, T, alpha, beta, rho, nu):
         one_minus_beta = 1.0 - beta_natm
         fk = F_natm * K_natm
         log_fk = np.log(F_natm / K_natm)
-        fk_pow = fk ** (one_minus_beta / 2.0)
+        fk_pow = np.maximum(fk, 1e-15) ** (one_minus_beta / 2.0)
         
         denom = 1.0 + ((one_minus_beta ** 2) / 24.0) * (log_fk ** 2) + ((one_minus_beta ** 4) / 1920.0) * (log_fk ** 4)
-        term1 = alpha_natm / (fk_pow * denom)
+        term1 = alpha_natm / (np.maximum(fk_pow, 1e-15) * denom)
         
-        z = (nu_natm / alpha_natm) * fk_pow * log_fk
+        z = (nu_natm / np.maximum(alpha_natm, 1e-15)) * fk_pow * log_fk
         
-        val = (np.sqrt(1.0 - 2.0 * rho_natm * z + z ** 2) + z - rho_natm) / (1.0 - rho_natm)
+        val = (np.sqrt(1.0 - 2.0 * rho_natm * z + z ** 2) + z - rho_natm) / np.maximum(1.0 - rho_natm, 1e-12)
         val = np.maximum(val, 1e-15)
         xz = np.log(val)
         xz_safe = np.where(np.abs(z) < 1e-8, 1.0, xz)
         z_over_xz = np.where(np.abs(z) < 1e-8, 1.0, z / xz_safe)
         
-        num_c1 = ((one_minus_beta ** 2) / 24.0) * (alpha_natm ** 2) / (fk ** one_minus_beta)
-        num_c2 = 0.25 * rho_natm * beta_natm * nu_natm * alpha_natm / fk_pow
+        num_c1 = ((one_minus_beta ** 2) / 24.0) * (alpha_natm ** 2) / (np.maximum(fk, 1e-15) ** one_minus_beta)
+        num_c2 = 0.25 * rho_natm * beta_natm * nu_natm * alpha_natm / np.maximum(fk_pow, 1e-15)
         num_c3 = ((2.0 - 3.0 * rho_natm ** 2) / 24.0) * (nu_natm ** 2)
         res[not_atm] = term1 * z_over_xz * (1.0 + (num_c1 + num_c2 + num_c3) * T_natm)
         

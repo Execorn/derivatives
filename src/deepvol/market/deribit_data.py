@@ -653,4 +653,4 @@ if __name__ == "__main__":
 
     assert len(df) > 100, "Expected >100 option rows"
     assert "log_moneyness" in df.columns
-    print("\n✓ All assertions passed.")
+    print("\nAll assertions passed.")

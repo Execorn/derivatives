@@ -4,18 +4,37 @@ Contains normal (Bachelier), lognormal (Black), and shifted Black pricing
 along with root-finding implied volatility solvers.
 """
 
+from typing import Union
 import numpy as np
 import scipy.stats as stats
 import scipy.optimize as opt
 
-def bachelier_price(F, K, T, sigma, option_type='call'):
+def bachelier_price(
+    F: Union[float, np.ndarray],
+    K: Union[float, np.ndarray],
+    T: Union[float, np.ndarray],
+    sigma: Union[float, np.ndarray],
+    option_type: str = 'call'
+) -> Union[float, np.ndarray]:
     """
-    Price a normal (Bachelier) option.
+    Price a normal (Bachelier) option using the Bachelier (1900) model.
     
+    The Bachelier model assumes the underlying asset follows a normal distribution
+    without mean reversion (Arithmetic Brownian Motion):
+    
+        dF_t = \\sigma dW_t
+        
     Formula:
-      d = (F - K) / (sigma * sqrt(T))
-      C = (F - K) * N(d) + sigma * sqrt(T) * n(d)
-      P = (K - F) * N(-d) + sigma * sqrt(T) * n(d)
+      d = \\frac{F - K}{\\sigma \\sqrt{T}}
+      C = (F - K) \\Phi(d) + \\sigma \\sqrt{T} \\phi(d)
+      P = (K - F) \\Phi(-d) + \\sigma \\sqrt{T} \\phi(d)
+      
+    where \\Phi is the standard normal cumulative distribution function (CDF)
+    and \\phi is the standard normal probability density function (PDF).
+    
+    Academic Reference:
+      Bachelier, L. (1900). Théorie de la spéculation. Annales Scientifiques de 
+      l'École Normale Supérieure, 17, 21-86.
       
     Parameters
     ----------
@@ -46,15 +65,15 @@ def bachelier_price(F, K, T, sigma, option_type='call'):
     
     price = np.zeros(shape)
     
-    # Valid condition: T > 0 and sigma > 0 (normal vol can be zero, but we handle it as intrinsic)
-    valid = (T > 0.0) & (sigma > 0.0)
+    # Valid condition: T > 1e-8 and sigma > 1e-8
+    valid = (T > 1e-8) & (sigma > 1e-8)
     
     # Error cases: T < 0 or sigma < 0 should return NaN
     nan_mask = (T < 0.0) | (sigma < 0.0)
     price[nan_mask] = np.nan
     
-    # Zero/boundary cases: T == 0 or sigma == 0 (intrinsic value)
-    zero_mask = ~nan_mask & ((T == 0.0) | (sigma == 0.0))
+    # Zero/boundary cases: T <= 1e-8 or sigma <= 1e-8 (intrinsic value)
+    zero_mask = ~nan_mask & (~valid)
     if np.any(zero_mask):
         if option_type.lower() in ['call', 'c']:
             price[zero_mask] = np.maximum(F[zero_mask] - K[zero_mask], 0.0)
@@ -69,7 +88,7 @@ def bachelier_price(F, K, T, sigma, option_type='call'):
         T_v = T[valid]
         sigma_v = sigma[valid]
         
-        vol_sqrt_T = sigma_v * np.sqrt(T_v)
+        vol_sqrt_T = np.maximum(sigma_v * np.sqrt(T_v), 1e-15)
         d = (F_v - K_v) / vol_sqrt_T
         
         N_d = stats.norm.cdf(d)
@@ -86,15 +105,31 @@ def bachelier_price(F, K, T, sigma, option_type='call'):
         return float(price)
     return price
 
-def black_price(F, K, T, sigma, option_type='call'):
+
+def black_price(
+    F: Union[float, np.ndarray],
+    K: Union[float, np.ndarray],
+    T: Union[float, np.ndarray],
+    sigma: Union[float, np.ndarray],
+    option_type: str = 'call'
+) -> Union[float, np.ndarray]:
     """
-    Price a lognormal (Black) option.
+    Price a lognormal (Black) option using the Black (1976) model.
     
+    The Black model assumes the forward price of the underlying follows a Geometric
+    Brownian Motion under the forward measure:
+    
+        dF_t = \\sigma F_t dW_t
+        
     Formula:
-      d1 = (ln(F/K) + 0.5 * sigma^2 * T) / (sigma * sqrt(T))
-      d2 = d1 - sigma * sqrt(T)
-      C = F * N(d1) - K * N(d2)
-      P = K * N(-d2) - F * N(-d1)
+      d1 = \\frac{\\ln(F/K) + 0.5 \\sigma^2 T}{\\sigma \\sqrt{T}}
+      d2 = d1 - \\sigma \\sqrt{T}
+      C = F \\Phi(d1) - K \\Phi(d2)
+      P = K \\Phi(-d2) - F \\Phi(-d1)
+      
+    Academic Reference:
+      Black, F. (1976). The pricing of commodity contracts. Journal of Financial 
+      Economics, 3(1-2), 167-179.
       
     Parameters
     ----------
@@ -126,14 +161,14 @@ def black_price(F, K, T, sigma, option_type='call'):
     price = np.zeros(shape)
     
     # Valid condition for Black pricing
-    valid = (F > 0.0) & (K > 0.0) & (T > 0.0) & (sigma > 0.0)
+    valid = (F > 1e-15) & (K > 1e-15) & (T > 1e-8) & (sigma > 1e-8)
     
     # Error cases: F <= 0, K <= 0, T < 0, or sigma < 0 should return NaN
     nan_mask = (F <= 0.0) | (K <= 0.0) | (T < 0.0) | (sigma < 0.0)
     price[nan_mask] = np.nan
     
-    # Zero/boundary cases: T == 0 or sigma == 0 (intrinsic value)
-    zero_mask = ~nan_mask & ((T == 0.0) | (sigma == 0.0))
+    # Zero/boundary cases: T <= 1e-8 or sigma <= 1e-8 (intrinsic value)
+    zero_mask = ~nan_mask & (~valid)
     if np.any(zero_mask):
         if option_type.lower() in ['call', 'c']:
             price[zero_mask] = np.maximum(F[zero_mask] - K[zero_mask], 0.0)
@@ -148,7 +183,10 @@ def black_price(F, K, T, sigma, option_type='call'):
         T_v = T[valid]
         sigma_v = sigma[valid]
         
-        vol_sqrt_T = sigma_v * np.sqrt(T_v)
+        vol_sqrt_T = np.maximum(sigma_v * np.sqrt(T_v), 1e-15)
+        # Avoid log of negative or division by zero, though F_v and K_v are > 1e-15
+        F_v = np.maximum(F_v, 1e-15)
+        K_v = np.maximum(K_v, 1e-15)
         d1 = (np.log(F_v / K_v) + 0.5 * (sigma_v ** 2) * T_v) / vol_sqrt_T
         d2 = d1 - vol_sqrt_T
         
@@ -163,13 +201,28 @@ def black_price(F, K, T, sigma, option_type='call'):
         return float(price)
     return price
 
-def shifted_black_price(F, K, T, sigma, shift, option_type='call'):
+
+def shifted_black_price(
+    F: Union[float, np.ndarray],
+    K: Union[float, np.ndarray],
+    T: Union[float, np.ndarray],
+    sigma: Union[float, np.ndarray],
+    shift: Union[float, np.ndarray],
+    option_type: str = 'call'
+) -> Union[float, np.ndarray]:
     """
-    Price a shifted (displaced) Black option.
+    Price a shifted (displaced) Black option using the displaced diffusion model.
     
     Displaced lognormal pricing, where both forward and strike are shifted by a shift parameter.
-    F_shifted = F + shift
-    K_shifted = K + shift
+    
+    Formula:
+      F_shifted = F + shift
+      K_shifted = K + shift
+      Price = BlackPrice(F_shifted, K_shifted, T, sigma, option_type)
+      
+    Academic Reference:
+      Rubinstein, M. (1983). Displaced Diffusion Option Pricing. The Journal of 
+      Finance, 38(1), 213-217.
     
     Parameters
     ----------
@@ -195,7 +248,16 @@ def shifted_black_price(F, K, T, sigma, shift, option_type='call'):
     K_shifted = np.asarray(K) + shift
     return black_price(F_shifted, K_shifted, T, sigma, option_type=option_type)
 
-def bachelier_implied_vol(price, F, K, T, option_type='call', tol=1e-8, max_iter=100):
+
+def bachelier_implied_vol(
+    price: Union[float, np.ndarray],
+    F: Union[float, np.ndarray],
+    K: Union[float, np.ndarray],
+    T: Union[float, np.ndarray],
+    option_type: str = 'call',
+    tol: float = 1e-8,
+    max_iter: int = 100
+) -> Union[float, np.ndarray]:
     """
     Solve for normal (Bachelier) implied volatility from option price.
     Uses Halley's cubic convergence method with Brent's method fallback.
@@ -244,7 +306,7 @@ def bachelier_implied_vol(price, F, K, T, option_type='call', tol=1e-8, max_iter
         k = K_flat[i]
         t = T_flat[i]
         
-        if np.isnan(p) or np.isnan(f) or np.isnan(k) or np.isnan(t) or t <= 0.0:
+        if np.isnan(p) or np.isnan(f) or np.isnan(k) or np.isnan(t) or t <= 1e-8:
             continue
             
         # Intrinsic value
@@ -270,7 +332,8 @@ def bachelier_implied_vol(price, F, K, T, option_type='call', tol=1e-8, max_iter
             if sigma_n <= 1e-15 or np.isnan(sigma_n) or np.isinf(sigma_n):
                 break
                 
-            d = (f - k) / (sigma_n * sqrt_t)
+            vol_sqrt_t = max(sigma_n * sqrt_t, 1e-15)
+            d = (f - k) / vol_sqrt_t
             n_d = np.exp(-0.5 * d * d) / np.sqrt(2.0 * np.pi)
             N_d = stats.norm.cdf(d)
             
@@ -289,7 +352,7 @@ def bachelier_implied_vol(price, F, K, T, option_type='call', tol=1e-8, max_iter
             if vega < 1e-15:
                 break
                 
-            vomma = vega * d * d / sigma_n
+            vomma = vega * d * d / max(sigma_n, 1e-15)
             denom = 2.0 * vega * vega - diff * vomma
             if abs(denom) < 1e-30:
                 break
@@ -299,7 +362,8 @@ def bachelier_implied_vol(price, F, K, T, option_type='call', tol=1e-8, max_iter
             
             if abs(step) < tol:
                 if sigma_next > 1e-15 and not np.isnan(sigma_next) and not np.isinf(sigma_next):
-                    d_next = (f - k) / (sigma_next * sqrt_t)
+                    vol_sqrt_t_next = max(sigma_next * sqrt_t, 1e-15)
+                    d_next = (f - k) / vol_sqrt_t_next
                     n_d_next = np.exp(-0.5 * d_next * d_next) / np.sqrt(2.0 * np.pi)
                     if option_type.lower() in ['call', 'c']:
                         p_next = (f - k) * stats.norm.cdf(d_next) + sigma_next * sqrt_t * n_d_next
@@ -320,8 +384,10 @@ def bachelier_implied_vol(price, F, K, T, option_type='call', tol=1e-8, max_iter
                 return bachelier_price(f, k, t, sigma, option_type=option_type) - p
             high = 0.1
             try:
-                while obj(high) < 0.0 and high < 1000.0:
+                iter_limit = 0
+                while obj(high) < 0.0 and high < 1000.0 and iter_limit < 20:
                     high *= 2.0
+                    iter_limit += 1
                 iv_flat[i] = opt.brentq(obj, 1e-15, high, xtol=tol, maxiter=max_iter)
             except ValueError:
                 iv_flat[i] = np.nan
@@ -330,7 +396,17 @@ def bachelier_implied_vol(price, F, K, T, option_type='call', tol=1e-8, max_iter
         return float(iv_flat[0])
     return iv_flat.reshape(shape)
 
-def black_implied_vol(price, F, K, T, option_type='call', shift=0.0, tol=1e-8, max_iter=100):
+
+def black_implied_vol(
+    price: Union[float, np.ndarray],
+    F: Union[float, np.ndarray],
+    K: Union[float, np.ndarray],
+    T: Union[float, np.ndarray],
+    option_type: str = 'call',
+    shift: Union[float, np.ndarray] = 0.0,
+    tol: float = 1e-8,
+    max_iter: int = 100
+) -> Union[float, np.ndarray]:
     """
     Solve for lognormal (Black) implied volatility from option price, with optional shift.
     Uses Halley's cubic convergence method with Brent's method fallback.
@@ -388,7 +464,7 @@ def black_implied_vol(price, F, K, T, option_type='call', shift=0.0, tol=1e-8, m
         f_s = f + sh
         k_s = k + sh
         
-        if np.isnan(p) or np.isnan(f_s) or np.isnan(k_s) or np.isnan(t) or t <= 0.0 or f_s <= 0.0 or k_s <= 0.0:
+        if np.isnan(p) or np.isnan(f_s) or np.isnan(k_s) or np.isnan(t) or t <= 1e-8 or f_s <= 1e-15 or k_s <= 1e-15:
             continue
             
         # Intrinsic value
@@ -408,7 +484,8 @@ def black_implied_vol(price, F, K, T, option_type='call', shift=0.0, tol=1e-8, m
             continue
             
         # Initial guess: ATM Black volatility formula
-        sigma_n = p / (f_s * np.sqrt(t)) * np.sqrt(2.0 * np.pi)
+        denom_init = max(f_s * np.sqrt(t), 1e-15)
+        sigma_n = p / denom_init * np.sqrt(2.0 * np.pi)
         if sigma_n <= 1e-15:
             sigma_n = 1e-4
             
@@ -420,7 +497,10 @@ def black_implied_vol(price, F, K, T, option_type='call', shift=0.0, tol=1e-8, m
             if sigma_n <= 1e-15 or np.isnan(sigma_n) or np.isinf(sigma_n):
                 break
                 
-            vol_sqrt_t = sigma_n * sqrt_t
+            vol_sqrt_t = max(sigma_n * sqrt_t, 1e-15)
+            # Avoid division by zero and log of zero
+            f_s = max(f_s, 1e-15)
+            k_s = max(k_s, 1e-15)
             d1 = (np.log(f_s / k_s) + 0.5 * sigma_n * sigma_n * t) / vol_sqrt_t
             d2 = d1 - vol_sqrt_t
             
@@ -441,7 +521,7 @@ def black_implied_vol(price, F, K, T, option_type='call', shift=0.0, tol=1e-8, m
             if vega < 1e-15:
                 break
                 
-            vomma = vega * d1 * d2 / sigma_n
+            vomma = vega * d1 * d2 / max(sigma_n, 1e-15)
             denom = 2.0 * vega * vega - diff * vomma
             if abs(denom) < 1e-30:
                 break
@@ -451,7 +531,7 @@ def black_implied_vol(price, F, K, T, option_type='call', shift=0.0, tol=1e-8, m
             
             if abs(step) < tol:
                 if sigma_next > 1e-15 and not np.isnan(sigma_next) and not np.isinf(sigma_next):
-                    vol_sqrt_t_next = sigma_next * sqrt_t
+                    vol_sqrt_t_next = max(sigma_next * sqrt_t, 1e-15)
                     d1_next = (np.log(f_s / k_s) + 0.5 * sigma_next * sigma_next * t) / vol_sqrt_t_next
                     d2_next = d1_next - vol_sqrt_t_next
                     if option_type.lower() in ['call', 'c']:
@@ -473,8 +553,10 @@ def black_implied_vol(price, F, K, T, option_type='call', shift=0.0, tol=1e-8, m
                 return black_price(f_s, k_s, t, sigma, option_type=option_type) - p
             high = 0.5
             try:
-                while obj(high) < 0.0 and high < 100.0:
+                iter_limit = 0
+                while obj(high) < 0.0 and high < 100.0 and iter_limit < 20:
                     high *= 2.0
+                    iter_limit += 1
                 iv_flat[i] = opt.brentq(obj, 1e-15, high, xtol=tol, maxiter=max_iter)
             except ValueError:
                 iv_flat[i] = np.nan
@@ -482,4 +564,3 @@ def black_implied_vol(price, F, K, T, option_type='call', shift=0.0, tol=1e-8, m
     if len(shape) == 0:
         return float(iv_flat[0])
     return iv_flat.reshape(shape)
-

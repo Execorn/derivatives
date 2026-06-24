@@ -129,9 +129,8 @@ def pnl_attribution(portfolio: List[Dict[str, Any]], dS: float, d_iv_surface: np
         "explained_pnl": float(explained_pnl.item()),
         "actual_pnl": float(actual_pnl.item() if isinstance(actual_pnl, torch.Tensor) else actual_pnl),
         "residual": float(residual.item() if isinstance(residual, torch.Tensor) else residual),
-        # BUG-11 fix: removed duplicate alias keys ("delta", "gamma", etc.)
-        # that held the same value as "delta_pnl", "gamma_pnl", etc.
         # Use the _pnl-suffixed keys consistently.
+        # Duplicate alias keys ("delta", "gamma", etc.) are removed.
         "breakdown": {
             "delta_pnl": float(delta_pnl_total.item()),
             "gamma_pnl": float(gamma_pnl_total.item()),

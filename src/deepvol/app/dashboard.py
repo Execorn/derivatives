@@ -33,7 +33,7 @@ from deepvol.models.local_vol import check_arbitrage_free
 import requests
 
 def render_neural_sde_panel():
-    st.header("🔮 Neural SDE Calibration")
+    st.header("Neural SDE Calibration")
     st.markdown("""
     This panel calibrates a **Non-parametric Neural SDE** model to an implied volatility surface.
     The drift $f_\\theta(t, V_t)$ and diffusion $g_\\theta(t, V_t)$ are parameterized as neural networks 
@@ -157,7 +157,7 @@ def render_neural_sde_panel():
 
 
 def render_signature_vol_panel():
-    st.header("🖋️ Signature Volatility Smile Forecasting")
+    st.header("Signature Volatility Smile Forecasting")
     st.markdown("""
     This panel simulates pathwise stock and variance dynamics under the **Signature Volatility** model,
     forecasting option smiles from path signatures of time-extended Brownian motion (up to depth 4).
@@ -269,7 +269,7 @@ def render_signature_vol_panel():
 
 
 def render_deep_hedging_panel():
-    st.header("🛡️ Deep Hedging Policy Simulation")
+    st.header("Deep Hedging Policy Simulation")
     st.markdown("""
     This panel evaluates **recurrent LSTM-based optimal deep hedging policies** under proportional transaction costs.
     It simulates asset paths and applies the pre-trained neural policy to compute dynamic rebalancing delta decisions.
@@ -416,7 +416,7 @@ def load_model(model_name: str):
     return model
 
 st.set_page_config(page_title="Deep Volatility Model Zoo NN Calibration", layout="wide")
-st.title("⚡ Deep Volatility Model Zoo Calibration")
+st.title("Deep Volatility Model Zoo Calibration")
 
 # ─── Sidebar Model Selector ─────────────────────────────────────────────────
 model_name = st.sidebar.selectbox(
@@ -457,7 +457,7 @@ if model_name in ("Neural SDE", "Signature Volatility", "Deep Hedging"):
 st.sidebar.header(f"True {model_name} Parameters")
 
 if model_name == "Rough Heston":
-    st.sidebar.info("🔒 Ghost parameters fixed: κ=1.0, θ=0.08, H=0.08")
+    st.sidebar.info("Constant parameter presets: κ=1.0, θ=0.08, H=0.08")
     kappa = 1.0; theta = 0.08; H = 0.08
     sigma = st.sidebar.slider("σ — Vol of Vol", 0.1, 1.0, 0.5, step=0.01)
     rho = st.sidebar.slider("ρ — Correlation", -0.9, -0.1, -0.5, step=0.01)
@@ -574,7 +574,7 @@ if model_name not in ("Neural SDE", "Signature Volatility", "Deep Hedging"):
         st.session_state.pop("calib_results", None)
 
     if "target_iv" not in st.session_state:
-        st.info("👈 Set parameters in the sidebar and click **Generate Target Surface** to begin.")
+        st.info("Set parameters in the sidebar and click **Generate Target Surface** to begin.")
         st.stop()
 
     target_iv = st.session_state["target_iv"]
@@ -650,7 +650,7 @@ if "calib_results" in st.session_state:
         
         # SVI arbitrage free check
         is_arb_free = check_arbitrage_free(MATURITIES, STRIKES, stored_true.reshape(8, 5))
-        st.markdown(f"**SVI Arbitrage-Free Check**: {'🟢 Calendar & Butterfly Arbitrage Free' if is_arb_free else '🔴 Arbitrage Violation Detected'}")
+        st.markdown(f"**SVI Arbitrage-Free Check**: {'Calendar and Butterfly Arbitrage Free' if is_arb_free else 'Arbitrage Violation Detected'}")
         
     else:
         res = res_dict["res"]

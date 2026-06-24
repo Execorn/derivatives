@@ -277,7 +277,8 @@ def sabr_iv_normal(F, K, T, alpha, beta, rho, nu):
         zeta_over_D = np.where(np.abs(zeta) < 1e-8, 1.0, zeta / D_zeta_safe)
         
         # first term
-        term1 = alpha_natm * (F_natm - K_natm) / I_0
+        I_0_safe = np.where(I_0 >= 0, np.maximum(I_0, 1e-15), np.minimum(I_0, -1e-15))
+        term1 = alpha_natm * (F_natm - K_natm) / I_0_safe
         
         # correction terms
         fk = F_natm * K_natm

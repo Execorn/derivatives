@@ -82,9 +82,9 @@ EDGE_CASES = {
     },
 }
 
-PASS = "✅ PASS"
-FAIL = "❌ FAIL"
-SKIP = "⚠️  SKIP"
+PASS = "[PASS]"
+FAIL = "[FAIL]"
+SKIP = "[SKIP]"
 
 # ── FNO model (random weights — tests architecture, not accuracy) ──────────────
 fno_model = MirrorPaddedFNO2d().eval()
@@ -145,7 +145,7 @@ for case_name, params in EDGE_CASES.items():
     if feller_ok:
         feller_status = PASS
     elif not feller_expected:
-        feller_status = "🟡 EXPECTED (stress boundary)"  # intentional violation
+        feller_status = "[EXPECTED (stress boundary)]"  # intentional violation
     else:
         feller_status = FAIL
         all_passed = False

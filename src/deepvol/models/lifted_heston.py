@@ -1,16 +1,14 @@
 """
-pricing_engine.py — Exact Fourier-COS pricing for the Lifted Rough Heston model.
+lifted_heston.py — Exact Fourier-COS pricing for the Lifted Rough Heston model.
 
 CPU reference implementation (SciPy BDF solver). Kept for validation / unit-test
 comparison against the GPU RK4 version.  NOT used in production — use
-pricing_engine_gpu.price_batch_gpu() instead.
+lifted_heston_gpu.price_batch_gpu() instead.
 
-Bug-fixes applied 2026-06-11:
-  1. kappa missing from Riccati decay term:
-       WRONG:   dpsi = F[:, None] - x[None, :] * psi_c
-       CORRECT: dpsi = F[:, None] - kappa * x[None, :] * psi_c
-  2. bernstein_factors did not normalise c (sum(c)≠1 caused sigma_eff blow-up).
-  3. accumulator used unweighted sum(psi_c) instead of c-weighted V=c·psi.
+Mathematical details of the Lifted Rough Heston model:
+  - The Riccati ODE decay term includes the mean reversion parameter kappa.
+  - Bernstein factor weights c are normalized (sum(c)=1).
+  - The volatility state V is computed as the c-weighted aggregate sum_i c_i * psi_i.
 """
 
 import numpy as np
@@ -34,7 +32,7 @@ def bernstein_factors(H: float, N: int = 20):
     r_N = 1.0 + 10.0 * (N ** -0.9)
     x = np.array([r_N ** (i - 1 - N / 2.0) for i in range(1, N + 1)])
     c = x ** -(H + 0.5)
-    c = c / c.sum()   # BUG FIX 2: normalise weights
+    c = c / c.sum()   # Normalise weights
     return x, c
 
 
@@ -119,7 +117,7 @@ def price_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0,
     rho   = params['rho']
     v0    = params['v0']
 
-    x, c = bernstein_factors(params.get('H', 0.08), N_factors)  # BUG FIX 2: c is normalised
+    x, c = bernstein_factors(params.get('H', 0.08), N_factors)  # c is normalised
     N = len(x)
 
     # COS domain [-4, 4]: The historical default was N_cos=64, but the current production
@@ -137,7 +135,7 @@ def price_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0,
         # State layout: [psi_real (N_cos*N), psi_imag (N_cos*N), int_cv_real (N_cos), int_cv_imag (N_cos)]
         psi_c = (state[:N_cos*N] + 1j * state[N_cos*N:2*N_cos*N]).reshape(N_cos, N)
 
-        # BUG FIX 3: c-weighted aggregate V(t) = sum_i c_i * psi_i
+        # c-weighted aggregate V(t) = sum_i c_i * psi_i
         V = psi_c @ c     # (N_cos,)  — matrix-vector with c as weights
 
         # Lifted Heston Riccati RHS: g(u, V)
@@ -145,7 +143,7 @@ def price_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0,
              + rho * sigma * 1j * u_c * V
              + 0.5 * sigma**2 * V**2)
 
-        # BUG FIX 1: include kappa in mean-reversion decay
+        # Include kappa in mean-reversion decay
         dpsi = F[:, None] - kappa * x[None, :] * psi_c   # (N_cos, N)
 
         # Accumulate int_0^t V(s) ds  (for kappa*theta*integral term)
@@ -174,7 +172,7 @@ def price_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0,
     for i, T in enumerate(T_grid):
         y_T       = sol.y[:, i]
         psi_T     = (y_T[:N_cos*N] + 1j * y_T[N_cos*N:2*N_cos*N]).reshape(N_cos, N)
-        # BUG FIX 3: c-weighted aggregate at terminal time T
+        # c-weighted aggregate at terminal time T
         V_T       = psi_T @ c                                     # (N_cos,)
         int_cv_T  = y_T[2*N_cos*N:2*N_cos*N+N_cos] + 1j * y_T[2*N_cos*N+N_cos:]
 
