@@ -48,8 +48,9 @@ def interpolate_bilinear_batched(
     k0 = K_grid[k_idx]
     k1 = K_grid[k_idx + 1]
     
-    wt = (T_clip - t0) / (t1 - t0)
-    wk = (k_clip - k0) / (k1 - k0)
+    # F-03: Guard denominators against zero division (e.g. duplicate grid points)
+    wt = (T_clip - t0) / torch.clamp(t1 - t0, min=1e-8)
+    wk = (k_clip - k0) / torch.clamp(k1 - k0, min=1e-8)
     
     batch_idx = torch.arange(M, device=iv_surface.device).unsqueeze(1).expand(-1, T.shape[1])
     
@@ -89,11 +90,13 @@ class MonteCarloVaREngine:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Simulates joint Heston spot and variance paths on the GPU.
-        Uses a full-truncation Euler-Maruyama discretization.
+        Uses a full-truncation Euler-Maruyama discretization per
+        Lord, Koekkoek & van Dijk (2010). Both drift and diffusion
+        terms use V^+ = max(V_t, 0) to ensure numerical stability.
 
         Formula References:
-            - dX_t = (r - 0.5 * V_t) * dt + sqrt(V_t) * dW_1,t
-            - dV_t = kappa * (theta_param - V_t) * dt + sigma * sqrt(V_t) * dW_2,t
+            - dX_t = (r - 0.5 * V^+_t) * dt + sqrt(V^+_t) * dW_1,t
+            - dV_t = kappa * (theta_param - V^+_t) * dt + sigma * sqrt(V^+_t) * dW_2,t
             - cov(dW_1, dW_2) = rho * dt
         """
         if seed is not None:
@@ -114,9 +117,10 @@ class MonteCarloVaREngine:
             Z3 = torch.randn(N_paths, dtype=torch.float32, device=self.device)
             Z1 = rho * Z2 + math.sqrt(1.0 - rho**2) * Z3
 
-            # Full truncation scheme for variance to prevent non-positivity
+            # F-02: Full truncation scheme (Lord et al. 2010) — use V^+ in BOTH
+            # drift and diffusion to guarantee non-negative variance propagation.
             V_prev_pos = torch.clamp(V_t, min=0.0)
-            V_t = V_t + kappa * (theta_param - V_t) * delta_t + sigma * torch.sqrt(V_prev_pos) * math.sqrt(delta_t) * Z2
+            V_t = V_t + kappa * (theta_param - V_prev_pos) * delta_t + sigma * torch.sqrt(V_prev_pos) * math.sqrt(delta_t) * Z2
             V_t = torch.clamp(V_t, min=1e-6)
 
             log_S = log_S + (r - 0.5 * V_prev_pos) * delta_t + torch.sqrt(V_prev_pos) * math.sqrt(delta_t) * Z1

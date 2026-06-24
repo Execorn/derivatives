@@ -8,6 +8,10 @@ import numpy as np
 import torch
 from typing import Dict, List, Union, Tuple, Optional
 
+# F-04: Module-level cache for standard Normal distribution objects,
+# keyed by (dtype, device) to avoid re-allocation on every BS pricing call.
+_STANDARD_NORMAL_CACHE: Dict[Tuple, torch.distributions.Normal] = {}
+
 # Pre-defined historical stress scenarios (Black Monday, Lehman, COVID, Flash Crash)
 HISTORICAL_SCENARIOS = {
     "Black Monday 1987": {
@@ -214,10 +218,14 @@ def bs_call_price_batch(
     sigma_safe = sigma.clamp(min=1e-8)
     T_safe = T.clamp(min=1e-8)
 
-    normal = torch.distributions.Normal(
-        torch.tensor(0.0, dtype=S.dtype, device=S.device),
-        torch.tensor(1.0, dtype=S.dtype, device=S.device)
-    )
+    # F-04: Reuse cached Normal distribution to avoid per-call allocation overhead
+    cache_key = (S.dtype, S.device)
+    if cache_key not in _STANDARD_NORMAL_CACHE:
+        _STANDARD_NORMAL_CACHE[cache_key] = torch.distributions.Normal(
+            torch.tensor(0.0, dtype=S.dtype, device=S.device),
+            torch.tensor(1.0, dtype=S.dtype, device=S.device)
+        )
+    normal = _STANDARD_NORMAL_CACHE[cache_key]
 
     d1 = (torch.log(S_safe / K_safe) + (r + 0.5 * sigma_safe ** 2) * T_safe) / (sigma_safe * torch.sqrt(T_safe))
     d2 = d1 - sigma_safe * torch.sqrt(T_safe)
@@ -320,7 +328,12 @@ def stress_portfolio(
             # SOTA asymmetric shifts
             shift_flat = flat_shift * torch.exp(-term_decay * T_p)
 
-            # Left-wing skew rotation
+            # F-11: DESIGN CHOICE — Left-wing skew rotation uses PRE-STRESS
+            # moneyness log(K/S0) rather than log(K/S_stressed) as the reference
+            # point. This ensures the skew deformation is anchored to the original
+            # surface geometry, not the post-shock spot level. Under a -20% spot
+            # crash, using post-stress moneyness would over-rotate the skew because
+            # all strikes become relatively more OTM.
             k_ref_p = torch.log(K_p / S0_t)
             sgn_k = torch.sign(k_ref_p)
             shift_skew = skew_shift * torch.tanh(-skew_steepness * k_ref_p) * (1.0 - sgn_k) * torch.exp(-skew_decay * T_p)
