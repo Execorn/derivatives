@@ -21,3 +21,11 @@ def fno_v2_model():
     model.to(device)
     model.eval()
     return model
+
+
+@pytest.fixture(autouse=True)
+def clear_cuda_cache():
+    yield
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
