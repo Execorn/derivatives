@@ -139,10 +139,16 @@ class DeribitWSClient:
         self._spot:        Optional[float]                           = None
         self._hb_task:     Optional[asyncio.Task]                    = None
         self._recv_task:   Optional[asyncio.Task]                    = None
-        self._surface_evt: asyncio.Event                             = asyncio.Event()
+        self._surface_evt_obj: Optional[asyncio.Event] = None
         self._connected:   bool                                      = False
         self._msg_id:      int                                       = 0
         self._subscribed:  set[str]                                  = set()
+
+    @property
+    def _surface_evt(self) -> asyncio.Event:
+        if self._surface_evt_obj is None:
+            self._surface_evt_obj = asyncio.Event()
+        return self._surface_evt_obj
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -294,7 +300,8 @@ class DeribitWSClient:
             log.exception("WS receive error: %s", exc)
         finally:
             self._connected = False
-            self._surface_evt.set()  # Unblock waiters if connection drops
+            if self._surface_evt_obj is not None:
+                self._surface_evt.set()  # Unblock waiters if connection drops
 
     def _handle_message(self, msg: dict) -> None:
         """Route a parsed JSON message."""
@@ -308,7 +315,8 @@ class DeribitWSClient:
                 row = _parse_tick(data)
                 if row is not None:
                     self._rows[row["instrument_name"]] = row
-                    self._surface_evt.set()
+                    if self._surface_evt_obj is not None:
+                        self._surface_evt.set()
 
             elif "price_index" in channel:
                 price = data.get("price")
