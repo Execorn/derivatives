@@ -34,6 +34,16 @@ Simulate macro stress scenarios, analyze high-frequency calculation telemetry, a
 # Setup paths to import from deepvol if necessary
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+# F-09: Define MATURITIES as a module-level constant so it is available before
+# ws_listener_thread is invoked, removing the fragile dependency on Streamlit
+# sidebar execution ordering.
+_MATURITIES = (0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0)
+
+# F-08: Thread-safe lock for protecting st.session_state writes from the
+# daemon WebSocket listener thread. Streamlit's session_state dict is not
+# designed for concurrent access.
+_session_lock = threading.Lock()
+
 # ── Session State Initialization ──────────────────────────────────────────────
 if "audit_log" not in st.session_state:
     st.session_state["audit_log"] = deque(maxlen=100)
@@ -121,30 +131,37 @@ def ws_listener_thread(url: str, currency: str, model: str, params: dict, interv
                     msg_str = ws.recv(timeout=1.0)
                     msg = json.loads(msg_str)
                     if msg.get("type") == "update":
-                        st.session_state["latest_data"] = msg
-                        st.session_state["telemetry_history"].append({
-                            "Timestamp": time.time(),
-                            "Spot Price": msg["spot"],
-                            "Latency (ms)": msg["latency_ms"]
-                        })
-                        if len(st.session_state["telemetry_history"]) > 100:
-                            st.session_state["telemetry_history"].pop(0)
+                        # F-08: Protect session_state writes with lock
+                        with _session_lock:
+                            st.session_state["latest_data"] = msg
+                            st.session_state["telemetry_history"].append({
+                                "Timestamp": time.time(),
+                                "Spot Price": msg["spot"],
+                                "Latency (ms)": msg["latency_ms"]
+                            })
+                            if len(st.session_state["telemetry_history"]) > 100:
+                                st.session_state["telemetry_history"].pop(0)
                         
                         # Check for anomalies
                         greeks = msg["greeks"]
-                        # Check calendar arbitrage breach (e.g. IV increasing as maturity decreases)
+                        # F-10: Use total variance w = σ²·T for calendar arbitrage
+                        # check instead of raw IV monotonicity. Total variance must
+                        # be non-decreasing in maturity for no-arbitrage.
                         iv_surf = np.array(greeks["iv_surface"])
                         for j in range(iv_surf.shape[1]):
                             for i in range(iv_surf.shape[0] - 1):
-                                if iv_surf[i, j] > iv_surf[i+1, j] + 0.05:  # Tolerance
-                                    st.session_state["audit_log"].append({
-                                        "Timestamp": time.strftime("%H:%M:%S"),
-                                        "Action": "Anomaly Alert",
-                                        "Severity": "HIGH",
-                                        "Spot Price": msg["spot"],
-                                        "Latency (ms)": msg["latency_ms"],
-                                        "Details": f"Calendar Arbitrage Breach at strike index {j} (T={MATURITIES[i]} vol > T={MATURITIES[i+1]} vol)"
-                                    })
+                                w_short = iv_surf[i, j] ** 2 * _MATURITIES[i]
+                                w_long = iv_surf[i+1, j] ** 2 * _MATURITIES[i+1]
+                                if w_short > w_long + 1e-6:  # Total variance violation
+                                    with _session_lock:
+                                        st.session_state["audit_log"].append({
+                                            "Timestamp": time.strftime("%H:%M:%S"),
+                                            "Action": "Anomaly Alert",
+                                            "Severity": "HIGH",
+                                            "Spot Price": msg["spot"],
+                                            "Latency (ms)": msg["latency_ms"],
+                                            "Details": f"Calendar Arbitrage Breach at strike index {j} (w(T={_MATURITIES[i]})={w_short:.6f} > w(T={_MATURITIES[i+1]})={w_long:.6f})"
+                                        })
                                     break
                     elif msg.get("type") == "error":
                         st.session_state["audit_log"].append({
@@ -189,7 +206,6 @@ stream_interval = st.sidebar.slider("Stream Tick Interval (s)", 0.2, 5.0, 1.0, s
 st.sidebar.subheader("📐 Model Target Parameters")
 base_params = {}
 maturities, strikes = get_grid_coordinates()
-MATURITIES = maturities
 
 if model_name in ("rough_heston", "heston"):
     base_params["kappa"] = st.sidebar.slider("κ (Mean reversion)", 0.5, 5.0, 2.0, step=0.1)

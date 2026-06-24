@@ -165,3 +165,60 @@ def test_guardian_price_or_fallback_anomalous_particle():
     assert len(res["anomalies"]) > 0
     assert res["prices"].shape == (2, 3)
     assert res["ivs"].shape == (2, 3)
+
+
+# ── F-07: Dedicated price_to_iv edge-case tests ──────────────────────────────
+
+from deepvol.mrm.guardian import price_to_iv
+
+
+def test_price_to_iv_round_trip():
+    """Verify that price_to_iv inverts a known BS price back to the correct IV."""
+    import scipy.stats as stats
+    S, K, T, sigma_true = 100.0, 100.0, 1.0, 0.25
+    d1 = (np.log(S / K) + 0.5 * sigma_true**2 * T) / (sigma_true * np.sqrt(T))
+    d2 = d1 - sigma_true * np.sqrt(T)
+    price = S * stats.norm.cdf(d1) - K * stats.norm.cdf(d2)
+
+    iv_recovered = price_to_iv(price, S, K, T)
+    assert abs(iv_recovered - sigma_true) < 1e-6, f"Expected {sigma_true}, got {iv_recovered}"
+
+
+def test_price_to_iv_below_intrinsic():
+    """Price ≤ intrinsic should return the floor IV (1e-4)."""
+    S, K, T = 110.0, 100.0, 0.5
+    intrinsic = S - K  # = 10.0
+    iv = price_to_iv(intrinsic - 1.0, S, K, T)
+    assert iv == 1e-4, f"Expected floor 1e-4 for sub-intrinsic price, got {iv}"
+
+    iv_exact = price_to_iv(intrinsic, S, K, T)
+    assert iv_exact == 1e-4, f"Expected floor 1e-4 for exact intrinsic price, got {iv_exact}"
+
+
+def test_price_to_iv_at_spot():
+    """Price ≥ spot should return the ceiling IV (5.0)."""
+    S, K, T = 100.0, 100.0, 1.0
+    iv = price_to_iv(S, S, K, T)
+    assert iv == 5.0, f"Expected ceiling 5.0 for price=spot, got {iv}"
+
+    iv_above = price_to_iv(S + 10.0, S, K, T)
+    assert iv_above == 5.0, f"Expected ceiling 5.0 for price>spot, got {iv_above}"
+
+
+def test_price_to_iv_deep_otm():
+    """Deep OTM option (very small price) should return a small but valid IV."""
+    S, K, T = 100.0, 200.0, 0.5  # Very deep OTM
+    price = 0.001  # Tiny premium
+    iv = price_to_iv(price, S, K, T)
+    assert 1e-4 <= iv <= 5.0, f"IV {iv} outside valid range"
+    assert np.isfinite(iv), f"IV is not finite: {iv}"
+
+
+def test_price_to_iv_zero_and_negative():
+    """Zero or negative prices should return floor IV without error."""
+    S, K, T = 100.0, 100.0, 1.0
+    iv_zero = price_to_iv(0.0, S, K, T)
+    assert iv_zero == 1e-4
+
+    iv_neg = price_to_iv(-5.0, S, K, T)
+    assert iv_neg == 1e-4

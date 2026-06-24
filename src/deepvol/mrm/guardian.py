@@ -2,6 +2,7 @@
 guardian.py — Model risk guardian that monitors parameters and intercepts pricing calls to trigger fallbacks.
 """
 
+import logging
 import numpy as np
 import torch
 import scipy.stats as stats
@@ -267,7 +268,15 @@ class ModelRiskGuardian:
                 fallback_prices = np.zeros((nT, nK))
                 fallback_ivs = np.zeros((nT, nK))
                 
-                # Price each option on the grid
+                # F-06: PERFORMANCE WARNING — The particle solver fallback prices
+                # each option individually in a nested O(nT × nK) loop, which is
+                # orders of magnitude slower than the vectorized Fourier path.
+                # For a typical 8×11 grid this is ~88 serial MC simulations.
+                logging.warning(
+                    "MRM Guardian: Particle solver fallback triggered for %d × %d = %d "
+                    "grid points. Expect significant latency increase vs. Fourier path.",
+                    nT, nK, nT * nK
+                )
                 for i, T in enumerate(maturities):
                     for j, K_val in enumerate(strikes):
                         K_abs = spot * np.exp(K_val) if (K_val < 0 or K_val < 5.0) else K_val
