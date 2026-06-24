@@ -150,8 +150,8 @@ _STRIKES    = np.linspace(-0.5, 0.5, 11, dtype=np.float32)
 def _get_cached_container(model_name: str) -> CachedModel:
     model_name = model_name.lower()
     if model_name not in _MODEL_CACHE:
-        from fno_model import MirrorPaddedFNO2d
-        from normalizers import IVSurfaceNormalizer, ParameterNormalizer
+        from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
+        from deepvol.surrogates.normalizers import IVSurfaceNormalizer, ParameterNormalizer
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -183,7 +183,8 @@ def _get_cached_container(model_name: str) -> CachedModel:
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported model: {model_name}")
 
-        artifacts_dir = Path(__file__).parents[2] / "artifacts"
+        from deepvol.utils.path_helpers import get_project_root
+        artifacts_dir = get_project_root() / "artifacts"
         path = artifacts_dir / "weights" / weights_file
         pn_path = artifacts_dir / "models" / pn_file
         yn_path = artifacts_dir / "models" / yn_file
@@ -226,7 +227,7 @@ async def _hot_reload_model_weights(model_name: str):
     cached_container = _MODEL_CACHE[model_name]
     
     async with cached_container.rwlock.writer():
-        from normalizers import IVSurfaceNormalizer, ParameterNormalizer
+        from deepvol.surrogates.normalizers import IVSurfaceNormalizer, ParameterNormalizer
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         state = torch.load(cached_container.path, map_location=device, weights_only=True)
@@ -250,13 +251,12 @@ async def _hot_reload_model_weights(model_name: str):
             pn_file = "param_normalizer_v2.npz"
             yn_file = "iv_normalizer_v2.npz"
 
-    from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
-    from deepvol.surrogates.normalizers import IVSurfaceNormalizer, ParameterNormalizer
-    from deepvol.utils.path_helpers import get_project_root
+        from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
+        from deepvol.utils.path_helpers import get_project_root
 
-    artifacts_dir = get_project_root() / "artifacts"
-    pn_path = artifacts_dir / "models" / pn_file
-    yn_path = artifacts_dir / "models" / yn_file
+        artifacts_dir = get_project_root() / "artifacts"
+        pn_path = artifacts_dir / "models" / pn_file
+        yn_path = artifacts_dir / "models" / yn_file
 
         cached_container.pn = ParameterNormalizer.load(str(pn_path))
         cached_container.yn = IVSurfaceNormalizer.load(str(yn_path))
@@ -442,7 +442,7 @@ class RBergomiGreeksRequest(BaseGreeksRequest):
 
 
 def _compute_greeks_from_surface(iv_surface: np.ndarray, S: float, r: float, q: float) -> dict:
-    from greeks.portfolio_greeks import bs_greeks
+    from deepvol.greeks.portfolio_greeks import bs_greeks
     T_grid = _MATURITIES
     k_grid = _STRIKES
     nT, nK = len(T_grid), len(k_grid)

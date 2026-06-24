@@ -14,20 +14,18 @@ import streamlit as st
 from scipy.stats import norm
 import scipy.optimize
 
-# Insert path for dependencies
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from fno_model import MirrorPaddedFNO2d
-from calibrate import _load_normalizers, _make_spatial_input, _fno_predict_real_iv
-from calibrate_fast import (
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
+from deepvol.calibration.calibrate_bfgs import _load_normalizers, _make_spatial_input, _fno_predict_real_iv
+from deepvol.calibration.calibrate_newton import (
     calibrate_heston,
     calibrate_sabr,
     calibrate_rbergomi,
 )
-from pricing.heston import heston_iv_surface
-from pricing.sabr import sabr_iv_surface
-from pricing.mlsv_gpu import MLSVSolverGPU
-from pricing.schwartz_smith import schwartz_smith_price_black76
-from pricing.neural_sde import NeuralSDE, NeuralSDEPricer, compute_calibration_loss
+from deepvol.models.heston import heston_iv_surface
+from deepvol.models.sabr import sabr_iv_surface
+from deepvol.models.mlsv_gpu import MLSVSolverGPU
+from deepvol.models.schwartz_smith import schwartz_smith_price_black76
+from deepvol.models.neural_sde import NeuralSDE, NeuralSDEPricer, compute_calibration_loss
 
 # Grid constants
 MATURITIES = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
