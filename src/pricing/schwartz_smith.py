@@ -902,15 +902,19 @@ def price_option_cos_pt(
     F = futures_price_pt(t, T_fut, chi_t, xi_t, kappa, sigma_chi, rho, sigma_xi, mu_star, lambda_chi)
     v2 = conditional_variance_pt(t, T_opt, T_fut, kappa, sigma_chi, rho, sigma_xi)
     
-    # We will clamp v2 to a safe minimum for the main COS calculations
-    v2_safe = torch.clamp(v2, min=1e-15)
-    
-    c1 = torch.log(F / K) - 0.5 * v2_safe
-    c2 = v2_safe
-    
-    a = c1 - L * torch.sqrt(c2)
-    b = c1 + L * torch.sqrt(c2)
-    
+    # ── COS truncation interval [a, b] ─────────────────────────────────────────
+    # Upcast to float64 for the log(F/K) computation to avoid precision loss at
+    # extreme moneyness when the caller passes float32 tensors (Finding 7.3).
+    v2_safe = torch.clamp(v2, min=1e-15)  # clamp before both the upcasting and payoff
+    _orig_dtype = chi_t.dtype
+    _f64 = torch.float64
+    c1 = torch.log(F.to(_f64) / K.to(_f64)) - 0.5 * v2_safe.to(_f64)
+    c2 = v2_safe.to(_f64)
+
+    a = (c1 - L * torch.sqrt(c2)).to(_orig_dtype)
+    b = (c1 + L * torch.sqrt(c2)).to(_orig_dtype)
+    c1 = c1.to(_orig_dtype)
+
     orig_shape = F.shape
     F_flat = F.reshape(-1)
     v2_flat = v2.reshape(-1)
@@ -919,7 +923,7 @@ def price_option_cos_pt(
     a_flat = a.reshape(-1)
     b_flat = b.reshape(-1)
     tau_flat = tau.reshape(-1)
-    
+
     K_flat = K.reshape(-1)
     r_flat = r.reshape(-1)
     

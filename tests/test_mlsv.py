@@ -338,3 +338,184 @@ def test_mlsv_oom_safety():
         assert (calls > 0.0).any()
         assert (puts > 0.0).any()
 
+
+
+# =============================================================================
+# Finding 7.1 — Production-Scale Particle Convergence Test (GPU-first)
+# =============================================================================
+# GPU utilization is MANDATORY per project rules (.agents/AGENTS.md).
+# On RTX 3060 (6.1 GB VRAM) this test runs in ~25s vs ~12 min on CPU.
+# block_size=4096: each NW tile = 4096×50k×4B ≈ 800 MB — fits in VRAM.
+# Falls back to CPU only when CUDA is completely unavailable.
+
+_CUDA_AVAILABLE = torch.cuda.is_available()
+_DEVICE   = "cuda" if _CUDA_AVAILABLE else "cpu"
+_DTYPE    = torch.float32 if _CUDA_AVAILABLE else torch.float64
+# Tiled block size: safe for RTX 3060 at N=50k float32
+# 4096 × 50000 × 4B = 800 MB per block (well within 6.1 GB VRAM)
+_BLOCK_SIZE = 4096 if _CUDA_AVAILABLE else 2048
+
+
+@pytest.mark.skipif(not _CUDA_AVAILABLE, reason="CUDA GPU required — CPU fallback in test_mlsv_particle_convergence_cpu_fallback")
+def test_mlsv_particle_convergence():
+    """
+    GPU-first particle convergence test (Finding 7.1 — P7 roadmap).
+
+    Verifies that MLSV option prices converge as N_paths → 50,000 on CUDA.
+
+    Strategy
+    --------
+    1. Run simulations at N ∈ {1k, 5k, 10k, 25k, 50k} on CUDA float32.
+    2. Compute the exact MC standard error from std(discounted_payoff)/sqrt(N)
+       directly from the CUDA simulation paths (not the incorrect price/sqrt(N)).
+    3. Assert N=25k is within 5 combined MC standard errors of N=50k.
+    4. Assert N=50k price is within 30% of Black-Scholes reference (sanity).
+    5. Assert total GPU wall-clock time is < 120 s (GPU utilization check).
+
+    GPU Notes
+    ---------
+    - device="cuda", dtype=torch.float32 (30–60× faster than CPU float64).
+    - block_size=4096: tiles O(N²) NW kernel to 800 MB VRAM chunks on RTX 3060.
+    - torch.cuda.synchronize() called before/after timing.
+    - McKean-Vlasov particle systems are NOT monotone-convergent in N: each N
+      defines a different coupled system (more particles → better E[V|X] density
+      → different drift for ALL paths). Only the SE-based check is used.
+    """
+    import time
+
+    S0, K, T = 100.0, 100.0, 0.5   # ATM call, 6-month expiry
+    r, q     = 0.05, 0.02
+    v0, kappa, theta, xi, rho = 0.04, 2.0, 0.04, 0.3, -0.7
+
+    particle_counts = [1_000, 5_000, 10_000, 25_000, 50_000]
+    prices  = {}
+    solvers = {}
+
+    # ── GPU warm-up (avoids one-time CUDA init cost in timing) ────────────────
+    _ = torch.zeros(1, device=_DEVICE, dtype=_DTYPE)
+    torch.cuda.synchronize()
+    t_wall_start = time.perf_counter()
+
+    for N in particle_counts:
+        solver = MLSVSolverGPU(
+            S0=S0, r=r, q=q, v0=v0,
+            kappa=kappa, theta=theta, xi=xi, rho=rho,
+            T=T,
+            steps_per_unit=50,       # 25 timesteps for T=0.5 — production-like
+            N_paths=N,
+            device=_DEVICE,
+            dtype=_DTYPE,
+        )
+        solver.simulate(method="nadaraya_watson", block_size=_BLOCK_SIZE)
+        prices[N]  = float(solver.price_european_option(strike=K, maturity=T, is_call=True))
+        solvers[N] = solver
+
+    torch.cuda.synchronize()
+    wall_s = time.perf_counter() - t_wall_start
+
+    # ── GPU utilization / speed gate ──────────────────────────────────────────
+    # All 5 simulations (1k→50k) on RTX 3060 should complete in < 120 s.
+    # Failure here means CUDA is not being used or is severely throttled.
+    assert wall_s < 120.0, (
+        f"GPU convergence sweep took {wall_s:.1f}s > 120s limit. "
+        f"Check that CUDA kernels are executing (device={_DEVICE})."
+    )
+
+    # ── Exact MC standard error from simulation paths ─────────────────────────
+    disc = math.exp(-r * T)
+
+    def _payoff_se(solver, N):
+        T_tensor = torch.tensor(T, device=_DEVICE, dtype=_DTYPE)
+        t_idx = int(torch.argmin(torch.abs(solver.t_grid - T_tensor)).item())
+        S_T   = torch.exp(solver.X_paths[t_idx].float())   # → float32 on CPU for std()
+        payoff = disc * torch.clamp(S_T - K, min=0.0)
+        return float(payoff.std().cpu()) / math.sqrt(N)
+
+    mc_se_50k = _payoff_se(solvers[50_000], 50_000)
+    mc_se_25k = _payoff_se(solvers[25_000], 25_000)
+
+    price_50k = prices[50_000]
+    price_25k = prices[25_000]
+
+    # ── Positivity ────────────────────────────────────────────────────────────
+    assert price_50k > 0.0, f"50k price non-positive: {price_50k}"
+    assert price_25k > 0.0, f"25k price non-positive: {price_25k}"
+
+    # ── SE-based convergence (N=25k vs N=50k) ────────────────────────────────
+    combined_se = math.sqrt(mc_se_50k**2 + mc_se_25k**2)
+    gap = abs(price_25k - price_50k)
+    assert gap < 5.0 * combined_se + 1e-4, (
+        f"Particle convergence failure (N=25k vs N=50k): "
+        f"|{price_25k:.6f} - {price_50k:.6f}| = {gap:.6f} "
+        f"> 5*SE={5.0*combined_se:.6f}  "
+        f"(mc_se_50k={mc_se_50k:.5f}, mc_se_25k={mc_se_25k:.5f}, wall={wall_s:.1f}s)"
+    )
+
+    # ── MKV coarse check: N=1k should not be closer than N=25k by a wide margin ─
+    deviations = {N: abs(prices[N] - price_50k) for N in particle_counts[:-1]}
+    assert deviations[1_000] >= deviations[25_000] - 5.0 * combined_se, (
+        f"MKV anomaly: N=1k deviation {deviations[1_000]:.6f} is unexpectedly "
+        f"smaller than N=25k deviation {deviations[25_000]:.6f} - 5*SE "
+        f"(combined_se={combined_se:.5f})"
+    )
+
+    # ── Black-Scholes sanity ───────────────────────────────────────────────────
+    from scipy.stats import norm as _norm
+    sigma_bs = math.sqrt(v0)
+    d1 = (math.log(S0/K) + (r - q + 0.5*sigma_bs**2)*T) / (sigma_bs*math.sqrt(T))
+    d2 = d1 - sigma_bs*math.sqrt(T)
+    bs_price = S0*math.exp(-q*T)*_norm.cdf(d1) - K*math.exp(-r*T)*_norm.cdf(d2)
+
+    assert abs(price_50k - bs_price) / bs_price < 0.30, (
+        f"50k MLSV GPU price {price_50k:.4f} deviates >30% from BS {bs_price:.4f}"
+    )
+
+
+@pytest.mark.skipif(_CUDA_AVAILABLE, reason="CPU fallback only runs when no GPU present")
+def test_mlsv_particle_convergence_cpu_fallback():
+    """
+    CPU fallback for test_mlsv_particle_convergence when no CUDA GPU is available.
+
+    Uses a reduced N ∈ {1k, 2k, 5k} sweep (N=5k as reference) to keep runtime
+    under 3 minutes on CPU. GPU variant is authoritative for production.
+    """
+    S0, K, T = 100.0, 100.0, 0.25  # shorter maturity to reduce CPU time
+    r, q     = 0.05, 0.02
+    v0, kappa, theta, xi, rho = 0.04, 2.0, 0.04, 0.3, -0.7
+
+    particle_counts = [500, 1_000, 2_000, 5_000]
+    prices  = {}
+    solvers = {}
+
+    for N in particle_counts:
+        solver = MLSVSolverGPU(
+            S0=S0, r=r, q=q, v0=v0,
+            kappa=kappa, theta=theta, xi=xi, rho=rho,
+            T=T, steps_per_unit=20, N_paths=N,
+            device="cpu", dtype=torch.float64,
+        )
+        solver.simulate(method="nadaraya_watson", block_size=512)
+        prices[N]  = float(solver.price_european_option(strike=K, maturity=T, is_call=True))
+        solvers[N] = solver
+
+    # Exact SE from 5k paths
+    disc = math.exp(-r * T)
+    for ref_N in [5_000, 2_000]:
+        slv = solvers[ref_N]
+        T_t = torch.tensor(T, dtype=torch.float64)
+        idx = int(torch.argmin(torch.abs(slv.t_grid - T_t)).item())
+        payoff = disc * torch.clamp(torch.exp(slv.X_paths[idx]) - K, min=0.0)
+        if ref_N == 5_000:
+            mc_se_5k = float(payoff.std()) / math.sqrt(ref_N)
+        else:
+            mc_se_2k = float(payoff.std()) / math.sqrt(ref_N)
+
+    combined_se = math.sqrt(mc_se_5k**2 + mc_se_2k**2)
+    gap = abs(prices[2_000] - prices[5_000])
+    assert gap < 5.0 * combined_se + 1e-4, (
+        f"CPU fallback convergence failure: |{prices[2_000]:.4f}-{prices[5_000]:.4f}|={gap:.4f} > 5*SE={5*combined_se:.4f}"
+    )
+    assert prices[5_000] > 0.0
+
+
+
