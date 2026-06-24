@@ -1330,6 +1330,28 @@ async def session_greeks(session_id: str, req: SessionGreeksRequest) -> GreeksRe
     return await compute_model_greeks(model_name, greeks_req)
 
 
+# ── WebSocket Risk Streaming Endpoint ──────────────────────────────────────────
+from fastapi import WebSocket, WebSocketDisconnect
+from deepvol.api.websocket import ConnectionManager, JSONRouter
+
+manager = ConnectionManager()
+router = JSONRouter(manager)
+
+@app.websocket("/ws/risk")
+async def websocket_risk_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            await router.handle_message(websocket, data)
+    except WebSocketDisconnect:
+        await manager.disconnect(websocket)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("WebSocket endpoint error: %s", exc)
+        await manager.disconnect(websocket)
+
+
 def main():
     import uvicorn
     import argparse
