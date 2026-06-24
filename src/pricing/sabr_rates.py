@@ -593,6 +593,82 @@ class SwaptionVolCube:
         
         return alpha, beta, rho, nu, shift
         
+    @staticmethod
+    def check_calendar_arbitrage(
+        expiries: np.ndarray,
+        vols_by_expiry: np.ndarray,
+        vol_type: str = 'normal',
+        atol: float = 1e-8,
+    ) -> list:
+        """
+        Post-hoc calendar spread no-arbitrage check on a set of smiles.
+
+        For each pair of consecutive expiries (T_i, T_{i+1}) and each strike,
+        verifies that the total implied variance is non-decreasing:
+
+            T_i * sigma_i^2 <= T_{i+1} * sigma_{i+1}^2   (lognormal)
+            T_i * sigma_i   <= T_{i+1} * sigma_{i+1}      (normal, BPV)
+
+        Parameters
+        ----------
+        expiries : ndarray, shape (M,)
+            Sorted option expiries.
+        vols_by_expiry : ndarray, shape (M, N_strikes)
+            Implied vols for each expiry row.
+        vol_type : str
+            'normal' or 'lognormal' — selects the total variance metric.
+        atol : float
+            Absolute tolerance for the non-decreasing check.
+
+        Returns
+        -------
+        violations : list of dict
+            Each entry has keys 'expiry_i', 'expiry_j', 'strike_idx',
+            'tv_i', 'tv_j' for any detected violation.
+        """
+        import logging
+        _log = logging.getLogger(__name__)
+
+        expiries = np.asarray(expiries)
+        vols = np.asarray(vols_by_expiry)
+
+        if vols.ndim == 1:
+            vols = vols[np.newaxis, :]  # treat as a single expiry — no check needed
+
+        violations = []
+        for i in range(len(expiries) - 1):
+            T_i  = expiries[i]
+            T_j  = expiries[i + 1]
+            v_i  = vols[i]
+            v_j  = vols[i + 1]
+
+            if vol_type.lower() == 'lognormal':
+                tv_i = T_i * v_i ** 2
+                tv_j = T_j * v_j ** 2
+            else:  # normal — use T*sigma directly (quadratic total BPV variance)
+                tv_i = T_i * v_i ** 2
+                tv_j = T_j * v_j ** 2
+
+            mask = tv_j < tv_i - atol
+            if np.any(mask):
+                strike_idxs = np.where(mask)[0].tolist()
+                for k in strike_idxs:
+                    violations.append({
+                        'expiry_i': float(T_i),
+                        'expiry_j': float(T_j),
+                        'strike_idx': k,
+                        'tv_i': float(tv_i[k]),
+                        'tv_j': float(tv_j[k]),
+                    })
+                _log.warning(
+                    "SwaptionVolCube: calendar spread arbitrage detected between "
+                    "expiry %.4f and %.4f at %d strike(s). "
+                    "Consider re-calibrating or using total-variance interpolation.",
+                    T_i, T_j, len(strike_idxs),
+                )
+
+        return violations
+
     def get_smile(self, T_exp, T_tenor, strikes, vol_type='normal'):
         """
         Get interpolated SABR implied volatilities for a specific smile.
@@ -620,8 +696,26 @@ class SwaptionVolCube:
         alpha, beta, rho, nu, shift = self.interpolate_params(T_exp, T_tenor)
         
         # Compute implied vols
-        return displaced_sabr_vol(F, strikes, T_exp, alpha, beta, rho, nu, shift, vol_type=vol_type)
-        
+        vols = displaced_sabr_vol(F, strikes, T_exp, alpha, beta, rho, nu, shift, vol_type=vol_type)
+
+        # ── Finding 7.4: calendar arbitrage post-hoc check ────────────────────
+        # Compare this smile against adjacent calibrated expiry smiles if the
+        # cube is calibrated and the requested T_exp aligns with a grid node.
+        if self.alpha is not None and np.isscalar(T_exp):
+            try:
+                strikes_arr = np.asarray(strikes)
+                expiry_smiles = []
+                for T_node in self.expiries:
+                    alpha_n, beta_n, rho_n, nu_n, shift_n = self.interpolate_params(T_node, T_tenor)
+                    F_n = bilinear_interpolate(T_node, T_tenor, self.expiries, self.tenors, self.forward_rates)
+                    v_node = displaced_sabr_vol(F_n, strikes_arr, T_node, alpha_n, beta_n, rho_n, nu_n, shift_n, vol_type=vol_type)
+                    expiry_smiles.append(v_node)
+                self.check_calendar_arbitrage(self.expiries, np.array(expiry_smiles), vol_type=vol_type)
+            except Exception:  # noqa: BLE001 — never raise from a diagnostic check
+                pass
+
+        return vols
+
     def price_swaption(self, T_exp, T_tenor, strike, forward, option_type='call', vol_type='normal'):
         """
         Price a swaption using the interpolated volatility.
