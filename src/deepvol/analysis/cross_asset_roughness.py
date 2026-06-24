@@ -27,11 +27,19 @@ src_dir = project_root / "src"
 if str(src_dir) not in sys.path:
     sys.path.insert(0, str(src_dir))
 
-# Patch SpectralConv2d.forward to be vmap-compatible
+# KNOWN LIMITATION (F-12): PyTorch's torch.vmap / torch.func.jacfwd cannot trace
+# through the original SpectralConv2d.forward because it uses in-place indexing on
+# a zero-initialized tensor (out_ft[:, :, :modes1, :modes2] = ...), which is not
+# supported by PyTorch's functional transforms (functorch).
+# This patched version replaces the in-place scatter with F.pad + addition, making
+# the forward pass purely functional and vmap-compatible.
+# TODO: Remove this patch once PyTorch natively supports in-place ops in vmap
+# (tracked in pytorch/functorch#667).
 from deepvol.surrogates import fno_model
 import torch.nn.functional as F
 
 def _spectral_conv2d_forward_patched(self, x):
+    """vmap-compatible SpectralConv2d forward pass using pad+add instead of in-place scatter."""
     B = x.shape[0]
     x_ft = torch.fft.rfft2(x)
     H, W = x.size(-2), x.size(-1)//2+1
@@ -48,6 +56,7 @@ def _spectral_conv2d_forward_patched(self, x):
     return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
 
 fno_model.SpectralConv2d.forward = _spectral_conv2d_forward_patched
+
 
 
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
