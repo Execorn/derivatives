@@ -213,3 +213,187 @@ def check_arbitrage(iv_surface: np.ndarray, K_grid: np.ndarray, T_grid: np.ndarr
         "butterfly_durrleman": but_dur,
         "butterfly_price": but_prc
     }
+
+import torch
+import scipy.optimize as optimize
+
+def invert_black_scholes_vectorized(
+    C: torch.Tensor,
+    S: torch.Tensor,
+    K: torch.Tensor,
+    T: torch.Tensor,
+    max_iters: int = 100,
+    tol: float = 1e-8
+) -> torch.Tensor:
+    """
+    Vectorized and differentiable implied volatility solver using hybrid bisection + Newton-Raphson.
+    Clamps the minimum volatility parameter to 0.01 to prevent Durrleman singularities.
+    Operates strictly in torch.float64.
+    """
+    import math
+    # 1. Cast all inputs to torch.float64
+    C_d = C.to(torch.float64)
+    S_d = S.to(torch.float64) if isinstance(S, torch.Tensor) else torch.tensor(S, dtype=torch.float64, device=C.device)
+    K_d = K.to(torch.float64)
+    T_d = T.to(torch.float64)
+    
+    # Initialize bounds for bisection: low = 0.01, high = 5.0
+    low = torch.full_like(C_d, 0.01)
+    high = torch.full_like(C_d, 5.0)
+    
+    vol = 0.5 * (low + high)
+    
+    for i in range(max_iters):
+        vol_std = vol * torch.sqrt(T_d)
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            d1 = (torch.log(S_d / K_d) + 0.5 * vol_std**2) / torch.clamp(vol_std, min=1e-12)
+            d2 = d1 - vol_std
+        
+        nd1 = 0.5 * (1.0 + torch.erf(d1 / math.sqrt(2.0)))
+        nd2 = 0.5 * (1.0 + torch.erf(d2 / math.sqrt(2.0)))
+        
+        price = S_d * nd1 - K_d * nd2
+        
+        intrinsic = torch.clamp(S_d - K_d, min=0.0)
+        price = torch.where(T_d <= 1e-12, intrinsic, price)
+        
+        diff = price - C_d
+        
+        if torch.max(torch.abs(diff)) < tol:
+            break
+            
+        pdf_d1 = torch.exp(-0.5 * d1**2) / math.sqrt(2.0 * math.pi)
+        vega = S_d * pdf_d1 * torch.sqrt(T_d)
+        vega = torch.clamp(vega, min=1e-12)
+        
+        low = torch.where(diff < 0.0, vol, low)
+        high = torch.where(diff > 0.0, vol, high)
+        
+        vol_new = vol - diff / vega
+        
+        fallback_mask = (vol_new <= low) | (vol_new >= high) | (vega < 1e-8)
+        vol = torch.where(fallback_mask, 0.5 * (low + high), vol_new)
+        vol = torch.clamp(vol, min=0.01, max=5.0)
+        
+    return vol
+
+def project_arbitrage_free(
+    iv_surface: np.ndarray,
+    K_grid: np.ndarray,
+    T_grid: np.ndarray,
+    S: float = 1.0
+) -> np.ndarray:
+    """
+    Project an arbitrated implied volatility surface onto the space of arbitrage-free surfaces
+    using a convex Quadratic Programming (QP) projection of Call option prices.
+    All internal computations are performed in double precision (float64).
+    
+    Parameters:
+        iv_surface (np.ndarray): Shape (nT, nK) grid of implied volatilities.
+        K_grid (np.ndarray): Shape (nK,) grid of log-moneyness.
+        T_grid (np.ndarray): Shape (nT,) times to maturity.
+        S (float): Current underlying asset price.
+        
+    Returns:
+        np.ndarray: Shape (nT, nK) projected implied volatility surface.
+    """
+    iv = np.asarray(iv_surface, dtype=np.float64)
+    K = np.asarray(K_grid, dtype=np.float64)
+    T = np.asarray(T_grid, dtype=np.float64)
+    S_val = float(S)
+    
+    M, N = iv.shape
+    
+    if np.any(K < 0) or np.max(np.abs(K)) < 5.0:
+        K_abs = S_val * np.exp(K)
+    else:
+        K_abs = K.copy()
+        
+    T_m = T[:, None]
+    vol_std = iv * np.sqrt(T_m)
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        d1 = (np.log(S_val / K_abs) + 0.5 * vol_std**2) / np.clip(vol_std, 1e-9, None)
+        d2 = d1 - vol_std
+        
+    C = S_val * stats.norm.cdf(d1) - K_abs * stats.norm.cdf(d2)
+    mask_zero = vol_std <= 1e-8
+    intrinsic = np.maximum(S_val - K_abs, 0.0)
+    C = np.where(mask_zero, intrinsic, C)
+    
+    c_flat = C.flatten()
+    
+    def objective(x):
+        diff = x - c_flat
+        return 0.5 * np.sum(diff ** 2)
+        
+    def jacobian(x):
+        return x - c_flat
+        
+    bounds = []
+    for i in range(M):
+        for j in range(N):
+            lb = max(S_val - K_abs[j], 0.0)
+            bounds.append((lb, S_val))
+            
+    A_list = []
+    # Butterfly constraints
+    for i in range(M):
+        h = np.diff(K_abs)
+        for j in range(1, N - 1):
+            row = np.zeros(M * N)
+            offset = i * N
+            row[offset + j - 1] = 1.0 / h[j - 1]
+            row[offset + j] = - (1.0 / h[j - 1] + 1.0 / h[j])
+            row[offset + j + 1] = 1.0 / h[j]
+            A_list.append(row)
+            
+    # Calendar constraints
+    for i in range(M - 1):
+        for j in range(N):
+            row = np.zeros(M * N)
+            row[i * N + j] = -1.0
+            row[(i + 1) * N + j] = 1.0
+            A_list.append(row)
+            
+    if len(A_list) > 0:
+        A = np.vstack(A_list)
+        lb_con = np.zeros(A.shape[0])
+        ub_con = np.full(A.shape[0], np.inf)
+        linear_constraint = optimize.LinearConstraint(A, lb_con, ub_con)
+        constraints = [linear_constraint]
+    else:
+        constraints = []
+        
+    res = optimize.minimize(
+        fun=objective,
+        x0=c_flat,
+        jac=jacobian,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints,
+        options={'maxiter': 500, 'ftol': 1e-9}
+    )
+    
+    C_proj = res.x.reshape((M, N))
+    
+    device = iv_surface.device if isinstance(iv_surface, torch.Tensor) else "cpu"
+    C_proj_t = torch.tensor(C_proj, dtype=torch.float64, device=device)
+    K_abs_t = torch.tensor(np.tile(K_abs, (M, 1)), dtype=torch.float64, device=device)
+    T_t = torch.tensor(np.tile(T[:, None], (1, N)), dtype=torch.float64, device=device)
+    
+    iv_proj_t = invert_black_scholes_vectorized(
+        C=C_proj_t,
+        S=torch.tensor(S_val, dtype=torch.float64, device=device),
+        K=K_abs_t,
+        T=T_t
+    )
+    
+    iv_proj = iv_proj_t.cpu().numpy()
+    iv_proj = np.clip(iv_proj, 0.01, None)
+    
+    if isinstance(iv_surface, torch.Tensor):
+        return torch.tensor(iv_proj, device=iv_surface.device, dtype=iv_surface.dtype)
+    return iv_proj
+

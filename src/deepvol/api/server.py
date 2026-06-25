@@ -24,6 +24,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from cachetools import TTLCache
+import orjson
 
 import numpy as np
 import torch
@@ -1348,7 +1349,7 @@ async def session_greeks(session_id: str, req: SessionGreeksRequest) -> GreeksRe
 
 # ── WebSocket Risk Streaming Endpoint ──────────────────────────────────────────
 from fastapi import WebSocket, WebSocketDisconnect
-from deepvol.api.websocket import ConnectionManager, JSONRouter
+from deepvol.api.websocket_server import ConnectionManager, JSONRouter, TaskGroup
 
 manager = ConnectionManager()
 router = JSONRouter(manager)
@@ -1357,15 +1358,41 @@ router = JSONRouter(manager)
 async def websocket_risk_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
-        while True:
-            data = await websocket.receive_json()
-            await router.handle_message(websocket, data)
+        async with TaskGroup() as tg:
+            conflated_queue = manager.get_queue(websocket)
+            
+            async def socket_writer_consumer():
+                try:
+                    while manager.is_active(websocket):
+                        batch = await conflated_queue.get()
+                        for item in batch.values():
+                            await manager.send_binary(websocket, item)
+                except WebSocketDisconnect:
+                    pass
+                except asyncio.CancelledError:
+                    pass
+
+            tg.create_task(socket_writer_consumer())
+
+            while True:
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(message.get("code", 1000))
+                
+                if "text" in message:
+                    data = orjson.loads(message["text"])
+                elif "bytes" in message:
+                    data = orjson.loads(message["bytes"])
+                else:
+                    continue
+                await router.handle_message(websocket, data, tg)
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("WebSocket endpoint error: %s", exc)
         await manager.disconnect(websocket)
+
 
 
 def main():
