@@ -132,3 +132,8 @@ notebooks/generate_notebooks.py
 notebooks/generate_p5_notebooks.py
 notebooks/generate_p6_notebooks.py
 
+
+# ── Phase 9 temporary and research artifacts ─────────────────────────────────
+P9_ROADMAP.md
+p9_agent_prompt.md
+
