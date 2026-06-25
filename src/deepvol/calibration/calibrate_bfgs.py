@@ -178,7 +178,8 @@ def _fno_predict_real_iv(model, params_raw: torch.Tensor,
     params_norm = _param_norm.transform_tensor(params_raw.to(torch.float32))
 
     # FNO forward — output is in normalised z-score IV space
-    pred_norm = model(spatial.expand(params_norm.size(0), -1, -1, -1),
+    actual_model = model.base_fno if hasattr(model, "base_fno") else model
+    pred_norm = actual_model(spatial.expand(params_norm.size(0), -1, -1, -1),
                       params_norm)            # (B, nT, nK)
 
     # Denormalise to real IV space

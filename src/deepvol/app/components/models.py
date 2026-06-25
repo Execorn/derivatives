@@ -94,7 +94,16 @@ def load_fno_model(model_name: str):
         model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     model.eval()
     _load_normalizers(norm_key)
-    return model
+    from deepvol.arbitrage.projection_layer import DifferentiableArbitrageFreeProjection, ArbitrageFreeFNO
+    from deepvol.calibration.calibrate_bfgs import _iv_norm
+    proj = DifferentiableArbitrageFreeProjection(
+        T_grid=torch.tensor(MATURITIES if "MATURITIES" in globals() else _MATURITIES, dtype=torch.float64),
+        K_grid=torch.tensor(STRIKES if "STRIKES" in globals() else _STRIKES, dtype=torch.float64),
+        S0=1.0,
+        is_log_moneyness=True
+    )
+    wrapped_model = ArbitrageFreeFNO(base_fno=model, projection_layer=proj, normalizer=_iv_norm)
+    return wrapped_model
 
 # ─── Model Surface Rebuilders ───────────────────────────────────────────────
 
