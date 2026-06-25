@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import numpy as np
+from deepvol.surrogates.normalizers import IVSurfaceNormalizer
 
 
 # ─── Black-Scholes PyTorch Utilities (Double Precision) ───────────────────────
@@ -251,13 +252,33 @@ class ArbitrageFreeFNO(nn.Module):
     Wrapper that couples the MirrorPaddedFNO2d with the DifferentiableArbitrageFreeProjection
     to guarantee arbitrage-free surfaces at inference time.
     """
-    def __init__(self, base_fno: nn.Module, projection_layer: DifferentiableArbitrageFreeProjection, normalizer):
+    def __init__(
+        self,
+        base_fno: nn.Module,
+        projection_layer: DifferentiableArbitrageFreeProjection,
+        normalizer: IVSurfaceNormalizer
+    ) -> None:
         super().__init__()
         self.base_fno = base_fno
         self.projection_layer = projection_layer
         self.normalizer = normalizer
         
     def forward(self, spatial: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the ArbitrageFreeFNO wrapper.
+        
+        Parameters
+        ----------
+        spatial : (B, T, K, 2) tensor
+            Spatial coordinates of the grid points.
+        theta : (B, 6) tensor
+            Normalised parameter vector.
+            
+        Returns
+        -------
+        normalized_clean : (B, T, K) tensor in float32
+            Arbitrage-free implied volatility surface in normalised z-score space.
+        """
         # 1. Forward pass through base FNO (outputs normalized z-scores)
         normalized_out = self.base_fno(spatial, theta)
         
@@ -265,8 +286,11 @@ class ArbitrageFreeFNO(nn.Module):
         iv_physical = self.normalizer.inverse_transform_tensor(normalized_out)
         
         # 3. Apply hard-constrained no-arbitrage projection
+        # Runs strictly in float64 internally and converts back to the input dtype (e.g. float32/bfloat16)
         iv_clean = self.projection_layer(iv_physical)
         
         # 4. Normalize back to z-score space for gradient consistency during training if needed
         normalized_clean = self.normalizer.transform_tensor(iv_clean)
-        return normalized_clean
+        
+        # Cast back to float32 at the boundary
+        return normalized_clean.to(torch.float32)
