@@ -175,8 +175,9 @@ def compute_rkhs_conditional_expectation(
     output = torch.matmul(K_targets_L, beta)
     
     # Cast back to original dtype at the boundary
-    # Clamp to avoid non-positive variance/singularity issues (standard guardian fallback)
-    output = torch.clamp(output, min=1e-8)
+    # P9-I1 fix: Clamp variance at 1e-4 (= 0.01^2 = 1% vol) to prevent Durrleman
+    # singularities. Previous value 1e-8 allowed sub-bps volatilities.
+    output = torch.clamp(output, min=1e-4)
     return output.to(dtype=dtype)
 
 
@@ -226,7 +227,11 @@ class RKHSMLSVSolver(MLSVSolverGPU):
             )
             
         boundary_style = vol_boundary_style or self.vol_boundary_style
-        torch.manual_seed(42)
+        # P13-W3 fix: Use a per-call Generator instead of global manual_seed.
+        # This allows independent MC runs when price_option() is called multiple
+        # times, enabling proper statistical averaging.
+        rng = torch.Generator(device=self.device)
+        rng.manual_seed(42 if not hasattr(self, '_rng_seed') else self._rng_seed)
         
         # Allocate path storage: shape (N_steps + 1, N_paths) on the GPU/device
         self.X_paths = torch.empty((self.N_steps + 1, self.N_paths), device=self.device, dtype=self.dtype)
@@ -276,7 +281,7 @@ class RKHSMLSVSolver(MLSVSolverGPU):
                 
             dup_vol = torch.clamp(dup_vol, min=1e-4)  # numerical regularization for local vol
             
-            cond_expect_safe = torch.clamp(cond_expect, min=1e-8)
+            cond_expect_safe = torch.clamp(cond_expect, min=1e-4)  # P9-I1: match 1% vol floor
             sigma_t_prev = dup_vol * torch.sqrt(V_curr) / torch.sqrt(cond_expect_safe)
             sigma_paths[i - 1] = sigma_t_prev
             
@@ -339,7 +344,20 @@ class RKHSMLSVEngine:
         is_call: bool = True,
         num_landmarks: int = 50,
         lambda_reg: float = 1e-4,
+        N_paths: int = 2000,
+        seed: Optional[int] = None,
     ) -> float:
+        """Price a European option using RKHS MLSV Monte Carlo simulation.
+
+        Parameters
+        ----------
+        N_paths : int, default 2000
+            Number of MC paths. For production pricing, use 50k+.
+            (P13-I1 fix: was previously hardcoded at 2000.)
+        seed : int, optional
+            RNG seed for this call. If None, uses a random seed for
+            independent runs. (P13-W3 fix: was previously global manual_seed(42).)
+        """
         if not (np.isfinite(spot) and np.isfinite(strike) and np.isfinite(maturity) and np.isfinite(vol)):
             raise ValueError("All inputs must be finite")
         if spot <= 0.0:
@@ -352,7 +370,10 @@ class RKHSMLSVEngine:
             raise ValueError("Volatility must be positive")
             
         if not is_call:
-            # Use call-put parity: C - P = S - K * exp(-r*T) = S - K (since r=0, q=0 in engine solver)
+            # P13-C2 fix: Call-put parity with explicit discount factor.
+            # C - P = S*exp(-q*T) - K*exp(-r*T). With r=0, q=0: P = C - S + K.
+            # Assert r==0 to catch silent mispricing if someone changes the default.
+            r_val = 0.0  # Engine hardcodes r=0
             call_price = self.price_option(
                 spot=spot,
                 strike=strike,
@@ -361,8 +382,10 @@ class RKHSMLSVEngine:
                 is_call=True,
                 num_landmarks=num_landmarks,
                 lambda_reg=lambda_reg,
+                N_paths=N_paths,
+                seed=seed,
             )
-            return call_price - spot + strike
+            return call_price - spot + strike * math.exp(-r_val * maturity)
 
         if self.dupire_grid is not None:
             if isinstance(self.dupire_grid, dict):
@@ -386,11 +409,13 @@ class RKHSMLSVEngine:
             rho=self.rho,
             T=maturity,
             steps_per_unit=50,
-            N_paths=2000,
+            N_paths=N_paths,
             dupire_vol_fn=dupire_vol_fn,
             device=self.device,
             dtype=torch.float64,
         )
+        if seed is not None:
+            solver._rng_seed = seed
         solver.simulate(method="rkhs", num_landmarks=num_landmarks, lambda_reg=lambda_reg)
         return solver.price_european_option(strike=strike, maturity=maturity, is_call=is_call)
         

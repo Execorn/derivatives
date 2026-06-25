@@ -162,6 +162,25 @@ class EGNO(nn.Module):
         # Ensure correct shapes
         if edge_attr.dim() == 3:
             edge_attr = edge_attr.unsqueeze(-1)
+
+        # P13-W1 fix: Validate and project correlation matrix to PSD cone.
+        # An invalid ρ (not positive semi-definite) produces physically meaningless
+        # cross-asset surfaces. We clamp negative eigenvalues and renormalize.
+        B, N, _, _ = edge_attr.shape
+        if N > 1:
+            rho_matrix = edge_attr[:, :, :, 0]  # (B, N, N)
+            # Check symmetry and fix if needed
+            rho_sym = 0.5 * (rho_matrix + rho_matrix.transpose(-1, -2))
+            # Spectral decomposition
+            eigenvalues, eigenvectors = torch.linalg.eigh(rho_sym)
+            # Clamp negative eigenvalues to small positive value
+            eigenvalues_clamped = torch.clamp(eigenvalues, min=1e-6)
+            # Reconstruct PSD matrix: V @ diag(λ_clamped) @ V^T
+            rho_psd = eigenvectors @ torch.diag_embed(eigenvalues_clamped) @ eigenvectors.transpose(-1, -2)
+            # Renormalize to unit diagonal
+            diag_sqrt = torch.sqrt(torch.diagonal(rho_psd, dim1=-2, dim2=-1)).unsqueeze(-1)  # (B, N, 1)
+            rho_psd = rho_psd / (diag_sqrt @ diag_sqrt.transpose(-1, -2))
+            edge_attr = rho_psd.unsqueeze(-1)  # (B, N, N, 1)
             
         # Mathematical Hardening: Clamp input volatility (index 1 of node features) to min 0.01 (100 bps)
         # to prevent division-by-zero or singular gradients at low vols.

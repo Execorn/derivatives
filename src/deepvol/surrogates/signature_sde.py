@@ -53,9 +53,19 @@ def compute_path_signature(path: torch.Tensor, depth: int = 3) -> torch.Tensor:
     B, L, D = path.shape
     device = path.device
     dtype = path.dtype
+
+    # P13-C1 fix: Guard against combinatorial explosion.
+    # Log-signature at depth N for d-dim path has sum(d^i, i=1..N) features.
+    # At depth 4, dim 5: 5+25+125+625 = 780 features with O(T^2 * d^N) cost.
+    num_features = sum(D ** i for i in range(1, depth + 1))
+    if num_features > 200:
+        logger.warning(
+            f"Signature feature count is {num_features} (depth={depth}, dim={D}). "
+            f"This will cause O(T^2 * d^{depth}) = O({L}^2 * {D}^{depth}) computation. "
+            f"Consider reducing depth or dimension to prevent VRAM/time explosion."
+        )
     
     if L < 2:
-        num_features = sum(D ** i for i in range(1, depth + 1))
         return torch.zeros(B, num_features, device=device, dtype=dtype)
         
     deltas = path[:, 1:, :] - path[:, :-1, :]  # (B, L-1, D)

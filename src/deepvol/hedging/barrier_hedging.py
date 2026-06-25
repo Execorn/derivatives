@@ -56,6 +56,8 @@ class BarrierHedgingEnv:
             
         # Payoff is computed dynamically during the hedging episode
         self.payoff = None
+        # P11-I1 fix: Explicitly set precompute attribute (was only accessed via getattr default)
+        self.precompute = True
             
     def get_state(self, k: int, prev_delta: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
         """

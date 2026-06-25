@@ -163,6 +163,9 @@ def train_frictional_hedger(
             loss = sub_env.compute_loss(wealth)
             
             loss.backward()
+            # P11-W1 fix: clip gradients to prevent explosion for large γ
+            # in exponential utility (e^{-γ·error} can produce extreme gradients)
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=10.0)
             optimizer.step()
             
             epoch_loss += loss.item() * len(batch_idx)

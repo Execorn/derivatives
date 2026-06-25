@@ -110,16 +110,16 @@ class MonteCarloVaREngine:
         num_blocks = (N_paths + block_size - 1) // block_size
         PATHS_padded = num_blocks * block_size
         
-        # Structure of Arrays (SoA) layout
-        S_t = torch.full((PATHS_padded,), S0, dtype=torch.float32, device=self.device)
-        V_t = torch.full((PATHS_padded,), v0, dtype=torch.float32, device=self.device)
+        # Structure of Arrays (SoA) layout — float64 per AGENTS.md for SDE pricing layers
+        S_t = torch.full((PATHS_padded,), S0, dtype=torch.float64, device=self.device)
+        V_t = torch.full((PATHS_padded,), v0, dtype=torch.float64, device=self.device)
         log_S = torch.log(S_t)
 
         delta_t = dt / N_steps
         total_rows = num_blocks * 2 * N_steps
 
         # Generate normal random numbers and lay them out in block-tiled shape [N, B]
-        raw_randn = torch.randn((2 * N_steps, PATHS_padded), dtype=torch.float32, device=self.device)
+        raw_randn = torch.randn((2 * N_steps, PATHS_padded), dtype=torch.float64, device=self.device)
         reshaped = raw_randn.view(2 * N_steps, num_blocks, block_size)
         permuted = reshaped.permute(1, 0, 2)  # [num_blocks, 2 * N_steps, block_size]
         block_tiled = permuted.reshape(total_rows, block_size).contiguous()

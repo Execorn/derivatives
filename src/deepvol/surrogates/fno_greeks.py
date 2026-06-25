@@ -139,16 +139,44 @@ def compute_greeks(
         iv_real = torch.clamp(iv_real, min=1e-6)
         return iv_real.squeeze(0).reshape(-1)
 
-    # First-order sensitivities via reverse-mode AD (VJPs)
-    def dIV_dsigma_fn(p):
-        J = jacrev(_iv_flat_fn, argnums=0)(p)
-        return J[:, SIGMA_IDX]  # shape (T*K,)
+    # Free fragmented GPU memory before heavy AD computation (CC-C1 fix)
+    if params.is_cuda:
+        torch.cuda.empty_cache()
 
-    # Second-order sensitivities via forward-mode AD (JVPs) over VJPs to prevent VRAM explosion
-    H_sigma = jacfwd(dIV_dsigma_fn, argnums=0)(params)  # shape (T*K, 6)
+    # CC-C1 Fix: Chunk the Hessian computation to stay within 4 GB VRAM.
+    # Both the inner jacrev AND the outer jacfwd operate on small output slices.
+    # This reduces peak VRAM from ~5 GB (full 88-element surface) to ~1.5 GB.
+    n_total = nT * nK
+    chunk_size = 22  # Process ~22 grid points at a time (safe for 6 GB GPU)
 
-    volga_flat = H_sigma[:, SIGMA_IDX]
-    vanna_flat = H_sigma[:, RHO_IDX]
+    volga_chunks = []
+    vanna_chunks = []
+
+    for start in range(0, n_total, chunk_size):
+        end = min(start + chunk_size, n_total)
+
+        # Inner function outputs ONLY the chunk slice — jacrev differentiates
+        # only chunk_size outputs, not the full 88-element surface.
+        def _iv_chunk_fn(p, _s=start, _e=end):
+            return _iv_flat_fn(p)[_s:_e]  # shape (chunk,)
+
+        # First-order: jacrev over the small chunk → (chunk, 6) Jacobian
+        def _dIV_dsigma_chunk(p, _fn=_iv_chunk_fn):
+            J = jacrev(_fn, argnums=0)(p)
+            return J[:, SIGMA_IDX]  # shape (chunk,)
+
+        # Second-order: jacfwd over the small first-order → (chunk, 6)
+        H_chunk = jacfwd(_dIV_dsigma_chunk, argnums=0)(params)
+
+        volga_chunks.append(H_chunk[:, SIGMA_IDX])
+        vanna_chunks.append(H_chunk[:, RHO_IDX])
+
+        # Free intermediate computation graphs between chunks
+        if params.is_cuda:
+            torch.cuda.empty_cache()
+
+    volga_flat = torch.cat(volga_chunks, dim=0)
+    vanna_flat = torch.cat(vanna_chunks, dim=0)
 
     volga = volga_flat.reshape(nT, nK)
     vanna = vanna_flat.reshape(nT, nK)

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import scipy.stats as stats
 from typing import Union, Dict, Any, List, Optional
+from deepvol.utils.strikes import resolve_strikes
 from deepvol.mrm.arbitrage import check_arbitrage
 from deepvol.models.heston import HestonEngine
 from deepvol.models.mlsv_gpu import MLSVEngine
@@ -221,7 +222,7 @@ class ModelRiskGuardian:
                 
                 # Convert implied volatilities to call prices
                 T_m = maturities[:, None]
-                K_m = spot * np.exp(strikes)[None, :] if np.any(strikes < 0) or np.max(np.abs(strikes)) < 5.0 else strikes[None, :]
+                K_m = resolve_strikes(strikes, spot)[None, :]
                 vol_std = fallback_ivs * np.sqrt(T_m)
                 
                 with np.errstate(divide='ignore', invalid='ignore'):
@@ -317,7 +318,7 @@ class ModelRiskGuardian:
                 ivs = engine.price_surface(params_dict, maturities, strikes, S0=spot)
                 
                 T_m = maturities[:, None]
-                K_m = spot * np.exp(strikes)[None, :] if np.any(strikes < 0) or np.max(np.abs(strikes)) < 5.0 else strikes[None, :]
+                K_m = resolve_strikes(strikes, spot)[None, :]
                 vol_std = ivs * np.sqrt(T_m)
                 
                 with np.errstate(divide='ignore', invalid='ignore'):

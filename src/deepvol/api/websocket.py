@@ -28,6 +28,10 @@ try:
         return orjson.dumps(data)
 except ImportError:
     import json
+    logging.getLogger(__name__).warning(
+        "orjson not installed — falling back to stdlib json. "
+        "WebSocket serialization will be ~10x slower. Install orjson for production use."
+    )
     def orjson_dumps(data: Any) -> bytes:
         return json.dumps(data).encode("utf-8")
 
@@ -61,14 +65,22 @@ class ConflatedQueue:
         self._event.set()
 
     async def get(self) -> Dict[str, Any]:
-        """Wait until data is available, then drain and return the current batch."""
+        """Wait until data is available, then drain and return the current batch.
+
+        Fix for CC-W1: _event.clear() is now inside the lock to prevent a
+        lost-wakeup race where put() sets the event between lock-release and
+        clear(), causing the consumer to block despite available data.
+        """
         while True:
             with self._lock:
                 if self._data:
                     batch = self._data.copy()
                     self._data.clear()
                     return batch
-            self._event.clear()
+                # Clear event inside lock: if put() fires after this point,
+                # it will re-set the event and we will see the data on the
+                # next iteration after await returns.
+                self._event.clear()
             await self._event.wait()
 
 

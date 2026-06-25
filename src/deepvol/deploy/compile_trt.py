@@ -8,42 +8,52 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-def compile_onnx_to_trt(onnx_path, engine_path):
-    print(f"Initializing TensorRT builder...")
+def compile_onnx_to_trt(onnx_path, engine_path, workspace_gb: float = 1.0):
+    \"\"\"Compile an ONNX model to a TensorRT engine.
+
+    Parameters
+    ----------
+    workspace_gb : float, default 1.0
+        Workspace memory limit in GB. P12-I1 fix: was hardcoded at 2 GB which
+        may be tight for max batch 2048 on RTX 3060 Laptop (6 GB VRAM).
+    \"\"\"
+    print(f\"Initializing TensorRT builder...\")
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
     
     # Check if we should use strongly-typed network (TRT 10+) or standard explicit batch
-    has_fp16_flag = hasattr(trt.BuilderFlag, "FP16")
+    has_fp16_flag = hasattr(trt.BuilderFlag, \"FP16\")
     
     if not has_fp16_flag:
-        print("TensorRT 10+ detected: Using strongly-typed network for compilation.")
+        print(\"TensorRT 10+ detected: Using strongly-typed network for compilation.\")
         flags = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
     else:
-        print("TensorRT 8/9 detected: Using standard explicit batch network.")
+        print(\"TensorRT 8/9 detected: Using standard explicit batch network.\")
         flags = 1 << 0  # Default explicit batch
         
     network = builder.create_network(flags)
     parser = trt.OnnxParser(network, logger)
     
     # Parse ONNX file
-    print(f"Parsing ONNX model from: {onnx_path}")
-    with open(onnx_path, "rb") as model:
+    print(f\"Parsing ONNX model from: {onnx_path}\")
+    with open(onnx_path, \"rb\") as model:
         if not parser.parse(model.read()):
             for error in range(parser.num_errors):
                 print(parser.get_error(error))
-            raise RuntimeError("Failed to parse ONNX model.")
+            raise RuntimeError(\"Failed to parse ONNX model.\")
             
-    print("ONNX parsing successful.")
+    print(\"ONNX parsing successful.\")
     
     # Configure builder config
     config = builder.create_builder_config()
     
-    # Configure workspace memory limit (e.g. 2 GB)
+    # Configure workspace memory limit
+    workspace_bytes = int(workspace_gb * 1024 * 1024 * 1024)
     try:
-        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 * 1024 * 1024 * 1024)
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
     except AttributeError:
         pass
+    print(f\"Workspace memory limit: {workspace_gb:.1f} GB\")
         
     # Configure FP16 quantization and precision flags
     if has_fp16_flag:

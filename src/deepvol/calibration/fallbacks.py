@@ -11,6 +11,8 @@ import scipy.stats as stats
 import torch
 from typing import Dict, Any, Union, Optional, List
 
+from deepvol.utils.strikes import resolve_strikes
+
 from deepvol.calibration.interface import CalibrationResult, _get_default_model
 from deepvol.calibration.calibrate_bfgs import (
     _load_normalizers,
@@ -89,7 +91,7 @@ class FourierCOSEngine:
         
         # Calculate Option Prices in float64 using Black-Scholes call pricing formula
         T_m = maturities[:, None]
-        K_m = S0 * np.exp(strikes)[None, :] if np.any(strikes < 0) or np.max(np.abs(strikes)) < 5.0 else strikes[None, :]
+        K_m = resolve_strikes(strikes, S0)[None, :]
         vol_std = ivs * np.sqrt(T_m)
         
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -131,11 +133,8 @@ class McKeanVlasovFallbackEngine:
         rho = max(-0.9999, min(float(params.get("rho", -0.7)), 0.9999))
         vol_init = max(float(np.sqrt(theta)), 0.01)
         
-        # Ensure strikes are absolute
-        if np.any(strikes < 0) or np.max(np.abs(strikes)) < 5.0:
-            strikes_abs = S0 * np.exp(strikes)
-        else:
-            strikes_abs = strikes.copy()
+        # Ensure strikes are absolute (P10-W1 fix: centralized utility)
+        strikes_abs = resolve_strikes(strikes, S0)
             
         # Initialize MLSVSolverGPU in float64
         solver = MLSVSolverGPU(
