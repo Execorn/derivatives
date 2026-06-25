@@ -11,7 +11,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Optional
 
 
 # ─── Black-Scholes PyTorch Utilities (Double Precision) ───────────────────────
@@ -21,27 +20,36 @@ def bs_call_price_pt(S: torch.Tensor, K: torch.Tensor, T: torch.Tensor, sigma: t
     Vectorized Black-Scholes call option pricing in PyTorch.
     Assumes r=0, q=0. Numerically safeguarded near boundary conditions.
     Operates in double precision for numerical stability.
+
+    Formula reference:
+        C = S * N(d1) - K * N(d2)
+        d1 = (ln(S/K) + 0.5 * sigma^2 * T) / (sigma * sqrt(T))
+        d2 = d1 - sigma * sqrt(T)
     """
     S = S.to(torch.float64)
     K = K.to(torch.float64)
     T = T.to(torch.float64)
     sigma = sigma.to(torch.float64)
     
-    vol_std = sigma * torch.sqrt(T)
-    vol_std = torch.clamp(vol_std, min=1e-12)
+    T_safe = torch.clamp(T, min=0.0)
+    vol_std = sigma * torch.sqrt(T_safe)
+    vol_std_clamped = torch.clamp(vol_std, min=1e-12)
     
-    d1 = (torch.log(S / K) + 0.5 * vol_std**2) / vol_std
-    d2 = d1 - vol_std
+    S_safe = torch.clamp(S, min=1e-15)
+    K_safe = torch.clamp(K, min=1e-15)
     
-    # Gaussian CDF approximation
-    normal = torch.distributions.Normal(0.0, 1.0)
+    d1 = (torch.log(S_safe / K_safe) + 0.5 * vol_std_clamped**2) / vol_std_clamped
+    d2 = d1 - vol_std_clamped
     
-    # Use normal.cdf in double precision
-    # In PyTorch, normal.cdf supports float64
-    c = S * normal.cdf(d1) - K * normal.cdf(d2)
+    # Vectorized standard Normal CDF using erf
+    phi_d1 = 0.5 * (1.0 + torch.erf(d1 * 0.7071067811865475))
+    phi_d2 = 0.5 * (1.0 + torch.erf(d2 * 0.7071067811865475))
     
-    # Handle small maturity or zero vol boundary
-    c = torch.where(vol_std <= 1e-10, torch.clamp(S - K, min=0.0), c)
+    c = S * phi_d1 - K * phi_d2
+    
+    # Handle small maturity or zero vol boundary: T <= 1e-10 or sigma <= 1e-10
+    boundary_mask = (T <= 1e-10) | (sigma <= 1e-10)
+    c = torch.where(boundary_mask, torch.clamp(S - K, min=0.0), c)
     return c
 
 
@@ -50,51 +58,71 @@ def bs_iv_inversion_hybrid(
     S: torch.Tensor,
     K: torch.Tensor,
     T: torch.Tensor,
-    max_bisection_iter: int = 35,
-    max_newton_iter: int = 6,
+    max_bisection_iter: int = 18,
+    max_newton_iter: int = 3,
     tol: float = 1e-12
 ) -> torch.Tensor:
     """
     Differentiable and vectorized implied volatility solver in PyTorch (Double Precision).
     Uses a hybrid approach:
-    1. Bisection search for global convergence stability.
-    2. Newton-Raphson iterations at the end to guarantee smooth, analytical gradients.
+    1. Bisection search (18 iterations) for global convergence stability.
+    2. Newton-Raphson iterations (3 iterations) at the end to guarantee smooth, analytical gradients.
+
+    Clamps the minimum volatility parameter to 0.01 (100 bps) inside the inversion solver.
+
+    Formula reference:
+        sigma_{n+1} = sigma_n - (C(sigma_n) - C_market) / Vega(sigma_n)
     """
     price = price.to(torch.float64)
     S = S.to(torch.float64)
     K = K.to(torch.float64)
     T = T.to(torch.float64)
     
-    # 1. Bisection search
-    low = torch.full_like(price, 1e-6, dtype=torch.float64)
+    T_safe = torch.clamp(T, min=0.0)
+    S_safe = torch.clamp(S, min=1e-15)
+    K_safe = torch.clamp(K, min=1e-15)
+    
+    # 1. Bisection search starting from 0.01 to clamp minimum volatility to 0.01
+    low = torch.full_like(price, 0.01, dtype=torch.float64)
     high = torch.full_like(price, 5.0, dtype=torch.float64)
     
     for _ in range(max_bisection_iter):
         mid = 0.5 * (low + high)
         p_mid = bs_call_price_pt(S, K, T, mid)
-        mask_too_high = p_mid > price
+        mask_too_high = p_mid >= price
         high = torch.where(mask_too_high, mid, high)
         low = torch.where(~mask_too_high, mid, low)
         
     sigma = 0.5 * (low + high)
+    # Detach to avoid backpropagating through the non-differentiable bisection search steps
+    sigma = sigma.detach()
+    sigma = torch.clamp(sigma, min=0.01, max=5.0)
     
     # 2. Newton-Raphson steps for exact analytical gradient flow
+    SQRT_2PI = 2.5066282746310005
     for _ in range(max_newton_iter):
-        vol_std = sigma * torch.sqrt(T)
-        vol_std = torch.clamp(vol_std, min=1e-12)
+        vol_std = sigma * torch.sqrt(T_safe)
+        vol_std_clamped = torch.clamp(vol_std, min=1e-12)
         
-        d1 = (torch.log(S / K) + 0.5 * vol_std**2) / vol_std
+        d1 = (torch.log(S_safe / K_safe) + 0.5 * vol_std_clamped**2) / vol_std_clamped
         p_curr = bs_call_price_pt(S, K, T, sigma)
         
         # Vega = S * N'(d1) * sqrt(T)
-        pdf_d1 = torch.exp(-0.5 * d1**2) / np.sqrt(2.0 * np.pi)
-        vega = S * pdf_d1 * torch.sqrt(T)
-        vega = torch.clamp(vega, min=1e-12)
+        pdf_d1 = torch.exp(-0.5 * d1**2) / SQRT_2PI
+        vega = S * pdf_d1 * torch.sqrt(T_safe)
         
         diff = p_curr - price
-        sigma = sigma - diff / vega
+        
+        # Only update sigma where vega is significant to avoid numerical division-by-zero/precision issues
+        update = torch.where(vega > 1e-9, diff / torch.clamp(vega, min=1e-12), torch.zeros_like(sigma))
+        sigma = sigma - update
         sigma = torch.clamp(sigma, min=0.01, max=5.0)
         
+    # Safeguard: if price is at or below intrinsic value, return exactly 0.01
+    intrinsic = torch.clamp(S - K, min=0.0)
+    at_intrinsic_mask = price <= (intrinsic + 1e-12)
+    sigma = torch.where(at_intrinsic_mask, torch.tensor(0.01, dtype=torch.float64, device=sigma.device), sigma)
+    
     return sigma
 
 
@@ -202,8 +230,9 @@ class DifferentiableArbitrageFreeProjection(nn.Module):
         # Run a differentiable cumulative maximum along the maturity dimension (dim=1)
         W_proj = torch.cummax(W, dim=1)[0]
         
-        # Recover physical implied volatilities
-        iv_final = torch.sqrt(W_proj / T_m)
+        # Recover physical implied volatilities safely
+        T_m_safe = torch.clamp(T_m, min=1e-12)
+        iv_final = torch.sqrt(W_proj / T_m_safe)
         
         return torch.clamp(iv_final, min=1e-4, max=5.0).to(orig_dtype)
 
