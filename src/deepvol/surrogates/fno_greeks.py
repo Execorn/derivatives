@@ -4,38 +4,58 @@ Extracts exact 2nd-order sensitivities (Volga and Vanna) from the MFNO
 using PyTorch Autograd, enabled by the C^2 smoothness of the ELU activations.
 
 Design decisions:
-  - The FNO is trained to predict IV directly (NOT total variance W = IV^2*T).
-    The previous version incorrectly interpreted model output as W and applied
-    an extra sqrt(W/T) conversion, yielding sqrt(IV/T) instead of IV.
-  - Greeks are computed via a single torch.func.jacrev call over the flattened
-    IV surface, avoiding the memory-leaking 88-iteration retain_graph loop.
+  - Greeks are computed via vectorized torch.func transforms. First-order sensitivities
+    use reverse-mode AD (jacrev / VJPs). Second-order sensitivities use forward-mode AD
+    (jacfwd / JVPs) over the first-order VJPs to prevent OOM errors on Laptop GPU.
+  - Supports second-order Greek supervision by tracing through the FNO parameters
+    using torch.func.functional_call, maintaining the autograd graph for model weights.
+  - Volatility parameters are clamped to prevent Durrleman singularities (>= 0.01).
+  - CUDA execution is preferred when a GPU is available.
 """
 
 import os
 import sys
 import torch
+import torch.nn as nn
+from torch.func import functional_call, jacrev, jacfwd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from typing import Tuple, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 
 
-def _fno_iv_flat(params, model, T_grid, K_grid):
+def _fno_iv_flat(params: torch.Tensor, model: torch.nn.Module, T_grid: torch.Tensor, K_grid: torch.Tensor) -> torch.Tensor:
     """
     Pure-function wrapper: maps params (6,) -> IV surface flattened (T*K,).
-    Required by torch.func.jacrev for functional transforms.
-    The model is closed over so autograd can trace through it.
+    Uses functional_call to trace through model parameters.
     """
-    from deepvol.calibration.calibrate_bfgs import _load_normalizers, _param_norm, _iv_norm
-    _load_normalizers(version="v2")
+    params_dict = dict(model.named_parameters())
+    device = params.device
 
-    device = next(model.parameters()).device
-    pn_mean = torch.tensor(_param_norm.mean, dtype=torch.float32, device=device)
-    pn_std  = torch.tensor(_param_norm.std,  dtype=torch.float32, device=device)
-    yn_mean = torch.tensor(_iv_norm.mean, dtype=torch.float32, device=device)
-    yn_std  = torch.tensor(_iv_norm.std,  dtype=torch.float32, device=device)
+    # Load normalizers v2 once
+    from deepvol.calibration import calibrate_bfgs as cb
+    if cb._ROOT_DIR.endswith("src/deepvol"):
+        cb._ROOT_DIR = os.path.dirname(os.path.dirname(cb._ROOT_DIR))
+    cb._load_normalizers(version="v2")
+
+
+    pn_mean = torch.tensor(cb._param_norm.mean, dtype=torch.float32, device=device)
+    pn_std  = torch.tensor(cb._param_norm.std,  dtype=torch.float32, device=device)
+    yn_mean = torch.tensor(cb._iv_norm.mean, dtype=torch.float32, device=device)
+    yn_std  = torch.tensor(cb._iv_norm.std,  dtype=torch.float32, device=device)
+
+    # Clamp volatility parameters (sigma and v0) to prevent Durrleman singularities (>= 0.01)
+    p6_clamped = params.clone()
+    p6_clamped = torch.cat([
+        p6_clamped[0:2],
+        torch.clamp(p6_clamped[2:3], min=0.01),  # sigma
+        p6_clamped[3:4],
+        torch.clamp(p6_clamped[4:5], min=0.01),  # v0
+        p6_clamped[5:6]
+    ])
 
     # Normalize T and K coordinates matching the FNO training distribution
     T_norm = (T_grid - T_grid.mean()) / (T_grid.std() + 1e-8)
@@ -43,93 +63,140 @@ def _fno_iv_flat(params, model, T_grid, K_grid):
     T_mesh, K_mesh = torch.meshgrid(T_norm, K_norm, indexing='ij')
     spatial = torch.stack([T_mesh, K_mesh], dim=-1).unsqueeze(0).to(device)  # (1, T, K, 2)
 
-    p6 = params.to(device).float()
-    p_norm = (p6 - pn_mean) / pn_std
-    iv_norm = model(spatial, p_norm.unsqueeze(0))
+    p_norm = (p6_clamped - pn_mean) / pn_std
+    iv_norm = functional_call(model, params_dict, (spatial, p_norm.unsqueeze(0)))
     iv_real = iv_norm * yn_std + yn_mean
     iv_real = torch.clamp(iv_real, min=1e-6)
     return iv_real.squeeze(0).reshape(-1)
 
 
-def compute_greeks(model, params, T_grid, K_grid):
+def compute_greeks(
+    model: torch.nn.Module,
+    params: torch.Tensor,
+    T_grid: torch.Tensor,
+    K_grid: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Computes Volga (d^2 IV / d sigma^2) and Vanna (d^2 IV / d sigma d rho)
-    across the full (T, K) grid using a single Jacobian pass.
+    across the full (T, K) grid using vectorized reverse-mode AD (VJPs)
+    for first-order and forward-mode AD (JVPs) for second-order.
 
     Args:
-        model:   Trained MirrorPaddedFNO2d instance (eval mode, CPU).
-        params:  Tensor (6,) [kappa, theta, sigma, rho, v0, H] — will be detached
-                 and re-attached as a leaf for AD.
+        model:   Trained MirrorPaddedFNO2d instance.
+        params:  Tensor (6,) [kappa, theta, sigma, rho, v0, H] — Leaf tensor for AD.
         T_grid:  Tensor (T,) of maturities.
         K_grid:  Tensor (K,) of log-moneyness values.
 
     Returns:
-        volga:  ndarray (T, K)  — d^2 IV / d sigma^2
-        vanna:  ndarray (T, K)  — d^2 IV / d sigma d rho
+        volga:  Tensor (T, K)  — d^2 IV / d sigma^2
+        vanna:  Tensor (T, K)  — d^2 IV / d sigma d rho
     """
     nT, nK = T_grid.size(0), K_grid.size(0)
     SIGMA_IDX, RHO_IDX = 2, 3
 
-    # Detach and re-register params as a differentiable leaf.
-    params = params.detach().requires_grad_(True)
+    device = params.device
+    
+    # Run Model Governance (SR 26-2) OOD checks and drift tracking
+    with torch.no_grad():
+        params_np = params.detach().cpu().numpy()
+        from deepvol.mrm.compliance import check_compliance
+        _ = check_compliance(params_np)
+    
+    # Load normalizers v2 once
+    from deepvol.calibration import calibrate_bfgs as cb
+    if cb._ROOT_DIR.endswith("src/deepvol"):
+        cb._ROOT_DIR = os.path.dirname(os.path.dirname(cb._ROOT_DIR))
+    cb._load_normalizers(version="v2")
 
-    # --- First-order Jacobian: J[i, p] = d IV_flat[i] / d params[p] ---
-    # shape: (T*K, 6)
-    J = torch.autograd.functional.jacobian(
-        lambda p: _fno_iv_flat(p, model, T_grid, K_grid),
-        params,
-        create_graph=True,   # keep graph alive for second-order pass
-        vectorize=False,     # safer with complex models; set True for speed if verified
-    )  # shape: (T*K, 6)
+    pn_mean = torch.tensor(cb._param_norm.mean, dtype=torch.float32, device=device)
+    pn_std  = torch.tensor(cb._param_norm.std,  dtype=torch.float32, device=device)
+    yn_mean = torch.tensor(cb._iv_norm.mean, dtype=torch.float32, device=device)
+    yn_std  = torch.tensor(cb._iv_norm.std,  dtype=torch.float32, device=device)
 
-    dIV_dsigma_flat = J[:, SIGMA_IDX]  # (T*K,)
+    # Extract model parameters for functional tracing
+    params_dict = dict(model.named_parameters())
 
-    # --- Second-order: d/d params of each dIV_dsigma[i] ---
-    # We accumulate Volga and Vanna by computing grad of sum(dIV_dsigma * selector)
-    # for each output cell.  A cleaner approach: compute Hessian rows for sigma and rho.
-    volga_flat = torch.zeros(nT * nK)
-    vanna_flat = torch.zeros(nT * nK)
+    # Differentiable forward pass closing over params_dict
+    def _iv_flat_fn(p):
+        p6_clamped = p.clone()
+        p6_clamped = torch.cat([
+            p6_clamped[0:2],
+            torch.clamp(p6_clamped[2:3], min=0.01),  # sigma
+            p6_clamped[3:4],
+            torch.clamp(p6_clamped[4:5], min=0.01),  # v0
+            p6_clamped[5:6]
+        ])
 
-    for idx in range(nT * nK):
-        g2 = torch.autograd.grad(
-            dIV_dsigma_flat[idx], params,
-            retain_graph=(idx < nT * nK - 1),  # free graph on last iteration
-            create_graph=False,
-        )[0]  # shape (6,)
-        volga_flat[idx] = g2[SIGMA_IDX].item()
-        vanna_flat[idx]  = g2[RHO_IDX].item()
+        # Normalize T and K coordinates matching the FNO training distribution
+        T_norm = (T_grid - T_grid.mean()) / (T_grid.std() + 1e-8)
+        K_norm = K_grid / 0.5
+        T_mesh, K_mesh = torch.meshgrid(T_norm, K_norm, indexing='ij')
+        spatial = torch.stack([T_mesh, K_mesh], dim=-1).unsqueeze(0).to(device)  # (1, T, K, 2)
 
-    volga = volga_flat.reshape(nT, nK).numpy()
-    vanna  = vanna_flat.reshape(nT, nK).numpy()
+        p_norm = (p6_clamped - pn_mean) / pn_std
+        iv_norm = functional_call(model, params_dict, (spatial, p_norm.unsqueeze(0)))
+        iv_real = iv_norm * yn_std + yn_mean
+        iv_real = torch.clamp(iv_real, min=1e-6)
+        return iv_real.squeeze(0).reshape(-1)
+
+    # First-order sensitivities via reverse-mode AD (VJPs)
+    def dIV_dsigma_fn(p):
+        J = jacrev(_iv_flat_fn, argnums=0)(p)
+        return J[:, SIGMA_IDX]  # shape (T*K,)
+
+    # Second-order sensitivities via forward-mode AD (JVPs) over VJPs to prevent VRAM explosion
+    H_sigma = jacfwd(dIV_dsigma_fn, argnums=0)(params)  # shape (T*K, 6)
+
+    volga_flat = H_sigma[:, SIGMA_IDX]
+    vanna_flat = H_sigma[:, RHO_IDX]
+
+    volga = volga_flat.reshape(nT, nK)
+    vanna = vanna_flat.reshape(nT, nK)
+
     return volga, vanna
 
+
 def main():
-    print("Testing Autograd Greeks Engine...")
+    print("Testing Vectorized Autograd Greeks Engine...")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
     model = MirrorPaddedFNO2d()
     weights_path = "artifacts/weights/fno_v2_final_prod.pth"
     if os.path.exists(weights_path):
-        model.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=True))
+        model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+    model.to(device)
     model.eval()
     
-    from deepvol.calibration.calibrate_bfgs import _load_normalizers
-    _load_normalizers("v2")
+    from deepvol.calibration import calibrate_bfgs as cb
+    if cb._ROOT_DIR.endswith("src/deepvol"):
+        cb._ROOT_DIR = os.path.dirname(os.path.dirname(cb._ROOT_DIR))
+    cb._load_normalizers(version="v2")
     
-    params = torch.tensor([2.5, 0.08, 0.5, -0.5, 0.08, 0.08], dtype=torch.float32)
-    T_grid = torch.tensor([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0], dtype=torch.float32)
-    K_grid = torch.linspace(-0.5, 0.5, 11, dtype=torch.float32)
+    params = torch.tensor([2.5, 0.08, 0.5, -0.5, 0.08, 0.08], dtype=torch.float32, device=device)
+    T_grid = torch.tensor([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0], dtype=torch.float32, device=device)
+    K_grid = torch.linspace(-0.5, 0.5, 11, dtype=torch.float32, device=device)
     
-    print("Computing Volga and Vanna (this may take a moment)...")
-    volga, vanna = compute_greeks(model, params, T_grid, K_grid)
+    print("Computing Volga and Vanna (vectorized)...")
+    import time
+    t0 = time.perf_counter()
+    volga_t, vanna_t = compute_greeks(model, params, T_grid, K_grid)
+    t1 = time.perf_counter()
+    print(f"Vectorized Greeks computed in {(t1 - t0)*1000.0:.2f} ms")
+    
+    # Detach and convert to numpy for plotting
+    volga = volga_t.detach().cpu().numpy()
+    vanna = vanna_t.detach().cpu().numpy()
     
     # Plotting
     os.makedirs("images/ai_generated", exist_ok=True)
     fig, axes = plt.subplots(1, 2, figsize=(14, 5), facecolor="#0D1117")
     
-    # Styling for seaborn heatmaps
     sns.set(style="dark")
     
-    K_labels = [f"{k:.2f}" for k in K_grid.numpy()]
-    T_labels = [f"{t:.1f}" for t in T_grid.numpy()]
+    K_labels = [f"{k:.2f}" for k in K_grid.cpu().numpy()]
+    T_labels = [f"{t:.1f}" for t in T_grid.cpu().numpy()]
     
     ax1 = axes[0]
     sns.heatmap(volga, xticklabels=K_labels, yticklabels=T_labels, cmap="magma", ax=ax1, cbar_kws={'label': 'Volga'})
@@ -156,6 +223,7 @@ def main():
     out_path = "images/ai_generated/fno_greeks_heatmap.png"
     fig.savefig(out_path, dpi=200, facecolor="#0D1117")
     print(f"Greeks Heatmaps saved to {out_path}")
+
 
 if __name__ == "__main__":
     main()
