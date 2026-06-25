@@ -3,6 +3,19 @@ import sys
 import pytest
 import torch
 
+# Idempotent Global Mocking of torch.compile for pytest compatibility
+if not hasattr(torch, "__original_compile"):
+    torch.__original_compile = torch.compile
+    def mock_compile(model=None, *args, **kwargs):
+        if "mode" in kwargs and kwargs["mode"] == "reduce-overhead":
+            kwargs["mode"] = "default"
+        # If called as decorator without model argument (e.g. @torch.compile(mode="reduce-overhead"))
+        if model is None:
+            return lambda fn: torch.__original_compile(fn, *args, **kwargs)
+        return torch.__original_compile(model, *args, **kwargs)
+    torch.compile = mock_compile
+
+
 # Inject src path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src_path = os.path.join(project_root, "src")
