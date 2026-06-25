@@ -31,7 +31,7 @@ except ImportError:
     def orjson_dumps(data: Any) -> bytes:
         return json.dumps(data).encode("utf-8")
 
-from deepvol.api.server import compute_model_greeks
+# Import compute_model_greeks deferred to prevent circular import
 
 log = logging.getLogger(__name__)
 
@@ -312,6 +312,7 @@ class JSONRouter:
                     }
 
                     try:
+                        from deepvol.api.server import compute_model_greeks
                         res = await compute_model_greeks(model_name, req_payload)
                         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
@@ -395,6 +396,7 @@ class JSONRouter:
 
         t0 = time.perf_counter()
         try:
+            from deepvol.api.server import compute_model_greeks
             res = await compute_model_greeks(model_name, req_payload)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             

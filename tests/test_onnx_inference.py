@@ -132,11 +132,19 @@ def test_tensorrt_inference_rmse_and_zero_copy(trt_engine, original_model_f64, n
         spatial = torch.randn(B, 8, 11, 2, dtype=torch.float32, device=device)
         theta = torch.randn(B, 6, dtype=torch.float32, device=device)
         
-        # PyTorch double precision evaluation
+        # PyTorch double precision evaluation (batched to prevent CUDA OOM on 6.1 GB GPU)
         spatial_double = spatial.double()
         theta_double = theta.double()
+        py_out_norm_chunks = []
+        chunk_size = 128
         with torch.no_grad():
-            py_out_norm = original_model_f64(spatial_double, theta_double).cpu().numpy()
+            for i in range(0, B, chunk_size):
+                sp_chunk = spatial_double[i : i + chunk_size]
+                th_chunk = theta_double[i : i + chunk_size]
+                out_chunk = original_model_f64(sp_chunk, th_chunk).cpu()
+                py_out_norm_chunks.append(out_chunk)
+                torch.cuda.empty_cache()
+        py_out_norm = torch.cat(py_out_norm_chunks, dim=0).numpy()
         py_out = normalizer.inverse_transform(py_out_norm)
         
         # TensorRT dynamic shapes binding setup
