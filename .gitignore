@@ -103,6 +103,8 @@ dev/
 ROADMAP_P4_ONWARDS.md
 *.ORIGINAL_REQUEST.md
 *TIER*ORCHESTRATOR*.md
+app_frontend/AGENTS.md
+app_frontend/CLAUDE.md
 PROJECT.md
 TEST_INFRA.md
 TEST_READY.md
