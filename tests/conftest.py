@@ -9,6 +9,15 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
+# Mock torch.compile to map reduce-overhead to default for pytest
+_orig_compile = torch.compile
+def mock_compile(*args, **kwargs):
+    if kwargs.get("mode") == "reduce-overhead":
+        kwargs["mode"] = "default"
+    return _orig_compile(*args, **kwargs)
+torch.compile = mock_compile
+
+
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 
 @pytest.fixture(scope="module")
