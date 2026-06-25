@@ -5,27 +5,19 @@ import torch
 
 # Mock torch.compile for autograd compatibility in testing
 _orig_compile = torch.compile
-def _mock_compile(model=None, *args, **kwargs):
-    if "mode" in kwargs and kwargs["mode"] == "reduce-overhead":
+def mock_compile(model=None, *args, **kwargs):
+    if kwargs.get("mode") == "reduce-overhead":
         kwargs["mode"] = "default"
     if model is None:
-        return lambda f: _mock_compile(f, *args, **kwargs)
+        return lambda f: mock_compile(f, *args, **kwargs)
     return _orig_compile(model, *args, **kwargs)
-torch.compile = _mock_compile
+torch.compile = mock_compile
 
 # Inject src path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
-
-# Mock torch.compile to map reduce-overhead to default for pytest
-_orig_compile = torch.compile
-def mock_compile(*args, **kwargs):
-    if kwargs.get("mode") == "reduce-overhead":
-        kwargs["mode"] = "default"
-    return _orig_compile(*args, **kwargs)
-torch.compile = mock_compile
 
 
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
