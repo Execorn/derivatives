@@ -3,6 +3,22 @@ import sys
 import pytest
 import torch
 
+# Idempotently mock torch.compile to map mode="reduce-overhead" to mode="default"
+# for pytest execution to prevent autograd/CUDAGraphs weakref issues.
+if not hasattr(torch, "__original_compile"):
+    torch.__original_compile = torch.compile
+    def mock_compile(model=None, *args, **kwargs):
+        if "mode" in kwargs and kwargs["mode"] == "reduce-overhead":
+            kwargs["mode"] = "default"
+        if model is not None:
+            return torch.__original_compile(model, *args, **kwargs)
+        else:
+            def decorator(fn):
+                return torch.__original_compile(fn, *args, **kwargs)
+            return decorator
+    torch.compile = mock_compile
+
+
 # Inject src path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src_path = os.path.join(project_root, "src")
