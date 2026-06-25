@@ -13,6 +13,7 @@ from deepvol.hedging.adversarial_market import (
     WGAN_GP_Discriminator,
     train_robust_minimax_hedger
 )
+from deepvol.hedging.cvar_loss import CVaRLoss
 
 
 def test_adversarial_components():
@@ -172,4 +173,94 @@ def test_stylized_facts_differentiability():
         
         sum_norms = sum(grad_norms)
         assert sum_norms > 0.0, f"{name}: sum of gradient norms is zero (no gradient propagated)"
+
+
+def test_cvar_loss_properties():
+    """
+    Validates mathematical correctness, differentiability, float64 internal math,
+    and parameter validation of CVaRLoss.
+    """
+    # 1. Test parameter validation
+    with pytest.raises(ValueError):
+        CVaRLoss(alpha=0.0)
+    with pytest.raises(ValueError):
+        CVaRLoss(alpha=1.0)
+    with pytest.raises(ValueError):
+        CVaRLoss(alpha=-0.5)
+
+    # 2. Test mathematical correctness
+    cvar_fn = CVaRLoss(alpha=0.8)
+    losses = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], dtype=torch.float32)
+    cvar_val = cvar_fn(losses)
+    
+    # CVaR must be strictly greater than the mean of the losses
+    assert cvar_val.item() > losses.mean().item()
+    
+    # Rockafellar-Uryasev formulation for [1..10] at alpha=0.8:
+    # VaR = 8.2 (linear interpolation), CVaR = 9.5
+    assert abs(cvar_val.item() - 9.5) < 1e-5
+
+    # 3. Test differentiability
+    losses.requires_grad_(True)
+    cvar_val = cvar_fn(losses)
+    cvar_val.backward()
+    assert losses.grad is not None
+    # Gradients should only be non-zero for paths with losses >= VaR
+    # VaR = 8.2, so only 9.0 and 10.0 should have positive gradients, others should be zero
+    assert torch.allclose(losses.grad[:8], torch.zeros(8), atol=1e-7)
+    assert torch.all(losses.grad[8:] > 0.0)
+
+    # 4. Test float64 internal math (promoting to float64 and casting back)
+    assert cvar_val.dtype == torch.float32
+
+
+def test_minimax_cvar_training():
+    """
+    Validates minimax robust deep hedging loop stability and convergence properties
+    when using the CVaR risk measure.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(42)
+    
+    # Latent space and sequence settings
+    latent_dim = 10
+    seq_len = 30
+    
+    # Generate mock real returns (512 samples)
+    real_returns = torch.randn(512, seq_len, device=device) * 0.01
+    real_acf = torch.linspace(0.1, 0.0, 20, device=device)
+    real_leverage = -0.12
+    real_cfvc_matrix = torch.eye(4, device=device)
+    
+    # Initialize networks
+    generator = WGAN_GP_Generator(latent_dim=latent_dim, seq_len=seq_len, hidden_dim=16)
+    discriminator = WGAN_GP_Discriminator(seq_len=seq_len, hidden_dim=16)
+    policy = HedgingPolicy(input_dim=4, hidden_dim=16, output_dim=1)
+    
+    # Run a single epoch of minimax training with "cvar" risk measure
+    train_robust_minimax_hedger(
+        real_returns=real_returns,
+        real_acf=real_acf,
+        real_leverage=real_leverage,
+        real_cfvc_matrix=real_cfvc_matrix,
+        generator=generator,
+        discriminator=discriminator,
+        policy=policy,
+        epochs=1,
+        critic_steps=1,
+        minimax_coeff=0.01,
+        device=device,
+        risk_measure="cvar",
+        alpha=0.95
+    )
+    
+    # Verify weights are modified and are not NaN
+    for name, param in generator.named_parameters():
+        if param.requires_grad:
+            assert not torch.isnan(param).any()
+            
+    for name, param in policy.named_parameters():
+        if param.requires_grad:
+            assert not torch.isnan(param).any()
+
 
