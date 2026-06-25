@@ -219,12 +219,21 @@ def _get_cached_container(model_name: str) -> CachedModel:
         pn = ParameterNormalizer.load(str(pn_path))
         yn = IVSurfaceNormalizer.load(str(yn_path))
 
-        container = CachedModel(model_name, model, pn, yn, path)
+        from deepvol.arbitrage.projection_layer import DifferentiableArbitrageFreeProjection, ArbitrageFreeFNO
+        proj = DifferentiableArbitrageFreeProjection(
+            T_grid=torch.tensor(_MATURITIES, dtype=torch.float64, device=device),
+            K_grid=torch.tensor(_STRIKES, dtype=torch.float64, device=device),
+            S0=1.0,
+            is_log_moneyness=True
+        )
+        wrapped_model = ArbitrageFreeFNO(base_fno=model, projection_layer=proj, normalizer=yn).to(device)
+
+        container = CachedModel(model_name, wrapped_model, pn, yn, path)
         _MODEL_CACHE[model_name] = container
         
         # Populate _MODEL_STATE for backward compatibility if default model is loaded
         if model_name in ("rough_heston", "default"):
-            _MODEL_STATE.update(model=model, pn=pn, yn=yn, device=device, loaded=True)
+            _MODEL_STATE.update(model=wrapped_model, pn=pn, yn=yn, device=device, loaded=True)
 
     return _MODEL_CACHE[model_name]
 
@@ -245,7 +254,10 @@ async def _hot_reload_model_weights(model_name: str):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         state = torch.load(cached_container.path, map_location=device, weights_only=True)
-        cached_container.model.load_state_dict(state)
+        if hasattr(cached_container.model, "base_fno"):
+            cached_container.model.base_fno.load_state_dict(state)
+        else:
+            cached_container.model.load_state_dict(state)
         cached_container.model.to(device)
         cached_container.model.eval()
         
@@ -528,7 +540,8 @@ async def compute_model_greeks(
         async with cached_container.rwlock.reader():
             # Build the model parameter array/tensor
             if model_name in ("heston", "rough_heston", "default", "v2"):
-                if cached_container.model.film.mlp[0].in_features == 5:
+                actual_model = cached_container.model.base_fno if hasattr(cached_container.model, "base_fno") else cached_container.model
+                if actual_model.film.mlp[0].in_features == 5:
                     # Classic Heston (5 params)
                     theta_arr = np.array([parsed_req.kappa, parsed_req.theta, parsed_req.sigma, parsed_req.rho, parsed_req.v0], dtype=np.float32)
                 else:
