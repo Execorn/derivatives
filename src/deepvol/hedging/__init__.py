@@ -19,3 +19,12 @@ from .adversarial_market import (
     train_robust_minimax_hedger,
     convert_returns_to_prices
 )
+
+from .mp_diffusion import (
+    MartingaleViolationError,
+    PathDenoisingNet,
+    project_spot_martingale,
+    audit_martingale_paths,
+    MPDDPM
+)
+
