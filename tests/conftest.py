@@ -4,12 +4,14 @@ import pytest
 import torch
 
 # Mock torch.compile to avoid CUDAGraphs weakref/memory issues in test suite
-original_compile = torch.compile
-def mock_compile(*args, **kwargs):
-    if "mode" in kwargs and kwargs["mode"] == "reduce-overhead":
-        kwargs["mode"] = "default"
-    return original_compile(*args, **kwargs)
-torch.compile = mock_compile
+if not hasattr(torch, "__original_compile"):
+    torch.__original_compile = torch.compile
+    def mock_compile(model=None, *args, **kwargs):
+        if kwargs.get("mode") == "reduce-overhead":
+            kwargs["mode"] = "default"
+            kwargs["dynamic"] = True
+        return torch.__original_compile(model, *args, **kwargs)
+    torch.compile = mock_compile
 
 # Inject src path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,14 +19,6 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-# Mock torch.compile for autograd/pytest compatibility
-original_compile = torch.compile
-def mock_compile(*args, **kwargs):
-    if kwargs.get("mode") == "reduce-overhead":
-        kwargs["mode"] = "default"
-        kwargs["dynamic"] = True
-    return original_compile(*args, **kwargs)
-torch.compile = mock_compile
 
 
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
