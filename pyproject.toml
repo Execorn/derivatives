@@ -7,7 +7,7 @@ name = "deepvol"
 dynamic = ["version"]
 description = "Deep Volatility: Neural Network Pricing, Calibration, and Hedging Framework"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Execorn Derivatives Team", email = "info@execorn.com"}
@@ -25,7 +25,8 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.0.0",
-    "numpy>=1.22.0",
+    "numpy>=1.22.0,<2.0.0",
+    "numba>=0.60.0",
     "scipy>=1.8.0",
     "pandas>=1.4.0",
     "torchdiffeq>=0.2.3",
@@ -35,6 +36,12 @@ dependencies = [
     "iisignature>=0.24",
     "redis",
     "confluent-kafka",
+    "orjson",
+    "prometheus-client",
+    "onnxruntime-gpu<1.20.0",
+    "tensorrt",
+    "onnx",
+    "ml-dtypes>=0.5.0",
 ]
 
 [project.optional-dependencies]
