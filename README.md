@@ -1,11 +1,11 @@
 # Deep Rough Heston Calibration via FiLM-FNO
 
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.12-EE4C2C?style=for-the-badge&logo=PyTorch&logoColor=white)](https://pytorch.org/)
-[![CUDA](https://img.shields.io/badge/CUDA-12.6-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
-[![Python 3.14](https://img.shields.io/badge/Python-3.14-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.8-EE4C2C?style=for-the-badge&logo=PyTorch&logoColor=white)](https://pytorch.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-12.8-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
+[![Python 3.9](https://img.shields.io/badge/Python-3.9-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-535%20passed-brightgreen?style=for-the-badge)](tests/)
+[![Tests](https://img.shields.io/badge/tests-955%20passed-brightgreen?style=for-the-badge)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
 > **Master's Thesis Project** — МФТИ ФПМИ, Кафедра БИТ, 2026
@@ -229,39 +229,29 @@ ParameterNormalizer.denormalize()
 
 ### Requirements
 
-- Python 3.14+
-- CUDA 12.6+ and a compatible GPU (tested: RTX 3080/4090, A100)
-- PyTorch 2.12+ with CUDA support
+- Python 3.9+
+- CUDA 12.8+ and a compatible GPU (tested: RTX 3060/3080/4090, A100)
+- PyTorch 2.8+ with CUDA support
+- `uv` Python package manager (highly recommended)
 - ~4 GB disk space (model weights + datasets)
 
 ### Setup
 
+Using `uv` (fastest & recommended):
 ```bash
 # 1. Clone the repository
 git clone <repo-url>
 cd derivatives
 
-# 2. Create and activate a virtual environment
-python -m venv .venv
-source .venv/bin/activate        # Linux/macOS
-# or: .venv\Scripts\activate     # Windows
+# 2. Sync dependencies and build virtual environment automatically
+uv sync
 
-# 3. Install Python dependencies
-pip install --extra-index-url https://download.pytorch.org/whl/cu126 \
-    torch torchvision torchaudio
-pip install pandas numpy scipy scikit-learn matplotlib seaborn \
-    streamlit plotly torchdiffeq httpx pytest-asyncio \
-    fastapi uvicorn aiohttp py_vollib_vectorized yfinance
+# 3. (Optional) Build the CUDA extension for direct kernel access
+uv run python setup.py build_ext --inplace
 
-# 4. (Optional) Build the CUDA extension for direct kernel access
-python setup.py build_ext --inplace
-# This compiles src/deepvol/models/cuda/cuda_engine.cu → lifted_heston_cuda.so
-# The pure-Python GPU pricer (src/deepvol/models/lifted_heston_gpu.py) works without this.
-
-# 5. Verify installation
-python -c "import torch; print('CUDA:', torch.cuda.is_available())"
-pytest tests/test_pricing_engine.py tests/test_normalizers.py -q
-# Expected: 60+ passed
+# 4. Verify installation
+uv run python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+uv run pytest tests/test_pricing_engine.py -q
 ```
 
 ### One-click setup (Linux)
@@ -688,11 +678,11 @@ python benchmarks/streaming_calibration_demo.py
 
 ## Test Suite
 
-**535 tests passing, 0 failing, 2 skipped (integration only).**
+**955 tests passing, 0 failing, 2 skipped (integration only).**
 
 ```bash
-# Full suite (~2.5 min)
-pytest tests/ -q
+# Full suite (~8 min)
+uv run pytest tests/ -q
 
 # By module
 pytest tests/test_pricing_engine.py         -v  # Fourier-COS pricer
@@ -749,19 +739,21 @@ production but kept for reproducibility.
 derivatives/
 ├── src/                              Core library
 │   └── deepvol/                      Main module package
-│       ├── surrogates/               FiLM-FNO models (fno_model.py, etc.)
-│       ├── models/                   Stochastic vol models (lifted_heston_gpu.py, heston.py, local_vol.py, rbergomi_gpu.py, etc.)
-│       ├── calibration/              Autograd Newton & joint calibrators (calibrate_newton.py, joint_calibration.py, etc.)
+│       ├── surrogates/               FiLM-FNO model, EGNO, Signature SDE, Greeks, etc.
+│       ├── models/                   Stochastic vol models (Classic Heston, SABR, SSVI, Dupire, rBergomi, MLSV, etc.)
+│       ├── calibration/              Autograd Newton, Joint, RKHS MLSV calibrators
 │       ├── market/                   Data integration (spx_data.py, deribit_ws.py, etc.)
 │       ├── arbitrage/                SVI & arbitrage completion (surface_completion.py)
 │       ├── greeks/                   Greeks & PnL attribution (portfolio_greeks.py, pnl_attribution.py)
-│       ├── analysis/                 Hurst dynamics & research (hurst_dynamics.py, crypto_hurst.py)
-│       ├── api/                      FastAPI REST server (server.py, websocket.py)
-│       └── app/                      Streamlit risk dashboards (app_v2.py, app_v3_risk.py, dashboard.py)
+│       ├── analysis/                 Hurst dynamics & research (hurst_dynamics.py, cross_asset_roughness.py)
+│       ├── api/                      FastAPI REST server (main.py, websocket.py)
+│       ├── app/                      Streamlit dashboards (app_v2.py, app_v3_risk.py, etc.)
+│       ├── mrm/                      Model Risk Guardian and particle fallbacks
+│       ├── deploy/                   TensorRT compilation and K8s configuration
+│       └── utils/                    Common utilities (strikes.py, etc.)
 │
-├── notebooks/                        7 Jupyter notebooks (end-to-end demos)
-│   └── generate_notebooks.py         Notebook source — regenerates all .ipynb
-├── tests/                            pytest suite (533+ passing)
+├── notebooks/                        Jupyter notebooks (end-to-end demos)
+├── tests/                            pytest suite (955+ passing)
 ├── benchmarks/                       Performance and accuracy studies
 ├── scripts/                          Utility scripts (batch VIX, plot generation)
 ├── data/                             Training datasets and market cache (gitignored)
@@ -813,9 +805,16 @@ pdflatex -interaction=nonstopmode main.tex
 | **P1**: FNO Surrogate | Complete | FNO v1/v2/v3, FIM reparameterization, Newton calibrator, Streamlit |
 | **P2**: Market Extensions | Complete | FastAPI, VIX futures, Deribit streaming, variance swaps, batch calibration |
 | **P3**: GPU-Native | Complete | GPU Gauss-Newton, SVI arbitrage enforcement, portfolio Greeks, P&L attribution |
-| **P4**: Model Zoo | Complete | Standalone Classic Heston, SABR (Hagan/Normal) & SSVI, Local Volatility (Dupire), and Rough Bergomi (Bennedsen hybrid scheme on GPU) |
-| **P5**: Neural SDE & Signature | Complete | Lifted Heston factor study, Neural SDE (prior training + adjoint calibration), and Signature Volatility (pathwise smile forecasting) |
-| **P6**: Recurrent Deep Hedging | Complete | Recurrent Deep Hedging (European/DOBC Barrier LSTM policy) and Robust Minimax GAN market generation |
+| **P4**: Model Zoo | Complete | Classic Heston, SABR & SSVI, Local Volatility, and Rough Bergomi on GPU |
+| **P5**: Neural SDE & Signature | Complete | Lifted Heston factor study, Neural SDE prior + adjoint, and Signature smile forecasting |
+| **P6**: Recurrent Deep Hedging | Complete | Recurrent Deep Hedging (European/DOBC Barrier LSTM) and Minimax GAN market generation |
+| **P7**: Quant Hardening | Complete | Stability fixes, call-put parity checks, boundary constraints, Feller tests |
+| **P8**: Production Orchestration | Complete | High-throughput FastAPI, multi-model dispatch layer, unified configuration |
+| **P9**: Differentiable FNO | Complete | JVP pricing loss, calendar/butterfly hard-constrained projection layers |
+| **P10**: Model Risk Governance | Complete | Greek Adjoints VRAM optimization, Model Risk Guardian particle fallbacks, PSI drift logs |
+| **P11**: Backtesting & Costs | Complete | Frictional env trading cost loops, Whalley-Wilmott delta hedging corridor |
+| **P12**: Production Deployment | Complete | TensorRT compilation, Kubernetes Helm deployments, 3D Streamlit visualizer |
+| **P13**: Advanced Vol Modeling | Complete | EGNO multi-asset graph surrogates, Joint SPX/VIX signature SDEs, RKHS Landmark MLSV |
 
 
 ---

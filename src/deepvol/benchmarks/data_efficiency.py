@@ -12,11 +12,12 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
-# COMPAT SHIM (F-01): numpy >= 1.24 removed np.bool. Older chaospy/numpoly
-# versions reference it internally. This restores the alias so chaospy can import.
-# TODO: Remove this shim once chaospy >= 4.3.14 (or numpoly >= 1.3) is adopted,
-# as those versions no longer rely on np.bool.
-np.bool = np.bool_  # type: ignore[attr-defined]
+# COMPAT SHIM: numpoly (chaospy dependency) still references np.bool internally
+# at numpoly/construct/from_attributes.py:95. This is needed until numpoly >= 1.3.
+# chaospy 4.3.21 itself no longer needs it, but numpoly does.
+if not hasattr(np, 'bool'):
+    np.bool = np.bool_  # type: ignore[attr-defined]
+
 import chaospy as cp
 
 from sklearn.linear_model import Ridge, RidgeCV, MultiTaskLassoCV

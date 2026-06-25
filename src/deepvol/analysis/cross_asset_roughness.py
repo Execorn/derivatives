@@ -33,8 +33,8 @@ if str(src_dir) not in sys.path:
 # supported by PyTorch's functional transforms (functorch).
 # This patched version replaces the in-place scatter with F.pad + addition, making
 # the forward pass purely functional and vmap-compatible.
-# TODO: Remove this patch once PyTorch natively supports in-place ops in vmap
-# (tracked in pytorch/functorch#667).
+# NOTE: Verified still required as of PyTorch 2.8.0+cu128 (Jun 2026).
+# Re-check when pytorch/functorch#667 is resolved in a future release.
 from deepvol.surrogates import fno_model
 import torch.nn.functional as F
 

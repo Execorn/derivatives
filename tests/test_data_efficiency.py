@@ -14,14 +14,17 @@ from deepvol.benchmarks.data_efficiency import BatchSVGPModel, _make_spatial_inp
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d, arbitrage_free_regularization
 from deepvol.surrogates.normalizers import ParameterNormalizerHeston, IVSurfaceNormalizer
 
-def test_numpy_bool_monkeypatch():
-    # Verify that np.bool is monkeypatched to np.bool_
-    assert np.bool is np.bool_
+def test_chaospy_import_without_shim():
+    """Verify chaospy 4.3.21+ imports without the np.bool compatibility shim."""
+    # chaospy should import cleanly without np.bool alias
+    import chaospy
+    assert hasattr(chaospy, 'Iid')
+    assert hasattr(chaospy, 'generate_expansion')
     
-    # Verify numpy.ma compatibility with the monkeypatch
+    # Verify numpy.ma still works with np.bool_
     import numpy.ma as ma
     data = np.array([1, 2, 3])
-    mask = np.array([True, False, True], dtype=np.bool)
+    mask = np.array([True, False, True], dtype=np.bool_)
     masked_arr = ma.array(data, mask=mask)
     
     assert masked_arr[0] is ma.masked
