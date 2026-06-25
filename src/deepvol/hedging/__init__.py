@@ -36,3 +36,11 @@ from .backtest import (
     extract_empirical_option_path,
     run_empirical_backtest
 )
+
+from .mp_diffusion import (
+    MartingaleViolationError,
+    PathDenoisingNet,
+    project_spot_martingale,
+    audit_martingale_paths,
+    MPDDPM
+)

@@ -14,7 +14,6 @@ if not hasattr(torch, "__original_compile"):
             return lambda f: mock_compile(f, *args, **kwargs)
         return torch.__original_compile(model, *args, **kwargs)
     torch.compile = mock_compile
-
 # Inject src path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src_path = os.path.join(project_root, "src")
