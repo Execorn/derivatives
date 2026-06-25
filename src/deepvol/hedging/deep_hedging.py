@@ -55,6 +55,124 @@ class HedgingPolicy(nn.Module):
         return delta, h_next
 
 
+@torch.compile(mode="reduce-overhead")
+def _signature_update_step(current_point: torch.Tensor, prev_point: torch.Tensor, S1: torch.Tensor, S2: torch.Tensor, S3: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    JIT-compiled update step for path signatures up to level 3 using Chen's relation.
+    Ensures kernel fusion on CUDA.
+    """
+    delta = current_point - prev_point
+    A1 = delta
+    A2 = 0.5 * torch.einsum('bi,bj->bij', delta, delta)
+    A3 = (1.0 / 6.0) * torch.einsum('bi,bj,bk->bijk', delta, delta, delta)
+    
+    S3_next = S3 + torch.einsum('bij,bk->bijk', S2, A1) + torch.einsum('bi,bjk->bijk', S1, A2) + A3
+    S2_next = S2 + torch.einsum('bi,bj->bij', S1, A1) + A2
+    S1_next = S1 + A1
+    
+    return S1_next.clone(), S2_next.clone(), S3_next.clone()
+
+
+class RecurrentHedgingPolicy(nn.Module):
+    """
+    Recurrent LSTM-based hedging policy network with rough path signature features.
+    Computes running path signatures of log-spot price and rolling volatility proxy (up to level 3)
+    using Chen's relation in double precision (torch.float64), then projects to the action space.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int = 64, output_dim: int = 1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.input_dim = input_dim
+        
+        # 14 signature features: 2 (level 1) + 4 (level 2) + 8 (level 3)
+        self.sig_dim = 14
+        
+        # The LSTM cell receives the raw environment features + signature features
+        # All weights of LSTM and FC layers are stored in double precision
+        self.lstm_cell = nn.LSTMCell(input_size=input_dim + self.sig_dim, hidden_size=hidden_dim)
+        
+        # Linear layer mapping hidden state to trading action
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),  # Swish/SiLU activation
+            nn.Linear(hidden_dim, output_dim)
+        )
+        
+        # Convert all model parameters to float64
+        self.double()
+        
+    def forward(self, x: torch.Tensor, h: Optional[Tuple] = None) -> Tuple[torch.Tensor, Tuple]:
+        """
+        x: Input tensor of shape (batch_size, input_dim)
+        h: Optional tuple/state of (h_lstm, S1, S2, S3, prev_point)
+           where:
+             - h_lstm is a tuple of (h_c, c_c) for LSTMCell
+             - S1 is shape (batch_size, 2)
+             - S2 is shape (batch_size, 2, 2)
+             - S3 is shape (batch_size, 2, 2, 2)
+             - prev_point is shape (batch_size, 2)
+             
+        Returns:
+            delta: Hedge ratio action of shape (batch_size, output_dim)
+            h_next: Updated recurrent state tuple
+        """
+        # Convert input to float64 for all internal computations
+        x_dbl = x.to(dtype=torch.float64)
+        batch_size = x_dbl.shape[0]
+        
+        # Extract features for path signature computation:
+        # log_moneyness is at feature index 0, vol_proxy is at feature index 2
+        log_spot = x_dbl[:, 0:1]
+        vol_proxy = x_dbl[:, 2:3]
+        current_point = torch.cat([log_spot, vol_proxy], dim=-1)  # (batch_size, 2)
+        
+        if h is None:
+            # Initialize LSTM states and signature registers
+            h_c = torch.zeros(batch_size, self.hidden_dim, device=x.device, dtype=torch.float64)
+            c_c = torch.zeros(batch_size, self.hidden_dim, device=x.device, dtype=torch.float64)
+            h_lstm = (h_c, c_c)
+            
+            S1 = torch.zeros(batch_size, 2, device=x.device, dtype=torch.float64)
+            S2 = torch.zeros(batch_size, 2, 2, device=x.device, dtype=torch.float64)
+            S3 = torch.zeros(batch_size, 2, 2, 2, device=x.device, dtype=torch.float64)
+            prev_point = current_point
+        else:
+            h_lstm, S1, S2, S3, prev_point = h
+            
+            # Call JIT-compiled signature update step
+            S1, S2, S3 = _signature_update_step(current_point, prev_point, S1, S2, S3)
+            
+            # Update previous point
+            prev_point = current_point
+            
+        # Flatten signature levels to construct 14 signature features
+        S1_flat = S1.reshape(batch_size, -1)
+        S2_flat = S2.reshape(batch_size, -1)
+        S3_flat = S3.reshape(batch_size, -1)
+        sig_flat = torch.cat([S1_flat, S2_flat, S3_flat], dim=-1)  # (batch_size, 14)
+        
+        # Concatenate environment features with signature features
+        x_lstm = torch.cat([x_dbl, sig_flat], dim=-1)
+        
+        # Step the LSTM cell
+        h_lstm_next = self.lstm_cell(x_lstm, h_lstm)
+        
+        # Calculate hedging action
+        delta_out = self.fc(h_lstm_next[0])
+        
+        # Squash output action to [-2.0, 2.0] as a reasonable trading limit
+        delta_out = 2.0 * torch.tanh(delta_out)
+        
+        # Cast action back to input's original dtype
+        delta_out = delta_out.to(dtype=x.dtype)
+        
+        # Package and return next state (clone to satisfy reduce-overhead/CUDA Graph rules)
+        h_next = ((h_lstm_next[0].clone(), h_lstm_next[1].clone()), S1.clone(), S2.clone(), S3.clone(), prev_point.clone())
+        
+        return delta_out.clone(), h_next
+
+
 class DeepHedgingEnv:
     """
     Vectorized deep hedging environment managing asset price paths, portfolio wealth,

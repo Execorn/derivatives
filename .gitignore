@@ -118,13 +118,9 @@ TEST_READY.md
 images/ai_generated/
 P4_MODEL_ZOO_TASK.md
 
-# ── Phase 9 temporary and research artifacts ─────────────────────────────────
-P9_ROADMAP.md
-p9_agent_prompt.md
-
-# ── Phase 10 temporary and research artifacts ────────────────────────────────
-P10_ROADMAP.md
-p10_agent_prompt.md
+# ── Phase 7 temporary and research artifacts ─────────────────────────────────
+CONTEXT.md
+ORIGINAL_REQUEST.md
 OVERVIEW.md
 P5_ROADMAP.md
 P6_ROADMAP.md
@@ -136,8 +132,16 @@ notebooks/generate_notebooks.py
 notebooks/generate_p5_notebooks.py
 notebooks/generate_p6_notebooks.py
 
-
 # ── Phase 9 temporary and research artifacts ─────────────────────────────────
 P9_ROADMAP.md
 p9_agent_prompt.md
+
+# ── Phase 10 temporary and research artifacts ────────────────────────────────
+P10_ROADMAP.md
+p10_agent_prompt.md
+
+# ── Phase 11 temporary and research artifacts ────────────────────────────────
+P11_ROADMAP.md
+p11_agent_prompt.md
+
 

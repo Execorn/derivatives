@@ -10,6 +10,8 @@ if not hasattr(torch, "__original_compile"):
         if kwargs.get("mode") == "reduce-overhead":
             kwargs["mode"] = "default"
             kwargs["dynamic"] = True
+        if model is None:
+            return lambda f: mock_compile(f, *args, **kwargs)
         return torch.__original_compile(model, *args, **kwargs)
     torch.compile = mock_compile
 
@@ -18,7 +20,6 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
-
 
 
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
