@@ -40,6 +40,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
+from deepvol.api.metrics import setup_metrics, fno_pricing_latency_seconds, fno_greeks_calculation_seconds
+from deepvol.api.compliance import compliance_monitor
+
 # ── path setup ────────────────────────────────────────────────────────────────
 _src = str(Path(__file__).parents[2])
 if _src not in sys.path:
@@ -66,6 +69,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+setup_metrics(app)
 
 # ── Global model cache & Lock Management ───────────────────────────────────────
 
@@ -308,6 +313,11 @@ class HestonParams(BaseModel):
     rho:   float = Field(..., le=0,    description="Correlation ρ ∈ (-0.95, 0)")
     v0:    float = Field(..., gt=0,    description="Initial variance V₀ ∈ (0.01, 0.25)")
     H:     float = Field(..., gt=0,    description="Hurst exponent H ∈ (0.04, 0.15)")
+    
+    # Optional fields for compliance testing
+    T_grid: Optional[List[float]] = Field(default=None, description="Optional maturities grid")
+    K_grid: Optional[List[float]] = Field(default=None, description="Optional strike grid")
+    S0: Optional[float] = Field(default=None, description="Optional spot price")
 
 
 class GreeksRequest(HestonParams):
@@ -364,6 +374,7 @@ def _make_spatial(device: torch.device) -> torch.Tensor:
 
 def _fno_forward(params: HestonParams) -> np.ndarray:
     """Run FNO forward pass, return (8,11) IV surface in decimal."""
+    t0 = time.perf_counter()
     container = _get_cached_container("rough_heston")
     model  = container.model
     pn     = container.pn
@@ -382,6 +393,9 @@ def _fno_forward(params: HestonParams) -> np.ndarray:
         pred_norm  = model(spatial, theta_norm)
         iv_tensor  = yn.inverse_transform_tensor(pred_norm).squeeze(0)
         iv_surface = iv_tensor.clamp(min=1e-4).cpu().numpy()   # (8,11)
+
+    elapsed = time.perf_counter() - t0
+    fno_pricing_latency_seconds.observe(elapsed)
 
     return iv_surface
 
@@ -418,13 +432,46 @@ async def iv_surface(params: HestonParams) -> IVSurfaceResponse:
             surface = await asyncio.get_event_loop().run_in_executor(
                 None, _fno_forward, params
             )
+
+        if params.T_grid is not None and params.K_grid is not None:
+            S0 = params.S0 if params.S0 is not None else 100.0
+            
+            clamped_T_grid = []
+            for T in params.T_grid:
+                T_clamped, _, _ = compliance_monitor.audit_ood_and_clamp(T, S0, S0, "rough_heston")
+                clamped_T_grid.append(T_clamped)
+
+            clamped_K_grid = []
+            for K in params.K_grid:
+                _, K_clamped, _ = compliance_monitor.audit_ood_and_clamp(1.0, K, S0, "rough_heston")
+                clamped_K_grid.append(K_clamped)
+
+            from deepvol.greeks.portfolio_greeks import _bilinear_interp
+            import math
+
+            interpolated_surface = np.zeros((len(clamped_T_grid), len(clamped_K_grid)), dtype=np.float32)
+            for i, T_val in enumerate(clamped_T_grid):
+                for j, K_val in enumerate(clamped_K_grid):
+                    k_val = math.log(K_val / S0)
+                    interpolated_surface[i, j] = _bilinear_interp(
+                        _MATURITIES, _STRIKES, surface, T_val, k_val
+                    )
+
+            surface_out = interpolated_surface.tolist()
+            T_grid_out = clamped_T_grid
+            K_grid_out = clamped_K_grid
+        else:
+            surface_out = surface.tolist()
+            T_grid_out = _MATURITIES.tolist()
+            K_grid_out = _STRIKES.tolist()
+
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return IVSurfaceResponse(
-        surface=surface.tolist(),
-        T_grid=_MATURITIES.tolist(),
-        K_grid=_STRIKES.tolist(),
+        surface=surface_out,
+        T_grid=T_grid_out,
+        K_grid=K_grid_out,
     )
 
 
@@ -569,9 +616,13 @@ async def compute_model_greeks(
 
             iv_surface = await asyncio.get_event_loop().run_in_executor(None, _run_forward)
 
+            t_greeks_start = time.perf_counter()
             g_results = await asyncio.get_event_loop().run_in_executor(
                 None, _compute_greeks_from_surface, iv_surface, parsed_req.S, parsed_req.r, parsed_req.q
             )
+            elapsed_greeks = time.perf_counter() - t_greeks_start
+            fno_greeks_calculation_seconds.observe(elapsed_greeks)
+
             return GreeksResponse(**g_results)
     except HTTPException:
         raise

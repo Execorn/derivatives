@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepvol-api
+  namespace: deepvol
+  labels:
+    app: deepvol-api
+spec:
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: deepvol-api
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepvol-api-headless
+  namespace: deepvol
+  labels:
+    app: deepvol-api
+spec:
+  clusterIP: None
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: deepvol-api
