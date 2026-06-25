@@ -9,6 +9,23 @@ import torch.nn as nn
 import torch.optim as optim
 from typing import Tuple, List, Optional
 from .deep_hedging import DeepHedgingEnv, estimate_gpd_tail_index_pwm, compute_acf_loss, compute_leverage_loss, compute_cfvc_loss
+from .cvar_loss import CVaRLoss
+
+
+class AdversarialHedgingEnv(DeepHedgingEnv):
+    """
+    Subclass of DeepHedgingEnv supporting differentiable CVaR loss.
+    """
+    def __init__(self, *args, alpha: float = 0.95, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cvar_loss_fn = CVaRLoss(alpha=alpha)
+
+    def compute_loss(self, wealth: torch.Tensor) -> torch.Tensor:
+        if self.risk_measure == "cvar":
+            # Loss = payoff - wealth (negative hedging error)
+            return self.cvar_loss_fn(self.payoff - wealth)
+        return super().compute_loss(wealth)
+
 
 
 class WGAN_GP_Generator(nn.Module):
@@ -194,6 +211,7 @@ def convert_returns_to_prices(returns: torch.Tensor, vol_paths: torch.Tensor, S_
     """
     Vectorized conversion of log-returns and volatility into price paths.
     The returns are cumulatively summed to build the stock price path.
+    Promotes to torch.float64 for internal cumulative operations to prevent precision loss.
     
     Returns:
         H: Price paths of shape (N_paths, seq_len + 1, 2)
@@ -204,23 +222,31 @@ def convert_returns_to_prices(returns: torch.Tensor, vol_paths: torch.Tensor, S_
     dtype = returns.dtype
     batch_size, seq_len = returns.shape
     
+    # Promote returns to float64 for cumulative operations
+    returns_64 = returns.to(torch.float64)
+    
     # Stock price S = S_0 * exp(cumsum(returns))
-    S = S_0 * torch.exp(torch.cumsum(returns, dim=-1))
+    S = S_0 * torch.exp(torch.cumsum(returns_64, dim=-1))
+    S = S.to(dtype)  # Cast back to original dtype at boundary
     
     # Prepend S_0 to make paths start at t_0
     S_0_tensor = torch.full((batch_size, 1), S_0, device=device, dtype=dtype)
     S_full = torch.cat([S_0_tensor, S], dim=-1)  # (batch_size, seq_len + 1)
     
     # Extrapolate V_0 from V_1 and V_2 to avoid artificial flat start, clamp to positive floor
+    vol_paths_64 = vol_paths.to(torch.float64)
     if seq_len > 1:
-        V_0_tensor = torch.clamp(2.0 * vol_paths[:, 0:1] - vol_paths[:, 1:2], min=1e-4)
+        V_0_tensor_64 = torch.clamp(2.0 * vol_paths_64[:, 0:1] - vol_paths_64[:, 1:2], min=1e-4)
     else:
-        V_0_tensor = vol_paths[:, 0:1]
+        V_0_tensor_64 = vol_paths_64[:, 0:1]
+    V_0_tensor = V_0_tensor_64.to(dtype)
+    
     V_full = torch.cat([V_0_tensor, vol_paths], dim=-1)  # (batch_size, seq_len + 1)
     
     # Stack stock and vol into a single instrument paths tensor
     H = torch.stack([S_full, V_full], dim=-1)  # (batch_size, seq_len + 1, 2)
     return H
+
 
 
 def train_robust_minimax_hedger(
@@ -238,7 +264,8 @@ def train_robust_minimax_hedger(
     device: str = "cuda",
     risk_measure: str = "entropic",
     strike: float = 100.0,
-    cost_coeffs_list: list = None
+    cost_coeffs_list: list = None,
+    alpha: float = 0.95
 ):
     """
     Runs the minimax robust deep hedging training loop.
@@ -312,8 +339,8 @@ def train_robust_minimax_hedger(
                 
             z = torch.randn(batch_size, generator.latent_dim, device=device)
             fake_samples = generator(z)
-            fake_ret = fake_samples[:, 0, :]
-            fake_vol = fake_samples[:, 1, :]
+            fake_ret = fake_samples[:, 0, :].contiguous()
+            fake_vol = fake_samples[:, 1, :].contiguous()
             
             # Enforce mean return alignment (martingale drift constraint)
             real_mean = torch.mean(real_ret_batch, dim=-1, keepdim=True)
@@ -347,7 +374,7 @@ def train_robust_minimax_hedger(
             if cost_coeffs_list is None:
                 cost_coeffs_list = [0.0001]
             cost_coeffs = torch.tensor(cost_coeffs_list, device=device)
-            env = DeepHedgingEnv(H=H[:, :, 0:1], payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure, strike=strike)
+            env = AdversarialHedgingEnv(H=H[:, :, 0:1], payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure, strike=strike, alpha=alpha)
             
             # Run simulation with the CURRENT policy
             # (Generator tries to MAXIMIZE this loss to find worst-case paths)
@@ -373,8 +400,8 @@ def train_robust_minimax_hedger(
             with torch.no_grad():
                 z = torch.randn(batch_size, generator.latent_dim, device=device)
                 fake_samples = generator(z)
-                fake_ret = fake_samples[:, 0, :]
-                fake_vol = fake_samples[:, 1, :]
+                fake_ret = fake_samples[:, 0, :].contiguous()
+                fake_vol = fake_samples[:, 1, :].contiguous()
                 
                 # Enforce mean return alignment (martingale drift constraint)
                 real_mean = torch.mean(real_ret_batch, dim=-1, keepdim=True)
@@ -385,7 +412,7 @@ def train_robust_minimax_hedger(
                 # Cap payoff to prevent generator from exploiting infinite payoff limits in minimax training
                 payoff = torch.clamp(S_T - 100.0, min=0.0, max=500.0)
                 
-            env_hedger = DeepHedgingEnv(H=H[:, :, 0:1], payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure)
+            env_hedger = AdversarialHedgingEnv(H=H[:, :, 0:1], payoff=payoff, cost_coeffs=cost_coeffs, risk_aversion=1.0, risk_measure=risk_measure, strike=strike, alpha=alpha)
             
             # Optimize policy parameters to MINIMIZE hedging loss
             wealth, _, _ = env_hedger.simulate_hedging_episode(policy)
