@@ -3,13 +3,15 @@ import sys
 import pytest
 import torch
 
-# Mock torch.compile to map mode="reduce-overhead" to "default" in pytest
-original_compile = torch.compile
-def mock_compile(*args, **kwargs):
-    if kwargs.get("mode") == "reduce-overhead":
+# Mock torch.compile for autograd compatibility in testing
+_orig_compile = torch.compile
+def _mock_compile(model=None, *args, **kwargs):
+    if "mode" in kwargs and kwargs["mode"] == "reduce-overhead":
         kwargs["mode"] = "default"
-    return original_compile(*args, **kwargs)
-torch.compile = mock_compile
+    if model is None:
+        return lambda f: _mock_compile(f, *args, **kwargs)
+    return _orig_compile(model, *args, **kwargs)
+torch.compile = _mock_compile
 
 # Inject src path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
