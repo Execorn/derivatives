@@ -9,6 +9,19 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
+# Idempotent torch.compile mocking for pytest CUDAGraphs compatibility
+if not hasattr(torch, "__original_compile"):
+    torch.__original_compile = torch.compile
+    def mock_compile(model=None, *args, **kwargs):
+        if 'mode' in kwargs and kwargs['mode'] == 'reduce-overhead':
+            kwargs['mode'] = 'default'
+        if model is not None:
+            return torch.__original_compile(model, *args, **kwargs)
+        else:
+            return lambda fn: torch.__original_compile(fn, *args, **kwargs)
+    torch.compile = mock_compile
+
+
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 
 @pytest.fixture(scope="module")
