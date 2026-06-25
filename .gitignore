@@ -132,3 +132,8 @@ notebooks/generate_notebooks.py
 notebooks/generate_p5_notebooks.py
 notebooks/generate_p6_notebooks.py
 
+# ── Phase 12 temporary and research artifacts ────────────────────────────────
+P12_ROADMAP.md
+p12_agent_prompt.md
+
+
