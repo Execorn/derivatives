@@ -152,5 +152,8 @@ p12_agent_prompt.md
 P13_ROADMAP.md
 p13_agent_prompt.md
 
-
-
+# ── Compiled Models & Engines ─────────────────────────────────────────────────
+*.engine
+*.onnx
+fno_surrogate.engine
+fno_surrogate.onnx
