@@ -3,6 +3,14 @@ import sys
 import pytest
 import torch
 
+# Mock torch.compile to avoid CUDAGraphs weakref/memory issues in test suite
+original_compile = torch.compile
+def mock_compile(*args, **kwargs):
+    if "mode" in kwargs and kwargs["mode"] == "reduce-overhead":
+        kwargs["mode"] = "default"
+    return original_compile(*args, **kwargs)
+torch.compile = mock_compile
+
 # Inject src path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src_path = os.path.join(project_root, "src")

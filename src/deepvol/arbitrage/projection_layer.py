@@ -16,6 +16,7 @@ from deepvol.surrogates.normalizers import IVSurfaceNormalizer
 
 # ─── Black-Scholes PyTorch Utilities (Double Precision) ───────────────────────
 
+@torch.compile(mode="reduce-overhead")
 def bs_call_price_pt(S: torch.Tensor, K: torch.Tensor, T: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """
     Vectorized Black-Scholes call option pricing in PyTorch.
@@ -51,9 +52,10 @@ def bs_call_price_pt(S: torch.Tensor, K: torch.Tensor, T: torch.Tensor, sigma: t
     # Handle small maturity or zero vol boundary: T <= 1e-10 or sigma <= 1e-10
     boundary_mask = (T <= 1e-10) | (sigma <= 1e-10)
     c = torch.where(boundary_mask, torch.clamp(S - K, min=0.0), c)
-    return c
+    return c.clone()
 
 
+@torch.compile(mode="reduce-overhead")
 def bs_iv_inversion_hybrid(
     price: torch.Tensor,
     S: torch.Tensor,
@@ -124,7 +126,7 @@ def bs_iv_inversion_hybrid(
     at_intrinsic_mask = price <= (intrinsic + 1e-12)
     sigma = torch.where(at_intrinsic_mask, torch.tensor(0.01, dtype=torch.float64, device=sigma.device), sigma)
     
-    return sigma
+    return sigma.clone()
 
 
 # ─── Differentiable No-Arbitrage Projection Layer ────────────────────────────
