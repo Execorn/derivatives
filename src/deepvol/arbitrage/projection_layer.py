@@ -197,13 +197,13 @@ class DifferentiableArbitrageFreeProjection(nn.Module):
         # Convert IV to Call Prices
         C = bs_call_price_pt(S0_tensor, K_m, T_m, iv_clamped)
         
-        # Call price at largest strike must be at least 0
-        C_proj = C.clone()
-        C_proj[:, :, -1] = torch.clamp(C_proj[:, :, -1], min=0.0)
+        # Call price at largest strike must be at least 0 (non-inplace)
+        C_last = torch.clamp(C[:, :, -1:], min=0.0)
+        C_clamped = torch.cat([C[:, :, :-1], C_last], dim=2)
         
         # Compute slopes
         h = K_m[:, :, 1:] - K_m[:, :, :-1]
-        d = (C_proj[:, :, 1:] - C_proj[:, :, :-1]) / h
+        d = (C_clamped[:, :, 1:] - C_clamped[:, :, :-1]) / h
         
         # Slopes for call options must be non-positive: d_k <= 0
         d_clamped = torch.clamp(d, max=0.0)
@@ -211,14 +211,21 @@ class DifferentiableArbitrageFreeProjection(nn.Module):
         # Enforce convexity: slopes must be non-decreasing: d_{k+1} >= d_k
         d_conv = torch.cummax(d_clamped, dim=2)[0]
         
-        # Reconstruct call prices going from right (large strikes) to left (small strikes)
-        # This preserves the zero call-price boundary at K -> infinity
-        for j in range(nK - 2, -1, -1):
-            C_proj[:, :, j] = C_proj[:, :, j+1] - d_conv[:, :, j] * h[:, :, j]
-            
+        # Vectorized loop-free cumulative sum reconstruction of call prices
+        increments = d_conv * h
+        increments_flipped = torch.flip(increments, dims=[2])
+        cumsum_flipped = torch.cumsum(increments_flipped, dim=2)
+        cumsum_back = torch.flip(cumsum_flipped, dims=[2])
+        
+        C_rest = C_last - cumsum_back
+        C_proj = torch.cat([C_rest, C_last], dim=2)
+        
         # Clamp Call prices to be at least intrinsic value max(S0 - K, 0.0)
         intrinsic = torch.clamp(S0_tensor - K_m, min=0.0)
         C_proj = torch.max(C_proj, intrinsic)
+        
+        # Clamp close-to-intrinsic option prices to exactly intrinsic to prevent solver noise
+        C_proj = torch.where(C_proj - intrinsic < 1e-7 * S0_tensor, intrinsic, C_proj)
         
         # Convert call prices back to Implied Volatility
         iv_proj = bs_iv_inversion_hybrid(C_proj, S0_tensor, K_m, T_m)
