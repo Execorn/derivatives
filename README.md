@@ -5,7 +5,7 @@
 [![Python 3.9](https://img.shields.io/badge/Python-3.9-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-955%20passed-brightgreen?style=for-the-badge)](tests/)
+[![Tests](https://img.shields.io/badge/tests-1008%20passed-brightgreen?style=for-the-badge)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
 > **Master's Thesis Project** — МФТИ ФПМИ, Кафедра БИТ, 2026
@@ -59,15 +59,14 @@ The project covers the full quant stack: mathematical foundations → GPU pricin
 4. [Architecture](#architecture)
 5. [Installation](#installation)
 6. [Quick Start](#quick-start)
-7. [Module Guide](#module-guide)
-8. [Notebooks](#notebooks)
-9. [REST API](#rest-api)
-10. [Benchmarks](#benchmarks)
-11. [Test Suite](#test-suite)
-12. [Models & Weights](#models--weights)
-13. [Project Structure](#project-structure)
-14. [Thesis & Publications](#thesis--publications)
-15. [License](#license)
+7. [Notebooks](#notebooks)
+8. [REST API](#rest-api)
+9. [Benchmarks](#benchmarks)
+10. [Test Suite](#test-suite)
+11. [Models & Weights](#models--weights)
+12. [Project Structure](#project-structure)
+13. [Thesis & Publications](#thesis--publications)
+14. [License](#license)
 
 ---
 
@@ -305,14 +304,14 @@ chmod +x setup_and_run.sh
 import sys; sys.path.insert(0, 'src')
 import torch
 import numpy as np
-from fno_model import MirrorPaddedFNO2d
-from calibrate import _load_normalizers, _fno_predict_real_iv, _make_spatial_input
-from market.spx_data import T_GRID, K_GRID
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
+from deepvol.calibration.calibrate_bfgs import _load_normalizers, _fno_predict_real_iv, _make_spatial_input
+from deepvol.market.spx_data import T_GRID, K_GRID
 
 # Load model and normalizers
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = MirrorPaddedFNO2d(param_dim=6).to(device)
-model.load_state_dict(torch.load("artifacts/weights/fno_v3_final_prod.pth", map_location=device))
+model.load_state_dict(torch.load("artifacts/weights/fno_v3_final_prod.pth", map_location=device, weights_only=True))
 model.eval()
 _load_normalizers("v3")  # must be called before any forward pass
 
@@ -332,23 +331,32 @@ print(f"ATM 6M: {iv_surface[2, 5]*100:.1f}%")  # roughly 20-25% for typical para
 ```python
 import sys; sys.path.insert(0, 'src')
 import torch
-from fno_model import MirrorPaddedFNO2d
-from calibrate_fast import calibrate_newton_h
-from market.spx_data import T_GRID, K_GRID
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
+from deepvol.calibration.calibrate_newton import calibrate_newton_h
+from deepvol.market.spx_data import T_GRID, K_GRID
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = MirrorPaddedFNO2d(param_dim=6).to(device)
-model.load_state_dict(torch.load("artifacts/weights/fno_v3_final_prod.pth", map_location=device))
+model.load_state_dict(torch.load("artifacts/weights/fno_v3_final_prod.pth", map_location=device, weights_only=True))
 model.eval()
 
 # Market IV surface: 8 maturities × 11 strikes (in decimal vol, e.g. 0.20 = 20%)
-import numpy as np
-market_iv = np.load("results/spx_calibration/2024-01-02.json")  # or your own array
+from deepvol.market.spx_data import download_spx_chain, clean_chain, to_iv_surface
+from datetime import date
+
+# Fetch or load market IV surface
+df = download_spx_chain(date(2024, 1, 2))
+cleaned = clean_chain(df)
+
+S0 = 4700.0
+r = 0.05
+q = 0.015
+market_iv = to_iv_surface(cleaned, S0, r, q)  # (8, 11) array
 
 # Gauss-Newton calibration in (v₀, ζ=σρ, λ=σ√(1-ρ²), H) space
 result = calibrate_newton_h(model, market_iv, T_GRID, K_GRID, max_iter=20, verbose=True)
-print(f"RMSE: {result['final_mse']**0.5 * 1e4:.1f} bps")
-print(f"κ={result['kappa']:.3f}  θ={result['theta']:.4f}  H={result['H']:.3f}")
+print(f"RMSE: {result['rmse'] * 1e4:.1f} bps")
+print(f"v0={result['v0']:.4f}  σ={result['sigma']:.3f}  ρ={result['rho']:.3f}  H={result['H']:.3f}")
 print(f"converged: {result['converged']}")
 ```
 
@@ -356,17 +364,9 @@ print(f"converged: {result['converged']}")
 
 ## Notebooks
 
-Sixteen self-contained Jupyter notebooks demonstrate the full pipeline end-to-end.
-Generate (or regenerate) them from source with:
+Forty-four self-contained Jupyter notebooks demonstrate the full pipeline end-to-end. They are located in the `notebooks/` directory.
 
-```bash
-cd notebooks
-python generate_notebooks.py       # writes 01_*.ipynb ... 11_*.ipynb
-python generate_p5_notebooks.py    # writes 12_*.ipynb and 13_*.ipynb
-python generate_p6_notebooks.py    # writes 14_*.ipynb ... 16_*.ipynb
-```
-
-Run in order:
+Run them in order:
 
 ```bash
 source .venv/bin/activate
@@ -401,7 +401,7 @@ incrementally and the run is resume-capable.
 
 ```python
 import sys; sys.path.insert(0, 'src')
-from calibration.batch_calibration import calibrate_batch, results_to_dataframe
+from deepvol.calibration.batch_calibration import calibrate_batch, results_to_dataframe
 
 # Calibrate SPX on 3 dates (fetches from yfinance, falls back to cached parquet)
 results = calibrate_batch(
@@ -424,7 +424,7 @@ term structure simultaneously:
 
 ```python
 import sys; sys.path.insert(0, 'src')
-from calibration.joint_calibration import calibrate_joint
+from deepvol.calibration.joint_calibration import calibrate_joint
 from datetime import date
 
 result = calibrate_joint(
@@ -443,8 +443,8 @@ Model the VIX futures curve from Rough Heston parameters:
 
 ```python
 import sys; sys.path.insert(0, 'src')
-from market.vix_futures import fetch_vix_futures
-from market.vix_pricing import compute_vix_term_structure
+from deepvol.market.vix_futures import fetch_vix_futures
+from deepvol.market.vix_pricing import compute_vix_term_structure
 from datetime import date
 import numpy as np
 
@@ -468,7 +468,7 @@ Fill gaps in a sparse IV surface and enforce no-arbitrage constraints:
 ```python
 import sys; sys.path.insert(0, 'src')
 import numpy as np
-from arbitrage.surface_completion import (
+from deepvol.arbitrage.surface_completion import (
     complete_sparse_surface,
     make_arbitrage_free,
     fit_svi_slice,
@@ -493,9 +493,9 @@ delta-hedging contracts needed:
 import sys; sys.path.insert(0, 'src')
 import numpy as np
 import torch
-from fno_model import MirrorPaddedFNO2d
-from normalizers import ParameterNormalizer, IVSurfaceNormalizer
-from greeks.portfolio_greeks import portfolio_greeks
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
+from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
+from deepvol.greeks.portfolio_greeks import portfolio_greeks
 
 # Load model (same as pricing above)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -530,7 +530,7 @@ Break down realized P&L into Greek components:
 
 ```python
 import sys; sys.path.insert(0, 'src')
-from greeks.pnl_attribution import pnl_attribution
+from deepvol.greeks.pnl_attribution import pnl_attribution
 
 # Greeks computed before the move
 greeks_before = {
@@ -559,7 +559,7 @@ Run a historical calibration study to track how H changes over time:
 
 ```python
 import sys; sys.path.insert(0, 'src')
-from analysis.hurst_dynamics import run_historical_study
+from deepvol.analysis.hurst_dynamics import run_historical_study
 
 # Resume-capable: already-calibrated dates are skipped
 df = run_historical_study(
@@ -582,7 +582,7 @@ Stream real-time BTC/ETH IV surfaces from Deribit via WebSocket:
 ```python
 import asyncio
 import sys; sys.path.insert(0, 'src')
-from market.deribit_ws import DeribitWebSocket
+from deepvol.market.deribit_ws import DeribitWebSocket
 
 async def main():
     async with DeribitWebSocket(currency="BTC") as ws:
@@ -602,7 +602,7 @@ Start the FastAPI server and use it to calibrate from any language:
 ```bash
 source .venv/bin/activate
 cd /path/to/derivatives
-uvicorn api.server:app --reload --port 8000 --app-dir src
+uvicorn deepvol.api.server:app --reload --port 8000 --app-dir src
 # OpenAPI docs → http://localhost:8000/docs
 ```
 
@@ -685,7 +685,7 @@ python benchmarks/streaming_calibration_demo.py
 
 ## Test Suite
 
-**955 tests passing, 0 failing, 2 skipped (integration only).**
+**1008 tests passing, 0 failing, 2 skipped (integration only).**
 
 ```bash
 # Full suite (~8 min)
@@ -753,7 +753,7 @@ derivatives/
 │       ├── arbitrage/                SVI & arbitrage completion (surface_completion.py)
 │       ├── greeks/                   Greeks & PnL attribution (portfolio_greeks.py, pnl_attribution.py)
 │       ├── analysis/                 Hurst dynamics & research (hurst_dynamics.py, cross_asset_roughness.py)
-│       ├── api/                      FastAPI REST server (main.py, websocket.py)
+│       ├── api/                      FastAPI REST server (server.py, websocket.py)
 │       ├── app/                      Streamlit dashboards (app_v2.py, app_v3_risk.py, etc.)
 │       ├── mrm/                      Model Risk Guardian and particle fallbacks
 │       ├── deploy/                   TensorRT compilation and K8s configuration
@@ -822,6 +822,9 @@ pdflatex -interaction=nonstopmode main.tex
 | **P11**: Backtesting & Costs | Complete | Frictional env trading cost loops, Whalley-Wilmott delta hedging corridor |
 | **P12**: Production Deployment | Complete | TensorRT compilation, Kubernetes Helm deployments, 3D Streamlit visualizer |
 | **P13**: Advanced Vol Modeling | Complete | EGNO multi-asset graph surrogates, Joint SPX/VIX signature SDEs, RKHS Landmark MLSV |
+| **P14**: Meta-Adaptation | Complete | Physics-Informed Meta-Learning FNO, Reptile/FOMAML online GPU adaptation, Model Risk Guardian |
+| **P15**: Differentiable Hedging | Complete | Recurrent Deep Hedging (LSTM/GRU), D-XVA loss, PIVOT implied vol solver, low-vega gating |
+| **P16**: Grey Rough Bergomi | Complete | C++/CUDA gRB path simulator, Mittag-Leffler CUDA kernel, uncertainty-guided active learning, Sobolev FNO |
 
 
 ---
