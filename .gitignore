@@ -153,6 +153,18 @@ p12_agent_prompt.md
 P13_ROADMAP.md
 p13_agent_prompt.md
 
+# ── Phase 14 temporary and research artifacts ────────────────────────────────
+P14_ROADMAP.md
+p14_agent_prompt.md
+
+# ── Phase 15 temporary and research artifacts ────────────────────────────────
+P15_ROADMAP.md
+p15_agent_prompt.md
+
+# ── Phase 16 temporary and research artifacts ────────────────────────────────
+P16_ROADMAP.md
+p16_agent_prompt.md
+
 # ── Compiled Models & Engines ─────────────────────────────────────────────────
 *.engine
 *.onnx
