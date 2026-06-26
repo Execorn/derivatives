@@ -164,6 +164,8 @@ p15_agent_prompt.md
 # ── Phase 16 temporary and research artifacts ────────────────────────────────
 P16_ROADMAP.md
 p16_agent_prompt.md
+CONTEXT.md
+walkthrough.md
 
 # ── Compiled Models & Engines ─────────────────────────────────────────────────
 *.engine

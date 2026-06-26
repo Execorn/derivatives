@@ -44,6 +44,10 @@ The project covers the full quant stack: mathematical foundations → GPU pricin
 | Minimax GAN market generation (NB16) | **0.0003 final tracking error** |
 | FastAPI Deep Hedging throughput | **132.91 RPS (p50 = 6.57 ms)** on GPU |
 | FastAPI FNO Calibration throughput | **353.42 RPS (p50 = 80.01 ms)** |
+| PI-M-FNO online crisis adaptation speed | **~3.5 ms** (2 inner-gradient steps, PDE loss < 10⁻⁴) |
+| D-XVA gradient flow differentiability | **Non-zero, non-NaN** ($\nabla_{\psi} \text{Var}(\Pi_T) \ne \mathbf{0}$) |
+| Grey Rough Bergomi MC path simulation | **< 15 ms** on GPU (4096 paths, 100 steps) |
+| Sobolev FNO gRB Validation accuracy | **MAE = 0.76 bp, MSE = 7.69e-5** (Active Learning) |
 
 ---
 
@@ -128,7 +132,7 @@ $10^6$. We apply a **reparameterization** $(v_0, \zeta, \lambda)$ reducing it by
 
 ## DeepVol Model Zoo
 
-The DeepVol framework contains a diverse "Zoo" of 10 volatility and derivatives models, implemented with high-performance CPU/GPU solvers and integrated with real-time calibration:
+The DeepVol framework contains a diverse "Zoo" of 13 volatility and derivatives models, implemented with high-performance CPU/GPU solvers and integrated with real-time calibration:
 
 1. **Classic Heston Model**: Traditional stochastic volatility model where variance follows a Cox-Ingersoll-Ross (CIR) process. Option pricing is performed using the exact Fourier-COS series expansion method.
 2. **SABR Model (Hagan/Displaced)**: Industry-standard smile model for FX and interest rates. Supports normal (Bachelier) and lognormal (Black) implied volatility via Hagan (2002) asymptotic expansions with displacement shifts.
@@ -140,6 +144,9 @@ The DeepVol framework contains a diverse "Zoo" of 10 volatility and derivatives 
 8. **McKean-Vlasov SDE (MLSV) Model**: Local stochastic volatility model where the volatility coefficient depends on the probability distribution (marginal laws) of the spot process.
 9. **Schwartz-Smith (2-Factor Commodity) Model**: Captures short-term mean-reverting deviations and long-term equilibrium price factors to model commodity futures curves and options.
 10. **LMM-SABR Model**: Combines the Libor Market Model (LMM) with SABR stochastic volatility to model the evolution of interest rate forward curves and swaption cubes.
+11. **Physics-Informed Meta-Learning FNO (PI-M-FNO)**: Physics-informed neural operator designed to price options under extreme, out-of-distribution market conditions with fast online GPU adaptation (< 10 ms).
+12. **End-to-End Differentiable Calibration & Hedging (D-XVA)**: Unifies option pricing, implied volatility inversion (PIVOT), and recurrent deep hedging into a single computational graph trained directly on hedging variance.
+13. **Grey Rough Bergomi (gRB) Model**: Generalizes rough Bergomi by replacing fractional Brownian motion with generalized grey Brownian motion, implemented via custom double-precision Mittag-Leffler and Wood-Chan circulant embedding CUDA kernels.
 
 ---
 
