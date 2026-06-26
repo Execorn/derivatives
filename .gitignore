@@ -167,6 +167,21 @@ p16_agent_prompt.md
 CONTEXT.md
 walkthrough.md
 
+# ── Broad AI-artifact catch-all (REC-3 hardening) ────────────────────────────
+# These patterns ensure no AI-generated planning, roadmap, prompt, or context
+# files are committed regardless of phase numbering or naming convention.
+# Rule: AI-generated documents must NEVER appear in git history (project rule §6).
+*_ROADMAP.md
+*_agent_prompt.md
+*walkthrough*.md
+AGENTS.md
+CLAUDE.md
+ROADMAP_*.md
+*CONTEXT*.md
+*_TASK.md
+*implementation_plan*.md
+*_AUDIT*.md
+
 # ── Compiled Models & Engines ─────────────────────────────────────────────────
 *.engine
 *.onnx

@@ -2,6 +2,7 @@
 meta_fno.py — Physics-Informed Meta-Learning FNO (PI-M-FNO) Model and Meta-Learning Engine.
 """
 
+import warnings
 import torch
 import torch.nn as nn
 from typing import Dict, List
@@ -113,6 +114,19 @@ def train_reptile(
     """
     adaptable_params = model.get_adaptable_parameters()
 
+    # REC-1: Guard against excessively large inner LR values that can cause
+    # gradient explosion on non-normalised local vol surfaces. The reference
+    # manual specifies inner_lr <= 1e-2 as the upper safe bound when grid
+    # inputs are normalised; beyond this, loss landscape curvature diverges.
+    if inner_lr > 1e-2:
+        warnings.warn(
+            f"train_reptile: inner_lr={inner_lr:.2e} exceeds the recommended ceiling of 1e-2. "
+            "Gradient explosion is likely on non-normalised local vol inputs. "
+            "Consider normalising grid inputs by S0 or reducing inner_lr to <= 1e-3.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     for epoch in range(meta_epochs):
         indices = torch.randperm(len(tasks)).tolist()
 
@@ -185,6 +199,17 @@ def train_fomaml(
         of Deep Networks. arXiv:1703.03400.
     """
     adaptable_params = model.get_adaptable_parameters()
+
+    # REC-1: Guard against excessively large inner LR values. See train_reptile
+    # for the full rationale. Same ceiling applies to FOMAML inner loops.
+    if inner_lr > 1e-2:
+        warnings.warn(
+            f"train_fomaml: inner_lr={inner_lr:.2e} exceeds the recommended ceiling of 1e-2. "
+            "Gradient explosion is likely on non-normalised local vol inputs. "
+            "Consider normalising grid inputs by S0 or reducing inner_lr to <= 1e-3.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     for epoch in range(meta_epochs):
         indices = torch.randperm(len(tasks)).tolist()

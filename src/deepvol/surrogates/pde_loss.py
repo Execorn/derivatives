@@ -4,6 +4,7 @@ pde_loss.py — Physics-informed Dupire Local Volatility PDE loss layer.
 
 import torch
 import torch.nn as nn
+import warnings
 
 
 class DupirePDELoss(nn.Module):
@@ -63,6 +64,23 @@ class DupirePDELoss(nn.Module):
         # T_dbl: [Batch, N_K, N_T], grid spacing is along the maturity dimension (dim 2)
         dK = K_dbl[:, 1:2, :] - K_dbl[:, 0:1, :]
         dT = T_dbl[:, :, 1:2] - T_dbl[:, :, 0:1]
+
+        # Guard: 4th-order finite difference stencils require a uniform grid.
+        # Raise if any strike interval deviates more than 1e-5 from the first interval.
+        if K_dbl.shape[1] > 2:
+            K_intervals = K_dbl[:, 1:, :] - K_dbl[:, :-1, :]
+            if not torch.allclose(K_intervals, dK.expand_as(K_intervals), atol=1e-5, rtol=0.0):
+                raise ValueError(
+                    "DupirePDELoss requires a uniform strike grid. "
+                    "Non-uniform dK detected — higher-order stencil coefficients would be incorrect."
+                )
+        if T_dbl.shape[2] > 2:
+            T_intervals = T_dbl[:, :, 1:] - T_dbl[:, :, :-1]
+            if not torch.allclose(T_intervals, dT.expand_as(T_intervals), atol=1e-5, rtol=0.0):
+                raise ValueError(
+                    "DupirePDELoss requires a uniform maturity grid. "
+                    "Non-uniform dT detected — central difference stencils would be incorrect."
+                )
 
         # 1. Temporal Derivative dC/dT (Forward/Backward difference at boundaries, central in interior)
         dC_dT = torch.zeros_like(C_dbl)

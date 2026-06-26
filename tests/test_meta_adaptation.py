@@ -240,7 +240,17 @@ def test_online_adaptation_performance_and_pde_convergence():
             p.data.copy_(val)
             
         if perturbation_scale > 0.05:
-            break
+            # REC-6: Fail explicitly rather than continuing with an invalid initial state.
+            # If no perturbation scale in [0.003, 0.05] satisfies both conditions, the
+            # test would pass vacuously with an unverified initial PDE loss. An explicit
+            # failure makes the problem immediately visible in CI output.
+            pytest.fail(
+                f"Could not find a perturbation scale in [0.003, 0.05] satisfying "
+                f"initial_pde_loss > 1e-3 AND final_pde_loss < 1e-4 after 2 adaptation steps. "
+                f"Last scale tried: {perturbation_scale:.4f}, "
+                f"initial_pde_loss={initial_pde_loss:.6f}, final_pde_loss={final_pde_loss:.6f}. "
+                f"Check that the FNO is properly pre-trained and the PDE loss function is correct."
+            )
         perturbation_scale += 0.0005
 
 

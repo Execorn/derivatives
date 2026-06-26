@@ -19,6 +19,13 @@ def price_bs_f64(
         Call = S * e^(-q * T) * N(d1) - K * e^(-r * T) * N(d2)
         Put = K * e^(-r * T) * N(-d2) - S * e^(-q * T) * N(-d1)
     """
+    # REC-5: Enforce the float64 contract at the function boundary.
+    # Callers must pass float64 tensors; silent float32 calls would propagate
+    # precision loss into the IV solver and its backward pass.
+    assert sigma.dtype == torch.float64, (
+        f"price_bs_f64 requires float64 inputs, got sigma.dtype={sigma.dtype}. "
+        "Cast inputs to torch.float64 before calling this function."
+    )
     sqrt_T = torch.sqrt(T)
     denom = sigma * sqrt_T
     
@@ -52,6 +59,11 @@ def vega_bs_f64(
         d1 = [ln(S/K) + (r - q + 0.5 * sigma^2) * T] / (sigma * sqrt(T))
         Vega = S * e^(-q * T) * sqrt(T) * N'(d1)
     """
+    # REC-5: Enforce the float64 contract at the function boundary.
+    assert sigma.dtype == torch.float64, (
+        f"vega_bs_f64 requires float64 inputs, got sigma.dtype={sigma.dtype}. "
+        "Cast inputs to torch.float64 before calling this function."
+    )
     sqrt_T = torch.sqrt(T)
     denom = sigma * sqrt_T
     d1 = (torch.log(S / K) + (r - q + 0.5 * sigma**2) * T) / denom

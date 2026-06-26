@@ -354,6 +354,13 @@ class DXVAPipeline(nn.Module):
 
             # 3. Construct Features for policy network
             # Features: log_moneyness, remaining_T, pred_vol, pred_price, prev_delta
+            #
+            # REC-2 — dtype boundary: float64 (Heston simulation) → float32 (policy network)
+            # S_t, C_pred_t, and sigma_pred_t are float64 from the Heston path simulation and
+            # the BS pricing layer above. The LSTM policy (policy_net) was trained in float32
+            # for memory efficiency and speed. All feature tensors are explicitly cast to
+            # float32 below with .float(). The delta output is cast back to float64 at line
+            # delta = delta_flat.view(...).double() before re-entering the simulation loop.
             log_mon_feat = torch.log(S_t / K).unsqueeze(-1).float()  # log(S_t / K)
             T_rem_feat = torch.full(
                 (B, N_paths, 1), T_t, device=device, dtype=torch.float

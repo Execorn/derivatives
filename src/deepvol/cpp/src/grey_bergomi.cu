@@ -25,7 +25,32 @@ inline int get_M(int N) {
     return M;
 }
 
-// Element-wise Mittag-Leffler evaluation on the GPU
+// Element-wise Mittag-Leffler evaluation on the GPU.
+//
+// Computes E_beta(z) = sum_{k=0}^{inf} z^k / Gamma(beta*k + 1)
+// using two regimes based on val_check = z^(1/beta):
+//
+//   Regime 1 (val_check <= 35.0): Power series in log-space via lgamma.
+//     - Uses lgamma instead of tgamma to avoid overflow at large k*beta.
+//     - Convergence criterion: term < tol * sum (relative), k > 0.
+//     - Accurate to machine epsilon for the tested range.
+//
+//   Regime 2 (val_check > 35.0): 4-term asymptotic expansion:
+//     E_beta(z) ~ (1/beta) * exp(z^{1/beta}) - sum_{j=1}^{4} z^{-j} / Gamma(1 - beta*j)
+//     - Poles of Gamma(1 - beta*j) at non-positive integers are handled by setting
+//       the corresponding term to 0.0 (residue vanishes at those poles).
+//     - REC-7 ACCURACY NOTE: Only 4 terms are used. For beta near 1.0 and intermediate
+//       z in (35, 100), the expansion may lose 1-2 ULP relative to the power series
+//       because poles of Gamma(1 - beta*j) cluster near negative integers.
+//       Validated to < 1e-7 relative error for beta in [0.5, 0.95] via test_grey_cuda.py.
+//       If beta > 0.95 and z in (35, 100) is required, consider increasing to 6 terms
+//       or switching the threshold to val_check <= 50.0.
+//
+// Parameters:
+//   z        : input argument (must be >= 0; z <= 0 returns 1.0 exactly)
+//   beta     : fractional order in (0, 1]
+//   max_iter : maximum power-series terms (default 500)
+//   tol      : relative convergence tolerance (default 1e-9)
 __device__ double mittag_leffler_eval(double z, double beta, int max_iter, double tol) {
     if (z <= 0.0) {
         return 1.0;
