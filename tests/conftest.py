@@ -40,4 +40,16 @@ def clear_cuda_cache():
     yield
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        # Reset float32 matmul precision to PyTorch default to prevent state leakage
+        torch.set_float32_matmul_precision("highest")
+
+
+def pytest_sessionstart(session):
+    import sys
+    print("\n--- Acquiring GPU Lock ---", flush=True)
+    from deepvol.utils.gpu_lock import acquire_gpu_lock
+    acquire_gpu_lock()
+    print("--- GPU Lock Acquired ---\n", flush=True)
+
+
 
