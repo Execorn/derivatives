@@ -50,3 +50,10 @@ from .pivot_iv import (
     pivot_implied_vol
 )
 
+from .policy import (
+    DeepHedgingPolicy,
+    proportional_transaction_cost,
+    huber_transaction_cost,
+    sqrt_transaction_cost
+)
+
