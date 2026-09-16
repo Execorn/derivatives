@@ -176,11 +176,15 @@ walkthrough.md
 *walkthrough*.md
 AGENTS.md
 CLAUDE.md
+.cursorrules
+.codex/
+vault/
 ROADMAP_*.md
 *CONTEXT*.md
 *_TASK.md
 *implementation_plan*.md
 *_AUDIT*.md
+
 
 # ── Compiled Models & Engines ─────────────────────────────────────────────────
 *.engine
