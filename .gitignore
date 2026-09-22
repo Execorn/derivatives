@@ -191,3 +191,8 @@ ROADMAP_*.md
 *.onnx
 fno_surrogate.engine
 fno_surrogate.onnx
+data/autocall/
+artifacts/weights/autocall_*.pth
+artifacts/scalers/autocall_*.npz
+.licenses/
+run_demo.sh

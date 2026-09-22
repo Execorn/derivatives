@@ -52,6 +52,7 @@ with col2:
 | **P15 D-XVA Hedging** | Heston MC → PIVOT IV → LSTM policy → P&L variance |
 | **P14 PI-M-FNO Adaptation** | Reptile / FOMAML online adaptation to crisis surfaces |
 | **EGNO Multi-Asset** | Graph neural operator for basket option pricing |
+| **Autocall Pricer** | 1-leg vanilla autocall: MLP surrogate + MC pricing, Greeks, scenario analysis |
     """)
 
 with col3:
