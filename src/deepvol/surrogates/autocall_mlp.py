@@ -66,8 +66,7 @@ class AutocallMLP(nn.Module):
         )
         self.out_head = nn.Linear(hidden, out_dim)
 
-    @torch.compile(mode="reduce-overhead")
-    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_uncompiled(self, x: torch.Tensor) -> torch.Tensor:
         h = self.in_proj(x)
         for block in self.blocks:
             h = block(h)
@@ -76,9 +75,13 @@ class AutocallMLP(nn.Module):
             out = torch.sigmoid(out)
         return out
 
+    @torch.compile(mode="reduce-overhead")
+    def _forward_compiled(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_uncompiled(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass with CUDAGraphs buffer protection.
+        Forward pass with CUDAGraphs buffer protection and autograd compatibility.
 
         Parameters:
             x: Tensor of shape (B, 10) in normalized space (float32).
@@ -86,7 +89,9 @@ class AutocallMLP(nn.Module):
         Returns:
             Tensor of shape (B, 3) in normalized [0, 1] target space.
         """
-        return self._forward_impl(x).clone()
+        if x.requires_grad or torch.is_grad_enabled():
+            return self._forward_uncompiled(x)
+        return self._forward_compiled(x).clone()
 
 
 def compute_greeks(
