@@ -53,6 +53,9 @@ with col2:
 | **P14 PI-M-FNO Adaptation** | Reptile / FOMAML online adaptation to crisis surfaces |
 | **EGNO Multi-Asset** | Graph neural operator for basket option pricing |
 | **Autocall Pricer** | 1-leg vanilla autocall: MLP surrogate + MC pricing, Greeks, scenario analysis |
+| **Phoenix Pricer** | 2-barrier autocall: coupon corridor + memory coupons, MLP surrogate |
+| **Worst-of Autocall** | 2-asset correlated Heston, EGNO surrogate, correlation sensitivity |
+| **Model Comparison** | Heston / LV / SLV / PDE reference pricer, model risk quantification |
     """)
 
 with col3:

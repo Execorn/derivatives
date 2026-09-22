@@ -193,6 +193,10 @@ fno_surrogate.engine
 fno_surrogate.onnx
 data/autocall/
 artifacts/weights/autocall_*.pth
+artifacts/weights/phoenix_*.pth
+artifacts/weights/wof_*.pth
 artifacts/scalers/autocall_*.npz
+artifacts/scalers/phoenix_*.npz
+artifacts/scalers/wof_*.npz
 .licenses/
 run_demo.sh

@@ -9,7 +9,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, Union
 
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
@@ -23,14 +23,14 @@ from deepvol.hedging.policy import (
 logger = logging.getLogger("deepvol.hedging.d_xva")
 
 
-@torch.compile(mode="reduce-overhead")
 def simulate_heston_paths(
     theta: torch.Tensor,
     S0: float,
     T: float,
     N_steps: int,
     N_paths: int,
-    r: float = 0.0,
+    r: Union[float, torch.Tensor] = 0.0,
+    antithetic: bool = True,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """
@@ -45,7 +45,8 @@ def simulate_heston_paths(
         T: Maturity time.
         N_steps: Number of simulation steps.
         N_paths: Number of simulation paths per batch element.
-        r: Risk-free interest rate.
+        r: Risk-free interest rate (float or Tensor of shape (B,) or (B, 1)).
+        antithetic: Whether to use antithetic variates for variance reduction.
         device: Target hardware device.
 
     Returns:
@@ -64,37 +65,47 @@ def simulate_heston_paths(
     rho = theta[:, 3].unsqueeze(-1).to(torch.float64)
     v0 = theta[:, 4].unsqueeze(-1).to(torch.float64)
 
-    # Use lists to accumulate steps to avoid in-place tensor modification errors in autograd
-    S_list = [torch.full((B, N_paths), S0, device=device, dtype=torch.float64)]
-    V_list = [v0.expand(B, N_paths).to(torch.float64)]
+    if isinstance(r, torch.Tensor):
+        r_t = r.view(B, 1).to(torch.float64)
+    else:
+        r_t = float(r)
+
+    S = torch.empty(B, N_paths, N_steps + 1, dtype=torch.float64, device=device)
+    S[:, :, 0] = S0
+    V_t = v0.expand(B, N_paths).to(torch.float64).clone()
 
     sqrt_dt = math.sqrt(dt)
+    c_rho = torch.sqrt(torch.clamp(1.0 - rho**2, min=1e-8))
+
+    use_av = antithetic and (N_paths % 2 == 0)
+    half_paths = N_paths // 2 if use_av else N_paths
 
     for t in range(N_steps):
-        Z1 = torch.randn(B, N_paths, device=device, dtype=torch.float64)
-        Z2 = torch.randn(B, N_paths, device=device, dtype=torch.float64)
+        if use_av:
+            Z1_half = torch.randn(B, half_paths, device=device, dtype=torch.float64)
+            Z2_half = torch.randn(B, half_paths, device=device, dtype=torch.float64)
+            Z1 = torch.cat([Z1_half, -Z1_half], dim=1)
+            Z2 = torch.cat([Z2_half, -Z2_half], dim=1)
+        else:
+            Z1 = torch.randn(B, N_paths, device=device, dtype=torch.float64)
+            Z2 = torch.randn(B, N_paths, device=device, dtype=torch.float64)
 
-        # Correlate Brownian motions
-        ZS = Z1
-        ZV = rho * Z1 + torch.sqrt(1.0 - rho**2) * Z2
+        ZV = rho * Z1 + c_rho * Z2
 
-        V_t = V_list[-1]
-        S_t = S_list[-1]
-
+        V_clamp = V_t.clamp(min=1e-8)
+        sqrt_V = torch.sqrt(V_clamp)
         V_next = (
             V_t
             + kappa * (theta_v - V_t) * dt
-            + sigma_v * torch.sqrt(V_t.clamp(min=1e-8)) * ZV * sqrt_dt
-        )
-        V_list.append(V_next.clamp(min=1e-4))
+            + sigma_v * sqrt_V * ZV * sqrt_dt
+        ).clamp(min=1e-4)
 
-        S_next = S_t * torch.exp(
-            (r - 0.5 * V_t) * dt + torch.sqrt(V_t.clamp(min=1e-8)) * ZS * sqrt_dt
+        S[:, :, t + 1] = S[:, :, t] * torch.exp(
+            (r_t - 0.5 * V_t) * dt + sqrt_V * Z1 * sqrt_dt
         )
-        S_list.append(S_next)
+        V_t = V_next
 
-    S = torch.stack(S_list, dim=-1)
-    return S.clone()
+    return S
 
 
 class DXVAPipeline(nn.Module):
