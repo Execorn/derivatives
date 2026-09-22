@@ -153,11 +153,11 @@ def simulate_correlated_heston_paths(
         sqrt_V1 = torch.sqrt(V1_pos)
         sqrt_V2 = torch.sqrt(V2_pos)
 
-        # Spot step (Euler-Maruyama)
+        # Spot step (Log-Euler exponential stepping guarantees S > 0 strictly)
         curr_S1 = S1[:, :, k]
         curr_S2 = S2[:, :, k]
-        S1[:, :, k + 1] = curr_S1 + r_t * curr_S1 * dt + sqrt_V1 * curr_S1 * dW_S1
-        S2[:, :, k + 1] = curr_S2 + r_t * curr_S2 * dt + sqrt_V2 * curr_S2 * dW_S2
+        S1[:, :, k + 1] = curr_S1 * torch.exp((r_t - 0.5 * V1_pos) * dt + sqrt_V1 * dW_S1)
+        S2[:, :, k + 1] = curr_S2 * torch.exp((r_t - 0.5 * V2_pos) * dt + sqrt_V2 * dW_S2)
 
         # Variance step (Full truncation scheme)
         V1 = V1 + kappa1.unsqueeze(1) * (theta_v1.unsqueeze(1) - V1_pos) * dt + sigma1.unsqueeze(1) * sqrt_V1 * dW_V1
@@ -191,11 +191,77 @@ def correlation_sensitivity(
     T: float,
     dt: float,
     delta_rho: float = 0.05,
+    theta1: Optional[Tensor] = None,
+    theta2: Optional[Tensor] = None,
+    rho_12: Optional[Tensor] = None,
 ) -> Tensor:
-    """Calculate sensitivity of WoF autocall NPV to correlation rho_12."""
-    npv_base, _, _ = price_wof_autocall_mc(S1, S2, obs_indices, B, coupon, r, T, dt)
-    # Re-sample or finite difference proxy on existing paths
-    perf1 = S1 / S1[:, :, 0:1]
-    perf2 = S2 / S2[:, :, 0:1]
-    # Sensitivity of min(X1, X2) to correlation is strictly positive when pricing autocall
-    return torch.tensor([0.05], dtype=torch.float64, device=S1.device)
+    """Calculate sensitivity of WoF autocall NPV to correlation rho_12.
+
+    If model parameters (theta1, theta2, rho_12) are provided, computes finite differences
+    via Common Random Numbers (CRN) simulation across rho_12 +/- delta_rho.
+    If only paths S1, S2 are provided, computes path-wise copula correlation shifting
+    of the orthogonalized asset increments.
+    """
+    if theta1 is not None and theta2 is not None and rho_12 is not None:
+        N_paths = S1.shape[1]
+        N_steps = S1.shape[2] - 1
+        device = S1.device
+
+        rho_val = float(rho_12.item() if isinstance(rho_12, Tensor) else rho_12)
+        rho_up = torch.tensor([min(0.99, rho_val + delta_rho)], dtype=torch.float64, device=device)
+        rho_dn = torch.tensor([max(-0.99, rho_val - delta_rho)], dtype=torch.float64, device=device)
+        eff_drho = (rho_up - rho_dn).item()
+        if eff_drho < 1e-6:
+            eff_drho = delta_rho
+
+        S0_1 = float(S1[0, 0, 0].item())
+        S0_2 = float(S2[0, 0, 0].item())
+        r_val = float(r[0].item() if isinstance(r, Tensor) and r.ndim > 0 else (r.item() if isinstance(r, Tensor) else r))
+
+        S1_up, S2_up = simulate_correlated_heston_paths(
+            theta1, theta2, rho_up, S0_1, S0_2, T, N_steps, N_paths, r_val, device=device
+        )
+        S1_dn, S2_dn = simulate_correlated_heston_paths(
+            theta1, theta2, rho_dn, S0_1, S0_2, T, N_steps, N_paths, r_val, device=device
+        )
+        npv_up, _, _ = price_wof_autocall_mc(S1_up, S2_up, obs_indices, B, coupon, r, T, dt)
+        npv_dn, _, _ = price_wof_autocall_mc(S1_dn, S2_dn, obs_indices, B, coupon, r, T, dt)
+        return (npv_up - npv_dn) / eff_drho
+
+    # Path-wise copula shift on existing trajectories
+    r1 = torch.log(torch.clamp(S1[:, :, 1:] / S1[:, :, :-1], min=1e-8))
+    r2 = torch.log(torch.clamp(S2[:, :, 1:] / S2[:, :, :-1], min=1e-8))
+
+    std1 = torch.std(r1, dim=1, keepdim=True).clamp(min=1e-6)
+    std2 = torch.std(r2, dim=1, keepdim=True).clamp(min=1e-6)
+    z1 = (r1 - torch.mean(r1, dim=1, keepdim=True)) / std1
+    z2 = (r2 - torch.mean(r2, dim=1, keepdim=True)) / std2
+
+    emp_rho = torch.mean(z1 * z2, dim=1, keepdim=True).clamp(-0.95, 0.95)
+    c_perp = torch.sqrt(torch.clamp(1.0 - emp_rho**2, min=1e-6))
+    z_perp = (z2 - emp_rho * z1) / c_perp
+
+    rho_up = torch.clamp(emp_rho + delta_rho, -0.99, 0.99)
+    rho_dn = torch.clamp(emp_rho - delta_rho, -0.99, 0.99)
+    eff_drho = (rho_up - rho_dn).mean().clamp(min=1e-4).item()
+
+    c_perp_up = torch.sqrt(torch.clamp(1.0 - rho_up**2, min=1e-6))
+    c_perp_dn = torch.sqrt(torch.clamp(1.0 - rho_dn**2, min=1e-6))
+
+    z2_up = rho_up * z1 + c_perp_up * z_perp
+    z2_dn = rho_dn * z1 + c_perp_dn * z_perp
+
+    r2_up = z2_up * std2 + torch.mean(r2, dim=1, keepdim=True)
+    r2_dn = z2_dn * std2 + torch.mean(r2, dim=1, keepdim=True)
+
+    S2_up = torch.empty_like(S2)
+    S2_dn = torch.empty_like(S2)
+    S2_up[:, :, 0] = S2[:, :, 0]
+    S2_dn[:, :, 0] = S2[:, :, 0]
+    S2_up[:, :, 1:] = S2[:, :, 0:1] * torch.cumprod(torch.exp(r2_up), dim=2)
+    S2_dn[:, :, 1:] = S2[:, :, 0:1] * torch.cumprod(torch.exp(r2_dn), dim=2)
+
+    npv_up, _, _ = price_wof_autocall_mc(S1, S2_up, obs_indices, B, coupon, r, T, dt)
+    npv_dn, _, _ = price_wof_autocall_mc(S1, S2_dn, obs_indices, B, coupon, r, T, dt)
+
+    return (npv_up - npv_dn) / eff_drho

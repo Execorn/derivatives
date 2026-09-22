@@ -52,7 +52,7 @@ def test_payoff_always_called_CUDA():
 
     # Heston parameters
     theta = torch.tensor([[2.0, 0.04, 0.3, -0.7, 0.04]], dtype=torch.float64, device=DEVICE)
-    S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=10000, r=0.0, device=DEVICE)
+    S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=10000, r=r_val, device=DEVICE)
 
     B_t = torch.tensor([B_val], dtype=torch.float64, device=DEVICE)
     coupon_t = torch.tensor([coupon_val], dtype=torch.float64, device=DEVICE)
@@ -82,7 +82,7 @@ def test_payoff_never_called_CUDA():
     obs_indices = make_obs_indices(n_obs, T, N_steps)
 
     theta = torch.tensor([[2.0, 0.04, 0.3, -0.7, 0.04]], dtype=torch.float64, device=DEVICE)
-    S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=10000, r=0.0, device=DEVICE)
+    S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=10000, r=r_val, device=DEVICE)
 
     B_t = torch.tensor([B_val], dtype=torch.float64, device=DEVICE)
     coupon_t = torch.tensor([coupon_val], dtype=torch.float64, device=DEVICE)
@@ -124,7 +124,7 @@ def test_call_prob_bounds_CUDA():
         coupon_t = torch.tensor([coupon], dtype=torch.float64, device=DEVICE)
         r_t = torch.tensor([r], dtype=torch.float64, device=DEVICE)
 
-        S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=5000, r=0.0, device=DEVICE)
+        S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=5000, r=r, device=DEVICE)
         npv, call_prob, exp_life = price_autocall_mc(
             S, obs_indices, B_t, coupon_t, r_t, T, dt
         )
@@ -142,7 +142,7 @@ def test_exp_life_monotone_CUDA():
     obs_indices = make_obs_indices(4, T, N_steps)
 
     theta = torch.tensor([[2.0, 0.04, 0.3, -0.7, 0.04]], dtype=torch.float64, device=DEVICE)
-    S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=20000, r=0.0, device=DEVICE)
+    S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=20000, r=0.03, device=DEVICE)
 
     barriers = [0.85, 0.95, 1.00, 1.05, 1.15]
     call_probs = []
@@ -178,7 +178,7 @@ def test_mc_low_variance_CUDA():
 
     estimates = []
     for _ in range(3):
-        S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=50000, r=0.0, device=DEVICE)
+        S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=50000, r=0.03, device=DEVICE)
         npv, _, _ = price_autocall_mc(S, obs_indices, B_t, coupon_t, r_t, T, dt)
         estimates.append(npv.item())
 
@@ -198,7 +198,6 @@ def test_upper_bound_CUDA():
     obs_indices = make_obs_indices(n_obs, T, N_steps)
 
     theta = torch.tensor([[2.0, 0.04, 0.3, -0.7, 0.04]], dtype=torch.float64, device=DEVICE)
-    S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=10000, r=0.0, device=DEVICE)
 
     for _ in range(n_sets):
         b = float(torch.empty(1).uniform_(0.85, 1.15))
@@ -209,6 +208,7 @@ def test_upper_bound_CUDA():
         coupon_t = torch.tensor([coupon], dtype=torch.float64, device=DEVICE)
         r_t = torch.tensor([r], dtype=torch.float64, device=DEVICE)
 
+        S = simulate_heston_paths(theta, 100.0, T, N_steps, N_paths=10000, r=r, device=DEVICE)
         npv, _, _ = price_autocall_mc(S, obs_indices, B_t, coupon_t, r_t, T, dt)
         ub = autocall_upper_bound(n_obs, coupon, T, r)
 

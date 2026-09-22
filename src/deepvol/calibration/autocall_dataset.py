@@ -174,14 +174,19 @@ def generate_dataset(
 
         theta_np = df.iloc[start_idx:end_idx][["kappa", "theta", "sigma", "rho", "v0"]].values
         theta_t = torch.tensor(theta_np, dtype=torch.float64, device=device)
+        r_np = df.iloc[start_idx:end_idx]["r"].values
+        r_batch = torch.tensor(r_np, dtype=torch.float64, device=device).unsqueeze(1)
 
         # Pad to full sub_batch_size if last batch to maintain static shape
         if curr_b_size < sub_batch_size:
             pad_rows = sub_batch_size - curr_b_size
             theta_pad = theta_t[-1:].repeat(pad_rows, 1)
             theta_sim = torch.cat([theta_t, theta_pad], dim=0)
+            r_pad = r_batch[-1:].repeat(pad_rows, 1)
+            r_sim = torch.cat([r_batch, r_pad], dim=0)
         else:
             theta_sim = theta_t
+            r_sim = r_batch
 
         with torch.no_grad():
             S = simulate_heston_paths(
@@ -190,9 +195,13 @@ def generate_dataset(
                 T=T_sim,
                 N_steps=N_steps_sim,
                 N_paths=n_paths_mc,
-                r=0.0,
+                r=r_sim,
                 device=device,
             )
+
+            npv_batch = []
+            call_prob_batch = []
+            exp_life_batch = []
 
             for j in range(curr_b_size):
                 row_idx = start_idx + j
@@ -213,9 +222,13 @@ def generate_dataset(
                     S_j, obs_indices, B_t, coupon_t, r_t, T_j, dt_j
                 )
 
-                npv_out[row_idx] = float(npv_t.item())
-                call_prob_out[row_idx] = float(call_p_t.item())
-                exp_life_out[row_idx] = float(exp_l_t.item())
+                npv_batch.append(npv_t)
+                call_prob_batch.append(call_p_t)
+                exp_life_batch.append(exp_l_t)
+
+            npv_out[start_idx:end_idx] = torch.cat(npv_batch).cpu().numpy()
+            call_prob_out[start_idx:end_idx] = torch.cat(call_prob_batch).cpu().numpy()
+            exp_life_out[start_idx:end_idx] = torch.cat(exp_life_batch).cpu().numpy()
 
             del S
             if device.type == "cuda":

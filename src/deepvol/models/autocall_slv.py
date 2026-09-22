@@ -20,7 +20,8 @@ from torch import Tensor
 
 from deepvol.models.local_vol import svi_to_lv_surface
 from deepvol.models.mlsv_gpu import MLSVSolverGPU
-from deepvol.models.autocall import price_autocall_mc, simulate_heston_paths, make_obs_indices
+from deepvol.models.autocall import price_autocall_mc, make_obs_indices
+from deepvol.hedging.d_xva import simulate_heston_paths
 
 
 def build_dupire_vol_fn(
@@ -61,7 +62,7 @@ def build_dupire_vol_fn(
         k_val = torch.log(torch.clamp(S_flat / S0_ref, min=1e-6))
 
         # Clamp t and k to grid boundaries
-        t_clamped = torch.clamp(torch.tensor(t, dtype=torch.float64, device=device), T_t[0], T_t[-1])
+        t_clamped = torch.clamp(torch.as_tensor(t, dtype=torch.float64, device=device), T_t[0], T_t[-1])
         k_clamped = torch.clamp(k_val, K_t[0], K_t[-1])
 
         # 1D index for T
@@ -216,11 +217,11 @@ def price_autocall_slv_mc(
         S0=S0,
         r=r,
         q=q,
-        v0=slv_params["v0"],
-        kappa=slv_params["kappa"],
-        theta=slv_params["theta"],
-        xi=slv_params["xi"],
-        rho=slv_params["rho"],
+        v0=slv_params.get("v0", 0.04),
+        kappa=slv_params.get("kappa", 2.0),
+        theta=slv_params.get("theta", 0.04),
+        xi=slv_params.get("xi", slv_params.get("sigma", 0.3)),
+        rho=slv_params.get("rho", -0.6),
         T=T,
         steps_per_unit=int(round(N_steps / T)),
         N_paths=N_paths,

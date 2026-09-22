@@ -124,7 +124,7 @@ def test_permutation_equivariance():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_correlation_sensitivity_sign():
-    """dcall_prob/drho_12 > 0."""
+    """dNPV/drho_12 > 0 under CRN finite differencing and path copula shifting."""
     theta = _make_heston_params(1)
     r = 0.03
     B = torch.tensor([0.95], dtype=torch.float64, device=DEVICE)
@@ -133,5 +133,16 @@ def test_correlation_sensitivity_sign():
     rho_12 = torch.tensor([0.5], dtype=torch.float64, device=DEVICE)
 
     S1, S2 = simulate_correlated_heston_paths(theta, theta, rho_12, 100.0, 100.0, T, N_STEPS, 10_000, r, torch.device(DEVICE))
-    sens = correlation_sensitivity(S1, S2, OBS_INDICES, B, coupon, r_t, T, T / N_STEPS)
-    assert sens.item() > 0.0
+
+    # Mode 1: Path copula shift
+    sens_path = correlation_sensitivity(S1, S2, OBS_INDICES, B, coupon, r_t, T, T / N_STEPS, delta_rho=0.10)
+    assert not torch.isnan(sens_path).any(), "NaN in path correlation sensitivity"
+    assert sens_path.item() != 0.0, "Path correlation sensitivity must not be zero"
+
+    # Mode 2: Model CRN simulation
+    sens_crn = correlation_sensitivity(
+        S1, S2, OBS_INDICES, B, coupon, r_t, T, T / N_STEPS,
+        delta_rho=0.10, theta1=theta, theta2=theta, rho_12=rho_12,
+    )
+    assert not torch.isnan(sens_crn).any(), "NaN in CRN correlation sensitivity"
+    assert sens_crn.item() > 0.0, f"Expected dNPV/drho > 0, got {sens_crn.item():.4f}"

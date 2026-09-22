@@ -110,7 +110,16 @@ class AutocallHedgingEnv(BarrierHedgingEnv):
         p_delta = self.prev_delta if prev_delta is None else prev_delta
 
         f0 = log_m
-        f1 = torch.zeros_like(log_m)
+        if self.H.shape[2] >= 2:
+            f1 = self.H[:, k, 1]
+        else:
+            w = min(k, 20)
+            if w >= 2:
+                # Rolling realized return volatility proxy
+                ret = torch.log(torch.clamp(self.H[:, k - w + 1 : k + 1, 0] / self.H[:, k - w : k, 0], min=1e-6))
+                f1 = torch.std(ret, dim=1) * (252.0 ** 0.5)
+            else:
+                f1 = torch.full_like(log_m, 0.20)  # Prior annual volatility proxy
         f2 = torch.full_like(log_m, tau)
         f3 = torch.full_like(log_m, norm_next_obs)
         f4 = c_mask.to(dtype)
@@ -187,9 +196,10 @@ class AutocallHedgingEnv(BarrierHedgingEnv):
             tail_loss = torch.clamp(shortfall - var_alpha, min=0.0)
             return var_alpha + (1.0 / self.cvar_alpha) * tail_loss.mean()
         else:
-            # Entropic loss: E[exp(lambda * (payoff - wealth))]
-            lam = self.risk_aversion
-            return torch.mean(torch.exp(torch.clamp(lam * shortfall, -20.0, 20.0)))
+            # Entropic loss / certainty equivalent: (1/lambda) * log(E[exp(lambda * (payoff - wealth))])
+            lam = max(1e-4, float(self.risk_aversion))
+            scaled = torch.clamp(lam * shortfall, -20.0, 20.0)
+            return (1.0 / lam) * torch.log(torch.mean(torch.exp(scaled)) + 1e-8)
 
 
 class AutocallHedgePolicy(nn.Module):

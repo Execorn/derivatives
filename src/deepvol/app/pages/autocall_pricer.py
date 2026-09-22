@@ -155,7 +155,7 @@ with tab_pricing:
         r_t = torch.tensor([r_val], dtype=torch.float64, device=device)
 
         with torch.no_grad():
-            S = simulate_heston_paths(theta_t, 100.0, T, N_steps, mc_paths, 0.0, device)
+            S = simulate_heston_paths(theta_t, 100.0, T, N_steps, mc_paths, r_val, device)
             npv_t, call_p_t, exp_l_t = price_autocall_mc(S, obs_indices, B_t, c_t, r_t, T, dt)
             npv_val = float(npv_t.item())
             call_prob_val = float(call_p_t.item())

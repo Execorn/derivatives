@@ -90,4 +90,5 @@ version = {attr = "deepvol.__version__"}
 asyncio_mode = "auto"
 markers = [
     "integration: marks tests requiring live market data / network (run with INTEGRATION=1)",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
