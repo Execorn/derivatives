@@ -3,8 +3,6 @@ Streamlit Dashboard Panel for Phoenix Two-Barrier Autocallable Notes.
 """
 
 import os
-import sys
-sys.path.insert(0, "src")
 
 import numpy as np
 import plotly.graph_objects as go
@@ -74,14 +72,19 @@ if mode == "MLP Surrogate" and surrogate_model is not None:
         preds_norm = surrogate_model(x_t).cpu().numpy()
     npv_val, cp_val, cpn_val, el_val = norm_out.inverse_transform(preds_norm)[0]
 else:
-    theta_t = torch.tensor([[kappa, theta, sigma, rho, v0]], dtype=torch.float64, device=DEVICE)
-    S = simulate_heston_paths(theta_t, S0=100.0, T=T, N_steps=N_steps, N_paths=n_paths_mc, r=r, device=DEVICE)
-    B_call_t = torch.tensor([B_call], dtype=torch.float64, device=DEVICE)
-    B_cpn_t = torch.tensor([B_cpn], dtype=torch.float64, device=DEVICE)
-    c_t = torch.tensor([coupon], dtype=torch.float64, device=DEVICE)
-    r_t = torch.tensor([r], dtype=torch.float64, device=DEVICE)
-    npv_t, cp_t, cpn_t, el_t = price_phoenix_mc(S, obs_indices, B_call_t, B_cpn_t, c_t, r_t, T, T / N_steps, memory=memory)
-    npv_val, cp_val, cpn_val, el_val = float(npv_t.item()), float(cp_t.item()), float(cpn_t.item()), float(el_t.item())
+    try:
+        theta_t = torch.tensor([[kappa, theta, sigma, rho, v0]], dtype=torch.float64, device=DEVICE)
+        S = simulate_heston_paths(theta_t, S0=100.0, T=T, N_steps=N_steps, N_paths=n_paths_mc, r=r, device=DEVICE)
+        B_call_t = torch.tensor([B_call], dtype=torch.float64, device=DEVICE)
+        B_cpn_t = torch.tensor([B_cpn], dtype=torch.float64, device=DEVICE)
+        c_t = torch.tensor([coupon], dtype=torch.float64, device=DEVICE)
+        r_t = torch.tensor([r], dtype=torch.float64, device=DEVICE)
+        npv_t, cp_t, cpn_t, el_t = price_phoenix_mc(S, obs_indices, B_call_t, B_cpn_t, c_t, r_t, T, T / N_steps, memory=memory)
+        npv_val, cp_val, cpn_val, el_val = float(npv_t.item()), float(cp_t.item()), float(cpn_t.item()), float(el_t.item())
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        st.error("⚠️ GPU out of memory. Reduce MC path count or tenor and retry.")
+        st.stop()
 
 # Vanilla benchmark for decomposition
 theta_t = torch.tensor([[kappa, theta, sigma, rho, v0]], dtype=torch.float64, device=DEVICE)

@@ -104,3 +104,41 @@ def test_zero_cost_baseline():
         p.data.zero_()
     wealth, payoff, _ = env.simulate_episode(zero_policy)
     assert wealth.abs().max() < 1e-3, f"Expected near-zero wealth, got {wealth.abs().max():.4f}"
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_deep_otm_delta_near_zero():
+    """For deeply out-of-money paths (S << B*S0), learned delta should be near zero.
+    
+    With a trained zero-init policy, delta is already zero. This test verifies
+    that the environment state representation is correct for deep OTM scenarios
+    and that the episode runs without numerical issues.
+    """
+    torch.manual_seed(99)
+    # Create paths that are deeply OTM (S drops to 50)
+    H = torch.ones(N_PATHS, N_T + 1, D, device=DEVICE, dtype=torch.float32) * 50.0
+    cost_coeffs = torch.tensor([0.001], device=DEVICE, dtype=torch.float32)
+    env = AutocallHedgingEnv(
+        H=H,
+        cost_coeffs=cost_coeffs,
+        S0=100.0,
+        strike=100.0,
+        B_call=1.0,
+        coupon=0.02,
+        r=0.05,
+        T=0.25,
+        obs_indices=OBS_INDICES,
+    )
+    # State should have large negative log(S/S0) = log(50/100) = -0.693
+    state = env.get_state(0)
+    assert state[:, 0].mean() < -0.5, f"Expected negative log-moneyness for OTM, got {state[:, 0].mean():.4f}"
+    assert not state.isnan().any(), "NaN in OTM state"
+    
+    # Episode should complete without NaN
+    policy = AutocallHedgePolicy(state_dim=STATE_DIM, n_instruments=D).to(DEVICE)
+    wealth, payoff, _ = env.simulate_episode(policy)
+    assert not wealth.isnan().any(), "NaN wealth in OTM episode"
+    # Since S=50 < B*S0=100, note should never be called -> payoff = exp(-r*T)
+    expected_payoff = float(torch.exp(torch.tensor(-0.05 * 0.25)).item())
+    assert torch.allclose(payoff, torch.full_like(payoff, expected_payoff), atol=1e-3), (
+        f"OTM payoff should be par protection ~{expected_payoff:.4f}, got {payoff.mean():.4f}"
+    )

@@ -48,14 +48,14 @@ class AutocallInputNormalizer:
         if self.mean is None or self.std is None:
             raise ValueError("AutocallInputNormalizer is not fitted yet.")
         X_arr = np.asarray(X, dtype=np.float32)
-        return ((X_arr - self.mean) / (self.std + 1e-8)).astype(np.float32)
+        return ((X_arr - self.mean) / self.std).astype(np.float32)
 
     def inverse_transform(self, X_norm: np.ndarray) -> np.ndarray:
         """Invert z-scored array back to real parameter space."""
         if self.mean is None or self.std is None:
             raise ValueError("AutocallInputNormalizer is not fitted yet.")
         X_arr = np.asarray(X_norm, dtype=np.float32)
-        return (X_arr * (self.std + 1e-8) + self.mean).astype(np.float32)
+        return (X_arr * self.std + self.mean).astype(np.float32)
 
     def to_tensor(
         self, X: np.ndarray, device: Optional[torch.device] = None
@@ -70,7 +70,7 @@ class AutocallInputNormalizer:
             raise ValueError("AutocallInputNormalizer is not fitted yet.")
         mean_t = torch.tensor(self.mean, dtype=t.dtype, device=t.device)
         std_t = torch.tensor(self.std, dtype=t.dtype, device=t.device)
-        return (t - mean_t) / (std_t + 1e-8)
+        return (t - mean_t) / std_t
 
     def inverse_transform_tensor(self, t_norm: torch.Tensor) -> torch.Tensor:
         """Inverse transform PyTorch tensor directly on its device."""
@@ -78,7 +78,7 @@ class AutocallInputNormalizer:
             raise ValueError("AutocallInputNormalizer is not fitted yet.")
         mean_t = torch.tensor(self.mean, dtype=t_norm.dtype, device=t_norm.device)
         std_t = torch.tensor(self.std, dtype=t_norm.dtype, device=t_norm.device)
-        return t_norm * (std_t + 1e-8) + mean_t
+        return t_norm * std_t + mean_t
 
     def save(self, path: str) -> None:
         """Save fitted normalizer statistics to compressed .npz archive."""
@@ -128,7 +128,7 @@ class AutocallOutputNormalizer:
         if self.min_val is None or self.max_val is None:
             raise ValueError("AutocallOutputNormalizer is not fitted yet.")
         Y_arr = np.asarray(Y, dtype=np.float32)
-        range_val = self.max_val - self.min_val + 1e-8
+        range_val = self.max_val - self.min_val
         return ((Y_arr - self.min_val) / range_val).astype(np.float32)
 
     def inverse_transform(self, Y_norm: np.ndarray) -> np.ndarray:
@@ -136,7 +136,7 @@ class AutocallOutputNormalizer:
         if self.min_val is None or self.max_val is None:
             raise ValueError("AutocallOutputNormalizer is not fitted yet.")
         Y_arr = np.asarray(Y_norm, dtype=np.float32)
-        range_val = self.max_val - self.min_val + 1e-8
+        range_val = self.max_val - self.min_val
         return (Y_arr * range_val + self.min_val).astype(np.float32)
 
     def to_tensor(
@@ -151,7 +151,7 @@ class AutocallOutputNormalizer:
         if self.min_val is None or self.max_val is None:
             raise ValueError("AutocallOutputNormalizer is not fitted yet.")
         min_t = torch.tensor(self.min_val, dtype=t.dtype, device=t.device)
-        range_t = torch.tensor(self.max_val - self.min_val + 1e-8, dtype=t.dtype, device=t.device)
+        range_t = torch.tensor(self.max_val - self.min_val, dtype=t.dtype, device=t.device)
         return (t - min_t) / range_t
 
     def inverse_transform_tensor(self, t_norm: torch.Tensor) -> torch.Tensor:
@@ -159,7 +159,7 @@ class AutocallOutputNormalizer:
         if self.min_val is None or self.max_val is None:
             raise ValueError("AutocallOutputNormalizer is not fitted yet.")
         min_t = torch.tensor(self.min_val, dtype=t_norm.dtype, device=t_norm.device)
-        range_t = torch.tensor(self.max_val - self.min_val + 1e-8, dtype=t_norm.dtype, device=t_norm.device)
+        range_t = torch.tensor(self.max_val - self.min_val, dtype=t_norm.dtype, device=t_norm.device)
         return t_norm * range_t + min_t
 
     def save(self, path: str) -> None:

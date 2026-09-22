@@ -13,9 +13,6 @@ References:
   - Tavella, D., & Randall, C. (2000). Pricing Financial Instruments: The Finite Difference Method. John Wiley & Sons.
 """
 
-import sys
-sys.path.insert(0, "src")
-
 from typing import Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 from scipy.linalg import solve_banded
@@ -151,7 +148,10 @@ def price_autocall_pde(
         # Crank-Nicolson backward step from t_{k+1} to t_k
         V = cn_step(V, S_grid, dt, r, sigma_slice, V_0_k, V_end_k)
 
-        # If t_k is an observation date (k > 0), apply autocall barrier jump condition
+        # If t_k is an observation date (k > 0), apply autocall barrier jump condition.
+        # Note: V(t_k) is the value AT time t_k (not discounted to t=0), so the
+        # call payoff is undiscounted here. The PDE backward evolution handles
+        # discounting as V propagates to t=0.
         if k > 0 and k in obs_set:
             call_payoff = 1.0 + coupon * t_k
             V[S_grid >= barrier_level] = call_payoff

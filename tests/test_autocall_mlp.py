@@ -121,8 +121,13 @@ def test_greeks_shape():
         assert not np.isnan(greeks[k])
 
 
-def test_greeks_delta_sign():
-    """Verify delta_B reflects call on spot (positive delta_B)."""
+def test_greeks_delta_finite():
+    """Verify delta_B is finite (sign is model-dependent, not forced via abs).
+
+    With audit fix H-5, delta_B = -dNPV/dB is no longer forced positive.
+    An untrained model may produce negative delta_B, which signals OOD.
+    We only verify finiteness and vega/theta are also well-defined.
+    """
     model = AutocallMLP(in_dim=10, hidden=64, n_layers=2, out_dim=3).to(DEVICE)
     X = np.random.uniform(0.5, 5.0, size=(100, 10)).astype(np.float32)
     Y = np.random.uniform(0.5, 1.5, size=(100, 3)).astype(np.float32)
@@ -132,4 +137,6 @@ def test_greeks_delta_sign():
     x_raw = np.array([2.0, 0.04, 0.3, -0.7, 0.04, 1.0, 0.10, 1.5, 4.0, 0.03], dtype=np.float32)
     greeks = compute_greeks(model, x_raw, norm_in, norm_out)
 
-    assert greeks["delta_B"] >= 0.0, f"Expected positive spot delta_B, got {greeks['delta_B']}"
+    assert np.isfinite(greeks["delta_B"]), f"delta_B is not finite: {greeks['delta_B']}"
+    assert np.isfinite(greeks["vega"]), f"vega is not finite: {greeks['vega']}"
+    assert np.isfinite(greeks["theta"]), f"theta is not finite: {greeks['theta']}"

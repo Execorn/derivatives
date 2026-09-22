@@ -11,9 +11,6 @@ Mathematical References:
   - Glasserman, P. (2004). Monte Carlo Methods in Financial Engineering. Springer.
 """
 
-import sys
-sys.path.insert(0, "src")
-
 from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor
@@ -131,13 +128,19 @@ def simulate_correlated_heston_paths(
     use_av = antithetic and (N_paths % 2 == 0)
     half_paths = N_paths // 2 if use_av else N_paths
 
+    # Pre-allocate all random normals for the entire simulation
+    if use_av:
+        Z_all = torch.randn(N_steps, B, 4, half_paths, dtype=torch.float64, device=device)
+    else:
+        Z_all = torch.randn(N_steps, B, 4, N_paths, dtype=torch.float64, device=device)
+
     for k in range(N_steps):
-        # Generate independent standard normals
+        # Use pre-allocated random numbers
         if use_av:
-            Z_half = torch.randn(B, 4, half_paths, dtype=torch.float64, device=device)
+            Z_half = Z_all[k]
             Z_iid = torch.cat([Z_half, -Z_half], dim=2)
         else:
-            Z_iid = torch.randn(B, 4, N_paths, dtype=torch.float64, device=device)
+            Z_iid = Z_all[k]
 
         # Correlated increments: L @ Z_iid -> (B, 4, N_paths)
         dZ = torch.bmm(L, Z_iid) * sqrt_dt

@@ -13,7 +13,6 @@ Mathematical Formulation:
 """
 
 import sys
-sys.path.insert(0, "src")
 
 import os
 import time
@@ -65,6 +64,26 @@ class AutocallHedgingEnv(BarrierHedgingEnv):
         self.obs_set = set(self.obs_indices)
         self.obs_map = {step: i + 1 for i, step in enumerate(self.obs_indices)}
 
+        # Pre-compute vectorized observation distances to avoid CPU loops in get_state()
+        self._next_obs_norm = torch.zeros(self.N_t + 1, dtype=H.dtype, device=H.device)
+        self._last_obs_norm = torch.zeros(self.N_t + 1, dtype=H.dtype, device=H.device)
+        n_t_float = max(1.0, float(self.N_t))
+        for k in range(self.N_t + 1):
+            # Next obs distance
+            next_d = float(self.N_t)
+            for obs_step in self.obs_indices:
+                if obs_step >= k:
+                    next_d = float(obs_step - k)
+                    break
+            self._next_obs_norm[k] = next_d / n_t_float
+            # Last obs distance
+            last_d = float(k)
+            for obs_step in reversed(self.obs_indices):
+                if obs_step <= k:
+                    last_d = float(k - obs_step)
+                    break
+            self._last_obs_norm[k] = last_d / n_t_float
+
         self.called_mask = torch.zeros(self.N_paths, dtype=torch.bool, device=H.device)
         self.prev_delta = torch.zeros(self.N_paths, self.d, dtype=H.dtype, device=H.device)
 
@@ -91,20 +110,9 @@ class AutocallHedgingEnv(BarrierHedgingEnv):
         log_m = torch.log(torch.clamp(S_k / self.S0, min=1e-6))
         tau = (self.T - (k * self.dt)) / self.T
 
-        # Find steps to next obs date and steps since last obs date
-        next_obs_dist = float(self.N_t)
-        for obs_step in self.obs_indices:
-            if obs_step >= k:
-                next_obs_dist = float(obs_step - k)
-                break
-        norm_next_obs = next_obs_dist / max(1.0, float(self.N_t))
-
-        last_obs_dist = float(k)
-        for obs_step in reversed(self.obs_indices):
-            if obs_step <= k:
-                last_obs_dist = float(k - obs_step)
-                break
-        norm_last_obs = last_obs_dist / max(1.0, float(self.N_t))
+        # Use pre-computed vectorized observation distances (no CPU loop)
+        norm_next_obs = float(self._next_obs_norm[k].item())
+        norm_last_obs = float(self._last_obs_norm[k].item())
 
         c_mask = self.called_mask if called_mask is None else called_mask
         p_delta = self.prev_delta if prev_delta is None else prev_delta

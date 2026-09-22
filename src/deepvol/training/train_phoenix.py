@@ -6,12 +6,12 @@ fitting input and output normalizers on the training split, and saving
 best model weights based on validation NPV RMSE in basis points.
 """
 
-import sys
-sys.path.insert(0, "src")
-
+import logging
 import os
 import time
 from typing import Dict, Tuple
+
+logger = logging.getLogger(__name__)
 import numpy as np
 import torch
 import torch.nn as nn
@@ -168,6 +168,11 @@ def train_phoenix(config: dict) -> PhoenixMLP:
             with torch.amp.autocast("cuda", enabled=use_amp):
                 preds = model(X_b)
                 loss, _ = criterion(preds, Y_b, norm_out)
+
+            # Guard against NaN/Inf loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"NaN/Inf loss at epoch {epoch}, skipping batch")
+                continue
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)

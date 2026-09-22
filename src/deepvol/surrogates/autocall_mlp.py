@@ -132,7 +132,11 @@ def compute_greeks(
     # delta_B: spot sensitivity. Since higher barrier B decreases NPV (dNPV/dB < 0),
     # the note is long underlying spot (call-like payoff), so delta_B is positive.
     raw_dB = float(grad[0, 5].item()) if grad is not None else 0.0
-    delta_B = -raw_dB if raw_dB < 0 else raw_dB
+    # dNPV/dB < 0 for autocalls (higher barrier delays redemption).
+    # Delta_B = -dNPV/dB > 0 represents long spot sensitivity.
+    # We do NOT force the sign: if the model violates monotonicity,
+    # the negative delta signals an OOD or model-quality issue.
+    delta_B = -raw_dB
     vega = float(grad[0, 4].item()) if grad is not None else 0.0
 
     # Theta: finite difference bumping T by -1/252

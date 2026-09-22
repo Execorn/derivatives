@@ -3,8 +3,6 @@ Streamlit Dashboard Panel for Worst-of 2-Asset Autocallable Notes.
 """
 
 import os
-import sys
-sys.path.insert(0, "src")
 
 import numpy as np
 import plotly.graph_objects as go
@@ -75,15 +73,19 @@ obs_indices = make_obs_indices(n_obs, T, N_steps)
 theta1_t = torch.tensor([[k1, th1, sig1, rho1, v01]], dtype=torch.float64, device=DEVICE)
 theta2_t = torch.tensor([[k2, th2, sig2, rho2, v02]], dtype=torch.float64, device=DEVICE)
 rho_t = torch.tensor([rho_12], dtype=torch.float64, device=DEVICE)
+try:
+    S1, S2 = simulate_correlated_heston_paths(theta1_t, theta2_t, rho_t, 100.0, 100.0, T, N_steps, 10000, r, DEVICE)
+    B_t = torch.tensor([B], dtype=torch.float64, device=DEVICE)
+    c_t = torch.tensor([coupon], dtype=torch.float64, device=DEVICE)
+    r_t = torch.tensor([r], dtype=torch.float64, device=DEVICE)
 
-S1, S2 = simulate_correlated_heston_paths(theta1_t, theta2_t, rho_t, 100.0, 100.0, T, N_steps, 10000, r, DEVICE)
-B_t = torch.tensor([B], dtype=torch.float64, device=DEVICE)
-c_t = torch.tensor([coupon], dtype=torch.float64, device=DEVICE)
-r_t = torch.tensor([r], dtype=torch.float64, device=DEVICE)
-
-npv_wof, cp_wof, el_wof = price_wof_autocall_mc(S1, S2, obs_indices, B_t, c_t, r_t, T, T / N_steps)
-npv_a1, cp_a1, _ = price_autocall_mc(S1, obs_indices, B_t, c_t, r_t, T, T / N_steps)
-npv_a2, cp_a2, _ = price_autocall_mc(S2, obs_indices, B_t, c_t, r_t, T, T / N_steps)
+    npv_wof, cp_wof, el_wof = price_wof_autocall_mc(S1, S2, obs_indices, B_t, c_t, r_t, T, T / N_steps)
+    npv_a1, cp_a1, _ = price_autocall_mc(S1, obs_indices, B_t, c_t, r_t, T, T / N_steps)
+    npv_a2, cp_a2, _ = price_autocall_mc(S2, obs_indices, B_t, c_t, r_t, T, T / N_steps)
+except torch.cuda.OutOfMemoryError:
+    torch.cuda.empty_cache()
+    st.error("⚠️ GPU out of memory. Reduce MC path count or tenor and retry.")
+    st.stop()
 
 st.subheader("Pricing Results")
 c1, c2, c3, c4 = st.columns(4)

@@ -15,9 +15,6 @@ Mathematical References:
   - Brigo, D., Mercurio, F. (2006). Interest Rate Models - Theory and Practice. Springer.
 """
 
-import sys
-sys.path.insert(0, "src")
-
 from typing import Dict, List, Tuple
 import torch
 from torch import Tensor
@@ -45,6 +42,7 @@ def _phoenix_mc_kernel(
     npv = torch.zeros(B_batch, N_paths, dtype=torch.float64, device=device)
     life = torch.zeros(B_batch, N_paths, dtype=torch.float64, device=device)
     missed_cpns = torch.zeros(B_batch, N_paths, dtype=torch.float64, device=device)
+    paid_cpns = torch.zeros(B_batch, N_paths, dtype=torch.float64, device=device)
 
     N_obs = obs_steps.shape[0]
     for i in range(N_obs):
@@ -60,7 +58,7 @@ def _phoenix_mc_kernel(
         disc = torch.exp(-r.unsqueeze(1) * t_i)
 
         # Call payoff: par + accrued coupon up to date t_i
-        call_payoff = disc * (1.0 + coupon.unsqueeze(1) * (float(i + 1)))
+        call_payoff = disc * (1.0 + coupon.unsqueeze(1) * (float(i + 1))) - paid_cpns
         npv = npv + call_trig.to(torch.float64) * call_payoff
         life = life + call_trig.to(torch.float64) * t_i
         had_coupon = had_coupon | call_trig
@@ -70,11 +68,13 @@ def _phoenix_mc_kernel(
             cpn_multiplier = 1.0 + missed_cpns
             cpn_payoff = disc * coupon.unsqueeze(1) * cpn_multiplier
             npv = npv + cpn_trig.to(torch.float64) * cpn_payoff
+            paid_cpns = paid_cpns + cpn_trig.to(torch.float64) * cpn_payoff
             had_coupon = had_coupon | cpn_trig
             missed_cpns = torch.where(cpn_trig, torch.zeros_like(missed_cpns), missed_cpns + 1.0)
         else:
             cpn_payoff = disc * coupon.unsqueeze(1)
             npv = npv + cpn_trig.to(torch.float64) * cpn_payoff
+            paid_cpns = paid_cpns + cpn_trig.to(torch.float64) * cpn_payoff
             had_coupon = had_coupon | cpn_trig
 
         called = called | call_trig

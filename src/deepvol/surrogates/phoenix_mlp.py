@@ -10,10 +10,8 @@ Implements:
   - compute_phoenix_greeks: Autograd sensitivities (Delta_call, Delta_cpn, Vega, Theta).
 """
 
-import sys
-sys.path.insert(0, "src")
-
 import os
+import warnings
 from typing import Dict, List, Optional
 import numpy as np
 import torch
@@ -192,9 +190,13 @@ def compute_phoenix_greeks(
 
     # Feature indices: 4=v0, 5=B_call, 6=B_cpn, 7=coupon, 8=T
     raw_dB_call = float(grad[0, 5].item()) if grad is not None else 0.0
-    delta_call = -raw_dB_call if raw_dB_call < 0 else raw_dB_call
+    # dNPV/dB_call < 0 (higher call barrier delays redemption).
+    # Delta_call = -dNPV/dB_call. Sign is NOT forced to enable model risk detection.
+    delta_call = -raw_dB_call
     raw_dB_cpn = float(grad[0, 6].item()) if grad is not None else 0.0
-    delta_cpn = -raw_dB_cpn if raw_dB_cpn < 0 else raw_dB_cpn
+    # dNPV/dB_cpn > 0 (higher coupon barrier reduces corridor coupons).
+    # Delta_cpn = dNPV/dB_cpn. Sign is NOT forced to enable model risk detection.
+    delta_cpn = raw_dB_cpn
     vega = float(grad[0, 4].item()) if grad is not None else 0.0
 
     # Theta via finite difference bumping T by -1/252

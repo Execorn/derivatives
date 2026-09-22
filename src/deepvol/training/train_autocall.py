@@ -9,9 +9,11 @@ Features:
   - Normalizer persistence (.npz) alongside model weights (.pth)
 """
 
+import logging
 import os
 import time
 from typing import Dict, Any, Tuple
+logger = logging.getLogger(__name__)
 import numpy as np
 import torch
 import torch.nn as nn
@@ -168,8 +170,8 @@ def train(config: Dict[str, Any]) -> AutocallMLP:
 
     for epoch in range(1, config["n_epochs"] + 1):
         model.train()
-        train_loss = 0.0
-        train_rmse = 0.0
+        train_loss = torch.tensor(0.0, device=device)
+        train_count = 0
 
         for batch_x, batch_y in train_loader:
             batch_x = batch_x.to(device, non_blocking=True)
@@ -178,14 +180,19 @@ def train(config: Dict[str, Any]) -> AutocallMLP:
             optimizer.zero_grad()
             preds = model(batch_x)
             loss, metrics = criterion(preds, batch_y, norm_out)
+
+            # Guard against NaN/Inf loss to prevent wasting compute
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"NaN/Inf loss detected at epoch {epoch}, skipping batch")
+                continue
+
             loss.backward()
             optimizer.step()
 
-            train_loss += loss.item() * len(batch_x)
-            train_rmse += metrics["rmse_bps"] * len(batch_x)
+            train_loss += loss.detach()
+            train_count += len(batch_x)
 
-        train_loss /= len(train_ds)
-        train_rmse /= len(train_ds)
+        train_loss = float(train_loss.item()) / max(1, train_count)
         scheduler.step()
 
         # Validation
@@ -216,7 +223,7 @@ def train(config: Dict[str, Any]) -> AutocallMLP:
         if epoch % 5 == 0 or epoch == 1 or val_rmse < best_val_rmse:
             print(
                 f"Epoch {epoch:3d}/{config['n_epochs']} | "
-                f"Train Loss: {train_loss:.6f} (RMSE: {train_rmse:.2f} bps) | "
+                f"Train Loss: {train_loss:.6f} | "
                 f"Val RMSE: {val_rmse:.2f} bps | Call MAE: {val_call_mae:.4f} | Life MAE: {val_life_mae:.4f}"
             )
 

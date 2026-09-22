@@ -9,9 +9,6 @@ Mathematical References:
   - Guyon, J., & Henry-Labordère, P. (2012). Being particular about local volatility. Risk, 25(1), 78-83.
 """
 
-import sys
-sys.path.insert(0, "src")
-
 import time
 from typing import Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
@@ -113,10 +110,12 @@ def simulate_lv_paths(
     curr_S = torch.full((N_paths,), S0, dtype=torch.float64, device=device)
     r_val = float(r)
 
+    Z_all = torch.randn(N_steps, N_paths, dtype=torch.float64, device=device)
+
     for k in range(N_steps):
         t_k = k * dt
         vol_k = vol_fn(t_k, curr_S)
-        Z = torch.randn(N_paths, dtype=torch.float64, device=device)
+        Z = Z_all[k]
 
         # Log-Euler step: S_{k+1} = S_k * exp((r - 0.5*sigma^2)*dt + sigma*sqrt(dt)*Z)
         drift = (r_val - 0.5 * (vol_k ** 2)) * dt

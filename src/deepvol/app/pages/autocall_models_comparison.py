@@ -3,8 +3,6 @@ Streamlit Dashboard Panel for Autocall Model Comparison (Heston vs LV vs SLV vs 
 """
 
 import os
-import sys
-sys.path.insert(0, "src")
 
 import numpy as np
 import plotly.graph_objects as go
@@ -52,24 +50,28 @@ svi_params = torch.tensor([
 ], dtype=torch.float64, device=DEVICE)
 
 # Run comparison
-flat_sigma_func = lambda t, S: np.full_like(S, np.sqrt(v0))
-pde_res = price_autocall_pde_scalar(
-    S0_val=S0, r=r, T=T, N_S=300, N_T=N_steps, obs_indices=obs_indices,
-    B=B, coupon=coupon, sigma_func=flat_sigma_func
-)
+try:
+    pde_res = price_autocall_pde_scalar(
+        S0_val=S0, r=r, T=T, N_S=300, N_T=N_steps, obs_indices=obs_indices,
+        B=B, coupon=coupon, sigma_func=flat_sigma_func
+    )
 
-heston_dict = {"kappa": kappa, "theta": theta, "sigma": sigma, "rho": rho, "v0": v0}
-contract_dict = {"S0": S0, "B": B, "coupon": coupon, "T": T, "r": r, "n_obs": obs_freq}
+    heston_dict = {"kappa": kappa, "theta": theta, "sigma": sigma, "rho": rho, "v0": v0}
+    contract_dict = {"S0": S0, "B": B, "coupon": coupon, "T": T, "r": r, "n_obs": obs_freq}
 
-comp_results = lv_vs_heston_comparison(
-    heston_params=heston_dict,
-    svi_params=svi_params,
-    T_grid=T_grid,
-    K_grid=K_grid,
-    autocall_contract=contract_dict,
-    device=DEVICE,
-    n_paths=10000,
-)
+    comp_results = lv_vs_heston_comparison(
+        heston_params=heston_dict,
+        svi_params=svi_params,
+        T_grid=T_grid,
+        K_grid=K_grid,
+        autocall_contract=contract_dict,
+        device=DEVICE,
+        n_paths=10000,
+    )
+except torch.cuda.OutOfMemoryError:
+    torch.cuda.empty_cache()
+    st.error("⚠️ GPU out of memory. Reduce parameters and retry.")
+    st.stop()
 
 c1, c2, c3, c4 = st.columns(4)
 pde_npv = pde_res["npv"]

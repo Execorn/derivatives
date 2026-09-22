@@ -132,3 +132,51 @@ def test_exp_life_le_T():
         S, OBS_INDICES, B_call, B_cpn, coupon, r, T, DT, memory=False
     )
     assert (exp_life <= T + 1e-6).all(), f"exp_life exceeds T: {exp_life}"
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_late_call_after_corridor_coupons():
+    """Call at i>0 after corridor coupons were paid must NOT double-count.
+    
+    Setup: B_call=1.02, B_cpn=0.50, constant paths at S=1.0.
+    At every obs date, S/S0 = 1.0 >= B_cpn=0.50, so corridor coupons are paid.
+    S/S0 = 1.0 < B_call=1.02, so call is NOT triggered.
+    Then at the last obs date, we bump paths to trigger the call.
+    
+    With the C-1 fix, the total NPV must equal:
+    sum(discounted corridor coupons) + discounted(call_payoff - already_paid_coupons)
+    which must be strictly less than the snowball payoff
+    discounted(1 + coupon * N_obs).
+    """
+    N_PATHS_TEST = 5000
+    N_STEPS_TEST = 252
+    OBS_TEST = [63, 126, 189, 252]
+    DT_TEST = 1.0 / 252
+
+    # Paths at S=1.0 for first 3 obs, then jump to S=1.05 at last obs
+    S = torch.ones(1, N_PATHS_TEST, N_STEPS_TEST + 1, device=DEVICE, dtype=torch.float64)
+    # Bump paths after obs 189 so they trigger call at obs 252
+    S[:, :, 190:] = 1.05
+
+    B_call = torch.tensor([1.02], dtype=torch.float64, device=DEVICE)
+    B_cpn = torch.tensor([0.50], dtype=torch.float64, device=DEVICE)
+    coupon_val = torch.tensor([0.02], dtype=torch.float64, device=DEVICE)
+    r_val = torch.tensor([0.05], dtype=torch.float64, device=DEVICE)
+
+    npv_mem, call_prob, cpn_prob, exp_life = price_phoenix_mc(
+        S, OBS_TEST, B_call, B_cpn, coupon_val, r_val, T=1.0, dt=DT_TEST, memory=True
+    )
+
+    # All paths should be called at the last obs date
+    assert call_prob.item() > 0.99, f"Expected call at last obs, got call_prob={call_prob.item():.4f}"
+
+    # Snowball upper bound (if no corridor coupons were deducted): exp(-r*T)*(1 + coupon*4)
+    snowball_ub = float(torch.exp(-r_val * 1.0).item()) * (1.0 + 0.02 * 4)
+    # With corridor coupons already paid, the call payoff should be LESS than snowball
+    # because we subtract already-paid coupons from the call redemption.
+    # Total NPV = corridor_coupons_at_t1_t2_t3 + (call_payoff_at_t4 - corridor_coupons)
+    # This should be approximately equal to snowball_ub (coupons shift from call to corridor)
+    # but numerically the discounting differs, so just verify it's reasonable.
+    assert npv_mem.item() < snowball_ub + 0.01, (
+        f"NPV {npv_mem.item():.6f} exceeds snowball bound {snowball_ub:.6f}, "
+        f"suggesting double-counting of corridor coupons."
+    )

@@ -146,3 +146,40 @@ def test_correlation_sensitivity_sign():
     )
     assert not torch.isnan(sens_crn).any(), "NaN in CRN correlation sensitivity"
     assert sens_crn.item() > 0.0, f"Expected dNPV/drho > 0, got {sens_crn.item():.4f}"
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_extreme_negative_correlation():
+    """Cholesky factorization must remain numerically stable at rho_12 = -0.99."""
+    theta = _make_heston_params(1)
+    r = 0.03
+    rho_12 = torch.tensor([-0.99], dtype=torch.float64, device=DEVICE)
+    S1, S2 = simulate_correlated_heston_paths(
+        theta, theta, rho_12, 100.0, 100.0, T, N_STEPS, N_PATHS, r, torch.device(DEVICE)
+    )
+    assert not S1.isnan().any(), "NaN in S1 at rho=-0.99"
+    assert not S2.isnan().any(), "NaN in S2 at rho=-0.99"
+    # Prices should still be valid
+    B = torch.tensor([1.0], dtype=torch.float64, device=DEVICE)
+    coupon = torch.tensor([0.02], dtype=torch.float64, device=DEVICE)
+    r_t = torch.tensor([r], dtype=torch.float64, device=DEVICE)
+    npv, cp, el = price_wof_autocall_mc(S1, S2, OBS_INDICES, B, coupon, r_t, T, T / N_STEPS)
+    assert not npv.isnan().any(), f"NaN NPV at rho=-0.99"
+    assert npv.item() > 0.5, f"Unreasonable NPV at rho=-0.99: {npv.item():.4f}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_zero_interest_rate():
+    """Zero risk-free rate must not cause NaN or division errors."""
+    theta = _make_heston_params(1)
+    rho_12 = torch.tensor([0.5], dtype=torch.float64, device=DEVICE)
+    S1, S2 = simulate_correlated_heston_paths(
+        theta, theta, rho_12, 100.0, 100.0, T, N_STEPS, N_PATHS, 0.0, torch.device(DEVICE)
+    )
+    B = torch.tensor([1.0], dtype=torch.float64, device=DEVICE)
+    coupon = torch.tensor([0.02], dtype=torch.float64, device=DEVICE)
+    r_t = torch.tensor([0.0], dtype=torch.float64, device=DEVICE)
+    npv, cp, el = price_wof_autocall_mc(S1, S2, OBS_INDICES, B, coupon, r_t, T, T / N_STEPS)
+    assert not npv.isnan().any(), "NaN NPV at r=0"
+    # At r=0, no discounting, so capital protection is exactly 1.0
+    # NPV should be >= 1.0 (par protection with zero discounting)
+    assert npv.item() >= 0.99, f"NPV below par at r=0: {npv.item():.4f}"

@@ -5,12 +5,12 @@ Trains the WoFAutocallEGNO surrogate model using AdamW and CosineAnnealingLR,
 enforcing permutation equivariance via an auxiliary consistency loss.
 """
 
-import sys
-sys.path.insert(0, "src")
-
+import logging
 import os
 import time
 from typing import Dict, Tuple, Optional
+
+logger = logging.getLogger(__name__)
 import numpy as np
 import torch
 import torch.nn as nn
@@ -167,16 +167,17 @@ def train_wof(config: dict) -> WoFAutocallEGNO:
             X_b = X_b.to(device, non_blocking=True)
             Y_b = Y_b.to(device, non_blocking=True)
 
-            # Create permuted input by swapping asset 1 (0..4) and asset 2 (5..9)
-            X_perm = X_b.clone()
-            X_perm[:, :5] = X_b[:, 5:10]
-            X_perm[:, 5:10] = X_b[:, :5]
-
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=use_amp):
                 preds = model(X_b)
-                preds_perm = model(X_perm)
-                loss, _ = criterion(preds, Y_b, norm_out, pred_perm=preds_perm)
+                # Permutation loss removed: EGNO is architecturally invariant
+                # via mean pooling (h.mean(dim=1)), verified at machine precision.
+                loss, _ = criterion(preds, Y_b, norm_out)
+
+            # Guard against NaN/Inf loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"NaN/Inf loss at epoch {epoch}, skipping batch")
+                continue
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
