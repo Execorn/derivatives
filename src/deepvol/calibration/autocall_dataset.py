@@ -16,7 +16,7 @@ import pandas as pd
 from scipy.stats import qmc
 import torch
 
-from deepvol.hedging.d_xva import simulate_heston_paths
+from deepvol.hedging.d_xva import simulate_heston_paths, simulate_heston_paths_sobol_bb
 from deepvol.models.autocall import make_obs_indices, price_autocall_mc
 
 AUTOCALL_PARAM_BOUNDS: Dict[str, tuple] = {
@@ -144,104 +144,170 @@ def generate_dataset(
     seed: int = 42,
     batch_size: int = 64,
     save_path: str = "data/autocall/train_100k.npz",
+    use_sobol_bb: bool = False,
 ) -> None:
     """
     Generate parameter grid and simulate Monte Carlo autocall note prices.
     Uses sub-batched GPU execution to guarantee RTX 3060 memory safety (< 2.5 GB VRAM).
+
+    When use_sobol_bb=True, uses Brownian Bridge observation-date Sobol anchoring
+    with Milstein coarse stepping (32 steps) for ~10x faster generation with
+    lower label noise (Glasserman 2004, Giles 2008).
     """
     device = torch.device(device_str if (device_str == "cuda" and torch.cuda.is_available()) else "cpu")
-    print(f"Generating {n_samples} samples with {n_paths_mc} MC paths on {device}...")
+    mode_str = "Sobol-BB + Milstein" if use_sobol_bb else "pseudo-random MC"
+    print(f"Generating {n_samples} samples with {n_paths_mc} {mode_str} paths on {device}...")
 
     df = sample_lhs(n_samples, seed=seed)
     npv_out = np.zeros(n_samples, dtype=np.float64)
     call_prob_out = np.zeros(n_samples, dtype=np.float64)
     exp_life_out = np.zeros(n_samples, dtype=np.float64)
 
-    # Sub-batch size to guarantee VRAM bounds on RTX 3060 (6.1 GB)
-    sub_batch_size = min(batch_size, 4 if n_paths_mc <= 50000 else 2)
+    # Sub-batch size: Sobol-BB uses float32 + compact obs-only storage → more headroom
+    if use_sobol_bb:
+        sub_batch_size = min(batch_size, 8)
+    else:
+        sub_batch_size = min(batch_size, 4 if n_paths_mc <= 50000 else 2)
 
     # Static simulation horizon across all batches to prevent CUDAGraphs recompilations
+    # (only used in pseudo-random mode)
     T_sim = 3.0
     N_steps_sim = 756
 
     t_start = time.perf_counter()
-    n_batches = (n_samples + sub_batch_size - 1) // sub_batch_size
 
-    for b in range(n_batches):
-        start_idx = b * sub_batch_size
-        end_idx = min(start_idx + sub_batch_size, n_samples)
-        curr_b_size = end_idx - start_idx
+    if use_sobol_bb:
+        # Sobol-BB mode: process each sample individually (each has unique n_obs/T)
+        for i in range(n_samples):
+            T_i = float(df["T"].iloc[i])
+            n_obs_per_yr = float(df["n_obs_per_year"].iloc[i])
+            n_obs_i = max(1, int(round(n_obs_per_yr * T_i)))
 
-        theta_np = df.iloc[start_idx:end_idx][["kappa", "theta", "sigma", "rho", "v0"]].values
-        theta_t = torch.tensor(theta_np, dtype=torch.float64, device=device)
-        r_np = df.iloc[start_idx:end_idx]["r"].values
-        r_batch = torch.tensor(r_np, dtype=torch.float64, device=device).unsqueeze(1)
+            theta_np = df.iloc[i:i+1][["kappa", "theta", "sigma", "rho", "v0"]].values
+            theta_t = torch.tensor(theta_np, dtype=torch.float64, device=device)
+            r_i = float(df["r"].iloc[i])
 
-        # Pad to full sub_batch_size if last batch to maintain static shape
-        if curr_b_size < sub_batch_size:
-            pad_rows = sub_batch_size - curr_b_size
-            theta_pad = theta_t[-1:].repeat(pad_rows, 1)
-            theta_sim = torch.cat([theta_t, theta_pad], dim=0)
-            r_pad = r_batch[-1:].repeat(pad_rows, 1)
-            r_sim = torch.cat([r_batch, r_pad], dim=0)
-        else:
-            theta_sim = theta_t
-            r_sim = r_batch
-
-        with torch.no_grad():
-            S = simulate_heston_paths(
-                theta_sim,
-                S0=100.0,
-                T=T_sim,
-                N_steps=N_steps_sim,
-                N_paths=n_paths_mc,
-                r=r_sim,
-                device=device,
-            )
-
-            npv_batch = []
-            call_prob_batch = []
-            exp_life_batch = []
-
-            for j in range(curr_b_size):
-                row_idx = start_idx + j
-                T_j = float(df["T"].iloc[row_idx])
-                n_obs_per_yr = float(df["n_obs_per_year"].iloc[row_idx])
-                n_obs = max(1, int(round(n_obs_per_yr * T_j)))
-                N_steps_j = max(1, int(round(T_j * 252)))
-                dt_j = T_j / N_steps_j
-
-                obs_indices = make_obs_indices(n_obs, T_j, N_steps_j)
-                S_j = S[j : j + 1, :, : N_steps_j + 1]
-
-                B_t = torch.tensor([df["B"].iloc[row_idx]], dtype=torch.float64, device=device)
-                coupon_t = torch.tensor([df["coupon"].iloc[row_idx]], dtype=torch.float64, device=device)
-                r_t = torch.tensor([df["r"].iloc[row_idx]], dtype=torch.float64, device=device)
-
-                npv_t, call_p_t, exp_l_t = price_autocall_mc(
-                    S_j, obs_indices, B_t, coupon_t, r_t, T_j, dt_j
+            with torch.no_grad():
+                S_obs, obs_idx = simulate_heston_paths_sobol_bb(
+                    theta_t,
+                    S0=100.0,
+                    T=T_i,
+                    n_obs=n_obs_i,
+                    N_paths=n_paths_mc,
+                    r=r_i,
+                    device=device,
+                    sub_steps_per_obs=8,
+                    seed=i,
+                    dtype=torch.float32,
                 )
 
-                npv_batch.append(npv_t)
-                call_prob_batch.append(call_p_t)
-                exp_life_batch.append(exp_l_t)
+                # Cast observation-date values to float64 for payoff precision
+                S_obs_f64 = S_obs.to(torch.float64)
 
-            npv_out[start_idx:end_idx] = torch.cat(npv_batch).cpu().numpy()
-            call_prob_out[start_idx:end_idx] = torch.cat(call_prob_batch).cpu().numpy()
-            exp_life_out[start_idx:end_idx] = torch.cat(exp_life_batch).cpu().numpy()
+                B_t = torch.tensor([df["B"].iloc[i]], dtype=torch.float64, device=device)
+                coupon_t = torch.tensor([df["coupon"].iloc[i]], dtype=torch.float64, device=device)
+                r_t = torch.tensor([r_i], dtype=torch.float64, device=device)
 
-            del S
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+                dt_i = T_i / (n_obs_i * 8)  # Milstein sub-step dt
+                npv_t, call_p_t, exp_l_t = price_autocall_mc(
+                    S_obs_f64, obs_idx, B_t, coupon_t, r_t, T_i, dt_i
+                )
 
-        if (b + 1) % max(1, 500 // sub_batch_size) == 0 or end_idx == n_samples:
-            elapsed = time.perf_counter() - t_start
-            rate = end_idx / max(1e-5, elapsed)
-            rem = (n_samples - end_idx) / max(1e-5, rate)
-            print(
-                f"[{end_idx:>6d}/{n_samples}] {rate:5.1f} rows/s | "
-                f"Elapsed: {elapsed/60:.1f}m | ETA: {rem/60:.1f}m"
-            )
+                npv_out[i] = float(npv_t.item())
+                call_prob_out[i] = float(call_p_t.item())
+                exp_life_out[i] = float(exp_l_t.item())
+
+                del S_obs, S_obs_f64
+                if device.type == "cuda" and (i + 1) % 100 == 0:
+                    torch.cuda.empty_cache()
+
+            if (i + 1) % max(1, n_samples // 20) == 0 or (i + 1) == n_samples:
+                elapsed = time.perf_counter() - t_start
+                rate = (i + 1) / max(1e-5, elapsed)
+                rem = (n_samples - i - 1) / max(1e-5, rate)
+                print(
+                    f"[{i+1:>6d}/{n_samples}] {rate:5.1f} rows/s | "
+                    f"Elapsed: {elapsed/60:.1f}m | ETA: {rem/60:.1f}m"
+                )
+    else:
+        # Original pseudo-random MC mode (batched with static T_sim)
+        n_batches = (n_samples + sub_batch_size - 1) // sub_batch_size
+
+        for b in range(n_batches):
+            start_idx = b * sub_batch_size
+            end_idx = min(start_idx + sub_batch_size, n_samples)
+            curr_b_size = end_idx - start_idx
+
+            theta_np = df.iloc[start_idx:end_idx][["kappa", "theta", "sigma", "rho", "v0"]].values
+            theta_t = torch.tensor(theta_np, dtype=torch.float64, device=device)
+            r_np = df.iloc[start_idx:end_idx]["r"].values
+            r_batch = torch.tensor(r_np, dtype=torch.float64, device=device).unsqueeze(1)
+
+            # Pad to full sub_batch_size if last batch to maintain static shape
+            if curr_b_size < sub_batch_size:
+                pad_rows = sub_batch_size - curr_b_size
+                theta_pad = theta_t[-1:].repeat(pad_rows, 1)
+                theta_sim = torch.cat([theta_t, theta_pad], dim=0)
+                r_pad = r_batch[-1:].repeat(pad_rows, 1)
+                r_sim = torch.cat([r_batch, r_pad], dim=0)
+            else:
+                theta_sim = theta_t
+                r_sim = r_batch
+
+            with torch.no_grad():
+                S = simulate_heston_paths(
+                    theta_sim,
+                    S0=100.0,
+                    T=T_sim,
+                    N_steps=N_steps_sim,
+                    N_paths=n_paths_mc,
+                    r=r_sim,
+                    device=device,
+                )
+
+                npv_batch = []
+                call_prob_batch = []
+                exp_life_batch = []
+
+                for j in range(curr_b_size):
+                    row_idx = start_idx + j
+                    T_j = float(df["T"].iloc[row_idx])
+                    n_obs_per_yr = float(df["n_obs_per_year"].iloc[row_idx])
+                    n_obs = max(1, int(round(n_obs_per_yr * T_j)))
+                    N_steps_j = max(1, int(round(T_j * 252)))
+                    dt_j = T_j / N_steps_j
+
+                    obs_indices = make_obs_indices(n_obs, T_j, N_steps_j)
+                    S_j = S[j : j + 1, :, : N_steps_j + 1]
+
+                    B_t = torch.tensor([df["B"].iloc[row_idx]], dtype=torch.float64, device=device)
+                    coupon_t = torch.tensor([df["coupon"].iloc[row_idx]], dtype=torch.float64, device=device)
+                    r_t = torch.tensor([df["r"].iloc[row_idx]], dtype=torch.float64, device=device)
+
+                    npv_t, call_p_t, exp_l_t = price_autocall_mc(
+                        S_j, obs_indices, B_t, coupon_t, r_t, T_j, dt_j
+                    )
+
+                    npv_batch.append(npv_t)
+                    call_prob_batch.append(call_p_t)
+                    exp_life_batch.append(exp_l_t)
+
+                npv_out[start_idx:end_idx] = torch.cat(npv_batch).cpu().numpy()
+                call_prob_out[start_idx:end_idx] = torch.cat(call_prob_batch).cpu().numpy()
+                exp_life_out[start_idx:end_idx] = torch.cat(exp_life_batch).cpu().numpy()
+
+                del S
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            if (b + 1) % max(1, 500 // sub_batch_size) == 0 or end_idx == n_samples:
+                elapsed = time.perf_counter() - t_start
+                rate = end_idx / max(1e-5, elapsed)
+                rem = (n_samples - end_idx) / max(1e-5, rate)
+                print(
+                    f"[{end_idx:>6d}/{n_samples}] {rate:5.1f} rows/s | "
+                    f"Elapsed: {elapsed/60:.1f}m | ETA: {rem/60:.1f}m"
+                )
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     save_dict = {col: df[col].values for col in df.columns}

@@ -9,7 +9,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, Dict, Any, Union
+from typing import List, Tuple, Optional, Dict, Any, Union
 
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
@@ -106,6 +106,186 @@ def simulate_heston_paths(
         V_t = V_next
 
     return S
+
+
+def simulate_heston_paths_sobol_bb(
+    theta: torch.Tensor,
+    S0: float,
+    T: float,
+    n_obs: int,
+    N_paths: int,
+    r: Union[float, torch.Tensor] = 0.0,
+    device: Optional[torch.device] = None,
+    sub_steps_per_obs: int = 8,
+    scramble: bool = True,
+    seed: int = 0,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, List[int]]:
+    """
+    Simulate Heston paths with Brownian Bridge observation-date Sobol anchoring
+    and Milstein coarse stepping.
+
+    QMC low-discrepancy points are placed ONLY at observation dates (dim=2*n_obs),
+    with GPU pseudo-random filling between observations. This concentrates QMC
+    variance reduction on the dimensions that actually affect the autocall payoff.
+
+    Dynamics (Milstein scheme, strong order 1.0):
+        dV_t = kappa * (theta_v - V_t) * dt + xi * sqrt(V_t) * dW^V
+               + (xi^2 / 4) * ((dW^V)^2 - dt)
+        d(log S_t) = (r - V_bar/2) * dt + sqrt(V_bar) * dW^S
+
+    where V_bar = (V_t + V_{t+1}) / 2 (trapezoidal variance averaging).
+
+    References:
+        Glasserman (2004) Ch.5: BB dimension reduction for QMC.
+        Giles (2008): Milstein scheme for MLMC strong convergence.
+        Caflisch, Morokoff, Owen (1997): BB QMC for path-dependent options.
+
+    Parameters:
+        theta: Heston parameters (B, 5) = [kappa, theta_v, sigma_v, rho, v0].
+        S0: Initial spot price.
+        T: Maturity in years.
+        n_obs: Number of discrete observation dates (4, 8, or 12).
+        N_paths: Number of paths per batch element (must be power of 2 for Sobol).
+        r: Risk-free rate (float or Tensor of shape (B,) or (B, 1)).
+        device: Target CUDA device.
+        sub_steps_per_obs: Milstein sub-steps between adjacent observation dates.
+        scramble: Owen scrambling for unbiased estimator + error bounds.
+        seed: Base seed for Sobol engine (each batch element uses seed + b*1000).
+        dtype: torch.float32 (default) or torch.float64 for path simulation.
+
+    Returns:
+        S_obs: (B, N_paths, n_obs+1) spot prices at t=0 and each observation date.
+        obs_step_indices: List [1, 2, ..., n_obs] for the payoff kernel.
+    """
+    assert N_paths & (N_paths - 1) == 0, (
+        f"N_paths must be power of 2 for Sobol, got {N_paths}"
+    )
+    assert n_obs >= 1, f"n_obs must be >= 1, got {n_obs}"
+
+    if device is None:
+        device = theta.device
+
+    B_batch = theta.shape[0]
+
+    # Extract Heston parameters in float64 for arithmetic precision
+    kappa = theta[:, 0].to(torch.float64)
+    theta_v = theta[:, 1].to(torch.float64)
+    sigma_v = theta[:, 2].to(torch.float64)
+    rho = theta[:, 3].to(torch.float64)
+    v0 = theta[:, 4].to(torch.float64)
+    c_rho = torch.sqrt(torch.clamp(1.0 - rho ** 2, min=1e-8))
+
+    if isinstance(r, torch.Tensor):
+        r_val = r.view(B_batch).to(torch.float64).to(device)
+    else:
+        r_val = torch.full(
+            (B_batch,), float(r), dtype=torch.float64, device=device
+        )
+
+    # Observation interval width
+    obs_dt = T / n_obs
+    M = sub_steps_per_obs
+    dt_sub = obs_dt / M
+    sqrt_dt_sub = math.sqrt(dt_sub)
+    sqrt_M = math.sqrt(float(M))
+
+    # Sobol dimension = 2 * n_obs (spot driver + vol driver per obs date)
+    sobol_dim = 2 * n_obs
+
+    # Output: spot prices at observation dates only (compact SoA layout)
+    S_obs = torch.empty(B_batch, N_paths, n_obs + 1, dtype=dtype, device=device)
+    S_obs[:, :, 0] = S0
+
+    for b in range(B_batch):
+        # --- Sobol generation (CPU) with per-batch unique seed ---
+        eng = torch.quasirandom.SobolEngine(
+            dimension=sobol_dim, scramble=scramble, seed=seed + b * 1000
+        )
+        U = eng.draw(N_paths)  # (N_paths, 2*n_obs), CPU float32
+        U = U.clamp(1e-6, 1.0 - 1e-6)
+
+        # Inverse normal CDF: Z = sqrt(2) * erfinv(2*U - 1)
+        Z_sobol = torch.erfinv(2.0 * U - 1.0) * math.sqrt(2.0)
+        # Transfer to GPU in float64 for precision
+        Z_sobol = Z_sobol.to(dtype=torch.float64, device=device)
+
+        # Split into spot and vol anchor normals per observation date
+        Z_obs_S = Z_sobol[:, 0::2]  # (N_paths, n_obs)
+        Z_obs_V = Z_sobol[:, 1::2]  # (N_paths, n_obs)
+
+        # Per-batch Heston parameters (scalars on device)
+        kap_b = kappa[b]
+        thv_b = theta_v[b]
+        sig_b = sigma_v[b]
+        rho_b = rho[b]
+        crho_b = c_rho[b]
+        r_b = r_val[b]
+        v0_b = v0[b]
+
+        # Initialize state
+        V_t = v0_b.expand(N_paths).clone()
+        log_S = torch.full(
+            (N_paths,), math.log(S0), dtype=torch.float64, device=device
+        )
+
+        # --- Milstein stepping within each observation interval ---
+        for k in range(n_obs):
+            Z_anchor_S = Z_obs_S[:, k]  # (N_paths,)
+            Z_anchor_V = Z_obs_V[:, k]
+
+            # Pre-allocate sub-step random numbers (bulk GPU randn)
+            Z_sub = torch.randn(
+                M, N_paths, 2, dtype=torch.float64, device=device
+            )
+
+            # Brownian bridge correction: adjust first sub-step so the sum of
+            # all M sub-step normals equals the Sobol anchor scaled by sqrt(M).
+            # This ensures the total increment over the observation interval
+            # matches the Sobol quasi-random point.
+            if M > 1:
+                tail_sum_S = Z_sub[1:, :, 0].sum(dim=0)
+                tail_sum_V = Z_sub[1:, :, 1].sum(dim=0)
+                Z_sub[0, :, 0] = Z_anchor_S * sqrt_M - tail_sum_S
+                Z_sub[0, :, 1] = Z_anchor_V * sqrt_M - tail_sum_V
+            else:
+                Z_sub[0, :, 0] = Z_anchor_S
+                Z_sub[0, :, 1] = Z_anchor_V
+
+            # Run M Milstein sub-steps within this observation interval
+            for m in range(M):
+                Z1 = Z_sub[m, :, 0]  # spot driver
+                Z2 = Z_sub[m, :, 1]  # independent vol driver
+                ZV = rho_b * Z1 + crho_b * Z2  # correlated vol Brownian
+
+                V_clamp = V_t.clamp(min=1e-8)
+                sqrt_V = torch.sqrt(V_clamp)
+
+                # Milstein for CIR variance (strong order 1.0):
+                # V_{j+1} = V_j + kappa*(theta_v - V_j)*dt + xi*sqrt(V_j)*dW
+                #           + (xi^2/4)*((dW)^2 - dt)
+                V_next = (
+                    V_t
+                    + kap_b * (thv_b - V_clamp) * dt_sub
+                    + sig_b * sqrt_V * ZV * sqrt_dt_sub
+                    + 0.25 * sig_b * sig_b * (ZV * ZV - 1.0) * dt_sub
+                ).clamp(min=1e-4)
+
+                # Log-Euler for spot with trapezoidal variance averaging:
+                # log S_{j+1} = log S_j + (r - V_bar/2)*dt + sqrt(V_bar)*dW^S
+                V_bar = 0.5 * (V_clamp + V_next.clamp(min=1e-8))
+                log_S = (
+                    log_S
+                    + (r_b - 0.5 * V_bar) * dt_sub
+                    + torch.sqrt(V_bar) * Z1 * sqrt_dt_sub
+                )
+                V_t = V_next
+
+            # Store observation-date spot value (cast to output dtype)
+            S_obs[b, :, k + 1] = torch.exp(log_S).to(dtype)
+
+    obs_step_indices = list(range(1, n_obs + 1))
+    return S_obs, obs_step_indices
 
 
 class DXVAPipeline(nn.Module):
