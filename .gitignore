@@ -200,3 +200,5 @@ artifacts/scalers/phoenix_*.npz
 artifacts/scalers/wof_*.npz
 .licenses/
 run_demo.sh
+overnight_pipeline.py
+data/*.npz
