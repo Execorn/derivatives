@@ -198,6 +198,7 @@ artifacts/weights/wof_*.pth
 artifacts/scalers/autocall_*.npz
 artifacts/scalers/phoenix_*.npz
 artifacts/scalers/wof_*.npz
+artifacts/scalers/correction_*.npz
 .licenses/
 run_demo.sh
 overnight_pipeline.py
