@@ -151,6 +151,26 @@ class TestMonotonicity:
         corr = np.corrcoef(B, residual)[0, 1]
         assert corr < -0.15, f"Expected strong negative correlation, got {corr:.4f}"
 
+    def test_total_barrier_derivative_chain_rule(self):
+        """Verify compute_total_barrier_derivative produces correct shape and non-NaN values."""
+        from deepvol.training.train_correction import compute_total_barrier_derivative
+        norm_in = CorrectionInputNormalizer()
+        norm_in.mean = np.zeros(19, dtype=np.float32)
+        norm_in.std = np.ones(19, dtype=np.float32)
+        norm_out = CorrectionOutputNormalizer()
+        norm_out.mean = np.zeros(1, dtype=np.float32)
+        norm_out.std = np.ones(1, dtype=np.float32)
+
+        jac = torch.randn(8, 19)
+        raw_params = {
+            "B": torch.full((8,), 1.05),
+            "v0": torch.full((8,), 0.04),
+            "T": torch.full((8,), 1.5),
+        }
+        df_dB = compute_total_barrier_derivative(jac, raw_params, norm_in, norm_out)
+        assert df_dB.shape == (8,)
+        assert not torch.isnan(df_dB).any()
+
 
 class TestNormalizerPrecision:
     """Verify normalizer roundtrip precision (< 1e-6)."""
@@ -290,3 +310,32 @@ class TestPhaseCIntegration:
             f"AC-10 Failed: Expected RMSE < {max_allowed:.2f} bps (>33% improvement over {phase_b_rmse:.2f}), "
             f"got {total_rmse_bps:.2f} bps"
         )
+
+    def test_total_barrier_monotonicity_violations(self):
+        """Verify that total barrier derivative violations df/dB > 0 are suppressed (< 1.5%)."""
+        val_data, _ = _load_phase_c_artifacts()
+        norm_in = CorrectionInputNormalizer.load(_NORM_IN_PATH)
+        norm_out = CorrectionOutputNormalizer.load(_NORM_OUT_PATH)
+
+        model = CorrectionMLP(
+            in_dim=19,
+            hidden=DEFAULT_CORRECTION_CONFIG["hidden"],
+            n_layers=DEFAULT_CORRECTION_CONFIG["n_layers"],
+            dropout=DEFAULT_CORRECTION_CONFIG["dropout"],
+        ).cuda()
+        weights = torch.load(_WEIGHTS_PATH, map_location="cuda", weights_only=True)
+        model.load_state_dict(weights)
+        model.eval()
+
+        from deepvol.training.train_correction import compute_total_barrier_derivative
+
+        X = CorrectionInputNormalizer.build_feature_matrix(val_data)
+        X_t = torch.tensor(norm_in.transform(X), dtype=torch.float32, device="cuda")
+        X_t.requires_grad_(True)
+        preds = model._forward_uncompiled(X_t)
+        jac = torch.autograd.grad(preds.sum(), X_t, create_graph=False)[0]
+
+        df_dB = compute_total_barrier_derivative(jac, X_t, norm_in, norm_out)
+        positive_violations = (df_dB > 1e-4).float().mean().item()
+        assert positive_violations < 0.015, f"Expected < 1.5% total monotonicity violations, got {positive_violations:.2%}"
+
