@@ -348,14 +348,14 @@ def _calibrate_fno_masked(model, target_iv: np.ndarray, mask: np.ndarray,
     inits = np.clip(inits, lo + 1e-4, hi - 1e-4)
 
     best_loss = float("inf")
-    best_params = inits[0].copy()
+    best_params_t = torch.tensor(inits[0], dtype=torch.float32, device=device)
+
+    lo_t = _BOUNDS_LOWER_3D.to(device)
+    hi_t = _BOUNDS_UPPER_3D.to(device)
 
     for init in inits:
-        theta = init.copy()
+        theta_t = torch.tensor(init, dtype=torch.float32, device=device)
         for it in range(max_iter):
-            theta_t = torch.tensor(theta, dtype=torch.float32, device=device)
-            lo_t = _BOUNDS_LOWER_3D.to(device)
-            hi_t = _BOUNDS_UPPER_3D.to(device)
             theta_c = theta_t.clamp(lo_t, hi_t)
 
             with torch.no_grad():
@@ -363,58 +363,55 @@ def _calibrate_fno_masked(model, target_iv: np.ndarray, mask: np.ndarray,
                 iv_pred = _fno_predict_real_iv(model, p6, spatial)
 
             r = (iv_pred - target_t)
-            r_masked = r[mask_t].cpu().numpy()
+            r_masked = r[mask_t]
             loss = float((r_masked**2).mean())
 
             if loss < tol:
                 break
 
-            # Autograd Jacobian
+            # Autograd Jacobian (returns GPU tensor)
             J = fno_jacobian_autograd(model, theta_c.detach(), spatial)
-            J_masked = J[mask_t].cpu().numpy()   # (N_obs, 3)
+            J_masked = J[mask_t]   # (N_obs, 3), stays on GPU
 
-            # Solve GN system: (JᵀJ + ε·diag(JᵀJ)) δ = -Jᵀr
+            # Solve GN system on GPU: (JᵀJ + ε·diag(JᵀJ)) δ = -Jᵀr
             JtJ = J_masked.T @ J_masked
-            eps_lm = 1e-4 * np.diag(JtJ).mean() if JtJ.size > 0 else 1e-4
-            
-            try:
-                delta = -np.linalg.solve(JtJ + eps_lm * np.eye(3), J_masked.T @ r_masked)
-            except np.linalg.LinAlgError:
-                break  # GN singular, stop this candidate
+            eps_lm = 1e-4 * JtJ.diag().mean() if JtJ.numel() > 0 else 1e-4
+            rhs = -(J_masked.T @ r_masked)
 
-            # Backtracking line search
+            try:
+                delta = torch.linalg.solve(JtJ + eps_lm * torch.eye(3, device=device), rhs)
+            except torch.linalg.LinAlgError:
+                break
+
+            # Backtracking line search (GPU-resident)
             alpha = damping
             for _ in range(8):
-                theta_new = np.clip(theta_c.cpu().numpy() + alpha * delta,
-                                    lo + 1e-5, hi - 1e-5)
-                tt = torch.tensor(theta_new, dtype=torch.float32, device=device)
+                theta_new = (theta_c + alpha * delta).clamp(lo_t + 1e-5, hi_t - 1e-5)
                 with torch.no_grad():
-                    p6n = _reparam_to_6d(tt[0:1], tt[1:2], tt[2:3], device)
+                    p6n = _reparam_to_6d(theta_new[0:1], theta_new[1:2], theta_new[2:3], device)
                     ivn = _fno_predict_real_iv(model, p6n, spatial)
                     rn = (ivn - target_t)[mask_t]
                     ln = float((rn**2).mean())
                 if ln < loss:
-                    theta = theta_new
+                    theta_t = theta_new
                     break
                 alpha *= 0.5
             else:
-                theta = theta_c.cpu().numpy()   # keep current
+                theta_t = theta_c.clone()
 
         # Final evaluation for candidate
-        theta_t = torch.tensor(theta, dtype=torch.float32, device=device)
         theta_c = theta_t.clamp(lo_t, hi_t)
         with torch.no_grad():
             p6 = _reparam_to_6d(theta_c[0:1], theta_c[1:2], theta_c[2:3], device)
             iv_pred = _fno_predict_real_iv(model, p6, spatial)
-        r_masked = (iv_pred - target_t)[mask_t].cpu().numpy()
+        r_masked = (iv_pred - target_t)[mask_t]
         final_loss = float((r_masked**2).mean())
 
         if final_loss < best_loss:
             best_loss = final_loss
-            best_params = theta.copy()
+            best_params_t = theta_t.clone()
 
     # Full surface prediction using the best candidate
-    best_params_t = torch.tensor(best_params, dtype=torch.float32, device=device)
     p6_best = _reparam_to_6d(best_params_t[0:1], best_params_t[1:2], best_params_t[2:3], device)
     with torch.no_grad():
         full_pred = _fno_predict_real_iv(model, p6_best, spatial)

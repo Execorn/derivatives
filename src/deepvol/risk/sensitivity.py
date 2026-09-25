@@ -61,7 +61,7 @@ def portfolio_price_tensor(
                 pred_norm = model(spatial, theta_norm)
                 iv_surface = yn.inverse_transform_tensor(pred_norm).squeeze(0)
                 
-    iv_surface = torch.clamp(iv_surface, min=1e-4).to(dtype)
+    iv_surface = torch.clamp(iv_surface, min=0.01).to(dtype)
     
     T_grid_t = torch.tensor(MATURITIES, dtype=dtype, device=device)
     K_grid_t = torch.tensor(STRIKES, dtype=dtype, device=device)
@@ -73,7 +73,7 @@ def portfolio_price_tensor(
         k_pos = torch.log(K_t.to(dtype) / S.detach())
         
     sig = interpolate_bilinear(T_grid_t, K_grid_t, iv_surface, T_pos, k_pos)
-    sig = torch.clamp(sig + epsilon, min=1e-4)
+    sig = torch.clamp(sig + epsilon, min=0.01)
     
     call_prices = bs_call_price(S, K_t.to(dtype), T_pos, r_t.to(dtype), sig)
     # Put-call parity: Put = Call + K * exp(-r * T) - S
@@ -140,7 +140,7 @@ class AutogradSensitivityEngine:
         with torch.no_grad():
             pred_norm = self.model(spatial, theta_norm)
             iv_surface = self.yn.inverse_transform_tensor(pred_norm).squeeze(0)
-            iv_surface = torch.clamp(iv_surface, min=1e-4).to(dtype)
+            iv_surface = torch.clamp(iv_surface, min=0.01).to(dtype)
 
         # Parse position details
         K_t = torch.tensor([float(p["K"]) for p in positions], dtype=dtype, device=self.device)

@@ -392,7 +392,7 @@ def _fno_forward(params: HestonParams) -> np.ndarray:
         theta_norm = pn.transform_tensor(theta_t.unsqueeze(0))
         pred_norm  = model(spatial, theta_norm)
         iv_tensor  = yn.inverse_transform_tensor(pred_norm).squeeze(0)
-        iv_surface = iv_tensor.clamp(min=1e-4).cpu().numpy()   # (8,11)
+        iv_surface = iv_tensor.clamp(min=0.01).cpu().numpy()   # (8,11)
 
     elapsed = time.perf_counter() - t0
     fno_pricing_latency_seconds.observe(elapsed)
@@ -612,7 +612,7 @@ async def compute_model_greeks(
                     theta_norm = cached_container.pn.transform_tensor(theta_t.unsqueeze(0))
                     pred_norm  = cached_container.model(spatial, theta_norm)
                     iv_tensor  = cached_container.yn.inverse_transform_tensor(pred_norm).squeeze(0)
-                    return iv_tensor.clamp(min=1e-4).cpu().numpy()
+                    return iv_tensor.clamp(min=0.01).cpu().numpy()
 
             iv_surface = await asyncio.get_event_loop().run_in_executor(None, _run_forward)
 

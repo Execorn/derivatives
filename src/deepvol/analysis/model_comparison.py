@@ -165,7 +165,7 @@ def make_dupire_vol_fn(local_vol_surface: np.ndarray, T_grid: np.ndarray, K_grid
         
         # Combine linear interpolations
         vol = vol_left * (1.0 - w_t) + vol_right * w_t
-        return torch.clamp(vol, min=1e-4)
+        return torch.clamp(vol, min=0.01)
         
     return dupire_vol_fn
 

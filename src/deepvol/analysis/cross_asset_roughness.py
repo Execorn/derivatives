@@ -370,7 +370,7 @@ def calibrate_newton_h_batch(
             spatial_input = spatial_single.unsqueeze(0)
             pred = model(spatial_input, theta_norm)
             iv = pred * yn_std + yn_mean
-            iv_flat = iv.clamp(min=1e-4).reshape(-1)
+            iv_flat = iv.clamp(min=0.01).reshape(-1)
             reg_term = reg_weights * (theta_single - prior_single)
             return torch.cat([iv_flat, reg_term], dim=0)
 
@@ -392,7 +392,7 @@ def calibrate_newton_h_batch(
             spatial_input = spatial_single.unsqueeze(0)
             pred = model(spatial_input, theta_norm)
             iv = pred * yn_std + yn_mean
-            return iv.clamp(min=1e-4).reshape(-1)
+            return iv.clamp(min=0.01).reshape(-1)
 
         vmap_fwd = torch.vmap(fwd_fn, in_dims=(0, 0, 0))
         vmap_jac = torch.vmap(torch.func.jacfwd(fwd_fn, argnums=0), in_dims=(0, 0, 0))
@@ -485,7 +485,7 @@ def calibrate_newton_h_batch(
         spatial_input = spatial_single.unsqueeze(0)
         pred = model(spatial_input, theta_norm)
         iv = pred * yn_std + yn_mean
-        return iv.clamp(min=1e-4).reshape(-1)
+        return iv.clamp(min=0.01).reshape(-1)
 
     vmap_fwd_6d = torch.vmap(fwd_fn_6d, in_dims=(0, 0))
 

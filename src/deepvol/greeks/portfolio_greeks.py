@@ -261,7 +261,7 @@ def fno_parameter_jacobian(model: torch.nn.Module,
         p_norm  = (p6 - pn_mean) / pn_std
         iv_norm = model(spatial, p_norm.unsqueeze(0))
         iv_real = iv_norm * yn_std + yn_mean
-        iv_real = iv_real.clamp(min=1e-4)
+        iv_real = iv_real.clamp(min=0.01)
         return iv_real.squeeze(0)
 
     p6 = theta.to(device).float().detach()
@@ -329,7 +329,7 @@ def fno_surface_greeks(model: torch.nn.Module,
         theta_norm = pn.transform_tensor(theta_t.unsqueeze(0))
         pred_norm  = model(spatial, theta_norm)
         iv_tensor  = yn.inverse_transform_tensor(pred_norm).squeeze(0)
-        iv_surface = iv_tensor.clamp(min=1e-4).cpu().numpy()
+        iv_surface = iv_tensor.clamp(min=0.01).cpu().numpy()
 
     nT, nK = len(T_grid), len(k_grid)
 
@@ -462,7 +462,7 @@ def portfolio_price_tensor(positions: list,
     
     pred_norm = model(spatial, theta_norm)
     iv_surface = yn.inverse_transform_tensor(pred_norm).squeeze(0)
-    iv_surface = torch.clamp(iv_surface, min=1e-4)
+    iv_surface = torch.clamp(iv_surface, min=0.01)
     
     T_grid_t = torch.tensor(T_grid, dtype=torch.float32, device=device)
     K_grid_t = torch.tensor(K_grid, dtype=torch.float32, device=device)
@@ -545,7 +545,7 @@ def portfolio_greeks(positions: list,
         theta_norm = pn.transform_tensor(theta_t.unsqueeze(0))
         pred_norm  = model(spatial, theta_norm)
         iv_tensor  = yn.inverse_transform_tensor(pred_norm).squeeze(0)
-        iv_surface = iv_tensor.clamp(min=1e-4) # Keep on GPU
+        iv_surface = iv_tensor.clamp(min=0.01) # Keep on GPU
 
     # Parse lists to GPU tensors
     K_t = torch.tensor([p[0] for p in valid_positions], dtype=torch.float32, device=device)
@@ -564,7 +564,7 @@ def portfolio_greeks(positions: list,
     K_grid_t = torch.tensor(K_grid, dtype=torch.float32, device=device)
 
     sig_t = interpolate_bilinear(T_grid_t, K_grid_t, iv_surface, T_t, k_t)
-    sig_t = torch.clamp(sig_t, min=1e-4)
+    sig_t = torch.clamp(sig_t, min=0.01)
 
     # Differentiable/vectorized Black-Scholes Greeks calculation
     normal = torch.distributions.Normal(

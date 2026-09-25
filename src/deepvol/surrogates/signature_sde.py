@@ -337,7 +337,7 @@ def implied_volatility(
         step = diff / (v + 1e-8)
         step = torch.clamp(step, -0.2, 0.2)
         sigma = sigma - step
-        sigma = torch.clamp(sigma, min=1e-4, max=5.0)
+        sigma = torch.clamp(sigma, min=0.01, max=5.0)
         
     # Enforce minimum volatility clamping to prevent Durrleman singularities
     sigma = torch.clamp(sigma, min=0.01)

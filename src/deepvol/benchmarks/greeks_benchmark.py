@@ -158,7 +158,7 @@ def benchmark_greeks(n_positions: int = 100, S: float = 5000.0) -> dict:
     with torch.no_grad():
         pred_norm_single = model(spatial_single, theta_norm_single)
         iv_surface_single = yn.inverse_transform_tensor(pred_norm_single).squeeze(0)
-        iv_surface_single = torch.clamp(iv_surface_single, min=1e-4) # keep on GPU
+        iv_surface_single = torch.clamp(iv_surface_single, min=0.01) # keep on GPU
         
     T_grid_t = torch.tensor(MATURITIES, dtype=torch.float32, device=device)
     K_grid_t = torch.tensor(np.linspace(-0.5, 0.5, 11, dtype=np.float32), dtype=torch.float32, device=device)
@@ -170,7 +170,7 @@ def benchmark_greeks(n_positions: int = 100, S: float = 5000.0) -> dict:
     # Fully vectorized GPU interpolation
     with torch.no_grad():
         sigma_t_val = interpolate_bilinear(T_grid_t, K_grid_t, iv_surface_single, T_t, k_t)
-        sigma_t_val = torch.clamp(sigma_t_val, min=1e-4)
+        sigma_t_val = torch.clamp(sigma_t_val, min=0.01)
         
     # Batch inputs for PyTorch autograd
     S_t = torch.full((n_positions,), S, dtype=torch.float32, device=device, requires_grad=True)
@@ -231,7 +231,7 @@ def benchmark_greeks(n_positions: int = 100, S: float = 5000.0) -> dict:
             pred_norm_chunks.append(model(spatial[i:i+4], theta_norm[i:i+4]))
         pred_norm = torch.cat(pred_norm_chunks, dim=0)
         iv_surface_batch = yn.inverse_transform_tensor(pred_norm)
-        iv_surface_batch = torch.clamp(iv_surface_batch, min=1e-4)
+        iv_surface_batch = torch.clamp(iv_surface_batch, min=0.01)
         
         T_grid_t = torch.tensor(MATURITIES, dtype=torch.float32, device=device)
         K_grid_t = torch.tensor(np.linspace(-0.5, 0.5, 11, dtype=np.float32), dtype=torch.float32, device=device)
@@ -262,6 +262,8 @@ def benchmark_greeks(n_positions: int = 100, S: float = 5000.0) -> dict:
         fno_greeks_heston = fno_greeks_bs.copy()
     
     # --- Finite-Difference COS Greeks ---
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     t0_cos = time.perf_counter()
     
     h_S = 1.0
@@ -361,6 +363,8 @@ def benchmark_greeks(n_positions: int = 100, S: float = 5000.0) -> dict:
             "volga": float(volga)
         })
         
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     t1_cos = time.perf_counter()
     cos_speed = (t1_cos - t0_cos) * 1000.0 # in ms
     

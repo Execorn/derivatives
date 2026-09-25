@@ -293,6 +293,21 @@ class AutocallModelGuardian:
         delta_v = float(self.norm_out.inverse_transform_tensor(preds).item())
         pde_npv = float(raw_params.get("pde_npv", 0.0))
 
+        # Step 2b: PSI Drift Tracking (SR 26-2 §4.3 Online Monitoring)
+        psi_score = self.compute_psi(X_row[0] if X_row.ndim > 1 else X_row)
+        if psi_score >= 0.25:
+            logger.warning(
+                f"[SR 26-2 PSI Drift] Significant input drift detected: PSI={psi_score:.4f} >= 0.25. "
+                f"Mandates model recalibration review."
+            )
+            return self._execute_fallback(
+                raw_params,
+                reasons=[f"Population Stability Index drift: PSI={psi_score:.4f} >= 0.25 (significant)"],
+                trigger="Tier_1b_PSI_Drift",
+                fallback_fn=fallback_fn,
+                t_start=t_start,
+            )
+
         # Step 3: Output Arbitrage Screen (Tier 2)
         arb_result = self.check_output_arbitrage(raw_params, pde_npv, delta_v, df_dB=df_dB)
         if arb_result["is_arbitrage"]:

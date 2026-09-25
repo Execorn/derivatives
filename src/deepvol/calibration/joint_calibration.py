@@ -126,7 +126,7 @@ def _fno_predict(theta_arr: np.ndarray,
         norm   = pn.transform_tensor(theta_t.unsqueeze(0))
         pred   = model(spatial, norm)
         iv     = yn.inverse_transform_tensor(pred).squeeze(0)
-        return iv.clamp(min=1e-4).cpu().numpy()  # (8,11)
+        return iv.clamp(min=0.01).cpu().numpy()  # (8,11)
 
 
 def _rmse_bps(pred: np.ndarray, target: np.ndarray) -> float:

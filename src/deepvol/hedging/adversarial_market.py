@@ -71,7 +71,7 @@ class WGAN_GP_Generator(nn.Module):
         # Apply physical constraints:
         # Returns: bounded to [-0.1, 0.1] to prevent exponential price explosion in minimax training
         ret = torch.clamp(paths[:, 0, :], min=-0.1, max=0.1)
-        vol = torch.clamp(torch.nn.functional.softplus(paths[:, 1, :]), min=1e-4, max=2.0)
+        vol = torch.clamp(torch.nn.functional.softplus(paths[:, 1, :]), min=0.01, max=2.0)
         
         return torch.stack([ret, vol], dim=1)
 

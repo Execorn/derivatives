@@ -424,7 +424,7 @@ def profile_batch(model, pn, yn, target_iv: np.ndarray, device: torch.device,
         spatial_input = spatial_single.unsqueeze(0)
         pred = model(spatial_input, theta_norm)
         iv = pred * yn_std + yn_mean
-        return iv.clamp(min=1e-4).reshape(-1)
+        return iv.clamp(min=0.01).reshape(-1)
 
     vmap_fwd = torch.vmap(fwd_fn, in_dims=(0, 0))
     vmap_jac = torch.vmap(torch.func.jacfwd(fwd_fn, argnums=0), in_dims=(0, 0))
@@ -653,7 +653,7 @@ def main():
         
         norm_v3 = pn.transform_tensor(p_true_v3)
         pred_v3 = fno_v3(spatial_v3, norm_v3)
-        target_iv_v3 = yn.inverse_transform_tensor(pred_v3).squeeze(0).clamp(min=1e-4).cpu().numpy()
+        target_iv_v3 = yn.inverse_transform_tensor(pred_v3).squeeze(0).clamp(min=0.01).cpu().numpy()
 
     # Clear memory of CPU loaders
     del fno_v2, fno_v3, spatial_v2, spatial_v3

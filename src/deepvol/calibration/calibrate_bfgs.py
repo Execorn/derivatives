@@ -184,7 +184,7 @@ def _fno_predict_real_iv(model, params_raw: torch.Tensor,
 
     # Denormalise to real IV space
     iv_real = _iv_norm.inverse_transform_tensor(pred_norm)
-    iv_real = iv_real.clamp(min=1e-4)         # enforce positivity
+    iv_real = iv_real.clamp(min=0.01)         # enforce positivity
 
     return iv_real.squeeze(0)                 # (nT, nK)
 

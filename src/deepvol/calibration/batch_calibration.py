@@ -210,7 +210,7 @@ def _fno_predict_batch(
             preds_list.append(model(spatial_chunk, norms_chunk))
         preds = torch.cat(preds_list, dim=0)
         ivs   = yn.inverse_transform_tensor(preds)
-        return ivs.clamp(min=1e-4).cpu().numpy()
+        return ivs.clamp(min=0.01).cpu().numpy()
 
 
 def _rmse_bps(pred: np.ndarray, target: np.ndarray) -> float:
@@ -269,7 +269,7 @@ def calibrate_newton_batch(
         spatial_input = spatial_single.unsqueeze(0)
         pred = model(spatial_input, theta_norm)
         iv = pred * yn_std + yn_mean
-        return iv.clamp(min=1e-4).reshape(-1)
+        return iv.clamp(min=0.01).reshape(-1)
 
     vmap_fwd = torch.vmap(fwd_fn, in_dims=(0, 0))
     vmap_jac = torch.vmap(torch.func.jacfwd(fwd_fn, argnums=0), in_dims=(0, 0))

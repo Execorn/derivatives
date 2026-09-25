@@ -177,7 +177,7 @@ def compute_rkhs_conditional_expectation(
     # Cast back to original dtype at the boundary
     # P9-I1 fix: Clamp variance at 1e-4 (= 0.01^2 = 1% vol) to prevent Durrleman
     # singularities. Previous value 1e-8 allowed sub-bps volatilities.
-    output = torch.clamp(output, min=1e-4)
+    output = torch.clamp(output, min=0.01)
     return output.to(dtype=dtype)
 
 

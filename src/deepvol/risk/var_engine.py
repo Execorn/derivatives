@@ -213,7 +213,7 @@ class MonteCarloVaREngine:
                 spatial_expanded = spatial.expand(chunk_size, -1, -1, -1)
                 pred_norm = self.model(spatial_expanded, theta_norm)
                 iv_surfaces = self.yn.inverse_transform_tensor(pred_norm)
-                iv_surfaces = torch.clamp(iv_surfaces, min=1e-4) # Shape: (chunk_size, nT, nK)
+                iv_surfaces = torch.clamp(iv_surfaces, min=0.01) # Shape: (chunk_size, nT, nK)
 
                 # Broadcast matrices for options pricing
                 spots_expanded = chunk_spots.unsqueeze(1).expand(-1, K_t.size(0)) # (chunk_size, N)
@@ -224,7 +224,7 @@ class MonteCarloVaREngine:
                 sig_chunk = interpolate_bilinear_batched(
                     T_grid_t, K_grid_t, iv_surfaces, T_expanded, k_expanded
                 )
-                sig_chunk = torch.clamp(sig_chunk, min=1e-4)
+                sig_chunk = torch.clamp(sig_chunk, min=0.01)
 
                 # Price chunk portfolio
                 call_prices = bs_call_price(spots_expanded, K_t.unsqueeze(0), T_expanded, r_t, sig_chunk)

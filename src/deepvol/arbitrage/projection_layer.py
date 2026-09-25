@@ -194,7 +194,7 @@ class DifferentiableArbitrageFreeProjection(nn.Module):
         S0_tensor = torch.full_like(iv_double, self.S0, device=device)
         
         # Clamp input IV to prevent NaNs
-        iv_clamped = torch.clamp(iv_double, min=1e-4, max=5.0)
+        iv_clamped = torch.clamp(iv_double, min=0.01, max=5.0)
 
         # ── 1. Butterfly Arbitrage Projection (Convexity & Monotonicity on Option Prices) ──
         # Convert IV to Call Prices
@@ -244,7 +244,7 @@ class DifferentiableArbitrageFreeProjection(nn.Module):
         T_m_safe = torch.clamp(T_m, min=1e-12)
         iv_final = torch.sqrt(W_proj / T_m_safe)
         
-        return torch.clamp(iv_final, min=1e-4, max=5.0).to(orig_dtype)
+        return torch.clamp(iv_final, min=0.01, max=5.0).to(orig_dtype)
 
 
 # ─── Module Integration Helper ──────────────────────────────────────────────
