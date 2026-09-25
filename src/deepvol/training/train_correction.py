@@ -226,10 +226,11 @@ class CorrectionOutputNormalizer:
         std_t = self.get_std_tensor(t.device, t.dtype)
         return (t - mean_t) / std_t
 
-    def inverse_transform_tensor(self, t_norm: torch.Tensor) -> torch.Tensor:
+    def inverse_transform_tensor(self, t_norm: torch.Tensor, preserve_float64: bool = False) -> torch.Tensor:
         """
         Denormalize predictions. Complies with .agents/AGENTS.md mandatory float64 policy:
-        Casts input to torch.float64, applies double precision scaling, and casts back if needed.
+        Casts input to torch.float64, applies double precision scaling, and preserves float64
+        when requested to prevent precision loss during pricing layer additions.
         """
         if self.mean is None or self.std is None:
             raise ValueError("CorrectionOutputNormalizer is not fitted yet.")
@@ -237,7 +238,7 @@ class CorrectionOutputNormalizer:
         std_f64 = self.get_std_tensor(t_norm.device, torch.float64)
         t_f64 = t_norm.to(torch.float64)
         out_f64 = t_f64 * std_f64 + mean_f64
-        return out_f64.to(t_norm.dtype) if t_norm.dtype != torch.float64 else out_f64
+        return out_f64 if (preserve_float64 or t_norm.dtype == torch.float64) else out_f64.to(t_norm.dtype)
 
     def save(self, path: str) -> None:
         if self.mean is None or self.std is None:
@@ -315,7 +316,7 @@ def compute_total_barrier_derivative(
 
 
 class InVRAMDataLoader:
-    """Zero-copy, zero-PCIe GPU resident data loader."""
+    """Zero-copy, zero-PCIe GPU resident data loader with preallocated buffers."""
     def __init__(self, X: torch.Tensor, Y: torch.Tensor, W: torch.Tensor, batch_size: int = 256):
         self.X = X.contiguous()
         self.Y = Y.contiguous()
@@ -324,12 +325,15 @@ class InVRAMDataLoader:
         self.N = len(X)
         self.n_batches = (self.N + batch_size - 1) // batch_size
         self.perm = torch.empty(self.N, dtype=torch.long, device=X.device)
+        self.X_shuffled = torch.empty_like(self.X)
+        self.Y_shuffled = torch.empty_like(self.Y)
+        self.W_shuffled = torch.empty_like(self.W)
 
     def __iter__(self):
         torch.randperm(self.N, out=self.perm, device=self.X.device)
-        self.X_shuffled = self.X[self.perm]
-        self.Y_shuffled = self.Y[self.perm]
-        self.W_shuffled = self.W[self.perm]
+        torch.index_select(self.X, 0, self.perm, out=self.X_shuffled)
+        torch.index_select(self.Y, 0, self.perm, out=self.Y_shuffled)
+        torch.index_select(self.W, 0, self.perm, out=self.W_shuffled)
         self.idx = 0
         return self
 
@@ -475,7 +479,10 @@ def train(config: Dict[str, Any]) -> CorrectionMLP:
                     std_out_t = norm_out.get_std_tensor(device, batch_x.dtype)[0]
                     # Scale to normalized target units so penalty is commensurate with value_loss
                     df_dB_norm = df_dB / std_out_t
-                    mono_penalty = torch.relu(df_dB_norm).pow(2).mean()
+                    coupon_unnorm = batch_x[:, 6] * norm_in.get_std_tensor(device, batch_x.dtype)[6] + norm_in.get_mean_tensor(device, batch_x.dtype)[6]
+                    r_unnorm = batch_x[:, 9] * norm_in.get_std_tensor(device, batch_x.dtype)[9] + norm_in.get_mean_tensor(device, batch_x.dtype)[9]
+                    mono_mask = (coupon_unnorm >= r_unnorm).float()
+                    mono_penalty = (torch.relu(df_dB_norm).pow(2) * mono_mask).mean()
                     reg_loss = reg_loss + lambda_mono * mono_penalty
 
                 loss = value_loss + reg_loss
@@ -506,8 +513,8 @@ def train(config: Dict[str, Any]) -> CorrectionMLP:
         eval_model.eval()
         with torch.no_grad():
             preds_val = eval_model(X_val_t)
-            delta_v_pred = norm_out.inverse_transform_tensor(preds_val)  # strict float64
-            total_pred = pde_val_t + delta_v_pred.squeeze(-1).to(torch.float64)
+            delta_v_pred = norm_out.inverse_transform_tensor(preds_val, preserve_float64=True)  # strict float64
+            total_pred = pde_val_t + delta_v_pred.squeeze(-1)
             errors_bps = (total_pred - mc_val_t) * 10000.0
 
             val_rmse_bps = float(torch.sqrt(torch.mean(errors_bps ** 2)).item())

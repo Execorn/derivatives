@@ -82,6 +82,21 @@ class TestImprovedPDE:
         var_corrected = var_base + (0.6**2 / (4.0 * kappa)) * (1.0 - ekt)
         assert var_corrected > var_base, "Convexity term must increase variance"
 
+    def test_gatheral_sigma_eff_near_zero_kappa(self):
+        """As kappa -> 0, (1 - exp(-kappa*t))/kappa -> t without numerical instability."""
+        v0 = 0.04
+        theta = 0.04
+        sigma = 0.3
+        t = 1.0
+
+        for kappa in [1e-4, 1e-6, 1e-8]:
+            npv, delta, gamma = compute_pde_label(
+                v0=v0, B=1.0, coupon=0.08, T=t, n_obs_per_year=4, r=0.02,
+                kappa=kappa, theta=theta, sigma=sigma,
+            )
+            assert not np.isnan(npv) and not np.isinf(npv)
+            assert npv > 0.0, f"Expected positive NPV, got {npv}"
+
     @pytest.mark.skipif(not os.path.exists(_VAL_PDE_PATH), reason="Validation dataset not found")
     def test_worker_reference_pde_exact_match(self):
         """Verify worker output matches reference compute_pde_label to machine precision."""

@@ -50,8 +50,15 @@ def compute_pde_label(
         (npv, delta, gamma) — PDE price and spatial Greeks at S0=100.
     """
     def sigma_func(t: float, S: np.ndarray) -> np.ndarray:
-        ekt = np.exp(-kappa * max(float(t), 1e-10))
-        var_t = v0 * ekt + theta * (1.0 - ekt) + (sigma**2 / (4.0 * max(kappa, 1e-4))) * (1.0 - ekt)
+        t_pos = max(float(t), 1e-10)
+        kt = kappa * t_pos
+        if abs(kt) < 1e-4:
+            inv_k = t_pos * (1.0 - 0.5 * kt + (kt**2) / 6.0 - (kt**3) / 24.0)
+            ekt = 1.0 - kt + 0.5 * (kt**2)
+        else:
+            ekt = float(np.exp(-kt))
+            inv_k = float(-np.expm1(-kt) / kappa)
+        var_t = v0 * ekt + theta * (1.0 - ekt) + 0.25 * (sigma**2) * inv_k
         sig_val = float(np.clip(np.sqrt(max(var_t, 1e-8)), 0.01, 2.0))
         return np.full_like(S, sig_val)
 
@@ -148,8 +155,15 @@ for i in range(count):
     be_remaining = 0
     for k in range(N_T - 1, -1, -1):
         t_k = float(t_grid[k])
-        ekt = np.exp(-kappa * max(t_k, 1e-10))
-        var_k = v0 * ekt + theta * (1.0 - ekt) + (sigma**2 / (4.0 * max(kappa, 1e-4))) * (1.0 - ekt)
+        t_pos = max(t_k, 1e-10)
+        kt = kappa * t_pos
+        if abs(kt) < 1e-4:
+            inv_k = t_pos * (1.0 - 0.5 * kt + (kt**2) / 6.0 - (kt**3) / 24.0)
+            ekt = 1.0 - kt + 0.5 * (kt**2)
+        else:
+            ekt = float(np.exp(-kt))
+            inv_k = float(-np.expm1(-kt) / kappa)
+        var_k = v0 * ekt + theta * (1.0 - ekt) + 0.25 * (sigma**2) * inv_k
         sig_k = float(np.clip(np.sqrt(max(var_k, 1e-8)), 0.01, 2.0))
         sig2_k = sig_k ** 2
 

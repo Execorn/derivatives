@@ -110,8 +110,8 @@ def train_single_member(
         eval_model.eval()
         with torch.no_grad():
             preds_val = eval_model(X_val_t)
-            delta_v_pred = norm_out.inverse_transform_tensor(preds_val)
-            total_pred = pde_val_t + delta_v_pred.squeeze(-1).to(torch.float64)
+            delta_v_pred = norm_out.inverse_transform_tensor(preds_val, preserve_float64=True)
+            total_pred = pde_val_t + delta_v_pred.squeeze(-1)
             errors_bps = (total_pred - mc_val_t) * 10000.0
             best_val_rmse = float(torch.sqrt(torch.mean(errors_bps ** 2)).item())
             trimmed_mask = torch.abs(errors_bps) <= float(torch.quantile(torch.abs(errors_bps), 0.99).item())
@@ -185,7 +185,10 @@ def train_single_member(
                     df_dB = compute_total_barrier_derivative(jac, batch_x, norm_in, norm_out)
                     std_out_t = norm_out.get_std_tensor(device, batch_x.dtype)[0]
                     df_dB_norm = df_dB / std_out_t
-                    mono_penalty = torch.relu(df_dB_norm).pow(2).mean()
+                    coupon_unnorm = batch_x[:, 6] * norm_in.get_std_tensor(device, batch_x.dtype)[6] + norm_in.get_mean_tensor(device, batch_x.dtype)[6]
+                    r_unnorm = batch_x[:, 9] * norm_in.get_std_tensor(device, batch_x.dtype)[9] + norm_in.get_mean_tensor(device, batch_x.dtype)[9]
+                    mono_mask = (coupon_unnorm >= r_unnorm).float()
+                    mono_penalty = (torch.relu(df_dB_norm).pow(2) * mono_mask).mean()
                     reg_loss = reg_loss + lambda_mono * mono_penalty
 
                 loss = value_loss + reg_loss
@@ -213,8 +216,8 @@ def train_single_member(
         eval_model.eval()
         with torch.no_grad():
             preds_val = eval_model(X_val_t)
-            delta_v_pred = norm_out.inverse_transform_tensor(preds_val)
-            total_pred = pde_val_t + delta_v_pred.squeeze(-1).to(torch.float64)
+            delta_v_pred = norm_out.inverse_transform_tensor(preds_val, preserve_float64=True)
+            total_pred = pde_val_t + delta_v_pred.squeeze(-1)
             errors_bps = (total_pred - mc_val_t) * 10000.0
 
             val_rmse_bps = float(torch.sqrt(torch.mean(errors_bps ** 2)).item())
@@ -331,6 +334,16 @@ def train_ensemble(config: Dict[str, Any]) -> Tuple[CorrectionEnsemble, Dict[str
             norm_out=norm_out,
             device=device,
         )
+        # Assert checkpoint independence to prevent duplicate weights
+        if k > 0:
+            sd_curr = torch.load(path, map_location="cpu", weights_only=True)
+            sd_prev = torch.load(member_paths[0], map_location="cpu", weights_only=True)
+            sim = torch.cosine_similarity(
+                torch.cat([v.flatten().float() for v in sd_curr.values()]),
+                torch.cat([v.flatten().float() for v in sd_prev.values()]),
+                dim=0,
+            ).item()
+            assert sim < 0.95, f"Ensemble member {k} is redundant with member 0 (cosine sim: {sim:.4f})"
         member_paths.append(path)
 
     # Construct and load full ensemble
@@ -349,8 +362,8 @@ def train_ensemble(config: Dict[str, Any]) -> Tuple[CorrectionEnsemble, Dict[str
     with torch.no_grad():
         mean_pred_norm, std_pred_norm = ensemble(X_val_t)
         # Denormalize predictions (strict double precision)
-        delta_v_mean = norm_out.inverse_transform_tensor(mean_pred_norm)
-        total_pred_ens = pde_val_t + delta_v_mean.squeeze(-1).to(torch.float64)
+        delta_v_mean = norm_out.inverse_transform_tensor(mean_pred_norm, preserve_float64=True)
+        total_pred_ens = pde_val_t + delta_v_mean.squeeze(-1)
         errors_bps = (total_pred_ens - mc_val_t) * 10000.0
 
         std_bps = (

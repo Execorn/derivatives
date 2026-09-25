@@ -61,6 +61,13 @@ class CorrectionEnsemble(nn.Module):
             for _ in range(K)
         ])
 
+    @torch.compile(mode="reduce-overhead")
+    def _forward_compiled(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        preds = torch.stack([m._forward_uncompiled(x) for m in self.members], dim=0)
+        mean_pred = preds.mean(dim=0)
+        std_pred = preds.std(dim=0, unbiased=True) if self.K > 1 else torch.zeros_like(mean_pred)
+        return mean_pred, std_pred
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through all K ensemble members.
@@ -73,10 +80,10 @@ class CorrectionEnsemble(nn.Module):
               - mean_pred: Ensemble mean prediction, shape (batch_size, 1)
               - std_pred: Epistemic uncertainty (sample std), shape (batch_size, 1)
         """
-        preds = torch.stack([m(x) for m in self.members], dim=0)  # shape (K, B, 1)
-        mean_pred = preds.mean(dim=0)
-        std_pred = preds.std(dim=0, unbiased=True) if self.K > 1 else torch.zeros_like(mean_pred)
-        return mean_pred, std_pred
+        if x.requires_grad or torch.is_grad_enabled():
+            return self._forward_uncompiled(x)
+        mean_pred, std_pred = self._forward_compiled(x)
+        return mean_pred.clone(), std_pred.clone()
 
     def _forward_uncompiled(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Uncompiled forward pass for autograd and dynamic Jacobian tracking."""

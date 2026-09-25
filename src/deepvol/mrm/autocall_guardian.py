@@ -58,8 +58,24 @@ class AutocallModelGuardian:
         self.audit_log: List[Dict[str, Any]] = []
 
     def set_reference_distribution(self, X_train: np.ndarray) -> None:
-        """Store reference training feature distribution for online PSI tracking."""
-        self.reference_distribution = np.asarray(X_train, dtype=np.float32).copy()
+        """Store reference training feature distribution and precompute per-dimension quantile bins for PSI."""
+        X = np.asarray(X_train, dtype=np.float32)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        self.reference_distribution = X.copy()
+        N, D = X.shape
+        self.psi_bin_edges = np.zeros((D, 11), dtype=np.float32)
+        self.psi_ref_pcts = np.zeros((D, 10), dtype=np.float32)
+        percentiles = np.linspace(0, 100, 11)
+        for d in range(D):
+            edges = np.percentile(X[:, d], percentiles)
+            edges[0] -= 1e-5
+            edges[-1] += 1e-5
+            if len(np.unique(edges)) < len(edges):
+                edges = np.linspace(edges[0], edges[-1], 11)
+            self.psi_bin_edges[d] = edges
+            counts, _ = np.histogram(X[:, d], bins=edges)
+            self.psi_ref_pcts[d] = (counts + 1e-4) / (N + 10 * 1e-4)
 
     def check_input_ood(self, raw_params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -190,30 +206,29 @@ class AutocallModelGuardian:
     def compute_psi(self, current_batch: np.ndarray) -> float:
         """
         Computes Population Stability Index (PSI) per Federal Reserve SR 26-2.
+        Evaluates PSI independently for each feature dimension and returns maximum drift.
         PSI < 0.10: Insignificant drift (Model stable).
         0.10 <= PSI < 0.25: Moderate drift (Monitor closely).
         PSI >= 0.25: Significant drift (Mandates model recalibration / fallback).
         """
-        if self.reference_distribution is None:
-            return 0.0
+        if getattr(self, "psi_bin_edges", None) is None:
+            if self.reference_distribution is None:
+                return 0.0
+            self.set_reference_distribution(self.reference_distribution)
 
-        ref = self.reference_distribution.flatten()
-        curr = np.asarray(current_batch, dtype=np.float32).flatten()
+        curr = np.asarray(current_batch, dtype=np.float32)
+        if curr.ndim == 1:
+            curr = curr.reshape(1, -1)
+        N, D = curr.shape
+        D_ref = self.psi_bin_edges.shape[0]
+        D_eval = min(D, D_ref)
 
-        percentiles = np.linspace(0, 100, 11)
-        bin_edges = np.percentile(ref, percentiles)
-        bin_edges[0] -= 1e-5
-        bin_edges[-1] += 1e-5
-
-        ref_counts, _ = np.histogram(ref, bins=bin_edges)
-        curr_counts, _ = np.histogram(curr, bins=bin_edges)
-
-        eps = 1e-4
-        ref_pct = (ref_counts + eps) / (len(ref) + len(ref_counts) * eps)
-        curr_pct = (curr_counts + eps) / (len(curr) + len(curr_counts) * eps)
-
-        psi = float(np.sum((curr_pct - ref_pct) * np.log(curr_pct / ref_pct)))
-        return psi
+        psi_per_dim = np.zeros(D_eval, dtype=np.float32)
+        for d in range(D_eval):
+            counts, _ = np.histogram(curr[:, d], bins=self.psi_bin_edges[d])
+            curr_pct = (counts + 1e-4) / (N + 10 * 1e-4)
+            psi_per_dim[d] = np.sum((curr_pct - self.psi_ref_pcts[d]) * np.log(curr_pct / self.psi_ref_pcts[d]))
+        return float(np.max(psi_per_dim))
 
     def predict_with_guardian(
         self,
@@ -320,28 +335,45 @@ class AutocallModelGuardian:
         if fallback_fn is not None:
             fallback_npv = float(fallback_fn(raw_params))
         else:
-            # Default fallback: Exact PDE solver with local vol
+            # Robust Gatheral Second-Order Effective Volatility PDE Fallback with S0=100.0
             from deepvol.models.autocall_pde import price_autocall_pde_scalar
-            sigma_val = float(raw_params.get("sigma", 0.3))
+            from deepvol.models.autocall import make_obs_indices
+
+            v0_val = float(raw_params.get("v0", 0.04))
+            theta_val = float(raw_params.get("theta", 0.04))
+            kappa_val = float(raw_params.get("kappa", 2.0))
+            sigma_vov = float(raw_params.get("sigma", 0.3))
             T_val = float(raw_params.get("T", 1.0))
             B_val = float(raw_params.get("B", 1.0))
             r_val = float(raw_params.get("r", 0.02))
             coupon_val = float(raw_params.get("coupon", 0.08))
-            n_obs = int(raw_params.get("n_obs_per_year", 4) * T_val)
+            n_obs = max(1, int(round(float(raw_params.get("n_obs_per_year", 4)) * T_val)))
 
-            from deepvol.models.autocall import make_obs_indices
-            obs_indices = make_obs_indices(max(1, n_obs), T_val, 100)
+            def effective_sigma_func(t: float, s: np.ndarray) -> np.ndarray:
+                t_pos = max(float(t), 1e-10)
+                kt = kappa_val * t_pos
+                if abs(kt) < 1e-4:
+                    inv_k = t_pos * (1.0 - 0.5 * kt + (kt**2) / 6.0 - (kt**3) / 24.0)
+                    ekt = 1.0 - kt + 0.5 * (kt**2)
+                else:
+                    ekt = float(np.exp(-kt))
+                    inv_k = float(-np.expm1(-kt) / kappa_val)
+                var_t = v0_val * ekt + theta_val * (1.0 - ekt) + 0.25 * (sigma_vov**2) * inv_k
+                sig_val = float(np.clip(np.sqrt(max(var_t, 1e-8)), 0.01, 2.0))
+                return np.full_like(s, sig_val)
 
+            obs_indices = make_obs_indices(n_obs, T_val, 48)
             pde_res = price_autocall_pde_scalar(
-                S0_val=1.0,
+                S0_val=100.0,
                 r=r_val,
                 T=T_val,
-                N_S=200,
-                N_T=100,
+                N_S=120,
+                N_T=48,
                 obs_indices=obs_indices,
                 B=B_val,
                 coupon=coupon_val,
-                sigma_func=lambda t, s: np.full_like(s, sigma_val),
+                sigma_func=effective_sigma_func,
+                rannacher_steps=1,
             )
             fallback_npv = float(pde_res["npv"])
 

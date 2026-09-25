@@ -161,11 +161,11 @@ def ensemble_guided_sampling(
     df_candidates = sample_lhs(n_candidates, seed=seed)
 
     # Convert candidates to dict format for build_feature_matrix
-    cand_dict = {col: df_candidates[col].values for col in df_candidates.columns}
-    # Provide placeholder pde values for initial feature generation
-    cand_dict["pde_npv"] = np.ones(n_candidates, dtype=np.float64)
-    cand_dict["pde_delta"] = np.zeros(n_candidates, dtype=np.float64)
-    cand_dict["pde_gamma"] = np.zeros(n_candidates, dtype=np.float64)
+    # Pre-calculate true Gatheral PDE labels to evaluate on valid 19D manifold
+    pde_npv, pde_delta, pde_gamma = run_pde_labels(df_candidates, n_workers=min(os.cpu_count() or 4, 12))
+    cand_dict["pde_npv"] = pde_npv
+    cand_dict["pde_delta"] = pde_delta
+    cand_dict["pde_gamma"] = pde_gamma
 
     X_candidates = CorrectionInputNormalizer.build_feature_matrix(cand_dict)
     X_norm = norm_in.transform(X_candidates)
