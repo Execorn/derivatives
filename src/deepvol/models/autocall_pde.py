@@ -24,9 +24,17 @@ def build_lv_grid(
     N_S: int,
     N_T: int,
     sigma_func: Callable[[float, np.ndarray], np.ndarray],
-    sigma_atm: float = 0.20,
+    sigma_atm: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Precomputes log-uniform spot grid, uniform time grid, and local volatility matrix."""
+    """Precomputes log-uniform spot grid, uniform time grid, and local volatility matrix.
+
+    Args:
+        sigma_atm: ATM vol for setting grid range. If None, auto-detected from
+            sigma_func(0, S0) to adapt the grid to the actual volatility surface.
+            This prevents grid mismatch between the PDE solver and inline workers.
+    """
+    if sigma_atm is None:
+        sigma_atm = float(np.clip(sigma_func(0.0, np.array([S0]))[0], 0.01, 2.0))
     S_min = max(1e-3, S0 * np.exp(-6.0 * sigma_atm * np.sqrt(T)))
     S_max = S0 * np.exp(+6.0 * sigma_atm * np.sqrt(T))
 
@@ -120,15 +128,15 @@ def price_autocall_pde(
     coupon: float,
     sigma_func: Callable[[float, np.ndarray], np.ndarray],
     device: str = "cpu",
-    rannacher_steps: int = 0,
+    rannacher_steps: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Solves Black-Scholes PDE backward in time to price autocallable note.
 
     Args:
-        rannacher_steps: Number of backward-Euler half-steps to apply after each
-            barrier observation date to damp Gibbs oscillations. Rannacher (1984).
-            Set to 0 to disable. Default 0 (pure Crank-Nicolson).
+        rannacher_steps: Number of backward-Euler steps (on the regular time grid)
+            to apply after each barrier observation date to damp Gibbs oscillations.
+            Rannacher (1984). Set to 0 to disable. Default 2.
 
     Returns:
         (npv_grid, delta_grid, gamma_grid) at t=0 on S_grid.
@@ -154,14 +162,23 @@ def price_autocall_pde(
         return float(np.exp(-r * (T - t)))
 
     # Backward induction from k = N_T - 1 down to 0
+    # Rannacher smoothing: after a barrier jump, switch the next `rannacher_steps`
+    # regular CN steps to backward Euler (theta_w=1.0) to damp Gibbs oscillations.
+    # This uses the existing time grid (no extra steps, no time-shift bias).
+    # Ref: Rannacher (1984) "Finite element solution of diffusion
+    # problems with irregular data", Numer. Math. 25(4), 329-341.
+    be_remaining = 0  # Counter for remaining BE steps after barrier jump
     for k in range(N_T - 1, -1, -1):
         t_k = float(t_grid[k])
         V_0_k = float(np.exp(-r * (T - t_k)))
         V_end_k = get_upper_bdry(t_k)
         sigma_slice = sigma_grid[k]
 
-        # Crank-Nicolson backward step from t_{k+1} to t_k
-        V = cn_step(V, S_grid, dt, r, sigma_slice, V_0_k, V_end_k)
+        # Use BE if smoothing a recent barrier jump, otherwise CN
+        theta_w = 1.0 if be_remaining > 0 else 0.5
+        V = cn_step(V, S_grid, dt, r, sigma_slice, V_0_k, V_end_k, theta_w=theta_w)
+        if be_remaining > 0:
+            be_remaining -= 1
 
         # If t_k is an observation date (k > 0), apply autocall barrier jump condition.
         # Note: V(t_k) is the value AT time t_k (not discounted to t=0), so the
@@ -170,16 +187,9 @@ def price_autocall_pde(
         if k > 0 and k in obs_set:
             call_payoff = 1.0 + coupon * t_k
             V[S_grid >= barrier_level] = call_payoff
-
-            # Rannacher smoothing: run backward-Euler half-steps to damp
-            # Gibbs oscillations from the C^0 barrier jump discontinuity.
-            # Ref: Rannacher (1984) "Finite element solution of diffusion
-            # problems with irregular data", Numer. Math. 25(4), 329-341.
+            # Schedule next steps as BE for smoothing
             if rannacher_steps > 0:
-                dt_half = dt / 2.0
-                for _ in range(rannacher_steps):
-                    V = cn_step(V, S_grid, dt_half, r, sigma_slice,
-                                V_0_k, V_end_k, theta_w=1.0)
+                be_remaining = rannacher_steps
 
     # At t=0, compute spatial Greeks via central differences
     h_minus = S_grid[1:-1] - S_grid[:-2]
@@ -211,7 +221,7 @@ def price_autocall_pde_scalar(
     coupon: float,
     sigma_func: Callable[[float, np.ndarray], np.ndarray],
     device: str = "cpu",
-    rannacher_steps: int = 0,
+    rannacher_steps: int = 2,
 ) -> Dict[str, Union[float, np.ndarray]]:
     """Convenience wrapper evaluating PDE at spot level S0_val."""
     npv_grid, delta_grid, gamma_grid = price_autocall_pde(

@@ -145,6 +145,7 @@ for i in range(count):
     obs_times = sorted([float(oi) * dt for oi in obs_indices])
     t_grid = np.linspace(0, T, N_T + 1)
 
+    be_remaining = 0
     for k in range(N_T - 1, -1, -1):
         t_k = float(t_grid[k])
         V0k = float(np.exp(-r * (T - t_k)))
@@ -154,13 +155,14 @@ for i in range(count):
             Vek = float(np.exp(-r * (tn - t_k)) * (1.0 + coupon * tn))
         else:
             Vek = float(np.exp(-r * (T - t_k)))
-        V = step(V, dt, 0.5, V0k, Vek)
+        tw = 1.0 if be_remaining > 0 else 0.5
+        V = step(V, dt, tw, V0k, Vek)
+        if be_remaining > 0:
+            be_remaining -= 1
         if k > 0 and k in obs_set:
             V[S_grid >= barrier_level] = 1.0 + coupon * t_k
             if rannacher_steps > 0:
-                dth = dt / 2.0
-                for _ in range(rannacher_steps):
-                    V = step(V, dth, 1.0, V0k, Vek)
+                be_remaining = rannacher_steps
 
     hm = S_grid[1:-1] - S_grid[:-2]
     hp = S_grid[2:] - S_grid[1:-1]
