@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import Link from "next/link";
 import { useShallow } from "zustand/react/shallow";
 import { useRiskStore, GreeksData } from "../store/useRiskStore";
 import { useWebSocket } from "../hooks/useWebSocket";
@@ -18,6 +19,7 @@ import {
   Zap,
   RefreshCw,
   Sliders,
+  Layers,
 } from "lucide-react";
 
 const TGrid = [0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0];
@@ -251,6 +253,13 @@ export default function Dashboard() {
               Vectorized FNO Volatility Calibration Framework
             </p>
           </div>
+          <Link
+            href="/autocall"
+            className="flex items-center gap-1.5 px-3 py-1.5 ml-4 text-xs font-semibold text-blue-300 bg-blue-950/60 hover:bg-blue-900/60 border border-blue-800 rounded-lg transition-colors shadow-sm"
+          >
+            <Layers className="w-3.5 h-3.5 text-blue-400" />
+            <span>Autocall Pricer (Phase D)</span>
+          </Link>
         </div>
 
         {/* CONNECTION STATUS & STATS */}
