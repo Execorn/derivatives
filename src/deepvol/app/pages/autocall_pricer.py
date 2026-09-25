@@ -23,10 +23,12 @@ import plotly.graph_objects as go
 import streamlit as st
 import torch
 
-_APP_DIR = Path(__file__).parent.parent
-_SRC_DIR = _APP_DIR.parent.parent
+_SRC_DIR = Path(__file__).resolve().parents[3]
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
+
+from deepvol.utils.path_helpers import get_project_root
+_PROJECT_ROOT = get_project_root()
 
 from deepvol.calibration.generate_pde_labels import compute_pde_label
 from deepvol.models.autocall import (
@@ -59,8 +61,8 @@ def _load_autocall_model() -> Tuple[
     Dict[str, Any],
 ]:
     """Load Phase D CorrectionEnsemble, normalizers, and calibration metrics from disk."""
-    weights_dir = _SRC_DIR / "artifacts/weights"
-    scalers_dir = _SRC_DIR / "artifacts/scalers"
+    weights_dir = _PROJECT_ROOT / "artifacts" / "weights"
+    scalers_dir = _PROJECT_ROOT / "artifacts" / "scalers"
 
     member_paths = [weights_dir / f"autocall_correction_mlp_member_{k}.pth" for k in range(5)]
     norm_in_path = scalers_dir / "correction_input_normalizer.npz"
