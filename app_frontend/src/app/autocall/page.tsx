@@ -108,25 +108,25 @@ export default function AutocallPage() {
         <div className="flex items-center gap-3">
           <Link
             href="/"
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-400 bg-zinc-800/60 hover:bg-zinc-800 rounded-lg transition-colors border border-zinc-700/50"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono font-medium text-zinc-400 bg-zinc-800/60 hover:bg-zinc-800 rounded-lg transition-colors border border-zinc-700/50"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
-            Surface Pricer
+            Surface Overview
           </Link>
           <div className="h-4 w-px bg-zinc-800 mx-1" />
           <h1 className="text-base font-semibold text-zinc-100 flex items-center gap-2">
             <Layers className="w-5 h-5 text-blue-500" />
-            DeepVol Autocallable Note Pricer
+            Autocallable Valuation Engine
           </h1>
           <span className="px-2 py-0.5 text-[10px] font-mono tracking-wider text-blue-400 bg-blue-950/60 border border-blue-800 rounded-full">
-            Phase D CorrectionEnsemble (K=5)
+            Residual Ensemble K=5 | 1D Crank-Nicolson Base
           </span>
         </div>
 
-        <div className="flex items-center gap-4 text-xs">
+        <div className="flex items-center gap-4 text-xs font-mono">
           <div className="flex items-center gap-1.5 text-zinc-400">
             <Cpu className="w-4 h-4 text-emerald-400" />
-            <span>Target: RTX 3060 CUDA</span>
+            <span>Target: CUDA Acceleration (RTX 3060)</span>
           </div>
           <div className="h-4 w-px bg-zinc-800" />
           <div className="flex items-center gap-1.5">
@@ -135,8 +135,8 @@ export default function AutocallPage() {
                 isFallback ? "bg-amber-400" : isOod ? "bg-red-400" : "bg-emerald-400"
               }`}
             />
-            <span className="font-mono text-zinc-300">
-              {isFallback ? "Fallback Active" : isOod ? "OOD Detected" : "In Distribution"}
+            <span className="text-zinc-300">
+              {isFallback ? "STATUS: PDE FALLBACK" : isOod ? "STATUS: OOD DETECTED" : "STATUS: IN-DISTRIBUTION"}
             </span>
           </div>
         </div>
@@ -147,14 +147,14 @@ export default function AutocallPage() {
         {/* Sidebar Controls */}
         <aside className="w-80 p-5 overflow-y-auto border-r border-zinc-800 bg-zinc-900/30 flex flex-col gap-5 shrink-0">
           <div>
-            <h2 className="text-xs font-semibold tracking-wider text-zinc-400 uppercase mb-3 flex items-center justify-between">
+            <h2 className="text-xs font-semibold tracking-wider text-zinc-400 uppercase mb-3 flex items-center justify-between font-mono">
               <span>Heston Dynamics</span>
-              <span className="text-[10px] font-mono text-blue-400">float64</span>
+              <span className="text-[10px] text-blue-400">float64</span>
             </h2>
             <div className="space-y-3 text-xs">
               <div>
                 <div className="flex justify-between mb-1">
-                  <label className="text-zinc-400">Mean Reversion (κ)</label>
+                  <label className="text-zinc-400">Mean Reversion Speed (κ)</label>
                   <span className="font-mono text-zinc-200">{kappa.toFixed(2)}</span>
                 </div>
                 <input
@@ -170,7 +170,7 @@ export default function AutocallPage() {
 
               <div>
                 <div className="flex justify-between mb-1">
-                  <label className="text-zinc-400">Long-term Variance (θ)</label>
+                  <label className="text-zinc-400">Long-Term Variance (θ)</label>
                   <span className="font-mono text-zinc-200">{theta.toFixed(3)}</span>
                 </div>
                 <input
@@ -186,7 +186,7 @@ export default function AutocallPage() {
 
               <div>
                 <div className="flex justify-between mb-1">
-                  <label className="text-zinc-400">Vol of Vol (σ)</label>
+                  <label className="text-zinc-400">Volatility of Variance (σ)</label>
                   <span className="font-mono text-zinc-200">{sigma.toFixed(2)}</span>
                 </div>
                 <input
@@ -202,7 +202,7 @@ export default function AutocallPage() {
 
               <div>
                 <div className="flex justify-between mb-1">
-                  <label className="text-zinc-400">Spot-Vol Correlation (ρ)</label>
+                  <label className="text-zinc-400">Spot-Variance Correlation (ρ)</label>
                   <span className="font-mono text-zinc-200">{rho.toFixed(2)}</span>
                 </div>
                 <input
@@ -235,13 +235,13 @@ export default function AutocallPage() {
           </div>
 
           <div className="border-t border-zinc-800/80 pt-4">
-            <h2 className="text-xs font-semibold tracking-wider text-zinc-400 uppercase mb-3">
-              Contract Terms
+            <h2 className="text-xs font-semibold tracking-wider text-zinc-400 uppercase mb-3 font-mono">
+              Contract Specifications
             </h2>
             <div className="space-y-3 text-xs">
               <div>
                 <div className="flex justify-between mb-1">
-                  <label className="text-zinc-400">Barrier B (% of S₀)</label>
+                  <label className="text-zinc-400">Autocall Barrier B (% of S₀)</label>
                   <span className="font-mono text-zinc-200">{(B * 100).toFixed(0)}%</span>
                 </div>
                 <input
@@ -257,7 +257,7 @@ export default function AutocallPage() {
 
               <div>
                 <div className="flex justify-between mb-1">
-                  <label className="text-zinc-400">Annual Coupon Rate</label>
+                  <label className="text-zinc-400">Annual Coupon Rate (% p.a.)</label>
                   <span className="font-mono text-zinc-200">{(coupon * 100).toFixed(1)}%</span>
                 </div>
                 <input
@@ -273,7 +273,7 @@ export default function AutocallPage() {
 
               <div>
                 <div className="flex justify-between mb-1">
-                  <label className="text-zinc-400">Maturity T (Years)</label>
+                  <label className="text-zinc-400">Maturity Tenor T (Years)</label>
                   <span className="font-mono text-zinc-200">{T.toFixed(2)}y</span>
                 </div>
                 <input
@@ -294,15 +294,15 @@ export default function AutocallPage() {
                   onChange={(e) => setParam("n_obs_per_year", parseFloat(e.target.value))}
                   className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-200 font-mono text-xs focus:outline-none focus:border-blue-500"
                 >
-                  <option value={4}>Quarterly (4 obs/yr)</option>
-                  <option value={8}>Semi-Annual / 8 per yr</option>
-                  <option value={12}>Monthly (12 obs/yr)</option>
+                  <option value={4}>Quarterly (4 obs/year)</option>
+                  <option value={8}>Bi-Monthly (8 obs/year)</option>
+                  <option value={12}>Monthly (12 obs/year)</option>
                 </select>
               </div>
 
               <div>
                 <div className="flex justify-between mb-1">
-                  <label className="text-zinc-400">Risk-free Rate (r)</label>
+                  <label className="text-zinc-400">Risk-Free Rate r (% p.a.)</label>
                   <span className="font-mono text-zinc-200">{(r * 100).toFixed(2)}%</span>
                 </div>
                 <input
@@ -319,7 +319,7 @@ export default function AutocallPage() {
           </div>
 
           <div className="border-t border-zinc-800/80 pt-4">
-            <div className="flex items-center justify-between p-3 bg-zinc-800/40 border border-zinc-750 rounded-xl mb-4">
+            <div className="flex items-center justify-between p-3 bg-zinc-800/40 border border-zinc-750 rounded-xl mb-4 font-mono">
               <div className="flex items-center gap-2">
                 <Shield className="w-4 h-4 text-blue-400" />
                 <label htmlFor="guardian-mode" className="text-xs font-medium text-zinc-200 cursor-pointer">
@@ -338,17 +338,17 @@ export default function AutocallPage() {
             <button
               onClick={() => fetchPrice()}
               disabled={isLoading}
-              className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 disabled:opacity-50 text-white font-medium text-xs rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg shadow-blue-900/30"
+              className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 disabled:opacity-50 text-white font-mono font-medium text-xs rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg shadow-blue-900/30"
             >
               {isLoading ? (
                 <>
                   <RotateCcw className="w-4 h-4 animate-spin" />
-                  <span>Computing PDE + Ensemble...</span>
+                  <span>Evaluating PDE Base + Ensemble...</span>
                 </>
               ) : (
                 <>
                   <Play className="w-4 h-4 fill-current" />
-                  <span>Price Autocall</span>
+                  <span>Compute Valuation</span>
                 </>
               )}
             </button>
@@ -367,21 +367,21 @@ export default function AutocallPage() {
           {/* Metric Cards Row */}
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
             <div className="p-4 bg-zinc-900 border border-zinc-800 rounded-xl">
-              <span className="text-xs text-zinc-400 block mb-1">Total NPV (% Par)</span>
+              <span className="text-xs text-zinc-400 block mb-1 font-mono">Present Value (% Par)</span>
               <span className="text-2xl font-bold font-mono text-zinc-100">
                 {npv !== null ? `${(npv * 100).toFixed(2)}%` : "--"}
               </span>
             </div>
 
             <div className="p-4 bg-zinc-900 border border-zinc-800 rounded-xl">
-              <span className="text-xs text-zinc-400 block mb-1">PDE Base Price</span>
+              <span className="text-xs text-zinc-400 block mb-1 font-mono">Finite Difference Base</span>
               <span className="text-2xl font-bold font-mono text-zinc-200">
                 {pdeNpv !== null ? `${(pdeNpv * 100).toFixed(2)}%` : "--"}
               </span>
             </div>
 
             <div className="p-4 bg-zinc-900 border border-zinc-800 rounded-xl">
-              <span className="text-xs text-zinc-400 block mb-1">MLP Correction</span>
+              <span className="text-xs text-zinc-400 block mb-1 font-mono">Ensemble Residual Correction</span>
               <span
                 className={`text-2xl font-bold font-mono ${
                   correctionBps && correctionBps >= 0 ? "text-emerald-400" : "text-amber-400"
@@ -392,21 +392,21 @@ export default function AutocallPage() {
             </div>
 
             <div className="p-4 bg-zinc-900 border border-zinc-800 rounded-xl">
-              <span className="text-xs text-zinc-400 block mb-1">Epistemic σ</span>
+              <span className="text-xs text-zinc-400 block mb-1 font-mono">Epistemic Uncertainty (1σ)</span>
               <span className="text-2xl font-bold font-mono text-blue-400">
                 {uncertaintyBps !== null ? `${uncertaintyBps.toFixed(2)} bps` : "--"}
               </span>
             </div>
 
             <div className="p-4 bg-zinc-900 border border-zinc-800 rounded-xl">
-              <span className="text-xs text-zinc-400 block mb-1">Barrier Delta (ΔB)</span>
+              <span className="text-xs text-zinc-400 block mb-1 font-mono">Barrier Sensitivity (∂V/∂B)</span>
               <span className="text-2xl font-bold font-mono text-zinc-200">
                 {dfDB !== null ? dfDB.toFixed(4) : "--"}
               </span>
             </div>
 
             <div className="p-4 bg-zinc-900 border border-zinc-800 rounded-xl">
-              <span className="text-xs text-zinc-400 block mb-1">Latency</span>
+              <span className="text-xs text-zinc-400 block mb-1 font-mono">Execution Latency</span>
               <span className="text-2xl font-bold font-mono text-emerald-400">
                 {latencyMs !== null ? `${latencyMs.toFixed(1)} ms` : "--"}
               </span>
@@ -426,11 +426,11 @@ export default function AutocallPage() {
             {/* Right: 5-Member Ensemble Spread Chart */}
             <div className="p-5 bg-zinc-900 border border-zinc-800 rounded-xl shadow-lg flex flex-col justify-between">
               <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-semibold tracking-wider text-zinc-400 uppercase">
-                  5-Member Ensemble Spread
+                <span className="text-xs font-mono font-medium tracking-wider text-zinc-400 uppercase">
+                  Ensemble Residual Realizations
                 </span>
                 <span className="text-xs font-mono text-zinc-400">
-                  Mean: {correctionBps !== null ? `${correctionBps > 0 ? "+" : ""}${correctionBps.toFixed(1)} bps` : "--"}
+                  Ensemble Mean: {correctionBps !== null ? `${correctionBps > 0 ? "+" : ""}${correctionBps.toFixed(1)} bps` : "--"}
                 </span>
               </div>
 
@@ -457,8 +457,8 @@ export default function AutocallPage() {
               </div>
 
               <div className="flex justify-between items-center text-[11px] text-zinc-400 pt-2 font-mono">
-                <span>Model: ResNet MLP (19D → 256)</span>
-                <span className="text-blue-400">K = 5 Members</span>
+                <span>Architecture: 5-Member ResNet MLP (19D → 256)</span>
+                <span className="text-blue-400">K = 5 Realizations</span>
               </div>
             </div>
           </div>
@@ -468,12 +468,12 @@ export default function AutocallPage() {
             <div className="flex items-center justify-between border-b border-zinc-800 pb-3">
               <div className="flex items-center gap-2">
                 <Shield className="w-5 h-5 text-blue-400" />
-                <h3 className="text-sm font-semibold text-zinc-100">
-                  SR 26-2 Model Risk Governance & Compliance
+                <h3 className="text-sm font-semibold text-zinc-100 font-mono">
+                  SR 26-2 Model Risk Governance & Validation
                 </h3>
               </div>
               <span
-                className={`px-3 py-1 text-xs font-semibold rounded-full border ${
+                className={`px-3 py-1 text-xs font-mono font-medium rounded-full border ${
                   isFallback
                     ? "bg-amber-950/70 border-amber-700 text-amber-300"
                     : isOod
@@ -481,43 +481,43 @@ export default function AutocallPage() {
                     : "bg-emerald-950/70 border-emerald-700 text-emerald-300"
                 }`}
               >
-                {isFallback ? "⚠️ Tier 3 PDE Fallback Engaged" : isOod ? "🚨 OOD Breach" : "🟢 Operational Status: Compliant"}
+                {isFallback ? "STATUS: PDE FALLBACK ROUTED" : isOod ? "STATUS: OOD BOUNDARY EXCEEDED" : "STATUS: COMPLIANT (IN-DISTRIBUTION)"}
               </span>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
               <div className="p-3 bg-zinc-950 border border-zinc-800/80 rounded-lg">
-                <span className="text-zinc-400 block mb-1">OOD Threshold (τ_OOD)</span>
+                <span className="text-zinc-400 block mb-1 font-mono">OOD Boundary (τ_OOD)</span>
                 <span className="text-base font-bold font-mono text-zinc-100">
                   {tauOod !== null ? `${tauOod.toFixed(2)} bps` : "2.17 bps"}
                 </span>
-                <span className="text-[10px] text-zinc-400 block mt-1">Calibrated at 99th percentile</span>
+                <span className="text-[10px] text-zinc-400 block mt-1 font-mono">Calibrated at 99th percentile</span>
               </div>
 
               <div className="p-3 bg-zinc-950 border border-zinc-800/80 rounded-lg">
-                <span className="text-zinc-400 block mb-1">Ensemble Raw RMSE</span>
+                <span className="text-zinc-400 block mb-1 font-mono">Validation Error (RMSE)</span>
                 <span className="text-base font-bold font-mono text-emerald-400">1.14 bps</span>
-                <span className="text-[10px] text-zinc-400 block mt-1">Trimmed RMSE: 0.99 bps</span>
+                <span className="text-[10px] text-zinc-400 block mt-1 font-mono">Trimmed RMSE (p99): 0.99 bps</span>
               </div>
 
               <div className="p-3 bg-zinc-950 border border-zinc-800/80 rounded-lg">
-                <span className="text-zinc-400 block mb-1">Tail Error Bounds</span>
+                <span className="text-zinc-400 block mb-1 font-mono">Empirical Residual Quantiles</span>
                 <span className="text-base font-bold font-mono text-zinc-100">P95: 2.30 | P99: 3.91 bps</span>
-                <span className="text-[10px] text-zinc-400 block mt-1">Worst routed outlier &lt; 15 bps</span>
+                <span className="text-[10px] text-zinc-400 block mt-1 font-mono">Max routed residual &lt; 15 bps</span>
               </div>
 
               <div className="p-3 bg-zinc-950 border border-zinc-800/80 rounded-lg">
-                <span className="text-zinc-400 block mb-1">Numerical Guardian Tier</span>
+                <span className="text-zinc-400 block mb-1 font-mono">Guardian Validation Tier</span>
                 <span className="text-base font-bold font-mono text-zinc-100">
-                  {isFallback ? fallbackTrigger || "Tier 1 OOD" : "Tier 1 & 2 Clear"}
+                  {isFallback ? fallbackTrigger || "Tier 1 OOD" : "Tier 1 & 2 Verified"}
                 </span>
-                <span className="text-[10px] text-zinc-400 block mt-1">Feller, Mahalanobis, df/dB</span>
+                <span className="text-[10px] text-zinc-400 block mt-1 font-mono">Feller, Mahalanobis, df/dB</span>
               </div>
             </div>
 
             {fallbackReasons && fallbackReasons.length > 0 && (
               <div className="p-3 bg-amber-950/40 border border-amber-800/80 rounded-lg text-xs text-amber-200">
-                <span className="font-semibold block mb-1">Guardian Intervention Reasons:</span>
+                <span className="font-semibold block mb-1 font-mono">Guardian Routing Interventions:</span>
                 <ul className="list-disc pl-5 space-y-0.5 font-mono text-[11px]">
                   {fallbackReasons.map((r, i) => (
                     <li key={i}>{r}</li>

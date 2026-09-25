@@ -67,8 +67,8 @@ export default function UncertaintyGauge({
   return (
     <div className="flex flex-col items-center justify-between p-4 bg-zinc-900 border border-zinc-800 rounded-xl shadow-lg">
       <div className="flex items-center justify-between w-full mb-1">
-        <span className="text-xs font-semibold tracking-wider text-zinc-400 uppercase">
-          Epistemic Uncertainty
+        <span className="text-xs font-mono font-medium tracking-wider text-zinc-400 uppercase">
+          Epistemic Uncertainty (σ)
         </span>
         <span className="text-xs font-mono text-zinc-400">
           τ_OOD = {threshold.toFixed(2)} bps
@@ -136,28 +136,33 @@ export default function UncertaintyGauge({
           <span className="text-2xl font-bold font-mono text-zinc-100">
             {uncertaintyBps !== null ? `${uncertaintyBps.toFixed(2)}` : "--"}
           </span>
-          <span className="text-xs text-zinc-500 font-medium">basis points (bps)</span>
+          <span className="text-[11px] font-mono text-zinc-400">basis points (bps)</span>
         </div>
       </div>
 
       {/* Ticks legend */}
       <div className="flex justify-between w-full px-5 text-[11px] font-mono text-zinc-400">
-        <span>0 bps</span>
-        <span className="text-amber-400 font-semibold">τ = {threshold.toFixed(2)}</span>
-        <span>5 bps</span>
+        <span>0.0 bps</span>
+        <span className="text-amber-400 font-medium">τ_OOD = {threshold.toFixed(2)} bps</span>
+        <span>5.0 bps</span>
       </div>
 
       {/* OOD & Governance Status Badge */}
       <div className="w-full mt-3">
-        {isOod || isFallback ? (
-          <div className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold text-red-300 bg-red-950/60 border border-red-800 rounded-lg">
+        {isFallback ? (
+          <div className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-mono font-medium text-amber-300 bg-amber-950/40 border border-amber-800/80 rounded-lg">
+            <AlertOctagon className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>STATUS: FALLBACK ACTIVE [NUMERICAL PDE ROUTE]</span>
+          </div>
+        ) : isOod ? (
+          <div className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-mono font-medium text-red-300 bg-red-950/40 border border-red-800/80 rounded-lg">
             <AlertOctagon className="w-4 h-4 text-red-400 shrink-0" />
-            <span>Out of Distribution ({isFallback ? "Fallback Active" : "Uncertainty Breach"})</span>
+            <span>STATUS: OUT-OF-DISTRIBUTION [σ &gt; τ_OOD]</span>
           </div>
         ) : (
-          <div className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold text-emerald-300 bg-emerald-950/60 border border-emerald-800 rounded-lg">
+          <div className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-mono font-medium text-emerald-300 bg-emerald-950/40 border border-emerald-800/80 rounded-lg">
             <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-            <span>In Distribution (Normal Operation)</span>
+            <span>STATUS: IN-DISTRIBUTION [σ ≤ τ_OOD]</span>
           </div>
         )}
       </div>

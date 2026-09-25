@@ -1,13 +1,12 @@
 """
-autocall_pricer.py — 1-Leg Vanilla Autocallable Note Pricing & Risk Dashboard.
+autocall_pricer.py — Capital-Protected Autocallable Structured Note Valuation Engine.
 
-Features:
-  - Real-time pricing via Phase D CorrectionEnsemble (PDE base + 5-member MLP correction)
-  - Epistemic uncertainty estimation (basis points) & SR 26-2 OOD routing indicator
-  - 5-member ensemble spread visualization & confidence interval bounds
-  - Live Greeks console (Barrier Delta ΔB, Vega)
-  - Interactive scenario analysis with isolated st.fragment rendering
-  - Early call probability distribution and survival curves across observation dates
+Architecture:
+  - Base valuation: 1D Crank-Nicolson finite difference scheme with Gatheral effective local volatility.
+  - Residual correction: 5-member deep residual MLP ensemble (19-dimensional feature representation).
+  - Uncertainty quantification: Epistemic variance estimation across ensemble realizations.
+  - Model risk governance: Out-of-distribution (OOD) boundary detection under Federal Reserve SR 26-2.
+  - Greeks: First-order barrier sensitivity ∂V/∂B via autograd chain rule.
 """
 from __future__ import annotations
 
@@ -44,11 +43,11 @@ from deepvol.training.train_correction import (
     compute_total_barrier_derivative,
 )
 
-st.set_page_config(page_title="Autocall Pricer", layout="wide")
-st.title("Autocall Pricer — 1-Leg Vanilla Autocallable Note")
+st.set_page_config(page_title="Autocallable Valuation Engine", layout="wide")
+st.title("Autocallable Structured Note Valuation Engine")
 st.markdown(
-    "Interactive pricing, epistemic uncertainty quantification, and model governance for capital-protected "
-    "**vanilla autocallable notes** under Heston stochastic volatility dynamics."
+    "Valuation, epistemic uncertainty quantification, and model governance for capital-protected "
+    "autocallable notes under Heston stochastic volatility dynamics."
 )
 
 
@@ -60,7 +59,7 @@ def _load_autocall_model() -> Tuple[
     float,
     Dict[str, Any],
 ]:
-    """Load Phase D CorrectionEnsemble, normalizers, and calibration metrics from disk."""
+    """Load CorrectionEnsemble, normalizers, and calibration metrics from disk."""
     weights_dir = _PROJECT_ROOT / "artifacts" / "weights"
     scalers_dir = _PROJECT_ROOT / "artifacts" / "scalers"
 
@@ -95,29 +94,29 @@ def _load_autocall_model() -> Tuple[
 
 # ── Sidebar Inputs ────────────────────────────────────────────────────────────
 st.sidebar.header("Heston Dynamics")
-kappa = st.sidebar.slider("Mean Reversion (κ)", 0.5, 5.0, 2.0, step=0.1)
-theta = st.sidebar.slider("Long-term Variance (θ)", 0.01, 0.15, 0.04, step=0.005)
-sigma = st.sidebar.slider("Vol of Vol (σ)", 0.1, 1.0, 0.3, step=0.05)
-rho = st.sidebar.slider("Spot-Vol Correlation (ρ)", -0.9, -0.1, -0.7, step=0.05)
+kappa = st.sidebar.slider("Mean Reversion Speed (κ)", 0.5, 5.0, 2.0, step=0.1)
+theta = st.sidebar.slider("Long-Term Variance (θ)", 0.01, 0.15, 0.04, step=0.005)
+sigma = st.sidebar.slider("Volatility of Variance (σ)", 0.1, 1.0, 0.3, step=0.05)
+rho = st.sidebar.slider("Spot-Variance Correlation (ρ)", -0.9, -0.1, -0.7, step=0.05)
 v0 = st.sidebar.slider("Initial Variance (v₀)", 0.01, 0.15, 0.04, step=0.005)
 
 st.sidebar.header("Contract Structure")
 B_pct = st.sidebar.slider("Autocall Barrier B (% of S₀)", 85, 115, 100, step=1)
 coupon_pct = st.sidebar.slider("Annual Coupon Rate (%)", 3.0, 25.0, 10.0, step=0.5)
-T = st.sidebar.slider("Maturity T (Years)", 0.5, 3.0, 1.5, step=0.25)
+T = st.sidebar.slider("Maturity Tenor T (Years)", 0.5, 3.0, 1.5, step=0.25)
 freq_label = st.sidebar.selectbox(
     "Observation Frequency",
-    ["Quarterly (4/yr)", "Semi-Annual / 8 per yr", "Monthly (12/yr)"],
+    ["Quarterly (4/year)", "Bi-Monthly (8/year)", "Monthly (12/year)"],
 )
-freq_map = {"Quarterly (4/yr)": 4, "Semi-Annual / 8 per yr": 8, "Monthly (12/yr)": 12}
+freq_map = {"Quarterly (4/year)": 4, "Bi-Monthly (8/year)": 8, "Monthly (12/year)": 12}
 n_obs_per_year = freq_map[freq_label]
 
 st.sidebar.header("Market Environment")
-r_pct = st.sidebar.slider("Risk-free Rate r (%)", 0.0, 8.0, 3.0, step=0.25)
+r_pct = st.sidebar.slider("Risk-Free Rate r (%)", 0.0, 8.0, 3.0, step=0.25)
 
 st.sidebar.header("Execution Engine")
-pricing_mode = st.sidebar.radio("Engine Mode", ["MLP Surrogate", "Full MC"])
-mc_paths = st.sidebar.selectbox("MC Paths (for MC mode)", [1000, 5000, 50000], index=1)
+pricing_mode = st.sidebar.radio("Engine Mode", ["Residual Ensemble (PDE + MLP)", "Monte Carlo Benchmark"])
+mc_paths = st.sidebar.selectbox("Monte Carlo Paths", [1000, 5000, 50000], index=1)
 
 # ── Parameter Packaging ───────────────────────────────────────────────────────
 B_val = B_pct / 100.0
@@ -128,17 +127,17 @@ ensemble_model, norm_in, norm_out, tau_ood, calib_dict = _load_autocall_model()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 tab_pricing, tab_scenarios, tab_distribution = st.tabs(
-    ["📊 Pricing & Risk", "📈 Scenario Analysis", "📅 Call Probability by Date"]
+    ["Valuation & Epistemic Uncertainty", "Comparative Statics", "Early Redemption Term Structure"]
 )
 
 # ── Tab 1: Pricing & Epistemic Uncertainty ────────────────────────────────────
 with tab_pricing:
     @st.fragment
     def render_pricing_panel():
-        use_mc = (pricing_mode == "Full MC") or (ensemble_model is None)
+        use_mc = (pricing_mode == "Monte Carlo Benchmark") or (ensemble_model is None)
 
-        if ensemble_model is None and pricing_mode == "MLP Surrogate":
-            st.warning("Phase D CorrectionEnsemble weights not found. Falling back to GPU Monte Carlo.")
+        if ensemble_model is None and pricing_mode == "Residual Ensemble (PDE + MLP)":
+            st.warning("Ensemble checkpoint not detected on disk. Routing valuation to Monte Carlo benchmark engine.")
 
         t0 = time.perf_counter()
         if not use_mc and ensemble_model is not None and norm_in is not None and norm_out is not None:
@@ -208,7 +207,7 @@ with tab_pricing:
             except Exception:
                 delta_B = 0.0
 
-            engine_label = "⚡ Phase D CorrectionEnsemble (PDE + 5-member MLP)"
+            engine_label = "Crank-Nicolson PDE Base + 5-Member Residual Ensemble"
         else:
             # Monte Carlo Pricing Fallback
             n_obs = max(1, int(round(n_obs_per_year * T)))
@@ -232,57 +231,57 @@ with tab_pricing:
             is_ood = False
             delta_B = 0.0
             member_deltas = [0.0] * 5
-            engine_label = f"🎲 GPU Monte Carlo ({mc_paths:,} paths)"
+            engine_label = f"Monte Carlo Benchmark ({mc_paths:,} paths)"
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         # Primary Metric Cards Row
         m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Total NPV (% Par)", f"{npv_val * 100.0:.2f}%")
-        m2.metric("PDE Base Price", f"{pde_npv * 100.0:.2f}%" if not use_mc else "N/A")
-        m3.metric("MLP Correction", f"{correction_bps:+.1f} bps" if not use_mc else "N/A")
-        m4.metric("Epistemic Uncertainty", f"{unc_bps:.2f} bps" if not use_mc else "N/A")
-        m5.metric("Barrier Delta (ΔB)", f"{delta_B:.4f}" if not use_mc else "N/A")
-        m6.metric("Latency", f"{elapsed_ms:.1f} ms")
+        m1.metric("Present Value (% Par)", f"{npv_val * 100.0:.2f}%")
+        m2.metric("Finite Difference Base", f"{pde_npv * 100.0:.2f}%" if not use_mc else "N/A")
+        m3.metric("Ensemble Residual Correction", f"{correction_bps:+.1f} bps" if not use_mc else "N/A")
+        m4.metric("Epistemic Uncertainty (1σ)", f"{unc_bps:.2f} bps" if not use_mc else "N/A")
+        m5.metric("Barrier Sensitivity (∂V/∂B)", f"{delta_B:.4f}" if not use_mc else "N/A")
+        m6.metric("Execution Latency", f"{elapsed_ms:.1f} ms")
 
-        st.caption(f"Engine: **{engine_label}** | Device: **{device.type.upper()}**")
+        st.caption(f"Engine: **{engine_label}** | Hardware Acceleration: **{device.type.upper()}**")
 
         if not use_mc:
             st.divider()
             c_gauge, c_chart = st.columns([1, 1])
             with c_gauge:
-                st.subheader("Epistemic Uncertainty & OOD Screening")
+                st.subheader("Epistemic Uncertainty and OOD Screening")
 
                 if unc_bps < 1.0:
-                    band_label = "High Confidence (< 1.0 bps)"
+                    band_label = "Strict In-Distribution (σ < 1.0 bps)"
                 elif unc_bps < 2.0:
-                    band_label = "Moderate Confidence (1.0 - 2.0 bps)"
+                    band_label = "Acceptable Margin (1.0 ≤ σ < 2.0 bps)"
                 elif unc_bps < 3.0:
-                    band_label = "Elevated Uncertainty (2.0 - 3.0 bps)"
+                    band_label = "Elevated Dispersion (2.0 ≤ σ < 3.0 bps)"
                 else:
-                    band_label = "Extreme Tail Uncertainty (> 3.0 bps)"
+                    band_label = "Excess Epistemic Variance (σ ≥ 3.0 bps)"
 
                 if not is_ood:
                     st.success(
-                        f"🟢 **IN DISTRIBUTION**: Epistemic uncertainty σ = {unc_bps:.2f} bps ≤ τ = {tau_ood:.2f} bps ({band_label})"
+                        f"STATUS: IN-DISTRIBUTION — Epistemic uncertainty σ = {unc_bps:.2f} bps ≤ τ = {tau_ood:.2f} bps ({band_label})"
                     )
                 else:
                     st.error(
-                        f"🔴 **OUT OF DISTRIBUTION**: Epistemic uncertainty σ = {unc_bps:.2f} bps > τ = {tau_ood:.2f} bps"
+                        f"STATUS: OUT-OF-DISTRIBUTION — Epistemic uncertainty σ = {unc_bps:.2f} bps > τ = {tau_ood:.2f} bps"
                     )
                     st.warning(
-                        "⚠️ **Model Risk Guardian**: In production, this contract is automatically intercepted "
-                        "and routed to the Gatheral second-order Crank-Nicolson PDE fallback solver."
+                        "INTERVENTION: SR 26-2 GUARDIAN ACTIVE — Parameter vector routed to analytical "
+                        "Gatheral Crank-Nicolson PDE benchmark."
                     )
 
                 lower_ci = npv_val - (2.0 * unc_bps / 10000.0)
                 upper_ci = npv_val + (2.0 * unc_bps / 10000.0)
                 st.info(
-                    f"**95% Epistemic Confidence Interval**: [{lower_ci * 100.0:.2f}%, {upper_ci * 100.0:.2f}%] (±{2.0 * unc_bps:.2f} bps)"
+                    f"95% Epistemic Confidence Interval: [{lower_ci * 100.0:.2f}%, {upper_ci * 100.0:.2f}%] (±{2.0 * unc_bps:.2f} bps)"
                 )
 
             with c_chart:
-                st.subheader("5-Member Ensemble Spread")
+                st.subheader("5-Member Residual Realizations")
                 fig_ens = go.Figure()
                 member_names = [f"Member {k}" for k in range(5)]
                 member_deltas_bps = [d * 10000.0 for d in member_deltas]
@@ -298,24 +297,24 @@ with tab_pricing:
                     y=correction_bps,
                     line_dash="dash",
                     line_color="#ef4444",
-                    annotation_text=f"Mean: {correction_bps:+.1f} bps",
+                    annotation_text=f"Ensemble Mean: {correction_bps:+.1f} bps",
                 )
                 fig_ens.update_layout(
-                    title="Ensemble Member Predictions (bps)",
-                    xaxis_title="Member",
-                    yaxis_title="Correction (bps)",
+                    title="Individual Member Corrections (bps)",
+                    xaxis_title="Ensemble Member",
+                    yaxis_title="Residual Correction (bps)",
                     template="plotly_dark",
                     height=280,
                     margin=dict(l=40, r=40, t=40, b=40),
                 )
                 st.plotly_chart(fig_ens, use_container_width=True)
 
-            with st.expander("🏛️ Model Governance & Compliance (SR 26-2)", expanded=False):
+            with st.expander("Model Risk Governance & Compliance (SR 26-2)", expanded=False):
                 gov_col1, gov_col2 = st.columns(2)
                 with gov_col1:
                     st.markdown(f"""
-                    - **OOD Threshold (τ_OOD)**: `{tau_ood:.2f} bps`
-                    - **Operational Status**: `{"🔴 FALLBACK ROUTING ACTIVE" if is_ood else "🟢 SURROGATE OPERATIONAL"}`
+                    - **OOD Boundary (τ_OOD)**: `{tau_ood:.2f} bps`
+                    - **Operational Status**: `{"ROUTING: PDE FALLBACK ACTIVE" if is_ood else "ROUTING: RESIDUAL ENSEMBLE OPERATIONAL"}`
                     - **Surrogate Architecture**: `5-Member Deep Ensemble ResNet MLP (19 features, 4 blocks)`
                     - **Base Numerical Engine**: `1D Crank-Nicolson with Gatheral σ_eff (float64)`
                     """)
@@ -331,7 +330,7 @@ with tab_pricing:
                     - **99th Percentile Error**: `{p99_err:.2f} bps`
                     """)
 
-        with st.expander("📋 Contract Terms & Analytical Upper Bound", expanded=False):
+        with st.expander("Contract Specifications & Theoretical Upper Bound", expanded=False):
             ub = autocall_upper_bound(max(1, int(round(n_obs_per_year * T))), coupon_val, T, r_val)
             c_left, c_right = st.columns(2)
             with c_left:
@@ -355,11 +354,11 @@ with tab_pricing:
 with tab_scenarios:
     @st.fragment
     def render_scenario_analysis():
-        st.subheader("Sensitivity & Scenario Curves")
-        st.markdown("Fast multi-parameter sweeps powered by the Phase D CorrectionEnsemble.")
+        st.subheader("Comparative Statics: Sensitivity Curves")
+        st.markdown("Parametric sweeps computed via the residual correction ensemble.")
 
         if ensemble_model is None or norm_in is None or norm_out is None:
-            st.info("CorrectionEnsemble weights not found.")
+            st.info("Ensemble checkpoint not detected on disk.")
             return
 
         def price_point(k_p: float, th_p: float, sig_p: float, rh_p: float, v0_p: float,
@@ -384,11 +383,11 @@ with tab_scenarios:
         npv_b = [price_point(kappa, theta, sigma, rho, v0, b, coupon_val, T, float(n_obs_per_year), r_val) for b in b_grid]
 
         fig1 = go.Figure()
-        fig1.add_trace(go.Scatter(x=b_grid * 100, y=[v * 100 for v in npv_b], mode="lines+markers", name="NPV (% Par)", line=dict(color="#3b82f6", width=2)))
+        fig1.add_trace(go.Scatter(x=b_grid * 100, y=[v * 100 for v in npv_b], mode="lines+markers", name="Present Value (% Par)", line=dict(color="#3b82f6", width=2)))
         fig1.update_layout(
-            title="Barrier Sensitivity (NPV vs Autocall Barrier %)",
+            title="Barrier Sensitivity: Fair Value vs Autocall Barrier B (% of S₀)",
             xaxis_title="Autocall Barrier B (% of S₀)",
-            yaxis_title="NPV (% Par)",
+            yaxis_title="Present Value (% Par)",
             template="plotly_dark",
             height=320,
         )
@@ -399,11 +398,11 @@ with tab_scenarios:
         npv_c = [price_point(kappa, theta, sigma, rho, v0, B_val, c, T, float(n_obs_per_year), r_val) for c in c_grid]
 
         fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=c_grid * 100, y=[v * 100 for v in npv_c], mode="lines+markers", name="NPV (% Par)", line=dict(color="#10b981", width=2)))
+        fig2.add_trace(go.Scatter(x=c_grid * 100, y=[v * 100 for v in npv_c], mode="lines+markers", name="Present Value (% Par)", line=dict(color="#10b981", width=2)))
         fig2.update_layout(
-            title="Coupon Sensitivity (NPV vs Annual Coupon %)",
-            xaxis_title="Annual Coupon (%)",
-            yaxis_title="NPV (% Par)",
+            title="Coupon Sensitivity: Fair Value vs Annual Coupon Rate (%)",
+            xaxis_title="Annual Coupon Rate (%)",
+            yaxis_title="Present Value (% Par)",
             template="plotly_dark",
             height=320,
         )
@@ -414,11 +413,11 @@ with tab_scenarios:
         npv_t = [price_point(kappa, theta, sigma, rho, v0, B_val, coupon_val, t, float(n_obs_per_year), r_val) for t in t_grid]
 
         fig3 = go.Figure()
-        fig3.add_trace(go.Scatter(x=t_grid, y=[v * 100 for v in npv_t], mode="lines+markers", name="NPV (% Par)", line=dict(color="#8b5cf6", width=2)))
+        fig3.add_trace(go.Scatter(x=t_grid, y=[v * 100 for v in npv_t], mode="lines+markers", name="Present Value (% Par)", line=dict(color="#8b5cf6", width=2)))
         fig3.update_layout(
-            title="Maturity Term Structure (NPV vs Maturity T)",
-            xaxis_title="Maturity T (Years)",
-            yaxis_title="NPV (% Par)",
+            title="Maturity Term Structure: Fair Value vs Maturity Tenor T (Years)",
+            xaxis_title="Maturity Tenor T (Years)",
+            yaxis_title="Present Value (% Par)",
             template="plotly_dark",
             height=320,
         )
@@ -426,12 +425,12 @@ with tab_scenarios:
 
     render_scenario_analysis()
 
-# ── Tab 3: Call Probability by Date ───────────────────────────────────────────
+# ── Tab 3: Early Redemption Term Structure ────────────────────────────────────
 with tab_distribution:
-    st.subheader("Observation Date Early Call Distribution")
-    st.markdown("Monte Carlo simulation of first-call hitting probability across scheduled observation dates.")
+    st.subheader("Early Redemption Probability Distribution")
+    st.markdown("Monte Carlo evaluation of first-call hitting probability across scheduled observation dates.")
 
-    if st.button("Run Distribution Simulation (5,000 paths)", type="primary"):
+    if st.button("Simulate Empirical Distribution (5,000 Paths)", type="primary"):
         n_obs = max(1, int(round(n_obs_per_year * T)))
         N_steps = max(1, int(round(T * 252)))
         dt = T / N_steps

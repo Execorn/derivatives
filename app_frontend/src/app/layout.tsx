@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "DeepVol — Quantitative Derivatives Platform",
-  description: "Real-time FNO volatility surfaces, Greeks risk hub, and Phase D Autocallable pricing engine",
+  description: "Neural operator volatility surfaces, Greeks sensitivity analytics, and structured product valuation framework",
 };
 
 export default function RootLayout({

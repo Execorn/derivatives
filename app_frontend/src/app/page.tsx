@@ -255,10 +255,10 @@ export default function Dashboard() {
           </div>
           <Link
             href="/autocall"
-            className="flex items-center gap-1.5 px-3 py-1.5 ml-4 text-xs font-semibold text-blue-300 bg-blue-950/60 hover:bg-blue-900/60 border border-blue-800 rounded-lg transition-colors shadow-sm"
+            className="flex items-center gap-1.5 px-3 py-1.5 ml-4 text-xs font-mono font-medium text-blue-300 bg-blue-950/60 hover:bg-blue-900/60 border border-blue-800 rounded-lg transition-colors shadow-sm"
           >
             <Layers className="w-3.5 h-3.5 text-blue-400" />
-            <span>Autocall Pricer (Phase D)</span>
+            <span>Autocallable Valuation Engine</span>
           </Link>
         </div>
 
