@@ -2,8 +2,8 @@
 correction_mlp.py — Lightweight MLP for PDE to MC Residual Correction.
 
 Architecture:
-  - Input: 13 parameters (10 base params + pde_npv, pde_delta, pde_gamma)
-  - Projection: Linear(13 -> 128) + LayerNorm + SiLU
+  - Input: 19 parameters (10 base params + 3 PDE outputs + 6 barrier-aware derived features)
+  - Projection: Linear(19 -> 128) + LayerNorm + SiLU
   - Trunk: 3 residual blocks (Linear + LayerNorm + SiLU + Dropout + Linear + skip)
   - Output Head: Linear(128 -> 1) predicting residual npv (V_MC - V_PDE) (unbounded).
   - Accelerated via torch.compile(mode="reduce-overhead") with .clone() output protection.
@@ -38,12 +38,12 @@ class CorrectionResidualBlock(nn.Module):
 class CorrectionMLP(nn.Module):
     """
     Lightweight residual MLP for autocall pricing correction.
-    Maps 13 inputs (10 params + 3 PDE outputs) to 1 scalar residual.
+    Maps 19 inputs (10 params + 3 PDE outputs + 6 barrier-aware derived features) to 1 scalar residual.
     """
 
     def __init__(
         self,
-        in_dim: int = 13,
+        in_dim: int = 19,
         hidden: int = 128,
         n_layers: int = 3,
         out_dim: int = 1,
@@ -76,7 +76,7 @@ class CorrectionMLP(nn.Module):
         Forward pass with CUDAGraphs buffer protection and autograd compatibility.
 
         Parameters:
-            x: Tensor of shape (B, 13) (float32).
+            x: Tensor of shape (B, 19) (float32).
 
         Returns:
             Tensor of shape (B, 1) residual prediction.

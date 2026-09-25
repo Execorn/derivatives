@@ -158,8 +158,9 @@ class TestCorrectionIntegration:
         norm_in = CorrectionInputNormalizer.load(_NORM_IN_PATH)
         norm_out = CorrectionOutputNormalizer.load(_NORM_OUT_PATH)
 
+        in_dim = norm_in.mean.shape[0] if norm_in.mean is not None else 19
         model = CorrectionMLP(
-            in_dim=13,
+            in_dim=in_dim,
             hidden=DEFAULT_CORRECTION_CONFIG["hidden"],
             n_layers=DEFAULT_CORRECTION_CONFIG["n_layers"],
             dropout=DEFAULT_CORRECTION_CONFIG["dropout"],
@@ -169,7 +170,14 @@ class TestCorrectionIntegration:
         model.eval()
 
         val_data = np.load(_VAL_PDE_PATH)
-        X = np.stack([val_data[f] for f in CorrectionInputNormalizer.FEATURE_NAMES], axis=1)
+        if in_dim == 19:
+            X = CorrectionInputNormalizer.build_feature_matrix(val_data)
+        else:
+            base_13 = [
+                "kappa", "theta", "sigma", "rho", "v0", "B", "coupon", "T", "n_obs_per_year", "r",
+                "pde_npv", "pde_delta", "pde_gamma"
+            ]
+            X = np.stack([val_data[f] for f in base_13], axis=1)
         pde_npv = val_data["pde_npv"].astype(np.float64)
         mc_npv = val_data["npv"].astype(np.float64)
 
@@ -199,8 +207,9 @@ class TestCorrectionIntegration:
         norm_in = CorrectionInputNormalizer.load(_NORM_IN_PATH)
         norm_out = CorrectionOutputNormalizer.load(_NORM_OUT_PATH)
 
+        in_dim = norm_in.mean.shape[0] if norm_in.mean is not None else 19
         model = CorrectionMLP(
-            in_dim=13,
+            in_dim=in_dim,
             hidden=DEFAULT_CORRECTION_CONFIG["hidden"],
             n_layers=DEFAULT_CORRECTION_CONFIG["n_layers"],
             dropout=DEFAULT_CORRECTION_CONFIG["dropout"],
@@ -210,7 +219,14 @@ class TestCorrectionIntegration:
         model.eval()
 
         val_data = np.load(_VAL_PDE_PATH)
-        X = np.stack([val_data[f] for f in CorrectionInputNormalizer.FEATURE_NAMES], axis=1)
+        if in_dim == 19:
+            X = CorrectionInputNormalizer.build_feature_matrix(val_data)
+        else:
+            base_13 = [
+                "kappa", "theta", "sigma", "rho", "v0", "B", "coupon", "T", "n_obs_per_year", "r",
+                "pde_npv", "pde_delta", "pde_gamma"
+            ]
+            X = np.stack([val_data[f] for f in base_13], axis=1)
         pde_npv = val_data["pde_npv"].astype(np.float64)
         mc_npv = val_data["npv"].astype(np.float64)
 
