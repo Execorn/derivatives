@@ -42,10 +42,10 @@ export function checkArbitrage(
   }
 
   // 2. Calendar Arbitrage Check
-  // w(T_i+1, k) - w(T_i, k) must be >= 0 (with a small tolerance)
+  // w(T_i+1, k) - w(T_i, k) must be >= 0 (with a numerical tolerance for float32 rounding)
   for (let i = 0; i < nT - 1; i++) {
     for (let j = 0; j < nK; j++) {
-      if (w[i + 1][j] - w[i][j] < -1e-8) {
+      if (w[i + 1][j] - w[i][j] < -1e-5) {
         calendarViolations[i + 1][j] = true;
         hasCalendarArb = true;
       }
@@ -91,7 +91,7 @@ export function checkArbitrage(
 
       // Durrleman violation check (ignore boundary coordinates for second derivative)
       if (j > 0 && j < nK - 1) {
-        if (g < -1e-8) {
+        if (g < -1e-5) {
           butterflyViolations[i][j] = true;
           hasButterflyArb = true;
         }

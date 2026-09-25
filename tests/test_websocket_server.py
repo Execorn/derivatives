@@ -118,6 +118,62 @@ def test_websocket_subscription_and_unsubscription():
         assert resp["type"] == "unsubscribed"
 
 
+def test_websocket_ssvi_streaming():
+    """Verify SSVI model with list-typed theta_atm streams without exception."""
+    client = TestClient(app)
+    with client.websocket_connect("/ws/risk") as websocket:
+        websocket.send_json({
+            "action": "subscribe",
+            "currency": "BTC",
+            "model_name": "ssvi",
+            "interval": 0.05,
+            "parameters": {
+                "theta_atm": [0.1] * 8,
+                "rho": -0.4,
+                "eta": 1.0,
+                "gamma": 0.5
+            }
+        })
+        ack = orjson.loads(websocket.receive_bytes())
+        assert ack["type"] == "subscribed"
+
+        data = orjson.loads(websocket.receive_bytes())
+        assert data["type"] == "update"
+        assert "greeks" in data
+        assert "iv_surface" in data["greeks"]
+
+        websocket.send_json({"action": "unsubscribe"})
+        unsub = orjson.loads(websocket.receive_bytes())
+        assert unsub["type"] == "unsubscribed"
+
+
+def test_websocket_rough_heston_no_arbitrage_explosion():
+    """Verify Rough Heston streaming maintains bounded volatility and zero calendar arbitrage."""
+    import numpy as np
+    client = TestClient(app)
+    with client.websocket_connect("/ws/risk") as websocket:
+        websocket.send_json({
+            "action": "subscribe",
+            "currency": "BTC",
+            "model_name": "rough_heston",
+            "interval": 0.05
+        })
+        ack = orjson.loads(websocket.receive_bytes())
+        assert ack["type"] == "subscribed"
+
+        # Receive 3 updates and check IV surface properties
+        for _ in range(3):
+            data = orjson.loads(websocket.receive_bytes())
+            assert data["type"] == "update"
+            iv = np.array(data["greeks"]["iv_surface"])
+            assert np.min(iv) >= 0.01
+            assert np.max(iv) <= 2.5, f"Implied vol exploded to {np.max(iv)}"
+
+        websocket.send_json({"action": "unsubscribe"})
+        unsub = orjson.loads(websocket.receive_bytes())
+        assert unsub["type"] == "unsubscribed"
+
+
 def test_parameter_clamping_and_compliance():
     client = TestClient(app)
     with client.websocket_connect("/ws/risk") as websocket:

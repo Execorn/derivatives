@@ -42,6 +42,7 @@ function generatePreviewSurface(spot: number, modelName: string, params: Record<
   const H = (params.H as number) || 0.08;
   const baseVol = v0 ? Math.sqrt(v0) : alpha || 0.20;
 
+  const prevW: number[] = Array(nK).fill(0);
   for (let i = 0; i < nT; i++) {
     const t = TGrid[i];
     const ivRow: number[] = [];
@@ -54,11 +55,12 @@ function generatePreviewSurface(spot: number, modelName: string, params: Record<
     for (let j = 0; j < nK; j++) {
       const k = KGrid[j];
       
-      // Generate a mock smile using a simple formula: baseVol + smile + term structure skew
-      const timeDecay = Math.pow(t, H - 0.5);
-      const skew = -0.15 * k * timeDecay;
-      const smile = 0.35 * k * k * timeDecay;
-      const vol = Math.max(0.01, baseVol + skew + smile);
+      // SVI-like parametric total variance formulation that guarantees monotonicity and Durrleman positivity
+      const baseW = baseVol * baseVol * t;
+      const smileW = 0.04 * (Math.sqrt(k * k + 0.04) - 0.2 * k) * (1.0 + 0.3 * Math.sqrt(t));
+      const wVal = Math.max(prevW[j] + 1e-4, baseW + smileW);
+      prevW[j] = wVal;
+      const vol = Math.max(0.01, Math.sqrt(wVal / t));
       
       ivRow.push(vol);
 
@@ -210,7 +212,6 @@ export default function Dashboard() {
       sigma: { label: "Vol of Vol (σ)", min: 0.1, max: 1.8, step: 0.05 },
       rho: { label: "Correlation (ρ)", min: -0.95, max: 0.0, step: 0.05 },
       v0: { label: "Initial Var (v0)", min: 0.02, max: 0.4, step: 0.01 },
-      H: { label: "Hurst (H)", min: 0.04, max: 0.2, step: 0.01 },
     },
     heston: {
       kappa: { label: "Mean Reversion (κ)", min: 0.2, max: 8.0, step: 0.1 },
@@ -494,7 +495,11 @@ export default function Dashboard() {
               <div>
                 <p className="text-xs text-gray-500 font-medium">Hurst Parameter (H)</p>
                 <p className="text-xl font-bold text-gray-100 font-mono">
-                  {parameters.H ? (parameters.H as number).toFixed(3) : "N/A"}
+                  {modelName === "rough_heston"
+                    ? "0.080 (Fixed)"
+                    : parameters.H
+                    ? (parameters.H as number).toFixed(3)
+                    : "N/A"}
                 </p>
               </div>
             </div>

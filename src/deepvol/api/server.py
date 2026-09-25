@@ -509,8 +509,9 @@ def _fno_forward(params: HestonParams) -> np.ndarray:
     yn     = container.yn
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    H_val = float(pn.mean[5]) if hasattr(pn, "mean") and pn.mean is not None and len(pn.mean) > 5 else (params.H if params.H is not None else 0.08)
     theta_arr = np.array(
-        [params.kappa, params.theta, params.sigma, params.rho, params.v0, params.H],
+        [params.kappa, params.theta, params.sigma, params.rho, params.v0, H_val],
         dtype=np.float32,
     )
     theta_t    = torch.tensor(theta_arr, dtype=torch.float32, device=device)
@@ -722,7 +723,8 @@ async def compute_model_greeks(
                     theta_arr = np.array([parsed_req.kappa, parsed_req.theta, parsed_req.sigma, parsed_req.rho, parsed_req.v0], dtype=np.float32)
                 else:
                     # Rough Heston (6 params)
-                    H_val = parsed_req.H if parsed_req.H is not None else 0.08
+                    # Note: FNO v2 was trained with fixed H=0.08001582; pin H to normalizer mean to avoid catastrophic OOD z-score divergence
+                    H_val = float(cached_container.pn.mean[5]) if hasattr(cached_container.pn, "mean") and cached_container.pn.mean is not None and len(cached_container.pn.mean) > 5 else 0.08
                     theta_arr = np.array([parsed_req.kappa, parsed_req.theta, parsed_req.sigma, parsed_req.rho, parsed_req.v0, H_val], dtype=np.float32)
             elif model_name == "sabr":
                 theta_arr = np.array([parsed_req.alpha, parsed_req.rho, parsed_req.nu], dtype=np.float32)

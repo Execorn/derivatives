@@ -43,12 +43,13 @@ class ParameterNormalizer:
         self.mean = X.mean(axis=0)
         self.std  = X.std(axis=0)
         # Guard against degenerate constant parameters
-        self.std[self.std < 1e-8] = 1.0
+        self.std[self.std < 1e-4] = 1.0
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         assert self.mean is not None, "Call fit() first"
-        return (X - self.mean) / self.std
+        std_safe = np.where(self.std < 1e-4, 1.0, self.std)
+        return (X - self.mean) / std_safe
 
     def inverse_transform(self, X_norm: np.ndarray) -> np.ndarray:
         assert self.mean is not None, "Call fit() first"
@@ -58,7 +59,8 @@ class ParameterNormalizer:
         """Transform a torch.Tensor on any device."""
         mean = torch.tensor(self.mean, dtype=t.dtype, device=t.device)
         std  = torch.tensor(self.std,  dtype=t.dtype, device=t.device)
-        return (t - mean) / std
+        std_safe = torch.where(std < 1e-4, torch.ones_like(std), std)
+        return (t - mean) / std_safe
 
     def inverse_transform_tensor(self, t: torch.Tensor) -> torch.Tensor:
         mean = torch.tensor(self.mean, dtype=t.dtype, device=t.device)
@@ -73,7 +75,9 @@ class ParameterNormalizer:
         data = np.load(path)
         n = cls()
         n.mean = data["mean"]
-        n.std  = data["std"]
+        n.std  = data["std"].copy()
+        # Guard against degenerate constant parameters that have numerical-noise std (< 1e-4)
+        n.std[n.std < 1e-4] = 1.0
         return n
 
     def summary(self) -> str:

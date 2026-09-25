@@ -40,6 +40,7 @@ PARAM_BOUNDS = {
     "beta": (0.0, 1.0),
     "nu": (0.1, 1.5),
     "eta": (0.1, 2.0),
+    "gamma": (0.05, 1.5),
 }
 
 
@@ -223,6 +224,9 @@ class ConnectionManager:
         """
         clamped_params = {}
         for p, val in parameters.items():
+            if isinstance(val, (list, tuple)):
+                clamped_params[p] = [max(0.001, float(x)) for x in val]
+                continue
             clamped_val = val
             # OOD check and clamp
             if p in PARAM_BOUNDS:
@@ -249,6 +253,8 @@ class ConnectionManager:
                 baselines = self.param_baselines.setdefault(websocket, {})
                 
                 for p, val in clamped_params.items():
+                    if not isinstance(val, (int, float)):
+                        continue
                     # If baseline does not exist, initialize it with a perturbed distribution around the initial value
                     if p not in baselines:
                         baselines[p] = [val + random.normalvariate(0, 0.05 * abs(val) if val != 0 else 0.05) for _ in range(100)]
@@ -398,12 +404,16 @@ class JSONRouter:
                         params["kappa"] += random.gauss(0.0, 0.05)
                     if "sigma" in params:
                         params["sigma"] += random.gauss(0.0, 0.01)
-                    if "H" in params:
+                    if "H" in params and model_name == "rbergomi":
                         params["H"] += random.gauss(0.0, 0.001)
                     if "alpha" in params:
                         params["alpha"] += random.gauss(0.0, 0.005)
                     if "nu" in params:
                         params["nu"] += random.gauss(0.0, 0.01)
+                    if "eta" in params:
+                        params["eta"] += random.gauss(0.0, 0.01)
+                    if "gamma" in params:
+                        params["gamma"] += random.gauss(0.0, 0.005)
 
                     # Verify compliance, track drift and clamp parameters
                     clamped_params = self.manager.track_drift_and_ood(websocket, params)
