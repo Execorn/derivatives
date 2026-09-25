@@ -32,7 +32,56 @@ AUTOCALL_PARAM_BOUNDS: Dict[str, tuple] = {
     "r": (0.00, 0.08),
 }
 
+CORNER_BOUNDS: Dict[str, tuple] = {
+    "v0": (0.01, 0.04),       # low spot variance
+    "theta": (0.06, 0.15),    # high mean-reversion target (theta >> v0)
+    "B": (1.03, 1.15),        # ITM barrier
+    "T": (1.8, 3.0),          # long maturity
+    "sigma": (0.4, 1.0),      # high vol-of-vol
+    "rho": (-0.9, -0.4),      # strong leverage
+    "kappa": (0.5, 5.0),      # full range
+    "coupon": (0.03, 0.25),   # full range
+    "r": (0.00, 0.08),        # full range
+}
+
 N_OBS_CHOICES: List[int] = [4, 8, 12]
+
+
+def sample_targeted_corners(n_samples: int, seed: int = 1001) -> pd.DataFrame:
+    """
+    Generate parameter combinations focused on the extreme outlier corner:
+    Low v0, high theta (theta >> v0), ITM barrier (B > 1.03), long T (> 1.8),
+    high vol-of-vol (sigma > 0.4), and strong negative leverage (rho < -0.4).
+    Uses Sobol quasi-random sequence for uniform corner space coverage.
+    """
+    cont_keys = ["kappa", "theta", "sigma", "rho", "v0", "B", "coupon", "T", "r"]
+    l_bounds = [CORNER_BOUNDS[k][0] for k in cont_keys]
+    u_bounds = [CORNER_BOUNDS[k][1] for k in cont_keys]
+
+    sampler = qmc.Sobol(d=9, seed=seed)
+    raw_samples = sampler.random(n=n_samples)
+    scaled = qmc.scale(raw_samples, l_bounds, u_bounds)
+
+    data: Dict[str, np.ndarray] = {k: scaled[:, i] for i, k in enumerate(cont_keys)}
+
+    rng = np.random.default_rng(seed)
+    u_obs = rng.uniform(0.0, 1.0, size=n_samples)
+    n_obs_arr = np.where(u_obs < 0.33, 4, np.where(u_obs < 0.67, 8, 12))
+    data["n_obs_per_year"] = n_obs_arr.astype(np.float64)
+
+    columns = [
+        "kappa",
+        "theta",
+        "sigma",
+        "rho",
+        "v0",
+        "B",
+        "coupon",
+        "T",
+        "n_obs_per_year",
+        "r",
+    ]
+    return pd.DataFrame({col: data[col] for col in columns})
 
 
 def sample_lhs(n_samples: int, seed: int = 42) -> pd.DataFrame:

@@ -39,6 +39,7 @@ class AutocallModelGuardian:
         mahalanobis_threshold: float = 36.19,  # chi2(19, p=0.99)
         residual_clamp_std: float = 3.0,
         psi_alert_threshold: float = 0.25,
+        tau_ood: float = 2.0,
         device: str = "cpu",
     ) -> None:
         self.model = model
@@ -49,6 +50,7 @@ class AutocallModelGuardian:
         self.mahalanobis_threshold = mahalanobis_threshold
         self.residual_clamp_std = residual_clamp_std
         self.psi_alert_threshold = psi_alert_threshold
+        self.tau_ood = tau_ood
         self.device = torch.device(device)
 
         # Baseline reference distribution for Population Stability Index (PSI)
@@ -248,7 +250,21 @@ class AutocallModelGuardian:
         X_t = self.norm_in.to_tensor(X_row, device=self.device)
         X_t.requires_grad_(True)
 
-        preds = self.model._forward_uncompiled(X_t) if hasattr(self.model, "_forward_uncompiled") else self.model(X_t)
+        # Step 2: Surrogate Inference & Ensemble Uncertainty Check
+        if hasattr(self.model, "predict_with_routing"):
+            mean_pred, std_bps, ood_mask = self.model.predict_with_routing(X_t, self.norm_out, tau_ood=self.tau_ood)
+            if ood_mask.any():
+                return self._execute_fallback(
+                    raw_params,
+                    reasons=[f"Ensemble epistemic uncertainty breach: {std_bps.item():.2f} bps > {self.tau_ood:.2f} bps"],
+                    trigger="Tier_1_Ensemble_Uncertainty_OOD",
+                    fallback_fn=fallback_fn,
+                    t_start=t_start,
+                )
+            preds = mean_pred
+        else:
+            preds = self.model._forward_uncompiled(X_t) if hasattr(self.model, "_forward_uncompiled") else self.model(X_t)
+
         jac = torch.autograd.grad(preds.sum(), X_t, create_graph=False)[0]
 
         df_dB_tensor = compute_total_barrier_derivative(

@@ -195,6 +195,7 @@ data/autocall/
 artifacts/weights/autocall_*.pth
 artifacts/weights/phoenix_*.pth
 artifacts/weights/wof_*.pth
+artifacts/weights/*.json
 artifacts/scalers/autocall_*.npz
 artifacts/scalers/phoenix_*.npz
 artifacts/scalers/wof_*.npz

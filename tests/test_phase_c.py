@@ -225,25 +225,44 @@ def _load_phase_c_artifacts():
     if norm_in.mean is None or norm_in.mean.shape[0] != 19:
         pytest.skip("Saved normalizer does not have 19 features (not Phase C)")
 
-    model = CorrectionMLP(
-        in_dim=19,
-        hidden=DEFAULT_CORRECTION_CONFIG["hidden"],
-        n_layers=DEFAULT_CORRECTION_CONFIG["n_layers"],
-        dropout=DEFAULT_CORRECTION_CONFIG["dropout"],
-    ).cuda()
-    weights = torch.load(_WEIGHTS_PATH, map_location="cuda", weights_only=True)
-    model.load_state_dict(weights)
-    model.eval()
-
     val_data = np.load(_VAL_PDE_PATH)
     X = CorrectionInputNormalizer.build_feature_matrix(val_data)
     pde_npv = val_data["pde_npv"].astype(np.float64)
     mc_npv = val_data["npv"].astype(np.float64)
 
-    with torch.no_grad():
-        X_tensor = torch.tensor(norm_in.transform(X), dtype=torch.float32, device="cuda")
-        pred_res_norm = model(X_tensor)
-        delta_v_pred = norm_out.inverse_transform_tensor(pred_res_norm).cpu().numpy().flatten()
+    member_paths = [
+        os.path.join(os.path.dirname(_WEIGHTS_PATH), f"autocall_correction_mlp_member_{k}.pth")
+        for k in range(5)
+    ]
+    if all(os.path.exists(p) for p in member_paths):
+        from deepvol.surrogates.correction_ensemble import CorrectionEnsemble
+        ensemble = CorrectionEnsemble(
+            K=5,
+            in_dim=19,
+            hidden=DEFAULT_CORRECTION_CONFIG["hidden"],
+            n_layers=DEFAULT_CORRECTION_CONFIG["n_layers"],
+            dropout=0.0,
+        ).cuda()
+        ensemble.load_members(member_paths, device="cuda")
+        ensemble.eval()
+        with torch.no_grad():
+            X_tensor = torch.tensor(norm_in.transform(X), dtype=torch.float32, device="cuda")
+            pred_res_norm, _ = ensemble(X_tensor)
+            delta_v_pred = norm_out.inverse_transform_tensor(pred_res_norm).cpu().numpy().flatten()
+    else:
+        model = CorrectionMLP(
+            in_dim=19,
+            hidden=DEFAULT_CORRECTION_CONFIG["hidden"],
+            n_layers=DEFAULT_CORRECTION_CONFIG["n_layers"],
+            dropout=DEFAULT_CORRECTION_CONFIG["dropout"],
+        ).cuda()
+        weights = torch.load(_WEIGHTS_PATH, map_location="cuda", weights_only=True)
+        model.load_state_dict(weights)
+        model.eval()
+        with torch.no_grad():
+            X_tensor = torch.tensor(norm_in.transform(X), dtype=torch.float32, device="cuda")
+            pred_res_norm = model(X_tensor)
+            delta_v_pred = norm_out.inverse_transform_tensor(pred_res_norm).cpu().numpy().flatten()
 
     total_npv_pred = pde_npv + delta_v_pred
     errors_bps = (total_npv_pred - mc_npv) * 10000

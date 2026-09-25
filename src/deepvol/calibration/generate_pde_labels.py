@@ -33,23 +33,28 @@ from deepvol.models.autocall_pde import price_autocall_pde_scalar
 def compute_pde_label(
     v0: float, B: float, coupon: float, T: float,
     n_obs_per_year: float, r: float,
+    kappa: float = 2.0, theta: float = 0.04, sigma: float = 0.3,
 ) -> Tuple[float, float, float]:
-    """Compute 1D BS-PDE price with flat effective vol sigma = sqrt(v0).
+    """Compute 1D BS-PDE price with Gatheral second-order effective vol.
 
-    Uses the Gatheral (2006) first-order effective volatility projection:
-    sigma_eff = sqrt(v0), which captures the ATM level but not skew/smile.
-    The MLP correction learns the Heston stochastic vol residual.
+    Uses Heston variance swap approximation:
+      σ_eff²(t) = v0·e^{-κt} + θ·(1-e^{-κt}) + σ²/(4κ)·(1-e^{-κt})
 
-    Optimizations vs naive approach:
-      - N_T = max(252, n_obs * 16): reduced from n_obs * 32. 16 sub-steps
-        per obs interval gives O(dt^2) CN accuracy without excess cost.
-      - rannacher_steps=2: 1 full BE step per obs date suffices for smoothing.
+    This captures the term structure from mean reversion and vol-of-vol
+    convexity, but not skew (ρ effect). The MLP correction learns the
+    residual from ρ-induced skew and higher-order effects.
+
+    Ref: Gatheral (2006), 'The Volatility Surface', ch. 3, eq. (3.6).
 
     Returns:
         (npv, delta, gamma) — PDE price and spatial Greeks at S0=100.
     """
-    sigma_eff = float(np.sqrt(max(v0, 1e-8)))
-    sigma_func = lambda t, S: np.full_like(S, sigma_eff)
+    def sigma_func(t: float, S: np.ndarray) -> np.ndarray:
+        ekt = np.exp(-kappa * max(float(t), 1e-10))
+        var_t = v0 * ekt + theta * (1.0 - ekt) + (sigma**2 / (4.0 * max(kappa, 1e-4))) * (1.0 - ekt)
+        sig_val = float(np.clip(np.sqrt(max(var_t, 1e-8)), 0.01, 2.0))
+        return np.full_like(S, sig_val)
+
     n_obs = int(round(T * n_obs_per_year))
     N_T = max(252, n_obs * 16)
     obs_indices = [int(round(i * N_T / n_obs)) for i in range(1, n_obs + 1)]
@@ -86,6 +91,9 @@ coupon_all = data["coupon"][start:end].astype(np.float64)
 T_all = data["T"][start:end].astype(np.float64)
 n_obs_all = data["n_obs_per_year"][start:end].astype(np.float64)
 r_all = data["r"][start:end].astype(np.float64)
+kappa_all = data["kappa"][start:end].astype(np.float64) if "kappa" in data else np.full(count, 2.0, dtype=np.float64)
+theta_all = data["theta"][start:end].astype(np.float64) if "theta" in data else np.full(count, 0.04, dtype=np.float64)
+sigma_all = data["sigma"][start:end].astype(np.float64) if "sigma" in data else np.full(count, 0.3, dtype=np.float64)
 
 report_interval = max(50, count // 20)
 
@@ -96,8 +104,11 @@ for i in range(count):
     T = float(T_all[i])
     n_obs_per_year = float(n_obs_all[i])
     r = float(r_all[i])
+    kappa = float(kappa_all[i])
+    theta = float(theta_all[i])
+    sigma = float(sigma_all[i])
 
-    sigma_eff = float(np.sqrt(max(v0, 1e-8)))
+    sigma_atm = float(np.clip(np.sqrt(max(v0, 1e-8)), 0.01, 2.0))
     n_obs = int(round(T * n_obs_per_year))
     N_T = max(252, n_obs * 16)
     N_S = 300
@@ -109,45 +120,43 @@ for i in range(count):
     obs_set = set(obs_indices)
     barrier_level = B * S0
 
-    S_min = max(1e-3, S0 * np.exp(-6.0 * sigma_eff * np.sqrt(T)))
-    S_max = S0 * np.exp(6.0 * sigma_eff * np.sqrt(T))
+    S_min = max(1e-3, S0 * np.exp(-6.0 * sigma_atm * np.sqrt(T)))
+    S_max = S0 * np.exp(6.0 * sigma_atm * np.sqrt(T))
     S_grid = np.exp(np.linspace(np.log(S_min), np.log(S_max), N_S))
+    t_grid = np.linspace(0.0, T, N_T + 1)
 
     h_minus = S_grid[1:-1] - S_grid[:-2]
     h_plus = S_grid[2:] - S_grid[1:-1]
     h_sum = h_minus + h_plus
     S_mid = S_grid[1:-1]
-    sig2_S2 = (sigma_eff ** 2) * (S_mid ** 2)
-    diff_c = 0.5 * sig2_S2
-    drift_c = r * S_mid
-    a_op = (2.0 * diff_c / (h_minus * h_sum)) - (drift_c / h_sum)
-    c_op = (2.0 * diff_c / (h_plus * h_sum)) + (drift_c / h_sum)
-    b_op = -(2.0 * diff_c / (h_plus * h_minus)) - r
+    S_mid_sq = S_mid ** 2
 
-    def step(V, dt_s, tw, V0, Ve):
-        ew = 1.0 - tw
-        As = -tw * dt_s * a_op
-        Ad = 1.0 - tw * dt_s * b_op
-        Au = -tw * dt_s * c_op
-        rhs = (ew * dt_s * a_op) * V[:-2] + (1.0 + ew * dt_s * b_op) * V[1:-1] + (ew * dt_s * c_op) * V[2:]
-        rhs[0] -= As[0] * V0
-        rhs[-1] -= Au[-1] * Ve
-        ab = np.zeros((3, N_S - 2), dtype=np.float64)
-        ab[0, 1:] = Au[:-1]; ab[1, :] = Ad; ab[2, :-1] = As[1:]
-        Vn = np.empty_like(V)
-        Vn[0] = V0; Vn[-1] = Ve; Vn[1:-1] = solve_banded((1, 1), ab, rhs)
-        return Vn
+    # Precalculate time-independent spatial geometry terms
+    diff_geom_a = (2.0 * 0.5 * S_mid_sq) / (h_minus * h_sum)
+    diff_geom_c = (2.0 * 0.5 * S_mid_sq) / (h_plus * h_sum)
+    diff_geom_b = -(2.0 * 0.5 * S_mid_sq) / (h_plus * h_minus)
+    drift_c = r * S_mid
+    drift_a = -drift_c / h_sum
+    drift_c_term = drift_c / h_sum
 
     V = np.ones(N_S, dtype=np.float64)
     if N_T in obs_set:
         V[S_grid >= barrier_level] = 1.0 + coupon * T
 
     obs_times = sorted([float(oi) * dt for oi in obs_indices])
-    t_grid = np.linspace(0, T, N_T + 1)
 
     be_remaining = 0
     for k in range(N_T - 1, -1, -1):
         t_k = float(t_grid[k])
+        ekt = np.exp(-kappa * max(t_k, 1e-10))
+        var_k = v0 * ekt + theta * (1.0 - ekt) + (sigma**2 / (4.0 * max(kappa, 1e-4))) * (1.0 - ekt)
+        sig_k = float(np.clip(np.sqrt(max(var_k, 1e-8)), 0.01, 2.0))
+        sig2_k = sig_k ** 2
+
+        a_op = sig2_k * diff_geom_a + drift_a
+        c_op = sig2_k * diff_geom_c + drift_c_term
+        b_op = sig2_k * diff_geom_b - r
+
         V0k = float(np.exp(-r * (T - t_k)))
         future = [t for t in obs_times if t >= t_k - 1e-8]
         if future:
@@ -155,8 +164,23 @@ for i in range(count):
             Vek = float(np.exp(-r * (tn - t_k)) * (1.0 + coupon * tn))
         else:
             Vek = float(np.exp(-r * (T - t_k)))
+
         tw = 1.0 if be_remaining > 0 else 0.5
-        V = step(V, dt, tw, V0k, Vek)
+        ew = 1.0 - tw
+        As = -tw * dt * a_op
+        Ad = 1.0 - tw * dt * b_op
+        Au = -tw * dt * c_op
+
+        rhs = (ew * dt * a_op) * V[:-2] + (1.0 + ew * dt * b_op) * V[1:-1] + (ew * dt * c_op) * V[2:]
+        rhs[0] -= As[0] * V0k
+        rhs[-1] -= Au[-1] * Vek
+
+        ab = np.zeros((3, N_S - 2), dtype=np.float64)
+        ab[0, 1:] = Au[:-1]; ab[1, :] = Ad; ab[2, :-1] = As[1:]
+        Vn = np.empty_like(V)
+        Vn[0] = V0k; Vn[-1] = Vek; Vn[1:-1] = solve_banded((1, 1), ab, rhs)
+        V = Vn
+
         if be_remaining > 0:
             be_remaining -= 1
         if k > 0 and k in obs_set:
