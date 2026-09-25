@@ -303,6 +303,102 @@ def _load_model() -> None:
     _get_cached_container("rough_heston")
 
 
+# ── Autocall Model State & Cache ───────────────────────────────────────────────
+
+_AUTOCALL_CACHE: Dict[str, Any] = {
+    "ensemble": None,
+    "norm_in": None,
+    "norm_out": None,
+    "guardian": None,
+    "tau_ood": 2.17,
+    "calib": {},
+    "device": None,
+    "loaded": False,
+}
+
+
+def _get_autocall_state() -> Dict[str, Any]:
+    """Retrieve or lazy-load the Phase D Autocall CorrectionEnsemble and Guardian."""
+    if not _AUTOCALL_CACHE["loaded"]:
+        import json
+        from deepvol.utils.path_helpers import get_project_root
+        from deepvol.surrogates.correction_ensemble import CorrectionEnsemble
+        from deepvol.training.train_correction import (
+            CorrectionInputNormalizer,
+            CorrectionOutputNormalizer,
+        )
+        from deepvol.mrm.autocall_guardian import AutocallModelGuardian
+
+        root = get_project_root()
+        weights_dir = root / "artifacts" / "weights"
+        scalers_dir = root / "artifacts" / "scalers"
+
+        member_paths = [
+            str(weights_dir / f"autocall_correction_mlp_member_{k}.pth")
+            for k in range(5)
+        ]
+        norm_in_path = str(scalers_dir / "correction_input_normalizer.npz")
+        norm_out_path = str(scalers_dir / "correction_output_normalizer.npz")
+        calib_path = str(weights_dir / "ensemble_calibration.json")
+
+        for p in member_paths:
+            if not os.path.exists(p):
+                raise HTTPException(status_code=500, detail=f"Member weight not found: {p}")
+        if not os.path.exists(norm_in_path) or not os.path.exists(norm_out_path):
+            raise HTTPException(status_code=500, detail="Correction normalizers not found")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        norm_in = CorrectionInputNormalizer.load(norm_in_path)
+        norm_out = CorrectionOutputNormalizer.load(norm_out_path)
+
+        tau_ood = 2.17
+        calib = {}
+        if os.path.exists(calib_path):
+            with open(calib_path, "r", encoding="utf-8") as f:
+                calib = json.load(f)
+            tau_ood = float(calib.get("tau_ood", calib.get("tau_ood_p99_bps", 2.17)))
+
+        ensemble = CorrectionEnsemble(K=5, in_dim=19, hidden=256, n_layers=4, dropout=0.0)
+        ensemble.load_members(member_paths, device=device)
+        ensemble.eval()
+
+        guardian = AutocallModelGuardian(
+            model=ensemble,
+            norm_in=norm_in,
+            norm_out=norm_out,
+            tau_ood=tau_ood,
+            device=str(device),
+        )
+
+        _AUTOCALL_CACHE.update({
+            "ensemble": ensemble,
+            "norm_in": norm_in,
+            "norm_out": norm_out,
+            "guardian": guardian,
+            "tau_ood": tau_ood,
+            "calib": calib,
+            "device": device,
+            "loaded": True,
+        })
+    return _AUTOCALL_CACHE
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    """Preload models and warm up GPU at application startup."""
+    try:
+        _load_model()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("FNO model preload skipped: %s", exc)
+    try:
+        _get_autocall_state()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Autocall ensemble preload skipped: %s", exc)
+
+
 # ── Pydantic schemas ───────────────────────────────────────────────────────────
 
 class HestonParams(BaseModel):
@@ -357,6 +453,38 @@ class DeribitSummaryResponse(BaseModel):
     atm_iv:        Optional[float]
     term_structure: Dict[str, float]
     spot:          Optional[float]
+
+
+class AutocallPriceRequest(BaseModel):
+    kappa: float = Field(2.0, description="Heston mean reversion speed")
+    theta: float = Field(0.04, description="Heston long-term variance")
+    sigma: float = Field(0.3, description="Heston vol of vol")
+    rho: float = Field(-0.7, description="Heston spot-vol correlation")
+    v0: float = Field(0.04, description="Heston initial variance")
+    B: float = Field(1.0, description="Autocall barrier level as fraction of S0")
+    coupon: float = Field(0.10, description="Annual coupon rate")
+    T: float = Field(1.5, description="Maturity in years")
+    n_obs_per_year: float = Field(4.0, description="Observation frequency per year")
+    r: float = Field(0.03, description="Risk-free rate")
+    use_guardian: bool = Field(True, description="Route through SR 26-2 model risk guardian")
+
+
+class AutocallPriceResponse(BaseModel):
+    npv: float
+    pde_npv: float
+    correction_bps: float
+    uncertainty_bps: float
+    is_ood: bool
+    is_fallback: bool
+    fallback_trigger: Optional[str] = None
+    fallback_reasons: List[str] = []
+    df_dB: float
+    latency_ms: float
+    tau_ood: float
+
+
+class AutocallPriceBatchRequest(BaseModel):
+    items: List[AutocallPriceRequest] = Field(..., max_length=100)
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -1396,6 +1524,123 @@ async def session_greeks(session_id: str, req: SessionGreeksRequest) -> GreeksRe
             greeks_req[k] = v
 
     return await compute_model_greeks(model_name, greeks_req)
+
+
+# ── Autocall Endpoints ────────────────────────────────────────────────────────
+
+@app.post("/autocall/price", response_model=AutocallPriceResponse, tags=["Autocall"])
+async def autocall_price(req: AutocallPriceRequest) -> AutocallPriceResponse:
+    """
+    Price a capital-protected autocallable note using the Phase D CorrectionEnsemble.
+    Computes Gatheral second-order effective vol Crank-Nicolson PDE base price,
+    applies the 5-member residual MLP correction with epistemic uncertainty,
+    and screens through SR 26-2 AutocallModelGuardian.
+    """
+    state = _get_autocall_state()
+    ensemble = state["ensemble"]
+    norm_in = state["norm_in"]
+    norm_out = state["norm_out"]
+    guardian = state["guardian"]
+    tau_ood = state["tau_ood"]
+    device = state["device"]
+
+    t0 = time.perf_counter()
+
+    from deepvol.calibration.generate_pde_labels import compute_pde_label
+    from deepvol.training.train_correction import compute_total_barrier_derivative
+
+    # 1. Crank-Nicolson PDE base price with Gatheral second-order effective vol
+    pde_npv, pde_delta, pde_gamma = compute_pde_label(
+        v0=req.v0,
+        B=req.B,
+        coupon=req.coupon,
+        T=req.T,
+        n_obs_per_year=req.n_obs_per_year,
+        r=req.r,
+        kappa=req.kappa,
+        theta=req.theta,
+        sigma=req.sigma,
+    )
+
+    raw_params = req.model_dump()
+    raw_params["pde_npv"] = float(pde_npv)
+    raw_params["pde_delta"] = float(pde_delta)
+    raw_params["pde_gamma"] = float(pde_gamma)
+
+    # 2. 19-dim feature vector and ensemble forward pass with routing
+    X = norm_in.build_feature_matrix({k: [v] for k, v in raw_params.items()})
+    X_t = norm_in.to_tensor(X, device=device)
+
+    with torch.no_grad():
+        mean_pred, std_bps_tensor, ood_mask_tensor = ensemble.predict_with_routing(
+            X_t, norm_out, tau_ood=tau_ood
+        )
+
+    uncertainty_bps = float(std_bps_tensor.item())
+    is_ood = bool(ood_mask_tensor.item())
+
+    # 3. Route through Guardian or evaluate surrogate directly
+    if req.use_guardian:
+        guardian_res = guardian.predict_with_guardian(raw_params)
+        total_npv = float(guardian_res["npv"])
+        delta_v = float(guardian_res["delta_v"])
+        is_fallback = bool(guardian_res["is_fallback"])
+        fallback_trigger = guardian_res.get("trigger")
+        fallback_reasons = guardian_res.get("reasons", [])
+        df_dB = float(guardian_res.get("df_dB") or 0.0)
+        if is_fallback:
+            is_ood = True
+    else:
+        delta_v = float(norm_out.inverse_transform_tensor(mean_pred).item())
+        total_npv = float(pde_npv) + delta_v
+        is_fallback = False
+        fallback_trigger = None
+        fallback_reasons = []
+
+        try:
+            X_t_grad = X_t.clone().detach().requires_grad_(True)
+            pred_grad = ensemble._forward_uncompiled(X_t_grad)[0]
+            jac = torch.autograd.grad(pred_grad.sum(), X_t_grad, create_graph=False)[0]
+            df_dB_tensor = compute_total_barrier_derivative(
+                jac,
+                {k: torch.tensor([float(v)], device=device) for k, v in raw_params.items()},
+                norm_in,
+                norm_out,
+            )
+            df_dB = float(df_dB_tensor.item())
+        except Exception:
+            df_dB = 0.0
+
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+
+    return AutocallPriceResponse(
+        npv=total_npv,
+        pde_npv=float(pde_npv),
+        correction_bps=delta_v * 10000.0,
+        uncertainty_bps=uncertainty_bps,
+        is_ood=is_ood,
+        is_fallback=is_fallback,
+        fallback_trigger=fallback_trigger,
+        fallback_reasons=fallback_reasons,
+        df_dB=df_dB,
+        latency_ms=latency_ms,
+        tau_ood=tau_ood,
+    )
+
+
+@app.post("/autocall/price_batch", response_model=List[AutocallPriceResponse], tags=["Autocall"])
+async def autocall_price_batch(
+    req: Union[List[AutocallPriceRequest], AutocallPriceBatchRequest]
+) -> List[AutocallPriceResponse]:
+    items = req.items if isinstance(req, AutocallPriceBatchRequest) else req
+    if len(items) > 100:
+        raise HTTPException(status_code=400, detail="Batch size exceeds limit of 100")
+
+    responses: List[AutocallPriceResponse] = []
+    for item in items:
+        resp = await autocall_price(item)
+        responses.append(resp)
+    return responses
 
 
 # ── WebSocket Risk Streaming Endpoint ──────────────────────────────────────────
