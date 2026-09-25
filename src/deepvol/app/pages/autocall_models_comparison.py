@@ -14,7 +14,7 @@ from deepvol.models.autocall_pde import price_autocall_pde_scalar
 from deepvol.models.autocall_slv import lv_vs_heston_comparison
 
 st.set_page_config(page_title="Autocall Model Comparison", layout="wide")
-st.title("🔬 Autocall Model Comparison: Heston vs LV vs SLV vs PDE")
+st.title("Autocallable Model Cross-Validation: Heston vs LV vs SLV vs PDE")
 st.caption("Cross-model risk and pricing comparison across Stochastic Volatility, Pure Dupire Local Volatility, McKean-Vlasov SLV, and 1D Finite Difference PDE.")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -70,7 +70,7 @@ try:
     )
 except torch.cuda.OutOfMemoryError:
     torch.cuda.empty_cache()
-    st.error("⚠️ GPU out of memory. Reduce parameters and retry.")
+    st.error("GPU memory limit exceeded. Reduce parameters and retry.")
     st.stop()
 
 c1, c2, c3, c4 = st.columns(4)

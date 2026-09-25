@@ -12,7 +12,6 @@ import streamlit as st
 
 st.set_page_config(
     page_title="DeepVol — Quantitative Volatility Platform",
-    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -33,7 +32,7 @@ st.header("Available Modules")
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.markdown("### 📊 Core Calibration")
+    st.markdown("### Core Calibration")
     st.markdown("""
 | Dashboard | Description |
 |-----------|-------------|
@@ -44,7 +43,7 @@ with col1:
     """)
 
 with col2:
-    st.markdown("### 🚀 Advanced Models (P14–P16)")
+    st.markdown("### Advanced Quantitative Pricing Models")
     st.markdown("""
 | Dashboard | Description |
 |-----------|-------------|
@@ -52,14 +51,14 @@ with col2:
 | **P15 D-XVA Hedging** | Heston MC → PIVOT IV → LSTM policy → P&L variance |
 | **P14 PI-M-FNO Adaptation** | Reptile / FOMAML online adaptation to crisis surfaces |
 | **EGNO Multi-Asset** | Graph neural operator for basket option pricing |
-| **Autocall Pricer** | 1-leg vanilla autocall: MLP surrogate + MC pricing, Greeks, scenario analysis |
+| **Autocall Pricer** | 1-leg vanilla autocall: Residual Ensemble + PDE + MC pricing, Greeks, scenario analysis |
 | **Phoenix Pricer** | 2-barrier autocall: coupon corridor + memory coupons, MLP surrogate |
 | **Worst-of Autocall** | 2-asset correlated Heston, EGNO surrogate, correlation sensitivity |
-| **Model Comparison** | Heston / LV / SLV / PDE reference pricer, model risk quantification |
+| **Model Comparison** | Heston / LV / SLV / PDE cross-validation, model risk quantification |
     """)
 
 with col3:
-    st.markdown("### ⚠️ Risk & Analytics")
+    st.markdown("### Risk & Quantitative Analytics")
     st.markdown("""
 | Dashboard | Description |
 |-----------|-------------|
@@ -78,7 +77,7 @@ import torch
 col_a, col_b, col_c, col_d = st.columns(4)
 
 gpu_available = torch.cuda.is_available()
-col_a.metric("GPU", "✅ Available" if gpu_available else "⚠️ CPU Only")
+col_a.metric("GPU", "Available" if gpu_available else "CPU Only")
 if gpu_available:
     device_name = torch.cuda.get_device_name(0)
     total_mem   = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -103,10 +102,10 @@ try:
     if str(cpp_dir) not in sys.path:
         sys.path.insert(0, str(cpp_dir))
     import deepvol_cuda  # noqa: F401
-    st.success("✅ `deepvol_cuda` CUDA extension loaded (Grey Rough Bergomi available)")
+    st.success("`deepvol_cuda` CUDA extension loaded (Grey Rough Bergomi available)")
 except ImportError:
     st.warning(
-        "⚠️ `deepvol_cuda` extension not found — "
+        "`deepvol_cuda` extension not found — "
         "P16 Grey Rough Bergomi panel will be unavailable. "
         "Build with: `python src/deepvol/cpp/setup.py build_ext --inplace`"
     )

@@ -1,36 +1,46 @@
 """
 Streamlit Dashboard Panel for Phoenix Two-Barrier Autocallable Notes.
 """
+from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 import torch
 
+_SRC_DIR = Path(__file__).resolve().parents[3]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from deepvol.utils.path_helpers import get_project_root
+_PROJECT_ROOT = get_project_root()
+
 from deepvol.models.phoenix import price_phoenix_mc, phoenix_decomposition
 from deepvol.models.autocall import price_autocall_mc, make_obs_indices
 from deepvol.hedging.d_xva import simulate_heston_paths
 from deepvol.surrogates.phoenix_mlp import PhoenixMLP, PhoenixInputNormalizer, PhoenixOutputNormalizer
 
-st.set_page_config(page_title="Phoenix Autocall Pricer", layout="wide")
-st.title("🦅 Phoenix Autocall Pricer — Two-Barrier Structure")
-st.caption("Two-barrier autocallable note: Autocall Barrier (B_call) + Coupon Corridor Barrier (B_cpn) with optional memory coupon accumulation.")
+st.set_page_config(page_title="Phoenix Autocall Valuation", layout="wide")
+st.title("Phoenix Autocallable Structured Note Valuation Engine")
+st.caption("Two-barrier structured note: Autocall Barrier (B_call) and Coupon Corridor Barrier (B_cpn) with optional memory coupon accumulation.")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @st.cache_resource
 def _load_phoenix_surrogate():
-    weights_path = "artifacts/weights/phoenix_mlp_best.pth"
-    norm_in_path = "artifacts/scalers/phoenix_input_normalizer.npz"
-    norm_out_path = "artifacts/scalers/phoenix_output_normalizer.npz"
+    weights_path = _PROJECT_ROOT / "artifacts" / "weights" / "phoenix_mlp_best.pth"
+    norm_in_path = _PROJECT_ROOT / "artifacts" / "scalers" / "phoenix_input_normalizer.npz"
+    norm_out_path = _PROJECT_ROOT / "artifacts" / "scalers" / "phoenix_output_normalizer.npz"
 
-    if os.path.exists(weights_path) and os.path.exists(norm_in_path) and os.path.exists(norm_out_path):
-        norm_in = PhoenixInputNormalizer.load(norm_in_path)
-        norm_out = PhoenixOutputNormalizer.load(norm_out_path)
+    if weights_path.exists() and norm_in_path.exists() and norm_out_path.exists():
+        norm_in = PhoenixInputNormalizer.load(str(norm_in_path))
+        norm_out = PhoenixOutputNormalizer.load(str(norm_out_path))
         model = PhoenixMLP().to(DEVICE)
-        model.load_state_dict(torch.load(weights_path, map_location=DEVICE))
+        model.load_state_dict(torch.load(str(weights_path), map_location=DEVICE))
         model.eval()
         return model, norm_in, norm_out
     return None, None, None
@@ -83,7 +93,7 @@ else:
         npv_val, cp_val, cpn_val, el_val = float(npv_t.item()), float(cp_t.item()), float(cpn_t.item()), float(el_t.item())
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
-        st.error("⚠️ GPU out of memory. Reduce MC path count or tenor and retry.")
+        st.error("GPU memory limit exceeded. Reduce Monte Carlo path count or tenor.")
         st.stop()
 
 # Vanilla benchmark for decomposition
@@ -95,7 +105,7 @@ r_t = torch.tensor([r], dtype=torch.float64, device=DEVICE)
 npv_va, _, _ = price_autocall_mc(S_bench, obs_indices, B_call_t, c_t, r_t, T, T / N_steps)
 npv_vanilla = float(npv_va.item())
 
-tab1, tab2, tab3 = st.tabs(["📊 Pricing & Decomposition", "🎯 Barrier Sensitivity", "🧠 Memory Analysis"])
+tab1, tab2, tab3 = st.tabs(["Valuation & Decomposition", "Barrier Sensitivity", "Memory Analysis"])
 
 with tab1:
     col1, col2, col3, col4 = st.columns(4)

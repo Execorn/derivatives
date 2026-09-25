@@ -1,35 +1,45 @@
 """
 Streamlit Dashboard Panel for Worst-of 2-Asset Autocallable Notes.
 """
+from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 import torch
 
+_SRC_DIR = Path(__file__).resolve().parents[3]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from deepvol.utils.path_helpers import get_project_root
+_PROJECT_ROOT = get_project_root()
+
 from deepvol.models.wof_autocall import simulate_correlated_heston_paths, price_wof_autocall_mc
 from deepvol.models.autocall import price_autocall_mc, make_obs_indices
 from deepvol.surrogates.wof_autocall_egno import WoFAutocallEGNO, WoFInputNormalizer, WoFOutputNormalizer
 
-st.set_page_config(page_title="Worst-of Autocall Pricer", layout="wide")
-st.title("📊 Worst-of Autocall Pricer — 2-Asset Correlated Heston")
+st.set_page_config(page_title="Worst-of Autocall Valuation", layout="wide")
+st.title("Worst-of 2-Asset Autocallable Structured Note Valuation Engine")
 st.caption("Multi-asset structured product evaluated on the minimum performance: min(S1_t/S1_0, S2_t/S2_0) >= B.")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @st.cache_resource
 def _load_wof_surrogate():
-    weights_path = "artifacts/weights/wof_mlp_best.pth"
-    norm_in_path = "artifacts/scalers/wof_input_normalizer.npz"
-    norm_out_path = "artifacts/scalers/wof_output_normalizer.npz"
+    weights_path = _PROJECT_ROOT / "artifacts" / "weights" / "wof_mlp_best.pth"
+    norm_in_path = _PROJECT_ROOT / "artifacts" / "scalers" / "wof_input_normalizer.npz"
+    norm_out_path = _PROJECT_ROOT / "artifacts" / "scalers" / "wof_output_normalizer.npz"
 
-    if os.path.exists(weights_path) and os.path.exists(norm_in_path) and os.path.exists(norm_out_path):
-        norm_in = WoFInputNormalizer.load(norm_in_path)
-        norm_out = WoFOutputNormalizer.load(norm_out_path)
+    if weights_path.exists() and norm_in_path.exists() and norm_out_path.exists():
+        norm_in = WoFInputNormalizer.load(str(norm_in_path))
+        norm_out = WoFOutputNormalizer.load(str(norm_out_path))
         model = WoFAutocallEGNO().to(DEVICE)
-        model.load_state_dict(torch.load(weights_path, map_location=DEVICE))
+        model.load_state_dict(torch.load(str(weights_path), map_location=DEVICE))
         model.eval()
         return model, norm_in, norm_out
     return None, None, None
@@ -84,7 +94,7 @@ try:
     npv_a2, cp_a2, _ = price_autocall_mc(S2, obs_indices, B_t, c_t, r_t, T, T / N_steps)
 except torch.cuda.OutOfMemoryError:
     torch.cuda.empty_cache()
-    st.error("⚠️ GPU out of memory. Reduce MC path count or tenor and retry.")
+    st.error("GPU memory limit exceeded. Reduce Monte Carlo path count or tenor.")
     st.stop()
 
 st.subheader("Pricing Results")
