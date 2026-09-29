@@ -1,6 +1,6 @@
 # Mathematical Specifications and Usage Examples for the DeepVol Model Zoo
 
-This document provides the mathematical formulations, discretization schemes, and functional Python API examples for the ten volatility and asset pricing models implemented in the `DeepVol` framework.
+This document provides the mathematical formulations, discretization schemes, and functional Python API examples for the sixteen volatility and asset pricing models implemented in the `DeepVol` framework.
 
 ---
 
@@ -364,4 +364,181 @@ option_price = engine.price_option(
     spot=100.0, strike=105.0, maturity=0.5, risk_free_rate=0.05, is_call=True
 )
 print("Schwartz-Smith Futures Option Price:", option_price)
+```
+
+---
+
+## 11. Physics-Informed Meta-Learning FNO (PI-M-FNO)
+
+### Mathematical Formulation
+The PI-M-FNO surrogate integrates the Dupire local volatility partial differential equation directly into operator training:
+
+$$\mathcal{L}_{\text{PDE}}(u) = \left\| \frac{\partial C}{\partial T} - \frac{1}{2} \sigma_{\text{loc}}^2(K, T) K^2 \frac{\partial^2 C}{\partial K^2} + (r-q) K \frac{\partial C}{\partial K} + q C \right\|_{L^2}^2$$
+
+During extreme market stress or regime shifts, the base operator weights $\theta$ are adapted via an inner-loop gradient step on the PDE residual without requiring new labeled market data:
+
+$$\theta' = \theta - \alpha \nabla_\theta \mathcal{L}_{\text{PDE}}(u_\theta)$$
+
+### Python Example
+```python
+import torch
+from deepvol.surrogates.meta_fno import MetaLearnerFNO
+from deepvol.surrogates.pde_loss import compute_pde_loss_grid
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+meta_fno = MetaLearnerFNO(param_dim=6, inner_lr=1e-3).to(device)
+
+# Parameter vector and spatial evaluation grid
+theta = torch.tensor([[2.5, 0.05, 0.6, -0.75, 0.05, 0.09]], device=device)
+spatial_grid = torch.randn(1, 8, 11, 2, device=device)
+
+# Perform online inner adaptation step (< 10 ms)
+adapted_surface = meta_fno.adapt_online(theta, spatial_grid, num_inner_steps=2)
+print("Adapted Volatility Surface Shape:", adapted_surface.shape)
+```
+
+---
+
+## 12. End-to-End Differentiable Calibration & Hedging (D-XVA)
+
+### Mathematical Formulation
+D-XVA unifies model calibration, implied volatility inversion via PIVOT, and recurrent deep hedging into a single differentiable computational graph:
+
+$$\min_{\theta, \psi} \mathcal{L}(\theta, \psi) = \text{Var}\left( \Pi_T(\psi) \right) + \lambda_{\text{cost}} \mathbb{E}\left[ \sum_{t=0}^{T-1} c |\Delta_{t+1} - \Delta_t| S_t \right] + \lambda_{\text{cal}} \|\sigma_{\text{IV}}(\theta) - \sigma_{\text{market}}\|_2^2$$
+
+where $\psi$ parametrizes an LSTM/GRU hedging policy network and $\theta$ parametrizes the rough volatility dynamics. Gradients backpropagate directly from terminal portfolio variance into calibration parameters.
+
+### Python Example
+```python
+import torch
+from deepvol.hedging.deep_hedging import DeepHedgingEngine
+from deepvol.hedging.d_xva import compute_dxva_loss
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+hedger = DeepHedgingEngine(input_dim=5, hidden_dim=64, num_layers=2).to(device)
+
+# Batch of simulated asset and implied vol trajectories (batch, time, features)
+trajectories = torch.randn(128, 50, 5, device=device)
+strike = 100.0
+
+# Compute hedge ratios and differentiable trading loss
+deltas = hedger(trajectories)
+loss = compute_dxva_loss(deltas, trajectories[:, :, 0], strike=strike, cost_bps=5.0)
+print("D-XVA Optimization Loss:", loss.item())
+```
+
+---
+
+## 13. Grey Rough Bergomi (gRB) Model
+
+### Mathematical Formulation
+The Grey Rough Bergomi model generalizes rough Bergomi by driving the variance process with generalized grey Brownian motion (ggBm) $B_t^{\beta, \alpha}$:
+
+$$v_t = v_0 \mathcal{E}\left( \eta \sqrt{2H} Y_t \right), \qquad Y_t = \int_0^t (t-s)^{H-\tfrac{1}{2}} dB_s^{\beta, \alpha}$$
+
+The characteristic function of ggBm is governed by the two-parameter Mittag-Leffler function $E_{\alpha, \beta}(z) = \sum_{k=0}^\infty \frac{z^k}{\Gamma(\alpha k + \beta)}$. Path generation is performed using Wood-Chan circulant embedding on GPU.
+
+### Python Example
+```python
+import torch
+from deepvol.models.rbergomi_gpu import rBergomiEngine
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+engine = rBergomiEngine()
+
+# Simulate paths on GPU using Wood-Chan circulant embedding
+paths = engine.simulate_paths(
+    v0=0.04, H=0.10, eta=1.4, rho=-0.75,
+    N_paths=10000, N_steps=100, T=1.0, device=device
+)
+print("gRB Simulated Asset Paths Shape:", paths.shape)
+```
+
+---
+
+## 14. Autocallable Structured Notes (Multi-Fidelity PDE + Ensemble MLP)
+
+### Mathematical Formulation
+An autocallable structured note defines early redemption stopping times $\tau = \min \{ t_m \in \{T_1, \dots, T_M\} \mid S_{t_m} \geq B_{\text{autocall}} \} \wedge T_M$. At redemption, the contract pays:
+
+$$V_\tau = \begin{cases} 1 + m \cdot c & \text{if early redemption occurs at } t_m \\ 1 + M \cdot c & \text{if } \tau = T_M \text{ and } S_{T_M} \geq B_{\text{autocall}} \\ 1 & \text{if } \tau = T_M, \, S_{T_M} < B_{\text{autocall}}, \text{ and } \min_{t \leq T} S_t > B_{\text{dip}} \\ \frac{S_{T_M}}{S_0} & \text{if capital protection barrier } B_{\text{dip}} \text{ was breached} \end{cases}$$
+
+The multi-fidelity valuation decomposes pricing into an analytical Gatheral boundary PDE base $V_{\text{PDE}}(x)$ and a 5-member residual deep ensemble $\{f_{\psi_k}\}_{k=1}^5$:
+
+$$\hat{V}(x) = V_{\text{PDE}}(x) + \frac{1}{K} \sum_{k=1}^K f_{\psi_k}(x), \qquad \sigma_{\text{bps}}(x) = \sqrt{\frac{1}{K-1} \sum_{k=1}^K \left( f_{\psi_k}(x) - \bar{f}(x) \right)^2} \times 10^4$$
+
+### Python Example
+```python
+import torch
+from deepvol.surrogates.correction_ensemble import CorrectionEnsemble
+from deepvol.mrm.autocall_guardian import AutocallGuardian
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+ensemble = CorrectionEnsemble.load_default(device=device)
+guardian = AutocallGuardian(ensemble)
+
+contract = {
+    "spot": 100.0, "strike": 100.0, "autocall_barrier": 105.0, "dip_barrier": 70.0,
+    "coupon_rate": 0.08, "volatility": 0.22, "rate": 0.03, "dividend": 0.01,
+    "maturity": 2.0, "obs_freq": 0.5
+}
+
+result = guardian.price_contract(contract)
+print(f"Autocall NPV: {result['price']:.4f} ± {result['uncertainty_bps']:.2f} bps")
+print(f"Guardian Routing: {result['routing']}, Fallback Active: {result['fallback_active']}")
+```
+
+---
+
+## 15. Phoenix Memory Coupon Autocallables
+
+### Mathematical Formulation
+Phoenix notes pay conditional memory coupons at observation dates $t_m$. If the underlying asset price exceeds the coupon barrier $B_{\text{coupon}}$, the investor receives the current coupon plus all accrued unpaid coupons:
+
+$$\text{Coupon Payout at } t_m = \begin{cases} (m - \text{last\_paid}) \times c & \text{if } S_{t_m} \geq B_{\text{coupon}} \\ 0 & \text{if } S_{t_m} < B_{\text{coupon}} \end{cases}$$
+
+Early redemption occurs if $S_{t_m} \geq B_{\text{autocall}}$. If the note survives until maturity $T$, capital protection applies provided $S_T \geq B_{\text{dip}}$.
+
+### Python Example
+```python
+import torch
+from deepvol.models.phoenix import price_phoenix_mc
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Vector of contract specs: [S0, K, B_autocall, B_coupon, B_dip, coupon, vol, r, q, T, n_obs]
+specs = torch.tensor([[100.0, 100.0, 105.0, 80.0, 70.0, 0.07, 0.20, 0.02, 0.01, 1.5, 6]], device=device)
+price = price_phoenix_mc(specs, N_paths=50000, device=device)
+print(f"Phoenix Note Price: {price.item():.4f}")
+```
+
+---
+
+## 16. Worst-Of (WoF) Basket Autocallables (EGNO)
+
+### Mathematical Formulation
+Worst-of basket autocallables depend on the joint evolution of $d$ correlated assets $S_t = (S_t^{(1)}, \dots, S_t^{(d)})$. The contract payoff is dictated by the worst-performing asset relative to its initial value:
+
+$$I_t = \min_{j=1, \dots, d} \frac{S_t^{(j)}}{S_0^{(j)}}$$
+
+The asset index permutation group $\mathcal{S}_d$ defines an exact symmetry: for any permutation $\pi \in \mathcal{S}_d$, the contract price satisfies $f(\pi \circ X) = f(X)$. The Equivariant Graph Neural Operator (EGNO) architecture preserves this permutation symmetry through invariant graph pooling and projects correlation matrices onto the positive semi-definite cone $\mathcal{S}_+^d$.
+
+### Python Example
+```python
+import torch
+from deepvol.models.wof_autocall import price_wof_autocall_mc
+from deepvol.surrogates.wof_autocall_egno import WorstOfAutocallEGNO
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+egno_model = WorstOfAutocallEGNO(n_assets=3, hidden_dim=64).to(device)
+
+# Correlated basket specs: 3 asset spots, volatilities, and correlation matrix
+spots = torch.tensor([100.0, 100.0, 100.0], device=device)
+vols = torch.tensor([0.25, 0.22, 0.28], device=device)
+corr = torch.tensor([[1.0, 0.6, 0.5], [0.6, 1.0, 0.55], [0.5, 0.55, 1.0]], device=device)
+
+# Evaluate via EGNO surrogate
+features = torch.cat([spots, vols, corr.flatten()]).unsqueeze(0)
+basket_price = egno_model(features)
+print(f"WoF Basket Autocall Price: {basket_price.item():.4f}")
 ```
