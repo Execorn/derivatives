@@ -1,25 +1,26 @@
-# Deep Rough Heston Calibration via FiLM-FNO
+# DeepVol: Deep Rough Heston Calibration & Structured Derivatives Engine
 
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.8-EE4C2C?style=for-the-badge&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-12.8-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
 [![Python 3.9](https://img.shields.io/badge/Python-3.9-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-1008%20passed-brightgreen?style=for-the-badge)](tests/)
+[![Next.js](https://img.shields.io/badge/Next.js-16+-black?style=for-the-badge&logo=next.js&logoColor=white)](https://nextjs.org/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![Tests](https://img.shields.io/badge/tests-1126%20passed-brightgreen?style=for-the-badge)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
 > **Master's Thesis Project** — МФТИ ФПМИ, Кафедра БИТ, 2026
 > *Нейронные сети в ценообразовании производных финансовых инструментов*
 
-An end-to-end GPU-accelerated system for **real-time calibration** of the
-**Rough Heston stochastic volatility model** (El Euch, Gatheral & Rosenbaum 2019).
-The core idea: replace an expensive Fourier-COS pricer (seconds per surface) with a
-**FiLM-conditioned Fourier Neural Operator (FNO)** surrogate that prices a full 8×11
-implied-volatility surface in under 1 ms — enabling Gauss-Newton calibration at
-interactive speed.
+An end-to-end GPU-accelerated quantitative platform for **real-time calibration**,
+**deep hedging**, and **structured derivatives pricing** under rough stochastic volatility
+(El Euch, Gatheral & Rosenbaum 2019) and multi-asset jump dynamics.
 
-The project covers the full quant stack: mathematical foundations → GPU pricing
-→ neural surrogate → real-time calibration → REST API → live market data integration.
+The system combines:
+1. **FiLM-conditioned Fourier Neural Operators (FNO)** pricing full 8×11 implied-volatility surfaces in under 1 ms.
+2. **SOTA Multi-Fidelity Autocallable Engines**: Crank-Nicolson Gatheral PDE base combined with a 5-member residual `CorrectionEnsemble` MLP delivering 0.99 bps accuracy with epistemic uncertainty estimation and SR 26-2 compliant model governance.
+3. **End-to-End Differentiable Risk & Deep Hedging**: PIVOT implied volatility solver, recurrent LSTM/GRU hedging policies under market frictions, and automated model risk fallback routing.
+4. **Full-Stack Institutional Delivery**: High-throughput FastAPI REST & WebSocket streaming services, Next.js 16+ Turbopack interface with interactive WebGL 3D surfaces, and multi-page Streamlit research dashboards.
 
 ---
 
@@ -48,6 +49,12 @@ The project covers the full quant stack: mathematical foundations → GPU pricin
 | D-XVA gradient flow differentiability | **Non-zero, non-NaN** ($\nabla_{\psi} \text{Var}(\Pi_T) \ne \mathbf{0}$) |
 | Grey Rough Bergomi MC path simulation | **< 15 ms** on GPU (4096 paths, 100 steps) |
 | Sobolev FNO gRB Validation accuracy | **MAE = 0.76 bp, MSE = 7.69e-5** (Active Learning) |
+| Autocall Multi-Fidelity Ensemble (Phase D) | **0.99 bps trimmed RMSE (1.14 bps raw)**, 5-member MLP + PDE base |
+| Autocall Epistemic Uncertainty OOD | Calibrated rejection threshold $\tau_{\text{OOD}} = 2.17$ bps |
+| Autocall Batch GPU Pricing Latency | **~4.5 ms** (batch 1024) vs ~28 s MC — **6000× speedup** |
+| Autocall Sobol-Brownian Bridge QMC | **< 12 ms** (50,000 paths, 252 steps, Milstein) |
+| Worst-Of (WoF) Basket Autocalls (EGNO) | **1.87 bps RMSE**, exact permutation equivariance |
+| Phoenix Memory Coupon Autocalls | **1.35 bps RMSE**, multi-barrier conditional payout |
 
 ---
 
@@ -66,7 +73,8 @@ The project covers the full quant stack: mathematical foundations → GPU pricin
 11. [Models & Weights](#models--weights)
 12. [Project Structure](#project-structure)
 13. [Thesis & Publications](#thesis--publications)
-14. [License](#license)
+14. [Completed Phases](#completed-phases)
+15. [License](#license)
 
 ---
 
@@ -131,7 +139,7 @@ $10^6$. We apply a **reparameterization** $(v_0, \zeta, \lambda)$ reducing it by
 
 ## DeepVol Model Zoo
 
-The DeepVol framework contains a diverse "Zoo" of 13 volatility and derivatives models, implemented with high-performance CPU/GPU solvers and integrated with real-time calibration:
+The DeepVol framework contains a diverse "Zoo" of 16 volatility and derivatives models, implemented with high-performance CPU/GPU solvers and integrated with real-time calibration:
 
 1. **Classic Heston Model**: Traditional stochastic volatility model where variance follows a Cox-Ingersoll-Ross (CIR) process. Option pricing is performed using the exact Fourier-COS series expansion method.
 2. **SABR Model (Hagan/Displaced)**: Industry-standard smile model for FX and interest rates. Supports normal (Bachelier) and lognormal (Black) implied volatility via Hagan (2002) asymptotic expansions with displacement shifts.
@@ -146,6 +154,9 @@ The DeepVol framework contains a diverse "Zoo" of 13 volatility and derivatives 
 11. **Physics-Informed Meta-Learning FNO (PI-M-FNO)**: Physics-informed neural operator designed to price options under extreme, out-of-distribution market conditions with fast online GPU adaptation (< 10 ms).
 12. **End-to-End Differentiable Calibration & Hedging (D-XVA)**: Unifies option pricing, implied volatility inversion (PIVOT), and recurrent deep hedging into a single computational graph trained directly on hedging variance.
 13. **Grey Rough Bergomi (gRB) Model**: Generalizes rough Bergomi by replacing fractional Brownian motion with generalized grey Brownian motion, implemented via custom double-precision Mittag-Leffler and Wood-Chan circulant embedding CUDA kernels.
+14. **Autocallable Structured Notes (Multi-Fidelity PDE + Ensemble MLP)**: Crank-Nicolson Gatheral PDE base solver combined with a 5-member residual `CorrectionEnsemble` MLP in 19-dimensional barrier-aware feature space, delivering sub-basis-point accuracy (0.99 bps RMSE) with epistemic uncertainty estimation and SR 26-2 model governance.
+15. **Phoenix Memory Coupon Autocallables**: Structured notes with conditional memory coupons, knock-out barriers, and European/American protection barriers, accelerated via specialized residual MLP surrogates.
+16. **Worst-Of (WoF) Basket Autocallables (EGNO)**: High-dimensional multi-asset basket notes priced via Equivariant Graph Neural Operators (EGNO) enforcing exact permutation equivariance across underlying assets with spectral PSD projection.
 
 ---
 
@@ -228,6 +239,77 @@ ParameterNormalizer.denormalize()
 θ* = (κ*, θ*, σ*, ρ*, V₀*, H*)
 ```
 
+### Autocallable Multi-Fidelity Correction Architecture
+
+Structured autocallable contracts feature discontinuous payoff boundaries across discrete observation dates, creating localized pricing gradients that challenge monolithic neural networks. DeepVol deploys a **hybrid multi-fidelity architecture** combining an analytical PDE prior with an epistemic deep ensemble:
+
+```
+Contract Specifications (19-dim: S, K, B_autocall, B_dip, coupon, vol, r, q, tenors)
+                                │
+                ┌───────────────┴───────────────┐
+                ▼                               ▼
+   Crank-Nicolson Gatheral PDE         19D Feature Normalizer
+         (Low-Fidelity Base)                    │
+                │                               ▼
+                │                   5-Member Correction MLP Ensemble
+                │                      (Residual Blocks + Dropout)
+                │                               │
+                │               ┌───────────────┴───────────────┐
+                │               ▼                               ▼
+                │       Mean Residual ΔV            Epistemic Uncertainty σ_bps
+                │               │                               │
+                └───────► ( + ) ◄───────────────────────────────┘
+                                │
+                                ▼
+                     AutocallModelGuardian (SR 26-2)
+                     - Feature Boundary & OOD Checks
+                     - Epistemic Uncertainty Gate (σ_bps > 2.17)
+                     - Payoff Monotonicity & Arbitrage Audit
+                                │
+                   ┌────────────┴────────────┐
+                   │ Passed                  │ Breached
+                   ▼                         ▼
+        Ensemble Valuation         Analytical PDE / GPU-MC
+        (NPV ± 2σ, Greeks)                 Fallback
+```
+
+**Key components:**
+- **Gatheral Crank-Nicolson PDE Base**: Solves the 1D Dupire/Gatheral boundary PDE with discrete jump conditions at coupon dates, capturing the macro structure of early redemption.
+- **5-Member `CorrectionEnsemble` MLP**: Each member features 4 ResidualBlocks with 256 hidden units trained under Sobolev loss regularization to fit the residual $\Delta V = V_{\text{QMC}} - V_{\text{PDE}}$.
+- **Epistemic Uncertainty Quantification**: Ensemble variance $\sigma_{\text{bps}}$ estimates surrogate uncertainty; queries with $\sigma_{\text{bps}} > \tau_{\text{OOD}} = 2.17$ bps are automatically flagged.
+- **SR 26-2 / SR 11-7 Model Guardian**: Enforces population drift monitoring (PSI), bounds checking, and deterministic fallback routing to high-precision GPU Monte Carlo.
+
+### Full-Stack System Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        User Interfaces & Clients                       │
+│                                                                        │
+│   Next.js 16+ Turbopack App               Streamlit Quantitative Suite │
+│   - Interactive 3D WebGL Surface          - app_main.py (Multi-Page)   │
+│   - Epistemic Uncertainty Gauge           - autocall_pricer.py         │
+│   - Live WebSocket Risk Telemetry         - p16_grey_bergomi.py        │
+│   (http://localhost:3000)                 (http://localhost:8501)      │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ HTTP / WebSocket
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                       FastAPI Orchestration Layer                      │
+│                                                                        │
+│   /autocall/price           /ws/risk (ConflatedQueue)    /iv_surface   │
+│   /autocall/price_batch     /greeks/{model}              /calibrate    │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   DeepVol Quantitative Computing Core                  │
+│                                                                        │
+│   Surrogates & Ensembles          Analytical & PDE       GPU Kernels   │
+│   - FiLM-FNO (2D Modes 8x11)      - Gatheral Crank-Nic   - Quasi-MC    │
+│   - CorrectionEnsemble (K=5)      - Fourier-COS (N=128)  - Wood-Chan   │
+│   - EGNO Permutation Equivariance - SVI Arbitrage Free   - Mittag-L    │
+└────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -272,33 +354,61 @@ chmod +x setup_and_run.sh
 
 ## Quick Start
 
-### 1. Interactive Streamlit Dashboard
+### 1. Web and Research Interfaces
 
-* **Main Calibration Dashboard**:
+* **Next.js Production Web Application**:
+  ```bash
+  cd app_frontend
+  npm install
+  npm run dev
+  # Main interface at http://localhost:3000 (3D surface visualizer & streaming telemetry)
+  # Structured products pricer at http://localhost:3000/autocall (PDE ensemble & SR 26-2 compliance)
+  ```
+
+* **Streamlit Quantitative Research Suite**:
   ```bash
   source .venv/bin/activate
-  streamlit run src/deepvol/app/app_v2.py
-  # Opens http://localhost:8501
+  streamlit run src/deepvol/app/app_main.py
+  # Launches the unified multi-page portal at http://localhost:8501
   ```
-  The calibration dashboard has three tabs:
-  - **IV Surface**: Adjust sliders for all 6 parameters, see the real-time FNO-predicted
-    implied-volatility surface update in < 1 ms.
-  - **Newton Calibration**: Upload or paste a market IV surface, run Gauss-Newton
-    calibration, watch the parameter trajectory converge.
-  - **Greeks**: Compute portfolio delta/gamma/vega for a set of positions.
+  Specialized subpages include `autocall_pricer.py` (multi-fidelity PDE ensemble), `phoenix_pricer.py`, `wof_autocall_pricer.py`, `p16_grey_bergomi.py` (fractional path simulation), `p15_dxva_hedging.py`, `p14_meta_adaptation.py`, and `var_es_risk.py`.
 
-* **Risk Management Dashboard**:
-  ```bash
-  source .venv/bin/activate
-  streamlit run src/deepvol/app/app_v3_risk.py
-  # Opens http://localhost:8501
-  ```
-  The risk dashboard provides:
-  - **Live Risk Telemetry**: Streaming Greeks, latency timelines, and spot updates.
-  - **Scenario Stress Testing**: Stress testing spot/vol shocks on 3D Greeks grids.
-  - **Audit Logs**: Scrolling historical telemetry reports and CSV downloads.
+### 2. Autocallable Pricing with Epistemic Uncertainty (Python API)
 
-### 2. Single Surface Pricing (Python API)
+Price structured autocalls using the hybrid Gatheral PDE base and 5-member residual ensemble with SR 26-2 risk validation:
+
+```python
+import sys; sys.path.insert(0, 'src')
+import torch
+from deepvol.surrogates.correction_ensemble import CorrectionEnsemble
+from deepvol.mrm.autocall_guardian import AutocallGuardian
+
+# Initialize ensemble (loads 5 members + PDE base + normalizers)
+ensemble = CorrectionEnsemble.load_default(device="cuda" if torch.cuda.is_available() else "cpu")
+guardian = AutocallGuardian(ensemble)
+
+# Contract parameters (S0, K, B_autocall, B_dip, coupon, vol, r, q, tenors)
+contract = {
+    "spot": 100.0,
+    "strike": 100.0,
+    "autocall_barrier": 105.0,
+    "dip_barrier": 70.0,
+    "coupon_rate": 0.08,
+    "volatility": 0.20,
+    "rate": 0.03,
+    "dividend": 0.01,
+    "maturity": 2.0,
+    "obs_freq": 0.5,
+}
+
+result = guardian.price_contract(contract)
+print(f"Price (NPV): {result['price']:.4f}")
+print(f"Epistemic Uncertainty: {result['uncertainty_bps']:.2f} bps")
+print(f"PDE Base: {result['pde_base']:.4f}, Residual Correction: {result['correction']:.4f}")
+print(f"Routing Decision: {result['routing']} (Fallback Active: {result['fallback_active']})")
+```
+
+### 3. Single Surface Pricing (Python API)
 
 ```python
 import sys; sys.path.insert(0, 'src')
@@ -308,12 +418,11 @@ from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 from deepvol.calibration.calibrate_bfgs import _load_normalizers, _fno_predict_real_iv, _make_spatial_input
 from deepvol.market.spx_data import T_GRID, K_GRID
 
-# Load model and normalizers
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = MirrorPaddedFNO2d(param_dim=6).to(device)
 model.load_state_dict(torch.load("artifacts/weights/fno_v3_final_prod.pth", map_location=device, weights_only=True))
 model.eval()
-_load_normalizers("v3")  # must be called before any forward pass
+_load_normalizers("v3")
 
 # Parameters: κ=2.0, θ=0.04, σ=0.5, ρ=-0.7, V₀=0.04, H=0.1
 theta = torch.tensor([[2.0, 0.04, 0.5, -0.7, 0.04, 0.1]], dtype=torch.float32, device=device)
@@ -322,42 +431,31 @@ spatial = _make_spatial_input(T_GRID, K_GRID, device)
 with torch.no_grad():
     iv_surface = _fno_predict_real_iv(model, theta, spatial).squeeze().cpu().numpy()
 
-print(iv_surface.shape)    # (8, 11) — implied vol in decimal (0.20 = 20%)
-print(f"ATM 6M: {iv_surface[2, 5]*100:.1f}%")  # roughly 20-25% for typical params
+print(f"IV Surface shape: {iv_surface.shape}")
+print(f"ATM 6M Volatility: {iv_surface[2, 5]*100:.2f}%")
 ```
 
-### 3. Calibrate to a Market Surface
+### 4. Calibrate to a Market Surface
 
 ```python
 import sys; sys.path.insert(0, 'src')
 import torch
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 from deepvol.calibration.calibrate_newton import calibrate_newton_h
-from deepvol.market.spx_data import T_GRID, K_GRID
+from deepvol.market.spx_data import T_GRID, K_GRID, download_spx_chain, clean_chain, to_iv_surface
+from datetime import date
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = MirrorPaddedFNO2d(param_dim=6).to(device)
 model.load_state_dict(torch.load("artifacts/weights/fno_v3_final_prod.pth", map_location=device, weights_only=True))
 model.eval()
 
-# Market IV surface: 8 maturities × 11 strikes (in decimal vol, e.g. 0.20 = 20%)
-from deepvol.market.spx_data import download_spx_chain, clean_chain, to_iv_surface
-from datetime import date
+cleaned = clean_chain(download_spx_chain(date(2024, 1, 2)))
+market_iv = to_iv_surface(cleaned, S0=4700.0, r=0.05, q=0.015)
 
-# Fetch or load market IV surface
-df = download_spx_chain(date(2024, 1, 2))
-cleaned = clean_chain(df)
-
-S0 = 4700.0
-r = 0.05
-q = 0.015
-market_iv = to_iv_surface(cleaned, S0, r, q)  # (8, 11) array
-
-# Gauss-Newton calibration in (v₀, ζ=σρ, λ=σ√(1-ρ²), H) space
 result = calibrate_newton_h(model, market_iv, T_GRID, K_GRID, max_iter=20, verbose=True)
-print(f"RMSE: {result['rmse'] * 1e4:.1f} bps")
-print(f"v0={result['v0']:.4f}  σ={result['sigma']:.3f}  ρ={result['rho']:.3f}  H={result['H']:.3f}")
-print(f"converged: {result['converged']}")
+print(f"RMSE: {result['rmse'] * 1e4:.1f} bps, Converged: {result['converged']}")
+print(f"Calibrated: v0={result['v0']:.4f}, σ={result['sigma']:.3f}, ρ={result['rho']:.3f}, H={result['H']:.3f}")
 ```
 
 ---
@@ -610,15 +708,50 @@ uvicorn deepvol.api.server:app --reload --port 8000 --app-dir src
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Server health, model version, device |
-| `POST` | `/iv_surface` | FNO inference: θ → IV surface |
-| `POST` | `/greeks` | Portfolio Greeks for a set of positions |
-| `GET` | `/vix` | VIX futures term structure for a date |
-| `GET` | `/deribit/snapshot` | Live BTC/ETH IV surface snapshot |
-| `POST` | `/calibrate` | Full calibration: market IV → θ* |
+| `GET` | `/health` | Server health, model versions, and active execution device |
+| `POST` | `/iv_surface` | FNO inference: parameter vector θ → implied volatility surface |
+| `POST` | `/greeks/{model_name}` | Multi-model per-strike Greeks surface (`rough_heston`, `heston`, `sabr`, `ssvi`, `rbergomi`) |
+| `POST` | `/greeks` | Portfolio-level Greeks and hedge contract recommendations |
+| `POST` | `/vix` | VIX futures term structure for a given valuation date |
+| `GET` | `/deribit/snapshot` | Live BTC/ETH implied volatility surface snapshot |
+| `POST` | `/calibrate/{model_name}` | Gauss-Newton / LM model calibration to market surface |
 | `POST` | `/calibrate_neural_sde` | Adjoint calibration of non-parametric Neural SDE prior |
 | `POST` | `/predict/signature_vol` | Signature Volatility weekly options smile forecasting |
-| `POST` | `/hedge/simulate` | Recurrent Deep Hedging delta-hedging simulation |
+| `POST` | `/hedge/simulate` | Recurrent Deep Hedging delta-hedging trajectory simulation |
+| `POST` | `/autocall/price` | Autocall pricing via Crank-Nicolson PDE base + 5-member residual ensemble with SR 26-2 guardian routing |
+| `POST` | `/autocall/price_batch` | Vectorized batch autocall pricing (up to 100 contracts per payload) |
+| `WS` | `/ws/risk` | Streaming WebSocket risk telemetry with `ConflatedQueue` backpressure control |
+
+### Example: POST /autocall/price
+
+```bash
+curl -X POST http://localhost:8000/autocall/price \
+  -H "Content-Type: application/json" \
+  -d '{
+    "spot": 100.0,
+    "strike": 100.0,
+    "autocall_barrier": 105.0,
+    "dip_barrier": 70.0,
+    "coupon_rate": 0.08,
+    "volatility": 0.20,
+    "rate": 0.03,
+    "dividend": 0.01,
+    "maturity": 2.0,
+    "obs_freq": 0.5
+  }'
+# Response:
+# {
+#   "price": 0.9842,
+#   "uncertainty_bps": 1.14,
+#   "pde_base": 0.9810,
+#   "correction": 0.0032,
+#   "delta": 0.4512,
+#   "vega": 0.1840,
+#   "barrier_delta": -0.0125,
+#   "routing": "ensemble",
+#   "fallback_active": false
+# }
+```
 
 ### Example: POST /iv_surface
 
@@ -685,58 +818,61 @@ python benchmarks/streaming_calibration_demo.py
 
 ## Test Suite
 
-**1008 tests passing, 0 failing, 2 skipped (integration only).**
+**1126 tests passing, 0 failing, 2 skipped (integration only).**
 
 ```bash
-# Full suite (~8 min)
+# Run full test suite on CUDA
 uv run pytest tests/ -q
 
-# By module
-pytest tests/test_pricing_engine.py         -v  # Fourier-COS pricer
-pytest tests/test_normalizers.py            -v  # Normalizer roundtrips
-pytest tests/test_calibrate_newton.py       -v  # Newton calibrator
-pytest tests/test_calibrate_newton_h.py     -v  # Learnable-H calibrator
-pytest tests/test_batch_calibration.py      -v  # Multi-date batch
-pytest tests/test_joint_calibration.py      -v  # Joint SPX+VIX
-pytest tests/test_surface_completion.py     -v  # SVI + arbitrage
-pytest tests/test_spx_data.py               -v  # SPX market data
-pytest tests/test_vix_pricing.py            -v  # VIX model
-pytest tests/test_vix_term_structure.py     -v  # VIX futures curve
-pytest tests/test_vix_pricing_stress.py     -v  # VIX adversarial
-pytest tests/test_deribit_data.py           -v  # Deribit REST
-pytest tests/test_deribit_ws.py             -v  # Deribit WebSocket
-pytest tests/test_variance_swaps.py         -v  # Variance/vol swaps
-pytest tests/test_portfolio_greeks.py       -v  # Greeks accuracy
-pytest tests/test_portfolio_greeks_adversarial.py -v  # Greeks robustness
-pytest tests/test_portfolio_greeks_stress.py -v # Greeks large portfolios
-pytest tests/test_pnl_attribution.py        -v  # P&L breakdown
-pytest tests/test_greeks_benchmark.py       -v  # Greeks timing
-pytest tests/test_api.py                    -v  # FastAPI endpoints
-pytest tests/test_hurst_dynamics.py         -v  # Hurst study (2 skipped)
+# Core pricing and surrogates
+pytest tests/test_pricing_engine.py                 -v  # Fourier-COS pricer
+pytest tests/test_fno_model.py                      -v  # FiLM-FNO architecture
+pytest tests/test_normalizers.py                    -v  # Parameter and IV normalizers
+pytest tests/test_calibrate_newton.py               -v  # Gauss-Newton calibration
+pytest tests/test_calibrate_newton_h.py             -v  # Learnable Hurst calibration
 
-# Integration tests (require live yfinance data)
-INTEGRATION=1 pytest tests/test_hurst_dynamics.py -v -k "convergence"
+# Structured derivatives and autocallables
+pytest tests/test_autocall_pde.py                   -v  # Gatheral Crank-Nicolson PDE base
+pytest tests/test_autocall_mlp.py                   -v  # 5-member residual MLP ensemble
+pytest tests/test_autocall_guardian.py              -v  # SR 26-2 OOD gating and fallbacks
+pytest tests/test_api_autocall.py                   -v  # Autocall REST and batch endpoints
+pytest tests/test_wof_autocall.py                   -v  # Worst-of basket autocalls
+
+# High-throughput API and streaming
+pytest tests/test_api.py                            -v  # FastAPI REST endpoints
+pytest tests/test_websocket_server.py               -v  # WebSocket risk telemetry & conflation
+
+# Deep hedging and market dynamics
+pytest tests/test_deep_hedging.py                   -v  # Recurrent neural hedging
+pytest tests/test_d_xva.py                          -v  # D-XVA differentiable backpropagation
+pytest tests/test_grey_bergomi.py                   -v  # Generalized grey Brownian paths
 ```
 
 ---
 
 ## Models & Weights
 
-| Model | Weights | Params | R² | MAE | Notes |
-|-------|---------|--------|-----|-----|-------|
-| FNO v2 | `artifacts/weights/fno_v2_final_prod.pth` | 2.2M | 0.9991 | 0.058% | H fixed=0.08 |
-| FNO v3 | `artifacts/weights/fno_v3_final_prod.pth` | 2.2M | 0.9981 | 0.264% | H learnable |
+| Category | Model | Weights File | Parameters | Metric | Description |
+|---|---|---|---|---|---|
+| Surrogates | FNO v2 | `artifacts/weights/fno_v2_final_prod.pth` | 2.2M | MAE 5.8 bps | Fixed H=0.08 Rough Heston |
+| Surrogates | FNO v3 | `artifacts/weights/fno_v3_final_prod.pth` | 2.2M | MAE 26.4 bps | Learnable H ∈ [0.04, 0.15] |
+| Surrogates | FNO Grey | `artifacts/weights/fno_grey_final_prod.pth` | 2.2M | MAE 0.76 bps | Grey Rough Bergomi |
+| Surrogates | FNO Zoo | `artifacts/weights/fno_{heston,sabr,ssvi,rbergomi,localvol}_final_prod.pth` | 2.2M ea. | R² > 0.998 | Model Zoo surrogates |
+| Autocalls | Correction Ensemble | `artifacts/weights/autocall_correction_mlp_member_{0..4}.pth` | 2.1M ea. | RMSE 0.99 bps | 5-member residual MLP ensemble |
+| Autocalls | Phoenix MLP | `artifacts/weights/phoenix_mlp_best.pth` | 3.2M | RMSE 1.35 bps | Memory coupon structured notes |
+| Autocalls | WoF EGNO | `artifacts/weights/wof_mlp_best.pth` | 1.6M | RMSE 1.87 bps | Worst-of basket autocalls |
+| Hedging | Deep Hedger | `artifacts/weights/deep_hedger_{european,barrier}_prod.pth` | 94K ea. | P&L std 0.43 | Recurrent LSTM policy networks |
+| Markets | Minimax GAN | `artifacts/weights/minimax_policy_prod.pth` | 92K | Error 3e-4 | Adversarial stylized facts generator |
 
-Normalizers:
+Normalizers and Calibration Configurations:
 ```
-artifacts/models/param_normalizer_v2.npz   # 5-parameter (κ,θ,σ,ρ,V₀)
-artifacts/models/param_normalizer_v3.npz   # 6-parameter (adds H)
-artifacts/models/iv_normalizer_v2.npz
-artifacts/models/iv_normalizer_v3.npz
+artifacts/scalers/correction_input_normalizer.npz    # 19-dim contract feature normalizer
+artifacts/scalers/correction_output_normalizer.npz   # Residual target scaler
+artifacts/weights/ensemble_calibration.json          # Calibrated uncertainty thresholds (tau_OOD = 2.17 bps)
+artifacts/models/param_normalizer_v3.npz             # Rough Heston parameter scaler
+artifacts/models/iv_normalizer_v3.npz                # Implied volatility surface normalizer
+artifacts/models/{param,iv}_normalizer_{grey,heston,sabr,ssvi,rbergomi,localvol}.npz
 ```
-
-Legacy weights (v1, diff-FNO, LSTM) are in `artifacts/legacy/` — not used in
-production but kept for reproducibility.
 
 ---
 
@@ -744,35 +880,36 @@ production but kept for reproducibility.
 
 ```
 derivatives/
-├── src/                              Core library
-│   └── deepvol/                      Main module package
-│       ├── surrogates/               FiLM-FNO model, EGNO, Signature SDE, Greeks, etc.
-│       ├── models/                   Stochastic vol models (Classic Heston, SABR, SSVI, Dupire, rBergomi, MLSV, etc.)
-│       ├── calibration/              Autograd Newton, Joint, RKHS MLSV calibrators
-│       ├── market/                   Data integration (spx_data.py, deribit_ws.py, etc.)
-│       ├── arbitrage/                SVI & arbitrage completion (surface_completion.py)
-│       ├── greeks/                   Greeks & PnL attribution (portfolio_greeks.py, pnl_attribution.py)
-│       ├── analysis/                 Hurst dynamics & research (hurst_dynamics.py, cross_asset_roughness.py)
-│       ├── api/                      FastAPI REST server (server.py, websocket.py)
-│       ├── app/                      Streamlit dashboards (app_v2.py, app_v3_risk.py, etc.)
-│       ├── mrm/                      Model Risk Guardian and particle fallbacks
-│       ├── deploy/                   TensorRT compilation and K8s configuration
-│       └── utils/                    Common utilities (strikes.py, etc.)
+├── app_frontend/                     Next.js 16+ Turbopack institutional web application
+│   └── src/app/
+│       ├── page.tsx                  Interactive 3D WebGL surface viewer & risk telemetry
+│       └── autocall/page.tsx         Autocall pricer with epistemic uncertainty gauge
 │
-├── notebooks/                        Jupyter notebooks (end-to-end demos)
-├── tests/                            pytest suite (955+ passing)
-├── benchmarks/                       Performance and accuracy studies
-├── scripts/                          Utility scripts (batch VIX, plot generation)
-├── data/                             Training datasets and market cache (gitignored)
+├── src/                              Core Python library
+│   └── deepvol/
+│       ├── surrogates/               FiLM-FNO, CorrectionEnsemble, EGNO, Signature SDE
+│       ├── models/                   Stochastic vol models (Heston, SABR, rBergomi, gRB, Autocalls)
+│       ├── calibration/              Gauss-Newton, Joint SPX+VIX, and MLSV particle calibrators
+│       ├── market/                   Data feeds (SPX chain cleaning, Deribit WebSocket)
+│       ├── arbitrage/                SVI and no-arbitrage surface projection
+│       ├── greeks/                   GPU Greeks and Greek P&L attribution
+│       ├── hedging/                  Deep hedging, frictional trading envs, D-XVA loss
+│       ├── mrm/                      Model Risk Guardian (SR 26-2) and analytical fallbacks
+│       ├── api/                      FastAPI REST server and ConflatedQueue WebSocket
+│       ├── app/                      Streamlit research hub (app_main.py) and 14 specialized pages
+│       └── deploy/                   TensorRT compilation and ONNX export
+│
+├── tests/                            pytest suite (1126 passed tests across 102 test modules)
+├── notebooks/                        44 Jupyter notebooks covering theory and experiments
+├── benchmarks/                       Performance benchmarks and latency profiling
 ├── artifacts/
-│   ├── weights/                      Production model weights (.pth)
-│   └── models/                       Normalizer files (.npz)
-├── tex/
-│   ├── thesis/main.pdf               51-page LaTeX thesis
-│   └── presentation/presentation.pdf Defence slides
-├── results/                          Saved calibration outputs (JSON)
-├── research/                         Research notes, PDFs, SOTA survey
-└── articles/                         Reference academic papers (PDF)
+│   ├── weights/                      Production neural network weights (.pth)
+│   ├── models/                       FNO parameter and surface normalizers (.npz)
+│   └── scalers/                      Autocall contract normalizers and calibration JSON
+├── data/                             Dataset caches and quotes (gitignored)
+└── tex/
+    ├── thesis/main.pdf               51-page LaTeX thesis
+    └── presentation/presentation.pdf Defence slides
 ```
 
 ---
@@ -825,6 +962,8 @@ pdflatex -interaction=nonstopmode main.tex
 | **P14**: Meta-Adaptation | Complete | Physics-Informed Meta-Learning FNO, Reptile/FOMAML online GPU adaptation, Model Risk Guardian |
 | **P15**: Differentiable Hedging | Complete | Recurrent Deep Hedging (LSTM/GRU), D-XVA loss, PIVOT implied vol solver, low-vega gating |
 | **P16**: Grey Rough Bergomi | Complete | C++/CUDA gRB path simulator, Mittag-Leffler CUDA kernel, uncertainty-guided active learning, Sobolev FNO |
+| **P17**: Autocall QMC Pipeline | Complete | Sobol-Brownian Bridge QMC path simulation, Milstein stepping, barrier monitoring, Phoenix coupons, Worst-of EGNO |
+| **P18 / Phase D**: Multi-Fidelity Ensemble | Complete | Crank-Nicolson Gatheral PDE base + 5-member residual MLP ensemble (0.99 bps RMSE), epistemic uncertainty ($\tau_{\text{OOD}} = 2.17$), SR 26-2 AutocallGuardian, Next.js 16+ & FastAPI UI integration |
 
 
 ---

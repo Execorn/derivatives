@@ -1,36 +1,46 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# DeepVol Institutional Frontend
 
-## Getting Started
+Next.js 16+ web application for interactive volatility surface exploration, real-time derivative risk telemetry, and structured autocallable note pricing.
 
-First, run the development server:
+---
 
+## Capabilities
+
+### 1. Implied Volatility Surface & Risk Telemetry (`/`)
+* **3D WebGL Surface Visualization**: Three.js interactive canvas rendering parameterized implied volatility surfaces across strike and maturity dimensions.
+* **Real-Time Calibration**: Interface to trigger Gauss-Newton and Levenberg-Marquardt calibration against SPX or Deribit cryptocurrency market data.
+* **WebSocket Risk Stream**: Connects to the FastAPI backend (`/ws/risk`) with conflation queuing to visualize live streaming Greeks (Delta, Gamma, Vega) without interface lag.
+* **Scenario Stress Testing**: Evaluates spot price and volatility shocks with real-time portfolio revaluation.
+
+### 2. Autocallable Structured Notes (`/autocall`)
+* **Multi-Fidelity Pricing**: Combines a Gatheral Crank-Nicolson PDE base solver with a 5-member residual MLP ensemble.
+* **Epistemic Uncertainty Gauge**: Displays model uncertainty $\sigma_{\text{bps}}$ with calibrated threshold gating ($\tau_{\text{OOD}} = 2.17$ bps).
+* **Barrier Sensitivity Analysis**: Quantifies discontinuous barrier risks including Autocall Barrier Delta ($\partial V / \partial B_{\text{autocall}}$) and Dip Barrier Delta ($\partial V / \partial B_{\text{dip}}$).
+* **SR 26-2 Compliance Telemetry**: Real-time auditing of input parameter validity, population drift, and automatic fallback routing to GPU Monte Carlo or analytical PDE.
+
+---
+
+## Setup & Execution
+
+### Prerequisites
+* Node.js 18.17+ or Node.js 20+
+* Running DeepVol FastAPI backend on port 8000:
+  ```bash
+  uvicorn deepvol.api.server:app --reload --port 8000 --app-dir src
+  ```
+
+### Development Server
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The application will be accessible at:
+* Volatility Surface & Risk: [http://localhost:3000](http://localhost:3000)
+* Structured Autocallable Notes: [http://localhost:3000/autocall](http://localhost:3000/autocall)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### Production Build
+```bash
+npm run build
+npm start
+```

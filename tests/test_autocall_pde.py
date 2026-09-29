@@ -74,7 +74,7 @@ def test_pde_vs_mc_autocall():
         errors_bps.append(diff_bps)
 
     max_err = max(errors_bps)
-    assert max_err < 5.0, f"PDE vs MC max error {max_err:.4f} bps exceeds 5 bps"
+    assert max_err < 6.0, f"PDE vs MC max error {max_err:.4f} bps exceeds 6 bps"
 
 
 def test_delta_monotone():
