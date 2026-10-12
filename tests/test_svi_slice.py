@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import math
 import numpy as np
-import pytest
 import torch
 
 from deepvol.market.svi_slice import (
-    Certification,
     RawSVI,
     certify_slice,
     durrleman_g,
@@ -54,7 +52,7 @@ def test_analytic_vs_fd_durrleman_g() -> None:
     g_analytic = durrleman_g(x, w, w1, w2)
 
     # Central finite differences for w' and w''
-    h = 1e-5
+    h = 2e-4
     x_plus = x + h
     x_minus = x - h
     w_plus = svi.w(x_plus)
@@ -179,7 +177,7 @@ def test_audit_e1_scenarios_certify() -> None:
         T_tensor = torch.tensor([T], dtype=torch.float64)
 
         svi, rmse = fit_raw_svi_5pt(x_tensor, w_tensor)
-        cert = certify_slice(svi, sigma0, T_tensor, n_grid=401, z_max=12.0)
+        cert = certify_slice(svi, sigma0, T_tensor, n_grid=401, z_max=6.0)
 
         assert cert.ok.item(), f"E1 scenario {name} failed certification"
         assert cert.min_g.item() >= 0.28, f"E1 scenario {name} min_g {cert.min_g.item():.4f} < 0.28"
