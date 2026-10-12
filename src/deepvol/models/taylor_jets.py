@@ -145,7 +145,7 @@ def mlp_jet(layers: Sequence[nn.Module], cols: Sequence[Jet]) -> Jet:
     for layer in layers:
         if isinstance(layer, nn.Linear):
             H = H @ layer.weight.t()
-            if layer.bias is not None:
+            if layer.bias is not None:  # pyright: ignore[reportUnnecessaryComparison]
                 H = torch.cat([H[:B] + layer.bias, H[B:]], dim=0)
         elif isinstance(layer, nn.SiLU):
             v_b = H[:B]

@@ -22,7 +22,6 @@ import numpy as np
 from deepvol.models.fx_cross_analytic import (
     AnalyticTriangulated,
     Col,
-    EngineOutputs,
     N_COLS,
     black76_otm_parity,
     black_partials,
@@ -202,8 +201,10 @@ def test_closed_form_greeks_vs_central_bumps_and_wolfram(device: str) -> None:
     assert abs(gamma_b76_ana - gamma_b76_num) / abs(gamma_b76_num) <= 1e-6, "Sticky-strike Gamma mismatch vs W2"
 
     # 2. Smile-inclusive total Delta and Gamma (engine bump moves k)
-    X_plus = X.clone(); X_plus[:, Col.F] = F + h_F
-    X_minus = X.clone(); X_minus[:, Col.F] = F - h_F
+    X_plus = X.clone()
+    X_plus[:, Col.F] = F + h_F
+    X_minus = X.clone()
+    X_minus[:, Col.F] = F - h_F
     V_plus = engine(X_plus).V
     V_minus = engine(X_minus).V
     dVdF_eng = (V_plus - V_minus) / (2.0 * h_F)
@@ -238,8 +239,10 @@ def test_closed_form_greeks_vs_central_bumps_and_wolfram(device: str) -> None:
     assert abs(vomma_ana - vomma_num) / abs(vomma_num) <= 1e-6, "Vomma mismatch vs W4"
 
     # 4. Correlation sensitivity: dV/drho (W8)
-    X_rho_p = X.clone(); X_rho_p[:, Col.RHO] += h_rho
-    X_rho_m = X.clone(); X_rho_m[:, Col.RHO] -= h_rho
+    X_rho_p = X.clone()
+    X_rho_p[:, Col.RHO] += h_rho
+    X_rho_m = X.clone()
+    X_rho_m[:, Col.RHO] -= h_rho
     drho_num = float(((engine(X_rho_p).V - engine(X_rho_m).V) / (2.0 * h_rho))[0].item())
     drho_ana = float(greeks_strike["rho"][0].item())
     assert abs(drho_ana - drho_num) / abs(drho_num) <= 1e-6, "d_rho mismatch vs W8"

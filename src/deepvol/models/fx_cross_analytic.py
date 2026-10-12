@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from enum import IntEnum
 import math
-from typing import Dict, Final, NamedTuple, Optional, Tuple
+from typing import Dict, Final, NamedTuple, Optional, Tuple, cast
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -141,7 +141,7 @@ def black76_otm_parity(
 
     phi_otm = torch.where(k >= 0.0, torch.ones_like(k), -torch.ones_like(k))
     c_otm = phi_otm * D_val * (F_val * torch.special.ndtr(phi_otm * d1) - K_val * torch.special.ndtr(phi_otm * d2))
-    return c_otm + 0.5 * (phi - phi_otm) * D_val * (F_val - K_val)
+    return cast(Tensor, c_otm + 0.5 * (phi - phi_otm) * D_val * (F_val - K_val))
 
 
 def black_partials(

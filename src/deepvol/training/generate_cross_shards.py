@@ -11,11 +11,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,7 +27,6 @@ from deepvol.market.fx_conventions import (
     pillar_strikes,
 )
 from deepvol.market.svi_slice import (
-    RawSVI,
     fit_raw_svi_5pt,
 )
 from deepvol.models.fx_cross_analytic import beta_split_jet
@@ -265,7 +263,7 @@ def generate_shards(cfg: ShardConfig) -> Path:
         "file_checksums": {},
     }
 
-    train_x_list: List[np.ndarray] = []
+    train_x_list: List[np.ndarray[Any, Any]] = []
     total_records = 0
 
     batch_states = 16
@@ -283,13 +281,13 @@ def generate_shards(cfg: ShardConfig) -> Path:
 
         n_split_states = split_states.shape[0]
 
-        split_x_list: List[np.ndarray] = []
-        split_c_list: List[np.ndarray] = []
-        split_dc_list: List[np.ndarray] = []
-        split_eps_list: List[np.ndarray] = []
-        split_deps_list: List[np.ndarray] = []
-        split_sh1_list: List[np.ndarray] = []
-        split_scop_list: List[np.ndarray] = []
+        split_x_list: List[np.ndarray[Any, Any]] = []
+        split_c_list: List[np.ndarray[Any, Any]] = []
+        split_dc_list: List[np.ndarray[Any, Any]] = []
+        split_eps_list: List[np.ndarray[Any, Any]] = []
+        split_deps_list: List[np.ndarray[Any, Any]] = []
+        split_sh1_list: List[np.ndarray[Any, Any]] = []
+        split_scop_list: List[np.ndarray[Any, Any]] = []
 
         for b_start in range(0, n_split_states, batch_states):
             b_end = min(b_start + batch_states, n_split_states)

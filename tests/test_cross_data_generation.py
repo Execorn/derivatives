@@ -11,15 +11,12 @@ import math
 from pathlib import Path
 
 import numpy as np
-import pytest
 import torch
 from scipy.stats import kstest
 
 from deepvol.training.data_generation_cross import (
-    CrossDomain,
     CrossSobolSampler,
     SamplerConfig,
-    beta22_quantile_exact,
 )
 from deepvol.training.generate_cross_shards import (
     ShardConfig,

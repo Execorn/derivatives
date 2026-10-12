@@ -1,4 +1,3 @@
-import pytest
 import numpy as np
 import torch
 from deepvol.mrm.arbitrage import check_arbitrage, project_arbitrage_free
@@ -7,8 +6,7 @@ from deepvol.calibration.fallbacks import (
     McKeanVlasovFallbackEngine,
     calibrate_tikhonov,
     calculate_psi,
-    check_ood_parameters,
-    get_drift_report
+    check_ood_parameters
 )
 
 # Standard grids expected by FNO models

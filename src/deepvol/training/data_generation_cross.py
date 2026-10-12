@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Tuple
 
-import numpy as np
 import torch
 from torch import Tensor
 
@@ -22,7 +21,6 @@ from deepvol.market.fx_conventions import (
     pillar_strikes,
 )
 from deepvol.market.svi_slice import (
-    RawSVI,
     certify_slice,
     fit_raw_svi_5pt,
 )
@@ -90,7 +88,7 @@ class CrossSobolSampler:
     def sample_raw_states(self) -> Tensor:
         """Samples 2^log2_states raw market states in R^12 without rejection."""
         n_states = 1 << self.cfg.log2_states
-        engine = torch.quasirandom.SobolEngine(dimension=12, scramble=True, seed=self.cfg.seed)
+        engine = torch.quasirandom.SobolEngine(dimension=12, scramble=True, seed=self.cfg.seed)  # type: ignore[no-untyped-call]
         u = engine.draw(n_states, dtype=torch.float64)
 
         d = self.cfg.domain
@@ -195,7 +193,7 @@ class CrossSobolSampler:
         all_strikes = []
         for s_idx in range(n_states):
             state_seed = self.cfg.seed + 10007 * s_idx + 1
-            eng1d = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=state_seed)
+            eng1d = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=state_seed)  # type: ignore[no-untyped-call]
             u_56 = eng1d.draw(56, dtype=torch.float64).squeeze(-1)
             z_56 = 7.5 * beta22_quantile_exact(u_56)
             z_64 = torch.cat([z_56, taper_strikes], dim=0)

@@ -7,13 +7,11 @@ and differentiable implied volatility surfaces.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import Tensor
-import torch.nn as nn
 
 from deepvol.hedging.pivot_iv import pivot_implied_vol
 from deepvol.market.svi_slice import RawSVI, durrleman_g
@@ -89,7 +87,7 @@ class _QuantileInversionFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
+        ctx: Any,
         u: Tensor,
         F: Tensor,
         T: Tensor,
@@ -135,7 +133,7 @@ class _QuantileInversionFunction(torch.autograd.Function):
         alpha_lin = torch.linspace(0.0, 1.0, N_grid, device=device, dtype=dtype).unsqueeze(0)
         kg = -k_max + 2.0 * k_max * alpha_lin
 
-        w, w1, w2 = svi.derivs(kg)
+        w, w1, _ = svi.derivs(kg)
         sq = torch.sqrt(torch.clamp(w, min=1e-8))
         d1 = (-kg + 0.5 * w) / sq
         d2 = d1 - sq
@@ -186,8 +184,9 @@ class _QuantileInversionFunction(torch.autograd.Function):
         return quantiles.reshape(original_shape)
 
     @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None, None, None]:
-        quantiles, F_eff, T, params_eff = ctx.saved_tensors
+    def backward(ctx: Any, *grad_outputs: Tensor) -> Tuple[Tensor, None, None, None, None]:
+        grad_output = grad_outputs[0]
+        quantiles, F_eff, _, params_eff = ctx.saved_tensors
         grad_out_2d = grad_output.reshape(quantiles.shape)
 
         svi = RawSVI(params_eff)
@@ -272,7 +271,8 @@ class GaussianCopulaCrossEngine:
         T_in = T.to(self.device, dtype=torch.float64)
         u_in = u.to(self.device, dtype=torch.float64)
         params_in = svi.params.to(self.device, dtype=torch.float64)
-        return _QuantileInversionFunction.apply(u_in, F_in, T_in, params_in, reflect)
+        res: Tensor = _QuantileInversionFunction.apply(u_in, F_in, T_in, params_in, reflect)  # type: ignore[no-untyped-call]
+        return res
 
     def price(
         self,
@@ -443,8 +443,6 @@ class GaussianCopulaCrossEngine:
         a = torch.full((S_cnt,), -0.99, device=dev, dtype=dtype)
         b = torch.full((S_cnt,), 0.99, device=dev, dtype=dtype)
 
-        f_a = _get_atmf_vol(a) - target
-        f_b = _get_atmf_vol(b) - target
 
         # 10 Bisection iterations
         for _ in range(10):
