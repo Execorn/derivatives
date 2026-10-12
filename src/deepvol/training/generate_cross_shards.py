@@ -181,55 +181,49 @@ def label_state_batch(
             - 'sigma_cop': (S, M) float64 copula implied volatilities.
     """
     dev = engine.device
-    st = states.to(dev, dtype=torch.float64)
-    z_in = z.to(dev, dtype=torch.float64)
+    st = states.to(dev, dtype=torch.float64).requires_grad_(True)
+    z_in = z.to(dev, dtype=torch.float64).requires_grad_(True)
     S_cnt = st.shape[0]
     M_cnt = z_in.shape[1]
 
-    # Evaluate primal outputs
+    # Evaluate primal outputs with autograd graph tracking
     c, sig_cop, sig_h1, eps_star = _eval_cross_state(st, z_in, engine)
 
     # Build network input x of shape (S, M, 13)
     z_mapped = 7.0 * torch.tanh(z_in / 7.0)
+    dx0_dz = 1.0 - torch.tanh(z_in / 7.0) ** 2
     x_coords = [z_mapped.unsqueeze(-1)]
     for j in range(12):
         x_coords.append(st[:, j].view(S_cnt, 1, 1).expand(-1, M_cnt, 1))
     x = torch.cat(x_coords, dim=-1).to(dtype=torch.float32)
 
-    # Compute input differentials dc_dx and deps_dx
+    # Allocate exact AAD differential tensors
     dc_dx = torch.zeros(S_cnt, M_cnt, 13, dtype=torch.float64, device=dev)
     deps_dx = torch.zeros(S_cnt, M_cnt, 13, dtype=torch.float64, device=dev)
 
-    h = 1e-5
+    # 1. Coordinate 0: moneyness strike z (vectorized in 1 backward pass)
+    gc_z = torch.autograd.grad(c.sum(), z_in, retain_graph=True)[0]
+    geps_z = torch.autograd.grad(eps_star.sum(), z_in, retain_graph=True)[0]
+    dc_dx[..., 0] = gc_z / dx0_dz
+    deps_dx[..., 0] = geps_z / dx0_dz
 
-    # 1. Coordinate 0: moneyness z
-    c_zp, _, _, eps_zp = _eval_cross_state(st, z_in + h, engine)
-    c_zm, _, _, eps_zm = _eval_cross_state(st, z_in - h, engine)
-    dx0_dz = 1.0 - torch.tanh(z_in / 7.0) ** 2
-    dc_dx[..., 0] = ((c_zp - c_zm) / (2.0 * h)) / dx0_dz
-    deps_dx[..., 0] = ((eps_zp - eps_zm) / (2.0 * h)) / dx0_dz
-
-    # 2. Coordinates 1..12: market state coordinates
-    for j in range(12):
-        st_p = st.clone()
-        st_p[:, j] += h
-        st_m = st.clone()
-        st_m[:, j] -= h
-
-        c_p, _, _, eps_p = _eval_cross_state(st_p, z_in, engine)
-        c_m, _, _, eps_m = _eval_cross_state(st_m, z_in, engine)
-
-        dc_dx[..., j + 1] = (c_p - c_m) / (2.0 * h)
-        deps_dx[..., j + 1] = (eps_p - eps_m) / (2.0 * h)
+    # 2. Coordinates 1..12: market state coordinates via M vector-Jacobian passes
+    for m in range(M_cnt):
+        retain_c = True
+        retain_eps = (m < M_cnt - 1)
+        gc_st_m = torch.autograd.grad(c[:, m].sum(), st, retain_graph=retain_c)[0]
+        geps_st_m = torch.autograd.grad(eps_star[:, m].sum(), st, retain_graph=retain_eps)[0]
+        dc_dx[:, m, 1:] = gc_st_m
+        deps_dx[:, m, 1:] = geps_st_m
 
     return {
-        "x": x,
-        "c": c,
-        "dc_dx": dc_dx,
-        "eps_star": eps_star,
-        "deps_dx": deps_dx,
-        "sigma_h1": sig_h1,
-        "sigma_cop": sig_cop,
+        "x": x.detach(),
+        "c": c.detach(),
+        "dc_dx": dc_dx.detach(),
+        "eps_star": eps_star.detach(),
+        "deps_dx": deps_dx.detach(),
+        "sigma_h1": sig_h1.detach(),
+        "sigma_cop": sig_cop.detach(),
     }
 
 
