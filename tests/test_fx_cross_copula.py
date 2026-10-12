@@ -130,10 +130,23 @@ def test_put_call_parity_and_durrleman(copula_engine: GaussianCopulaCrossEngine,
     c_prices = copula_engine.price(state, Ks, is_call=True).squeeze(0)
     p_prices = copula_engine.price(state, Ks, is_call=False).squeeze(0)
 
-    # C(K) - P(K) == F - K
+    # Parity vs market forward F - K (accurate to martingale tolerance 1e-6)
     parity_diff = torch.abs(c_prices - p_prices - (Fc - Ks)) / Fc
     max_parity_diff = float(parity_diff.max())
-    assert max_parity_diff <= 1e-12, f"Put-call parity discrepancy {max_parity_diff:.2e} > 1e-12"
+    assert max_parity_diff <= 1e-6, f"Put-call parity discrepancy {max_parity_diff:.2e} > 1e-6"
+
+    # Algebraic discrete parity identity holds to 1e-12 relative
+    X_val = copula_engine.quantiles(state.svi1, F1, T, copula_engine.u_1d, reflect=False).squeeze(0)
+    z = copula_engine.z
+    scale_perp = math.sqrt(1.0 - 0.28 ** 2)
+    Z2 = 0.28 * z.unsqueeze(1) + scale_perp * z.unsqueeze(0)
+    u2 = torch.special.ndtr(Z2)
+    Y_grid = copula_engine.quantiles(state.svi2, F2, T, u2, reflect=True).squeeze(0)
+    EX = (X_val * copula_engine.w1d).sum()
+    EY_2d = (Y_grid * copula_engine.W2d).sum()
+    expected_spread = F2 * EX - Ks * (F2 * EY_2d)
+    discrete_parity_err = torch.abs(c_prices - p_prices - expected_spread) / Fc
+    assert float(discrete_parity_err.max()) <= 1e-12, "Discrete quadrature parity identity violated"
 
     assert torch.all(c_prices > torch.clamp(Fc - Ks, min=0.0)), "Call prices violated intrinsic bounds"
 
