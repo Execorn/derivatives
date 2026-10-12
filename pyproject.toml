@@ -110,13 +110,27 @@ module = [
     "deepvol.market.svi_slice",
     "deepvol.market.smile_canonicalizer",
     "deepvol.market.legacy_adapter",
-    "deepvol.models.fx_cross_*",
+    "deepvol.models.fx_cross_analytic",
+    "deepvol.models.fx_cross_copula",
+    "deepvol.models.fx_cross_surrogate",
+    "deepvol.models.fx_cross_safeguards",
     "deepvol.models.taylor_jets",
-    "deepvol.training.*cross*",
+    "deepvol.training.data_generation_cross",
+    "deepvol.training.generate_cross_shards",
+    "deepvol.training.train_cross_surrogate",
     "deepvol.api.schemas_fx_cross",
-    "deepvol.api.fx_cross_*",
+    "deepvol.api.fx_cross_arrow",
+    "deepvol.api.fx_cross_runtime",
 ]
 strict = true
+
+[[tool.mypy.overrides]]
+module = [
+    "scipy.*",
+    "scipy.optimize.*",
+    "py_vollib_vectorized.*",
+]
+ignore_missing_imports = true
 
 [tool.pyright]
 include = [
@@ -130,4 +144,11 @@ include = [
     "src/deepvol/api/schemas_fx_cross.py",
     "src/deepvol/api/fx_cross_*.py",
 ]
+venvPath = "."
+venv = ".venv"
 typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportConstantRedefinition = false

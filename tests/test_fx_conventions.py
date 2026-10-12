@@ -10,7 +10,6 @@ from deepvol.market.fx_conventions import (
     ConventionSolveError,
     DeltaConvention,
     LegMarket,
-    StrangleConvention,
     atm_strike,
     fx_delta,
     market_to_smile_strangle,
