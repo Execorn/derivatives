@@ -159,13 +159,47 @@ def _fit_single_slice(
         x_span = 0.2
     x_mid = 0.5 * (x_5.max() + x_5.min()).item()
 
-    m_grid = torch.linspace(x_mid - 0.5 * x_span, x_mid + 0.5 * x_span, init_grid, dtype=torch.float64)
-    s_grid = torch.linspace(0.02 * x_span, 0.8 * x_span, init_grid, dtype=torch.float64)
+    m_grid = torch.linspace(x_mid - 0.5 * x_span, x_mid + 0.5 * x_span, init_grid, dtype=torch.float64, device=x_5.device)
+    s_grid = torch.linspace(0.02 * x_span, 0.8 * x_span, init_grid, dtype=torch.float64, device=x_5.device)
+    M, S_mesh = torch.meshgrid(m_grid, s_grid, indexing="ij")
+    m_flat = M.reshape(-1)
+    s_flat = S_mesh.reshape(-1)
 
-    best_loss = float("inf")
-    best_p: Tuple[float, float, float, float, float] = (0.0, 0.1, 0.0, 0.0, 0.1)
-    best_m = 0.0
-    best_s = 0.1
+    # Vectorized initial grid solve across all (m, s) pairs
+    y_grid = (x_5.unsqueeze(0) - m_flat.unsqueeze(1)) / s_flat.unsqueeze(1)
+    A_grid = torch.stack([torch.ones_like(y_grid), y_grid, torch.sqrt(y_grid ** 2 + 1.0)], dim=-1)
+    w_exp = w_5.unsqueeze(0).expand(m_flat.shape[0], 5).unsqueeze(-1)
+
+    At_g = A_grid.transpose(-2, -1)
+    AtA_g = At_g @ A_grid + 1e-12 * torch.eye(3, dtype=torch.float64, device=x_5.device)
+    sol_g = torch.linalg.solve(AtA_g, At_g @ w_exp).squeeze(-1)
+
+    a_g = sol_g[:, 0]
+    d_g = sol_g[:, 1]
+    c_g = sol_g[:, 2]
+
+    rho_g = d_g / torch.clamp(c_g, min=1e-12)
+    b_g = c_g / s_flat
+    radicand_g = torch.clamp(c_g ** 2 - d_g ** 2, min=0.0)
+    w_min_g = a_g + torch.sqrt(radicand_g)
+    lee_g = b_g * (1.0 + torch.abs(rho_g))
+
+    valid_g = (c_g > 1e-8) & (torch.abs(rho_g) < 0.999) & (w_min_g > 0.0) & (lee_g <= 2.01)
+    pred_g = (A_grid @ sol_g.unsqueeze(-1)).squeeze(-1)
+    loss_g = torch.sum((pred_g - w_5.unsqueeze(0)) ** 2, dim=-1)
+    loss_g = torch.where(valid_g, loss_g, torch.tensor(float("inf"), dtype=torch.float64, device=x_5.device))
+
+    best_idx = int(torch.argmin(loss_g).item())
+    best_loss = float(loss_g[best_idx].item())
+    best_p: Tuple[float, float, float, float, float] = (
+        float(a_g[best_idx].item()),
+        float(b_g[best_idx].item()),
+        float(rho_g[best_idx].item()),
+        float(m_flat[best_idx].item()),
+        float(s_flat[best_idx].item()),
+    )
+    best_m = float(m_flat[best_idx].item())
+    best_s = float(s_flat[best_idx].item())
 
     def solve_linear(m_val: float, s_val: float) -> Tuple[Tuple[float, float, float, float, float] | None, float]:
         y = (x_5 - m_val) / s_val
@@ -173,7 +207,8 @@ def _fit_single_slice(
         col1 = y
         col2 = torch.sqrt(y ** 2 + 1.0)
         A = torch.stack([col0, col1, col2], dim=1)
-        sol = torch.linalg.lstsq(A, w_5).solution
+        AtA = A.T @ A + 1e-12 * torch.eye(3, dtype=torch.float64, device=x_5.device)
+        sol = torch.linalg.solve(AtA, A.T @ w_5)
         a_val, d_val, c_val = sol[0].item(), sol[1].item(), sol[2].item()
         if c_val <= 1e-8:
             return None, float("inf")
@@ -189,19 +224,10 @@ def _fit_single_slice(
         loss_val = torch.sum((pred - w_5) ** 2).item()
         return (a_val, b_val, rho_val, m_val, s_val), loss_val
 
-    for m_val in m_grid.tolist():
-        for s_val in s_grid.tolist():
-            p_cand, loss = solve_linear(m_val, s_val)
-            if p_cand is not None and loss < best_loss:
-                best_loss = loss
-                best_p = p_cand
-                best_m = m_val
-                best_s = s_val
-
     # Wider search if default grid failed to produce an admissible candidate
     if best_loss == float("inf"):
-        for m_val in torch.linspace(x_mid - 1.5 * x_span, x_mid + 1.5 * x_span, 21, dtype=torch.float64).tolist():
-            for s_val in torch.linspace(0.005 * x_span, 2.0 * x_span, 21, dtype=torch.float64).tolist():
+        for m_val in torch.linspace(x_mid - 1.5 * x_span, x_mid + 1.5 * x_span, 21, dtype=torch.float64, device=x_5.device).tolist():
+            for s_val in torch.linspace(0.005 * x_span, 2.0 * x_span, 21, dtype=torch.float64, device=x_5.device).tolist():
                 p_cand, loss = solve_linear(m_val, s_val)
                 if p_cand is not None and loss < best_loss:
                     best_loss = loss
@@ -213,20 +239,20 @@ def _fit_single_slice(
     m_curr = best_m
     eta_curr = math.log(max(best_s, 1e-6))
     lam = 1e-3
+    curr_loss = best_loss
 
     for _ in range(lm_iters):
-        s_curr = math.exp(eta_curr)
-        _, curr_loss = solve_linear(m_curr, s_curr)
-        if curr_loss < 1e-20:
+        if curr_loss < 1e-22:
             break
-
+        s_curr = math.exp(eta_curr)
         hm = 1e-6 * x_span
         heta = 1e-6
 
         def get_r(m_v: float, s_v: float) -> Tensor:
             y_v = (x_5 - m_v) / s_v
             A_v = torch.stack([torch.ones_like(y_v), y_v, torch.sqrt(y_v ** 2 + 1.0)], dim=1)
-            sol_v = torch.linalg.lstsq(A_v, w_5).solution
+            AtA_v = A_v.T @ A_v + 1e-12 * torch.eye(3, dtype=torch.float64, device=x_5.device)
+            sol_v = torch.linalg.solve(AtA_v, A_v.T @ w_5)
             return cast(Tensor, A_v @ sol_v - w_5)
 
         r = get_r(m_curr, s_curr)
@@ -286,6 +312,12 @@ def fit_raw_svi_5pt(
     """
     S_len = x.shape[0]
     dev = x.device
+
+    if S_len > 1 and torch.all(x == x[0]) and torch.all(w == w[0]):
+        p_fit, rmse_val = _fit_single_slice(x[0], w[0], lm_iters, init_grid)
+        params_tensor = torch.tensor([list(p_fit)] * S_len, dtype=torch.float64, device=dev)
+        rmse_tensor = torch.full((S_len,), rmse_val, dtype=torch.float64, device=dev)
+        return RawSVI(params_tensor), rmse_tensor
 
     params_list = []
     rmse_list = []

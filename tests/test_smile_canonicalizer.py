@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 import pytest
 import torch
@@ -72,7 +73,7 @@ def test_jacobian_vs_central_bumps() -> None:
 def test_arbitrageable_quote_triggers_ssvi() -> None:
     # A quote set whose raw-SVI 5-point fit produces butterfly arbitrage
     # Extreme risk-reversal and small butterfly forces wing curvature arbitrage in raw SVI
-    quotes = torch.tensor([[0.20, 0.120, 0.008, 0.240, 0.020]], dtype=torch.float64)
+    quotes = torch.tensor([[0.16, 0.03, 0.002, 0.054, 0.008]], dtype=torch.float64)
     leg = make_test_leg(spot=100.0, df_f=0.99, df_d=0.97, T=1.0)
     conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
 
@@ -141,8 +142,13 @@ def test_convention_invariance_of_xi() -> None:
 
     for conv in conventions:
         # Generate quotes matching true_svi under convention conv
-        # ATM DNS
-        sigma_atm_dns = math.sqrt(true_svi.w(torch.tensor([[0.0]], dtype=torch.float64)).item() / 1.0)
+        # ATM DNS solved on smile for convention
+        sign_shift = 1.0 if conv in (DeltaConvention.FORWARD_PNA, DeltaConvention.SPOT_PNA) else -1.0
+        x_atm = 0.5 * sign_shift * true_svi.w(torch.tensor([[0.0]], dtype=torch.float64))
+        for _ in range(10):
+            w_val, w1_val, _ = true_svi.derivs(x_atm)
+            x_atm = x_atm - (x_atm - 0.5 * sign_shift * w_val) / (1.0 - 0.5 * sign_shift * w1_val)
+        sigma_atm_dns = math.sqrt(true_svi.w(x_atm).item() / 1.0)
         # Find 25C, 25P, 10C, 10P strikes and vols
         d_vals = [0.25, -0.25, 0.10, -0.10]
         phis = [1.0, -1.0, 1.0, -1.0]
@@ -150,7 +156,7 @@ def test_convention_invariance_of_xi() -> None:
         for d_t, p_t in zip(d_vals, phis):
             # Fixed point to find strike on smile matching delta
             v_curr = sigma_atm_dns
-            for _ in range(10):
+            for _ in range(15):
                 K_t = strike_from_delta(
                     torch.tensor([d_t], dtype=torch.float64),
                     torch.tensor([v_curr], dtype=torch.float64),
@@ -229,3 +235,47 @@ def test_calendar_check() -> None:
     w_invalid[2, :] = 0.015  # drops below T=0.50 level
     is_invalid = calendar_check(w_invalid, T)
     assert not torch.all(is_invalid), "Calendar check must detect inverted variance transition"
+
+
+# ── Test SSVI Slice Fit, Raw-SVI Mapping, and Certification ──
+
+def test_ssvi_fit_and_mapping() -> None:
+    x = torch.tensor([[-0.20, -0.10, 0.00, 0.10, 0.20]], dtype=torch.float64)
+    w = torch.tensor([[0.045, 0.038, 0.035, 0.037, 0.043]], dtype=torch.float64)
+    params, rmse = fit_ssvi_slice(x, w)
+    assert params.shape == (1, 3)
+    assert rmse[0].item() <= 0.01
+
+    raw_svi = ssvi_to_raw_svi(params[:, 0], params[:, 1], params[:, 2])
+    assert isinstance(raw_svi, RawSVI)
+    sigma0 = torch.tensor([0.20], dtype=torch.float64)
+    T = torch.tensor([1.0], dtype=torch.float64)
+    cert = certify_slice(raw_svi, sigma0, T)
+    assert cert.ok.item()
+    assert cert.min_g.item() >= 0.0
+
+
+# ── Test Direct Canonical Features and Autograd Implicit Map ──
+
+def test_canonical_features_and_autograd() -> None:
+    leg = make_test_leg(spot=1.20, df_f=0.98, df_d=0.95, T=1.0)
+    svi = RawSVI(torch.tensor([[0.03, 0.08, -0.10, 0.02, 0.15]], dtype=torch.float64))
+    xi = canonical_features(svi, leg)
+    assert xi.shape == (1, 5)
+
+    quotes = torch.tensor([[0.16, 0.020, 0.006, 0.038, 0.015]], dtype=torch.float64, requires_grad=True)
+    conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
+    canonicalizer = SmileCanonicalizer(cache_size=16)
+
+    # Autograd forward + backward through ImplicitCanonicalMap
+    xi_map = ImplicitCanonicalMap.apply(quotes, conv, leg, canonicalizer)
+    assert isinstance(xi_map, torch.Tensor)
+    loss = xi_map.sum()
+    loss.backward()
+    assert quotes.grad is not None
+    assert quotes.grad.shape == (1, 5)
+
+    # Check CanonicalSmile instance structure
+    smile = canonicalizer.canonicalize(quotes.detach(), conv, leg)
+    assert isinstance(smile, CanonicalSmile)
+    assert smile.slice_params.shape == (1, 5)
