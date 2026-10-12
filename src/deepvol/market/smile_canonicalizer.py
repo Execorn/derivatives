@@ -205,7 +205,11 @@ def canonical_features(svi: RawSVI, leg: LegMarket) -> Tensor:
         f1_val = 1.0 - 0.5 * w1_val
         x_atm = (x_atm.unsqueeze(1) - f_val / f1_val).squeeze(1)
 
-    sig_atm = torch.sqrt(torch.clamp(svi.w(x_atm.unsqueeze(1)).squeeze(1) / leg.T, min=1e-12))
+    min_var = (0.01 ** 2) * leg.T
+    sig_atm = torch.clamp(
+        torch.sqrt(torch.clamp(svi.w(x_atm.unsqueeze(1)).squeeze(1), min=min_var) / leg.T),
+        min=0.01,
+    )
 
     # Invert 25C, 25P, 10C, 10P strikes and vols
     d_targets = [0.25, -0.25, 0.10, -0.10]
@@ -219,7 +223,10 @@ def canonical_features(svi: RawSVI, leg: LegMarket) -> Tensor:
         for _ in range(16):
             K_curr = strike_from_delta(d_ten, sig_curr, leg, p_ten, DeltaConvention.FORWARD_PNA)
             x_curr = torch.log(K_curr / leg.forward)
-            sig_curr = torch.sqrt(torch.clamp(svi.w(x_curr.unsqueeze(1)).squeeze(1) / leg.T, min=1e-12))
+            sig_curr = torch.clamp(
+                torch.sqrt(torch.clamp(svi.w(x_curr.unsqueeze(1)).squeeze(1), min=min_var) / leg.T),
+                min=0.01,
+            )
         v_out.append(sig_curr)
 
     v25c, v25p, v10c, v10p = v_out
@@ -345,7 +352,8 @@ def compute_canonical_feature_jacobian_theta(svi: RawSVI, leg: LegMarket) -> Ten
         f1_val = 1.0 - 0.5 * w1_val
         x_atm = (x_atm.unsqueeze(1) - f_val / f1_val).squeeze(1)
     w_atm, _, _ = svi.derivs(x_atm.unsqueeze(1))
-    v_atm = torch.sqrt(torch.clamp(w_atm.squeeze(1) / T, min=1e-12))
+    min_var = (0.01 ** 2) * T
+    v_atm = torch.clamp(torch.sqrt(torch.clamp(w_atm.squeeze(1), min=min_var) / T), min=0.01)
 
     def eval_gv(x_k: Tensor, v_k: Tensor, d2_k: Tensor) -> Tensor:
         delta_k = x_k - svi.params[:, 3]
@@ -375,7 +383,7 @@ def compute_canonical_feature_jacobian_theta(svi: RawSVI, leg: LegMarket) -> Ten
         for _ in range(16):
             x_curr = -d1 * v_curr * sqrt_T + 0.5 * (v_curr ** 2) * T
             w_curr = svi.w(x_curr.unsqueeze(1)).squeeze(1)
-            v_curr = torch.sqrt(torch.clamp(w_curr / T, min=1e-12))
+            v_curr = torch.clamp(torch.sqrt(torch.clamp(w_curr, min=min_var) / T), min=0.01)
         d2 = d1 - v_curr * sqrt_T
         gv_wings.append(eval_gv(x_curr, v_curr, d2))
 
@@ -616,8 +624,7 @@ class SmileCanonicalizer:
         R_q = compute_raw_svi_residual_jacobian_q(quotes, leg, conv, final_svi, x_mkt)
         Psi_theta = compute_canonical_feature_jacobian_theta(final_svi, leg)
 
-        dtheta_dq = -torch.linalg.solve(R_theta, R_q)
-        jacobian = torch.bmm(Psi_theta, dtheta_dq)
+        jacobian = torch.zeros(S_len, 5, 5, dtype=torch.float64, device=dev)
 
         for i in range(S_len):
             if conv[i] == ref_conv and not used_ssvi_list[i]:
@@ -660,10 +667,17 @@ class SmileCanonicalizer:
                 R_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
                 R_q[i] = -J_mat
                 Psi_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
+            else:
+                dtheta_dq_i = -torch.linalg.solve(R_theta[i], R_q[i])
+                jacobian[i] = Psi_theta[i] @ dtheta_dq_i
 
         # ATMF volatility: w(0) / T
         w_atmf = final_svi.w(torch.zeros(S_len, 1, dtype=torch.float64, device=dev)).squeeze(1)
-        sigma_atmf = torch.sqrt(torch.clamp(w_atmf / leg.T, min=1e-12))
+        min_var_leg = (0.01 ** 2) * leg.T
+        sigma_atmf = torch.clamp(
+            torch.sqrt(torch.clamp(w_atmf, min=min_var_leg) / leg.T),
+            min=0.01,
+        )
 
         # Asymptotic Lee slope L = b * (1 + |rho_s|)
         lee_slope = slice_params[:, 1] * (1.0 + torch.abs(slice_params[:, 2]))

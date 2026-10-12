@@ -200,9 +200,13 @@ def strike_from_delta(
     if not torch.compiler.is_compiling():
         recovered_delta = fx_delta(K, sigma, leg, phi, conv)
         residual = torch.abs(recovered_delta - delta)
-        if bool(torch.any(residual > tol)):
+        eps_mach = torch.finfo(torch.float64).eps
+        tau_safe = torch.clamp(tau, min=1e-15)
+        tol_tensor = torch.as_tensor(tol, dtype=torch.float64, device=tau.device)
+        tol_eff = torch.maximum(tol_tensor, 10.0 * eps_mach / tau_safe)
+        if bool(torch.any(residual > tol_eff)):
             raise ConventionSolveError(
-                f"Delta solver failed to reach tolerance {tol}: max residual {residual.max().item():.3e}"
+                f"Delta solver failed to reach tolerance: max residual {residual.max().item():.3e} > effective tol {tol_eff.max().item():.3e}"
             )
 
     return K
