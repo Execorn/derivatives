@@ -501,3 +501,23 @@ def get_drift_report(model_name: str, baseline_parameters: np.ndarray) -> dict:
         "psi": psi_dict,
         "count": len(history)
     }
+
+
+class AnalyticTriangulatedFallbackEngine:
+    """Deterministic analytic fallback pricing engine for triangulated FX crosses.
+
+    Wraps AnalyticTriangulated to provide guaranteed closed-form pricing and Greek
+    evaluation under SR 11-7 / SR 26-2 when neural surrogates encounter OOD market regimes.
+    """
+
+    def __init__(self, device: str = "cpu") -> None:
+        self.device = torch.device(device)
+        from deepvol.models.fx_cross_analytic import AnalyticTriangulated
+        self.module = AnalyticTriangulated().to(self.device).eval()
+
+    def price(self, X: torch.Tensor) -> Any:
+        """Evaluates analytic triangulated pricing and jets for input tensor X (B, 34)."""
+        X_dev = X.to(self.device)
+        with torch.no_grad():
+            return self.module(X_dev)
+

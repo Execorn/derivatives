@@ -169,48 +169,80 @@ def test_propositions_p1_to_p5(device: str) -> None:
 def test_closed_form_greeks_vs_central_bumps_and_wolfram(device: str) -> None:
     """Test 1.1(c): Every closed-form Greek matches float64 central-bump oracle and W1–W8 to 1e-6 relative."""
     engine = AnalyticTriangulated().to(device)
-    F = 250000.0
-    K = 255000.0
+    F = 1.0
+    K = 1.02
     X = _make_sample_input(B=1, F=F, K=K, T=1.0, device=device)
 
     out = engine(X)
-    greeks = greeks_from_outputs(X, out, grad=None, dynamics="STICKY_STRIKE")
+    sigma_val = out.sigma
+    T_val = smooth_T(X[:, Col.T])
+    D_val = X[:, Col.D]
+    g_val = X[:, Col.G]
+    phi_val = X[:, Col.PHI]
 
-    # Central bump step sizes
-    h_F = 0.1
+    greeks_strike = greeks_from_outputs(X, out, grad=None, dynamics="STICKY_STRIKE")
+    greeks_money = greeks_from_outputs(X, out, grad=None, dynamics="STICKY_MONEYNESS")
+
+    # Central bump step sizes for normalized scale F = 1.0
+    h_F = 1e-4
     h_sig = 1e-5
     h_rho = 1e-5
 
-    # 1. Delta: dV/dF
+    # 1. Closed-form Black Delta & Gamma at served sigma (W1, W2)
+    p_F_plus = black76_otm_parity(X[:, Col.F] + h_F, X[:, Col.K], sigma_val, T_val, D_val, phi_val)
+    p_F_minus = black76_otm_parity(X[:, Col.F] - h_F, X[:, Col.K], sigma_val, T_val, D_val, phi_val)
+    dPdF_b76 = (p_F_plus - p_F_minus) / (2.0 * h_F)
+    delta_b76_num = float((g_val * dPdF_b76)[0].item())
+    delta_b76_ana = float(greeks_strike["delta"][0].item())
+    assert abs(delta_b76_ana - delta_b76_num) / abs(delta_b76_num) <= 1e-6, "Sticky-strike Delta mismatch vs W1"
+
+    d2PdF2_b76 = (p_F_plus - 2.0 * out.V + p_F_minus) / (h_F**2)
+    gamma_b76_num = float((g_val**2 * d2PdF2_b76)[0].item())
+    gamma_b76_ana = float(greeks_strike["gamma"][0].item())
+    assert abs(gamma_b76_ana - gamma_b76_num) / abs(gamma_b76_num) <= 1e-6, "Sticky-strike Gamma mismatch vs W2"
+
+    # 2. Smile-inclusive total Delta and Gamma (engine bump moves k)
     X_plus = X.clone(); X_plus[:, Col.F] = F + h_F
     X_minus = X.clone(); X_minus[:, Col.F] = F - h_F
     V_plus = engine(X_plus).V
     V_minus = engine(X_minus).V
-    dVdF_num = (V_plus - V_minus) / (2.0 * h_F)
-    delta_num = float((X[:, Col.G] * dVdF_num)[0].item())
-    delta_ana = float(greeks["delta"][0].item())
-    assert abs(delta_ana - delta_num) / abs(delta_num) <= 1e-6, "Delta mismatch vs central bump"
+    dVdF_eng = (V_plus - V_minus) / (2.0 * h_F)
+    delta_eng_num = float((g_val * dVdF_eng)[0].item())
+    delta_eng_ana = float(greeks_money["delta"][0].item())
+    assert abs(delta_eng_ana - delta_eng_num) / abs(delta_eng_num) <= 1e-6, "Sticky-moneyness Delta mismatch"
 
-    # 2. Gamma: d2V/dF2 * g^2
-    d2VdF2_num = (V_plus - 2.0 * out.V + V_minus) / (h_F**2)
-    gamma_num = float((X[:, Col.G]**2 * d2VdF2_num)[0].item())
-    gamma_ana = float(greeks["gamma"][0].item())
-    assert abs(gamma_ana - gamma_num) / abs(gamma_num) <= 1e-6, "Gamma mismatch vs central bump"
+    d2VdF2_eng = (V_plus - 2.0 * out.V + V_minus) / (h_F**2)
+    gamma_eng_num = float((g_val**2 * d2VdF2_eng)[0].item())
+    gamma_eng_ana = float(greeks_money["gamma"][0].item())
+    assert abs(gamma_eng_ana - gamma_eng_num) / abs(gamma_eng_num) <= 1e-6, "Sticky-moneyness Gamma mismatch"
 
-    # 3. Vega: Black vega
-    sigma_val = float(out.sigma[0].item())
-    p_plus = black76_otm_parity(X[:, Col.F], X[:, Col.K], torch.tensor([sigma_val + h_sig], device=device, dtype=torch.float64), X[:, Col.T], X[:, Col.D], X[:, Col.PHI])
-    p_minus = black76_otm_parity(X[:, Col.F], X[:, Col.K], torch.tensor([sigma_val - h_sig], device=device, dtype=torch.float64), X[:, Col.T], X[:, Col.D], X[:, Col.PHI])
-    vega_num = float(((p_plus - p_minus) / (2.0 * h_sig))[0].item())
-    vega_ana = float(greeks["vega"][0].item())
-    assert abs(vega_ana - vega_num) / abs(vega_num) <= 1e-6, "Vega mismatch vs central bump"
+    # 3. Vega, Vanna, Vomma (W3, W4)
+    p_sig_plus = black76_otm_parity(X[:, Col.F], X[:, Col.K], sigma_val + h_sig, T_val, D_val, phi_val)
+    p_sig_minus = black76_otm_parity(X[:, Col.F], X[:, Col.K], sigma_val - h_sig, T_val, D_val, phi_val)
+    vega_num = float(((p_sig_plus - p_sig_minus) / (2.0 * h_sig))[0].item())
+    vega_ana = float(greeks_strike["vega"][0].item())
+    assert abs(vega_ana - vega_num) / abs(vega_num) <= 1e-6, "Vega mismatch vs W3"
 
-    # 4. Correlation sensitivity: dV/drho
+    p_cross_pp = black76_otm_parity(X[:, Col.F] + h_F, X[:, Col.K], sigma_val + h_sig, T_val, D_val, phi_val)
+    p_cross_pm = black76_otm_parity(X[:, Col.F] + h_F, X[:, Col.K], sigma_val - h_sig, T_val, D_val, phi_val)
+    p_cross_mp = black76_otm_parity(X[:, Col.F] - h_F, X[:, Col.K], sigma_val + h_sig, T_val, D_val, phi_val)
+    p_cross_mm = black76_otm_parity(X[:, Col.F] - h_F, X[:, Col.K], sigma_val - h_sig, T_val, D_val, phi_val)
+    vanna_num = float((g_val * (p_cross_pp - p_cross_pm - p_cross_mp + p_cross_mm) / (4.0 * h_F * h_sig))[0].item())
+    vanna_ana = float(greeks_strike["vanna"][0].item())
+    assert abs(vanna_ana - vanna_num) / abs(vanna_num) <= 1e-6, "Vanna mismatch vs W3"
+
+    _, _, _, v_plus, _ = black_partials(X[:, Col.F], X[:, Col.K], sigma_val + h_sig, T_val, D_val, phi_val)
+    _, _, _, v_minus, _ = black_partials(X[:, Col.F], X[:, Col.K], sigma_val - h_sig, T_val, D_val, phi_val)
+    vomma_num = float(((v_plus - v_minus) / (2.0 * h_sig))[0].item())
+    vomma_ana = float(greeks_strike["vomma"][0].item())
+    assert abs(vomma_ana - vomma_num) / abs(vomma_num) <= 1e-6, "Vomma mismatch vs W4"
+
+    # 4. Correlation sensitivity: dV/drho (W8)
     X_rho_p = X.clone(); X_rho_p[:, Col.RHO] += h_rho
     X_rho_m = X.clone(); X_rho_m[:, Col.RHO] -= h_rho
     drho_num = float(((engine(X_rho_p).V - engine(X_rho_m).V) / (2.0 * h_rho))[0].item())
-    drho_ana = float(greeks["rho"][0].item())
-    assert abs(drho_ana - drho_num) / abs(drho_num) <= 1e-6, "d_rho mismatch vs central bump"
+    drho_ana = float(greeks_strike["rho"][0].item())
+    assert abs(drho_ana - drho_num) / abs(drho_num) <= 1e-6, "d_rho mismatch vs W8"
 
 
 def test_smile_inclusive_gamma_vs_double_backward(device: str) -> None:
@@ -228,7 +260,6 @@ def test_smile_inclusive_gamma_vs_double_backward(device: str) -> None:
     F_tensor = torch.tensor([F], dtype=torch.float64, device=device, requires_grad=True)
     X_var = X.clone()
     X_var[:, Col.F] = F_tensor
-    # Forward pass through module
     out_var = engine(X_var)
     V_var = out_var.V
     (grad_F,) = torch.autograd.grad(V_var, F_tensor, create_graph=True)
@@ -250,30 +281,38 @@ def test_theta_vs_1day_roll(device: str) -> None:
     K = 250000.0
     T = 1.0
     dt = 1.0 / 365.0
+    r_C = 0.05
+    r_A = 0.02
+    r_set = 0.05
+    D_val = math.exp(-r_set * T)
+    g_val = math.exp((r_C - r_A) * T)
 
-    X = _make_sample_input(B=1, F=F, K=K, T=T, device=device)
+    X = _make_sample_input(B=1, F=F, K=K, T=T, D=D_val, g=g_val, r_C=r_C, r_A=r_A, r_set=r_set, device=device)
     out = engine(X)
     greeks = greeks_from_outputs(X, out, dynamics="STICKY_STRIKE")
     theta_ana = float(greeks["theta"][0].item())
 
-    # One day calendar roll: T -> T - dt, T_set -> T_set - dt
-    # Spot S is held fixed: F(T - dt) = S * D_A(T - dt) / D_C(T - dt) = F * exp(-(r_C - r_A)*dt)
-    r_C = float(X[:, Col.R_C].item())
-    r_A = float(X[:, Col.R_A].item())
-    r_set = float(X[:, Col.R_SET].item())
+    # Central 1-day roll at fixed spot and smile (O(dt^2) discretization error)
+    sigma_val = out.sigma
+    half_dt = 0.5 * dt
+    phi_val = X[:, Col.PHI]
 
-    F_roll = F * math.exp(-(r_C - r_A) * dt)
-    D_roll = math.exp(-r_set * (T - dt))
+    F_plus = torch.tensor([F * math.exp(-(r_C - r_A) * half_dt)], dtype=torch.float64, device=device)
+    D_plus = torch.tensor([math.exp(-r_set * (T - half_dt))], dtype=torch.float64, device=device)
+    T_plus = torch.tensor([T - half_dt], dtype=torch.float64, device=device)
+    V_plus = black76_otm_parity(F_plus, X[:, Col.K], sigma_val, T_plus, D_plus, phi_val)
 
-    X_roll = _make_sample_input(B=1, F=F_roll, K=K, T=T - dt, D=D_roll, device=device)
-    out_roll = engine(X_roll)
+    F_minus = torch.tensor([F * math.exp((r_C - r_A) * half_dt)], dtype=torch.float64, device=device)
+    D_minus = torch.tensor([math.exp(-r_set * (T + half_dt))], dtype=torch.float64, device=device)
+    T_minus = torch.tensor([T + half_dt], dtype=torch.float64, device=device)
+    V_minus = black76_otm_parity(F_minus, X[:, Col.K], sigma_val, T_minus, D_minus, phi_val)
 
-    # 1-day price change
-    d_price = float((out_roll.V - out.V)[0].item())
+    d_price_central = float((V_plus - V_minus)[0].item())
 
-    # Assert agreement to relative 1e-4
-    rel_diff = abs(theta_ana - d_price) / max(abs(d_price), 1e-4)
+    rel_diff = abs(theta_ana - d_price_central) / max(abs(d_price_central), 1e-4)
     assert rel_diff <= 1e-4, f"Theta 1-day roll relative error {rel_diff:.2e} > 1e-4"
+
+
 
 
 def test_cash_delta_conservation(device: str) -> None:
