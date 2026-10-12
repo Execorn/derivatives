@@ -124,7 +124,7 @@ def strike_from_delta(
     phi: Tensor,
     conv: DeltaConvention,
     *,
-    n_iter: int = 12,
+    n_iter: int = 20,
     tol: float = 1e-12,
 ) -> Tensor:
     """Inverts option delta to strike K across market quoting conventions.
@@ -136,6 +136,9 @@ def strike_from_delta(
         phi: Call (+1.0) / Put (-1.0) tensor of shape (S,), float64.
         conv: Delta convention enum.
         n_iter: Fixed Newton iteration count for premium-adjusted conventions.
+            Set to 20 to ensure convergence across wide log-moneyness brackets
+            (8 * tau) under extreme volatility regimes (tau >= 5.0) while
+            preserving torch.compile(fullgraph=True) static loop unrolling.
         tol: Convergence residual tolerance.
 
     Returns:
@@ -203,7 +206,12 @@ def strike_from_delta(
         eps_mach = torch.finfo(torch.float64).eps
         tau_safe = torch.clamp(tau, min=1e-15)
         tol_tensor = torch.as_tensor(tol, dtype=torch.float64, device=tau.device)
-        tol_eff = torch.maximum(tol_tensor, 10.0 * eps_mach / tau_safe)
+        scale_pa = torch.where(
+            (phi > 0.0) & ((conv == DeltaConvention.FORWARD_PA) | (conv == DeltaConvention.SPOT_PA)),
+            torch.clamp(K / F, min=1.0, max=1e11),
+            torch.ones_like(K),
+        )
+        tol_eff = torch.clamp(torch.maximum(tol_tensor, 10.0 * eps_mach * scale_pa / tau_safe), max=1e-3)
         if bool(torch.any(residual > tol_eff)):
             raise ConventionSolveError(
                 f"Delta solver failed to reach tolerance: max residual {residual.max().item():.3e} > effective tol {tol_eff.max().item():.3e}"

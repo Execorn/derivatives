@@ -75,7 +75,7 @@ def fit_ssvi_slice(x: Tensor, w: Tensor) -> Tuple[Tensor, Tensor]:
         w(x) = 0.5 * theta * (1 + rho * phi * x + sqrt((phi * x + rho)^2 + 1 - rho^2))
     Sufficient no-arbitrage bounds theta * phi * (1 + |rho|) < 4 and theta * phi^2 * (1 + |rho|) <= 4
     are enforced through smooth unconstrained reparametrization:
-        rho = tanh(u)
+        rho = 0.999 * tanh(u)
         phi = phi_max * sigmoid(v)
         phi_max = min(4 / (theta * (1 + |rho|)), sqrt(4 / (theta * (1 + |rho|)))) * (1 - 1e-6)
 
@@ -90,8 +90,8 @@ def fit_ssvi_slice(x: Tensor, w: Tensor) -> Tuple[Tensor, Tensor]:
     Raises:
         SmileArbitrageError: If inputs contain non-positive total variances or fit RMSE exceeds threshold.
     """
-    x_in = x.unsqueeze(0) if x.dim() == 1 else x
-    w_in = w.unsqueeze(0) if w.dim() == 1 else w
+    x_in = (x.unsqueeze(0) if x.dim() == 1 else x).detach()
+    w_in = (w.unsqueeze(0) if w.dim() == 1 else w).detach()
     S_len = x_in.shape[0]
     dev = x_in.device
 
@@ -99,8 +99,8 @@ def fit_ssvi_slice(x: Tensor, w: Tensor) -> Tuple[Tensor, Tensor]:
     rmse_out: List[float] = []
 
     for i in range(S_len):
-        x_row = x_in[i].cpu().numpy()
-        w_row = w_in[i].cpu().numpy()
+        x_row = x_in[i].detach().cpu().numpy()
+        w_row = w_in[i].detach().cpu().numpy()
 
         if np.any(w_row <= 0.0) or np.any(np.isnan(w_row)):
             raise SmileArbitrageError("Non-positive or NaN total variance encountered in SSVI fit")
@@ -111,7 +111,7 @@ def fit_ssvi_slice(x: Tensor, w: Tensor) -> Tuple[Tensor, Tensor]:
         def get_params(p: Sequence[float]) -> Tuple[float, float, float]:
             zeta, u_val, v_val = p
             th = th_base * math.exp(zeta)
-            r_val = math.tanh(u_val)
+            r_val = 0.999 * math.tanh(u_val)
             denom = th * (1.0 + abs(r_val))
             phi_max = min(4.0 / denom, math.sqrt(4.0 / denom)) * (1.0 - 1e-6)
             sigm_v = 1.0 / (1.0 + math.exp(-v_val))
@@ -171,11 +171,12 @@ def ssvi_to_raw_svi(theta: Tensor, rho: Tensor, phi: Tensor) -> RawSVI:
     Returns:
         RawSVI slice container.
     """
-    a = 0.5 * theta * (1.0 - (rho ** 2))
+    rho_safe = torch.clamp(rho, min=-0.999, max=0.999)
+    a = 0.5 * theta * (1.0 - (rho_safe ** 2))
     b = 0.5 * theta * phi
-    rho_s = rho
-    m = -rho / phi
-    s = torch.sqrt(torch.clamp(1.0 - (rho ** 2), min=1e-15)) / phi
+    rho_s = rho_safe
+    m = -rho_safe / phi
+    s = torch.sqrt(torch.clamp(1.0 - (rho_safe ** 2), min=1e-15)) / phi
 
     params = torch.stack([a, b, rho_s, m, s], dim=-1)
     return RawSVI(params)
@@ -636,7 +637,7 @@ class SmileCanonicalizer:
                 # On SSVI fallback, evaluate Jacobian strictly on the SSVI manifold
                 h = 1e-6
                 J_mat = torch.zeros(5, 5, dtype=torch.float64, device=dev)
-                q_base = quotes[i:i+1]
+                q_base = quotes[i:i+1].detach()
                 leg_i = LegMarket(
                     spot=leg.spot[i:i+1],
                     df_foreign=leg.df_foreign[i:i+1],

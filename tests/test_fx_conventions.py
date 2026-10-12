@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 import pytest
 import torch
 from hypothesis import given, settings, strategies as st
@@ -274,3 +275,63 @@ def test_pillar_strikes() -> None:
     # Check monotonic strike ordering for standard currency pairs K_10P < K_25P < K_ATM < K_25C < K_10C
     for s_idx in range(2):
         assert K[s_idx, 0] < K[s_idx, 1] < K[s_idx, 2] < K[s_idx, 3] < K[s_idx, 4]
+
+
+# ── Test High-Tau PA Delta Inversion Convergence (T in [5.0, 10.0], sigma in [2.0, 3.0]) ──
+
+@pytest.mark.parametrize("tau_params", [
+    (5.0, 3.0, -0.50),  # Challenger 1 Defect 2 reproduction case
+    (5.0, 3.0, -0.25),  # 25D Put
+    (5.0, 3.0, -0.10),  # 10D Put
+    (10.0, 3.0, -0.50), # 10Y extreme vol ATM Put
+    (10.0, 3.0, -0.25), # 10Y extreme vol 25D Put
+    (10.0, 3.0, -0.10), # 10Y extreme vol 10D Put
+])
+def test_strike_from_delta_high_tau_pa_put_convergence(tau_params: tuple[float, float, float]) -> None:
+    """Verifies that strike_from_delta with default n_iter=20 achieves strict tolerance on tau >= 5.0."""
+    T_val, vol_val, d_target = tau_params
+    leg = LegMarket(
+        spot=torch.tensor([0.5], dtype=torch.float64),
+        df_foreign=torch.tensor([0.98], dtype=torch.float64),
+        df_domestic=torch.tensor([0.95], dtype=torch.float64),
+        T=torch.tensor([T_val], dtype=torch.float64),
+    )
+    sig = torch.tensor([vol_val], dtype=torch.float64)
+    phi = torch.tensor([-1.0], dtype=torch.float64)
+    target = torch.tensor([d_target], dtype=torch.float64)
+
+    K = strike_from_delta(target, sig, leg, phi, DeltaConvention.FORWARD_PA)
+    assert torch.isfinite(K).all() and (K > 0).all()
+
+    rec = fx_delta(K, sig, leg, phi, DeltaConvention.FORWARD_PA)
+    assert torch.isfinite(rec).all()
+    res = torch.abs(rec - target).item()
+    assert res <= 1e-12, f"PA Put residual {res:.3e} > 1e-12 at T={T_val}, vol={vol_val}, target={d_target}"
+
+
+def test_strike_from_delta_compile_fullgraph_high_tau() -> None:
+    """Verifies torch.compile(fullgraph=True) produces 0 graph breaks on high-tau batch with n_iter=20."""
+    n = 8
+    leg = LegMarket(
+        spot=torch.full((n,), 1.25, dtype=torch.float64),
+        df_foreign=torch.full((n,), 0.98, dtype=torch.float64),
+        df_domestic=torch.full((n,), 0.95, dtype=torch.float64),
+        T=torch.tensor([1.0, 2.0, 5.0, 10.0, 1.0, 2.0, 5.0, 10.0], dtype=torch.float64),
+    )
+    sigma = torch.tensor([0.20, 1.00, 2.50, 3.00, 0.20, 1.00, 2.50, 3.00], dtype=torch.float64)
+    delta = torch.tensor([-0.10, -0.25, -0.50, -0.25, -0.10, -0.25, -0.50, -0.25], dtype=torch.float64)
+    phi = torch.full((n,), -1.0, dtype=torch.float64)
+
+    def solve_fn(d: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        return strike_from_delta(d, s, leg, phi, DeltaConvention.FORWARD_PA)
+
+    dynamo_mod: Any = getattr(torch, "_dynamo")
+    explanation: Any = dynamo_mod.explain(solve_fn)(delta, sigma)
+    assert getattr(explanation, "graph_break_count", 0) == 0
+
+    compiled_solve = torch.compile(solve_fn, fullgraph=True)
+    out_comp = compiled_solve(delta, sigma)
+    out_eag = solve_fn(delta, sigma)
+
+    assert torch.all(out_comp > 0)
+    assert torch.max(torch.abs(out_comp - out_eag)).item() <= 1e-12

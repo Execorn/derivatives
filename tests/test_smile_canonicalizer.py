@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import math
 import time
+from typing import cast
 import pytest
 import torch
+from torch import Tensor
 
 from deepvol.market.fx_conventions import (
     AtmConvention,
@@ -345,10 +347,10 @@ def test_canonical_features_and_autograd() -> None:
     canonicalizer = SmileCanonicalizer(cache_size=16)
 
     # Autograd forward + backward through ImplicitCanonicalMap
-    xi_map = ImplicitCanonicalMap.apply(quotes, conv, leg, canonicalizer)
+    xi_map = cast(Tensor, ImplicitCanonicalMap.apply(quotes, conv, leg, canonicalizer))  # type: ignore[no-untyped-call]
     assert isinstance(xi_map, torch.Tensor)
     loss = xi_map.sum()
-    loss.backward()
+    loss.backward()  # type: ignore[no-untyped-call]
     assert quotes.grad is not None
     assert quotes.grad.shape == (1, 5)
 
@@ -356,3 +358,116 @@ def test_canonical_features_and_autograd() -> None:
     smile = canonicalizer.canonicalize(quotes.detach(), conv, leg)
     assert isinstance(smile, CanonicalSmile)
     assert smile.slice_params.shape == (1, 5)
+
+
+# ── Test SSVI Fallback Direct Autograd and Boundary Hardening ──
+
+def test_canonicalize_direct_requires_grad_ssvi_fallback() -> None:
+    """Verifies that direct canonicalize call on quotes with requires_grad=True succeeds on SSVI fallback."""
+    can = SmileCanonicalizer(cache_size=0)
+    leg = LegMarket(
+        spot=torch.tensor([1.20], dtype=torch.float64),
+        df_foreign=torch.tensor([0.98], dtype=torch.float64),
+        df_domestic=torch.tensor([0.95], dtype=torch.float64),
+        T=torch.tensor([0.5], dtype=torch.float64),
+    )
+    conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
+
+    # Severe butterfly-violating quotes forcing SSVI fallback
+    quotes_arb = torch.tensor(
+        [[0.20, 0.08, -0.015, 0.16, -0.025]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    smile = can.canonicalize(quotes_arb, conv, leg)
+    assert smile.used_ssvi[0].item() is True
+    assert torch.isfinite(smile.xi).all()
+    assert torch.isfinite(smile.jacobian).all()
+    assert smile.min_g[0].item() >= -1e-12
+
+
+def test_ssvi_boundary_clamping_severe_positive_skew() -> None:
+    """Verifies that severe positive skew quotes do not collapse rho to 1.0 in SSVI fallback."""
+    leg = LegMarket(
+        spot=torch.tensor([1.25], dtype=torch.float64),
+        df_foreign=torch.tensor([0.99], dtype=torch.float64),
+        df_domestic=torch.tensor([0.97], dtype=torch.float64),
+        T=torch.tensor([0.5], dtype=torch.float64),
+    )
+    conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
+    # Quotes triggering Defect 3: RR10 = 0.18, BF10 = -0.028
+    q_pos = torch.tensor([[0.22, 0.09, -0.018, 0.18, -0.028]], dtype=torch.float64)
+
+    can = SmileCanonicalizer(cache_size=0)
+    smile = can.canonicalize(q_pos, conv, leg)
+
+    assert smile.used_ssvi.item() is True, "Expected SSVI fallback activation"
+    assert smile.min_g.item() >= 0.0, f"Expected non-negative butterfly min_g, got {smile.min_g.item()}"
+    rho_fitted = smile.slice_params[0, 2].item()
+    assert abs(rho_fitted) <= 0.999 + 1e-10, f"Fitted rho {rho_fitted} exceeded interior bound 0.999"
+    assert 1.0 - (rho_fitted ** 2) > 1e-4, "Expected strictly positive 1 - rho^2 margin"
+    assert smile.slice_params[0, 0].item() > 0.0, "Expected strictly positive a parameter"
+    assert smile.slice_params[0, 4].item() > 0.0, "Expected strictly positive s parameter"
+
+
+def test_ssvi_boundary_clamping_severe_negative_skew() -> None:
+    """Verifies that severe negative skew quotes do not collapse rho to -1.0 in SSVI fallback."""
+    leg = LegMarket(
+        spot=torch.tensor([1.25], dtype=torch.float64),
+        df_foreign=torch.tensor([0.99], dtype=torch.float64),
+        df_domestic=torch.tensor([0.97], dtype=torch.float64),
+        T=torch.tensor([0.5], dtype=torch.float64),
+    )
+    conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
+    # Severe put skew: RR10 = -0.18, BF10 = -0.028
+    q_neg = torch.tensor([[0.22, -0.09, -0.018, -0.18, -0.028]], dtype=torch.float64)
+
+    can = SmileCanonicalizer(cache_size=0)
+    smile = can.canonicalize(q_neg, conv, leg)
+
+    assert smile.used_ssvi.item() is True, "Expected SSVI fallback activation"
+    assert smile.min_g.item() >= 0.0, f"Expected non-negative butterfly min_g, got {smile.min_g.item()}"
+    rho_fitted = smile.slice_params[0, 2].item()
+    assert rho_fitted >= -0.999 - 1e-10, f"Fitted rho {rho_fitted} exceeded interior bound -0.999"
+    assert 1.0 - (rho_fitted ** 2) > 1e-4, "Expected strictly positive 1 - rho^2 margin"
+    assert smile.slice_params[0, 0].item() > 0.0, "Expected strictly positive a parameter"
+
+
+def test_ssvi_to_raw_svi_boundary_admissibility() -> None:
+    """Directly verifies that ssvi_to_raw_svi preserves slice admissibility at rho = +/- 1.0."""
+    theta = torch.tensor([0.04, 0.04, 0.02], dtype=torch.float64)
+    rho_boundary = torch.tensor([1.0, -1.0, 0.999], dtype=torch.float64)
+    phi = torch.tensor([2.0, 2.0, 3.0], dtype=torch.float64)
+
+    raw_svi = ssvi_to_raw_svi(theta, rho_boundary, phi)
+    sigma0 = torch.tensor([0.20, 0.20, 0.14], dtype=torch.float64)
+    T = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float64)
+
+    cert = certify_slice(raw_svi, sigma0, T)
+    assert cert.ok.all(), "All boundary-clamped slices must satisfy certification"
+    assert cert.positive_ok.all(), "All boundary-clamped slices must satisfy positive_ok"
+    assert cert.lee_ok.all(), "All boundary-clamped slices must satisfy lee_ok"
+    assert (cert.min_g >= -1e-12).all(), "All boundary-clamped slices must satisfy Durrleman condition"
+
+
+def test_ssvi_fallback_autograd_differentiable_quotes_severe_skew() -> None:
+    """Verifies autograd forward and backward stability under severe skew SSVI fallback."""
+    can = SmileCanonicalizer(cache_size=0)
+    leg = LegMarket(
+        spot=torch.tensor([1.25], dtype=torch.float64),
+        df_foreign=torch.tensor([0.99], dtype=torch.float64),
+        df_domestic=torch.tensor([0.97], dtype=torch.float64),
+        T=torch.tensor([0.5], dtype=torch.float64),
+    )
+    conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
+    q_diff = torch.tensor([[0.22, 0.09, -0.018, 0.18, -0.028]], dtype=torch.float64, requires_grad=True)
+
+    xi = cast(Tensor, ImplicitCanonicalMap.apply(q_diff, conv, leg, can))  # type: ignore[no-untyped-call]
+    loss = (xi ** 2).sum()
+    loss.backward()  # type: ignore[no-untyped-call]
+
+    assert q_diff.grad is not None
+    assert torch.isfinite(q_diff.grad).all()
+    assert not torch.isnan(q_diff.grad).any()
+    assert not torch.isinf(q_diff.grad).any()

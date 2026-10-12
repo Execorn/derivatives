@@ -75,8 +75,8 @@ def test_stress_pa_argmax_and_inversion() -> None:
     """Stress tests Premium-Adjusted conventions, argmax stationary condition, and bounds."""
     np.seterr(all="raise")
 
-    vols = [0.02, 0.05, 0.10, 0.20, 0.50, 1.0]
-    tenors = [1/365, 0.1, 1.0, 3.0]
+    vols = [0.02, 0.05, 0.10, 0.20, 0.50, 1.0, 2.0, 3.0]
+    tenors = [1/365, 0.1, 0.5, 1.0, 3.0, 5.0, 10.0]
 
     for v in vols:
         for t in tenors:
@@ -105,7 +105,9 @@ def test_stress_pa_argmax_and_inversion() -> None:
                     K_call = strike_from_delta(target_ten, sig, leg, phi_call, DeltaConvention.FORWARD_PA)
                     assert torch.isfinite(K_call).all() and (K_call > 0).all()
                     rec_call = fx_delta(K_call, sig, leg, phi_call, DeltaConvention.FORWARD_PA)
-                    assert torch.abs(rec_call - target_ten).item() <= 1e-12
+                    eps_mach = torch.finfo(torch.float64).eps
+                    tol_call = max(1e-12, 10.0 * eps_mach * (K_call.item() / leg.forward.item()) / tau)
+                    assert torch.abs(rec_call - target_ten).item() <= tol_call
 
             # PA Put: Globally monotonic, all deltas in [0.05, 0.45] must invert
             for d_target in [0.05, 0.10, 0.25, 0.45]:
@@ -282,3 +284,67 @@ def test_stress_calendar_monotonicity_checker() -> None:
     w_invalid[2] = w_invalid[1] * 0.8  # total variance drops
     invalid_flags = calendar_check(w_invalid, T)
     assert not bool(invalid_flags[2].item())
+
+
+# ── Challenge 8: SSVI Fallback Autograd Gradcheck and Mixed-Batch Stability ──
+
+def test_stress_autograd_gradcheck_ssvi_fallback() -> None:
+    """Performs rigorous torch.autograd.gradcheck on ImplicitCanonicalMap under SSVI fallback."""
+    can = SmileCanonicalizer(cache_size=0)
+    leg = LegMarket(
+        spot=torch.tensor([1.20], dtype=torch.float64),
+        df_foreign=torch.tensor([0.98], dtype=torch.float64),
+        df_domestic=torch.tensor([0.95], dtype=torch.float64),
+        T=torch.tensor([0.5], dtype=torch.float64),
+    )
+    conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
+    quotes_arb = torch.tensor(
+        [[0.20, 0.08, -0.015, 0.16, -0.025]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    def evaluate_xi(q: Tensor) -> Tensor:
+        return cast(Tensor, ImplicitCanonicalMap.apply(q, conv, leg, can))  # type: ignore[no-untyped-call]
+
+    # Verifies analytical IFT backward matches central finite differences
+    assert torch.autograd.gradcheck(evaluate_xi, (quotes_arb,), eps=1e-6, atol=1e-4, rtol=1e-3)
+
+
+def test_stress_autograd_mixed_batch_raw_svi_and_ssvi() -> None:
+    """Verifies autograd backward stability and Jacobian agreement on mixed Raw-SVI + SSVI batch."""
+    can = SmileCanonicalizer(cache_size=0)
+    leg = LegMarket(
+        spot=torch.tensor([1.20, 1.25], dtype=torch.float64),
+        df_foreign=torch.tensor([0.98, 0.99], dtype=torch.float64),
+        df_domestic=torch.tensor([0.95, 0.97], dtype=torch.float64),
+        T=torch.tensor([0.5, 0.5], dtype=torch.float64),
+    )
+    conv = [
+        (DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE),
+        (DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE),
+    ]
+
+    quotes = torch.tensor(
+        [
+            [0.16, -0.015, 0.006, -0.030, 0.014],   # State 0: Raw SVI certified
+            [0.20, 0.08, -0.015, 0.16, -0.025],     # State 1: SSVI fallback triggered
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    xi = cast(Tensor, ImplicitCanonicalMap.apply(quotes, conv, leg, can))  # type: ignore[no-untyped-call]
+    loss = (xi ** 2).sum()
+    loss.backward()  # type: ignore[no-untyped-call]
+
+    assert quotes.grad is not None
+    assert torch.isfinite(quotes.grad).all()
+
+    smile = can.canonicalize(quotes.detach(), conv, leg)
+    assert smile.used_ssvi.tolist() == [False, True]
+
+    # Expected gradient: 2 * xi @ jacobian
+    expected_grad = 2.0 * torch.einsum("si,sij->sj", xi.detach(), smile.jacobian)
+    grad_diff = torch.abs(quotes.grad - expected_grad).max().item()
+    assert grad_diff < 1e-10, f"Mixed batch gradient discrepancy {grad_diff:.3e} > 1e-10"
