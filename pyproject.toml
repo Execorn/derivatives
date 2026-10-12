@@ -69,6 +69,10 @@ dev = [
     "black>=23.0.0",
     "isort>=5.12.0",
     "ruff>=0.0.250",
+    "mypy>=1.11",
+    "pyright>=1.1.380",
+    "hypothesis>=6.100",
+    "pytest-benchmark>=4",
 ]
 
 [project.scripts]
@@ -91,4 +95,39 @@ asyncio_mode = "auto"
 markers = [
     "integration: marks tests requiring live market data / network (run with INTEGRATION=1)",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: marks tests requiring CUDA GPU acceleration",
+    "bench: marks benchmark latency and throughput tests",
 ]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "deepvol.market.fx_conventions",
+    "deepvol.market.svi_slice",
+    "deepvol.market.smile_canonicalizer",
+    "deepvol.market.legacy_adapter",
+    "deepvol.models.fx_cross_*",
+    "deepvol.models.taylor_jets",
+    "deepvol.training.*cross*",
+    "deepvol.api.schemas_fx_cross",
+    "deepvol.api.fx_cross_*",
+]
+strict = true
+
+[tool.pyright]
+include = [
+    "src/deepvol/market/fx_conventions.py",
+    "src/deepvol/market/svi_slice.py",
+    "src/deepvol/market/smile_canonicalizer.py",
+    "src/deepvol/market/legacy_adapter.py",
+    "src/deepvol/models/fx_cross_*.py",
+    "src/deepvol/models/taylor_jets.py",
+    "src/deepvol/training/*cross*.py",
+    "src/deepvol/api/schemas_fx_cross.py",
+    "src/deepvol/api/fx_cross_*.py",
+]
+typeCheckingMode = "strict"
