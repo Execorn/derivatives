@@ -182,3 +182,33 @@ def test_model_governance_compliance():
     assert 0.01 <= res_rb["clamped_params"][1] <= 0.5
     assert 0.5 <= res_rb["clamped_params"][2] <= 4.0
     assert -0.95 <= res_rb["clamped_params"][3] <= 0.0
+
+
+def test_analytic_triangulated_fallback_engine() -> None:
+    from deepvol.calibration.fallbacks import AnalyticTriangulatedFallbackEngine
+    from deepvol.models.fx_cross_analytic import Col, N_COLS
+
+    engine = AnalyticTriangulatedFallbackEngine(device="cpu")
+    X = torch.zeros(2, N_COLS, dtype=torch.float64)
+    X[:, Col.F] = 250000.0
+    X[:, Col.K] = 250000.0
+    X[:, Col.T] = 1.0
+    X[:, Col.T_SET] = 1.0
+    X[:, Col.D] = 0.95
+    X[:, Col.G] = 1.05
+    X[:, Col.RHO] = -0.20
+    X[:, Col.PHI] = 1.0
+    for i in range(5):
+        X[:, Col.SVI1 + i] = torch.tensor([0.025, 0.08, -0.15, 0.02, 0.05], dtype=torch.float64)[i]
+        X[:, Col.SVI2 + i] = torch.tensor([0.040, 0.12, 0.35, -0.01, 0.08], dtype=torch.float64)[i]
+    X[:, Col.R_C] = 0.05
+    X[:, Col.R_A] = 0.02
+    X[:, Col.R_SET] = 0.05
+
+    out = engine.price(X)
+    assert out.V.shape == (2,)
+    assert torch.all(torch.isfinite(out.V))
+    assert torch.all(out.sigma > 0.0)
+    assert out.s_k.shape == (2,)
+    assert out.s_kk.shape == (2,)
+
