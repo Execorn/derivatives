@@ -35,37 +35,111 @@ def make_test_leg(spot: float = 1.25, df_f: float = 0.98, df_d: float = 0.95, T:
     )
 
 
-# ── Test (a): IFT Jacobian vs Float64 Central Bumps <= 1e-5 ──
+# ── Test (a1): Reference Convention Identity Check ──
 
-def test_jacobian_vs_central_bumps() -> None:
+def test_jacobian_vs_central_bumps_reference() -> None:
     leg = make_test_leg(spot=1.20, df_f=0.98, df_d=0.95, T=1.0)
     quotes = torch.tensor([[0.16, 0.020, 0.006, 0.038, 0.015]], dtype=torch.float64)
     conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
 
     canonicalizer = SmileCanonicalizer(cache_size=128)
     smile = canonicalizer.canonicalize(quotes, conv, leg)
-    J_analytic = smile.jacobian[0]  # (5, 5)
+    J_analytic = smile.jacobian[0]
 
-    # Numerical Jacobian via float64 central differences
+    assert torch.allclose(J_analytic, torch.eye(5, dtype=torch.float64), atol=1e-12)
+
+
+# ── Test (a2): Non-Reference Convention IFT vs Central Differences (SPOT_PNA + ATMF) ──
+
+def test_jacobian_vs_central_bumps_spot_pna_atmf() -> None:
+    leg = make_test_leg(spot=1.25, df_f=0.98, df_d=0.95, T=1.0)
+    quotes = torch.tensor([[0.16, 0.020, 0.006, 0.038, 0.015]], dtype=torch.float64)
+    conv = [(DeltaConvention.SPOT_PNA, AtmConvention.ATMF, StrangleConvention.SMILE)]
+
+    canonicalizer = SmileCanonicalizer(cache_size=0)
+    smile = canonicalizer.canonicalize(quotes, conv, leg)
+    J_analytic = smile.jacobian[0]
+
+    assert not torch.allclose(J_analytic, torch.eye(5, dtype=torch.float64), atol=1e-3)
+
     h = 1e-6
     J_num = torch.zeros(5, 5, dtype=torch.float64)
-
     for j in range(5):
-        quotes_plus = quotes.clone()
-        quotes_plus[0, j] += h
-        smile_plus = canonicalizer.canonicalize(quotes_plus, conv, leg)
+        qp = quotes.clone()
+        qp[0, j] += h
+        smile_p = canonicalizer.canonicalize(qp, conv, leg)
 
-        quotes_minus = quotes.clone()
-        quotes_minus[0, j] -= h
-        smile_minus = canonicalizer.canonicalize(quotes_minus, conv, leg)
+        qm = quotes.clone()
+        qm[0, j] -= h
+        smile_m = canonicalizer.canonicalize(qm, conv, leg)
 
-        diff = (smile_plus.xi[0] - smile_minus.xi[0]) / (2.0 * h)
-        J_num[:, j] = diff
+        J_num[:, j] = (smile_p.xi[0] - smile_m.xi[0]) / (2.0 * h)
 
-    # Relative difference check <= 1e-5
     rel_diff = torch.abs(J_analytic - J_num) / torch.clamp(torch.abs(J_analytic), min=1e-3)
     max_rel = rel_diff.max().item()
-    assert max_rel <= 1e-5, f"Jacobian relative error {max_rel:.3e} exceeds 1e-5"
+    assert max_rel <= 1e-5, f"IFT Jacobian relative error {max_rel:.3e} exceeds 1e-5 on SPOT_PNA"
+
+
+# ── Test (a3): Premium-Adjusted Convention IFT vs Central Differences (FORWARD_PA + DNS) ──
+
+def test_jacobian_vs_central_bumps_forward_pa() -> None:
+    leg = make_test_leg(spot=1.25, df_f=0.98, df_d=0.95, T=1.0)
+    quotes = torch.tensor([[0.16, 0.020, 0.006, 0.038, 0.015]], dtype=torch.float64)
+    conv = [(DeltaConvention.FORWARD_PA, AtmConvention.DNS, StrangleConvention.SMILE)]
+
+    canonicalizer = SmileCanonicalizer(cache_size=0)
+    smile = canonicalizer.canonicalize(quotes, conv, leg)
+    J_analytic = smile.jacobian[0]
+
+    assert not torch.allclose(J_analytic, torch.eye(5, dtype=torch.float64), atol=1e-3)
+
+    h = 1e-6
+    J_num = torch.zeros(5, 5, dtype=torch.float64)
+    for j in range(5):
+        qp = quotes.clone()
+        qp[0, j] += h
+        smile_p = canonicalizer.canonicalize(qp, conv, leg)
+
+        qm = quotes.clone()
+        qm[0, j] -= h
+        smile_m = canonicalizer.canonicalize(qm, conv, leg)
+
+        J_num[:, j] = (smile_p.xi[0] - smile_m.xi[0]) / (2.0 * h)
+
+    rel_diff = torch.abs(J_analytic - J_num) / torch.clamp(torch.abs(J_analytic), min=1e-3)
+    max_rel = rel_diff.max().item()
+    assert max_rel <= 1e-5, f"IFT Jacobian relative error {max_rel:.3e} exceeds 1e-5 on FORWARD_PA"
+
+
+# ── Test (a4): Premium-Adjusted Convention IFT vs Central Differences (SPOT_PA + DNS) ──
+
+def test_jacobian_vs_central_bumps_spot_pa() -> None:
+    leg = make_test_leg(spot=1.25, df_f=0.98, df_d=0.95, T=1.0)
+    quotes = torch.tensor([[0.16, 0.020, 0.006, 0.038, 0.015]], dtype=torch.float64)
+    conv = [(DeltaConvention.SPOT_PA, AtmConvention.DNS, StrangleConvention.SMILE)]
+
+    canonicalizer = SmileCanonicalizer(cache_size=0)
+    smile = canonicalizer.canonicalize(quotes, conv, leg)
+    J_analytic = smile.jacobian[0]
+
+    assert not torch.allclose(J_analytic, torch.eye(5, dtype=torch.float64), atol=1e-3)
+
+    h = 1e-6
+    J_num = torch.zeros(5, 5, dtype=torch.float64)
+    for j in range(5):
+        qp = quotes.clone()
+        qp[0, j] += h
+        smile_p = canonicalizer.canonicalize(qp, conv, leg)
+
+        qm = quotes.clone()
+        qm[0, j] -= h
+        smile_m = canonicalizer.canonicalize(qm, conv, leg)
+
+        J_num[:, j] = (smile_p.xi[0] - smile_m.xi[0]) / (2.0 * h)
+
+    rel_diff = torch.abs(J_analytic - J_num) / torch.clamp(torch.abs(J_analytic), min=1e-3)
+    max_rel = rel_diff.max().item()
+    assert max_rel <= 1e-5, f"IFT Jacobian relative error {max_rel:.3e} exceeds 1e-5 on SPOT_PA"
 
 
 # ── Test (b): Arbitrageable Quote Set Triggers SSVI Fallback ──
@@ -190,16 +264,19 @@ def test_convention_invariance_of_xi() -> None:
 
 def test_batch_throughput_64_states() -> None:
     n_states = 64
-    torch.manual_seed(12345)
-    leg = LegMarket(
-        spot=torch.full((n_states,), 1.25, dtype=torch.float64),
-        df_foreign=torch.full((n_states,), 0.98, dtype=torch.float64),
-        df_domestic=torch.full((n_states,), 0.95, dtype=torch.float64),
-        T=torch.full((n_states,), 1.0, dtype=torch.float64),
-    )
-    quotes = torch.tensor([
-        [0.16, 0.020, 0.006, 0.038, 0.015],
-    ], dtype=torch.float64).expand(n_states, -1)
+    # Generate 64 distinct realistic market states: varying spots, tenors, discount curves, and quote smiles
+    spots = torch.linspace(1.10, 1.45, n_states, dtype=torch.float64)
+    T = torch.linspace(0.10, 2.00, n_states, dtype=torch.float64)
+    df_f = torch.exp(-0.02 * T)
+    df_d = torch.exp(-0.04 * T)
+    leg = LegMarket(spot=spots, df_foreign=df_f, df_domestic=df_d, T=T)
+
+    atm = torch.linspace(0.12, 0.20, n_states, dtype=torch.float64)
+    rr25 = torch.linspace(0.010, 0.030, n_states, dtype=torch.float64)
+    bf25 = torch.linspace(0.004, 0.009, n_states, dtype=torch.float64)
+    rr10 = rr25 * 1.85
+    bf10 = bf25 * 2.80
+    quotes = torch.stack([atm, rr25, bf25, rr10, bf10], dim=-1)
     conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)] * n_states
 
     canonicalizer = SmileCanonicalizer(cache_size=0)  # disable cache to measure pure compute
@@ -211,7 +288,7 @@ def test_batch_throughput_64_states() -> None:
     assert smile_batch.jacobian.shape == (n_states, 5, 5)
     amortized_ms = elapsed_ms / n_states
     print(f"\n64-state canonicalization elapsed: {elapsed_ms:.2f} ms ({amortized_ms:.3f} ms/state)")
-    # Soft target <= 1.5 ms per state amortized
+    # Soft target <= 1.0 ms per state amortized, SLA budget <= 2.5 ms/state
     assert amortized_ms <= 2.5, f"Throughput {amortized_ms:.3f} ms/state exceeds budget"
 
 

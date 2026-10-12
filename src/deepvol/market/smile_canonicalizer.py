@@ -47,6 +47,21 @@ class CanonicalSmile:
     min_g: Tensor
     used_ssvi: Tensor
     lee_slope: Tensor
+    _R_theta: Optional[Tensor] = None
+    _R_q: Optional[Tensor] = None
+    _Psi_theta: Optional[Tensor] = None
+
+    @property
+    def r_theta(self) -> Optional[Tensor]:
+        return self._R_theta
+
+    @property
+    def r_q(self) -> Optional[Tensor]:
+        return self._R_q
+
+    @property
+    def psi_theta(self) -> Optional[Tensor]:
+        return self._Psi_theta
 
 
 class SmileArbitrageError(Exception):
@@ -201,7 +216,7 @@ def canonical_features(svi: RawSVI, leg: LegMarket) -> Tensor:
         d_ten = torch.full((S_len,), d_val, dtype=torch.float64, device=dev)
         p_ten = torch.full((S_len,), p_val, dtype=torch.float64, device=dev)
         sig_curr = sig_atm.clone()
-        for _ in range(12):
+        for _ in range(16):
             K_curr = strike_from_delta(d_ten, sig_curr, leg, p_ten, DeltaConvention.FORWARD_PNA)
             x_curr = torch.log(K_curr / leg.forward)
             sig_curr = torch.sqrt(torch.clamp(svi.w(x_curr.unsqueeze(1)).squeeze(1) / leg.T, min=1e-12))
@@ -216,8 +231,167 @@ def canonical_features(svi: RawSVI, leg: LegMarket) -> Tensor:
     return torch.stack([sig_atm, rr25, bf25, rr10, bf10], dim=-1)
 
 
+def compute_raw_svi_residual_jacobian_theta(svi: RawSVI, x: Tensor) -> Tensor:
+    """Evaluates analytical residual Jacobian R_theta = dR/dtheta of shape (S, 5, 5).
+
+    Row k: [1, rho_s * (x_k - m) + h_k, b * (x_k - m), -w'(x_k), b * s / h_k]
+    """
+    S_len = svi.params.shape[0]
+    dev = svi.params.device
+    b = svi.params[:, 1:2]
+    rho_s = svi.params[:, 2:3]
+    m = svi.params[:, 3:4]
+    s = svi.params[:, 4:5]
+
+    delta = x - m
+    hk = torch.sqrt(delta ** 2 + s ** 2)
+    _, w1k, _ = svi.derivs(x)
+
+    R_theta = torch.zeros(S_len, 5, 5, dtype=torch.float64, device=dev)
+    R_theta[:, :, 0] = 1.0
+    R_theta[:, :, 1] = rho_s * delta + hk
+    R_theta[:, :, 2] = b * delta
+    R_theta[:, :, 3] = -w1k
+    R_theta[:, :, 4] = b * s / hk
+    return R_theta
+
+
+def compute_raw_svi_residual_jacobian_q(
+    quotes: Tensor,
+    leg: LegMarket,
+    conv_list: Sequence[Tuple[DeltaConvention, AtmConvention, StrangleConvention]],
+    svi: RawSVI,
+    x_mkt: Tensor,
+) -> Tensor:
+    """Evaluates analytical residual Jacobian R_q = dR/dq of shape (S, 5, 5)."""
+    S_len = quotes.shape[0]
+    dev = quotes.device
+    T = leg.T
+    _, w1k, _ = svi.derivs(x_mkt)
+
+    M_sigma = torch.tensor([
+        [1.0, 0.0, 0.0, -0.5, 1.0],
+        [1.0, -0.5, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0, 0.0],
+        [1.0, 0.5, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.5, 1.0],
+    ], dtype=torch.float64, device=dev)
+
+    R_q_list: List[Tensor] = []
+    d_targets = [-0.10, -0.25, 0.0, 0.25, 0.10]
+    phis = [-1.0, -1.0, 0.0, 1.0, 1.0]
+
+    for i in range(S_len):
+        d_conv, atm_conv, _ = conv_list[i]
+        T_i = float(T[i].item())
+        sqrt_T = math.sqrt(T_i)
+        df_f_i = float(leg.df_foreign[i].item())
+
+        if d_conv in (DeltaConvention.FORWARD_PNA, DeltaConvention.SPOT_PNA):
+            c_spot = df_f_i if d_conv == DeltaConvention.SPOT_PNA else 1.0
+            diag_f = torch.zeros(5, dtype=torch.float64, device=dev)
+            for k in range(5):
+                w1_val = float(w1k[i, k].item())
+                if k == 2:
+                    sig_atm = float(quotes[i, 0].item())
+                    if atm_conv == AtmConvention.ATMF:
+                        diag_f[k] = -2.0 * sig_atm * T_i
+                    else:
+                        diag_f[k] = (w1_val - 2.0) * sig_atm * T_i
+                else:
+                    d_val = d_targets[k]
+                    p_val = phis[k]
+                    d1 = p_val * float(torch.special.ndtri(torch.tensor(p_val * d_val / c_spot, dtype=torch.float64)).item())
+                    sig_k = float((M_sigma[k:k+1] @ quotes[i:i+1].T).item())
+                    d2 = d1 - sig_k * sqrt_T
+                    diag_f[k] = -w1_val * d2 * sqrt_T - 2.0 * sig_k * T_i
+            R_q_i = torch.diag(diag_f) @ M_sigma
+        else:
+            leg_i = LegMarket(
+                spot=leg.spot[i:i+1],
+                df_foreign=leg.df_foreign[i:i+1],
+                df_domestic=leg.df_domestic[i:i+1],
+                T=leg.T[i:i+1],
+            )
+            p_i = svi.params[i]
+
+            def eval_res(q_row: Tensor) -> Tensor:
+                K_i, s_i = pillar_strikes(q_row.unsqueeze(0), leg_i, d_conv, atm_conv)
+                x_eval = torch.log(K_i / leg_i.forward.unsqueeze(-1)).squeeze(0)
+                w_eval = (s_i.squeeze(0) ** 2) * T_i
+                delta_p = x_eval - p_i[3]
+                hk_eval = torch.sqrt(delta_p ** 2 + p_i[4] ** 2)
+                w_mod = p_i[0] + p_i[1] * (p_i[2] * delta_p + hk_eval)
+                return w_mod - w_eval
+
+            R_q_i = cast(Tensor, torch.autograd.functional.jacobian(eval_res, quotes[i]))  # type: ignore[no-untyped-call]
+
+        R_q_list.append(R_q_i)
+
+    return torch.stack(R_q_list, dim=0)
+
+
+def compute_canonical_feature_jacobian_theta(svi: RawSVI, leg: LegMarket) -> Tensor:
+    """Evaluates analytical Jacobian Psi_theta = d xi / d theta of shape (S, 5, 5)."""
+    S_len = svi.params.shape[0]
+    dev = svi.params.device
+    T = leg.T
+    sqrt_T = torch.sqrt(T)
+
+    x_atm = 0.5 * svi.w(torch.zeros(S_len, 1, dtype=torch.float64, device=dev)).squeeze(1)
+    for _ in range(8):
+        w_val, w1_val, _ = svi.derivs(x_atm.unsqueeze(1))
+        f_val = x_atm.unsqueeze(1) - 0.5 * w_val
+        f1_val = 1.0 - 0.5 * w1_val
+        x_atm = (x_atm.unsqueeze(1) - f_val / f1_val).squeeze(1)
+    w_atm, _, _ = svi.derivs(x_atm.unsqueeze(1))
+    v_atm = torch.sqrt(torch.clamp(w_atm.squeeze(1) / T, min=1e-12))
+
+    def eval_gv(x_k: Tensor, v_k: Tensor, d2_k: Tensor) -> Tensor:
+        delta_k = x_k - svi.params[:, 3]
+        hk = torch.sqrt(delta_k ** 2 + svi.params[:, 4] ** 2)
+        _, w1_k, _ = svi.derivs(x_k.unsqueeze(1))
+        w1_s = w1_k.squeeze(1)
+        grad_w = torch.stack([
+            torch.ones_like(x_k),
+            svi.params[:, 2] * delta_k + hk,
+            svi.params[:, 1] * delta_k,
+            -w1_s,
+            svi.params[:, 1] * svi.params[:, 4] / hk,
+        ], dim=-1)
+        denom = 2.0 * v_k * T + w1_s * d2_k * sqrt_T
+        return grad_w / denom.unsqueeze(-1)
+
+    gv_atm = eval_gv(x_atm, v_atm, -v_atm * sqrt_T)
+
+    d_targets = [0.25, -0.25, 0.10, -0.10]
+    phis = [1.0, -1.0, 1.0, -1.0]
+    gv_wings: List[Tensor] = []
+
+    for d_val, p_val in zip(d_targets, phis):
+        d1 = p_val * torch.special.ndtri(torch.tensor(p_val * d_val, dtype=torch.float64, device=dev))
+        v_curr = v_atm.clone()
+        x_curr = torch.zeros(S_len, dtype=torch.float64, device=dev)
+        for _ in range(16):
+            x_curr = -d1 * v_curr * sqrt_T + 0.5 * (v_curr ** 2) * T
+            w_curr = svi.w(x_curr.unsqueeze(1)).squeeze(1)
+            v_curr = torch.sqrt(torch.clamp(w_curr / T, min=1e-12))
+        d2 = d1 - v_curr * sqrt_T
+        gv_wings.append(eval_gv(x_curr, v_curr, d2))
+
+    gv_25c, gv_25p, gv_10c, gv_10p = gv_wings
+    Psi_theta = torch.stack([
+        gv_atm,
+        gv_25c - gv_25p,
+        0.5 * (gv_25c + gv_25p) - gv_atm,
+        gv_10c - gv_10p,
+        0.5 * (gv_10c + gv_10p) - gv_atm,
+    ], dim=1)
+    return Psi_theta
+
+
 class ImplicitCanonicalMap(torch.autograd.Function):
-    """Autograd function computing canonical features with IFT reverse-mode Jacobian."""
+    """Autograd function computing canonical features with analytical IFT reverse-mode solve."""
 
     @staticmethod
     def forward(
@@ -228,14 +402,21 @@ class ImplicitCanonicalMap(torch.autograd.Function):
         canonicalizer: SmileCanonicalizer,
     ) -> Tensor:
         smile = canonicalizer.canonicalize_unmemoized(quotes, conv, leg)
-        ctx.save_for_backward(smile.jacobian)
+        ctx.save_for_backward(smile.r_theta, smile.r_q, smile.psi_theta)
         return smile.xi
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> Any:
-        (jacobian,) = ctx.saved_tensors
+        R_theta, R_q, Psi_theta = ctx.saved_tensors
         grad_output = cast(Tensor, grad_outputs[0])
-        grad_quotes = torch.einsum("si,sij->sj", grad_output, jacobian)
+
+        bar_theta = torch.einsum("si,sij->sj", grad_output, Psi_theta)
+        lambda_vec = torch.linalg.solve(
+            R_theta.mT,
+            bar_theta.unsqueeze(-1),
+        ).squeeze(-1)
+        grad_quotes = -torch.einsum("si,sij->sj", lambda_vec, R_q)
+
         return grad_quotes, None, None, None
 
 
@@ -430,13 +611,22 @@ class SmileCanonicalizer:
                 xi_list.append(xi_i[0])
         xi = torch.stack(xi_list, dim=0)
 
-        # Compute Jacobian d xi / d quotes
-        J_list: List[Tensor] = []
+        # Compute Jacobian d xi / d quotes via analytical IFT
+        R_theta = compute_raw_svi_residual_jacobian_theta(final_svi, x_mkt)
+        R_q = compute_raw_svi_residual_jacobian_q(quotes, leg, conv, final_svi, x_mkt)
+        Psi_theta = compute_canonical_feature_jacobian_theta(final_svi, leg)
+
+        dtheta_dq = -torch.linalg.solve(R_theta, R_q)
+        jacobian = torch.bmm(Psi_theta, dtheta_dq)
+
         for i in range(S_len):
             if conv[i] == ref_conv and not used_ssvi_list[i]:
-                J_list.append(torch.eye(5, dtype=torch.float64, device=dev))
-            else:
-                # Numerical central difference Jacobian for convention mapping
+                jacobian[i] = torch.eye(5, dtype=torch.float64, device=dev)
+                R_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
+                R_q[i] = -torch.eye(5, dtype=torch.float64, device=dev)
+                Psi_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
+            elif used_ssvi_list[i]:
+                # On SSVI fallback, evaluate Jacobian strictly on the SSVI manifold
                 h = 1e-6
                 J_mat = torch.zeros(5, 5, dtype=torch.float64, device=dev)
                 q_base = quotes[i:i+1]
@@ -452,7 +642,8 @@ class SmileCanonicalizer:
                     K_p, sig_p = pillar_strikes(q_p, leg_i, conv[i][0], conv[i][1])
                     xp = torch.log(K_p / leg_i.forward.unsqueeze(-1))
                     wp = (sig_p ** 2) * leg_i.T.unsqueeze(-1)
-                    svi_p, _ = fit_raw_svi_5pt(xp, wp)
+                    params_p, _ = fit_ssvi_slice(xp, wp)
+                    svi_p = ssvi_to_raw_svi(params_p[:, 0], params_p[:, 1], params_p[:, 2])
                     xi_p = canonical_features(svi_p, leg_i)[0]
 
                     q_m = q_base.clone()
@@ -460,12 +651,15 @@ class SmileCanonicalizer:
                     K_m, sig_m = pillar_strikes(q_m, leg_i, conv[i][0], conv[i][1])
                     xm = torch.log(K_m / leg_i.forward.unsqueeze(-1))
                     wm = (sig_m ** 2) * leg_i.T.unsqueeze(-1)
-                    svi_m, _ = fit_raw_svi_5pt(xm, wm)
+                    params_m, _ = fit_ssvi_slice(xm, wm)
+                    svi_m = ssvi_to_raw_svi(params_m[:, 0], params_m[:, 1], params_m[:, 2])
                     xi_m = canonical_features(svi_m, leg_i)[0]
 
                     J_mat[:, j] = (xi_p - xi_m) / (2.0 * h)
-                J_list.append(J_mat)
-        jacobian = torch.stack(J_list, dim=0)
+                jacobian[i] = J_mat
+                R_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
+                R_q[i] = -J_mat
+                Psi_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
 
         # ATMF volatility: w(0) / T
         w_atmf = final_svi.w(torch.zeros(S_len, 1, dtype=torch.float64, device=dev)).squeeze(1)
@@ -482,4 +676,7 @@ class SmileCanonicalizer:
             min_g=min_g,
             used_ssvi=used_ssvi,
             lee_slope=lee_slope,
+            _R_theta=R_theta,
+            _R_q=R_q,
+            _Psi_theta=Psi_theta,
         )
