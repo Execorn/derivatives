@@ -1,11 +1,19 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Tuple, cast
 
 import torch
 from torch import Tensor
+
+__all__ = [
+    "Certification",
+    "RawSVI",
+    "_fit_single_slice",
+    "certify_slice",
+    "durrleman_g",
+    "fit_raw_svi_5pt",
+]
 
 
 @dataclass(frozen=True)
@@ -148,185 +156,238 @@ def certify_slice(
     return Certification(min_g=min_g, lee_ok=lee_ok, positive_ok=positive_ok, ok=ok)
 
 
-def _fit_single_slice(
-    x_5: Tensor,
-    w_5: Tensor,
-    lm_iters: int,
-    init_grid: int,
-) -> Tuple[Tuple[float, float, float, float, float], float]:
-    x_span = (x_5.max() - x_5.min()).item()
-    if x_span < 1e-4:
-        x_span = 0.2
-    x_mid = 0.5 * (x_5.max() + x_5.min()).item()
+def fit_raw_svi_5pt(
+    x: Tensor,
+    w: Tensor,
+    *,
+    lm_iters: int = 25,
+    init_grid: int = 9,
+) -> Tuple[RawSVI, Tensor]:
+    """Fits 5-point raw-SVI total variance slice via batched quasi-explicit lstsq and outer Levenberg-Marquardt.
 
-    m_grid = torch.linspace(x_mid - 0.5 * x_span, x_mid + 0.5 * x_span, init_grid, dtype=torch.float64, device=x_5.device)
-    s_grid = torch.linspace(0.02 * x_span, 0.8 * x_span, init_grid, dtype=torch.float64, device=x_5.device)
-    M, S_mesh = torch.meshgrid(m_grid, s_grid, indexing="ij")
-    m_flat = M.reshape(-1)
-    s_flat = S_mesh.reshape(-1)
+    Fully vectorized across the batch dimension S without sequential Python loops.
 
-    # Vectorized initial grid solve across all (m, s) pairs
-    y_grid = (x_5.unsqueeze(0) - m_flat.unsqueeze(1)) / s_flat.unsqueeze(1)
-    A_grid = torch.stack([torch.ones_like(y_grid), y_grid, torch.sqrt(y_grid ** 2 + 1.0)], dim=-1)
-    w_exp = w_5.unsqueeze(0).expand(m_flat.shape[0], 5).unsqueeze(-1)
+    Args:
+        x: Log-moneyness tensor of shape (S, 5) or (5,), float64.
+        w: Total variance tensor of shape (S, 5) or (5,), float64.
+        lm_iters: Levenberg-Marquardt iteration count (default 25).
+        init_grid: Initial grid search density per dimension (default 9, creating 81 candidates).
 
-    At_g = A_grid.transpose(-2, -1)
-    AtA_g = At_g @ A_grid + 1e-12 * torch.eye(3, dtype=torch.float64, device=x_5.device)
-    sol_g = torch.linalg.solve(AtA_g, At_g @ w_exp).squeeze(-1)
+    Returns:
+        Tuple of (RawSVI, fit_rmse_vol) where fit_rmse_vol has shape (S,) or scalar.
+    """
+    dev = x.device
+    is_1d = (x.dim() == 1)
+    x_in = x.unsqueeze(0) if is_1d else x
+    w_in = w.unsqueeze(0) if is_1d else w
+    S = x_in.shape[0]
 
-    a_g = sol_g[:, 0]
-    d_g = sol_g[:, 1]
-    c_g = sol_g[:, 2]
+    x_min = torch.min(x_in, dim=-1, keepdim=True).values
+    x_max = torch.max(x_in, dim=-1, keepdim=True).values
+    x_span = x_max - x_min
+    x_span = torch.where(x_span < 1e-4, torch.full_like(x_span, 0.2), x_span)
+    x_mid = 0.5 * (x_max + x_min)
+
+    # 1. Deterministic grid search over (m, s) across all S states simultaneously: shape (S, G)
+    u_m = torch.linspace(-0.5, 0.5, init_grid, dtype=torch.float64, device=dev)
+    u_s = torch.linspace(0.02, 0.8, init_grid, dtype=torch.float64, device=dev)
+    U_m, U_s = torch.meshgrid(u_m, u_s, indexing="ij")
+    u_m_flat = U_m.reshape(1, -1)
+    u_s_flat = U_s.reshape(1, -1)
+
+    m_grid = x_mid + u_m_flat * x_span  # (S, G)
+    s_grid = u_s_flat * x_span          # (S, G)
+
+    y_grid = (x_in.unsqueeze(1) - m_grid.unsqueeze(-1)) / s_grid.unsqueeze(-1)  # (S, G, 5)
+    col0 = torch.ones_like(y_grid)
+    col1 = y_grid
+    col2 = torch.sqrt(y_grid ** 2 + 1.0)
+    A_grid = torch.stack([col0, col1, col2], dim=-1)  # (S, G, 5, 3)
+
+    At_g = A_grid.transpose(-2, -1)  # (S, G, 3, 5)
+    AtA_g = At_g @ A_grid + 1e-12 * torch.eye(3, dtype=torch.float64, device=dev)  # (S, G, 3, 3)
+    w_exp = w_in.unsqueeze(1).unsqueeze(-1)  # (S, 1, 5, 1)
+    Atw_g = At_g @ w_exp  # (S, G, 3, 1)
+
+    sol_g = torch.linalg.solve(AtA_g, Atw_g)  # (S, G, 3, 1)
+    a_g = sol_g[..., 0, 0]
+    d_g = sol_g[..., 1, 0]
+    c_g = sol_g[..., 2, 0]
 
     rho_g = d_g / torch.clamp(c_g, min=1e-12)
-    b_g = c_g / s_flat
+    b_g = c_g / s_grid
     radicand_g = torch.clamp(c_g ** 2 - d_g ** 2, min=0.0)
     w_min_g = a_g + torch.sqrt(radicand_g)
     lee_g = b_g * (1.0 + torch.abs(rho_g))
 
     valid_g = (c_g > 1e-8) & (torch.abs(rho_g) < 0.999) & (w_min_g > 0.0) & (lee_g <= 2.01)
-    pred_g = (A_grid @ sol_g.unsqueeze(-1)).squeeze(-1)
-    loss_g = torch.sum((pred_g - w_5.unsqueeze(0)) ** 2, dim=-1)
-    loss_g = torch.where(valid_g, loss_g, torch.tensor(float("inf"), dtype=torch.float64, device=x_5.device))
+    pred_g = (A_grid @ sol_g).squeeze(-1)  # (S, G, 5)
+    loss_g = torch.sum((pred_g - w_in.unsqueeze(1)) ** 2, dim=-1)  # (S, G)
+    loss_g = torch.where(valid_g, loss_g, torch.full_like(loss_g, float("inf")))
 
-    best_idx = int(torch.argmin(loss_g).item())
-    best_loss = float(loss_g[best_idx].item())
-    best_p: Tuple[float, float, float, float, float] = (
-        float(a_g[best_idx].item()),
-        float(b_g[best_idx].item()),
-        float(rho_g[best_idx].item()),
-        float(m_flat[best_idx].item()),
-        float(s_flat[best_idx].item()),
-    )
-    best_m = float(m_flat[best_idx].item())
-    best_s = float(s_flat[best_idx].item())
+    best_idx = torch.argmin(loss_g, dim=-1, keepdim=True)  # (S, 1)
+    best_loss = torch.gather(loss_g, 1, best_idx).squeeze(1)  # (S,)
+    best_m = torch.gather(m_grid, 1, best_idx).squeeze(1)     # (S,)
+    best_s = torch.gather(s_grid, 1, best_idx).squeeze(1)     # (S,)
+    best_a = torch.gather(a_g, 1, best_idx).squeeze(1)        # (S,)
+    best_b = torch.gather(b_g, 1, best_idx).squeeze(1)        # (S,)
+    best_rho = torch.gather(rho_g, 1, best_idx).squeeze(1)    # (S,)
 
-    def solve_linear(m_val: float, s_val: float) -> Tuple[Tuple[float, float, float, float, float] | None, float]:
-        y = (x_5 - m_val) / s_val
-        col0 = torch.ones_like(y)
-        col1 = y
-        col2 = torch.sqrt(y ** 2 + 1.0)
-        A = torch.stack([col0, col1, col2], dim=1)
-        AtA = A.T @ A + 1e-12 * torch.eye(3, dtype=torch.float64, device=x_5.device)
-        sol = torch.linalg.solve(AtA, A.T @ w_5)
-        a_val, d_val, c_val = sol[0].item(), sol[1].item(), sol[2].item()
-        if c_val <= 1e-8:
-            return None, float("inf")
-        b_val = c_val / s_val
-        rho_val = d_val / c_val
-        if abs(rho_val) >= 0.999:
-            return None, float("inf")
-        if a_val + math.sqrt(max(c_val ** 2 - d_val ** 2, 0.0)) <= 0.0:
-            return None, float("inf")
-        if b_val * (1.0 + abs(rho_val)) > 2.01:
-            return None, float("inf")
-        pred = A @ sol
-        loss_val = torch.sum((pred - w_5) ** 2).item()
-        return (a_val, b_val, rho_val, m_val, s_val), loss_val
+    # Fallback for any slice where the initial 9x9 grid was completely inadmissible
+    inadmissible_mask = torch.isinf(best_loss)
+    if torch.any(inadmissible_mask):
+        m_w = torch.linspace(-1.5, 1.5, 21, dtype=torch.float64, device=dev)
+        s_w = torch.linspace(0.005, 2.0, 21, dtype=torch.float64, device=dev)
+        Mw, Sw = torch.meshgrid(m_w, s_w, indexing="ij")
+        u_mw = Mw.reshape(1, -1)
+        u_sw = Sw.reshape(1, -1)
 
-    # Wider search if default grid failed to produce an admissible candidate
-    if best_loss == float("inf"):
-        for m_val in torch.linspace(x_mid - 1.5 * x_span, x_mid + 1.5 * x_span, 21, dtype=torch.float64, device=x_5.device).tolist():
-            for s_val in torch.linspace(0.005 * x_span, 2.0 * x_span, 21, dtype=torch.float64, device=x_5.device).tolist():
-                p_cand, loss = solve_linear(m_val, s_val)
-                if p_cand is not None and loss < best_loss:
-                    best_loss = loss
-                    best_p = p_cand
-                    best_m = m_val
-                    best_s = s_val
+        bad_idx = torch.where(inadmissible_mask)[0]
+        x_bad = x_in[bad_idx]
+        w_bad = w_in[bad_idx]
+        x_span_bad = x_span[bad_idx]
+        x_mid_bad = x_mid[bad_idx]
 
-    # Levenberg-Marquardt polish in (m, ln s)
-    m_curr = best_m
-    eta_curr = math.log(max(best_s, 1e-6))
-    lam = 1e-3
-    curr_loss = best_loss
+        m_gw = x_mid_bad + u_mw * x_span_bad
+        s_gw = u_sw * x_span_bad
+        y_gw = (x_bad.unsqueeze(1) - m_gw.unsqueeze(-1)) / s_gw.unsqueeze(-1)
+        A_gw = torch.stack([torch.ones_like(y_gw), y_gw, torch.sqrt(y_gw ** 2 + 1.0)], dim=-1)
+        At_gw = A_gw.transpose(-2, -1)
+        AtA_gw = At_gw @ A_gw + 1e-12 * torch.eye(3, dtype=torch.float64, device=dev)
+        w_exp_bad = w_bad.unsqueeze(1).unsqueeze(-1)
+        sol_gw = torch.linalg.solve(AtA_gw, At_gw @ w_exp_bad)
+
+        a_gw = sol_gw[..., 0, 0]
+        d_gw = sol_gw[..., 1, 0]
+        c_gw = sol_gw[..., 2, 0]
+        rho_gw = d_gw / torch.clamp(c_gw, min=1e-12)
+        b_gw = c_gw / s_gw
+        rad_gw = torch.clamp(c_gw ** 2 - d_gw ** 2, min=0.0)
+        w_min_gw = a_gw + torch.sqrt(rad_gw)
+        lee_gw = b_gw * (1.0 + torch.abs(rho_gw))
+        val_gw = (c_gw > 1e-8) & (torch.abs(rho_gw) < 0.999) & (w_min_gw > 0.0) & (lee_gw <= 2.01)
+        pred_gw = (A_gw @ sol_gw).squeeze(-1)
+        loss_gw = torch.sum((pred_gw - w_bad.unsqueeze(1)) ** 2, dim=-1)
+        loss_gw = torch.where(val_gw, loss_gw, torch.full_like(loss_gw, float("inf")))
+
+        b_idx_w = torch.argmin(loss_gw, dim=-1, keepdim=True)
+        best_m[bad_idx] = torch.gather(m_gw, 1, b_idx_w).squeeze(1)
+        best_s[bad_idx] = torch.gather(s_gw, 1, b_idx_w).squeeze(1)
+        best_a[bad_idx] = torch.gather(a_gw, 1, b_idx_w).squeeze(1)
+        best_b[bad_idx] = torch.gather(b_gw, 1, b_idx_w).squeeze(1)
+        best_rho[bad_idx] = torch.gather(rho_gw, 1, b_idx_w).squeeze(1)
+        best_loss[bad_idx] = torch.gather(loss_gw, 1, b_idx_w).squeeze(1)
+
+    # 2. Vectorized Levenberg-Marquardt polish in (m, ln s)
+    m_curr = best_m.clone()
+    eta_curr = torch.log(torch.clamp(best_s, min=1e-6))
+    lam = torch.full((S,), 1e-3, dtype=torch.float64, device=dev)
+    curr_loss = best_loss.clone()
+
+    x_span_1d = x_span.squeeze(-1)
+    hm = 1e-6 * x_span_1d
+    heta = 1e-6
+
+    def eval_residuals_and_params(m_v: Tensor, eta_v: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        s_v = torch.exp(eta_v)
+        y_v = (x_in.unsqueeze(1) - m_v.unsqueeze(-1)) / s_v.unsqueeze(-1)
+        A_v = torch.stack([torch.ones_like(y_v), y_v, torch.sqrt(y_v ** 2 + 1.0)], dim=-1)
+        At_v = A_v.transpose(-2, -1)
+        AtA_v = At_v @ A_v + 1e-12 * torch.eye(3, dtype=torch.float64, device=dev)
+        w_v = w_in.unsqueeze(1).unsqueeze(-1)
+        sol_v = torch.linalg.solve(AtA_v, At_v @ w_v)
+        r_v = (A_v @ sol_v - w_v).squeeze(-1)
+
+        a_v = sol_v[..., 0, 0]
+        d_v = sol_v[..., 1, 0]
+        c_v = sol_v[..., 2, 0]
+        rho_val = d_v / torch.clamp(c_v, min=1e-12)
+        b_val = c_v / s_v
+        w_min_val = a_v + torch.sqrt(torch.clamp(c_v ** 2 - d_v ** 2, min=0.0))
+        lee_val = b_val * (1.0 + torch.abs(rho_val))
+
+        valid_v = (c_v > 1e-8) & (torch.abs(rho_val) < 0.999) & (w_min_val > 0.0) & (lee_val <= 2.01)
+        loss_v = torch.sum(r_v ** 2, dim=-1)
+        loss_v = torch.where(valid_v, loss_v, torch.full_like(loss_v, float("inf")))
+
+        return r_v, a_v, b_val, rho_val, s_v, loss_v
+
+    best_params = torch.stack([best_a, best_b, best_rho, best_m, best_s], dim=-1)
 
     for _ in range(lm_iters):
-        if curr_loss < 1e-22:
+        if torch.all(curr_loss < 1e-22):
             break
-        s_curr = math.exp(eta_curr)
-        hm = 1e-6 * x_span
-        heta = 1e-6
 
-        def get_r(m_v: float, s_v: float) -> Tensor:
-            y_v = (x_5 - m_v) / s_v
-            A_v = torch.stack([torch.ones_like(y_v), y_v, torch.sqrt(y_v ** 2 + 1.0)], dim=1)
-            AtA_v = A_v.T @ A_v + 1e-12 * torch.eye(3, dtype=torch.float64, device=x_5.device)
-            sol_v = torch.linalg.solve(AtA_v, A_v.T @ w_5)
-            return cast(Tensor, A_v @ sol_v - w_5)
+        # 5-point central stencil: [base, +hm, -hm, +heta, -heta]
+        m_pert = torch.stack([m_curr, m_curr + hm, m_curr - hm, m_curr, m_curr], dim=1)
+        eta_pert = torch.stack([eta_curr, eta_curr, eta_curr, eta_curr + heta, eta_curr - heta], dim=1)
 
-        r = get_r(m_curr, s_curr)
-        r_mp = get_r(m_curr + hm, s_curr)
-        r_mm = get_r(m_curr - hm, s_curr)
-        J0 = (r_mp - r_mm) / (2.0 * hm)
+        r_all, _, _, _, _, _ = eval_residuals_and_params(m_pert, eta_pert)
 
-        r_ep = get_r(m_curr, math.exp(eta_curr + heta))
-        r_em = get_r(m_curr, math.exp(eta_curr - heta))
+        r_base = r_all[:, 0, :]
+        r_mp   = r_all[:, 1, :]
+        r_mm   = r_all[:, 2, :]
+        r_ep   = r_all[:, 3, :]
+        r_em   = r_all[:, 4, :]
+
+        hm_exp = hm.unsqueeze(-1)
+        J0 = (r_mp - r_mm) / (2.0 * hm_exp)
         J1 = (r_ep - r_em) / (2.0 * heta)
 
-        J = torch.stack([J0, J1], dim=1)
-        H = J.T @ J + lam * torch.eye(2, dtype=torch.float64, device=x_5.device)
-        grad = J.T @ r
-        step = torch.linalg.solve(H, grad)
+        J = torch.stack([J0, J1], dim=-1)  # (S, 5, 2)
+        Jt = J.transpose(-2, -1)           # (S, 2, 5)
 
-        m_new = m_curr - step[0].item()
-        eta_new = eta_curr - step[1].item()
-        s_new = math.exp(eta_new)
+        H = Jt @ J + lam.view(S, 1, 1) * torch.eye(2, dtype=torch.float64, device=dev)  # (S, 2, 2)
+        grad = (Jt @ r_base.unsqueeze(-1)).squeeze(-1)  # (S, 2)
 
-        p_new, new_loss = solve_linear(m_new, s_new)
-        if p_new is not None and new_loss < curr_loss:
-            m_curr = m_new
-            eta_curr = eta_new
-            best_p = p_new
-            curr_loss = new_loss
-            lam = max(lam / 3.0, 1e-12)
-        else:
-            lam = min(lam * 4.0, 1e8)
+        if torch.all(curr_loss < 1e-22):
+            break
 
-    a_f, b_f, r_f, m_f, s_f = best_p
-    delta_f = x_5 - m_f
+        # 2x2 batched closed-form solve
+        det = H[:, 0, 0] * H[:, 1, 1] - H[:, 0, 1] * H[:, 1, 0]
+        delta0 = (H[:, 1, 1] * grad[:, 0] - H[:, 0, 1] * grad[:, 1]) / det
+        delta1 = (-H[:, 1, 0] * grad[:, 0] + H[:, 0, 0] * grad[:, 1]) / det
+
+        m_cand = m_curr - delta0
+        eta_cand = eta_curr - delta1
+
+        _, a_c, b_c, rho_c, s_c, loss_c = eval_residuals_and_params(m_cand.unsqueeze(1), eta_cand.unsqueeze(1))
+        loss_cand = loss_c[:, 0]
+
+        accept_mask = (loss_cand < curr_loss)
+
+        m_curr = torch.where(accept_mask, m_cand, m_curr)
+        eta_curr = torch.where(accept_mask, eta_cand, eta_curr)
+        curr_loss = torch.where(accept_mask, loss_cand, curr_loss)
+        lam = torch.where(accept_mask, torch.clamp(lam / 3.0, min=1e-12), torch.clamp(lam * 4.0, max=1e8))
+
+        new_params = torch.stack([a_c[:, 0], b_c[:, 0], rho_c[:, 0], m_cand, s_c[:, 0]], dim=-1)
+        best_params = torch.where(accept_mask.unsqueeze(-1), new_params, best_params)
+
+    a_f = best_params[:, 0:1]
+    b_f = best_params[:, 1:2]
+    rho_f = best_params[:, 2:3]
+    m_f = best_params[:, 3:4]
+    s_f = best_params[:, 4:5]
+
+    delta_f = x_in - m_f
     hypot_f = torch.sqrt(delta_f ** 2 + s_f ** 2)
-    w_pred = a_f + b_f * (r_f * delta_f + hypot_f)
-    vol_rmse = torch.sqrt(torch.mean((torch.sqrt(torch.clamp(w_pred, min=1e-12)) - torch.sqrt(torch.clamp(w_5, min=1e-12))) ** 2)).item()
+    w_pred = a_f + b_f * (rho_f * delta_f + hypot_f)
+    vol_rmse = torch.sqrt(torch.mean((torch.sqrt(torch.clamp(w_pred, min=1e-12)) - torch.sqrt(torch.clamp(w_in, min=1e-12))) ** 2, dim=-1))
 
-    return best_p, vol_rmse
+    if is_1d:
+        return RawSVI(best_params[0]), vol_rmse[0]
+    return RawSVI(best_params), vol_rmse
 
 
-def fit_raw_svi_5pt(
-    x: Tensor,
-    w: Tensor,
-    *,
-    lm_iters: int = 60,
+def _fit_single_slice(
+    x_5: Tensor,
+    w_5: Tensor,
+    lm_iters: int = 25,
     init_grid: int = 9,
-) -> Tuple[RawSVI, Tensor]:
-    """Fits 5-point raw-SVI total variance slice via quasi-explicit lstsq and outer Levenberg-Marquardt.
+) -> Tuple[Tuple[float, float, float, float, float], float]:
+    """Backward compatibility wrapper delegating single slice fitting to vectorized solver."""
+    svi, rmse = fit_raw_svi_5pt(x_5.unsqueeze(0), w_5.unsqueeze(0), lm_iters=lm_iters, init_grid=init_grid)
+    p = svi.params[0].tolist()
+    return (float(p[0]), float(p[1]), float(p[2]), float(p[3]), float(p[4])), float(rmse[0].item())
 
-    Args:
-        x: Log-moneyness tensor of shape (S, 5), float64.
-        w: Total variance tensor of shape (S, 5), float64.
-        lm_iters: Levenberg-Marquardt iteration count.
-        init_grid: Initial grid search density per dimension.
-
-    Returns:
-        Tuple of (RawSVI, fit_rmse_vol) where fit_rmse_vol has shape (S,).
-    """
-    S_len = x.shape[0]
-    dev = x.device
-
-    if S_len > 1 and torch.all(x == x[0]) and torch.all(w == w[0]):
-        p_fit, rmse_val = _fit_single_slice(x[0], w[0], lm_iters, init_grid)
-        params_tensor = torch.tensor([list(p_fit)] * S_len, dtype=torch.float64, device=dev)
-        rmse_tensor = torch.full((S_len,), rmse_val, dtype=torch.float64, device=dev)
-        return RawSVI(params_tensor), rmse_tensor
-
-    params_list = []
-    rmse_list = []
-
-    for i in range(S_len):
-        p_fit, rmse_val = _fit_single_slice(x[i], w[i], lm_iters, init_grid)
-        params_list.append(list(p_fit))
-        rmse_list.append(rmse_val)
-
-    params_tensor = torch.tensor(params_list, dtype=torch.float64, device=dev)
-    rmse_tensor = torch.tensor(rmse_list, dtype=torch.float64, device=dev)
-    return RawSVI(params_tensor), rmse_tensor
