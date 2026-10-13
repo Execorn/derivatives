@@ -8,7 +8,7 @@ and differentiable implied volatility surfaces.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -162,7 +162,7 @@ class _QuantileInversionFunction(torch.autograd.Function):
 
             cdf_s = cdf_grid[s]
             kg_s = kg[s]
-            u_s = u_2d[s]
+            u_s = torch.clamp(u_2d[s], min=1e-45, max=1.0 - 1e-16)
 
             for start in range(0, U_cnt, chunk_len):
                 end = min(start + chunk_len, U_cnt)
@@ -176,7 +176,7 @@ class _QuantileInversionFunction(torch.autograd.Function):
                 k_lo = kg_s[idx - 1]
                 k_hi = kg_s[idx]
 
-                frac = (u_chunk - c_lo) / torch.clamp(c_hi - c_lo, min=1e-16)
+                frac = torch.clamp((u_chunk - c_lo) / torch.clamp(c_hi - c_lo, min=1e-16), min=0.0, max=1.0)
                 k_interp = k_lo + frac * (k_hi - k_lo)
                 quantiles[s, start:end] = F_eff[s] * torch.exp(k_interp)
 
@@ -194,99 +194,60 @@ class _QuantileInversionFunction(torch.autograd.Function):
         grad_output = grad_outputs[0]
         quantiles, F_eff, _, params_eff = ctx.saved_tensors
         grad_out_2d = grad_output.reshape(quantiles.shape)
-        S_cnt, U_cnt = quantiles.shape
-        chunk_len = 65536
-
-        grad_u = torch.empty_like(quantiles)
-        grad_params = torch.zeros_like(params_eff)
-        grad_F = torch.zeros_like(F_eff)
         SQRT_2PI = 2.5066282746310005
 
-        for s in range(S_cnt):
-            p_s = params_eff[s : s + 1]
-            svi_s = RawSVI(p_s)
-            F_s = F_eff[s]
+        if not hasattr(ctx, "_cached_basis"):
+            svi_all = RawSVI(params_eff)
+            F_col = F_eff.unsqueeze(1)
 
-            b = p_s[:, 1:2]
-            rho_s = p_s[:, 2:3]
-            m = p_s[:, 3:4]
-            s_param = p_s[:, 4:5]
+            b = params_eff[:, 1:2]
+            rho_s = params_eff[:, 2:3]
+            m = params_eff[:, 3:4]
+            s_param = params_eff[:, 4:5]
 
-            grad_a_s = torch.zeros(1, dtype=torch.float64, device=quantiles.device)
-            grad_b_s = torch.zeros(1, dtype=torch.float64, device=quantiles.device)
-            grad_rho_s = torch.zeros(1, dtype=torch.float64, device=quantiles.device)
-            grad_m_s = torch.zeros(1, dtype=torch.float64, device=quantiles.device)
-            grad_s_param_s = torch.zeros(1, dtype=torch.float64, device=quantiles.device)
-            grad_F_s = torch.zeros(1, dtype=torch.float64, device=quantiles.device)
+            k_all = torch.log(torch.clamp(quantiles / F_col, min=1e-12))
+            w_c, w1_c, w2_c = svi_all.derivs(k_all)
 
-            for start in range(0, U_cnt, chunk_len):
-                end = min(start + chunk_len, U_cnt)
-                q_chunk = quantiles[s : s + 1, start:end]
-                grad_out_chunk = grad_out_2d[s : s + 1, start:end]
+            sq_c = torch.sqrt(torch.clamp(w_c, min=1e-8))
+            d1_c = (-k_all + 0.5 * w_c) / sq_c
+            d2_c = d1_c - sq_c
+            phi_d2_c = torch.exp(-0.5 * d2_c ** 2) / SQRT_2PI
 
-                k_chunk = torch.log(torch.clamp(q_chunk / F_s, min=1e-12))
-                w_c, w1_c, w2_c = svi_s.derivs(k_chunk)
+            g_c = durrleman_g(k_all, w_c, w1_c, w2_c)
+            pdf_c = (phi_d2_c / (quantiles * sq_c)) * torch.clamp(g_c, min=1e-8)
+            inv_pdf = 1.0 / torch.clamp(pdf_c, min=1e-12)
 
-                sq_c = torch.sqrt(torch.clamp(w_c, min=1e-8))
-                d1_c = (-k_chunk + 0.5 * w_c) / sq_c
-                d2_c = d1_c - sq_c
-                phi_d2_c = torch.exp(-0.5 * d2_c ** 2) / SQRT_2PI
+            d_F_dw1 = phi_d2_c / (2.0 * sq_c)
+            d_d2_dw = (2.0 * k_all - w_c) / (4.0 * sq_c ** 3)
+            d_F_dw = phi_d2_c * (-d_d2_dw * (1.0 + d2_c * w1_c / (2.0 * sq_c)) - w1_c / (4.0 * sq_c ** 3))
 
-                g_c = durrleman_g(k_chunk, w_c, w1_c, w2_c)
-                pdf_c = (phi_d2_c / (q_chunk * sq_c)) * torch.clamp(g_c, min=1e-8)
-                pdf_safe = torch.clamp(pdf_c, min=1e-12)
+            delta = k_all - m
+            hk = torch.sqrt(delta ** 2 + s_param ** 2)
 
-                grad_u_chunk = grad_out_chunk / pdf_safe
-                grad_u[s, start:end] = grad_u_chunk.squeeze(0)
+            dF_da = d_F_dw
+            dF_db = d_F_dw * (rho_s * delta + hk) + d_F_dw1 * (rho_s + delta / hk)
+            dF_drho = d_F_dw * (b * delta) + d_F_dw1 * b
+            dF_dm = d_F_dw * (-w1_c) + d_F_dw1 * (-b * (s_param ** 2) / (hk ** 3))
+            dF_ds = d_F_dw * (b * s_param / hk) + d_F_dw1 * (-b * s_param * delta / (hk ** 3))
 
-                # Parameter derivatives: dq / d params = - (1 / p(q)) * d F_cdf / d params
-                d_F_dw1 = phi_d2_c / (2.0 * sq_c)
-                d_d2_dw = (2.0 * k_chunk - w_c) / (4.0 * sq_c ** 3)
-                d_F_dw = phi_d2_c * (-d_d2_dw * (1.0 + d2_c * w1_c / (2.0 * sq_c)) - w1_c / (4.0 * sq_c ** 3))
+            ctx._cached_basis = (inv_pdf, dF_da, dF_db, dF_drho, dF_dm, dF_ds, F_col)
 
-                delta = k_chunk - m
-                hk = torch.sqrt(delta ** 2 + s_param ** 2)
+        inv_pdf, dF_da, dF_db, dF_drho, dF_dm, dF_ds, F_col = ctx._cached_basis
 
-                dw_da = torch.ones_like(k_chunk)
-                dw1_da = torch.zeros_like(k_chunk)
+        grad_u = grad_out_2d * inv_pdf
+        grad_a = -(grad_u * dF_da).sum(dim=-1)
+        grad_b = -(grad_u * dF_db).sum(dim=-1)
+        grad_rho = -(grad_u * dF_drho).sum(dim=-1)
+        grad_m = -(grad_u * dF_dm).sum(dim=-1)
+        grad_s_param = -(grad_u * dF_ds).sum(dim=-1)
+        grad_F = (grad_out_2d * (quantiles / F_col)).sum(dim=-1)
 
-                dw_db = rho_s * delta + hk
-                dw1_db = rho_s + delta / hk
+        if ctx.reflect:
+            grad_rho = -grad_rho
+            grad_m = -grad_m
+            grad_F = -grad_F / (F_eff ** 2)
 
-                dw_drho = b * delta
-                dw1_drho = b.expand_as(k_chunk)
-
-                dw_dm = -w1_c
-                dw1_dm = -b * (s_param ** 2) / (hk ** 3)
-
-                dw_ds = b * s_param / hk
-                dw1_ds = -b * s_param * delta / (hk ** 3)
-
-                dF_da = d_F_dw * dw_da + d_F_dw1 * dw1_da
-                dF_db = d_F_dw * dw_db + d_F_dw1 * dw1_db
-                dF_drho = d_F_dw * dw_drho + d_F_dw1 * dw1_drho
-                dF_dm = d_F_dw * dw_dm + d_F_dw1 * dw1_dm
-                dF_ds = d_F_dw * dw_ds + d_F_dw1 * dw1_ds
-
-                grad_a_s = grad_a_s - (grad_u_chunk * dF_da).sum()
-                grad_b_s = grad_b_s - (grad_u_chunk * dF_db).sum()
-                grad_rho_s = grad_rho_s - (grad_u_chunk * dF_drho).sum()
-                grad_m_s = grad_m_s - (grad_u_chunk * dF_dm).sum()
-                grad_s_param_s = grad_s_param_s - (grad_u_chunk * dF_ds).sum()
-
-                grad_F_s = grad_F_s + (grad_out_chunk * (q_chunk / F_s)).sum()
-
-            if ctx.reflect:
-                grad_rho_s = -grad_rho_s
-                grad_m_s = -grad_m_s
-                grad_F_s = -grad_F_s / (F_s ** 2)
-
-            grad_params[s, 0] = grad_a_s.squeeze()
-            grad_params[s, 1] = grad_b_s.squeeze()
-            grad_params[s, 2] = grad_rho_s.squeeze()
-            grad_params[s, 3] = grad_m_s.squeeze()
-            grad_params[s, 4] = grad_s_param_s.squeeze()
-            grad_F[s] = grad_F_s.squeeze()
+        grad_params = torch.stack([grad_a, grad_b, grad_rho, grad_m, grad_s_param], dim=-1)
 
         if len(ctx.u_shape) == 1:
             grad_u_out = grad_u.sum(dim=0)
@@ -442,7 +403,7 @@ class GaussianCopulaCrossEngine:
         F: Tensor,
         K: Tensor,
         T: Tensor,
-        is_call: bool = True,
+        is_call: Union[Tensor, bool] = True,
     ) -> Tensor:
         """Inverts undiscounted cross prices to Black-76 implied vol via PIVOT.
 
@@ -451,7 +412,7 @@ class GaussianCopulaCrossEngine:
             F: Cross forward tensor of shape (S,) or (S, M).
             K: Strike tensor of shape (S, M).
             T: Maturity tensor of shape (S,) or (S, M).
-            is_call: Whether price represents call (True) or put (False).
+            is_call: Whether price represents call (True) or put (False), scalar or Tensor.
 
         Returns:
             Implied volatility tensor of shape (S, M) in float64.

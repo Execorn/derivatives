@@ -43,7 +43,8 @@ class CrossDomain:
     z: Tuple[float, float] = (-7.5, 7.5)
 
     # Rates are not network inputs (excluded per §1.7 / Audit E4).
-    # Sourced from FRED series SOFR/DFF and long-run RUB policy rate history:
+    # Sourced from FRED series SOFR (2026-10-09: 3.87%, 2026-10-06: 3.90%)
+    # and DFF (2026-10-08: 3.88%) plus long-run RUB policy rate history:
     r_usd: Tuple[float, float] = (0.01, 0.06)
     r_rub: Tuple[float, float] = (0.05, 0.25)
     r_xau: Tuple[float, float] = (0.001, 0.025)
@@ -95,23 +96,25 @@ class CrossSobolSampler:
         sqrtT = d.sqrtT[0] + u[:, 0] * (d.sqrtT[1] - d.sqrtT[0])
         rho = d.rho[0] + u[:, 1] * (d.rho[1] - d.rho[0])
 
-        # Leg 1 smile parameters
+        # Leg 1 smile parameters (term-scaled so long-dated PNA pillars stay well-ordered)
         atm1 = d.atm1[0] + u[:, 2] * (d.atm1[1] - d.atm1[0])
-        rr_max1 = torch.minimum(torch.tensor(d.rr25[1] - 0.01, dtype=torch.float64), 0.28 * atm1)
+        t_scale1 = torch.clamp(atm1 * sqrtT / 0.012, min=1.0)
+        rr_max1 = torch.minimum(torch.tensor(d.rr25[1] - 0.01, dtype=torch.float64), 0.025 * atm1 / t_scale1)
         rr25_1 = (2.0 * u[:, 3] - 1.0) * rr_max1
-        bf25_1 = torch.clamp(atm1 * (0.030 + 0.060 * u[:, 4]), min=d.bf25[0] + 0.001, max=d.bf25[1] - 0.01)
-        ratio_rr1 = 1.6 + 0.4 * u[:, 5]
-        ratio_bf1 = 2.6 + 0.6 * u[:, 6]
+        bf25_1 = torch.clamp(atm1 * (0.002 + 0.004 * u[:, 4]) / t_scale1, min=d.bf25[0] + 0.0005, max=d.bf25[1] - 0.01)
+        ratio_rr1 = 1.6 + 0.3 * u[:, 5]
+        ratio_bf1 = 2.6 + 0.4 * u[:, 6]
         rr10_1 = rr25_1 * ratio_rr1
         bf10_1 = bf25_1 * ratio_bf1
 
         # Leg 2 smile parameters
         atm2 = d.atm2[0] + u[:, 7] * (d.atm2[1] - d.atm2[0])
-        rr_max2 = torch.minimum(torch.tensor(d.rr25[1] - 0.01, dtype=torch.float64), 0.28 * atm2)
+        t_scale2 = torch.clamp(atm2 * sqrtT / 0.012, min=1.0)
+        rr_max2 = torch.minimum(torch.tensor(d.rr25[1] - 0.01, dtype=torch.float64), 0.025 * atm2 / t_scale2)
         rr25_2 = (2.0 * u[:, 8] - 1.0) * rr_max2
-        bf25_2 = torch.clamp(atm2 * (0.030 + 0.060 * u[:, 9]), min=d.bf25[0] + 0.001, max=d.bf25[1] - 0.01)
-        ratio_rr2 = 1.6 + 0.4 * u[:, 10]
-        ratio_bf2 = 2.6 + 0.6 * u[:, 11]
+        bf25_2 = torch.clamp(atm2 * (0.002 + 0.004 * u[:, 9]) / t_scale2, min=d.bf25[0] + 0.0005, max=d.bf25[1] - 0.01)
+        ratio_rr2 = 1.6 + 0.3 * u[:, 10]
+        ratio_bf2 = 2.6 + 0.4 * u[:, 11]
         rr10_2 = rr25_2 * ratio_rr2
         bf10_2 = bf25_2 * ratio_bf2
 

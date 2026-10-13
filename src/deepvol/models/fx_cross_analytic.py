@@ -66,18 +66,17 @@ def smooth_T(T: Tensor) -> Tensor:
 
 def svi_vol_jet(x: tj.Jet, p: Tensor, T: Tensor, delta: tj.Jet) -> tj.Jet:
     """Evaluates raw SVI implied volatility sqrt(w(x)/T) + delta as a Jet."""
-    P = x.t.shape[1]
     a = p[:, 0]
     b = p[:, 1]
     rho_s = p[:, 2]
     m = p[:, 3]
     s = p[:, 4]
 
-    delta_x = tj.add(x, tj.const(-m, P))
-    hypot_sq = tj.add(tj.mul(delta_x, delta_x), tj.const(s * s, P))
+    delta_x = tj.add(x, tj.const(-m))
+    hypot_sq = tj.add(tj.mul(delta_x, delta_x), tj.const(s * s))
     hypot = tj.sqrt(hypot_sq)
     bracket = tj.add(tj.scale(delta_x, rho_s), hypot)
-    w = tj.add(tj.const(a, P), tj.scale(bracket, b))
+    w = tj.add(tj.const(a), tj.scale(bracket, b))
     w_t = tj.scale(w, 1.0 / T)
     return tj.add(tj.sqrt(w_t), delta)
 
@@ -93,8 +92,7 @@ def beta_split_jet(
     n_fp: int = 6,
 ) -> Tuple[tj.Jet, tj.Jet, tj.Jet]:
     """Beta-split H1 fixed-point triangulation with exact strike additivity."""
-    P = k.t.shape[1]
-    zero_jet = tj.const(torch.zeros_like(T), P)
+    zero_jet = tj.const(torch.zeros_like(T))
 
     s1 = svi_vol_jet(zero_jet, p1, T, d1)
     s2 = svi_vol_jet(zero_jet, p2, T, d2)
@@ -104,11 +102,11 @@ def beta_split_jet(
         s22 = tj.mul(s2, s2)
         s12 = tj.mul(tj.mul(s1, s2), rho)
         sc2 = tj.add(tj.add(s11, s22), tj.scale(s12, 2.0))
-        sc2_safe = tj.add(sc2, tj.const(torch.full_like(T, 1e-8), P))
+        sc2_safe = tj.add(sc2, tj.const(torch.full_like(T, 1e-8)))
         inv_sc2 = tj.recip(sc2_safe)
 
         beta1 = tj.mul(tj.add(s11, s12), inv_sc2)
-        beta2 = tj.add(tj.const(torch.ones_like(T), P), tj.scale(beta1, -1.0))
+        beta2 = tj.add(tj.const(torch.ones_like(T)), tj.scale(beta1, -1.0))
 
         k1 = tj.mul(k, beta1)
         k2 = tj.mul(k, beta2)
@@ -173,7 +171,13 @@ def black_partials(
 class AnalyticTriangulated(nn.Module):
     """Analytic triangulated cross pricing engine with hand-written Taylor jets."""
 
-    def forward(self, X: Tensor) -> EngineOutputs:
+    eye3: Tensor
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("eye3", torch.eye(3, dtype=torch.float64), persistent=False)
+
+    def forward(self, X: Tensor, eye: Optional[Tensor] = None) -> EngineOutputs:
         """Evaluates price, served vol, jets, and Black partials for device tensor X (B, 34)."""
         F_val = X[:, Col.F]
         K_val = X[:, Col.K]
@@ -189,12 +193,12 @@ class AnalyticTriangulated(nn.Module):
         k_val = torch.log(K_val / F_val)
 
         P = 3
-        eye = torch.eye(P, dtype=torch.float64, device=X.device)
+        eye_mat = eye if eye is not None else self.eye3.to(device=X.device)
 
-        k_jet = tj.seed_k(k_val, P)
-        rho_jet = tj.seed_tangent(rho_val, 0, P, eye=eye)
-        d1_jet = tj.seed_tangent(X[:, Col.DELTA1], 1, P, eye=eye)
-        d2_jet = tj.seed_tangent(X[:, Col.DELTA2], 2, P, eye=eye)
+        k_jet = tj.seed_k(k_val)
+        rho_jet = tj.seed_tangent(rho_val, 0, P, eye=eye_mat)
+        d1_jet = tj.seed_tangent(X[:, Col.DELTA1], 1, P, eye=eye_mat)
+        d2_jet = tj.seed_tangent(X[:, Col.DELTA2], 2, P, eye=eye_mat)
 
         sigma_jet, _, _ = beta_split_jet(k_jet, T_val, rho_jet, p1, p2, d1_jet, d2_jet, n_fp=6)
         sigma_jet = tj.softfloor(sigma_jet, lo=0.01, beta=200.0)
@@ -202,6 +206,7 @@ class AnalyticTriangulated(nn.Module):
         sigma = sigma_jet.v
         s_k = sigma_jet.d
         s_kk = sigma_jet.dd
+        assert sigma_jet.t is not None
         s_t = sigma_jet.t
 
         V = black76_otm_parity(F_val, K_val, sigma, T_val, D_val, phi_val)

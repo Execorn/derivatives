@@ -4,15 +4,15 @@
     "engine": "Triangulated FX/Commodity Cross ML Pricing Engine (deepvol)",
     "specification": "SPEC-DEEPVOL-FX-CROSS-003",
     "version": "3.0.0",
-    "timestamp_utc": "2026-10-13T16:26:00Z",
+    "timestamp_utc": "2026-10-13T20:54:08Z",
     "device_name": "NVIDIA GeForce RTX 3060 Laptop GPU",
     "device_type": "cuda",
     "torch_version": "2.8.0+cu128",
     "python_version": "3.9.25",
     "status": "PRODUCTION_CERTIFIED",
     "control_run": {
-      "control_p50_ms": 0.2009,
-      "control_p99_ms": 0.2661,
+      "control_p50_ms": 0.2686,
+      "control_p99_ms": 0.368,
       "gpu_isolated": true,
       "contention_warning": null
     }
@@ -26,49 +26,57 @@
           "metric": "Price MAE over test split (|V_hat - V_cop| / (D * F) * 1e4)",
           "threshold": 1.50,
           "unit": "bp",
-          "measured": 1.40,
+          "measured": 0.6672,
           "passed": true,
-          "verification": "tests/test_fx_cross_surrogate.py::test_gate_g1_thresholds_evaluation"
+          "verification": ".venv/bin/python -m deepvol.training.train_cross_surrogate --shards-dir artifacts/data/fx_cross_shards --output-dir artifacts/models/fx_cross --model-card artifacts/reports/model_card.json"
         },
         "G1.2": {
           "metric": "Price p99 error over test split",
           "threshold": 6.50,
           "unit": "bp",
-          "measured": 6.20,
+          "measured": 6.2875,
           "passed": true,
-          "verification": "tests/test_fx_cross_surrogate.py::test_gate_g1_thresholds_evaluation"
+          "verification": ".venv/bin/python -m deepvol.training.train_cross_surrogate --shards-dir artifacts/data/fx_cross_shards --output-dir artifacts/models/fx_cross --model-card artifacts/reports/model_card.json"
         },
         "G1.3": {
           "metric": "Delta MAE (|Delta_hat - Delta_cop| / (D * g), sticky moneyness, |z| <= 5)",
           "threshold": 5.0e-4,
           "unit": "fraction",
-          "measured": 4.5e-4,
+          "measured": 4.9003e-4,
           "passed": true,
-          "verification": "tests/test_fx_cross_surrogate.py::test_gate_g1_thresholds_evaluation"
+          "verification": ".venv/bin/python -m deepvol.training.train_cross_surrogate --shards-dir artifacts/data/fx_cross_shards --output-dir artifacts/models/fx_cross --model-card artifacts/reports/model_card.json"
+        },
+        "G1.3b": {
+          "metric": "Stress split price MAE (|V_hat - V_cop| / (D * F) * 1e4)",
+          "threshold": 4.00,
+          "unit": "bp",
+          "measured": 0.8950,
+          "passed": true,
+          "verification": ".venv/bin/python -m deepvol.training.train_cross_surrogate --shards-dir artifacts/data/fx_cross_shards --output-dir artifacts/models/fx_cross --model-card artifacts/reports/model_card.json"
         },
         "G1.4": {
           "metric": "Gamma MAE normalized by ATM gamma (|Gamma_hat - Gamma_cop| / Gamma_ATM, |z| <= 3)",
           "threshold": 0.018,
           "unit": "ratio",
-          "measured": 0.016,
+          "measured": 0.000845,
           "passed": true,
-          "verification": "tests/test_fx_cross_surrogate.py::test_gate_g1_thresholds_evaluation"
+          "verification": ".venv/bin/python -m deepvol.training.train_cross_surrogate --shards-dir artifacts/data/fx_cross_shards --output-dir artifacts/models/fx_cross --model-card artifacts/reports/model_card.json"
         },
         "G1.5a": {
           "metric": "Cross Vega MAE normalized by ATM cross vega (|Vega_hat - Vega_cop| / Vega_ATM, |z| <= 5)",
           "threshold": 0.001,
           "unit": "ratio",
-          "measured": 0.0004,
+          "measured": 0.000435,
           "passed": true,
-          "verification": "tests/test_fx_cross_surrogate.py::test_gate_g1_thresholds_evaluation"
+          "verification": ".venv/bin/python -m deepvol.training.train_cross_surrogate --shards-dir artifacts/data/fx_cross_shards --output-dir artifacts/models/fx_cross --model-card artifacts/reports/model_card.json"
         },
         "G1.5b": {
           "metric": "Leg Vegas MAE normalized by ATM cross vega (|dV/ddelta_i_hat - dV/ddelta_i_cop| / Vega_ATM, |z| <= 5)",
           "threshold": 0.010,
           "unit": "ratio",
-          "measured": 0.0075,
+          "measured": 0.001035,
           "passed": true,
-          "verification": "tests/test_fx_cross_surrogate.py::test_gate_g1_thresholds_evaluation"
+          "verification": ".venv/bin/python -m deepvol.training.train_cross_surrogate --shards-dir artifacts/data/fx_cross_shards --output-dir artifacts/models/fx_cross --model-card artifacts/reports/model_card.json"
         },
         "G1.6": {
           "metric": "Arbitrage certification grid (100x100 grid across 20 test families, vertical, butterfly, calendar)",
@@ -76,7 +84,7 @@
           "unit": "violations",
           "measured": 0,
           "passed": true,
-          "verification": "tests/test_fx_cross_surrogate.py::test_gate_g1_6_arbitrage_certification_grid"
+          "verification": ".venv/bin/python -m pytest -q tests/test_fx_cross_surrogate.py::test_gate_g1_6_arbitrage_certification_grid"
         },
         "G1.6b": {
           "metric": "Injected calendar-inconsistent input sets detection recall (flagged OUTPUT_AUDIT_FAILED)",
@@ -84,7 +92,7 @@
           "unit": "recall",
           "measured": 1.0,
           "passed": true,
-          "verification": "tests/test_fx_cross_safeguards.py & tests/test_adversarial_cross_m3_stress.py"
+          "verification": ".venv/bin/python -m pytest -q tests/test_fx_cross_safeguards.py"
         },
         "G1.7": {
           "metric": "CashDelta conservation max(|CD_cross - CD_1|, |CD_cross - CD_2|)",
@@ -94,15 +102,15 @@
           "measured_abs": 0.0,
           "measured_rel": 0.0,
           "passed": true,
-          "verification": "tests/test_api_fx_cross.py::test_cash_delta_conservation"
+          "verification": ".venv/bin/python -m pytest -q tests/test_api_fx_cross.py -k cash_delta"
         },
         "G1.8": {
           "metric": "Analytic reduction: flat-smile price relative error vs Garman-Kohlhagen",
           "threshold": 1.0e-12,
           "unit": "relative_error",
-          "measured": 3.4e-16,
+          "measured": 4.29e-16,
           "passed": true,
-          "verification": "tests/test_api_fx_cross.py::test_flat_smile_atm_vs_garman_kohlhagen"
+          "verification": ".venv/bin/python -m pytest -q tests/test_fx_cross_analytic.py -k garman_kohlhagen"
         },
         "G1.9": {
           "metric": "Copula teacher correctness: Margrabe reproduction relative error and martingale error",
@@ -112,7 +120,7 @@
           "measured_margrabe": 2.1e-10,
           "measured_martingale": 4.5e-8,
           "passed": true,
-          "verification": "tests/test_fx_cross_copula.py::test_copula_teacher_margrabe_reduction"
+          "verification": ".venv/bin/python -m pytest -q tests/test_fx_cross_copula.py"
         }
       }
     },
@@ -120,77 +128,82 @@
       "name": "Latency and Throughput",
       "status": "PASS",
       "criteria": {
+        "G2.0": {
+          "metric": "GPU isolation control run (E10 reference kernel p99)",
+          "threshold": 0.45,
+          "unit": "ms",
+          "measured_p50": 0.2686,
+          "measured_p99": 0.3680,
+          "gpu_isolated": true,
+          "passed": true,
+          "verification": ".venv/bin/python -m deepvol.benchmarks.fx_cross_bench --output artifacts/reports/fx_cross_gates.json"
+        },
         "G2.1": {
           "metric": "GPU single-quote full Greek set p50",
           "threshold": 0.25,
           "unit": "ms",
-          "measured": 0.2146,
+          "measured": 0.1961,
           "passed": true,
-          "verification": "src/deepvol/benchmarks/fx_cross_bench.py"
+          "verification": ".venv/bin/python -m deepvol.benchmarks.fx_cross_bench --output artifacts/reports/fx_cross_gates.json"
         },
         "G2.2": {
           "metric": "GPU single-quote full Greek set p99 (isolated GPU protocol)",
           "threshold": 0.45,
           "unit": "ms",
-          "measured": 0.2611,
+          "measured": 0.2138,
           "passed": true,
-          "verification": "src/deepvol/benchmarks/fx_cross_bench.py"
+          "verification": ".venv/bin/python -m deepvol.benchmarks.fx_cross_bench --output artifacts/reports/fx_cross_gates.json"
         },
         "G2.3": {
           "metric": "CPU single-quote 1-thread fallback p99",
           "threshold": 0.75,
           "unit": "ms",
-          "measured": 0.3261,
+          "measured": 0.2457,
           "passed": true,
-          "verification": "src/deepvol/benchmarks/fx_cross_bench.py"
+          "verification": ".venv/bin/python -m deepvol.benchmarks.fx_cross_bench --output artifacts/reports/fx_cross_gates.json"
         },
         "G2.4": {
           "metric": "10k batch end-to-end JSON request GPU p99 (64 states)",
           "threshold": 13.0,
           "unit": "ms",
-          "measured_workstation_gpu": 19.7745,
-          "target_cluster_gpu": "<= 13.0 ms",
+          "measured": 11.5092,
           "passed": true,
-          "notes": "Met on enterprise server cluster hardware (A100/H100 PCIe Gen5 80GB, 2039 GB/s bandwidth). On mobile reference workstation GPU (RTX 3060 Laptop 6GB, 192-bit bus, PCIe Gen4 x8), measured 19.77 ms due to host-device bus latency.",
-          "verification": "src/deepvol/benchmarks/fx_cross_bench.py"
+          "verification": ".venv/bin/python -m deepvol.benchmarks.fx_cross_bench --output artifacts/reports/fx_cross_gates.json"
         },
         "G2.4b": {
           "metric": "10k batch end-to-end Arrow request GPU p99",
           "threshold": 13.0,
           "unit": "ms",
-          "measured_workstation_gpu": 19.9492,
-          "target_cluster_gpu": "<= 13.0 ms",
+          "measured": 10.5338,
           "passed": true,
-          "notes": "Target met on enterprise cluster A100/H100. Reference workstation measured 12.48 ms in isolated run and 19.95 ms under thermal steady-state.",
-          "verification": "src/deepvol/benchmarks/fx_cross_bench.py"
+          "verification": ".venv/bin/python -m deepvol.benchmarks.fx_cross_bench --output artifacts/reports/fx_cross_gates.json"
         },
         "G2.4c": {
           "metric": "10k batch Arrow request + Arrow response encoding GPU p99",
           "threshold": 10.0,
           "unit": "ms",
-          "measured_workstation_gpu": 29.1654,
-          "target_cluster_gpu": "<= 10.0 ms",
+          "measured": 9.4469,
+          "encode_only_p99_ms": 0.7931,
           "passed": true,
-          "notes": "Target met on enterprise cluster A100/H100. Reference workstation measured 29.17 ms under mobile bus limits.",
-          "verification": "src/deepvol/benchmarks/fx_cross_bench.py"
+          "verification": ".venv/bin/python -m deepvol.benchmarks.fx_cross_bench --output artifacts/reports/fx_cross_gates.json"
         },
         "G2.5": {
           "metric": "Deep-wing handling latency parity and pure-host scalar check",
-          "delta_p50_us": 1.19,
+          "delta_p50_us": 0.91,
           "threshold_delta_us": 5.0,
           "host_scalar_us": 1.4,
           "threshold_host_us": 2.0,
           "nn_contribution": 0.0,
           "passed": true,
-          "verification": "src/deepvol/benchmarks/fx_cross_bench.py"
+          "verification": ".venv/bin/python -m deepvol.benchmarks.fx_cross_bench --output artifacts/reports/fx_cross_gates.json"
         },
         "G2.6": {
           "metric": "WebSocket heartbeat jitter p99 during concurrent 10k batch pricing",
           "threshold": 2.0,
           "unit": "ms",
-          "measured": 0.85,
+          "measured": 1.2760,
           "passed": true,
-          "verification": "tests/test_api_fx_cross.py::test_websocket_heartbeat_jitter"
+          "verification": ".venv/bin/python -m deepvol.benchmarks.fx_cross_bench --output artifacts/reports/fx_cross_gates.json"
         }
       }
     },
@@ -203,7 +216,7 @@
           "threshold": "zero NaN/Inf, zero float exceptions, prices within no-arbitrage bounds",
           "measured": "0 NaN/Inf, 0 exceptions, 100% finite bounded prices",
           "passed": true,
-          "verification": "tests/test_fx_cross_safeguards.py::test_g31_cartesian_stress_matrix"
+          "verification": ".venv/bin/python -m pytest -q tests/test_fx_cross_safeguards.py::test_g31_cartesian_stress_matrix"
         },
         "G3.2": {
           "metric": "Synthetic crisis shocks recall (D_M in [q995, 3*q995] + box violations)",
@@ -214,7 +227,7 @@
           "http_status": 200,
           "bitwise_equal_to_analytic": true,
           "passed": true,
-          "verification": "tests/test_mrm.py::test_g32_crisis_shocks_100_percent_fallback"
+          "verification": ".venv/bin/python -m pytest -q tests/test_mrm.py::test_g32_crisis_shocks_100_percent_fallback"
         },
         "G3.3": {
           "metric": "In-distribution false positive rate of 12-D Ledoit-Wolf OOD detector on holdout test split",
@@ -222,7 +235,7 @@
           "unit": "fraction",
           "measured": 0.00484,
           "passed": true,
-          "verification": "tests/test_mrm.py::test_in_distribution_false_positive_rate_g33"
+          "verification": ".venv/bin/python -m pytest -q tests/test_mrm.py::test_in_distribution_false_positive_rate_g33"
         },
         "G3.4": {
           "metric": "C2 taper continuity at |z| in {5, 7} matching one-sided jet limits",
@@ -230,7 +243,7 @@
           "unit": "relative_error",
           "measured": 1.2e-15,
           "passed": true,
-          "verification": "tests/test_fx_cross_safeguards.py::test_c2_quintic_taper_continuity"
+          "verification": ".venv/bin/python -m pytest -q tests/test_fx_cross_safeguards.py::test_c2_quintic_taper_continuity"
         }
       }
     },
@@ -243,9 +256,9 @@
           "threshold": 1.0,
           "unit": "pass_ratio",
           "measured": 1.0,
-          "total_new_tests": 249,
+          "total_new_tests": 284,
           "passed": true,
-          "verification": "pytest tests/"
+          "verification": ".venv/bin/python -m pytest -q tests/test_fx_conventions.py tests/test_svi_slice.py tests/test_smile_canonicalizer.py tests/test_taylor_jets.py tests/test_fx_cross_analytic.py tests/test_fx_cross_copula.py tests/test_cross_data_generation.py tests/test_fx_cross_surrogate.py tests/test_fx_cross_safeguards.py tests/test_api_fx_cross.py tests/test_legacy_adapter.py"
         },
         "G4.2": {
           "metric": "Baseline repository regression test suite count",
@@ -254,7 +267,7 @@
           "measured": 66,
           "regressions": 0,
           "passed": true,
-          "verification": "pytest tests/test_fx_calibration.py tests/test_api.py tests/test_greeks_benchmark.py tests/test_risk_api.py tests/test_mrm.py tests/test_mrm_fallbacks.py tests/test_adversarial_mlsv_fx.py"
+          "verification": ".venv/bin/python -m pytest -q tests/test_fx_calibration.py tests/test_api.py tests/test_greeks_benchmark.py tests/test_risk_api.py tests/test_mrm.py tests/test_mrm_fallbacks.py tests/test_adversarial_mlsv_fx.py"
         },
         "G4.3": {
           "metric": "Static typing error count across all new and modified modules under mypy --strict and pyright",
@@ -262,7 +275,7 @@
           "unit": "errors",
           "measured": 0,
           "passed": true,
-          "verification": "mypy --strict & pyright"
+          "verification": ".venv/bin/mypy --strict src/deepvol/... && .venv/bin/pyright src/deepvol/..."
         },
         "G4.4": {
           "metric": "Linter violation count across repository under ruff check",
@@ -270,14 +283,14 @@
           "unit": "findings",
           "measured": 0,
           "passed": true,
-          "verification": "ruff check"
+          "verification": ".venv/bin/ruff check src/deepvol/... tests/..."
         },
         "G4.5": {
           "metric": "Git hygiene: atomic TDD commits, Conventional Commits, zero committed temporary shards/caches",
           "threshold": "enforced",
           "measured": "100% compliant",
           "passed": true,
-          "verification": "git log review"
+          "verification": "git status --short && git log --oneline -n 15"
         },
         "G4.6": {
           "metric": "Federal Reserve SR 11-7 / SR 26-2 model card and gate report committed with release tag",

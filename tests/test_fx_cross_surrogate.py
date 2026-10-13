@@ -424,24 +424,41 @@ def test_gate_g1_thresholds_evaluation(tmp_path: Path, device: str) -> None:
     Asserts price MAE <= 1.50 bp, price p99 <= 6.50 bp, delta MAE <= 5.0e-4,
     gamma relative error <= 1.8%, leg vega error <= 1.0%, and cross vega error <= 0.10%.
     """
-    net = ResidualCrossVolNet(width=64, depth=3, members=1).to(device)
-    engine = CrossVolSurrogateEngine(net).to(device)
-
     shards_root = Path("artifacts/data/fx_cross_shards")
-    if (shards_root / "test").exists() and len(list((shards_root / "test").glob("*.npy"))) > 0:
+    models_root = Path("artifacts/models/fx_cross")
+    ckpts = sorted(models_root.glob("residual_vol_v3_m*.pt"))
+
+    if (shards_root / "test").exists() and len(list((shards_root / "test").glob("*.npy"))) > 0 and len(ckpts) > 0:
+        n_members = len(ckpts)
+        net = ResidualCrossVolNet(width=64, depth=3, members=n_members).to(device)
+        ref_ckpt = torch.load(ckpts[0], map_location=device)
+        for m, cp in enumerate(ckpts):
+            m_ckpt = torch.load(cp, map_location=device)
+            m_sd = m_ckpt["state_dict"]
+            for l_idx in range(len(net.weights)):
+                net.weights[l_idx].data[m].copy_(m_sd[f"weights.{l_idx}"][0])
+                net.biases[l_idx].data[m].copy_(m_sd[f"biases.{l_idx}"][0])
+        net.feature_mean.copy_(ref_ckpt["feature_mean"].to(device))
+        net.feature_std.copy_(ref_ckpt["feature_std"].to(device))
+        engine = CrossVolSurrogateEngine(net).to(device)
+
         eval_ds = ShardedCrossDataset(shards_root, split="test", member_idx=0, seed=42)
         stress_ds = (
             ShardedCrossDataset(shards_root, split="stress", member_idx=0, seed=42)
             if (shards_root / "stress").exists() and len(list((shards_root / "stress").glob("*.npy"))) > 0
             else None
         )
+        max_eval_records = len(eval_ds)
     else:
+        net = ResidualCrossVolNet(width=64, depth=3, members=1).to(device)
+        engine = CrossVolSurrogateEngine(net).to(device)
         fixture_dir = tmp_path / "eval_shards"
         _create_mock_shards(fixture_dir, n_states=8, strikes_per_state=64)
         eval_ds = ShardedCrossDataset(fixture_dir, split="test", member_idx=0, seed=42)
         stress_ds = ShardedCrossDataset(fixture_dir, split="stress", member_idx=0, seed=42)
+        max_eval_records = 512
 
-    metrics = evaluate_gate_g1(engine, eval_ds, stress_dataset=stress_ds, max_records=512)
+    metrics = evaluate_gate_g1(engine, eval_ds, stress_dataset=stress_ds, max_records=max_eval_records)
 
     assert "g1_1_price_mae_bp" in metrics
     assert "g1_2_price_p99_bp" in metrics

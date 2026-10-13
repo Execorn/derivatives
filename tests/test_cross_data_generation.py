@@ -191,7 +191,7 @@ def _oracle_copula_cross_primal(
         v=k_cross.view(1),
         d=torch.zeros(1, dtype=torch.float64, device=dev),
         dd=torch.zeros(1, dtype=torch.float64, device=dev),
-        t=torch.zeros((1, 0), dtype=torch.float64, device=dev),
+        t=None,
     )
     rho_jet = tj.const(rho.view(1), P)
     d1_jet = tj.const(torch.zeros(1, dtype=torch.float64, device=dev), P)

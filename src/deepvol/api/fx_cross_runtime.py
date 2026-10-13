@@ -34,17 +34,93 @@ import torch
 from torch import Tensor
 import torch._inductor.config as inductor_config
 
-from deepvol.models.fx_cross_analytic import Col, N_COLS
+from deepvol.models.fx_cross_analytic import Col, EngineOutputs, N_COLS
 from deepvol.models.fx_cross_surrogate import CrossVolSurrogateEngine
 
 # Single-thread inductor compilation prevents subproc pool closed errors in worker threads
 inductor_config.compile_threads = 1
+inductor_config.triton.cudagraphs = False
 
 logger = logging.getLogger("deepvol.api.fx_cross_runtime")
 
 QUOTE_BUCKET_GPU: Final[int] = 2
 BATCH_BUCKETS: Final[Tuple[int, ...]] = (64, 1024, 10240)
 _SQ2PI: Final[float] = math.sqrt(2.0 * math.pi)
+
+
+def _assemble_batch_greeks_gpu(
+    raw_in: Tensor, out: EngineOutputs, grad: Tensor
+) -> Tensor:
+    """Assembles the 12 canonical response columns on GPU inside the captured CUDA graph."""
+    F_val = raw_in[:, Col.F]
+    K_val = raw_in[:, Col.K]
+    T_val = torch.clamp(raw_in[:, Col.T], min=1e-4)
+    D_val = raw_in[:, Col.D]
+    g_val = raw_in[:, Col.G]
+    phi_val = raw_in[:, Col.PHI]
+    r_C = raw_in[:, Col.R_C]
+    r_A = raw_in[:, Col.R_A]
+    r_set = raw_in[:, Col.R_SET]
+
+    V = out.V.detach()
+    sigma = out.sigma.detach()
+    s_k = out.s_k.detach()
+    s_kk = out.s_kk.detach()
+    B_F = out.B_F.detach()
+    B_FF = out.B_FF.detach()
+    B_Fs = out.B_Fs.detach()
+    B_s = out.B_s.detach()
+    B_ss = out.B_ss.detach()
+
+    k_F = -1.0 / F_val
+    k_FF = 1.0 / (F_val * F_val)
+    dVdF = B_F + B_s * s_k * k_F
+    d2VdF2 = (
+        B_FF
+        + 2.0 * B_Fs * s_k * k_F
+        + B_ss * (s_k * k_F) ** 2
+        + B_s * (s_kk * k_F * k_F + s_k * k_FF)
+    )
+
+    delta = g_val * dVdF
+    cash_delta = F_val * dVdF
+    gamma = g_val * g_val * d2VdF2
+    vega = B_s
+    vanna = g_val * (B_Fs + B_ss * s_k * k_F)
+    vomma = B_ss
+
+    sq_T = torch.sqrt(T_val)
+    sd = sigma * sq_T
+    d1 = (-torch.log(K_val / F_val) + 0.5 * sd * sd) / sd
+    n1 = torch.exp(-0.5 * d1 * d1) / _SQ2PI
+
+    n_phi_d1 = torch.special.ndtr(phi_val * d1)
+    carry_term = phi_val * D_val * F_val * n_phi_d1 * (r_C - r_A)
+    decay_term = (D_val * F_val * sigma * n1) / (2.0 * sq_T)
+    roll_term = B_s * s_k * (r_C - r_A)
+    theta = (r_set * V - carry_term - decay_term + roll_term) / 365.0
+
+    d_rho = grad[:, Col.RHO]
+    d_delta1 = grad[:, Col.DELTA1]
+    d_delta2 = grad[:, Col.DELTA2]
+
+    return torch.stack(
+        [
+            V,
+            sigma,
+            delta,
+            cash_delta,
+            gamma,
+            vega,
+            d_delta1,
+            d_delta2,
+            theta,
+            vanna,
+            vomma,
+            d_rho,
+        ],
+        dim=1,
+    )
 
 
 class GraphBucket:
@@ -67,7 +143,20 @@ class GraphBucket:
         self.stream = stream if stream is not None else torch.cuda.Stream(device=device)  # type: ignore[no-untyped-call]
 
         self.static_input = torch.zeros((B, n_cols), dtype=torch.float64, device=device)
+        self.static_input[:, Col.F] = 1.0
+        self.static_input[:, Col.K] = 1.0
+        self.static_input[:, Col.T] = 1.0
+        self.static_input[:, Col.T_SET] = 1.0
+        self.static_input[:, Col.D] = 1.0
+        self.static_input[:, Col.G] = 1.0
+        self.static_input[:, Col.PHI] = 1.0
+        self.static_input[:, Col.SVI1] = 0.04
+        self.static_input[:, Col.SVI1 + 4] = 0.10
+        self.static_input[:, Col.SVI2] = 0.04
+        self.static_input[:, Col.SVI2 + 4] = 0.10
+
         self.host_input = torch.zeros((B, n_cols), dtype=torch.float64).pin_memory()
+        self.host_input.copy_(self.static_input.cpu())
 
         s = self.stream
         s.wait_stream(torch.cuda.current_stream(device))
@@ -99,7 +188,8 @@ class GraphBucket:
             if self.B > 1:
                 self.host_input_np[1 : self.B] = host_rows[0]
         else:
-            self.host_input_np[:N] = host_rows
+            if not np.shares_memory(host_rows, self.host_input_np):
+                self.host_input_np[:N] = host_rows
             if N < self.B:
                 self.host_input_np[N : self.B] = host_rows[-1]
 
@@ -110,8 +200,8 @@ class GraphBucket:
 
         self.stream.synchronize()
 
-        # Mandatory output cloning prevents static buffer overwrite on subsequent requests
-        return self.host_output_np[:N].copy()
+        # Mandatory output cloning in column-major (SoA) order makes each column res[:, k] 1D C-contiguous
+        return self.host_output_np[:N].copy(order="F")
 
 
 class CPUQuotePath:
@@ -123,6 +213,14 @@ class CPUQuotePath:
             torch.set_num_threads(1)
         except RuntimeError:
             pass
+        self._input_buf = torch.zeros((1, N_COLS), dtype=torch.float64, device="cpu")
+        self._input_buf[0, Col.F] = 1.0
+        self._input_buf[0, Col.K] = 1.0
+        self._input_buf[0, Col.T] = 1.0
+        self._input_buf[0, Col.T_SET] = 1.0
+        self._input_buf[0, Col.D] = 1.0
+        self._input_buf[0, Col.G] = 1.0
+        self._input_buf_np = self._input_buf.detach().numpy()
         self.compiled_fn = self.engine.forward_single
         try:
             cfn = torch.compile(
@@ -130,15 +228,8 @@ class CPUQuotePath:
                 dynamic=False,
                 fullgraph=True,
             )
-            dummy_X = torch.zeros((1, N_COLS), dtype=torch.float64, device="cpu")
-            dummy_X[0, Col.F] = 1.0
-            dummy_X[0, Col.K] = 1.0
-            dummy_X[0, Col.T] = 1.0
-            dummy_X[0, Col.T_SET] = 1.0
-            dummy_X[0, Col.D] = 1.0
-            dummy_X[0, Col.G] = 1.0
             with torch.no_grad():
-                _ = cfn(dummy_X)
+                _ = cfn(self._input_buf)
             self.compiled_fn = cfn
         except Exception:
             logger.info("CPU Inductor C++ compilation unavailable; using eager CPU forward")
@@ -147,13 +238,14 @@ class CPUQuotePath:
     def price_single(self, X: NDArray[Any]) -> NDArray[Any]:
         """Evaluates single-row input (1, 34) on CPU and returns packed output (1, 9)."""
         if X.ndim == 1:
-            X = X.reshape(1, -1)
-        X_t = torch.from_numpy(X).to(dtype=torch.float64, device="cpu")
+            self._input_buf_np[0] = X
+        else:
+            self._input_buf_np[0] = X[0]
         with torch.no_grad():
             try:
-                out = self.compiled_fn(X_t)
+                out = self.compiled_fn(self._input_buf)
             except Exception:
-                out = self.engine.forward_single(X_t)
+                out = self.engine.forward_single(self._input_buf)
         return out.detach().numpy().copy()
 
 
@@ -182,31 +274,18 @@ class FXCrossRuntime:
         shared_stream = torch.cuda.Stream(device=self.device) if self.is_cuda else None  # type: ignore[no-untyped-call]
 
         # 1. Batch graph: capture largest bucket B=10240 first to create and size shared pool
-        cf_batch = torch.compile(self.engine.forward, dynamic=False, fullgraph=True)
+        cf_batch = torch.compile(
+            self.engine.forward_batch, dynamic=False, fullgraph=True
+        )
+        cf_greeks = torch.compile(
+            _assemble_batch_greeks_gpu, dynamic=False, fullgraph=True
+        )
 
         def batch_pipeline(raw_in: Tensor) -> Tensor:
             x = raw_in.detach().requires_grad_(True)
-            out = cf_batch(x)
+            out, _ = cf_batch(x)
             (grad,) = torch.autograd.grad(out.V.sum(), x)
-            eps_std = self.engine.epistemic_std_bps(x)
-            packed = torch.cat(
-                [
-                    out.V.unsqueeze(-1).detach(),
-                    grad.detach(),
-                    out.sigma.unsqueeze(-1).detach(),
-                    out.s_k.unsqueeze(-1).detach(),
-                    out.s_kk.unsqueeze(-1).detach(),
-                    out.B_F.unsqueeze(-1).detach(),
-                    out.B_FF.unsqueeze(-1).detach(),
-                    out.B_Fs.unsqueeze(-1).detach(),
-                    out.B_s.unsqueeze(-1).detach(),
-                    out.B_ss.unsqueeze(-1).detach(),
-                    out.chi.unsqueeze(-1).detach(),
-                    eps_std.unsqueeze(-1).detach(),
-                ],
-                dim=1,
-            )
-            return packed
+            return cf_greeks(raw_in, out, grad.detach())
 
         mempool: Optional[Any] = None
         for B_sz in sorted(BATCH_BUCKETS, reverse=True):
@@ -268,8 +347,7 @@ class FXCrossRuntime:
 
         bucket_size = next((b for b in BATCH_BUCKETS if b >= N), BATCH_BUCKETS[-1])
         bucket = self.batch_buckets[bucket_size]
-        raw_out = bucket.run(X)  # (N, 45)
-        return self._assemble_batch_greeks(X, raw_out)
+        return bucket.run(X)  # (N, 12) directly assembled on GPU
 
     def _price_rows_cpu(self, X: NDArray[Any]) -> NDArray[Any]:
         """CPU fallback path when CUDA is unavailable."""
@@ -278,9 +356,8 @@ class FXCrossRuntime:
             .to(dtype=torch.float64, device="cpu")
             .requires_grad_(True)
         )
-        out = self.engine.forward(X_t)
+        out, eps_std = self.engine.forward_batch(X_t)
         (grad,) = torch.autograd.grad(out.V.sum(), X_t)
-        eps_std = self.engine.epistemic_std_bps(X_t)
         packed = torch.cat(
             [
                 out.V.unsqueeze(-1).detach(),

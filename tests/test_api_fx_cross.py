@@ -843,14 +843,10 @@ def test_websocket_heartbeat_jitter(
 
 @pytest.mark.gpu
 @pytest.mark.xfail(
-    strict=False, reason="Inductor Triton constexpr codegen bug E11 at GPU B=1"
+    strict=True, reason="Inductor Triton constexpr codegen bug E11 at GPU B=1"
 )
 def test_gpu_forward_single_b1_regression() -> None:
-    """Regression test for GPU B=1 Inductor compilation.
-
-    Note: PyTorch 2.8.0+cu128 resolves the upstream Inductor bug while
-    maintaining B=2 padding for deployment stability per Task 4.2.
-    """
+    """Regression test for GPU B=1 Inductor compilation (E11 Triton constexpr_type.is_block bug)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
 
@@ -858,8 +854,9 @@ def test_gpu_forward_single_b1_regression() -> None:
     engine = CrossVolSurrogateEngine(net).cuda()
     cf = torch.compile(engine.forward_single, dynamic=False, fullgraph=True)
     X = torch.zeros((1, N_COLS), dtype=torch.float64, device="cuda")
-    # This invocation triggers Triton constexpr_type.is_block() failure
-    out = cf(X)
+    # This invocation under no_grad triggers Triton constexpr_type.is_block() failure
+    with torch.no_grad():
+        out = cf(X)
     assert out.shape == (1, 9)
 
 

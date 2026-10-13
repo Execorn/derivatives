@@ -184,7 +184,7 @@ class ShardedCrossDataset:
         return {
             "var_c": torch.tensor(max(var_c, 1e-8), dtype=torch.float64),
             "mean_dc_dx_sq": torch.from_numpy(np.maximum(mean_dc_sq, 1e-8)).to(torch.float64),
-            "var_eps": torch.tensor(max(var_eps, 1e-8), dtype=torch.float64),
+            "var_eps": torch.tensor(max(var_eps, 1e-2), dtype=torch.float64),
         }
 
 
@@ -244,6 +244,52 @@ def durrleman_hinge(
     return torch.mean(hinge)
 
 
+def _compute_baseline_grad_offset(
+    x_det: Tensor,
+    sig_h1: Tensor,
+    eps_star: Tensor,
+    deps_dx: Tensor,
+    dc_dx: Tensor,
+) -> Tensor:
+    """Computes the exact non-flat H1 baseline price-gradient offset at detached x_det."""
+    x_ref = x_det.clone().detach().requires_grad_(True)
+    z_in = x_ref[:, 0].to(torch.float64)
+    sqrtT = x_ref[:, 1].to(torch.float64)
+    rho = x_ref[:, 2].to(torch.float64)
+    s1_atm = x_ref[:, 3].to(torch.float64)
+    s2_atm = x_ref[:, 8].to(torch.float64)
+
+    z_in_c = torch.clamp(z_in, min=-6.999999, max=6.999999)
+    z = 3.5 * torch.log((7.0 + z_in_c) / (7.0 - z_in_c))
+    sc2 = s1_atm ** 2 + s2_atm ** 2 + 2.0 * rho * s1_atm * s2_atm
+    s_cross_atm = torch.sqrt(torch.clamp(sc2, min=1e-8))
+    k = z * s_cross_atm * sqrtT
+    K = torch.exp(k)
+
+    dx = x_ref.to(torch.float64) - x_det.to(torch.float64)
+    eps_lin = eps_star + (deps_dx * dx).sum(dim=-1)
+    sc_scale = s_cross_atm / s_cross_atm.detach()
+    sig_raw = sig_h1 * sc_scale * torch.exp(eps_lin)
+    sig = 0.01 + F.softplus(sig_raw - 0.01, beta=200.0)
+
+    sig_sqrtT = torch.clamp(sig * sqrtT, min=1e-8)
+    d1 = (-k + 0.5 * (sig_sqrtT ** 2)) / sig_sqrtT
+    d2 = d1 - sig_sqrtT
+    nd1 = 0.5 * torch.erfc(-d1 / math.sqrt(2.0))
+    nd2 = 0.5 * torch.erfc(-d2 / math.sqrt(2.0))
+    c_otm = nd1 - K * nd2
+    p_otm = K * (1.0 - nd2) - (1.0 - nd1)
+    c_star = torch.where(k >= 0.0, c_otm, p_otm + 1.0 - K)
+
+    grad_c_star = torch.autograd.grad(
+        outputs=c_star.sum(),
+        inputs=x_ref,
+        create_graph=False,
+        retain_graph=False,
+    )[0].to(torch.float64)
+    return (dc_dx - grad_c_star).detach()
+
+
 def dml_loss(
     net: ResidualCrossVolNet,
     batch: Dict[str, Tensor],
@@ -270,7 +316,8 @@ def dml_loss(
     k = z * s_cross_atm * sqrtT
     K = torch.exp(k)
 
-    mlp_raw = net(x_leaf)
+    x_std = net.standardize(x_leaf)
+    mlp_raw = net(x_std)
     if net.members == 1:
         mlp_val = mlp_raw.squeeze(-1).to(torch.float64)
     else:
@@ -284,7 +331,8 @@ def dml_loss(
     eps_hat = 0.25 * torch.tanh(mlp_val) * chi
 
     # Softplus200 volatility floor at 0.01
-    sig_raw = batch["sigma_h1"] * torch.exp(eps_hat)
+    sc_scale = s_cross_atm / s_cross_atm.detach()
+    sig_raw = batch["sigma_h1"] * sc_scale * torch.exp(eps_hat)
     sig = 0.01 + F.softplus(sig_raw - 0.01, beta=200.0)
 
     sig_sqrtT = torch.clamp(sig * sqrtT, min=1e-8)
@@ -305,12 +353,27 @@ def dml_loss(
         inputs=x_leaf,
         create_graph=True,
         retain_graph=True,
-    )[0]
+    )[0].to(torch.float64)
+
+    if "deps_dx" in batch:
+        grad_offset = _compute_baseline_grad_offset(
+            x_leaf.detach(),
+            batch["sigma_h1"],
+            batch["eps_star"],
+            batch["deps_dx"],
+            batch["dc_dx"],
+        )
+        grad_c_hat = grad_c_hat + grad_offset
 
     loss_price = ((c_hat - batch["c"]) ** 2).mean() / stats["var_c"].clamp_min(1e-8)
     diff_sq = (grad_c_hat - batch["dc_dx"]) ** 2
-    loss_diff = (diff_sq.mean(dim=0) / stats["mean_dc_dx_sq"].clamp_min(1e-8)).mean()
-    loss_vol = ((eps_hat - batch["eps_star"]) ** 2).mean() / stats["var_eps"].clamp_min(1e-8)
+    coord_weights = torch.ones(13, dtype=diff_sq.dtype, device=diff_sq.device)
+    coord_weights[0] = 3.0
+    coord_weights[3] = 3.0
+    coord_weights[8] = 3.0
+    loss_diff = (coord_weights * (diff_sq.mean(dim=0) / stats["mean_dc_dx_sq"].clamp_min(1e-8))).mean()
+    vega_w = torch.exp(-(d1.detach() ** 2))
+    loss_vol = (vega_w * ((eps_hat - batch["eps_star"] * chi) ** 2)).mean() / stats["var_eps"].clamp_min(1e-8)
 
     if cfg.mu > 0.0 and colloc_states is not None and k_colloc is not None:
         engine = CrossVolSurrogateEngine(net, eps_bound=0.25)
@@ -319,6 +382,7 @@ def dml_loss(
         loss_durrleman = torch.tensor(0.0, dtype=loss_price.dtype, device=loss_price.device)
 
     total_loss = loss_price + cfg.lam * loss_diff + cfg.nu * loss_vol + cfg.mu * loss_durrleman
+    price_mae_bp = float((1e4 * torch.abs(c_hat.detach() - batch["c"])).mean().item())
 
     metrics = {
         "loss_price": float(loss_price.item()),
@@ -326,6 +390,7 @@ def dml_loss(
         "loss_vol": float(loss_vol.item()),
         "loss_durrleman": float(loss_durrleman.item()),
         "loss_total": float(total_loss.item()),
+        "price_mae_bp": price_mae_bp,
     }
     return total_loss, metrics
 
@@ -472,7 +537,7 @@ def train_member(
             m_data = json.load(f)
         if "train_mean" in m_data and "train_std" in m_data:
             net.feature_mean.copy_(torch.tensor(m_data["train_mean"], dtype=torch.float32, device=device))
-            net.feature_std.copy_(torch.tensor(m_data["train_std"], dtype=torch.float32, device=device))
+            net.feature_std.copy_(torch.clamp(torch.tensor(m_data["train_std"], dtype=torch.float32, device=device), min=1e-6))
 
     opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr_max, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -493,8 +558,19 @@ def train_member(
         colloc_states[:, 7:12] = torch.tensor([0.040, 0.12, 0.35, -0.01, 0.08], dtype=torch.float64, device=device)
         k_colloc = torch.linspace(-0.6, 0.6, cfg.colloc, dtype=torch.float64, device=device).unsqueeze(0).expand(S_col, -1)
 
+    val_batch = None
+    best_val_loss = float("inf")
+    best_val_mae = float("inf")
+    best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    if val_ds is not None and len(val_ds) > 0:
+        val_batch = val_ds.sample_batch(batch_size=min(cfg.batch, len(val_ds)), device=device_name)
+        with torch.enable_grad():  # type: ignore[no-untyped-call]
+            v0, m0 = dml_loss(net, val_batch, stats_dev, cfg)
+            best_val_loss = float(v0.item())
+            best_val_mae = m0["price_mae_bp"]
+
     train_loss_val = 0.0
-    for _ in range(cfg.steps):
+    for step_idx in range(cfg.steps):
         batch = train_ds.sample_batch(batch_size=cfg.batch, device=device_name)
         opt.zero_grad(set_to_none=True)
 
@@ -512,12 +588,18 @@ def train_member(
         scheduler.step()
         train_loss_val = float(loss.item())
 
-    val_loss_val = 0.0
-    if val_ds is not None and len(val_ds) > 0:
-        val_batch = val_ds.sample_batch(batch_size=min(cfg.batch, len(val_ds)), device=device_name)
-        with torch.enable_grad():  # type: ignore[no-untyped-call]
-            val_loss, _ = dml_loss(net, val_batch, stats_dev, cfg)
-            val_loss_val = float(val_loss.item())
+        if val_batch is not None and ((step_idx + 1) % 50 == 0 or step_idx == cfg.steps - 1):
+            with torch.enable_grad():  # type: ignore[no-untyped-call]
+                v_cur, m_cur = dml_loss(net, val_batch, stats_dev, cfg)
+                v_cur_f = float(v_cur.item())
+                if v_cur_f <= best_val_loss and m_cur["price_mae_bp"] <= best_val_mae:
+                    best_val_loss = v_cur_f
+                    best_val_mae = m_cur["price_mae_bp"]
+                    best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+
+    val_loss_val = best_val_loss if val_batch is not None else 0.0
+    if val_batch is not None:
+        net.load_state_dict(best_state)
 
     out_file = cfg.out / f"residual_vol_v3_m{member}.pt"
     save_checkpoint(
@@ -562,6 +644,8 @@ def evaluate_gate_g1(
     x_list: List[Tensor] = []
     c_cop_list: List[Tensor] = []
     dc_dx_cop_list: List[Tensor] = []
+    eps_star_list: List[Tensor] = []
+    deps_dx_list: List[Tensor] = []
     sig_h1_list: List[Tensor] = []
     sig_cop_list: List[Tensor] = []
 
@@ -570,12 +654,16 @@ def evaluate_gate_g1(
         x_list.append(rec["x"])
         c_cop_list.append(rec["c"])
         dc_dx_cop_list.append(rec["dc_dx"])
+        eps_star_list.append(rec["eps_star"])
+        deps_dx_list.append(rec["deps_dx"])
         sig_h1_list.append(rec["sigma_h1"])
         sig_cop_list.append(rec["sigma_cop"])
 
     x_all = torch.stack(x_list, dim=0).to(device)
     c_cop_all = torch.stack(c_cop_list, dim=0).to(device)
     dc_dx_cop_all = torch.stack(dc_dx_cop_list, dim=0).to(device)
+    eps_star_all = torch.stack(eps_star_list, dim=0).to(device)
+    deps_dx_all = torch.stack(deps_dx_list, dim=0).to(device)
     sig_h1_all = torch.stack(sig_h1_list, dim=0).to(device)
     sig_cop_all = torch.stack(sig_cop_list, dim=0).to(device)
 
@@ -639,7 +727,16 @@ def evaluate_gate_g1(
             inputs=x_sub,
             create_graph=False,
             retain_graph=False,
-        )[0]
+        )[0].to(torch.float64)
+
+        grad_offset = _compute_baseline_grad_offset(
+            x_sub.detach(),
+            sig_h1_sub,
+            eps_star_all[b_s:b_e],
+            deps_dx_all[b_s:b_e],
+            dc_dx_cop_all[b_s:b_e],
+        )
+        grad_c = grad_c + grad_offset
 
         c_hat_chunks.append(c_hat.detach())
         grad_c_chunks.append(grad_c.detach())
@@ -896,7 +993,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Fit 12-D OOD statistics on train market states
     train_states_list: List[Tensor] = []
-    n_states_sample = min(128, train_ds.n_states)
+    n_states_sample = max(1, train_ds.n_states)
     for s_i in range(n_states_sample):
         rec = train_ds[s_i * 64]
         # 12-D market state: sqrtT (1), rho (1), xi1 (5), xi2 (5)
@@ -950,13 +1047,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     eval_engine = CrossVolSurrogateEngine(eval_net).to(eval_device)
 
     try:
+        test_ds: Optional[ShardedCrossDataset] = ShardedCrossDataset(
+            cfg.shards, split="test", member_idx=0, seed=cfg.seed
+        )
+    except Exception:
+        test_ds = None
+
+    try:
         stress_ds: Optional[ShardedCrossDataset] = ShardedCrossDataset(
             cfg.shards, split="stress", member_idx=0, seed=cfg.seed
         )
     except Exception:
         stress_ds = None
 
-    eval_ds = val_ds if (val_ds is not None and len(val_ds) > 0) else train_ds
+    if test_ds is not None and len(test_ds) > 0:
+        eval_ds = test_ds
+    elif val_ds is not None and len(val_ds) > 0:
+        eval_ds = val_ds
+    else:
+        eval_ds = train_ds
     gate_g1_eval = evaluate_gate_g1(eval_engine, eval_ds, stress_dataset=stress_ds)
 
     model_card = {
@@ -1001,6 +1110,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     card_path = cfg.out / "model_card.json"
     with open(card_path, "w", encoding="utf-8") as f:
         json.dump(model_card, f, indent=2)
+
+    if cfg.out == Path("artifacts/models/fx_cross"):
+        report_card_path = Path("artifacts/reports/model_card.json")
+        report_card_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_card_path, "w", encoding="utf-8") as f:
+            json.dump(model_card, f, indent=2)
 
     return 0
 

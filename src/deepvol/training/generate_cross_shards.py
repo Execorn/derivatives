@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,12 +28,12 @@ from deepvol.market.fx_conventions import (
     pillar_strikes,
 )
 from deepvol.market.svi_slice import (
+    RawSVI,
     fit_raw_svi_5pt,
 )
 from deepvol.models.fx_cross_analytic import beta_split_jet
 from deepvol.models.fx_cross_copula import (
     CopulaConfig,
-    CrossState,
     GaussianCopulaCrossEngine,
 )
 from deepvol.models import taylor_jets as tj
@@ -123,7 +123,7 @@ class StreamingFeatureStats:
             return [0.0] * 13, [1.0] * 13
         mean = self.sum / self.count
         variance = np.maximum(0.0, (self.sum_sq / self.count) - (mean ** 2))
-        std = np.sqrt(variance)
+        std = np.maximum(np.sqrt(variance), 1e-6)
         return [float(v) for v in mean], [float(v) for v in std]
 
 
@@ -214,24 +214,6 @@ class ShardStreamWriter:
         self._close_active_shard()
         return self.checksums
 
-# pyright: ignore[reportUnusedFunction]
-def _eval_copula_strike_primal(
-    engine: GaussianCopulaCrossEngine,
-    cstate: CrossState,
-    K: Tensor,
-) -> Tensor:
-    """Evaluates undiscounted cross price with put-call parity for a strike."""
-    is_call_mask = (K >= 1.0)
-    if is_call_mask.all():
-        return engine.price(cstate, K, is_call=True)
-    elif (~is_call_mask).all():
-        otm_p = engine.price(cstate, K, is_call=False)
-        return cast(Tensor, otm_p + (1.0 - K))
-    else:
-        c_otm = engine.price(cstate, K, is_call=True)
-        p_otm = engine.price(cstate, K, is_call=False)
-        return torch.where(is_call_mask, c_otm, p_otm + (1.0 - K))
-
 
 def label_state_batch(
     states: Tensor,
@@ -283,6 +265,79 @@ def label_state_batch(
 
     ones = torch.ones(S_cnt, dtype=torch.float64, device=dev)
 
+    # Precompute state-only SVI parameters and their exact 12-D state Jacobians once per state batch
+    st_init = st_dev.clone().requires_grad_(True)
+    sqrtT_init = st_init[:, 0]
+    T_init = sqrtT_init ** 2
+    q1_init = st_init[:, 2:7]
+    q2_init = st_init[:, 7:12]
+
+    leg_init = LegMarket(spot=ones, df_foreign=ones, df_domestic=ones, T=T_init)
+    k1_init, s1_init = pillar_strikes(q1_init, leg_init, DeltaConvention.FORWARD_PNA, AtmConvention.DNS)
+    x1_init = torch.log(k1_init / leg_init.forward.unsqueeze(-1))
+    svi1_init, _ = fit_raw_svi_5pt(x1_init, s1_init ** 2 * T_init.unsqueeze(1))
+
+    k2_init, s2_init = pillar_strikes(q2_init, leg_init, DeltaConvention.FORWARD_PNA, AtmConvention.DNS)
+    x2_init = torch.log(k2_init / leg_init.forward.unsqueeze(-1))
+    svi2_init, _ = fit_raw_svi_5pt(x2_init, s2_init ** 2 * T_init.unsqueeze(1))
+
+    svi1_params_init = svi1_init.params.reshape(S_cnt, 5)
+    svi2_params_init = svi2_init.params.reshape(S_cnt, 5)
+    dsvi1_list: List[Tensor] = []
+    dsvi2_list: List[Tensor] = []
+    for p_idx in range(5):
+        g1_p = torch.autograd.grad(svi1_params_init[:, p_idx].sum(), st_init, retain_graph=True)[0]
+        dsvi1_list.append(g1_p.detach())
+    for p_idx in range(5):
+        g2_p = torch.autograd.grad(
+            svi2_params_init[:, p_idx].sum(), st_init, retain_graph=(p_idx < 4)
+        )[0]
+        dsvi2_list.append(g2_p.detach())
+    dsvi1_dst = torch.stack(dsvi1_list, dim=1)  # (S_cnt, 5, 12)
+    dsvi2_dst = torch.stack(dsvi2_list, dim=1)  # (S_cnt, 5, 12)
+    svi1_params_val = svi1_params_init.detach()
+    svi2_params_val = svi2_params_init.detach()
+    del st_init, leg_init, svi1_init, svi2_init, svi1_params_init, svi2_params_init
+
+    sqrtT_val = st_dev[:, 0]
+    T_val = sqrtT_val ** 2
+    rho_val = st_dev[:, 1]
+    q1_val = st_dev[:, 2:7]
+    q2_val = st_dev[:, 7:12]
+    s1_atm_val = q1_val[:, 0:1]
+    s2_atm_val = q2_val[:, 0:1]
+    sig_cross_atm_val = torch.sqrt(s1_atm_val ** 2 + s2_atm_val ** 2 + 2.0 * rho_val.unsqueeze(1) * s1_atm_val * s2_atm_val)
+
+    # Precompute state-level copula quantile grids X_cop (S, n) and Y_cop (S, n, n) once per state batch
+    st_leaf_cop = st_dev.clone().requires_grad_(True)
+    sqrtT_1 = st_leaf_cop[:, 0]
+    T_1 = sqrtT_1 ** 2
+    rho_1 = st_leaf_cop[:, 1]
+    q1_1 = st_leaf_cop[:, 2:7]
+    q2_1 = st_leaf_cop[:, 7:12]
+
+    d_st_1 = st_leaf_cop - st_dev
+    svi1_p1 = svi1_params_val + torch.einsum("spj,sj->sp", dsvi1_dst, d_st_1)
+    svi2_p1 = svi2_params_val + torch.einsum("spj,sj->sp", dsvi2_dst, d_st_1)
+    svi1_1 = RawSVI(svi1_p1)
+    svi2_1 = RawSVI(svi2_p1)
+
+    s1_atm_1 = q1_1[:, 0:1]
+    s2_atm_1 = q2_1[:, 0:1]
+    sig_cross_atm_1 = torch.sqrt(s1_atm_1 ** 2 + s2_atm_1 ** 2 + 2.0 * rho_1.unsqueeze(1) * s1_atm_1 * s2_atm_1)
+
+    n_quad = engine.cfg.n_nodes
+    X_cop = engine.quantiles(svi1_1, ones, T_1, engine.u_1d, reflect=False)
+    rho_z_col = (-rho_1).view(S_cnt, 1, 1)
+    scale_perp = torch.sqrt(torch.clamp(1.0 - rho_z_col ** 2, min=1e-8))
+    Z2_joint = rho_z_col * engine.z.view(1, n_quad, 1) + scale_perp * engine.z.view(1, 1, n_quad)
+    u2_joint = torch.special.ndtr(Z2_joint)
+    Y_cop = engine.quantiles(svi2_1, ones, T_1, u2_joint, reflect=True)
+    X_cop_b = X_cop.view(S_cnt, 1, n_quad, 1)
+    Y_cop_b = Y_cop.view(S_cnt, 1, n_quad, n_quad)
+    w1d_row = engine.w1d.view(1, 1, 1, n_quad)
+    w1d_col = engine.w1d.view(1, 1, n_quad)
+
     # Evaluate strikes one by one to ensure peak memory is strictly O(1) in M
     for m in range(M_cnt):
         z_m = z_dev[:, m:m + 1]
@@ -290,105 +345,86 @@ def label_state_batch(
         # -------------------------------------------------------------
         # Pass 1: Primal Copula Pricing & Price Adjoints w.r.t (z, st)
         # -------------------------------------------------------------
-        st_leaf = st_dev.clone().requires_grad_(True)
         z_leaf = z_m.clone().requires_grad_(True)
-
-        sqrtT_1 = st_leaf[:, 0]
-        T_1 = sqrtT_1 ** 2
-        rho_1 = st_leaf[:, 1]
-        q1_1 = st_leaf[:, 2:7]
-        q2_1 = st_leaf[:, 7:12]
-
-        leg_1 = LegMarket(spot=ones, df_foreign=ones, df_domestic=ones, T=T_1)
-        k1_1, s1_1 = pillar_strikes(q1_1, leg_1, DeltaConvention.FORWARD_PNA, AtmConvention.DNS)
-        x1_1 = torch.log(k1_1 / leg_1.forward.unsqueeze(-1))
-        svi1_1, _ = fit_raw_svi_5pt(x1_1, s1_1 ** 2 * T_1.unsqueeze(1))
-
-        k2_1, s2_1 = pillar_strikes(q2_1, leg_1, DeltaConvention.FORWARD_PNA, AtmConvention.DNS)
-        x2_1 = torch.log(k2_1 / leg_1.forward.unsqueeze(-1))
-        svi2_1, _ = fit_raw_svi_5pt(x2_1, s2_1 ** 2 * T_1.unsqueeze(1))
-
-        s1_atm_1 = q1_1[:, 0:1]
-        s2_atm_1 = q2_1[:, 0:1]
-        sig_cross_atm_1 = torch.sqrt(s1_atm_1 ** 2 + s2_atm_1 ** 2 + 2.0 * rho_1.unsqueeze(1) * s1_atm_1 * s2_atm_1)
         k_cross_1 = z_leaf * sig_cross_atm_1 * sqrtT_1.unsqueeze(1)
         K_1 = torch.exp(k_cross_1)
+        K_b = K_1.view(S_cnt, 1, 1, 1)
 
-        cstate_1 = CrossState(F1=ones, F2=ones, T=T_1, svi1=svi1_1, svi2=svi2_1, rho=rho_1)
-
-        c_m = _eval_copula_strike_primal(engine, cstate_1, K_1)
-
-        # Backward Pass 1: Differentiate c w.r.t (z, st) with retain_graph=False
-        gc_z, gc_st = torch.autograd.grad(c_m.sum(), [z_leaf, st_leaf], retain_graph=False)
-
-        # Copula graph is destroyed immediately!
-        c_m_val = c_m.detach()
-        K_1_val = K_1.detach()
-        T_1_val = T_1.detach()
-        del cstate_1, svi1_1, svi2_1, K_1, k_cross_1, z_leaf, st_leaf, c_m
-
-        # -------------------------------------------------------------
-        # Pass 2: Scalar Price Sensitivity deps_dc = d(eps_star) / d(c)
-        # -------------------------------------------------------------
-        c_scalar = c_m_val.clone().requires_grad_(True)
-        is_call_scalar = (K_1_val >= 1.0)
-        otm_scalar = torch.where(is_call_scalar, c_scalar, c_scalar - (1.0 - K_1_val))
-
-        if is_call_scalar.all():
-            sig_cop_scalar = engine.implied_vol(otm_scalar, F=ones.unsqueeze(1), K=K_1_val, T=T_1_val.unsqueeze(1), is_call=True)
-        elif (~is_call_scalar).all():
-            sig_cop_scalar = engine.implied_vol(otm_scalar, F=ones.unsqueeze(1), K=K_1_val, T=T_1_val.unsqueeze(1), is_call=False)
+        is_call_mask = (K_1 >= 1.0)
+        if is_call_mask.all():
+            payoff = torch.clamp(X_cop_b - K_b * Y_cop_b, min=0.0)
+            p_int = (payoff * w1d_row).sum(dim=-1)
+            c_m = (p_int * w1d_col).sum(dim=-1)
+        elif (~is_call_mask).all():
+            payoff = torch.clamp(K_b * Y_cop_b - X_cop_b, min=0.0)
+            p_int = (payoff * w1d_row).sum(dim=-1)
+            otm_p = (p_int * w1d_col).sum(dim=-1)
+            c_m = otm_p + (1.0 - K_1)
         else:
-            iv_calls = engine.implied_vol(otm_scalar, F=ones.unsqueeze(1), K=K_1_val, T=T_1_val.unsqueeze(1), is_call=True)
-            iv_puts = engine.implied_vol(otm_scalar, F=ones.unsqueeze(1), K=K_1_val, T=T_1_val.unsqueeze(1), is_call=False)
-            sig_cop_scalar = torch.where(is_call_scalar, iv_calls, iv_puts)
+            pay_c = torch.clamp(X_cop_b - K_b * Y_cop_b, min=0.0)
+            c_otm = ((pay_c * w1d_row).sum(dim=-1) * w1d_col).sum(dim=-1)
+            pay_p = torch.clamp(K_b * Y_cop_b - X_cop_b, min=0.0)
+            p_otm = ((pay_p * w1d_row).sum(dim=-1) * w1d_col).sum(dim=-1)
+            c_m = torch.where(is_call_mask, c_otm, p_otm + (1.0 - K_1))
 
-        # Baseline H1 at fixed values for this strike
-        sqrtT_val = st_dev[:, 0]
-        T_val = sqrtT_val ** 2
-        rho_val = st_dev[:, 1]
-        q1_val = st_dev[:, 2:7]
-        q2_val = st_dev[:, 7:12]
-
-        leg_val = LegMarket(spot=ones, df_foreign=ones, df_domestic=ones, T=T_val)
-        k1_val, s1_val = pillar_strikes(q1_val, leg_val, DeltaConvention.FORWARD_PNA, AtmConvention.DNS)
-        x1_val = torch.log(k1_val / leg_val.forward.unsqueeze(-1))
-        svi1_val, _ = fit_raw_svi_5pt(x1_val, s1_val ** 2 * T_val.unsqueeze(1))
-
-        k2_val, s2_val = pillar_strikes(q2_val, leg_val, DeltaConvention.FORWARD_PNA, AtmConvention.DNS)
-        x2_val = torch.log(k2_val / leg_val.forward.unsqueeze(-1))
-        svi2_val, _ = fit_raw_svi_5pt(x2_val, s2_val ** 2 * T_val.unsqueeze(1))
-
-        s1_atm_val = q1_val[:, 0:1]
-        s2_atm_val = q2_val[:, 0:1]
-        sig_cross_atm_val = torch.sqrt(s1_atm_val ** 2 + s2_atm_val ** 2 + 2.0 * rho_val.unsqueeze(1) * s1_atm_val * s2_atm_val)
-        k_cross_val = z_m * sig_cross_atm_val * sqrtT_val.unsqueeze(1)
-
-        P = 0
-        k_jet_val = tj.Jet(
-            v=k_cross_val.reshape(-1),
-            d=torch.zeros(S_cnt, dtype=torch.float64, device=dev),
-            dd=torch.zeros(S_cnt, dtype=torch.float64, device=dev),
-            t=torch.zeros((S_cnt, 0), dtype=torch.float64, device=dev),
+        # Backward Pass 1: Differentiate c w.r.t (z, st)
+        gc_z, gc_st = torch.autograd.grad(
+            c_m.sum(), [z_leaf, st_leaf_cop], retain_graph=(m < M_cnt - 1)
         )
-        rho_jet_val = tj.const(rho_val, P)
-        d1_jet_val = tj.const(torch.zeros(S_cnt, dtype=torch.float64, device=dev), P)
-        d2_jet_val = tj.const(torch.zeros(S_cnt, dtype=torch.float64, device=dev), P)
 
-        sig_jet_val, _, _ = beta_split_jet(
-            k_jet_val, T_val, rho_jet_val,
-            svi1_val.params.reshape(S_cnt, 5),
-            svi2_val.params.reshape(S_cnt, 5),
-            d1_jet_val, d2_jet_val,
-        )
-        sig_h1_val = sig_jet_val.v.reshape(S_cnt, 1)
+        c_out[:, m] = c_m.detach().squeeze(-1)
+        dc_dx_out[:, m, 0] = (gc_z.detach() / dx0_dz[:, m:m + 1]).squeeze(-1)
+        dc_dx_out[:, m, 1:] = gc_st.detach()
 
-        eps_scalar = torch.log(sig_cop_scalar / torch.clamp(sig_h1_val, min=1e-8))
-        deps_dc = torch.autograd.grad(eps_scalar.sum(), c_scalar, retain_graph=False)[0]
+        del K_1, K_b, k_cross_1, z_leaf, c_m, gc_z, gc_st
 
-        # -------------------------------------------------------------
-        # Pass 3: Direct Non-Copula Sensitivities w.r.t (z, st)
-        # -------------------------------------------------------------
+    del X_cop, Y_cop, X_cop_b, Y_cop_b, st_leaf_cop, u2_joint, Z2_joint
+
+    # -------------------------------------------------------------
+    # Pass 2: Vectorized Implied Vol & Partial Sensitivities (c, K, T)
+    # -------------------------------------------------------------
+    k_cross_all = z_dev * sig_cross_atm_val * sqrtT_val.unsqueeze(1)
+    K_all_val = torch.exp(k_cross_all)
+
+    c_scalar_all = c_out.clone().detach().requires_grad_(True)
+    K_leaf_all = K_all_val.clone().detach().requires_grad_(True)
+    T_leaf_all = T_val.unsqueeze(1).expand(S_cnt, M_cnt).clone().detach().requires_grad_(True)
+
+    is_call_all = (K_all_val >= 1.0)
+    otm_all = torch.where(is_call_all, c_scalar_all, c_scalar_all - (1.0 - K_leaf_all))
+    F_all = ones.unsqueeze(1).expand(S_cnt, M_cnt)
+
+    if S_cnt < 8:
+        pad_n = 8 - S_cnt
+        otm_pad = torch.cat([otm_all, otm_all[:1].expand(pad_n, M_cnt)], dim=0)
+        F_pad = torch.cat([F_all, F_all[:1].expand(pad_n, M_cnt)], dim=0)
+        K_pad = torch.cat([K_leaf_all, K_leaf_all[:1].expand(pad_n, M_cnt)], dim=0)
+        T_pad = torch.cat([T_leaf_all, T_leaf_all[:1].expand(pad_n, M_cnt)], dim=0)
+        call_pad = torch.cat([is_call_all, is_call_all[:1].expand(pad_n, M_cnt)], dim=0)
+        sig_cop_all = engine.implied_vol(otm_pad, F=F_pad, K=K_pad, T=T_pad, is_call=call_pad)[:S_cnt]
+    else:
+        sig_cop_all = engine.implied_vol(otm_all, F=F_all, K=K_leaf_all, T=T_leaf_all, is_call=is_call_all)
+
+    log_sig_cop_all = torch.log(sig_cop_all)
+    dlog_scop_dc, dlog_scop_dK, dlog_scop_dT = torch.autograd.grad(
+        log_sig_cop_all.sum(), [c_scalar_all, K_leaf_all, T_leaf_all], retain_graph=False
+    )
+    sigma_cop_out.copy_(sig_cop_all.detach())
+    dlog_dc_det = dlog_scop_dc.detach()
+    dlog_dK_det = dlog_scop_dK.detach()
+    dlog_dT_det = dlog_scop_dT.detach()
+    del c_scalar_all, K_leaf_all, T_leaf_all, otm_all, sig_cop_all, log_sig_cop_all
+
+    # -------------------------------------------------------------
+    # Pass 3: Direct Non-Copula Sensitivities w.r.t (z, st)
+    # -------------------------------------------------------------
+    P = 0
+    zero_s = torch.zeros(S_cnt, dtype=torch.float64, device=dev)
+    d1_jet_d = tj.const(zero_s, P)
+    d2_jet_d = tj.const(zero_s, P)
+
+    for m in range(M_cnt):
+        z_m = z_dev[:, m:m + 1]
         st_dir = st_dev.clone().requires_grad_(True)
         z_dir = z_m.clone().requires_grad_(True)
 
@@ -398,14 +434,9 @@ def label_state_batch(
         q1_d = st_dir[:, 2:7]
         q2_d = st_dir[:, 7:12]
 
-        leg_d = LegMarket(spot=ones, df_foreign=ones, df_domestic=ones, T=T_d)
-        k1_d, s1_d = pillar_strikes(q1_d, leg_d, DeltaConvention.FORWARD_PNA, AtmConvention.DNS)
-        x1_d = torch.log(k1_d / leg_d.forward.unsqueeze(-1))
-        svi1_d, _ = fit_raw_svi_5pt(x1_d, s1_d ** 2 * T_d.unsqueeze(1))
-
-        k2_d, s2_d = pillar_strikes(q2_d, leg_d, DeltaConvention.FORWARD_PNA, AtmConvention.DNS)
-        x2_d = torch.log(k2_d / leg_d.forward.unsqueeze(-1))
-        svi2_d, _ = fit_raw_svi_5pt(x2_d, s2_d ** 2 * T_d.unsqueeze(1))
+        d_st_d = st_dir - st_dev
+        svi1_pd = svi1_params_val + torch.einsum("spj,sj->sp", dsvi1_dst, d_st_d)
+        svi2_pd = svi2_params_val + torch.einsum("spj,sj->sp", dsvi2_dst, d_st_d)
 
         s1_atm_d = q1_d[:, 0:1]
         s2_atm_d = q2_d[:, 0:1]
@@ -413,59 +444,41 @@ def label_state_batch(
         k_cross_d = z_dir * sig_cross_atm_d * sqrtT_d.unsqueeze(1)
         K_d = torch.exp(k_cross_d)
 
-        is_call_d = (K_d >= 1.0)
-        otm_d = torch.where(is_call_d, c_m_val, c_m_val - (1.0 - K_d))
-
-        if is_call_d.all():
-            sig_cop_d = engine.implied_vol(otm_d, F=ones.unsqueeze(1), K=K_d, T=T_d.unsqueeze(1), is_call=True)
-        elif (~is_call_d).all():
-            sig_cop_d = engine.implied_vol(otm_d, F=ones.unsqueeze(1), K=K_d, T=T_d.unsqueeze(1), is_call=False)
-        else:
-            iv_calls_d = engine.implied_vol(otm_d, F=ones.unsqueeze(1), K=K_d, T=T_d.unsqueeze(1), is_call=True)
-            iv_puts_d = engine.implied_vol(otm_d, F=ones.unsqueeze(1), K=K_d, T=T_d.unsqueeze(1), is_call=False)
-            sig_cop_d = torch.where(is_call_d, iv_calls_d, iv_puts_d)
-
         k_jet_d = tj.Jet(
             v=k_cross_d.reshape(-1),
-            d=torch.zeros(S_cnt, dtype=torch.float64, device=dev),
-            dd=torch.zeros(S_cnt, dtype=torch.float64, device=dev),
-            t=torch.zeros((S_cnt, 0), dtype=torch.float64, device=dev),
+            d=zero_s,
+            dd=zero_s,
+            t=None,
         )
         rho_jet_d = tj.const(rho_d, P)
-        d1_jet_d = tj.const(torch.zeros(S_cnt, dtype=torch.float64, device=dev), P)
-        d2_jet_d = tj.const(torch.zeros(S_cnt, dtype=torch.float64, device=dev), P)
 
         sig_jet_d, _, _ = beta_split_jet(
             k_jet_d, T_d, rho_jet_d,
-            svi1_d.params.reshape(S_cnt, 5),
-            svi2_d.params.reshape(S_cnt, 5),
+            svi1_pd,
+            svi2_pd,
             d1_jet_d, d2_jet_d,
         )
         sig_h1_d = sig_jet_d.v.reshape(S_cnt, 1)
 
-        eps_d = torch.log(sig_cop_d / torch.clamp(sig_h1_d, min=1e-8))
+        log_sig_cop_d = dlog_dK_det[:, m:m + 1] * K_d + dlog_dT_det[:, m:m + 1] * T_d.unsqueeze(1)
+        eps_d = log_sig_cop_d - torch.log(torch.clamp(sig_h1_d, min=1e-8))
         geps_z_dir, geps_st_dir = torch.autograd.grad(eps_d.sum(), [z_dir, st_dir], retain_graph=False)
 
-        # -------------------------------------------------------------
-        # Recombine exact gradients via multivariate chain rule
-        # -------------------------------------------------------------
-        geps_st = deps_dc * gc_st + geps_st_dir
-        geps_z = deps_dc * gc_z + geps_z_dir
+        sig_h1_val = sig_h1_d.detach().squeeze(-1)
+        sigma_h1_out[:, m] = sig_h1_val
+        eps_star_out[:, m] = torch.log(sigma_cop_out[:, m] / torch.clamp(sig_h1_val, min=1e-8))
 
-        # Store into output tensors
-        c_out[:, m] = c_m_val.squeeze(-1)
-        eps_star_out[:, m] = eps_scalar.detach().squeeze(-1)
-        sigma_cop_out[:, m] = sig_cop_scalar.detach().squeeze(-1)
-        sigma_h1_out[:, m] = sig_h1_val.squeeze(-1)
+        deps_dc_m = dlog_dc_det[:, m:m + 1]
+        gc_z_m = dc_dx_out[:, m, 0:1] * dx0_dz[:, m:m + 1]
+        gc_st_m = dc_dx_out[:, m, 1:]
 
-        dc_dx_out[:, m, 0] = (gc_z / dx0_dz[:, m:m + 1]).squeeze(-1)
+        geps_st = deps_dc_m * gc_st_m + geps_st_dir
+        geps_z = deps_dc_m * gc_z_m + geps_z_dir
+
         deps_dx_out[:, m, 0] = (geps_z / dx0_dz[:, m:m + 1]).squeeze(-1)
-        dc_dx_out[:, m, 1:] = gc_st
         deps_dx_out[:, m, 1:] = geps_st
 
-        del gc_z, gc_st, geps_z, geps_st, deps_dc, geps_z_dir, geps_st_dir
-        del c_scalar, eps_scalar, sig_cop_scalar, sig_h1_val, c_m_val
-        del st_dir, z_dir, leg_d, svi1_d, svi2_d, k_cross_d, K_d, otm_d, sig_cop_d, sig_h1_d, eps_d
+        del st_dir, z_dir, k_cross_d, K_d, sig_h1_d, eps_d, geps_z_dir, geps_st_dir
 
     return {
         "x": x_out.detach(),

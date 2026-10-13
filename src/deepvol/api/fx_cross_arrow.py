@@ -207,6 +207,16 @@ def decode_arrow_batch(body: bytes) -> DecodedBatch:
     )
 
 
+_EMPTY_DICT_VALS: Final[pa.Array] = pa.array([""], type=pa.string())
+_ZERO_INT8_BUF: Final[NDArray[np.int8]] = np.zeros(MAX_CONTRACTS, dtype=np.int8)
+_ZERO_INT8_ARRAY: Final[pa.Array] = pa.Array.from_buffers(
+    pa.int8(), MAX_CONTRACTS, [None, pa.py_buffer(_ZERO_INT8_BUF)]
+)
+_ZERO_BOOL_ARRAY: Final[pa.Array] = pa.array(
+    np.zeros(MAX_CONTRACTS, dtype=bool), type=pa.bool_()
+)
+
+
 def encode_arrow_response(
     cols: Mapping[str, Any],
     meta: Mapping[str, str],
@@ -220,19 +230,28 @@ def encode_arrow_response(
     arrow_arrays: List[Union[pa.Array, pa.ChunkedArray]] = []
     field_names: List[str] = []
 
+    fb_mask = cols.get("fallback_mask")
+    no_fallbacks = (
+        isinstance(fb_mask, np.ndarray)
+        and (fb_mask.dtype == np.bool_ or fb_mask.dtype == bool)
+        and not bool(fb_mask.any())
+    )
+
     for name, col in cols.items():
         field_names.append(name)
         if name == "fallback_reason":
+            n_rows = len(col)
             if isinstance(col, (pa.Array, pa.ChunkedArray)):
                 arrow_arrays.append(col)
-            elif isinstance(col, (list, tuple)) and (
-                len(col) == 0 or all(x == "" for x in col)
+            elif (no_fallbacks and n_rows <= MAX_CONTRACTS) or (
+                isinstance(col, (list, tuple))
+                and n_rows <= MAX_CONTRACTS
+                and (n_rows == 0 or all(x == "" for x in col))
             ):
-                idx = np.zeros(len(col), dtype=np.int8)
-                buf = pa.py_buffer(idx)
-                idx_arr = pa.Array.from_buffers(pa.int8(), len(col), [None, buf])
-                dict_vals = pa.array([""])
-                arrow_arrays.append(pa.DictionaryArray.from_arrays(idx_arr, dict_vals))
+                idx_arr = _ZERO_INT8_ARRAY.slice(0, n_rows)
+                arrow_arrays.append(
+                    pa.DictionaryArray.from_arrays(idx_arr, _EMPTY_DICT_VALS)
+                )
             else:
                 arrow_arrays.append(pa.array(col, type=pa.string()).dictionary_encode())
         elif (
@@ -256,7 +275,10 @@ def encode_arrow_response(
         elif isinstance(col, np.ndarray) and (
             col.dtype == np.bool_ or col.dtype == bool
         ):
-            arrow_arrays.append(pa.array(col, type=pa.bool_()))
+            if no_fallbacks and name == "fallback_mask" and len(col) <= MAX_CONTRACTS:
+                arrow_arrays.append(_ZERO_BOOL_ARRAY.slice(0, len(col)))
+            else:
+                arrow_arrays.append(pa.array(col, type=pa.bool_()))
         elif np.issubdtype(col.dtype, np.floating):
             arrow_arrays.append(pa.array(col, type=pa.float64()))
         elif np.issubdtype(col.dtype, np.integer):

@@ -510,3 +510,34 @@ Module[{z, c, g, dg, ddg},
 {"g(0)" -> 0, "dg(0)" -> 1, "ddg(0)" -> 0, "Limit z -> Infinity" -> c, "Limit z -> -Infinity" -> -c}
 ```
 
+---
+
+### Proof W3.4: SiLU Activation First & Second Derivatives and Sticky-Moneyness $\Theta$ Term
+
+#### 1. Mathematical Derivation
+For the SiLU (Swish-1) activation $\operatorname{SiLU}(x) = x \sigma(x)$ where $\sigma(x) = (1 + e^{-x})^{-1}$:
+$$\operatorname{SiLU}'(x) = \sigma(x)\big(1 + x(1 - \sigma(x))\big) = \sigma(x) + x \sigma(x)(1 - \sigma(x)),$$
+$$\operatorname{SiLU}''(x) = \sigma(x)(1 - \sigma(x))\big(2 + x(1 - 2\sigma(x))\big).$$
+
+For the sticky-moneyness $\Theta$ adjustment, under sticky log-moneyness $k(t) = \ln(K / F(t))$ with $F(t) = S e^{(r_C - r_A)(T - t)}$, $\frac{dk}{dt} = r_C - r_A$, and the leg moneyness drift adjustment satisfies:
+$$(r_C - r_A) + \beta_1(r_A - r_B) + \beta_2(r_B - r_C) = \beta_1(r_C - r_B) + \beta_2(r_B - r_A) \quad (\text{when } \beta_1 + \beta_2 = 1).$$
+
+#### 2. Wolfram Language Verification Code & Output
+```wolfram
+Module[{x, sig, silu, dSilu, ddSilu, dSiluTarget, ddSiluTarget, resSilu1, resSilu2, beta1, beta2, rA, rB, rC, resSticky},
+  sig[x_] := 1/(1 + Exp[-x]);
+  silu[x_] := x*sig[x];
+  dSilu = D[silu[x], x];
+  ddSilu = D[silu[x], {x, 2}];
+  dSiluTarget = sig[x]*(1 + x*(1 - sig[x]));
+  ddSiluTarget = sig[x]*(1 - sig[x])*(2 + x*(1 - 2*sig[x]));
+  resSilu1 = FullSimplify[dSilu - dSiluTarget];
+  resSilu2 = FullSimplify[ddSilu - ddSiluTarget];
+  resSticky = FullSimplify[((rC - rA) + beta1*(rA - rB) + beta2*(rB - rC)) - (beta1*(rC - rB) + beta2*(rB - rA)) /. beta2 -> 1 - beta1];
+  <|"resSilu1" -> resSilu1, "resSilu2" -> resSilu2, "resSticky" -> resSticky|>
+]
+```
+**Kernel Result**:
+```
+<|"resSilu1" -> 0, "resSilu2" -> 0, "resSticky" -> 0|>
+```
