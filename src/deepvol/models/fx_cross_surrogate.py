@@ -89,6 +89,17 @@ class ResidualCrossVolNet(nn.Module):
             self.weights.append(nn.Parameter(w))
             self.biases.append(nn.Parameter(b))
 
+    def load_state_dict(self, state_dict: Any, strict: bool = True, assign: bool = False) -> Any:
+        """Unpacks 'state_dict' and frozen statistics from top-level checkpoint dictionary."""
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            sd = state_dict["state_dict"]
+            if "feature_mean" in state_dict:
+                self.feature_mean.copy_(state_dict["feature_mean"])
+            if "feature_std" in state_dict:
+                self.feature_std.copy_(state_dict["feature_std"])
+            return super().load_state_dict(sd, strict=strict, assign=assign)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     def standardize(self, x: Tensor) -> Tensor:
         """Standardizes raw 13-D input features using frozen training statistics."""
         return (x - self.feature_mean) / self.feature_std

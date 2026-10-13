@@ -2205,7 +2205,16 @@ async def reload_fx_cross_weights(weights_path: Union[str, Path]) -> None:
     async with _FX_CROSS_RW_LOCK.writer():
         state = _get_fx_cross_state()
         new_state = torch.load(weights_path, map_location="cpu", weights_only=True)
-        state["engine"].net.load_state_dict(new_state)
+        if isinstance(new_state, dict) and "state_dict" in new_state:
+            state["engine"].net.load_state_dict(new_state["state_dict"])
+            if "feature_mean" in new_state:
+                state["engine"].net.feature_mean.copy_(new_state["feature_mean"])
+            if "feature_std" in new_state:
+                state["engine"].net.feature_std.copy_(new_state["feature_std"])
+            if "model_version" in new_state:
+                state["model_version"] = new_state["model_version"]
+        else:
+            state["engine"].net.load_state_dict(new_state)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, state["runtime"].warmup_and_capture)
 
