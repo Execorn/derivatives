@@ -393,6 +393,7 @@ def test_challenge_task34_non_blocking_with_1s_delayed_copula() -> None:
         latencies_us = np.empty(800, dtype=np.float64)
         gc_was_enabled = gc.isenabled()
         gc.disable()
+        stale: bool = True
         try:
             for idx in range(800):
                 t0 = time.perf_counter_ns()
