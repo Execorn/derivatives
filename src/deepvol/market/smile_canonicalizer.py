@@ -65,7 +65,7 @@ class CanonicalSmile:
         return self._Psi_theta
 
 
-class SmileArbitrageError(Exception):
+class SmileArbitrageError(ValueError):
     """Raised when market smile quotes exhibit unrepairable vertical or butterfly arbitrage."""
 
 
@@ -147,8 +147,8 @@ def fit_ssvi_slice(x: Tensor, w: Tensor) -> Tuple[Tensor, Tensor]:
         vol_fit = np.sqrt(np.maximum(w_fit, 1e-12))
         rmse_val = float(np.sqrt(np.mean((vol_fit - sig_row) ** 2)))
 
-        if rmse_val > 0.05:
-            raise SmileArbitrageError(f"SSVI fit RMSE {rmse_val:.4f} exceeds 0.05 vol threshold")
+        if rmse_val > 0.02:
+            raise SmileArbitrageError(f"SSVI fit RMSE {rmse_val:.4f} exceeds 0.02 vol threshold")
 
         params_out.append([th_opt, r_opt, ph_opt])
         rmse_out.append(rmse_val)
