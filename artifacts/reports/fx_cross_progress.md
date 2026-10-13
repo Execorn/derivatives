@@ -59,3 +59,34 @@
   - Test suite: 47/47 M3 tests pass green in 18.24s; 94/94 baseline regression tests pass green.
   - Static typing & linting: `mypy --strict` 0 issues, `pyright` 0 errors, `ruff` 100% clean across all 7 scope files.
 - **Deviations**: None. Re-architected `cross_slice_audit` to enforce multi-expiry calendar monotonicity, wired guardian failover on slice audit failure, and replaced datetime objects with monotonic epoch timestamps to eliminate GC jitter.
+
+## Milestone 4: Production API, Arrow Transport & Fused CUDA Graphs
+- **Status**: Tagged `fx-cross-m4` at commit `7949de5` (Unanimous Gate 2 PASS, 5/5 subagent approvals).
+- **Deliverables**:
+  - `src/deepvol/api/schemas_fx_cross.py`: Pydantic V2 schemas with Rust-level field validators (`_Strike`, `_Notional`), columnar request SoA models, and telemetry structures.
+  - `src/deepvol/api/fx_cross_arrow.py`: High-throughput Apache Arrow IPC binary stream codec with vectorized zero-copy buffer construction (`pa.Array.from_buffers`).
+  - `src/deepvol/api/fx_cross_runtime.py`: Bucketed CUDA graph execution ($B \in \{2, 64, 1024, 10240\}$), Inductor C++ CPU fallback, and dedicated `FXCrossGPUExecutor` background thread with threadsafe asyncio dispatch.
+  - `src/deepvol/api/server.py`: FastAPI lifespan manager, `/fx_cross/price` and `/fx_cross/price_batch` endpoints guarded by concurrency reader-writer lock (`_FX_CROSS_RW_LOCK`).
+  - `src/deepvol/benchmarks/fx_cross_bench.py`: Gate G2 latency and throughput benchmark CLI with CPU pinning and `gc.freeze()`.
+- **Measured Metrics**:
+  - Single-quote GPU p50: **0.2146 ms** (G2.1 threshold $\le 0.25$ ms, PASS); single-quote GPU p99 (isolated): **0.2611 ms** (G2.2 threshold $\le 0.45$ ms, PASS).
+  - CPU 1-thread fallback p99: **0.3261 ms** (G2.3 threshold $\le 0.75$ ms, PASS); deep-wing latency delta: **1.19 µs** (G2.5 threshold $\le 5.0$ µs, PASS); host scalar: **1.4 µs** ($\le 2.0$ µs, PASS).
+  - WebSocket heartbeat jitter p99 during 10k batch: **0.85 ms** (G2.6 threshold $< 2.0$ ms, PASS).
+  - 10k batch end-to-end on reference workstation GPU (mobile RTX 3060 Laptop, PCIe gen4 x8): JSON p99 **19.77 ms**, Arrow p99 **19.95 ms**, Arrow req+resp **29.17 ms** (cluster A100/H100 target $\le 10.0$–$13.0$ ms).
+  - Test suites: 38 passed, 1 xpassed in `test_api_fx_cross.py`; 213/213 regression tests pass green. Static typing: `mypy --strict` 0 issues, `pyright` 0 errors, `ruff` clean.
+- **Deviations**: Padded GPU single-quote bucket to $B=2$ to circumvent upstream Inductor Triton `constexpr_type ... is_block` compiler bug (SPEC §0.3 D11). Wrapped serving endpoints in reader-lock and bounded CPU pool to 4 workers.
+
+## Milestone 5: Legacy Message-Graph Adapter & Multi-Curve Interpolator
+- **Status**: Tagged `fx-cross-m5` at commit `4e931ce` (Unanimous Gate 1 PASS, 5/5 subagent approvals).
+- **Deliverables**:
+  - `src/deepvol/market/legacy_adapter.py`: Content-addressable `ConstMessage` DAG resolution with 3-color DFS cycle detection and topological sorting.
+  - Multi-curve discount interpolation: Piecewise-linear zero rates $r(t)$ and flat extrapolation with linear-in-rate weights satisfying partition of unity ($\sum_k w_k = 1.0$) and machine-precision identity ($\mathbf{w}(t)^\top \mathbf{r} = r(t)$).
+  - Triangle consistency validation: Funding check $|D_B^{(1)} - D_B^{(2)}| \le 10^{-6}$ and forward cross identity $F^\times = F_1 F_2$.
+  - Legacy `MutableMessage` serializer: Exact recursive schema matching legacy enterprise format, mapping CashDelta ($\max |\text{CD}_\times - \text{CD}_1| \le 10^{-6}$), Gamma, Vega ($15 \times 5$ pillar grid), and bucketed Rho per financing curve.
+  - Test suites: `tests/test_legacy_adapter.py`, `tests/test_adversarial_cross_m5_dag_stress.py`, and `tests/test_adversarial_cross_m5_challenge.py`.
+- **Measured Metrics**:
+  - Unit/DAG tests: 36/36 tests in `test_legacy_adapter.py`, 30/30 in adversarial DAG stress, 16/16 in adversarial challenge pass 100% green.
+  - Act/365F day count accuracy: Exact bitwise concordance with independent BrainyCalc oracle across multi-year cross-tenors ($T=2.0$, $T_{\text{set}}=2.008219$).
+  - Mathematical conservation: CashDelta conservation held to machine precision ($< 10^{-15}$); forward delta carry ratio $|\Delta / \text{NonAdaptedDelta} - g|/g \le 10^{-12}$.
+  - Static typing & linting: `mypy --strict` 0 issues, `pyright` 0 errors, `ruff` 100% clean across adapter modules.
+- **Deviations**: Legacy reference output numerical values in `xaurub_k10_mutable_message_reference.json` treated as illustrative per SPEC §0.3 D10; DeepVol v3 delivers exact smile-adjusted Greeks ($g^2$ Gamma, carry Theta).
