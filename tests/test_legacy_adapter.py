@@ -61,28 +61,21 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, cast
 
 import numpy as np
 import pytest
 
 from deepvol.api.schemas_fx_cross import (
-    AtmConventionEnum,
     CashDeltaLegs,
-    ContractTerms,
     DeltaConventionEnum,
     DeltaLegs,
-    ExecutionOptions,
-    FXLegData,
     InterestRates,
-    MarketData,
     ModelRiskTelemetry,
     ParityEnum,
     PricingEngineEnum,
     SettlementTypeEnum,
     SmileDynamicsEnum,
-    SmileQuotes,
-    StrangleConventionEnum,
     TriangulatedFXOptionRequest,
     TriangulatedFXOptionResponse,
     VegaLegs,
@@ -112,19 +105,20 @@ REFERENCE_MUTABLE_PATH = FIXTURES_DIR / "xaurub_k10_mutable_message_reference.js
 def reference_mutable_message() -> Dict[str, Any]:
     with open(REFERENCE_MUTABLE_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return data[0] if isinstance(data, list) else data
+    res = data[0] if isinstance(data, list) else data
+    return cast(Dict[str, Any], res)
 
 
 @pytest.fixture(scope="session")
 def baseline_const_messages() -> List[Dict[str, Any]]:
     with open(BASELINE_FIXTURE_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return cast(List[Dict[str, Any]], json.load(f))
 
 
 @pytest.fixture(scope="session")
 def complete_const_messages() -> List[Dict[str, Any]]:
     with open(COMPLETE_FIXTURE_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return cast(List[Dict[str, Any]], json.load(f))
 
 
 def _make_mock_pricing_response(
@@ -290,7 +284,7 @@ class TestConstMessageGraph:
         h2 = "2222222222222222222222222222222222222222"
         h3 = "3333333333333333333333333333333333333333"
 
-        raw_list = [
+        raw_list: List[Mapping[str, Any] | ConstMessage] = [
             {"ConstMessage": {"id": h1, "value": {"TypeName": "TypeA"}}},
             {"id": h2, "value": {"TypeName": "TypeB"}},
             ConstMessage(id=h3, value={"TypeName": "TypeC"}),
@@ -540,7 +534,7 @@ class TestYearFractionAct365F:
         # String ISO parsing vs datetime objects
         t_str_1 = "2026-09-09T00:00:00Z"
         t_str_2 = "2028-09-08T00:00:00Z"
-        assert year_fraction_act365f(t_str_1, t_str_2) == 2.0  # type: ignore[arg-type]
+        assert year_fraction_act365f(t_str_1, t_str_2) == 2.0
 
         # Naive vs aware alignment
         dt_naive_start = datetime(2026, 9, 9, 0, 0, 0)
@@ -624,24 +618,14 @@ class TestRequestBuilder:
         assert req.market_data.leg2.smile.delta_convention == DeltaConventionEnum.SPOT_PNA
 
     def test_build_request_triangle_mismatch_raises_value_error(self, complete_const_messages: List[Dict[str, Any]]) -> None:
-        # Tamper USD_XCCY curve to violate D_B match
+        # Tamper USDRUB ForeignForwardCurve to point to RUB curve, violating D_B match
         tampered_msgs = copy.deepcopy(complete_const_messages)
         for m in tampered_msgs:
             val = m.get("ConstMessage", m).get("value", {})
-            if val.get("Identifier") == "USD_XCCY":
-                # Shift all rates drastically by 500%
-                val["RatesSchedule"]["Rates"] = [r * 5.0 for r in val["RatesSchedule"]["Rates"]]
-
-        graph = ConstMessageGraph(tampered_msgs)
-        root_id = "1b4eef0d8162d4d520fe6bbebfed6798a4600b99"
-        # Since USDRUB ForeignForwardCurve and XAUUSD DomesticForwardCurve both point to USD_XCCY,
-        # tampering the curve message directly keeps them equal.
-        # To test mismatch detection, create two divergent USD curves and point leg2 to the perturbed one.
-        for m in tampered_msgs:
-            val = m.get("ConstMessage", m).get("value", {})
             if val.get("Identifier") == "USDRUB" and val.get("TypeName") == "FXForwardObject":
-                val["ForeignForwardCurve"] = "bee2a9441a169c74148755c135c5a066db548b77"  # Points to RUB curve!
+                val["ForeignForwardCurve"] = "bee2a9441a169c74148755c135c5a066db548b77"
 
+        root_id = "1b4eef0d8162d4d520fe6bbebfed6798a4600b99"
         graph_mismatched = ConstMessageGraph(tampered_msgs)
         with pytest.raises(ValueError) as exc_info:
             build_request(graph_mismatched, root_id)
@@ -910,7 +894,7 @@ class TestEndToEndLegacyAdapter:
         root_id = "1b4eef0d8162d4d520fe6bbebfed6798a4600b99"
 
         # 1. Ingest legacy DAG
-        req, interest_rates, ctx = build_request(graph, root_id)
+        req, _, ctx = build_request(graph, root_id)
 
         # 2. Evaluate pricing (via mock pricing response representing engine output)
         resp = _make_mock_pricing_response(req)
