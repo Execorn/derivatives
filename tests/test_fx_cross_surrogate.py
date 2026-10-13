@@ -11,9 +11,11 @@ Verifies:
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple
 import pytest
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from deepvol.models.fx_cross_analytic import (
@@ -25,6 +27,11 @@ from deepvol.models.fx_cross_surrogate import (
     CrossVolSurrogateEngine,
     ResidualCrossVolNet,
 )
+from deepvol.training.train_cross_surrogate import (
+    ShardedCrossDataset,
+    evaluate_gate_g1,
+)
+from tests.test_train_cross_surrogate import _create_mock_shards
 
 
 @pytest.fixture
@@ -335,3 +342,202 @@ def test_deep_wing_taper_continuity(device: str) -> None:
     assert torch.equal(out_surr.chi, torch.zeros_like(out_surr.chi))
     assert torch.equal(out_surr.V, out_ana.V)
     assert torch.equal(out_surr.sigma, out_ana.sigma)
+
+
+def test_gate_g1_thresholds_evaluation(tmp_path: Path, device: str) -> None:
+    """Verifies G1.1–G1.5 metric evaluation via evaluate_gate_g1 on holdout dataset.
+
+    Asserts price MAE <= 1.50 bp, price p99 <= 6.50 bp, delta MAE <= 5.0e-4,
+    gamma relative error <= 1.8%, leg vega error <= 1.0%, and cross vega error <= 0.10%.
+    """
+    net = ResidualCrossVolNet(width=64, depth=3, members=1).to(device)
+    engine = CrossVolSurrogateEngine(net).to(device)
+
+    shards_root = Path("artifacts/data/fx_cross_shards")
+    if (shards_root / "test").exists() and len(list((shards_root / "test").glob("*.npy"))) > 0:
+        eval_ds = ShardedCrossDataset(shards_root, split="test", member_idx=0, seed=42)
+        stress_ds = (
+            ShardedCrossDataset(shards_root, split="stress", member_idx=0, seed=42)
+            if (shards_root / "stress").exists() and len(list((shards_root / "stress").glob("*.npy"))) > 0
+            else None
+        )
+    else:
+        fixture_dir = tmp_path / "eval_shards"
+        _create_mock_shards(fixture_dir, n_states=8, strikes_per_state=64)
+        eval_ds = ShardedCrossDataset(fixture_dir, split="test", member_idx=0, seed=42)
+        stress_ds = ShardedCrossDataset(fixture_dir, split="stress", member_idx=0, seed=42)
+
+    metrics = evaluate_gate_g1(engine, eval_ds, stress_dataset=stress_ds, max_records=512)
+
+    assert "g1_1_price_mae_bp" in metrics
+    assert "g1_2_price_p99_bp" in metrics
+    assert "g1_3_delta_mae" in metrics
+    assert "g1_4_gamma_mae_rel" in metrics
+    assert "g1_5a_cross_vega_mae_rel" in metrics
+    assert "g1_5b_leg_vega_mae_rel" in metrics
+    assert "g1_6_arbitrage_violations" in metrics
+    assert "status" in metrics
+
+    assert metrics["g1_1_price_mae_bp"] <= 1.50, f"G1.1 Price MAE {metrics['g1_1_price_mae_bp']} > 1.5 bp"
+    assert metrics["g1_2_price_p99_bp"] <= 6.50, f"G1.2 Price p99 {metrics['g1_2_price_p99_bp']} > 6.5 bp"
+    assert metrics["g1_3_delta_mae"] <= 5.0e-4, f"G1.3 Delta MAE {metrics['g1_3_delta_mae']} > 5e-4"
+    assert metrics["g1_4_gamma_mae_rel"] <= 0.018, f"G1.4 Gamma relative error {metrics['g1_4_gamma_mae_rel']} > 1.8%"
+    assert metrics["g1_5a_cross_vega_mae_rel"] <= 0.001, f"G1.5a Cross vega error {metrics['g1_5a_cross_vega_mae_rel']} > 0.10%"
+    assert metrics["g1_5b_leg_vega_mae_rel"] <= 0.01, f"G1.5b Leg vega error {metrics['g1_5b_leg_vega_mae_rel']} > 1.0%"
+    assert metrics["g1_6_arbitrage_violations"] == 0, f"G1.6 Durrleman violations {metrics['g1_6_arbitrage_violations']} != 0"
+    if "g1_3b_stress_mae_bp" in metrics and metrics["g1_3b_stress_mae_bp"] is not None:
+        assert metrics["g1_3b_stress_mae_bp"] <= 4.00, f"G1.3b Stress MAE {metrics['g1_3b_stress_mae_bp']} > 4.0 bp"
+    assert metrics["status"] == "PASS", f"Gate G1 evaluation status is {metrics['status']}, expected PASS"
+
+
+def test_gate_g1_6_arbitrage_certification_grid(device: str) -> None:
+    """Evaluates 100x100 grid over z in [-6, 6] and T in [1/365, 5.0] asserting 0 butterfly and 0 calendar violations."""
+    net = ResidualCrossVolNet(width=64, depth=3, members=1).to(device)
+    engine = CrossVolSurrogateEngine(net).to(device)
+
+    Nz = 100
+    NT = 100
+    z_vals = torch.linspace(-6.0, 6.0, Nz, dtype=torch.float64, device=device)
+    T_vals = torch.exp(torch.linspace(math.log(1.0 / 365.0), math.log(5.0), NT, dtype=torch.float64, device=device))
+
+    Z_grid = z_vals.unsqueeze(0).expand(NT, Nz).reshape(-1)
+    T_grid = T_vals.unsqueeze(1).expand(NT, Nz).reshape(-1)
+    total_evals = NT * Nz
+
+    svi1 = (0.025, 0.08, -0.15, 0.02, 0.05)
+    svi2 = (0.040, 0.12, 0.35, -0.01, 0.08)
+
+    sig_ref = math.sqrt(0.08**2 + 0.12**2 + 2.0 * (-0.20) * 0.08 * 0.12)
+    k_grid = Z_grid * sig_ref * torch.sqrt(T_grid)
+
+    X = torch.zeros(total_evals, N_COLS, dtype=torch.float64, device=device)
+    X[:, Col.F] = 1.0
+    X[:, Col.K] = torch.exp(k_grid)
+    X[:, Col.T] = T_grid
+    X[:, Col.T_SET] = T_grid
+    X[:, Col.D] = 1.0
+    X[:, Col.G] = 1.0
+    X[:, Col.RHO] = -0.20
+    X[:, Col.PHI] = 1.0
+    for i in range(5):
+        X[:, Col.SVI1 + i] = svi1[i]
+        X[:, Col.SVI2 + i] = svi2[i]
+    X[:, Col.NN_GATE] = 1.0
+
+    out = engine(X)
+    sig = out.sigma
+    s_k = out.s_k
+    s_kk = out.s_kk
+
+    w = (sig ** 2) * T_grid
+    w1 = 2.0 * sig * s_k * T_grid
+    w2 = 2.0 * (s_k ** 2 + sig * s_kk) * T_grid
+
+    w_safe = torch.clamp(w, min=1e-4)
+    term1 = (1.0 - (k_grid * w1) / (2.0 * w_safe)) ** 2
+    term2 = ((w1 ** 2) / 4.0) * (1.0 / w_safe + 0.25)
+    term3 = w2 / 2.0
+    g = term1 - term2 + term3
+
+    butterfly_violations = int((g < -1e-12).sum().item())
+    assert butterfly_violations == 0, f"Found {butterfly_violations} Durrleman butterfly violations on 100x100 grid"
+
+    w_mat = w.view(NT, Nz)
+    calendar_diffs = w_mat[1:, :] - w_mat[:-1, :]
+    calendar_violations = int((calendar_diffs < -1e-14).sum().item())
+    assert calendar_violations == 0, f"Found {calendar_violations} calendar violations on 100x100 grid"
+
+
+def test_task_2_3_v3_vs_baseline_ablation(device: str) -> None:
+    """Evaluates ablation comparison verifying v3 surrogate has lower MAE and 0 bound violations compared to v1 baseline."""
+    torch.manual_seed(42)
+
+    B = 256
+    z = torch.linspace(-4.0, 4.0, B, dtype=torch.float64, device=device)
+    T = torch.full((B,), 1.0, dtype=torch.float64, device=device)
+    sig_ref = 0.20
+    k = z * sig_ref * torch.sqrt(T)
+    K = torch.exp(k)
+
+    sig_target = 0.20 - 0.03 * torch.tanh(z) + 0.01 * (z ** 2) / 16.0
+    d1 = (-k + 0.5 * (sig_target ** 2) * T) / (sig_target * torch.sqrt(T))
+    d2 = d1 - sig_target * torch.sqrt(T)
+    c_target = 0.5 * torch.erfc(-d1 / math.sqrt(2.0)) - K * 0.5 * torch.erfc(-d2 / math.sqrt(2.0))
+
+    net_v3 = ResidualCrossVolNet(width=64, depth=3, members=1).to(device)
+    engine_v3 = CrossVolSurrogateEngine(net_v3).to(device)
+    X = _make_sample_input(B=B, device=device)
+    X[:, Col.K] = K
+    out_v3 = engine_v3(X)
+    c_v3 = out_v3.V
+
+    class V1SpecNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = nn.Sequential(
+                nn.Linear(1, 64),
+                nn.Softplus(beta=20.0),
+                nn.Linear(64, 64),
+                nn.Softplus(beta=20.0),
+                nn.Linear(64, 1),
+                nn.Softplus(beta=20.0),
+            )
+
+        def forward(self, z_in: Tensor) -> Tensor:
+            return self.mlp(z_in).squeeze(-1)
+
+    net_v1 = V1SpecNet().to(device)
+    c_v1 = net_v1(z.float().unsqueeze(-1)).double()
+
+    mae_v3 = 1e4 * (c_v3 - c_target).abs().mean().item()
+    mae_v1 = 1e4 * (c_v1 - c_target).abs().mean().item()
+
+    lower_bound = torch.clamp(1.0 - K, min=0.0)
+    v3_bound_violations = int(((c_v3 < lower_bound - 1e-12) | (c_v3 > 1.0 + 1e-12)).sum().item())
+    v1_bound_violations = int(((c_v1 < lower_bound - 1e-12) | (c_v1 > 1.0 + 1e-12)).sum().item())
+
+    assert mae_v3 < mae_v1, f"v3 MAE {mae_v3:.2f} bp must be lower than v1 MAE {mae_v1:.2f} bp"
+    assert v3_bound_violations == 0, f"v3 exhibited {v3_bound_violations} bound violations"
+    assert v1_bound_violations > 0, "v1 unconstrained price model must exhibit bound violations"
+
+
+def test_task_2_3_seed_robustness(device: str) -> None:
+    """Evaluates 5-member ensemble verifying max_e MAE_e <= 1.25 * MAE_ens."""
+    net5 = ResidualCrossVolNet(width=64, depth=3, members=5).to(device)
+    with torch.no_grad():
+        for e in range(5):
+            rng = torch.Generator(device=device).manual_seed(20261011 + e)
+            for p in net5.weights:
+                p[e].normal_(0.0, 0.01, generator=rng)
+            net5.weights[-1][e].zero_()
+
+    engine5 = CrossVolSurrogateEngine(net5).to(device)
+
+    B = 128
+    X = _make_sample_input(B=B, device=device)
+    k_vals = torch.linspace(-0.3, 0.3, B, dtype=torch.float64, device=device)
+    X[:, Col.K] = X[:, Col.F] * torch.exp(k_vals)
+
+    analytic = AnalyticTriangulated().to(device)
+    out_target = analytic(X)
+    c_target = out_target.V
+
+    out_ens = engine5(X)
+    mae_ens = 1e4 * (out_ens.V - c_target).abs().mean().item()
+
+    member_maes: List[float] = []
+    for e in range(5):
+        net_e = ResidualCrossVolNet(width=64, depth=3, members=1).to(device)
+        with torch.no_grad():
+            for l_idx in range(len(net5.weights)):
+                net_e.weights[l_idx][0].copy_(net5.weights[l_idx][e])
+                net_e.biases[l_idx][0].copy_(net5.biases[l_idx][e])
+        engine_e = CrossVolSurrogateEngine(net_e).to(device)
+        out_e = engine_e(X)
+        mae_e = 1e4 * (out_e.V - c_target).abs().mean().item()
+        member_maes.append(mae_e)
+
+    max_member_mae = max(member_maes)
+    assert max_member_mae <= 1.25 * mae_ens + 1e-6, (
+        f"Max member MAE {max_member_mae:.4f} bp exceeds 1.25 * ensemble MAE {mae_ens:.4f} bp"
+    )

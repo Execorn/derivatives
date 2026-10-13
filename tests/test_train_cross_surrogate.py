@@ -74,10 +74,15 @@ def _create_mock_shards(root: Path, n_states: int = 4, strikes_per_state: int = 
 
     manifest = {
         "sobol_seed": 20261011,
-        "train_mean": [0.0] * 13,
-        "train_std": [1.0] * 13,
+        "train_mean": [0.05 * (i + 1) for i in range(13)],
+        "train_std": [0.8 + 0.05 * i for i in range(13)],
         "git_hash": "24977e7",
-        "shards": {"train": ["train/shard_0000.npy"]},
+        "shards": {
+            "train": ["train/shard_0000.npy"],
+            "val": ["val/shard_0000.npy"],
+            "test": ["test/shard_0000.npy"],
+            "stress": ["stress/shard_0000.npy"],
+        },
     }
     with open(root / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -199,6 +204,8 @@ def test_checkpoint_reload_and_model_card(tmp_path: Path) -> None:
     with torch.no_grad():
         for p in net.parameters():
             p.normal_(0.0, 0.05)
+        net.feature_mean.copy_(torch.linspace(0.1, 1.3, 13, dtype=torch.float32))
+        net.feature_std.copy_(torch.linspace(0.8, 2.0, 13, dtype=torch.float32))
 
     ckpt_path = tmp_path / "residual_vol_v3_m0.pt"
     git_hash = "24977e7d6928e08cf4410a51c411516e5461c3bc"
@@ -222,6 +229,11 @@ def test_checkpoint_reload_and_model_card(tmp_path: Path) -> None:
 
     for p_orig, p_reload in zip(net.parameters(), net_reloaded.parameters()):
         assert torch.equal(p_orig, p_reload), "Reloaded parameter tensor was not bitwise identical"
+
+    assert torch.equal(meta["feature_mean"], net.feature_mean.cpu())
+    assert torch.equal(meta["feature_std"], net.feature_std.cpu())
+    assert torch.equal(net_reloaded.feature_mean.cpu(), net.feature_mean.cpu())
+    assert torch.equal(net_reloaded.feature_std.cpu(), net.feature_std.cpu())
 
     # Model version reproducibility: sha256(weights)[:12] + git short hash
     version = compute_model_version(net.state_dict(), git_hash)
@@ -269,6 +281,26 @@ def test_fast_smoke_training_cli(tmp_path: Path) -> None:
         "created_at",
     ):
         assert req_key in card, f"Missing required model card key: {req_key}"
+
+    # Assert feature_statistics dynamically exported from net buffers, not dummy [0.0]*13 / [1.0]*13
+    expected_mean = [0.05 * (i + 1) for i in range(13)]
+    expected_std = [0.8 + 0.05 * i for i in range(13)]
+    for i in range(13):
+        assert abs(card["feature_statistics"]["mean"][i] - expected_mean[i]) < 1e-5, (
+            f"feature_mean[{i}] = {card['feature_statistics']['mean'][i]} does not match expected {expected_mean[i]}"
+        )
+        assert abs(card["feature_statistics"]["std"][i] - expected_std[i]) < 1e-5, (
+            f"feature_std[{i}] = {card['feature_statistics']['std'][i]} does not match expected {expected_std[i]}"
+        )
+
+    # Assert gate_g1_metrics is dynamically evaluated by evaluate_gate_g1 and not hardcoded to prototype literal values
+    g1 = card["gate_g1_metrics"]
+    assert "status" in g1
+    assert g1["status"] in ("PASS", "FAIL", "PENDING_TEST_EVALUATION")
+    # Must NOT be hardcoded prototype constant 1.40
+    assert g1["g1_1_price_mae_bp"] != 1.40 or g1["g1_2_price_p99_bp"] != 6.20, (
+        "gate_g1_metrics contains hardcoded prototype constants (1.40, 6.20)"
+    )
 
 
 def test_fit_ood_statistics() -> None:
