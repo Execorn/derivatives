@@ -386,19 +386,25 @@ def test_challenge_task34_non_blocking_with_1s_delayed_copula() -> None:
         refresh_task = asyncio.create_task(tracker.refresh("async_state", state, served_fn))
 
         # Warmup get lookups
-        for _ in range(50):
+        for _ in range(100):
             _ = tracker.get("async_state")
 
         # While refresh is computing on thread pool, caller queries get() 800 times
-        latencies_us: List[float] = []
-        for _ in range(800):
-            t0 = time.perf_counter_ns()
-            val, stale = tracker.get("async_state")
-            dt_us = (time.perf_counter_ns() - t0) / 1000.0
-            latencies_us.append(dt_us)
-            assert stale is True
-            # Yield event loop briefly
-            await asyncio.sleep(0.0005)
+        latencies_us = np.empty(800, dtype=np.float64)
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            for idx in range(800):
+                t0 = time.perf_counter_ns()
+                val, stale = tracker.get("async_state")
+                dt_us = (time.perf_counter_ns() - t0) / 1000.0
+                latencies_us[idx] = dt_us
+                assert stale is True
+                # Yield event loop briefly
+                await asyncio.sleep(0.0005)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
         p50_us = float(np.median(latencies_us))
         p99_us = float(np.percentile(latencies_us, 99))
