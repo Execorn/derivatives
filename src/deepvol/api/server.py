@@ -2233,9 +2233,11 @@ async def fx_cross_health() -> Dict[str, Any]:
     state = _get_fx_cross_state()
     runtime: FXCrossRuntime = state["runtime"]
     executor: FXCrossGPUExecutor = state["executor"]
+    dev = str(state.get("device", "cpu"))
+    is_degraded = dev == "cpu" or not getattr(runtime, "graphs_captured", False)
     return {
-        "status": "ok",
-        "device": str(state.get("device", "cpu")),
+        "status": "degraded" if is_degraded else "ok",
+        "device": dev,
         "model_version": state["model_version"],
         "graphs_captured": runtime.graphs_captured,
         "quote_bucket_gpu": QUOTE_BUCKET_GPU,
