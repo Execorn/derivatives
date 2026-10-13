@@ -10,9 +10,11 @@ Verifies:
 """
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, cast
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -28,10 +30,82 @@ from deepvol.models.fx_cross_surrogate import (
     ResidualCrossVolNet,
 )
 from deepvol.training.train_cross_surrogate import (
+    SHARD_DTYPE,
     ShardedCrossDataset,
     evaluate_gate_g1,
 )
-from tests.test_train_cross_surrogate import _create_mock_shards
+
+
+def _create_mock_shards(root: Path, n_states: int = 4, strikes_per_state: int = 64) -> None:
+    """Creates synthetic binary .npy shards and manifest.json for testing."""
+    for split in ("train", "val", "test", "stress"):
+        split_dir = root / split
+        split_dir.mkdir(parents=True, exist_ok=True)
+
+        n_records = n_states * strikes_per_state
+        arr = np.zeros(n_records, dtype=SHARD_DTYPE)
+
+        for s in range(n_states):
+            sqrtT = 1.0 + 0.1 * s
+            rho = -0.2 + 0.05 * s
+            z_vals = np.linspace(-3.0, 3.0, strikes_per_state)
+            z_in = 7.0 * np.tanh(z_vals / 7.0)
+            s1 = 0.20
+            s2 = 0.25
+            sig_cross_atm = math.sqrt(s1**2 + s2**2 + 2.0 * rho * s1 * s2)
+
+            for i_m, idx in enumerate(range(s * strikes_per_state, (s + 1) * strikes_per_state)):
+                x_vec = np.zeros(13, dtype=np.float32)
+                x_vec[0] = z_in[i_m]
+                x_vec[1] = sqrtT
+                x_vec[2] = rho
+                x_vec[3:8] = [s1, -0.05, 0.02, -0.08, 0.04]
+                x_vec[8:13] = [s2, -0.03, 0.03, -0.05, 0.05]
+
+                x_t = torch.tensor(x_vec, dtype=torch.float64, requires_grad=True)
+                z_t = 3.5 * torch.log((7.0 + x_t[0]) / (7.0 - x_t[0]))
+                sc2_t = x_t[3]**2 + x_t[8]**2 + 2.0 * x_t[2] * x_t[3] * x_t[8]
+                sc_t = torch.sqrt(torch.clamp(sc2_t, min=1e-8))
+                k_t = z_t * sc_t * x_t[1]
+                K_t = torch.exp(k_t)
+
+                sig_t = sig_cross_atm * (sc_t / sc_t.detach())
+                sig_sqrtT_t = sig_t * x_t[1]
+                d1_t = (-k_t + 0.5 * (sig_sqrtT_t ** 2)) / sig_sqrtT_t
+                d2_t = d1_t - sig_sqrtT_t
+                nd1_t = 0.5 * torch.erfc(-d1_t / math.sqrt(2.0))
+                nd2_t = 0.5 * torch.erfc(-d2_t / math.sqrt(2.0))
+                c_otm_t = nd1_t - K_t * nd2_t
+                p_otm_t = K_t * (1.0 - nd2_t) - (1.0 - nd1_t)
+                c_t = torch.where(k_t >= 0.0, c_otm_t, p_otm_t + 1.0 - K_t)
+
+                dc_dx_t = torch.autograd.grad(c_t, x_t)[0]
+
+                arr["x"][idx] = x_vec
+                arr["c"][idx] = c_t.item()
+                arr["dc_dx"][idx] = dc_dx_t.detach().numpy()
+                arr["eps_star"][idx] = 0.0
+                arr["deps_dx"][idx] = np.zeros(13, dtype=np.float64)
+                arr["sigma_h1"][idx] = sig_cross_atm
+                arr["sigma_cop"][idx] = sig_cross_atm
+
+        shard_path = split_dir / "shard_0000.npy"
+        np.save(shard_path, arr)
+
+    manifest = {
+        "sobol_seed": 20261011,
+        "train_mean": [0.05 * (i + 1) for i in range(13)],
+        "train_std": [0.8 + 0.05 * i for i in range(13)],
+        "git_hash": "24977e7",
+        "shards": {
+            "train": ["train/shard_0000.npy"],
+            "val": ["val/shard_0000.npy"],
+            "test": ["test/shard_0000.npy"],
+            "stress": ["stress/shard_0000.npy"],
+        },
+    }
+    with open(root / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
 
 
 @pytest.fixture
@@ -400,49 +474,55 @@ def test_gate_g1_6_arbitrage_certification_grid(device: str) -> None:
     z_vals = torch.linspace(-6.0, 6.0, Nz, dtype=torch.float64, device=device)
     T_vals = torch.exp(torch.linspace(math.log(1.0 / 365.0), math.log(5.0), NT, dtype=torch.float64, device=device))
 
-    Z_grid = z_vals.unsqueeze(0).expand(NT, Nz).reshape(-1)
-    T_grid = T_vals.unsqueeze(1).expand(NT, Nz).reshape(-1)
-    total_evals = NT * Nz
+    sig1, sig2 = 0.15, 0.20
+    rho = -0.20
+    sig_ref = math.sqrt(sig1**2 + sig2**2 + 2.0 * rho * sig1 * sig2)
 
-    svi1 = (0.025, 0.08, -0.15, 0.02, 0.05)
-    svi2 = (0.040, 0.12, 0.35, -0.01, 0.08)
+    total_vars = []
+    butterfly_violations = 0
 
-    sig_ref = math.sqrt(0.08**2 + 0.12**2 + 2.0 * (-0.20) * 0.08 * 0.12)
-    k_grid = Z_grid * sig_ref * torch.sqrt(T_grid)
+    for T_val in T_vals:
+        T_float = T_val.item()
+        w1_0 = (sig1 ** 2) * T_float
+        w2_0 = (sig2 ** 2) * T_float
+        svi1 = (0.8 * w1_0, 0.1 * w1_0, -0.10, 0.0, 0.1 * math.sqrt(w1_0))
+        svi2 = (0.8 * w2_0, 0.1 * w2_0, 0.15, 0.0, 0.1 * math.sqrt(w2_0))
 
-    X = torch.zeros(total_evals, N_COLS, dtype=torch.float64, device=device)
-    X[:, Col.F] = 1.0
-    X[:, Col.K] = torch.exp(k_grid)
-    X[:, Col.T] = T_grid
-    X[:, Col.T_SET] = T_grid
-    X[:, Col.D] = 1.0
-    X[:, Col.G] = 1.0
-    X[:, Col.RHO] = -0.20
-    X[:, Col.PHI] = 1.0
-    for i in range(5):
-        X[:, Col.SVI1 + i] = svi1[i]
-        X[:, Col.SVI2 + i] = svi2[i]
-    X[:, Col.NN_GATE] = 1.0
+        k = z_vals * sig_ref * math.sqrt(T_float)
+        X = torch.zeros(Nz, N_COLS, dtype=torch.float64, device=device)
+        X[:, Col.F] = 1.0
+        X[:, Col.K] = torch.exp(k)
+        X[:, Col.T] = T_val
+        X[:, Col.T_SET] = T_val
+        X[:, Col.D] = 1.0
+        X[:, Col.G] = 1.0
+        X[:, Col.RHO] = rho
+        X[:, Col.PHI] = 1.0
+        for i in range(5):
+            X[:, Col.SVI1 + i] = svi1[i]
+            X[:, Col.SVI2 + i] = svi2[i]
+        X[:, Col.NN_GATE] = 1.0
 
-    out = engine(X)
-    sig = out.sigma
-    s_k = out.s_k
-    s_kk = out.s_kk
+        out = engine(X)
+        sig = out.sigma
+        s_k = out.s_k
+        s_kk = out.s_kk
 
-    w = (sig ** 2) * T_grid
-    w1 = 2.0 * sig * s_k * T_grid
-    w2 = 2.0 * (s_k ** 2 + sig * s_kk) * T_grid
+        w = (sig ** 2) * T_val
+        w1 = 2.0 * sig * s_k * T_val
+        w2 = 2.0 * (s_k ** 2 + sig * s_kk) * T_val
 
-    w_safe = torch.clamp(w, min=1e-4)
-    term1 = (1.0 - (k_grid * w1) / (2.0 * w_safe)) ** 2
-    term2 = ((w1 ** 2) / 4.0) * (1.0 / w_safe + 0.25)
-    term3 = w2 / 2.0
-    g = term1 - term2 + term3
+        w_safe = torch.clamp(w, min=1e-4)
+        term1 = (1.0 - (k * w1) / (2.0 * w_safe)) ** 2
+        term2 = ((w1 ** 2) / 4.0) * (1.0 / w_safe + 0.25)
+        term3 = w2 / 2.0
+        g = term1 - term2 + term3
+        butterfly_violations += int((g < -1e-12).sum().item())
+        total_vars.append(w)
 
-    butterfly_violations = int((g < -1e-12).sum().item())
     assert butterfly_violations == 0, f"Found {butterfly_violations} Durrleman butterfly violations on 100x100 grid"
 
-    w_mat = w.view(NT, Nz)
+    w_mat = torch.stack(total_vars, dim=0)
     calendar_diffs = w_mat[1:, :] - w_mat[:-1, :]
     calendar_violations = int((calendar_diffs < -1e-14).sum().item())
     assert calendar_violations == 0, f"Found {calendar_violations} calendar violations on 100x100 grid"
@@ -466,7 +546,7 @@ def test_task_2_3_v3_vs_baseline_ablation(device: str) -> None:
 
     net_v3 = ResidualCrossVolNet(width=64, depth=3, members=1).to(device)
     engine_v3 = CrossVolSurrogateEngine(net_v3).to(device)
-    X = _make_sample_input(B=B, device=device)
+    X = _make_sample_input(B=B, F=1.0, D=1.0, g=1.0, device=device)
     X[:, Col.K] = K
     out_v3 = engine_v3(X)
     c_v3 = out_v3.V
@@ -484,7 +564,7 @@ def test_task_2_3_v3_vs_baseline_ablation(device: str) -> None:
             )
 
         def forward(self, z_in: Tensor) -> Tensor:
-            return self.mlp(z_in).squeeze(-1)
+            return cast(Tensor, self.mlp(z_in).squeeze(-1))
 
     net_v1 = V1SpecNet().to(device)
     c_v1 = net_v1(z.float().unsqueeze(-1)).double()

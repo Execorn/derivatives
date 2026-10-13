@@ -11,6 +11,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import numpy as np
 import pytest
@@ -46,28 +47,49 @@ def _create_mock_shards(root: Path, n_states: int = 4, strikes_per_state: int = 
         n_records = n_states * strikes_per_state
         arr = np.zeros(n_records, dtype=SHARD_DTYPE)
 
-        # Populate synthetic features
         for s in range(n_states):
             sqrtT = 1.0 + 0.1 * s
             rho = -0.2 + 0.05 * s
             z_vals = np.linspace(-3.0, 3.0, strikes_per_state)
             z_in = 7.0 * np.tanh(z_vals / 7.0)
+            s1 = 0.20
+            s2 = 0.25
+            sig_cross_atm = math.sqrt(s1**2 + s2**2 + 2.0 * rho * s1 * s2)
 
             for i_m, idx in enumerate(range(s * strikes_per_state, (s + 1) * strikes_per_state)):
                 x_vec = np.zeros(13, dtype=np.float32)
                 x_vec[0] = z_in[i_m]
                 x_vec[1] = sqrtT
                 x_vec[2] = rho
-                x_vec[3:8] = [0.20, -0.05, 0.02, -0.08, 0.04]  # xi1
-                x_vec[8:13] = [0.25, -0.03, 0.03, -0.05, 0.05]  # xi2
+                x_vec[3:8] = [s1, -0.05, 0.02, -0.08, 0.04]
+                x_vec[8:13] = [s2, -0.03, 0.03, -0.05, 0.05]
+
+                x_t = torch.tensor(x_vec, dtype=torch.float64, requires_grad=True)
+                z_t = 3.5 * torch.log((7.0 + x_t[0]) / (7.0 - x_t[0]))
+                sc2_t = x_t[3]**2 + x_t[8]**2 + 2.0 * x_t[2] * x_t[3] * x_t[8]
+                sc_t = torch.sqrt(torch.clamp(sc2_t, min=1e-8))
+                k_t = z_t * sc_t * x_t[1]
+                K_t = torch.exp(k_t)
+
+                sig_t = sig_cross_atm * (sc_t / sc_t.detach())
+                sig_sqrtT_t = sig_t * x_t[1]
+                d1_t = (-k_t + 0.5 * (sig_sqrtT_t ** 2)) / sig_sqrtT_t
+                d2_t = d1_t - sig_sqrtT_t
+                nd1_t = 0.5 * torch.erfc(-d1_t / math.sqrt(2.0))
+                nd2_t = 0.5 * torch.erfc(-d2_t / math.sqrt(2.0))
+                c_otm_t = nd1_t - K_t * nd2_t
+                p_otm_t = K_t * (1.0 - nd2_t) - (1.0 - nd1_t)
+                c_t = torch.where(k_t >= 0.0, c_otm_t, p_otm_t + 1.0 - K_t)
+
+                dc_dx_t = torch.autograd.grad(c_t, x_t)[0]
 
                 arr["x"][idx] = x_vec
-                arr["c"][idx] = 0.05 + 0.001 * i_m
-                arr["dc_dx"][idx] = np.full(13, 0.01)
-                arr["eps_star"][idx] = 0.02 * np.sin(z_vals[i_m])
-                arr["deps_dx"][idx] = np.full(13, 0.005)
-                arr["sigma_h1"][idx] = 0.22
-                arr["sigma_cop"][idx] = 0.22 * np.exp(arr["eps_star"][idx])
+                arr["c"][idx] = c_t.item()
+                arr["dc_dx"][idx] = dc_dx_t.detach().numpy()
+                arr["eps_star"][idx] = 0.0
+                arr["deps_dx"][idx] = np.zeros(13, dtype=np.float64)
+                arr["sigma_h1"][idx] = sig_cross_atm
+                arr["sigma_cop"][idx] = sig_cross_atm
 
         shard_path = split_dir / "shard_0000.npy"
         np.save(shard_path, arr)

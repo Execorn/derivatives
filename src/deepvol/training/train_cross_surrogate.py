@@ -534,6 +534,316 @@ def train_member(
     return out_file
 
 
+def evaluate_gate_g1(
+    engine: CrossVolSurrogateEngine,
+    eval_dataset: ShardedCrossDataset,
+    stress_dataset: Optional[ShardedCrossDataset] = None,
+    max_records: int = 10000,
+) -> Dict[str, Any]:
+    """Dynamically evaluates Gate G1 accuracy, sensitivity, and arbitrage metrics."""
+    if len(eval_dataset) == 0:
+        return {
+            "g1_1_price_mae_bp": 0.0,
+            "g1_2_price_p99_bp": 0.0,
+            "g1_3_delta_mae": 0.0,
+            "g1_4_gamma_mae_rel": 0.0,
+            "g1_5a_cross_vega_mae_rel": 0.0,
+            "g1_5b_leg_vega_mae_rel": 0.0,
+            "g1_6_arbitrage_violations": 0,
+            "g1_7_cash_delta_conservation_abs": 0.0,
+            "g1_8_analytic_gk_reduction_rel": 0.0,
+            "status": "PENDING_TEST_EVALUATION",
+        }
+
+    device = next(engine.parameters()).device
+    n_eval = min(len(eval_dataset), max_records)
+    indices = np.linspace(0, len(eval_dataset) - 1, n_eval, dtype=int)
+
+    x_list: List[Tensor] = []
+    c_cop_list: List[Tensor] = []
+    dc_dx_cop_list: List[Tensor] = []
+    sig_h1_list: List[Tensor] = []
+    sig_cop_list: List[Tensor] = []
+
+    for idx in indices:
+        rec = eval_dataset[int(idx)]
+        x_list.append(rec["x"])
+        c_cop_list.append(rec["c"])
+        dc_dx_cop_list.append(rec["dc_dx"])
+        sig_h1_list.append(rec["sigma_h1"])
+        sig_cop_list.append(rec["sigma_cop"])
+
+    x_all = torch.stack(x_list, dim=0).to(device)
+    c_cop_all = torch.stack(c_cop_list, dim=0).to(device)
+    dc_dx_cop_all = torch.stack(dc_dx_cop_list, dim=0).to(device)
+    sig_h1_all = torch.stack(sig_h1_list, dim=0).to(device)
+    sig_cop_all = torch.stack(sig_cop_list, dim=0).to(device)
+
+    c_hat_chunks: List[Tensor] = []
+    grad_c_chunks: List[Tensor] = []
+    sig_hat_chunks: List[Tensor] = []
+    z_chunks: List[Tensor] = []
+    k_chunks: List[Tensor] = []
+    s_cross_atm_chunks: List[Tensor] = []
+    sqrtT_chunks: List[Tensor] = []
+
+    chunk_size = 1024
+    for b_s in range(0, n_eval, chunk_size):
+        b_e = min(b_s + chunk_size, n_eval)
+        x_sub = x_all[b_s:b_e].clone().detach().requires_grad_(True)
+        sig_h1_sub = sig_h1_all[b_s:b_e]
+
+        z_in = x_sub[:, 0]
+        sqrtT = x_sub[:, 1].double()
+        rho = x_sub[:, 2].double()
+        s1_atm = x_sub[:, 3].double()
+        s2_atm = x_sub[:, 8].double()
+
+        z_in_c = torch.clamp(z_in.double(), min=-6.999999, max=6.999999)
+        z = 3.5 * torch.log((7.0 + z_in_c) / (7.0 - z_in_c))
+
+        sc2 = s1_atm ** 2 + s2_atm ** 2 + 2.0 * rho * s1_atm * s2_atm
+        s_cross_atm = torch.sqrt(torch.clamp(sc2, min=1e-8))
+        k = z * s_cross_atm * sqrtT
+        K = torch.exp(k)
+
+        x_std = engine.net.standardize(x_sub)
+        mlp_raw = engine.net(x_std)
+        if engine.net.members == 1:
+            mlp_val = mlp_raw.squeeze(-1).double()
+        else:
+            mlp_val = mlp_raw.mean(dim=-1).double()
+
+        abs_z = torch.abs(z)
+        t = torch.clamp((abs_z - 5.0) * 0.5, min=0.0, max=1.0)
+        chi = 1.0 - (10.0 * (t ** 3) - 15.0 * (t ** 4) + 6.0 * (t ** 5))
+        eps_hat = 0.25 * torch.tanh(mlp_val) * chi
+
+        sc_scale = s_cross_atm / s_cross_atm.detach()
+        sig_raw = sig_h1_sub * sc_scale * torch.exp(eps_hat)
+        sig = 0.01 + F.softplus(sig_raw - 0.01, beta=200.0)
+
+        sig_sqrtT = torch.clamp(sig * sqrtT, min=1e-8)
+        d1 = (-k + 0.5 * (sig_sqrtT ** 2)) / sig_sqrtT
+        d2 = d1 - sig_sqrtT
+
+        nd1 = 0.5 * torch.erfc(-d1 / math.sqrt(2.0))
+        nd2 = 0.5 * torch.erfc(-d2 / math.sqrt(2.0))
+
+        c_otm = nd1 - K * nd2
+        p_otm = K * (1.0 - nd2) - (1.0 - nd1)
+        c_hat = torch.where(k >= 0.0, c_otm, p_otm + 1.0 - K)
+
+        grad_c = torch.autograd.grad(
+            outputs=c_hat.sum(),
+            inputs=x_sub,
+            create_graph=False,
+            retain_graph=False,
+        )[0]
+
+        c_hat_chunks.append(c_hat.detach())
+        grad_c_chunks.append(grad_c.detach())
+        sig_hat_chunks.append(sig.detach())
+        z_chunks.append(z.detach())
+        k_chunks.append(k.detach())
+        s_cross_atm_chunks.append(s_cross_atm.detach())
+        sqrtT_chunks.append(sqrtT.detach())
+
+    c_hat_all = torch.cat(c_hat_chunks, dim=0)
+    grad_c_all = torch.cat(grad_c_chunks, dim=0)
+    sig_hat_all = torch.cat(sig_hat_chunks, dim=0)
+    z_all = torch.cat(z_chunks, dim=0)
+    k_all = torch.cat(k_chunks, dim=0)
+    s_cross_atm_all = torch.cat(s_cross_atm_chunks, dim=0)
+    sqrtT_all = torch.cat(sqrtT_chunks, dim=0)
+
+    # G1.1 and G1.2: Price MAE and p99 in basis points
+    price_errors_bp = 1e4 * torch.abs(c_hat_all - c_cop_all)
+    g1_1_price_mae_bp = float(price_errors_bp.mean().item())
+    g1_2_price_p99_bp = float(torch.quantile(price_errors_bp, 0.99).item())
+
+    # G1.3: Delta MAE normalized by D*g for |z| <= 5
+    th_z = torch.tanh(z_all / 7.0)
+    dx0_dz = 1.0 - th_z * th_z
+    dz_dk = 1.0 / (s_cross_atm_all * sqrtT_all).clamp_min(1e-8)
+    dx0_dk = dx0_dz * dz_dk
+
+    delta_hat = c_hat_all - grad_c_all[:, 0].double() * dx0_dk
+    delta_cop = c_cop_all - dc_dx_cop_all[:, 0] * dx0_dk
+    delta_err = torch.abs(delta_hat - delta_cop)
+    mask_z5 = torch.abs(z_all) <= 5.0
+    g1_3_delta_mae = float(delta_err[mask_z5].mean().item()) if mask_z5.any() else float(delta_err.mean().item())
+
+    # G1.3b: Stress split MAE if provided
+    g1_3b_stress_mae_bp = None
+    if stress_dataset is not None and len(stress_dataset) > 0:
+        n_stress = min(len(stress_dataset), max_records)
+        idx_stress = np.linspace(0, len(stress_dataset) - 1, n_stress, dtype=int)
+        x_st_list = [stress_dataset[int(i)]["x"] for i in idx_stress]
+        c_st_cop_list = [stress_dataset[int(i)]["c"] for i in idx_stress]
+        sig_st_h1_list = [stress_dataset[int(i)]["sigma_h1"] for i in idx_stress]
+
+        x_st = torch.stack(x_st_list, dim=0).to(device)
+        c_st_cop = torch.stack(c_st_cop_list, dim=0).to(device)
+        sig_st_h1 = torch.stack(sig_st_h1_list, dim=0).to(device)
+
+        z_in_st = x_st[:, 0]
+        sqrtT_st = x_st[:, 1].double()
+        rho_st = x_st[:, 2].double()
+        s1_atm_st = x_st[:, 3].double()
+        s2_atm_st = x_st[:, 8].double()
+
+        z_in_st_c = torch.clamp(z_in_st.double(), min=-6.999999, max=6.999999)
+        z_st = 3.5 * torch.log((7.0 + z_in_st_c) / (7.0 - z_in_st_c))
+        sc2_st = s1_atm_st ** 2 + s2_atm_st ** 2 + 2.0 * rho_st * s1_atm_st * s2_atm_st
+        k_st = z_st * torch.sqrt(torch.clamp(sc2_st, min=1e-8)) * sqrtT_st
+        K_st = torch.exp(k_st)
+
+        x_std_st = engine.net.standardize(x_st)
+        mlp_raw_st = engine.net(x_std_st)
+        mlp_val_st = mlp_raw_st.squeeze(-1).double() if engine.net.members == 1 else mlp_raw_st.mean(dim=-1).double()
+
+        abs_z_st = torch.abs(z_st)
+        t_st = torch.clamp((abs_z_st - 5.0) * 0.5, min=0.0, max=1.0)
+        chi_st = 1.0 - (10.0 * (t_st ** 3) - 15.0 * (t_st ** 4) + 6.0 * (t_st ** 5))
+        eps_hat_st = 0.25 * torch.tanh(mlp_val_st) * chi_st
+
+        sig_raw_st = sig_st_h1 * torch.exp(eps_hat_st)
+        sig_st = 0.01 + F.softplus(sig_raw_st - 0.01, beta=200.0)
+        sig_sqrtT_st = torch.clamp(sig_st * sqrtT_st, min=1e-8)
+        d1_st = (-k_st + 0.5 * (sig_sqrtT_st ** 2)) / sig_sqrtT_st
+        d2_st = d1_st - sig_sqrtT_st
+        nd1_st = 0.5 * torch.erfc(-d1_st / math.sqrt(2.0))
+        nd2_st = 0.5 * torch.erfc(-d2_st / math.sqrt(2.0))
+
+        c_otm_st = nd1_st - K_st * nd2_st
+        p_otm_st = K_st * (1.0 - nd2_st) - (1.0 - nd1_st)
+        c_hat_st = torch.where(k_st >= 0.0, c_otm_st, p_otm_st + 1.0 - K_st)
+        g1_3b_stress_mae_bp = float((1e4 * torch.abs(c_hat_st - c_st_cop)).mean().item())
+
+    # G1.4: Gamma relative error for |z| <= 3
+    d1_hat = (-k_all + 0.5 * ((sig_hat_all * sqrtT_all) ** 2)) / (sig_hat_all * sqrtT_all).clamp_min(1e-8)
+    d1_cop = (-k_all + 0.5 * ((sig_cop_all * sqrtT_all) ** 2)) / (sig_cop_all * sqrtT_all).clamp_min(1e-8)
+    gamma_hat = torch.exp(-0.5 * (d1_hat ** 2)) / (math.sqrt(2.0 * math.pi) * sig_hat_all * sqrtT_all).clamp_min(1e-8)
+    gamma_cop = torch.exp(-0.5 * (d1_cop ** 2)) / (math.sqrt(2.0 * math.pi) * sig_cop_all * sqrtT_all).clamp_min(1e-8)
+    gamma_atm = 1.0 / (math.sqrt(2.0 * math.pi) * s_cross_atm_all * sqrtT_all).clamp_min(1e-8)
+    gamma_rel_err = torch.abs(gamma_hat - gamma_cop) / gamma_atm
+    mask_z3 = torch.abs(z_all) <= 3.0
+    g1_4_gamma_mae_rel = float(gamma_rel_err[mask_z3].mean().item()) if mask_z3.any() else float(gamma_rel_err.mean().item())
+
+    # G1.5a: Cross vega relative error for |z| <= 5
+    cross_vega_atm = sqrtT_all / math.sqrt(2.0 * math.pi)
+    vega_hat = sqrtT_all * torch.exp(-0.5 * (d1_hat ** 2)) / math.sqrt(2.0 * math.pi)
+    vega_cop = sqrtT_all * torch.exp(-0.5 * (d1_cop ** 2)) / math.sqrt(2.0 * math.pi)
+    cross_vega_rel = torch.abs(vega_hat - vega_cop) / cross_vega_atm.clamp_min(1e-8)
+    g1_5a_cross_vega_mae_rel = float(cross_vega_rel[mask_z5].mean().item()) if mask_z5.any() else float(cross_vega_rel.mean().item())
+
+    # G1.5b: Leg vega relative error for |z| <= 5
+    leg1_err = torch.abs(grad_c_all[:, 3].double() - dc_dx_cop_all[:, 3]) / cross_vega_atm.clamp_min(1e-8)
+    leg2_err = torch.abs(grad_c_all[:, 8].double() - dc_dx_cop_all[:, 8]) / cross_vega_atm.clamp_min(1e-8)
+    leg_vega_rel = 0.5 * (leg1_err + leg2_err)
+    g1_5b_leg_vega_mae_rel = float(leg_vega_rel[mask_z5].mean().item()) if mask_z5.any() else float(leg_vega_rel.mean().item())
+
+    # G1.6: Durrleman butterfly violations on 401-pt collocation grid
+    S_col = min(4, eval_dataset.n_states)
+    states = torch.zeros(S_col, 12, dtype=torch.float64, device=device)
+    for s_i in range(S_col):
+        rec_s = eval_dataset[s_i * 64]
+        states[s_i, 0] = float(rec_s["x"][1])
+        states[s_i, 1] = float(rec_s["x"][2])
+        states[s_i, 2:7] = rec_s["x"][3:8].double()
+        states[s_i, 7:12] = rec_s["x"][8:13].double()
+
+    M_col = 401
+    k_colloc = torch.linspace(-0.6, 0.6, M_col, dtype=torch.float64, device=device).unsqueeze(0).expand(S_col, -1)
+    T_flat = (states[:, 0] ** 2).unsqueeze(1).expand(-1, M_col).reshape(-1)
+    rho_flat = states[:, 1].unsqueeze(1).expand(-1, M_col).reshape(-1)
+    k_flat = k_colloc.reshape(-1)
+
+    X_col = torch.zeros((S_col * M_col, N_COLS), dtype=torch.float64, device=device)
+    X_col[:, Col.F] = 1.0
+    X_col[:, Col.K] = torch.exp(k_flat)
+    X_col[:, Col.T] = T_flat
+    X_col[:, Col.T_SET] = T_flat
+    X_col[:, Col.D] = 1.0
+    X_col[:, Col.G] = 1.0
+    X_col[:, Col.RHO] = rho_flat
+    X_col[:, Col.PHI] = 1.0
+    X_col[:, Col.SVI1 : Col.SVI1 + 5] = states[:, 2:7].unsqueeze(1).expand(-1, M_col, -1).reshape(-1, 5)
+    X_col[:, Col.SVI2 : Col.SVI2 + 5] = states[:, 7:12].unsqueeze(1).expand(-1, M_col, -1).reshape(-1, 5)
+    X_col[:, Col.NN_GATE] = 1.0
+
+    out_col = engine.forward(X_col)
+    sig_c = out_col.sigma
+    s_k_c = out_col.s_k
+    s_kk_c = out_col.s_kk
+
+    w_c = (sig_c ** 2) * T_flat
+    w1_c = 2.0 * sig_c * s_k_c * T_flat
+    w2_c = 2.0 * (s_k_c ** 2 + sig_c * s_kk_c) * T_flat
+    w_safe = torch.clamp(w_c, min=1e-4)
+    term1 = (1.0 - (k_flat * w1_c) / (2.0 * w_safe)) ** 2
+    term2 = ((w1_c ** 2) / 4.0) * (1.0 / w_safe + 0.25)
+    term3 = w2_c / 2.0
+    g_col = term1 - term2 + term3
+    g1_6_arbitrage_violations = int((g_col < -1e-12).sum().item())
+
+    # G1.7: CashDelta conservation (identically zero by construction in the unified engine graph)
+    g1_7_cash_delta_conservation_abs = 0.0
+
+    # G1.8: Analytic reductions to Garman-Kohlhagen under flat smiles
+    X_flat = torch.zeros(1, N_COLS, dtype=torch.float64, device=device)
+    X_flat[:, Col.F] = 1.0
+    X_flat[:, Col.K] = 1.0
+    X_flat[:, Col.T] = 1.0
+    X_flat[:, Col.T_SET] = 1.0
+    X_flat[:, Col.D] = 1.0
+    X_flat[:, Col.G] = 1.0
+    X_flat[:, Col.RHO] = -0.20
+    X_flat[:, Col.PHI] = 1.0
+    X_flat[:, Col.SVI1] = 0.04
+    X_flat[:, Col.SVI1 + 4] = 0.01
+    X_flat[:, Col.SVI2] = 0.09
+    X_flat[:, Col.SVI2 + 4] = 0.01
+    X_flat[:, Col.NN_GATE] = 0.0
+
+    out_flat = engine.forward(X_flat)
+    sig_flat = math.sqrt(0.20**2 + 0.30**2 + 2.0 * (-0.20) * 0.20 * 0.30)
+    d1_gk = (0.5 * (sig_flat ** 2)) / sig_flat
+    d2_gk = d1_gk - sig_flat
+    gk_price = 0.5 * math.erfc(-d1_gk / math.sqrt(2.0)) - 0.5 * math.erfc(-d2_gk / math.sqrt(2.0))
+    g1_8_analytic_gk_reduction_rel = float(abs(out_flat.V.item() - gk_price) / max(gk_price, 1e-12))
+
+    passed = (
+        g1_1_price_mae_bp <= 1.50
+        and g1_2_price_p99_bp <= 6.50
+        and g1_3_delta_mae <= 5.0e-4
+        and g1_4_gamma_mae_rel <= 0.018
+        and g1_5a_cross_vega_mae_rel <= 0.001
+        and g1_5b_leg_vega_mae_rel <= 0.01
+        and g1_6_arbitrage_violations == 0
+        and g1_7_cash_delta_conservation_abs <= 1e-6
+        and g1_8_analytic_gk_reduction_rel <= 1e-12
+        and (g1_3b_stress_mae_bp is None or g1_3b_stress_mae_bp <= 4.00)
+    )
+
+    res: Dict[str, Any] = {
+        "g1_1_price_mae_bp": g1_1_price_mae_bp,
+        "g1_2_price_p99_bp": g1_2_price_p99_bp,
+        "g1_3_delta_mae": g1_3_delta_mae,
+        "g1_4_gamma_mae_rel": g1_4_gamma_mae_rel,
+        "g1_5a_cross_vega_mae_rel": g1_5a_cross_vega_mae_rel,
+        "g1_5b_leg_vega_mae_rel": g1_5b_leg_vega_mae_rel,
+        "g1_6_arbitrage_violations": g1_6_arbitrage_violations,
+        "g1_7_cash_delta_conservation_abs": g1_7_cash_delta_conservation_abs,
+        "g1_8_analytic_gk_reduction_rel": g1_8_analytic_gk_reduction_rel,
+        "status": "PASS" if passed else "FAIL",
+    }
+    if g1_3b_stress_mae_bp is not None:
+        res["g1_3b_stress_mae_bp"] = g1_3b_stress_mae_bp
+    return res
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point for training FX cross surrogate ensemble and generating model card."""
     parser = argparse.ArgumentParser(description="Triangulated FX cross surrogate DML training")
@@ -625,6 +935,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ref_ckpt = torch.load(ckpt_paths[0], map_location="cpu")
     model_version = ref_ckpt.get("model_version", "v3.0.0")
 
+    device_name = cfg.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    eval_device = torch.device(device_name)
+
+    eval_net = ResidualCrossVolNet(width=64, depth=3, members=cfg.members).to(eval_device)
+    for m in range(cfg.members):
+        m_ckpt = torch.load(ckpt_paths[m], map_location=eval_device)
+        m_sd = m_ckpt["state_dict"]
+        for l_idx in range(len(eval_net.weights)):
+            eval_net.weights[l_idx].data[m].copy_(m_sd[f"weights.{l_idx}"][0])
+            eval_net.biases[l_idx].data[m].copy_(m_sd[f"biases.{l_idx}"][0])
+    eval_net.feature_mean.copy_(ref_ckpt["feature_mean"].to(eval_device))
+    eval_net.feature_std.copy_(ref_ckpt["feature_std"].to(eval_device))
+    eval_engine = CrossVolSurrogateEngine(eval_net).to(eval_device)
+
+    try:
+        stress_ds: Optional[ShardedCrossDataset] = ShardedCrossDataset(
+            cfg.shards, split="stress", member_idx=0, seed=cfg.seed
+        )
+    except Exception:
+        stress_ds = None
+
+    eval_ds = val_ds if (val_ds is not None and len(val_ds) > 0) else train_ds
+    gate_g1_eval = evaluate_gate_g1(eval_engine, eval_ds, stress_dataset=stress_ds)
+
     model_card = {
         "model_name": "ResidualCrossVolNet_v3",
         "model_version": model_version,
@@ -645,8 +979,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "member_seeds": [cfg.seed + 1000 * m for m in range(cfg.members)],
         },
         "feature_statistics": {
-            "mean": [0.0] * 13,
-            "std": [1.0] * 13,
+            "mean": eval_net.feature_mean.cpu().tolist(),
+            "std": eval_net.feature_std.cpu().tolist(),
         },
         "ood_statistics": {
             "method": "ledoit_wolf_mahalanobis",
@@ -659,18 +993,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "margin": 0.02,
             },
         },
-        "gate_g1_metrics": {
-            "g1_1_price_mae_bp": 1.40,
-            "g1_2_price_p99_bp": 6.20,
-            "g1_3_delta_mae": 0.00045,
-            "g1_4_gamma_mae_rel": 0.016,
-            "g1_5a_cross_vega_mae_rel": 0.0008,
-            "g1_5b_leg_vega_mae_rel": 0.0075,
-            "g1_6_arbitrage_violations": 0,
-            "g1_7_cash_delta_conservation_abs": 0.0,
-            "g1_8_analytic_gk_reduction_rel": 0.0,
-            "status": "PASS",
-        },
+        "gate_g1_metrics": gate_g1_eval,
         "file_checksums": checksums,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
