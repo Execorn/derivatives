@@ -2488,6 +2488,10 @@ async def _fx_cross_price_batch_impl(request: Request) -> Response:
     canonicalizer: SmileCanonicalizer = state["canonicalizer"]
     executor: FXCrossGPUExecutor = state["executor"]
 
+    cl = request.headers.get("content-length")
+    MAX_PAYLOAD_BYTES = 50 * 1024 * 1024
+    if cl and int(cl) > MAX_PAYLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Payload Too Large (50MB limit)")
     content_type = request.headers.get("content-type", "application/json")
     accept = request.headers.get("accept", "*/*")
     allowed_ct = ["application/json", "application/vnd.apache.arrow.stream"]
@@ -2497,6 +2501,8 @@ async def _fx_cross_price_batch_impl(request: Request) -> Response:
     if not any(allowed in accept for allowed in allowed_accept):
         raise HTTPException(status_code=406, detail="Not Acceptable")
     body = await request.body()
+    if len(body) > MAX_PAYLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Payload Too Large (50MB limit)")
 
     def _prepare_inputs() -> Tuple[
         NDArray[np.float64],
