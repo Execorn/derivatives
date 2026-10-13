@@ -23,6 +23,21 @@ RH_BOUNDS = {
 
 PARAM_NAMES = ["kappa", "theta", "sigma", "rho", "v0", "H"]
 
+FEATURE_NAMES_12D: List[str] = [
+    "T",
+    "F_cross",
+    "s1",
+    "s2",
+    "rho",
+    "d1_f",
+    "d1_d",
+    "d2_f",
+    "d2_d",
+    "d_set",
+    "sigma_atmf_1",
+    "sigma_atmf_2",
+]
+
 
 class DriftMonitor:
     """
