@@ -146,3 +146,81 @@ def test_gradcheck():
         
     # Run gradcheck
     assert torch.autograd.gradcheck(func, (price,), eps=1e-5, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("r_val", [0.02, 0.05])
+@pytest.mark.parametrize("q_val", [0.01, 0.03])
+@pytest.mark.parametrize("is_call", [True, False])
+def test_pivot_implied_vol_non_zero_rates_autograd_sensitivities(r_val: float, q_val: float, is_call: bool) -> None:
+    """Verifies that autograd sensitivities of pivot_implied_vol w.r.t S, K, and T
+    under non-zero rates and dividends match analytical BS derivatives and 4th-order FD bumps.
+    """
+    device = torch.device("cpu")
+    r = torch.tensor(r_val, device=device, dtype=torch.float64)
+    q = torch.tensor(q_val, device=device, dtype=torch.float64)
+
+    test_cases = [
+        (100.0, 95.0, 0.5, 0.20),
+        (100.0, 100.0, 1.0, 0.25),
+        (100.0, 110.0, 2.0, 0.30),
+    ]
+
+    h = 1e-4
+
+    for S_val, K_val, T_val, vol_val in test_cases:
+        S = torch.tensor(S_val, device=device, dtype=torch.float64)
+        K = torch.tensor(K_val, device=device, dtype=torch.float64)
+        T = torch.tensor(T_val, device=device, dtype=torch.float64)
+        vol = torch.tensor(vol_val, device=device, dtype=torch.float64)
+
+        sqrt_T = torch.sqrt(T)
+        denom = vol * sqrt_T
+        d1 = (torch.log(S / K) + (r - q + 0.5 * vol**2) * T) / denom
+        d2 = d1 - denom
+        SQRT_2 = 1.4142135623730951
+        phi_d1 = torch.exp(-0.5 * d1**2) / 2.5066282746310005
+        vega = S * torch.exp(-q * T) * sqrt_T * phi_d1
+
+        nd1 = 0.5 * (1.0 + torch.erf(d1 / SQRT_2))
+        nd2 = 0.5 * (1.0 + torch.erf(d2 / SQRT_2))
+        exp_q = torch.exp(-q * T)
+        exp_r = torch.exp(-r * T)
+
+        if is_call:
+            price_ref = S * exp_q * nd1 - K * exp_r * nd2
+            dc_dS = exp_q * nd1
+            dc_dK = -exp_r * nd2
+            dc_dT = S * exp_q * vol * phi_d1 / (2.0 * sqrt_T) - q * S * exp_q * nd1 + r * K * exp_r * nd2
+        else:
+            price_ref = K * exp_r * (1.0 - nd2) - S * exp_q * (1.0 - nd1)
+            dc_dS = -exp_q * (1.0 - nd1)
+            dc_dK = exp_r * (1.0 - nd2)
+            dc_dT = S * exp_q * vol * phi_d1 / (2.0 * sqrt_T) + q * S * exp_q * (1.0 - nd1) - r * K * exp_r * (1.0 - nd2)
+
+        target_dsigma_dS = -dc_dS / vega
+        target_dsigma_dK = -dc_dK / vega
+        target_dsigma_dT = -dc_dT / vega
+
+        S_ag = S.clone().requires_grad_(True)
+        K_ag = K.clone().requires_grad_(True)
+        T_ag = T.clone().requires_grad_(True)
+
+        iv = pivot_implied_vol(price_ref, S_ag, K_ag, T_ag, r, q, is_call=is_call)
+        g_S, g_K, g_T = torch.autograd.grad(iv, (S_ag, K_ag, T_ag))
+
+        # Analytical BS implicit derivatives match
+        assert torch.isclose(g_S, target_dsigma_dS, rtol=1e-11, atol=1e-11)
+        assert torch.isclose(g_K, target_dsigma_dK, rtol=1e-11, atol=1e-11)
+        assert torch.isclose(g_T, target_dsigma_dT, rtol=1e-11, atol=1e-11)
+
+        # 4th-order finite difference stencils
+        def eval_iv(s_val: torch.Tensor, k_val: torch.Tensor, t_val: torch.Tensor) -> float:
+            return float(pivot_implied_vol(price_ref, s_val, k_val, t_val, r, q, is_call=is_call).item())
+
+        fd4_S = (-eval_iv(S + 2 * h, K, T) + 8 * eval_iv(S + h, K, T) - 8 * eval_iv(S - h, K, T) + eval_iv(S - 2 * h, K, T)) / (12 * h)
+        fd4_K = (-eval_iv(S, K + 2 * h, T) + 8 * eval_iv(S, K + h, T) - 8 * eval_iv(S, K - h, T) + eval_iv(S, K - 2 * h, T)) / (12 * h)
+        fd4_T = (-eval_iv(S, K, T + 2 * h) + 8 * eval_iv(S, K, T + h) - 8 * eval_iv(S, K, T - h) + eval_iv(S, K, T - 2 * h)) / (12 * h)
+
+        assert abs(g_S.item() - fd4_S) / abs(fd4_S) <= 1e-9
+        assert abs(g_K.item() - fd4_K) / abs(fd4_K) <= 1e-9
+        assert abs(g_T.item() - fd4_T) / abs(fd4_T) <= 1e-9
