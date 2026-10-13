@@ -429,12 +429,13 @@ class ImplicitCanonicalMap(torch.autograd.Function):
         return grad_quotes, None, None, None
 
 
-def calendar_check(w_cross: Tensor, T: Tensor) -> Tensor:
+def calendar_check(w_cross: Tensor, T: Tensor, tol: float = 1e-14) -> Tensor:
     """Verifies monotonic total variance growth across calendar expiries.
 
     Args:
         w_cross: Total variance tensor of shape (S_T, M) across sorted expiries.
         T: Expiry tenors of shape (S_T,).
+        tol: Permissible tolerance for numerical variance decrease (default 1e-14).
 
     Returns:
         Boolean tensor of shape (S_T,) indicating validity of each expiry transition.
@@ -448,7 +449,7 @@ def calendar_check(w_cross: Tensor, T: Tensor) -> Tensor:
     w_sorted = w_cross[order]
 
     diffs = w_sorted[1:] - w_sorted[:-1]
-    step_valid = torch.all(diffs >= -1e-14, dim=-1)
+    step_valid = torch.all(diffs >= -tol, dim=-1)
 
     valid_sorted = torch.cat([torch.tensor([True], dtype=torch.bool, device=dev), step_valid])
     inv_order = torch.argsort(order)

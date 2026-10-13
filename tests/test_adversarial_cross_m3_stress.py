@@ -15,16 +15,8 @@ import pytest
 import torch
 from torch import Tensor
 
-from deepvol.models import taylor_jets as tj
 from deepvol.models.fx_cross_analytic import AnalyticTriangulated, Col, greeks_from_outputs
-from deepvol.models.fx_cross_safeguards import (
-    cross_slice_audit,
-    smooth_time_floor,
-    smooth_vol_floor,
-    taper_jet,
-    wing_slope_certificate,
-    z_squash,
-)
+from deepvol.models.fx_cross_safeguards import cross_slice_audit
 from deepvol.models.fx_cross_surrogate import CrossVolSurrogateEngine, ResidualCrossVolNet
 from deepvol.mrm.fx_cross_guardian import (
     FallbackReasonEnum,

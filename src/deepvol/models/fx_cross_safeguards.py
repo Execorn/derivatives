@@ -11,12 +11,13 @@ Implements:
 """
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from deepvol.market.smile_canonicalizer import calendar_check
 from deepvol.market.svi_slice import durrleman_g
 from deepvol.models import taylor_jets as tj
 from deepvol.models.fx_cross_analytic import Col, lee_slope_bound
@@ -28,7 +29,8 @@ class AuditResult(NamedTuple):
     min_g: Tensor           # (S,) float64 minimum Durrleman butterfly density
     call_spread_ok: Tensor  # (S,) bool call-spread slope bounds [-D, 0] satisfied
     slope_bound: Tensor     # (S,) float64 Roger Lee asymptotic wing slope bound bar_L
-    ok: Tensor              # (S,) bool composite slice certification passed
+    ok: Tensor              # (S,) bool composite certification passed (slice & calendar)
+    calendar_ok: Tensor     # (S,) bool calendar monotonicity satisfied across expiries
 
 
 def taper_jet(z: tj.Jet, z0: float = 5.0, z1: float = 7.0) -> tj.Jet:
@@ -119,17 +121,23 @@ def cross_slice_audit(
     X_states: Tensor,
     n_grid: int = 401,
     z_max: float = 12.0,
+    k_max: float = 1.0,
+    tol_calendar: float = 1e-8,
+    cross_ids: Optional[Union[Sequence[object], Tensor]] = None,
 ) -> AuditResult:
-    """Audits market states across a 401-point collocation grid for Durrleman, call-spread, and wing bounds.
+    """Audits market states across a 401-point collocation grid for Durrleman, call-spread, wing, and calendar bounds.
 
     Args:
         engine: Pricing engine module (e.g. AnalyticTriangulated or CrossVolSurrogateEngine).
         X_states: Tensor of shape (S, 34) containing market states.
         n_grid: Number of points on log-moneyness grid (default 401).
         z_max: Truncation boundary in standardized moneyness z (default 12.0).
+        k_max: Truncation boundary on canonical log-moneyness grid for calendar audit (default 1.0).
+        tol_calendar: Tolerance for numerical variance decrease across expiries (default 1e-8).
+        cross_ids: Optional sequence of cross identifier keys for grouping term structures.
 
     Returns:
-        AuditResult named tuple containing min_g (S,), call_spread_ok (S,), slope_bound (S,), ok (S,).
+        AuditResult named tuple containing min_g (S,), call_spread_ok (S,), slope_bound (S,), ok (S,), calendar_ok (S,).
     """
     if X_states.dim() == 1:
         X_states = X_states.unsqueeze(0)
@@ -138,12 +146,15 @@ def cross_slice_audit(
     device = X_states.device
     dtype = torch.float64
 
-    min_g_list = []
-    call_spread_ok_list = []
-    slope_bound_list = []
-    ok_list = []
+    min_g_list: List[float] = []
+    call_spread_ok_list: List[bool] = []
+    slope_bound_list: List[float] = []
+    slice_ok_list: List[bool] = []
+    T_list: List[float] = []
+    w_canon_list: List[Tensor] = []
 
     z_grid = torch.linspace(-z_max, z_max, n_grid, dtype=dtype, device=device)
+    k_canon = torch.linspace(-k_max, k_max, n_grid, dtype=dtype, device=device) if S_cnt > 1 else None
 
     for s in range(S_cnt):
         state = X_states[s]
@@ -152,6 +163,7 @@ def cross_slice_audit(
         T_raw = state[Col.T]
         T_val = smooth_time_floor(T_raw)
         T_float = float(T_val.item())
+        T_list.append(T_float)
         D_val = float(state[Col.D].item())
         rho_val = float(state[Col.RHO].item())
 
@@ -228,16 +240,65 @@ def cross_slice_audit(
 
         min_g_pass = (min_g >= -1e-12)
         slope_pass = (bar_L <= 1.9)
-        ok = min_g_pass and call_spread_pass and slope_pass
+        slice_ok = min_g_pass and call_spread_pass and slope_pass
 
         min_g_list.append(min_g)
         call_spread_ok_list.append(call_spread_pass)
         slope_bound_list.append(bar_L)
-        ok_list.append(ok)
+        slice_ok_list.append(slice_ok)
+
+        # Canonical collocation grid evaluation for multi-expiry calendar check
+        if S_cnt > 1 and k_canon is not None:
+            K_canon = F_val * torch.exp(k_canon)
+            X_canon = state.unsqueeze(0).expand(n_grid, -1).clone()
+            X_canon[:, Col.K] = K_canon
+            X_canon[:, Col.PHI] = 1.0
+            with torch.no_grad():
+                out_canon = engine(X_canon)
+            w_canon = (out_canon.sigma ** 2) * T_val
+            w_canon_list.append(w_canon)
+
+    # Multi-expiry calendar monotonicity evaluation
+    calendar_ok_list = [True] * S_cnt
+    if S_cnt > 1:
+        w_all = torch.stack(w_canon_list, dim=0)
+        T_all = torch.tensor(T_list, dtype=dtype, device=device)
+
+        # Group indices by cross_ids if provided, otherwise group by cross characteristics (RHO, F/G)
+        groups: Dict[object, List[int]] = {}
+        if cross_ids is not None:
+            if isinstance(cross_ids, Tensor):
+                c_ids_list = [x.item() for x in cross_ids]
+            else:
+                c_ids_list = list(cross_ids)
+            for idx, cid in enumerate(c_ids_list):
+                groups.setdefault(cid, []).append(idx)
+        else:
+            for idx in range(S_cnt):
+                st = X_states[idx]
+                r_val = round(float(st[Col.RHO].item()), 4)
+                g_val = max(float(st[Col.G].item()), 1e-8)
+                s0_val = round(float(st[Col.F].item()) / g_val, 2)
+                groups.setdefault((r_val, s0_val), []).append(idx)
+
+        for grp_indices in groups.values():
+            if len(grp_indices) <= 1:
+                continue
+            T_grp = T_all[grp_indices]
+            w_grp = w_all[grp_indices]
+            if float((T_grp.max() - T_grp.min()).item()) < 1e-6:
+                continue
+            cal_ok_grp = calendar_check(w_grp, T_grp, tol=tol_calendar)
+            for local_i, orig_i in enumerate(grp_indices):
+                calendar_ok_list[orig_i] = bool(cal_ok_grp[local_i].item())
+
+    # Composite certification: ok = slice_ok and calendar_ok
+    ok_list = [slice_ok_list[s] and calendar_ok_list[s] for s in range(S_cnt)]
 
     return AuditResult(
         min_g=torch.tensor(min_g_list, dtype=dtype, device=device),
         call_spread_ok=torch.tensor(call_spread_ok_list, dtype=torch.bool, device=device),
         slope_bound=torch.tensor(slope_bound_list, dtype=dtype, device=device),
         ok=torch.tensor(ok_list, dtype=torch.bool, device=device),
+        calendar_ok=torch.tensor(calendar_ok_list, dtype=torch.bool, device=device),
     )
