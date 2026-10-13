@@ -396,6 +396,7 @@ class FXCrossRuntime:
             sigma0 = float(raw[0, 1])
             gF0 = float(raw[0, 2])
             dVdF0 = float(raw[0, 3])
+            B_Fs0 = float(raw[0, 4])
             B_ss0 = float(raw[0, 5])
             d_rho0 = float(raw[0, 6])
             d_d10 = float(raw[0, 7])
@@ -410,14 +411,21 @@ class FXCrossRuntime:
             d20 = d10 - sd0
             n10 = math.exp(-0.5 * d10 * d10) / _SQ2PI
 
-            vega0 = D0 * F0 * math.sqrt(T0) * n10
-            vanna0 = -D0 * g0 * n10 * d20 / sigma0
+            k_F0 = -1.0 / F0
+            B_s0 = D0 * F0 * math.sqrt(T0) * n10
+            n_phi_d10 = 0.5 * (1.0 + math.erf(phi0 * d10 / math.sqrt(2.0)))
+            B_F0 = phi0 * D0 * n_phi_d10
+            sk_kF0 = (dVdF0 - B_F0) / B_s0 if abs(B_s0) > 1e-12 else 0.0
+            s_k0 = -F0 * sk_kF0
+
+            vega0 = B_s0
+            vanna0 = g0 * (B_Fs0 + B_ss0 * sk_kF0)
             vomma0 = B_ss0
 
-            n_phi_d10 = 0.5 * (1.0 + math.erf(phi0 * d10 / math.sqrt(2.0)))
             carry0 = phi0 * D0 * F0 * n_phi_d10 * (r_C0 - r_A0)
             decay0 = (D0 * F0 * sigma0 * n10) / (2.0 * math.sqrt(T0))
-            theta0 = (r_set0 * V0 - carry0 - decay0) / 365.0
+            roll0 = B_s0 * s_k0 * (r_C0 - r_A0)
+            theta0 = (r_set0 * V0 - carry0 - decay0 + roll0) / 365.0
 
             return np.array(
                 [
@@ -453,6 +461,7 @@ class FXCrossRuntime:
         sigma = raw[:, 1]
         gF = raw[:, 2]
         dVdF = raw[:, 3]
+        B_Fs = raw[:, 4]
         B_ss = raw[:, 5]
         d_rho = raw[:, 6]
         d_delta1 = raw[:, 7]
@@ -467,14 +476,20 @@ class FXCrossRuntime:
         d2 = d1 - sd
         n1 = np.exp(-0.5 * d1 * d1) / _SQ2PI
 
-        vega = D_val * F_val * np.sqrt(T_val) * n1
-        vanna = -D_val * g_val * n1 * d2 / sigma
+        B_s = D_val * F_val * np.sqrt(T_val) * n1
+        n_phi_d1 = ndtr(phi_val * d1)
+        B_F = phi_val * D_val * n_phi_d1
+        sk_kF = np.where(np.abs(B_s) > 1e-12, (dVdF - B_F) / B_s, 0.0)
+        s_k = -F_val * sk_kF
+
+        vega = B_s
+        vanna = g_val * (B_Fs + B_ss * sk_kF)
         vomma = B_ss
 
-        n_phi_d1 = ndtr(phi_val * d1)
         carry_term = phi_val * D_val * F_val * n_phi_d1 * (r_C - r_A)
         decay_term = (D_val * F_val * sigma * n1) / (2.0 * np.sqrt(T_val))
-        theta = (r_set * V - carry_term - decay_term) / 365.0
+        roll_term = B_s * s_k * (r_C - r_A)
+        theta = (r_set * V - carry_term - decay_term + roll_term) / 365.0
 
         return np.column_stack(
             [
