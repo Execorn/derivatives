@@ -197,6 +197,7 @@ class AnalyticTriangulated(nn.Module):
         d2_jet = tj.seed_tangent(X[:, Col.DELTA2], 2, P, eye=eye)
 
         sigma_jet, _, _ = beta_split_jet(k_jet, T_val, rho_jet, p1, p2, d1_jet, d2_jet, n_fp=6)
+        sigma_jet = tj.softfloor(sigma_jet, lo=0.01, beta=200.0)
 
         sigma = sigma_jet.v
         s_k = sigma_jet.d

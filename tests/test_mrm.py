@@ -1,12 +1,32 @@
-import pytest
+import asyncio
+from datetime import datetime, timedelta, timezone
+import time
+
 import numpy as np
 import torch
-from deepvol.mrm.arbitrage import check_calendar_arbitrage, check_butterfly_arbitrage_durrleman, check_butterfly_arbitrage_price, check_arbitrage
-from deepvol.mrm.guardian import ModelRiskGuardian
 
-def test_calendar_arbitrage_detection():
+from deepvol.market.svi_slice import RawSVI
+from deepvol.models.fx_cross_analytic import AnalyticTriangulated, Col
+from deepvol.models.fx_cross_copula import CrossState
+from deepvol.models.fx_cross_surrogate import CrossVolSurrogateEngine, ResidualCrossVolNet
+from deepvol.mrm.arbitrage import (
+    check_butterfly_arbitrage_durrleman,
+    check_butterfly_arbitrage_price,
+    check_calendar_arbitrage,
+)
+from deepvol.mrm.fx_cross_guardian import (
+    FallbackReasonEnum,
+    FXCrossGuardian,
+    MarketStateDriftMonitor,
+    MarketStateOODDetector,
+    ModelReserveTracker,
+    PricingEngineEnum,
+)
+from deepvol.mrm.guardian import ModelRiskGuardian, price_to_iv
+
+
+def test_calendar_arbitrage_detection() -> None:
     T_grid = np.array([0.1, 0.5, 1.0])
-    K_grid = np.array([-0.2, 0.0, 0.2])
     
     # Safe surface: total variance w = iv^2 * T increases with T
     # T=0.1: w = 0.2^2 * 0.1 = 0.004
@@ -28,7 +48,7 @@ def test_calendar_arbitrage_detection():
     assert res_bad["has_arbitrage"]
     assert res_bad["violations"][0, 0]  # First transition decreases
 
-def test_butterfly_arbitrage_detection():
+def test_butterfly_arbitrage_detection() -> None:
     T_grid = np.array([0.5, 1.0])
     K_grid = np.array([-0.5, 0.0, 0.5])
     
@@ -50,7 +70,7 @@ def test_butterfly_arbitrage_detection():
     assert res_bad_dur["has_arbitrage"]
     assert res_bad_prc["has_arbitrage"]
 
-def test_guardian_parameter_checks():
+def test_guardian_parameter_checks() -> None:
     guardian = ModelRiskGuardian(vol_of_vol_limit=0.99, hurst_limit=0.015, residual_limit=0.0150)
     
     # 1. Clean Heston
@@ -100,7 +120,7 @@ def test_guardian_parameter_checks():
     assert res_high_res["anomaly_detected"]
     assert any("residual exceeds" in a for a in res_high_res["anomalies"])
 
-def test_guardian_price_or_fallback_clean():
+def test_guardian_price_or_fallback_clean() -> None:
     guardian = ModelRiskGuardian()
     T_grid = np.array([0.1, 0.5, 1.0])
     K_grid = np.array([-0.2, 0.0, 0.2])
@@ -120,7 +140,7 @@ def test_guardian_price_or_fallback_clean():
     assert res["ivs"].shape == (3, 3)
     assert not np.isnan(res["prices"]).any()
 
-def test_guardian_price_or_fallback_anomalous_fourier():
+def test_guardian_price_or_fallback_anomalous_fourier() -> None:
     guardian = ModelRiskGuardian(vol_of_vol_limit=0.99)
     T_grid = np.array([0.1, 0.5, 1.0])
     K_grid = np.array([-0.2, 0.0, 0.2])
@@ -143,7 +163,7 @@ def test_guardian_price_or_fallback_anomalous_fourier():
     assert res["ivs"].shape == (3, 3)
     assert not np.isnan(res["prices"]).any()
     
-def test_guardian_price_or_fallback_anomalous_particle():
+def test_guardian_price_or_fallback_anomalous_particle() -> None:
     # Only run MLSV particle solver if CPU/GPU supports it
     guardian = ModelRiskGuardian(vol_of_vol_limit=0.99)
     T_grid = np.array([0.1, 0.5])
@@ -169,10 +189,9 @@ def test_guardian_price_or_fallback_anomalous_particle():
 
 # ── F-07: Dedicated price_to_iv edge-case tests ──────────────────────────────
 
-from deepvol.mrm.guardian import price_to_iv
 
 
-def test_price_to_iv_round_trip():
+def test_price_to_iv_round_trip() -> None:
     """Verify that price_to_iv inverts a known BS price back to the correct IV."""
     import scipy.stats as stats
     S, K, T, sigma_true = 100.0, 100.0, 1.0, 0.25
@@ -184,7 +203,7 @@ def test_price_to_iv_round_trip():
     assert abs(iv_recovered - sigma_true) < 1e-6, f"Expected {sigma_true}, got {iv_recovered}"
 
 
-def test_price_to_iv_below_intrinsic():
+def test_price_to_iv_below_intrinsic() -> None:
     """Price ≤ intrinsic should return the floor IV (1e-4)."""
     S, K, T = 110.0, 100.0, 0.5
     intrinsic = S - K  # = 10.0
@@ -195,7 +214,7 @@ def test_price_to_iv_below_intrinsic():
     assert iv_exact == 1e-4, f"Expected floor 1e-4 for exact intrinsic price, got {iv_exact}"
 
 
-def test_price_to_iv_at_spot():
+def test_price_to_iv_at_spot() -> None:
     """Price ≥ spot should return the ceiling IV (5.0)."""
     S, K, T = 100.0, 100.0, 1.0
     iv = price_to_iv(S, S, K, T)
@@ -205,7 +224,7 @@ def test_price_to_iv_at_spot():
     assert iv_above == 5.0, f"Expected ceiling 5.0 for price>spot, got {iv_above}"
 
 
-def test_price_to_iv_deep_otm():
+def test_price_to_iv_deep_otm() -> None:
     """Deep OTM option (very small price) should return a small but valid IV."""
     S, K, T = 100.0, 200.0, 0.5  # Very deep OTM
     price = 0.001  # Tiny premium
@@ -214,7 +233,7 @@ def test_price_to_iv_deep_otm():
     assert np.isfinite(iv), f"IV is not finite: {iv}"
 
 
-def test_price_to_iv_zero_and_negative():
+def test_price_to_iv_zero_and_negative() -> None:
     """Zero or negative prices should return floor IV without error."""
     S, K, T = 100.0, 100.0, 1.0
     iv_zero = price_to_iv(0.0, S, K, T)
@@ -227,23 +246,6 @@ def test_price_to_iv_zero_and_negative():
 # ===========================================================================
 # Milestone 3 — Tasks 3.3 & 3.4: FX Cross Guardian, OOD Detector & Reserve Tracker
 # ===========================================================================
-
-import asyncio
-from datetime import datetime, timedelta, timezone
-import time
-from deepvol.mrm.fx_cross_guardian import (
-    FallbackReasonEnum,
-    FXCrossGuardian,
-    MarketStateDriftMonitor,
-    MarketStateOODDetector,
-    ModelReserveTracker,
-    PricingEngineEnum,
-    RoutingDecision,
-)
-from deepvol.market.svi_slice import RawSVI
-from deepvol.models.fx_cross_analytic import AnalyticTriangulated, Col
-from deepvol.models.fx_cross_copula import CopulaConfig, CrossState, GaussianCopulaCrossEngine
-from deepvol.models.fx_cross_surrogate import CrossVolSurrogateEngine, ResidualCrossVolNet
 
 
 def _make_sample_12d_market_states(n: int, seed: int = 42) -> torch.Tensor:
@@ -273,10 +275,11 @@ def _make_34col_state_from_12d(m_12d: torch.Tensor) -> torch.Tensor:
     """Expands 12-D market state into a 34-column engine tensor."""
     S_cnt = m_12d.shape[0]
     X = torch.zeros(S_cnt, 34, dtype=torch.float64)
-    sq_T = m_12d[:, 0]
-    X[:, Col.T] = sq_T ** 2
-    X[:, Col.T_SET] = sq_T ** 2
-    X[:, Col.RHO] = m_12d[:, 1]
+    sq_T = torch.clamp(m_12d[:, 0].abs(), min=1e-4)
+    T_val = sq_T ** 2
+    X[:, Col.T] = T_val
+    X[:, Col.T_SET] = T_val
+    X[:, Col.RHO] = torch.clamp(m_12d[:, 1], -0.999, 0.999)
     X[:, Col.XI1 : Col.XI1 + 5] = m_12d[:, 2:7]
     X[:, Col.XI2 : Col.XI2 + 5] = m_12d[:, 7:12]
 
@@ -289,13 +292,12 @@ def _make_34col_state_from_12d(m_12d: torch.Tensor) -> torch.Tensor:
     X[:, Col.NN_GATE] = 1.0
 
     # Basic SVI params matching ATM vols
-    atm1 = m_12d[:, 2]
-    atm2 = m_12d[:, 7]
-    T_val = sq_T ** 2
-    X[:, Col.SVI1] = (atm1 ** 2) * T_val
+    atm1 = torch.clamp(m_12d[:, 2].abs(), min=0.01)
+    atm2 = torch.clamp(m_12d[:, 7].abs(), min=0.01)
+    X[:, Col.SVI1] = torch.clamp((atm1 ** 2) * T_val, min=1e-4)
     X[:, Col.SVI1 + 1] = 0.05
     X[:, Col.SVI1 + 4] = 0.10
-    X[:, Col.SVI2] = (atm2 ** 2) * T_val
+    X[:, Col.SVI2] = torch.clamp((atm2 ** 2) * T_val, min=1e-4)
     X[:, Col.SVI2 + 1] = 0.05
     X[:, Col.SVI2 + 4] = 0.10
 
@@ -351,6 +353,12 @@ def test_g32_crisis_shocks_100_percent_fallback() -> None:
     unit_dirs = unit_dirs / torch.norm(unit_dirs, dim=-1, keepdim=True)
     radii = torch.empty(500, 1, dtype=torch.float64).uniform_(1.2 * detector.q995, 2.5 * detector.q995, generator=gen)
     mahalanobis_crisis = detector.mean + (unit_dirs @ L.t()) * radii
+
+    # Physical bounds for market states under crisis perturbations
+    mahalanobis_crisis[:, 0] = torch.clamp(mahalanobis_crisis[:, 0], min=0.01, max=3.0)
+    mahalanobis_crisis[:, 1] = torch.clamp(mahalanobis_crisis[:, 1], min=-0.99, max=0.99)
+    mahalanobis_crisis[:, 2] = torch.clamp(mahalanobis_crisis[:, 2], min=0.01, max=2.5)
+    mahalanobis_crisis[:, 7] = torch.clamp(mahalanobis_crisis[:, 7], min=0.01, max=2.5)
 
     # 500 box violations (e.g. RUB ATM vol 150%, extreme correlation, extreme RR)
     box_crisis = train_states[:500].clone()
@@ -462,7 +470,7 @@ class _MockCopulaEngine:
         if self.delay_sec > 0:
             time.sleep(self.delay_sec)
         # Returns deterministic synthetic price: max(F - K, 0) + 2.0
-        F_val = float(state.F.squeeze()[0].item() if state.F.dim() > 0 else state.F.item())
+        F_val = float(state.F.flatten()[0].item())
         K_f64 = strikes.to(dtype=torch.float64)
         c = torch.clamp(F_val - K_f64, min=0.0) + 2.0
         if c.dim() == 1:
