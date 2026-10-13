@@ -2489,6 +2489,13 @@ async def _fx_cross_price_batch_impl(request: Request) -> Response:
     executor: FXCrossGPUExecutor = state["executor"]
 
     content_type = request.headers.get("content-type", "application/json")
+    accept = request.headers.get("accept", "*/*")
+    allowed_ct = ["application/json", "application/vnd.apache.arrow.stream"]
+    if not any(allowed in content_type for allowed in allowed_ct):
+        raise HTTPException(status_code=415, detail="Unsupported Content-Type")
+    allowed_accept = ["*/*", "application/json", "application/vnd.apache.arrow.stream"]
+    if not any(allowed in accept for allowed in allowed_accept):
+        raise HTTPException(status_code=406, detail="Not Acceptable")
     body = await request.body()
 
     def _prepare_inputs() -> Tuple[
