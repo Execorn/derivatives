@@ -5,6 +5,7 @@ import math
 import struct
 from collections import OrderedDict
 from dataclasses import dataclass
+import threading
 from typing import Any, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
@@ -130,11 +131,15 @@ def fit_ssvi_slice(x: Tensor, w: Tensor) -> Tuple[Tensor, Tensor]:
             return cast(np.ndarray[Any, Any], vol_pred - sig_row)
 
         best_res = None
-        for u0 in (-0.5, 0.0, 0.5):
-            for v0 in (-1.0, 0.0, 1.0):
+        for u0 in (0.0, -0.5, 0.5):
+            for v0 in (0.0, -1.0, 1.0):
                 sol = least_squares(residuals, [0.0, u0, v0], ftol=1e-12, xtol=1e-12)
                 if best_res is None or sol.cost < best_res.cost:
                     best_res = sol
+                if best_res.cost < 1e-8:
+                    break
+            if best_res is not None and best_res.cost < 1e-8:
+                break
 
         assert best_res is not None
         th_opt, r_opt, ph_opt = get_params(best_res.x)
@@ -462,6 +467,7 @@ class SmileCanonicalizer:
     def __init__(self, cache_size: int = 4096) -> None:
         self.cache_size = cache_size
         self._cache: OrderedDict[bytes, CanonicalSmile] = OrderedDict()
+        self._lock = threading.Lock()
 
     @staticmethod
     def cache_key(
@@ -484,6 +490,7 @@ class SmileCanonicalizer:
         quotes: Tensor,
         conv: Sequence[Tuple[DeltaConvention, AtmConvention, StrangleConvention]],
         leg: LegMarket,
+        compute_jacobian: bool = True,
     ) -> CanonicalSmile:
         """Canonicalizes market smile quotes across conventions.
 
@@ -491,6 +498,7 @@ class SmileCanonicalizer:
             quotes: Market quotes tensor of shape (S, 5) or (5,), float64.
             conv: Sequence of convention tuples of length S.
             leg: LegMarket container of length S.
+            compute_jacobian: Whether to compute analytical/numerical Jacobians.
 
         Returns:
             CanonicalSmile container.
@@ -501,6 +509,7 @@ class SmileCanonicalizer:
 
         if self.cache_size > 0:
             h_batch = hashlib.blake2b(digest_size=16)
+            h_batch.update(b"J1" if compute_jacobian else b"J0")
             for i in range(S_len):
                 q_row = [float(val) for val in quotes_in[i].tolist()]
                 l_row = [
@@ -513,16 +522,20 @@ class SmileCanonicalizer:
                 h_batch.update(self.cache_key(q_row, l_row, conv_str))
             batch_key = h_batch.digest()
 
-            if batch_key in self._cache:
-                self._cache.move_to_end(batch_key)
-                return self._cache[batch_key]
+            with self._lock:
+                if batch_key in self._cache:
+                    self._cache.move_to_end(batch_key)
+                    return self._cache[batch_key]
 
-        result = self.canonicalize_unmemoized(quotes_in, conv, leg)
+        result = self.canonicalize_unmemoized(
+            quotes_in, conv, leg, compute_jacobian=compute_jacobian
+        )
 
         if self.cache_size > 0 and batch_key is not None:
-            if len(self._cache) >= self.cache_size:
-                self._cache.popitem(last=False)
-            self._cache[batch_key] = result
+            with self._lock:
+                if len(self._cache) >= self.cache_size:
+                    self._cache.popitem(last=False)
+                self._cache[batch_key] = result
 
         return result
 
@@ -531,6 +544,7 @@ class SmileCanonicalizer:
         quotes: Tensor,
         conv: Sequence[Tuple[DeltaConvention, AtmConvention, StrangleConvention]],
         leg: LegMarket,
+        compute_jacobian: bool = True,
     ) -> CanonicalSmile:
         S_len = quotes.shape[0]
         dev = quotes.device
@@ -621,57 +635,63 @@ class SmileCanonicalizer:
                 xi_list.append(xi_i[0])
         xi = torch.stack(xi_list, dim=0)
 
-        # Compute Jacobian d xi / d quotes via analytical IFT
-        R_theta = compute_raw_svi_residual_jacobian_theta(final_svi, x_mkt)
-        R_q = compute_raw_svi_residual_jacobian_q(quotes, leg, conv, final_svi, x_mkt)
-        Psi_theta = compute_canonical_feature_jacobian_theta(final_svi, leg)
+        if compute_jacobian:
+            # Compute Jacobian d xi / d quotes via analytical IFT
+            R_theta = compute_raw_svi_residual_jacobian_theta(final_svi, x_mkt)
+            R_q = compute_raw_svi_residual_jacobian_q(quotes, leg, conv, final_svi, x_mkt)
+            Psi_theta = compute_canonical_feature_jacobian_theta(final_svi, leg)
 
-        jacobian = torch.zeros(S_len, 5, 5, dtype=torch.float64, device=dev)
+            jacobian = torch.zeros(S_len, 5, 5, dtype=torch.float64, device=dev)
 
-        for i in range(S_len):
-            if conv[i] == ref_conv and not used_ssvi_list[i]:
-                jacobian[i] = torch.eye(5, dtype=torch.float64, device=dev)
-                R_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
-                R_q[i] = -torch.eye(5, dtype=torch.float64, device=dev)
-                Psi_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
-            elif used_ssvi_list[i]:
-                # On SSVI fallback, evaluate Jacobian strictly on the SSVI manifold
-                h = 1e-6
-                J_mat = torch.zeros(5, 5, dtype=torch.float64, device=dev)
-                q_base = quotes[i:i+1].detach()
-                leg_i = LegMarket(
-                    spot=leg.spot[i:i+1],
-                    df_foreign=leg.df_foreign[i:i+1],
-                    df_domestic=leg.df_domestic[i:i+1],
-                    T=leg.T[i:i+1],
-                )
-                for j in range(5):
-                    q_p = q_base.clone()
-                    q_p[0, j] += h
-                    K_p, sig_p = pillar_strikes(q_p, leg_i, conv[i][0], conv[i][1])
-                    xp = torch.log(K_p / leg_i.forward.unsqueeze(-1))
-                    wp = (sig_p ** 2) * leg_i.T.unsqueeze(-1)
-                    params_p, _ = fit_ssvi_slice(xp, wp)
-                    svi_p = ssvi_to_raw_svi(params_p[:, 0], params_p[:, 1], params_p[:, 2])
-                    xi_p = canonical_features(svi_p, leg_i)[0]
+            for i in range(S_len):
+                if conv[i] == ref_conv and not used_ssvi_list[i]:
+                    jacobian[i] = torch.eye(5, dtype=torch.float64, device=dev)
+                    R_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
+                    R_q[i] = -torch.eye(5, dtype=torch.float64, device=dev)
+                    Psi_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
+                elif used_ssvi_list[i]:
+                    # On SSVI fallback, evaluate Jacobian strictly on the SSVI manifold
+                    h = 1e-6
+                    J_mat = torch.zeros(5, 5, dtype=torch.float64, device=dev)
+                    q_base = quotes[i:i+1].detach()
+                    leg_i = LegMarket(
+                        spot=leg.spot[i:i+1],
+                        df_foreign=leg.df_foreign[i:i+1],
+                        df_domestic=leg.df_domestic[i:i+1],
+                        T=leg.T[i:i+1],
+                    )
+                    for j in range(5):
+                        q_p = q_base.clone()
+                        q_p[0, j] += h
+                        K_p, sig_p = pillar_strikes(q_p, leg_i, conv[i][0], conv[i][1])
+                        xp = torch.log(K_p / leg_i.forward.unsqueeze(-1))
+                        wp = (sig_p ** 2) * leg_i.T.unsqueeze(-1)
+                        params_p, _ = fit_ssvi_slice(xp, wp)
+                        svi_p = ssvi_to_raw_svi(params_p[:, 0], params_p[:, 1], params_p[:, 2])
+                        xi_p = canonical_features(svi_p, leg_i)[0]
 
-                    q_m = q_base.clone()
-                    q_m[0, j] -= h
-                    K_m, sig_m = pillar_strikes(q_m, leg_i, conv[i][0], conv[i][1])
-                    xm = torch.log(K_m / leg_i.forward.unsqueeze(-1))
-                    wm = (sig_m ** 2) * leg_i.T.unsqueeze(-1)
-                    params_m, _ = fit_ssvi_slice(xm, wm)
-                    svi_m = ssvi_to_raw_svi(params_m[:, 0], params_m[:, 1], params_m[:, 2])
-                    xi_m = canonical_features(svi_m, leg_i)[0]
+                        q_m = q_base.clone()
+                        q_m[0, j] -= h
+                        K_m, sig_m = pillar_strikes(q_m, leg_i, conv[i][0], conv[i][1])
+                        xm = torch.log(K_m / leg_i.forward.unsqueeze(-1))
+                        wm = (sig_m ** 2) * leg_i.T.unsqueeze(-1)
+                        params_m, _ = fit_ssvi_slice(xm, wm)
+                        svi_m = ssvi_to_raw_svi(params_m[:, 0], params_m[:, 1], params_m[:, 2])
+                        xi_m = canonical_features(svi_m, leg_i)[0]
 
-                    J_mat[:, j] = (xi_p - xi_m) / (2.0 * h)
-                jacobian[i] = J_mat
-                R_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
-                R_q[i] = -J_mat
-                Psi_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
-            else:
-                dtheta_dq_i = -torch.linalg.solve(R_theta[i], R_q[i])
-                jacobian[i] = Psi_theta[i] @ dtheta_dq_i
+                        J_mat[:, j] = (xi_p - xi_m) / (2.0 * h)
+                    jacobian[i] = J_mat
+                    R_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
+                    R_q[i] = -J_mat
+                    Psi_theta[i] = torch.eye(5, dtype=torch.float64, device=dev)
+                else:
+                    dtheta_dq_i = -torch.linalg.solve(R_theta[i], R_q[i])
+                    jacobian[i] = Psi_theta[i] @ dtheta_dq_i
+        else:
+            jacobian = torch.zeros(S_len, 5, 5, dtype=torch.float64, device=dev)
+            R_theta = torch.zeros(S_len, 5, 5, dtype=torch.float64, device=dev)
+            R_q = torch.zeros(S_len, 5, 5, dtype=torch.float64, device=dev)
+            Psi_theta = torch.zeros(S_len, 5, 5, dtype=torch.float64, device=dev)
 
         # ATMF volatility: w(0) / T
         w_atmf = final_svi.w(torch.zeros(S_len, 1, dtype=torch.float64, device=dev)).squeeze(1)

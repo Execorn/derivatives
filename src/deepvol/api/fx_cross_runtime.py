@@ -17,6 +17,8 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import copy
 import gc
 import logging
 import math
@@ -27,6 +29,7 @@ from typing import Any, Callable, Dict, Final, Optional, Tuple, Union
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.special import ndtr  # type: ignore[import-untyped]
 import torch
 from torch import Tensor
 import torch._inductor.config as inductor_config
@@ -115,16 +118,31 @@ class CPUQuotePath:
     """Single-threaded forward-only quote engine compiled via C++ Inductor backend on CPU."""
 
     def __init__(self, engine: CrossVolSurrogateEngine) -> None:
-        self.engine = engine.to("cpu")
+        self.engine = copy.deepcopy(engine).to("cpu")
         try:
             torch.set_num_threads(1)
         except RuntimeError:
             pass
-        self.compiled_fn = torch.compile(
-            self.engine.forward_single,
-            dynamic=False,
-            fullgraph=True,
-        )
+        self.compiled_fn = self.engine.forward_single
+        try:
+            cfn = torch.compile(
+                self.engine.forward_single,
+                dynamic=False,
+                fullgraph=True,
+            )
+            dummy_X = torch.zeros((1, N_COLS), dtype=torch.float64, device="cpu")
+            dummy_X[0, Col.F] = 1.0
+            dummy_X[0, Col.K] = 1.0
+            dummy_X[0, Col.T] = 1.0
+            dummy_X[0, Col.T_SET] = 1.0
+            dummy_X[0, Col.D] = 1.0
+            dummy_X[0, Col.G] = 1.0
+            with torch.no_grad():
+                _ = cfn(dummy_X)
+            self.compiled_fn = cfn
+        except Exception:
+            logger.info("CPU Inductor C++ compilation unavailable; using eager CPU forward")
+            self.compiled_fn = self.engine.forward_single
 
     def price_single(self, X: NDArray[Any]) -> NDArray[Any]:
         """Evaluates single-row input (1, 34) on CPU and returns packed output (1, 9)."""
@@ -132,7 +150,10 @@ class CPUQuotePath:
             X = X.reshape(1, -1)
         X_t = torch.from_numpy(X).to(dtype=torch.float64, device="cpu")
         with torch.no_grad():
-            out = self.compiled_fn(X_t)
+            try:
+                out = self.compiled_fn(X_t)
+            except Exception:
+                out = self.engine.forward_single(X_t)
         return out.detach().numpy().copy()
 
 
@@ -373,7 +394,7 @@ class FXCrossRuntime:
         vanna = -D_val * g_val * n1 * d2 / sigma
         vomma = B_ss
 
-        n_phi_d1 = 0.5 * (1.0 + np.vectorize(math.erf)(phi_val * d1 / math.sqrt(2.0)))
+        n_phi_d1 = ndtr(phi_val * d1)
         carry_term = phi_val * D_val * F_val * n_phi_d1 * (r_C - r_A)
         decay_term = (D_val * F_val * sigma * n1) / (2.0 * np.sqrt(T_val))
         theta = (r_set * V - carry_term - decay_term) / 365.0
@@ -442,7 +463,7 @@ class FXCrossRuntime:
         d1 = (-np.log(K_val / F_val) + 0.5 * sd * sd) / sd
         n1 = np.exp(-0.5 * d1 * d1) / _SQ2PI
 
-        n_phi_d1 = 0.5 * (1.0 + np.vectorize(math.erf)(phi_val * d1 / math.sqrt(2.0)))
+        n_phi_d1 = ndtr(phi_val * d1)
         carry_term = phi_val * D_val * F_val * n_phi_d1 * (r_C - r_A)
         decay_term = (D_val * F_val * sigma * n1) / (2.0 * np.sqrt(T_val))
         roll_term = B_s * s_k * (r_C - r_A)
@@ -496,6 +517,9 @@ class FXCrossGPUExecutor:
         self._running = False
         self._warmup_error: Optional[Exception] = None
         self._warmup_done: threading.Event = threading.Event()
+        self._cpu_fallback_pool = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="deepvol-cpu-fallback"
+        )
 
     def start(self, wait_warmup: bool = True) -> None:
         """Starts the dedicated background executor thread and optionally waits for warmup."""
@@ -525,6 +549,7 @@ class FXCrossGPUExecutor:
         self._queue.put(self._stop_sentinel)
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=5.0)
+        self._cpu_fallback_pool.shutdown(wait=False)
 
     @property
     def queue_depth(self) -> int:
@@ -562,7 +587,7 @@ class FXCrossGPUExecutor:
                 except Exception as ex:
                     loop.call_soon_threadsafe(fut.set_exception, ex)
 
-            threading.Thread(target=_eval_cpu, daemon=True).start()
+            self._cpu_fallback_pool.submit(_eval_cpu)
             return fut
 
         task = _Task(X=X, single=single, future=fut, loop=loop)

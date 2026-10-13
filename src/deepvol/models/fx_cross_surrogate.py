@@ -254,8 +254,8 @@ class CrossVolSurrogateEngine(nn.Module):
             *[tj.const(xi2[:, i], P) for i in range(5)],
         ]
 
-        mean = self.net.feature_mean.double()
-        std = self.net.feature_std.double()
+        mean = self.net.feature_mean.to(device=X.device, dtype=torch.float64)
+        std = self.net.feature_std.to(device=X.device, dtype=torch.float64)
         cols_std = [
             tj.Jet(
                 v=(c.v - mean[j]) / std[j],

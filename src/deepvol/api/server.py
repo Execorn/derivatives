@@ -25,11 +25,12 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import uuid
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from cachetools import TTLCache
 import orjson
 
 import numpy as np
+from numpy.typing import NDArray
 import torch
 
 # Limit intra-op threads to prevent CPU core thrashing when executing in thread pools
@@ -129,28 +130,44 @@ class AsyncReadWriteLock:
 
     def __init__(self):
         self._readers = 0
-        self._write_lock = asyncio.Lock()
-        self._read_ready = asyncio.Condition()
+        self._write_lock = None
+        self._read_ready = None
+        self._loop = None
+
+    def _get_locks(self):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+        if self._loop is not loop or self._write_lock is None or self._read_ready is None:
+            self._loop = loop
+            self._write_lock = asyncio.Lock()
+            self._read_ready = asyncio.Condition()
+            self._readers = 0
+        return self._write_lock, self._read_ready
 
     async def acquire_read(self):
-        async with self._read_ready:
-            while self._write_lock.locked():
-                await self._read_ready.wait()
+        write_lock, read_ready = self._get_locks()
+        async with read_ready:
+            while write_lock.locked():
+                await read_ready.wait()
             self._readers += 1
 
     async def release_read(self):
-        async with self._read_ready:
+        write_lock, read_ready = self._get_locks()
+        async with read_ready:
             self._readers -= 1
             if self._readers == 0:
-                self._read_ready.notify_all()
+                read_ready.notify_all()
 
     async def acquire_write(self):
-        await self._write_lock.acquire()
+        write_lock, read_ready = self._get_locks()
+        await write_lock.acquire()
         t0 = asyncio.get_event_loop().time()
         _WRITE_STARVATION_WARN_S = 30.0
-        async with self._read_ready:
+        async with read_ready:
             while self._readers > 0:
-                await self._read_ready.wait()
+                await read_ready.wait()
                 elapsed = asyncio.get_event_loop().time() - t0
                 if elapsed > _WRITE_STARVATION_WARN_S:
                     import logging as _logging
@@ -164,10 +181,11 @@ class AsyncReadWriteLock:
                     t0 = asyncio.get_event_loop().time()  # reset to avoid log spam
 
     async def release_write(self):
-        if self._write_lock.locked():
-            self._write_lock.release()
-        async with self._read_ready:
-            self._read_ready.notify_all()
+        write_lock, read_ready = self._get_locks()
+        if write_lock.locked():
+            write_lock.release()
+        async with read_ready:
+            read_ready.notify_all()
 
     class ReaderContext:
         def __init__(self, rwlock):
@@ -2132,6 +2150,9 @@ _FX_CROSS_RW_LOCK = AsyncReadWriteLock()
 
 
 def _init_fx_cross_state() -> None:
+    import sys
+
+    sys.setswitchinterval(0.0002)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     net = ResidualCrossVolNet(width=64, depth=3, members=1)
     engine = CrossVolSurrogateEngine(net)
@@ -2210,11 +2231,9 @@ async def fx_cross_health() -> Dict[str, Any]:
     }
 
 
-@fx_cross_router.post("/price", response_model=TriangulatedFXOptionResponse)
-async def fx_cross_price(
+async def _fx_cross_price_impl(
     req: TriangulatedFXOptionRequest,
 ) -> TriangulatedFXOptionResponse:
-    """Prices a single triangulated cross option with smile-inclusive Greeks."""
     state = _get_fx_cross_state()
     guardian: FXCrossGuardian = state["guardian"]
     canonicalizer: SmileCanonicalizer = state["canonicalizer"]
@@ -2267,7 +2286,7 @@ async def fx_cross_price(
             df_domestic=torch.tensor([d1_d], dtype=torch.float64),
             T=torch.tensor([max(T_val, 1e-4)], dtype=torch.float64),
         )
-        cs1 = canonicalizer.canonicalize(q1, conv1, lm1)
+        cs1 = canonicalizer.canonicalize(q1, conv1, lm1, compute_jacobian=False)
     except Exception:
         w_atm = (leg1.smile.atm_vol**2) * max(T_val, 1e-4)
         cs1 = CanonicalSmile(
@@ -2311,7 +2330,7 @@ async def fx_cross_price(
             df_domestic=torch.tensor([d2_d], dtype=torch.float64),
             T=torch.tensor([max(T_val, 1e-4)], dtype=torch.float64),
         )
-        cs2 = canonicalizer.canonicalize(q2, conv2, lm2)
+        cs2 = canonicalizer.canonicalize(q2, conv2, lm2, compute_jacobian=False)
     except Exception:
         w_atm = (leg2.smile.atm_vol**2) * max(T_val, 1e-4)
         cs2 = CanonicalSmile(
@@ -2461,8 +2480,16 @@ async def fx_cross_price(
     )
 
 
-@fx_cross_router.post("/price_batch")
-async def fx_cross_price_batch(request: Request) -> Response:
+@fx_cross_router.post("/price", response_model=TriangulatedFXOptionResponse)
+async def fx_cross_price(
+    req: TriangulatedFXOptionRequest,
+) -> TriangulatedFXOptionResponse:
+    """Prices a single triangulated cross option with smile-inclusive Greeks."""
+    async with _FX_CROSS_RW_LOCK.reader():
+        return await _fx_cross_price_impl(req)
+
+
+async def _fx_cross_price_batch_impl(request: Request) -> Response:
     """Columnar batch evaluation supporting JSON and Apache Arrow IPC content negotiation."""
     state = _get_fx_cross_state()
     guardian: FXCrossGuardian = state["guardian"]
@@ -2471,40 +2498,40 @@ async def fx_cross_price_batch(request: Request) -> Response:
 
     content_type = request.headers.get("content-type", "application/json")
     body = await request.body()
-    try:
+
+    def _prepare_inputs() -> Tuple[
+        NDArray[np.float64],
+        NDArray[np.bool_],
+        List[Optional[str]],
+        List[float],
+        int,
+        str,
+    ]:
         if ARROW_MIME in content_type:
             batch = decode_arrow_batch(body)
         else:
             batch = decode_json_batch(body)
-    except (ValueError, ValidationError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    sec_year = 365.0 * 86400.0
-    S_cnt = len(batch.states)
-    state_table = np.zeros((S_cnt, N_COLS), dtype=np.float64)
-    state_z_ref = np.zeros(S_cnt, dtype=np.float64)
-    state_min_g = []
+        sec_year = 365.0 * 86400.0
+        S_cnt = len(batch.states)
+        state_table = np.zeros((S_cnt, N_COLS), dtype=np.float64)
 
-    for s_idx, st in enumerate(batch.states):
-        as_of = st.as_of_date
-        exp_dt = st.expiration_date
-        set_dt = st.settlement_date
-        T_val = (exp_dt - as_of).total_seconds() / sec_year
-        T_set_val = (set_dt - as_of).total_seconds() / sec_year
+        q1_list, conv1_list, s1_list, d1f_list, d1d_list = [], [], [], [], []
+        q2_list, conv2_list, s2_list, d2f_list, d2d_list = [], [], [], [], []
+        T_list, T_set_list, D_set_list, rho_list = [], [], [], []
 
-        leg1 = st.market_data.leg1
-        leg2 = st.market_data.leg2
-        s1, s2 = leg1.spot, leg2.spot
-        d1_f, d1_d = leg1.foreign_discount_factor, leg1.domestic_discount_factor
-        d2_f, d2_d = leg2.foreign_discount_factor, leg2.domestic_discount_factor
-        D_A, _, D_C = d1_f, d1_d, d2_d
-        D_set = st.market_data.settlement_discount_factor
-        rho = st.market_data.correlation
-        g = D_A / D_C
-        F = s1 * s2 * g
+        for st in batch.states:
+            as_of = st.as_of_date
+            exp_dt = st.expiration_date
+            set_dt = st.settlement_date
+            T_val = (exp_dt - as_of).total_seconds() / sec_year
+            T_set_val = (set_dt - as_of).total_seconds() / sec_year
+            T_list.append(max(T_val, 1e-4))
+            T_set_list.append(max(T_set_val, 1e-4))
 
-        q1 = torch.tensor(
-            [
+            leg1 = st.market_data.leg1
+            leg2 = st.market_data.leg2
+            q1_list.append(
                 [
                     leg1.smile.atm_vol,
                     leg1.smile.rr25,
@@ -2512,26 +2539,19 @@ async def fx_cross_price_batch(request: Request) -> Response:
                     leg1.smile.rr10,
                     leg1.smile.bf10,
                 ]
-            ],
-            dtype=torch.float64,
-        )
-        conv1 = [
-            (
-                DeltaConvention(leg1.smile.delta_convention.value),
-                AtmConvention(leg1.smile.atm_convention.value),
-                StrangleConvention(leg1.smile.strangle_convention.value),
             )
-        ]
-        lm1 = LegMarket(
-            spot=torch.tensor([s1], dtype=torch.float64),
-            df_foreign=torch.tensor([d1_f], dtype=torch.float64),
-            df_domestic=torch.tensor([d1_d], dtype=torch.float64),
-            T=torch.tensor([max(T_val, 1e-4)], dtype=torch.float64),
-        )
-        cs1 = canonicalizer.canonicalize(q1, conv1, lm1)
+            conv1_list.append(
+                (
+                    DeltaConvention(leg1.smile.delta_convention.value),
+                    AtmConvention(leg1.smile.atm_convention.value),
+                    StrangleConvention(leg1.smile.strangle_convention.value),
+                )
+            )
+            s1_list.append(leg1.spot)
+            d1f_list.append(leg1.foreign_discount_factor)
+            d1d_list.append(leg1.domestic_discount_factor)
 
-        q2 = torch.tensor(
-            [
+            q2_list.append(
                 [
                     leg2.smile.atm_vol,
                     leg2.smile.rr25,
@@ -2539,135 +2559,185 @@ async def fx_cross_price_batch(request: Request) -> Response:
                     leg2.smile.rr10,
                     leg2.smile.bf10,
                 ]
-            ],
-            dtype=torch.float64,
-        )
-        conv2 = [
-            (
-                DeltaConvention(leg2.smile.delta_convention.value),
-                AtmConvention(leg2.smile.atm_convention.value),
-                StrangleConvention(leg2.smile.strangle_convention.value),
             )
-        ]
+            conv2_list.append(
+                (
+                    DeltaConvention(leg2.smile.delta_convention.value),
+                    AtmConvention(leg2.smile.atm_convention.value),
+                    StrangleConvention(leg2.smile.strangle_convention.value),
+                )
+            )
+            s2_list.append(leg2.spot)
+            d2f_list.append(leg2.foreign_discount_factor)
+            d2d_list.append(leg2.domestic_discount_factor)
+
+            D_set_list.append(st.market_data.settlement_discount_factor)
+            rho_list.append(st.market_data.correlation)
+
+        q1 = torch.tensor(q1_list, dtype=torch.float64)
+        lm1 = LegMarket(
+            spot=torch.tensor(s1_list, dtype=torch.float64),
+            df_foreign=torch.tensor(d1f_list, dtype=torch.float64),
+            df_domestic=torch.tensor(d1d_list, dtype=torch.float64),
+            T=torch.tensor(T_list, dtype=torch.float64),
+        )
+        cs1 = canonicalizer.canonicalize(q1, conv1_list, lm1, compute_jacobian=False)
+
+        q2 = torch.tensor(q2_list, dtype=torch.float64)
         lm2 = LegMarket(
-            spot=torch.tensor([s2], dtype=torch.float64),
-            df_foreign=torch.tensor([d2_f], dtype=torch.float64),
-            df_domestic=torch.tensor([d2_d], dtype=torch.float64),
-            T=torch.tensor([max(T_val, 1e-4)], dtype=torch.float64),
+            spot=torch.tensor(s2_list, dtype=torch.float64),
+            df_foreign=torch.tensor(d2f_list, dtype=torch.float64),
+            df_domestic=torch.tensor(d2d_list, dtype=torch.float64),
+            T=torch.tensor(T_list, dtype=torch.float64),
         )
-        cs2 = canonicalizer.canonicalize(q2, conv2, lm2)
+        cs2 = canonicalizer.canonicalize(q2, conv2_list, lm2, compute_jacobian=False)
 
-        r_C = -math.log(D_C) / T_val if T_val > 0 else 0.0
-        r_A = -math.log(D_A) / T_val if T_val > 0 else 0.0
-        r_set = -math.log(D_set) / T_set_val if T_set_val > 0 else 0.0
+        s1_arr = np.array(s1_list, dtype=np.float64)
+        s2_arr = np.array(s2_list, dtype=np.float64)
+        d1f_arr = np.array(d1f_list, dtype=np.float64)
+        d2d_arr = np.array(d2d_list, dtype=np.float64)
+        T_arr = np.array(T_list, dtype=np.float64)
+        T_set_arr = np.array(T_set_list, dtype=np.float64)
+        D_set_arr = np.array(D_set_list, dtype=np.float64)
+        rho_arr = np.array(rho_list, dtype=np.float64)
 
-        state_table[s_idx, Col.F] = F
-        state_table[s_idx, Col.T] = T_val
-        state_table[s_idx, Col.T_SET] = T_set_val
-        state_table[s_idx, Col.D] = D_set
-        state_table[s_idx, Col.G] = g
-        state_table[s_idx, Col.RHO] = rho
-        state_table[s_idx, Col.SVI1 : Col.SVI1 + 5] = cs1.slice_params[0].cpu().numpy()
-        state_table[s_idx, Col.SVI2 : Col.SVI2 + 5] = cs2.slice_params[0].cpu().numpy()
-        state_table[s_idx, Col.XI1 : Col.XI1 + 5] = cs1.xi[0].cpu().numpy()
-        state_table[s_idx, Col.XI2 : Col.XI2 + 5] = cs2.xi[0].cpu().numpy()
-        state_table[s_idx, Col.R_C] = r_C
-        state_table[s_idx, Col.R_A] = r_A
-        state_table[s_idx, Col.R_SET] = r_set
-        state_table[s_idx, Col.NN_GATE] = 1.0
+        g_arr = d1f_arr / d2d_arr
+        F_arr = s1_arr * s2_arr * g_arr
 
-        sig_ref = math.sqrt(
-            leg1.smile.atm_vol**2
-            + leg2.smile.atm_vol**2
-            + 2.0 * rho * leg1.smile.atm_vol * leg2.smile.atm_vol
+        state_table[:, Col.F] = F_arr
+        state_table[:, Col.T] = T_arr
+        state_table[:, Col.T_SET] = T_set_arr
+        state_table[:, Col.D] = D_set_arr
+        state_table[:, Col.G] = g_arr
+        state_table[:, Col.RHO] = rho_arr
+        state_table[:, Col.SVI1 : Col.SVI1 + 5] = cs1.slice_params.cpu().numpy()
+        state_table[:, Col.SVI2 : Col.SVI2 + 5] = cs2.slice_params.cpu().numpy()
+        state_table[:, Col.XI1 : Col.XI1 + 5] = cs1.xi.cpu().numpy()
+        state_table[:, Col.XI2 : Col.XI2 + 5] = cs2.xi.cpu().numpy()
+        state_table[:, Col.R_C] = np.where(T_arr > 0, -np.log(d2d_arr) / T_arr, 0.0)
+        state_table[:, Col.R_A] = np.where(T_arr > 0, -np.log(d1f_arr) / T_arr, 0.0)
+        state_table[:, Col.R_SET] = np.where(T_set_arr > 0, -np.log(D_set_arr) / T_set_arr, 0.0)
+        state_table[:, Col.NN_GATE] = 1.0
+
+        atm1 = q1[:, 0].cpu().numpy()
+        atm2 = q2[:, 0].cpu().numpy()
+        sig_ref = np.sqrt(atm1**2 + atm2**2 + 2.0 * rho_arr * atm1 * atm2)
+        state_z_ref = sig_ref * np.sqrt(np.maximum(T_arr, 1e-4))
+        state_min_g = np.minimum(cs1.min_g.cpu().numpy(), cs2.min_g.cpu().numpy()).tolist()
+
+        states_t = torch.from_numpy(state_table).to(dtype=torch.float64)
+        state_decision = guardian.route(states_t, engine=batch.options.engine)
+
+        N_cnt = len(batch.strike)
+        X = np.zeros((N_cnt, N_COLS), dtype=np.float64)
+        X[:] = state_table[batch.state_index]
+        X[:, Col.K] = batch.strike
+        X[:, Col.PHI] = batch.parity
+
+        fallback_mask = np.zeros(N_cnt, dtype=bool)
+        fallback_reasons_arr = np.full(N_cnt, "", dtype=object)
+
+        F_arr = X[:, Col.F]
+        denom = state_z_ref[batch.state_index]
+        denom = np.where(denom <= 0, 1e-4, denom)
+        z_arr = np.log(batch.strike / F_arr) / denom
+
+        for i in range(N_cnt):
+            s_i = batch.state_index[i]
+            if abs(z_arr[i]) >= 7.0:
+                fallback_mask[i] = True
+                fallback_reasons_arr[i] = FallbackReasonEnum.EXTREME_MONEYNESS.value
+                X[i, Col.NN_GATE] = 0.0
+            elif bool(state_decision.fallback_activated[s_i].item()):
+                fallback_mask[i] = True
+                fallback_reasons_arr[i] = (
+                    state_decision.fallback_reason[s_i]
+                    or FallbackReasonEnum.OOD_MARKET_REGIME.value
+                )
+                X[i, Col.NN_GATE] = 0.0
+            elif batch.options.engine == PricingEngineEnum.ANALYTIC_TRIANGULATED:
+                fallback_mask[i] = True
+                fallback_reasons_arr[i] = FallbackReasonEnum.ENGINE_REQUESTED.value
+                X[i, Col.NN_GATE] = 0.0
+
+        return (
+            X,
+            fallback_mask,
+            fallback_reasons_arr,
+            state_min_g,
+            S_cnt,
+            batch.options.engine.value,
         )
-        state_z_ref[s_idx] = sig_ref * math.sqrt(max(T_val, 1e-4))
-        state_min_g.append(float(min(cs1.min_g[0].item(), cs2.min_g[0].item())))
 
-    states_t = torch.from_numpy(state_table).to(dtype=torch.float64)
-    state_decision = guardian.route(states_t, engine=batch.options.engine)
-
-    N_cnt = len(batch.strike)
-    X = np.zeros((N_cnt, N_COLS), dtype=np.float64)
-    X[:] = state_table[batch.state_index]
-    X[:, Col.K] = batch.strike
-    X[:, Col.PHI] = batch.parity
-
-    fallback_mask = np.zeros(N_cnt, dtype=bool)
-    fallback_reasons: List[Optional[str]] = [None] * N_cnt
-
-    F_arr = X[:, Col.F]
-    denom = state_z_ref[batch.state_index]
-    denom = np.where(denom <= 0, 1e-4, denom)
-    z_arr = np.log(batch.strike / F_arr) / denom
-
-    for i in range(N_cnt):
-        s_i = batch.state_index[i]
-        if abs(z_arr[i]) >= 7.0:
-            fallback_mask[i] = True
-            fallback_reasons[i] = FallbackReasonEnum.EXTREME_MONEYNESS.value
-            X[i, Col.NN_GATE] = 0.0
-        elif bool(state_decision.fallback_activated[s_i].item()):
-            fallback_mask[i] = True
-            fallback_reasons[i] = (
-                state_decision.fallback_reason[s_i]
-                or FallbackReasonEnum.OOD_MARKET_REGIME.value
-            )
-            X[i, Col.NN_GATE] = 0.0
-        elif batch.options.engine == PricingEngineEnum.ANALYTIC_TRIANGULATED:
-            fallback_mask[i] = True
-            fallback_reasons[i] = FallbackReasonEnum.ENGINE_REQUESTED.value
-            X[i, Col.NN_GATE] = 0.0
+    try:
+        (
+            X,
+            fallback_mask,
+            fallback_reasons_arr,
+            state_min_g,
+            S_cnt,
+            engine_used_str,
+        ) = await asyncio.to_thread(_prepare_inputs)
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     t0 = time.perf_counter()
     fut = executor.submit(X, single=False)
     res = await fut
     latency_ms = (time.perf_counter() - t0) * 1e3
 
-    cols = {
-        "product_value": res[:, 0],
-        "implied_vol_cross": res[:, 1],
-        "delta_cross": res[:, 2],
-        "cash_delta": res[:, 3],
-        "gamma_cross": res[:, 4],
-        "vega_cross": res[:, 5],
-        "vega_leg1": res[:, 6],
-        "vega_leg2": res[:, 7],
-        "theta": res[:, 8],
-        "vanna_cross": res[:, 9],
-        "vomma_cross": res[:, 10],
-        "correlation_sensitivity": res[:, 11],
-        "fallback_mask": fallback_mask,
-        "fallback_reason": np.array(
-            [r if r is not None else "" for r in fallback_reasons]
-        ),
-    }
-
-    scalars = {
-        "status": "done",
-        "state_model_reserve_bps": [None] * S_cnt,
-        "state_durrleman_min_g": state_min_g,
-        "cold_states": S_cnt,
-        "engine_used": batch.options.engine.value,
-        "model_version": state["model_version"],
-        "latency_ms": round(latency_ms, 3),
-    }
-
     accept = request.headers.get("accept", "application/json")
-    if ARROW_MIME in accept:
-        meta = {
-            "status": "done",
-            "state_durrleman_min_g": orjson.dumps(state_min_g).decode("utf-8"),
-            "cold_states": str(S_cnt),
-            "engine_used": batch.options.engine.value,
-            "model_version": state["model_version"],
-            "latency_ms": str(round(latency_ms, 3)),
+
+    def _assemble_and_encode() -> Tuple[bytes, str]:
+        cols = {
+            "product_value": res[:, 0],
+            "implied_vol_cross": res[:, 1],
+            "delta_cross": res[:, 2],
+            "cash_delta": res[:, 3],
+            "gamma_cross": res[:, 4],
+            "vega_cross": res[:, 5],
+            "vega_leg1": res[:, 6],
+            "vega_leg2": res[:, 7],
+            "theta": res[:, 8],
+            "vanna_cross": res[:, 9],
+            "vomma_cross": res[:, 10],
+            "correlation_sensitivity": res[:, 11],
+            "fallback_mask": fallback_mask,
+            "fallback_reason": fallback_reasons_arr,
         }
-        resp_bytes = encode_arrow_response(cols, meta)
-        return Response(content=resp_bytes, media_type=ARROW_MIME)
-    else:
-        resp_bytes = encode_json_response(cols, scalars)
-        return Response(content=resp_bytes, media_type="application/json")
+
+        scalars = {
+            "status": "done",
+            "state_model_reserve_bps": [None] * S_cnt,
+            "state_durrleman_min_g": state_min_g,
+            "cold_states": S_cnt,
+            "engine_used": engine_used_str,
+            "model_version": state["model_version"],
+            "latency_ms": round(latency_ms, 3),
+        }
+
+        if ARROW_MIME in accept:
+            meta = {
+                "status": "done",
+                "state_durrleman_min_g": orjson.dumps(state_min_g).decode("utf-8"),
+                "cold_states": str(S_cnt),
+                "engine_used": engine_used_str,
+                "model_version": state["model_version"],
+                "latency_ms": str(round(latency_ms, 3)),
+            }
+            return encode_arrow_response(cols, meta), ARROW_MIME
+        else:
+            return encode_json_response(cols, scalars), "application/json"
+
+    resp_bytes, media_type = await asyncio.to_thread(_assemble_and_encode)
+    return Response(content=resp_bytes, media_type=media_type)
+
+
+@fx_cross_router.post("/price_batch")
+async def fx_cross_price_batch(request: Request) -> Response:
+    """Columnar batch evaluation supporting JSON and Apache Arrow IPC content negotiation."""
+    async with _FX_CROSS_RW_LOCK.reader():
+        return await _fx_cross_price_batch_impl(request)
 
 
 app.include_router(fx_cross_router)
