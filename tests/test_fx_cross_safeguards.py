@@ -428,3 +428,67 @@ def test_gate_g31_cartesian_stress_matrix() -> None:
         loss.backward()
         assert X_batch.grad is not None
         assert torch.isfinite(X_batch.grad).all(), "NaN/Inf in autograd backward gradient"
+
+
+def test_cross_slice_audit_multi_expiry_calendar_monotonicity() -> None:
+    """Verifies that cross_slice_audit enforces calendar monotonicity across expiries.
+
+    For an arbitrageable multi-expiry batch where total variance decreases (w2 < w1),
+    cross_slice_audit must reject with calendar_ok=False and composite ok=False.
+    For a valid monotonic term structure (w2 > w1), cross_slice_audit must certify
+    both calendar_ok=True and composite ok=True.
+    """
+    engine = AnalyticTriangulated()
+    state1 = make_clean_test_state().squeeze(0)
+    state2 = make_clean_test_state().squeeze(0)
+
+    # 1. Arbitrageable batch: T1=0.2, vol=0.50 -> w1 approx 0.05
+    #                         T2=1.0, vol=0.10 -> w2 approx 0.01 (w2 < w1)
+    state1_arb = state1.clone()
+    state1_arb[Col.T] = 0.2
+    state1_arb[Col.T_SET] = 0.2
+    state1_arb[Col.SVI1] = (0.50 ** 2) * 0.2
+    state1_arb[Col.SVI1 + 4] = 0.10
+    state1_arb[Col.SVI2] = (0.50 ** 2) * 0.2
+    state1_arb[Col.SVI2 + 4] = 0.10
+
+    state2_arb = state2.clone()
+    state2_arb[Col.T] = 1.0
+    state2_arb[Col.T_SET] = 1.0
+    state2_arb[Col.SVI1] = (0.10 ** 2) * 1.0
+    state2_arb[Col.SVI1 + 4] = 0.10
+    state2_arb[Col.SVI2] = (0.10 ** 2) * 1.0
+    state2_arb[Col.SVI2 + 4] = 0.10
+
+    X_arb = torch.stack([state1_arb, state2_arb], dim=0)
+    audit_arb = cross_slice_audit(engine, X_arb, n_grid=401)
+
+    assert hasattr(audit_arb, "calendar_ok"), "AuditResult must contain calendar_ok field"
+    assert bool(audit_arb.calendar_ok[1].item()) is False, "calendar_ok must be False for decreasing total variance"
+    assert bool(audit_arb.ok[1].item()) is False, "composite ok must be False for calendar arbitrage slice"
+    assert not bool(audit_arb.ok.all().item()), "multi-expiry batch with calendar arbitrage must not be certified"
+
+    # 2. Monotonic batch: T1=0.2, vol=0.20 -> w1 approx 0.008
+    #                     T2=1.0, vol=0.20 -> w2 approx 0.040 (w2 > w1)
+    state1_clean = state1.clone()
+    state1_clean[Col.T] = 0.2
+    state1_clean[Col.T_SET] = 0.2
+    state1_clean[Col.SVI1] = (0.20 ** 2) * 0.2
+    state1_clean[Col.SVI1 + 4] = 0.10
+    state1_clean[Col.SVI2] = (0.20 ** 2) * 0.2
+    state1_clean[Col.SVI2 + 4] = 0.10
+
+    state2_clean = state2.clone()
+    state2_clean[Col.T] = 1.0
+    state2_clean[Col.T_SET] = 1.0
+    state2_clean[Col.SVI1] = (0.20 ** 2) * 1.0
+    state2_clean[Col.SVI1 + 4] = 0.10
+    state2_clean[Col.SVI2] = (0.20 ** 2) * 1.0
+    state2_clean[Col.SVI2 + 4] = 0.10
+
+    X_clean = torch.stack([state1_clean, state2_clean], dim=0)
+    audit_clean = cross_slice_audit(engine, X_clean, n_grid=401)
+
+    assert bool(audit_clean.calendar_ok.all().item()) is True, "calendar_ok must be True for monotonic term structure"
+    assert bool(audit_clean.ok.all().item()) is True, "composite ok must be True for clean slices"
+

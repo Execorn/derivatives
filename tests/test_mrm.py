@@ -197,7 +197,7 @@ def test_price_to_iv_round_trip() -> None:
     S, K, T, sigma_true = 100.0, 100.0, 1.0, 0.25
     d1 = (np.log(S / K) + 0.5 * sigma_true**2 * T) / (sigma_true * np.sqrt(T))
     d2 = d1 - sigma_true * np.sqrt(T)
-    price = S * stats.norm.cdf(d1) - K * stats.norm.cdf(d2)
+    price = float(S * stats.norm.cdf(d1) - K * stats.norm.cdf(d2))
 
     iv_recovered = price_to_iv(price, S, K, T)
     assert abs(iv_recovered - sigma_true) < 1e-6, f"Expected {sigma_true}, got {iv_recovered}"
@@ -450,6 +450,32 @@ def test_market_state_drift_monitor_psi() -> None:
     decision = guardian.route(X, engine=PricingEngineEnum.DIFFERENTIAL_ML)
 
     assert all(eng == PricingEngineEnum.HYBRID_ENSEMBLE for eng in decision.engine_used)
+
+
+def test_guardian_route_output_audit_failed_routing() -> None:
+    """Task 3.2(c) / §1.9: Guardian detects arbitrageable slice and routes to Analytic_Triangulated.
+
+    Verifies that when states contain an arbitrageable slice (b1 = 2.2, rho_s1 = 0.5),
+    guardian.route(X, engine=PricingEngineEnum.DIFFERENTIAL_ML) sets:
+      - fallback_reason = "OUTPUT_AUDIT_FAILED"
+      - nn_gate = 0.0
+      - fallback_activated = True
+      - engine_used = PricingEngineEnum.ANALYTIC_TRIANGULATED
+    """
+    guardian = FXCrossGuardian()
+    states_12d = _make_sample_12d_market_states(1, seed=42)
+    X = _make_34col_state_from_12d(states_12d)
+
+    # Inject an arbitrageable slice into Leg 1 SVI parameters
+    X[0, Col.SVI1 + 1] = 2.2  # b1 = 2.2
+    X[0, Col.SVI1 + 2] = 0.5  # rho_s1 = 0.5 -> L1 = 3.3 > 2.0 (Lee bound violation)
+
+    decision = guardian.route(X, engine=PricingEngineEnum.DIFFERENTIAL_ML)
+
+    assert bool(decision.fallback_activated[0].item()) is True
+    assert decision.fallback_reason[0] == FallbackReasonEnum.OUTPUT_AUDIT_FAILED.value
+    assert float(decision.nn_gate[0].item()) == 0.0
+    assert decision.engine_used[0] == PricingEngineEnum.ANALYTIC_TRIANGULATED
 
 
 # ---------------------------------------------------------------------------
