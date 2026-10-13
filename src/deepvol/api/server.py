@@ -2213,8 +2213,13 @@ async def reload_fx_cross_weights(weights_path: Union[str, Path]) -> None:
                 state["engine"].net.feature_std.copy_(new_state["feature_std"])
             if "model_version" in new_state:
                 state["model_version"] = new_state["model_version"]
+            else:
+                file_stem = Path(weights_path).stem
+                state["model_version"] = f"deepvol-fx-cross-{file_stem}"
         else:
             state["engine"].net.load_state_dict(new_state)
+            file_stem = Path(weights_path).stem
+            state["model_version"] = f"deepvol-fx-cross-{file_stem}"
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, state["runtime"].warmup_and_capture)
 
