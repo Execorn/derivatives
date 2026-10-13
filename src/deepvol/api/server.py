@@ -2208,7 +2208,8 @@ async def reload_fx_cross_weights(weights_path: Union[str, Path]) -> None:
         state = _get_fx_cross_state()
         new_state = torch.load(weights_path, map_location="cpu")
         state["engine"].net.load_state_dict(new_state)
-        state["runtime"].warmup_and_capture()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, state["runtime"].warmup_and_capture)
 
 
 fx_cross_router = APIRouter(prefix="/fx_cross", tags=["FX Cross"])
