@@ -482,6 +482,13 @@ class FXCrossGuardian(ModelRiskGuardian):
                     fallback_activated[i] = True
                     fallback_reason[i] = FallbackReasonEnum.OOD_MARKET_REGIME.value if is_ood[i] else "NUMERICAL_INSTABILITY"
                     engine_used[i] = PricingEngineEnum.ANALYTIC_TRIANGULATED
+                    logger.info(
+                        "SR11_7_MODEL_FALLBACK: request_id=%s reason=%s model_version=%s engine=%s",
+                        getattr(self, "current_request_id", "req-unknown"),
+                        fallback_reason[i],
+                        getattr(self, "model_version", "unknown"),
+                        engine_used[i].value,
+                    )
                 else:
                     if drift_breached:
                         engine_used[i] = PricingEngineEnum.HYBRID_ENSEMBLE

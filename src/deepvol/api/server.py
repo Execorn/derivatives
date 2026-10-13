@@ -2400,6 +2400,13 @@ async def _fx_cross_price_impl(
         engine_used = PricingEngineEnum.ANALYTIC_TRIANGULATED
         X[0, Col.NN_GATE] = 0.0
 
+    if fallback_activated:
+        logger.info(
+            "SR11_7_FALLBACK_TRIGGERED: reason=%s model_version=%s",
+            fallback_reason,
+            state["model_version"],
+        )
+
     t0 = time.perf_counter()
     fut = executor.submit(X, single=True)
     res_rows = await fut
