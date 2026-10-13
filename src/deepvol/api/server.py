@@ -2143,7 +2143,7 @@ _FX_CROSS_STATE: Dict[str, Any] = {
     "executor": None,
     "guardian": None,
     "canonicalizer": None,
-    "model_version": "deepvol-fx-cross-v3.0-b24977e7",
+    "model_version": "1326b33ce012+afc6d3f",
 }
 _FX_CROSS_RW_LOCK = AsyncReadWriteLock()
 
