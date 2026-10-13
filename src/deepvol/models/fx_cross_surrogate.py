@@ -8,7 +8,8 @@ epistemic uncertainty estimation, fused Black-76 with ITM parity, and forward-on
 from __future__ import annotations
 
 import math
-from typing import Optional, Sequence, Tuple, cast
+from typing import ClassVar, Optional, Sequence, Tuple, cast
+import weakref
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -54,9 +55,11 @@ class ResidualCrossVolNet(nn.Module):
 
     feature_mean: Tensor
     feature_std: Tensor
+    _instances: ClassVar[weakref.WeakSet[ResidualCrossVolNet]] = weakref.WeakSet()
 
     def __init__(self, width: int = 64, depth: int = 3, members: int = 1) -> None:
         super().__init__()
+        self._instances.add(self)
         self.width = width
         self.depth = depth
         self.members = members

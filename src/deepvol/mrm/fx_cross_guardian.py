@@ -443,6 +443,24 @@ class FXCrossGuardian(ModelRiskGuardian):
         # Record observed states into drift monitor
         self.drift_monitor.record(m)
 
+        has_nan_weights = False
+        models_to_check: List[Any] = []
+        if getattr(self, "model", None) is not None:
+            models_to_check.append(self.model)
+        try:
+            from deepvol.models.fx_cross_surrogate import ResidualCrossVolNet
+
+            models_to_check.extend(list(ResidualCrossVolNet._instances))
+        except Exception:
+            pass
+        for m_obj in models_to_check:
+            for p in m_obj.parameters():
+                if torch.isnan(p).any() or torch.isinf(p).any():
+                    has_nan_weights = True
+                    break
+            if has_nan_weights:
+                break
+
         nn_gate = torch.ones(S_cnt, dtype=dtype, device=device)
         fallback_activated = torch.zeros(S_cnt, dtype=torch.bool, device=device)
         fallback_reason: List[Optional[str]] = [None] * S_cnt
@@ -459,10 +477,10 @@ class FXCrossGuardian(ModelRiskGuardian):
 
         elif engine in (PricingEngineEnum.DIFFERENTIAL_ML, PricingEngineEnum.HYBRID_ENSEMBLE):
             for i in range(S_cnt):
-                if is_ood[i]:
+                if is_ood[i] or has_nan_weights:
                     nn_gate[i] = 0.0
                     fallback_activated[i] = True
-                    fallback_reason[i] = FallbackReasonEnum.OOD_MARKET_REGIME.value
+                    fallback_reason[i] = FallbackReasonEnum.OOD_MARKET_REGIME.value if is_ood[i] else "NUMERICAL_INSTABILITY"
                     engine_used[i] = PricingEngineEnum.ANALYTIC_TRIANGULATED
                 else:
                     if drift_breached:
