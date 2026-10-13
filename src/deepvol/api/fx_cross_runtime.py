@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, Final, Optional, Tuple, Union
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.special import ndtr  # type: ignore[import-untyped]
+from scipy.special import ndtr
 import torch
 from torch import Tensor
 import torch._inductor.config as inductor_config
