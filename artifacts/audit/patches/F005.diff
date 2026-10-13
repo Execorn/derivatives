@@ -1,0 +1,13 @@
+diff --git a/src/deepvol/api/server.py b/src/deepvol/api/server.py
+index 9bbe4d6..0b52745 100644
+--- a/src/deepvol/api/server.py
++++ b/src/deepvol/api/server.py
+@@ -2207,6 +2207,8 @@ async def reload_fx_cross_weights(weights_path: Union[str, Path]) -> None:
+         state = _get_fx_cross_state()
+         new_state = torch.load(weights_path, map_location="cpu")
+         state["engine"].net.load_state_dict(new_state)
++        file_stem = Path(weights_path).stem
++        state["model_version"] = f"deepvol-fx-cross-{file_stem}"
+         state["runtime"].warmup_and_capture()
+ 
+ 

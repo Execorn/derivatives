@@ -1,0 +1,35 @@
+
+--- Acquiring GPU Lock ---
+--- GPU Lock Acquired ---
+
+........................................................................ [ 86%]
+...........                                                              [100%]
+=============================== warnings summary ===============================
+../../home/execorn/programming/derivatives/.venv/lib/python3.9/site-packages/py_vollib_vectorized/util/data_format.py:5
+  /home/execorn/programming/derivatives/.venv/lib/python3.9/site-packages/py_vollib_vectorized/util/data_format.py:5: DeprecationWarning: py_vollib is deprecated and will be removed in a future release; please import from vollib instead.
+    from py_vollib.helpers.constants import FLOAT_MAX, MINUS_FLOAT_MAX
+
+src/deepvol/api/server.py:387
+  /tmp/deepvol_base/src/deepvol/api/server.py:387: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+../../home/execorn/programming/derivatives/.venv/lib/python3.9/site-packages/fastapi/applications.py:4579
+  /home/execorn/programming/derivatives/.venv/lib/python3.9/site-packages/fastapi/applications.py:4579: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)
+
+tests/test_adversarial_mlsv_fx.py::test_mlsv_nadaraya_watson_single_path_nan
+  /tmp/deepvol_base/src/deepvol/models/mlsv_gpu.py:105: UserWarning: std(): degrees of freedom is <= 0. Correction should be strictly less than the reduction factor (input numel divided by output numel). (Triggered internally at /pytorch/aten/src/ATen/native/ReduceOps.cpp:1839.)
+    std_X = torch.std(X_t)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+83 passed, 4 warnings in 58.63s

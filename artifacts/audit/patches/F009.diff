@@ -1,0 +1,56 @@
+diff --git a/src/deepvol/api/server.py b/src/deepvol/api/server.py
+index 9bbe4d6..41e93ba 100644
+--- a/src/deepvol/api/server.py
++++ b/src/deepvol/api/server.py
+@@ -2287,22 +2287,10 @@ async def _fx_cross_price_impl(
+             T=torch.tensor([max(T_val, 1e-4)], dtype=torch.float64),
+         )
+         cs1 = canonicalizer.canonicalize(q1, conv1, lm1, compute_jacobian=False)
+-    except Exception:
+-        w_atm = (leg1.smile.atm_vol**2) * max(T_val, 1e-4)
+-        cs1 = CanonicalSmile(
+-            slice_params=torch.tensor(
+-                [[w_atm, 0.0, 0.0, 0.0, 0.1]], dtype=torch.float64
+-            ),
+-            xi=torch.tensor(
+-                [[leg1.smile.atm_vol, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64
+-            ),
+-            jacobian=torch.zeros((1, 5, 5), dtype=torch.float64),
+-            sigma_atmf=torch.tensor([leg1.smile.atm_vol], dtype=torch.float64),
+-            min_g=torch.tensor([0.0], dtype=torch.float64),
+-            used_ssvi=torch.tensor([True]),
+-            lee_slope=torch.tensor([0.0], dtype=torch.float64),
++    except ValueError as e:
++        raise HTTPException(
++            status_code=422, detail=f"SMILE_ARBITRAGE: leg1 smile calibration failed ({e})"
+         )
+-        ood_from_smile = True
+ 
+     try:
+         q2 = torch.tensor(
+@@ -2331,22 +2319,10 @@ async def _fx_cross_price_impl(
+             T=torch.tensor([max(T_val, 1e-4)], dtype=torch.float64),
+         )
+         cs2 = canonicalizer.canonicalize(q2, conv2, lm2, compute_jacobian=False)
+-    except Exception:
+-        w_atm = (leg2.smile.atm_vol**2) * max(T_val, 1e-4)
+-        cs2 = CanonicalSmile(
+-            slice_params=torch.tensor(
+-                [[w_atm, 0.0, 0.0, 0.0, 0.1]], dtype=torch.float64
+-            ),
+-            xi=torch.tensor(
+-                [[leg2.smile.atm_vol, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64
+-            ),
+-            jacobian=torch.zeros((1, 5, 5), dtype=torch.float64),
+-            sigma_atmf=torch.tensor([leg2.smile.atm_vol], dtype=torch.float64),
+-            min_g=torch.tensor([0.0], dtype=torch.float64),
+-            used_ssvi=torch.tensor([True]),
+-            lee_slope=torch.tensor([0.0], dtype=torch.float64),
++    except ValueError as e:
++        raise HTTPException(
++            status_code=422, detail=f"SMILE_ARBITRAGE: leg2 smile calibration failed ({e})"
+         )
+-        ood_from_smile = True
+ 
+     r_C = -math.log(D_C) / T_val if T_val > 0 else 0.0
+     r_A = -math.log(D_A) / T_val if T_val > 0 else 0.0

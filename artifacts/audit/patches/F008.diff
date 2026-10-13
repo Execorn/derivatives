@@ -1,0 +1,118 @@
+diff --git a/src/deepvol/api/fx_cross_runtime.py b/src/deepvol/api/fx_cross_runtime.py
+index a3bd3f7..cc7b90e 100644
+--- a/src/deepvol/api/fx_cross_runtime.py
++++ b/src/deepvol/api/fx_cross_runtime.py
+@@ -592,6 +592,7 @@ class FXCrossGPUExecutor:
+         self._stop_sentinel = object()
+         self._worker_thread: Optional[threading.Thread] = None
+         self._running = False
++        self._worker_busy = False
+         self._warmup_error: Optional[Exception] = None
+         self._warmup_done: threading.Event = threading.Event()
+         self._cpu_fallback_pool = ThreadPoolExecutor(
+@@ -654,7 +655,7 @@ class FXCrossGPUExecutor:
+             return fut
+ 
+         # Dynamic fallback routing: bypass busy GPU queue for single quotes
+-        if single and self.queue_depth > 0:
++        if single and (self.queue_depth > 0 or self._worker_busy):
+ 
+             def _eval_cpu() -> None:
+                 try:
+@@ -695,50 +696,54 @@ class FXCrossGPUExecutor:
+                 task = item
+                 assert isinstance(task, _Task)
+ 
+-                if not task.single:
+-                    try:
+-                        res = self.runtime.price_rows(task.X, single=False)
+-                        task.loop.call_soon_threadsafe(task.future.set_result, res)
+-                    except Exception as ex:
+-                        task.loop.call_soon_threadsafe(task.future.set_exception, ex)
+-                    continue
+-
+-                # Single quote with micro-batching window check
+-                accumulated = [task]
+-                if self.window_us > 0 and not self._queue.empty():
+-                    t_target = time.perf_counter() + self.window_us * 1e-6
+-                    while time.perf_counter() < t_target and len(accumulated) < 64:
++                self._worker_busy = True
++                try:
++                    if not task.single:
+                         try:
+-                            next_item = self._queue.get_nowait()
+-                            if next_item is self._stop_sentinel:
+-                                self._queue.put(self._stop_sentinel)
+-                                break
+-                            assert isinstance(next_item, _Task)
+-                            if next_item.single:
+-                                accumulated.append(next_item)
+-                            else:
+-                                self._queue.put(next_item)
++                            res = self.runtime.price_rows(task.X, single=False)
++                            task.loop.call_soon_threadsafe(task.future.set_result, res)
++                        except Exception as ex:
++                            task.loop.call_soon_threadsafe(task.future.set_exception, ex)
++                        continue
++
++                    # Single quote with micro-batching window check
++                    accumulated = [task]
++                    if self.window_us > 0 and not self._queue.empty():
++                        t_target = time.perf_counter() + self.window_us * 1e-6
++                        while time.perf_counter() < t_target and len(accumulated) < 64:
++                            try:
++                                next_item = self._queue.get_nowait()
++                                if next_item is self._stop_sentinel:
++                                    self._queue.put(self._stop_sentinel)
++                                    break
++                                assert isinstance(next_item, _Task)
++                                if next_item.single:
++                                    accumulated.append(next_item)
++                                else:
++                                    self._queue.put(next_item)
++                                    break
++                            except queue.Empty:
+                                 break
+-                        except queue.Empty:
+-                            break
+-
+-                if len(accumulated) == 1:
+-                    try:
+-                        res = self.runtime.price_rows(task.X, single=True)
+-                        task.loop.call_soon_threadsafe(task.future.set_result, res)
+-                    except Exception as ex:
+-                        task.loop.call_soon_threadsafe(task.future.set_exception, ex)
+-                else:
+-                    try:
+-                        X_cat = np.vstack([t.X for t in accumulated])
+-                        res_cat = self.runtime.price_rows(X_cat, single=False)
+-                        for idx, t in enumerate(accumulated):
+-                            t.loop.call_soon_threadsafe(
+-                                t.future.set_result, res_cat[idx : idx + 1]
+-                            )
+-                    except Exception as ex:
+-                        for t in accumulated:
+-                            t.loop.call_soon_threadsafe(t.future.set_exception, ex)
++
++                    if len(accumulated) == 1:
++                        try:
++                            res = self.runtime.price_rows(task.X, single=True)
++                            task.loop.call_soon_threadsafe(task.future.set_result, res)
++                        except Exception as ex:
++                            task.loop.call_soon_threadsafe(task.future.set_exception, ex)
++                    else:
++                        try:
++                            X_cat = np.vstack([t.X for t in accumulated])
++                            res_cat = self.runtime.price_rows(X_cat, single=False)
++                            for idx, t in enumerate(accumulated):
++                                t.loop.call_soon_threadsafe(
++                                    t.future.set_result, res_cat[idx : idx + 1]
++                                )
++                        except Exception as ex:
++                            for t in accumulated:
++                                t.loop.call_soon_threadsafe(t.future.set_exception, ex)
++                finally:
++                    self._worker_busy = False
+ 
+             except Exception as ex:
+                 logger.error("Executor failure in worker loop: %s", ex, exc_info=True)

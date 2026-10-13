@@ -1,0 +1,19 @@
+diff --git a/src/deepvol/api/server.py b/src/deepvol/api/server.py
+index 9bbe4d6..f7a5d85 100644
+--- a/src/deepvol/api/server.py
++++ b/src/deepvol/api/server.py
+@@ -2496,8 +2496,14 @@ async def _fx_cross_price_batch_impl(request: Request) -> Response:
+     canonicalizer: SmileCanonicalizer = state["canonicalizer"]
+     executor: FXCrossGPUExecutor = state["executor"]
+ 
++    cl = request.headers.get("content-length")
++    MAX_PAYLOAD_BYTES = 50 * 1024 * 1024
++    if cl and int(cl) > MAX_PAYLOAD_BYTES:
++        raise HTTPException(status_code=413, detail="Payload Too Large (50MB limit)")
+     content_type = request.headers.get("content-type", "application/json")
+     body = await request.body()
++    if len(body) > MAX_PAYLOAD_BYTES:
++        raise HTTPException(status_code=413, detail="Payload Too Large (50MB limit)")
+ 
+     def _prepare_inputs() -> Tuple[
+         NDArray[np.float64],

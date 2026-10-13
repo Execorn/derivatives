@@ -1,0 +1,158 @@
+[main]	INFO	profile include tests: None
+[main]	INFO	profile exclude tests: None
+[main]	INFO	cli include tests: None
+[main]	INFO	cli exclude tests: None
+[main]	INFO	running on Python 3.9.25
+Working... ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 0:00:07
+Run started:2026-10-13 21:41:36.645443
+
+Test results:
+>> Issue: [B324:hashlib] Use of weak MD5 hash for security. Consider usedforsecurity=False
+   Severity: High   Confidence: High
+   CWE: CWE-327 (https://cwe.mitre.org/data/definitions/327.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b324_hashlib.html
+   Location: src/deepvol/analysis/cross_asset_roughness.py:109:29
+108	            # Seed PRNG based on asset name for deterministic daily noise
+109	            asset_seed = int(hashlib.md5(asset.encode()).hexdigest(), 16) % (2**32)
+110	            rng = np.random.default_rng(asset_seed)
+
+--------------------------------------------------
+>> Issue: [B324:hashlib] Use of weak MD5 hash for security. Consider usedforsecurity=False
+   Severity: High   Confidence: High
+   CWE: CWE-327 (https://cwe.mitre.org/data/definitions/327.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b324_hashlib.html
+   Location: src/deepvol/analysis/cross_asset_roughness.py:282:19
+281	        seed_str = f"noise_{asset_upper}_{date_str}"
+282	        seed = int(hashlib.md5(seed_str.encode()).hexdigest(), 16) % (2**32)
+283	        rng = np.random.default_rng(seed)
+
+--------------------------------------------------
+>> Issue: [B614:pytorch_load] Use of unsafe PyTorch load
+   Severity: Medium   Confidence: High
+   CWE: CWE-502 (https://cwe.mitre.org/data/definitions/502.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b614_pytorch_load.html
+   Location: src/deepvol/api/server.py:2208:20
+2207	        state = _get_fx_cross_state()
+2208	        new_state = torch.load(weights_path, map_location="cpu")
+2209	        state["engine"].net.load_state_dict(new_state)
+
+--------------------------------------------------
+>> Issue: [B104:hardcoded_bind_all_interfaces] Possible binding to all interfaces.
+   Severity: Medium   Confidence: Medium
+   CWE: CWE-605 (https://cwe.mitre.org/data/definitions/605.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b104_hardcoded_bind_all_interfaces.html
+   Location: src/deepvol/api/server.py:2752:36
+2751	    parser.add_argument(
+2752	        "--host", type=str, default="0.0.0.0", help="Host address to bind to"
+2753	    )
+
+--------------------------------------------------
+>> Issue: [B614:pytorch_load] Use of unsafe PyTorch load
+   Severity: Medium   Confidence: High
+   CWE: CWE-502 (https://cwe.mitre.org/data/definitions/502.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b614_pytorch_load.html
+   Location: src/deepvol/app/pages/phoenix_pricer.py:43:30
+42	        model = PhoenixMLP().to(DEVICE)
+43	        model.load_state_dict(torch.load(str(weights_path), map_location=DEVICE))
+44	        model.eval()
+
+--------------------------------------------------
+>> Issue: [B614:pytorch_load] Use of unsafe PyTorch load
+   Severity: Medium   Confidence: High
+   CWE: CWE-502 (https://cwe.mitre.org/data/definitions/502.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b614_pytorch_load.html
+   Location: src/deepvol/app/pages/wof_autocall_pricer.py:42:30
+41	        model = WoFAutocallEGNO().to(DEVICE)
+42	        model.load_state_dict(torch.load(str(weights_path), map_location=DEVICE))
+43	        model.eval()
+
+--------------------------------------------------
+>> Issue: [B324:hashlib] Use of weak SHA1 hash for security. Consider usedforsecurity=False
+   Severity: High   Confidence: High
+   CWE: CWE-327 (https://cwe.mitre.org/data/definitions/327.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b324_hashlib.html
+   Location: src/deepvol/market/legacy_adapter.py:148:32
+147	            if verify_hash:
+148	                expected_sha1 = hashlib.sha1(_canonical_json_bytes(msg.value)).hexdigest()
+149	                if msg.id != expected_sha1:
+
+--------------------------------------------------
+>> Issue: [B324:hashlib] Use of weak SHA1 hash for security. Consider usedforsecurity=False
+   Severity: High   Confidence: High
+   CWE: CWE-327 (https://cwe.mitre.org/data/definitions/327.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b324_hashlib.html
+   Location: src/deepvol/market/legacy_adapter.py:849:13
+848	    canon_bytes = _canonical_json_bytes(value_payload)
+849	    msg_id = hashlib.sha1(canon_bytes).hexdigest()
+850	    gen_id = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+
+--------------------------------------------------
+>> Issue: [B614:pytorch_load] Use of unsafe PyTorch load
+   Severity: Medium   Confidence: High
+   CWE: CWE-502 (https://cwe.mitre.org/data/definitions/502.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b614_pytorch_load.html
+   Location: src/deepvol/mrm/fx_cross_guardian.py:162:15
+161	
+162	        ckpt = torch.load(p, map_location="cpu")
+163	        ood_data = ckpt.get("ood_statistics", {})
+
+--------------------------------------------------
+>> Issue: [B614:pytorch_load] Use of unsafe PyTorch load
+   Severity: Medium   Confidence: High
+   CWE: CWE-502 (https://cwe.mitre.org/data/definitions/502.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b614_pytorch_load.html
+   Location: src/deepvol/surrogates/train_fno.py:203:20
+202	        if os.path.exists(WEIGHTS_BEST):
+203	            state = torch.load(WEIGHTS_BEST)
+204	            torch.save(state, WEIGHTS_PROD)
+
+--------------------------------------------------
+>> Issue: [B614:pytorch_load] Use of unsafe PyTorch load
+   Severity: Medium   Confidence: High
+   CWE: CWE-502 (https://cwe.mitre.org/data/definitions/502.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b614_pytorch_load.html
+   Location: src/deepvol/training/train_cross_surrogate.py:507:11
+506	    """Loads weights and frozen statistics from a checkpoint into ResidualCrossVolNet."""
+507	    ckpt = torch.load(path, map_location="cpu")
+508	    net.load_state_dict(ckpt["state_dict"])
+
+--------------------------------------------------
+>> Issue: [B614:pytorch_load] Use of unsafe PyTorch load
+   Severity: Medium   Confidence: High
+   CWE: CWE-502 (https://cwe.mitre.org/data/definitions/502.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b614_pytorch_load.html
+   Location: src/deepvol/training/train_cross_surrogate.py:1032:15
+1031	    # Primary version from member 0
+1032	    ref_ckpt = torch.load(ckpt_paths[0], map_location="cpu")
+1033	    model_version = ref_ckpt.get("model_version", "v3.0.0")
+
+--------------------------------------------------
+>> Issue: [B614:pytorch_load] Use of unsafe PyTorch load
+   Severity: Medium   Confidence: High
+   CWE: CWE-502 (https://cwe.mitre.org/data/definitions/502.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b614_pytorch_load.html
+   Location: src/deepvol/training/train_cross_surrogate.py:1040:17
+1039	    for m in range(cfg.members):
+1040	        m_ckpt = torch.load(ckpt_paths[m], map_location=eval_device)
+1041	        m_sd = m_ckpt["state_dict"]
+
+--------------------------------------------------
+
+Code scanned:
+	Total lines of code: 46312
+	Total lines skipped (#nosec): 0
+	Total potential issues skipped due to specifically being disabled (e.g., #nosec BXXX): 0
+
+Run metrics:
+	Total issues (by severity):
+		Undefined: 0
+		Low: 71
+		Medium: 9
+		High: 4
+	Total issues (by confidence):
+		Undefined: 0
+		Low: 0
+		Medium: 1
+		High: 83
+Files skipped (1):
+	src/deepvol/deploy/compile_trt.py (syntax error while parsing AST from file)

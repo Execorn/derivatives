@@ -1,0 +1,28 @@
+--- a/src/deepvol/mrm/fx_cross_guardian.py
++++ b/src/deepvol/mrm/fx_cross_guardian.py
+@@ -443,6 +443,13 @@ class FXCrossGuardian:
+         # Record observed states into drift monitor
+         self.drift_monitor.record(m)
+ 
++        has_nan_weights = False
++        if getattr(self, "model", None) is not None:
++            for p in self.model.parameters():
++                if torch.isnan(p).any() or torch.isinf(p).any():
++                    has_nan_weights = True
++                    break
++
+         nn_gate = torch.ones(S_cnt, dtype=dtype, device=device)
+         fallback_activated = torch.zeros(S_cnt, dtype=torch.bool, device=device)
+         fallback_reason: List[Optional[str]] = [None] * S_cnt
+@@ -461,9 +468,9 @@ class FXCrossGuardian:
+         elif engine in (PricingEngineEnum.DIFFERENTIAL_ML, PricingEngineEnum.HYBRID_ENSEMBLE):
+             for i in range(S_cnt):
+-                if is_ood[i]:
++                if is_ood[i] or has_nan_weights:
+                     nn_gate[i] = 0.0
+                     fallback_activated[i] = True
+-                    fallback_reason[i] = FallbackReasonEnum.OOD_MARKET_REGIME.value
++                    fallback_reason[i] = FallbackReasonEnum.OOD_MARKET_REGIME.value if is_ood[i] else "NUMERICAL_INSTABILITY"
+                     engine_used[i] = PricingEngineEnum.ANALYTIC_TRIANGULATED
+                 else:
+                     if drift_breached:
