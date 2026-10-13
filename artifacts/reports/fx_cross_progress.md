@@ -13,3 +13,20 @@
   - SVI solver accuracy: Fit RMSE $3.79 \times 10^{-14}$ on exact slices.
   - Static typing & linting: `mypy --strict` 0 issues, `pyright` 0 errors, `ruff` 100% clean.
 - **Deviations**: None. All 5 findings from Gate 1 and 2 remediated under strict TDD and formal Wolfram proofs (W0.1–W0.3).
+
+## Milestone 1: Analytic Base, Taylor Jets and Copula Teacher Dataset
+- **Status**: Tagged `fx-cross-m1` at commit `6eb622c` (Unanimous Gate 3 PASS, 5/5 subagent approvals).
+- **Deliverables**:
+  - `src/deepvol/models/taylor_jets.py`: Hand-written 2nd-order Taylor jets ($s_k, s_{kk}$) and forward tangents with stacked GEMMs in float64/float32.
+  - `src/deepvol/models/fx_cross_analytic.py`: Smile-consistent $\beta$-split H1 triangulation with 6 fixed-point iterations, OTM pricing + parity, closed-form Black Greeks, and `AnalyticTriangulatedFallbackEngine` in `fallbacks.py`.
+  - `src/deepvol/models/fx_cross_copula.py`: Gaussian copula pricer under $\mathbb{Q}^B$ on 1,601-node quadrature with 1D tensor contraction and PIVOT implied vol solver.
+  - `src/deepvol/training/data_generation_cross.py`: 13-D scrambled Sobol sampler with state-level train/val/test/stress holdouts and star discrepancy $\le 0.01$.
+  - `src/deepvol/training/generate_cross_shards.py`: Memory-mapped streaming dataset generator with per-strike autograd tape chunking, multivariate chain-rule decomposition, online Welford statistics, and SHA-256 cryptographic manifests.
+- **Measured Metrics**:
+  - Unit/adversarial/SLA tests: 42/42 M1 tests + 85/85 M0 regression tests pass 100% green.
+  - Peak GPU VRAM: Flat at **154.11 MB** across $M \in [1, 64]$ strikes (vs $\le 165$ MB SLA target) and **154.32 MB** during 1,601-node production generation (vs $\le 256$ MB ceiling).
+  - Adjoint scaling: Reverse-mode AAD execution ratio **5.56x** forward runtime (vs $\le 10.0$x SLA limit).
+  - Gradient fidelity: 117/117 coordinate differentials match decoupled numerical finite difference oracle.
+  - PIVOT sensitivity: Analytical rate sensitivities match Black-Scholes to $< 10^{-14}$.
+  - Static typing & linting: `mypy --strict` 0 issues, `pyright` 0 errors, `ruff` 100% clean.
+- **Deviations**: None. Replaced initial finite-difference facade with authentic reverse-mode vector-Jacobian autograd and zero-copy memmapped disk streaming.
