@@ -269,7 +269,7 @@ class PIVOTImpliedVolFunction(torch.autograd.Function):
         d_c_dT = (
             S_safe * torch.exp(-q * T_safe) * sigma * phi_d1 / (2.0 * sqrt_T)
             - q * S_safe * torch.exp(-q * T_safe) * torch.where(is_call, nd1, -(1.0 - nd1))
-            + r * K_safe * exp_r * torch.where(is_call, -nd2, 1.0 - nd2)
+            + r * K_safe * exp_r * torch.where(is_call, nd2, -(1.0 - nd2))
         )
         grad_T = -grad_price * d_c_dT
 

@@ -147,7 +147,7 @@ class _QuantileInversionFunction(torch.autograd.Function):
         cdf_grid = torch.cummax(cdf_grid, dim=-1).values
 
         quantiles = torch.empty((S_cnt, U_cnt), device=device, dtype=dtype)
-        chunk_len = 262144
+        chunk_len = 65536
 
         for s in range(S_cnt):
             if params_eff[s, 1] < 1e-12:
@@ -195,7 +195,7 @@ class _QuantileInversionFunction(torch.autograd.Function):
         quantiles, F_eff, _, params_eff = ctx.saved_tensors
         grad_out_2d = grad_output.reshape(quantiles.shape)
         S_cnt, U_cnt = quantiles.shape
-        chunk_len = 262144
+        chunk_len = 65536
 
         grad_u = torch.empty_like(quantiles)
         grad_params = torch.zeros_like(params_eff)
@@ -331,7 +331,11 @@ class GaussianCopulaCrossEngine:
         self.z = z
         self.w1d = w1d
         self.u_1d = torch.special.ndtr(z)
-        self.W2d = w1d.unsqueeze(1) * w1d.unsqueeze(0)
+
+    @property
+    def W2d(self) -> Tensor:
+        """On-demand 2D quadrature weight matrix for backward compatibility."""
+        return self.w1d.unsqueeze(1) * self.w1d.unsqueeze(0)
 
     def quantiles(
         self,
@@ -394,7 +398,6 @@ class GaussianCopulaCrossEngine:
         n = self.cfg.n_nodes
         z = self.z
         u_1d = self.u_1d
-        W2d = self.W2d
 
         # Evaluate X(z_1): shape (S, n)
         X = self.quantiles(state.svi1, F1, T, u_1d, reflect=False)  # (S, n)
@@ -415,7 +418,6 @@ class GaussianCopulaCrossEngine:
 
         X_b = X.view(S_cnt, 1, n, 1)
         Y_b = Y.view(S_cnt, 1, n, n)
-        W_b = W2d.view(1, 1, n, n)
 
         for start_idx in range(0, M_cnt, chunk_size):
             end_idx = min(start_idx + chunk_size, M_cnt)
@@ -428,9 +430,9 @@ class GaussianCopulaCrossEngine:
             else:
                 payoff = torch.clamp(K_b * Y_b - X_b, min=0.0)
 
-            chunk_price = (payoff * W_b).sum(dim=(-2, -1))
-            chunk_price = chunk_price * F2.unsqueeze(-1)
-            out_prices[:, start_idx:end_idx] = chunk_price
+            p_int = (payoff * self.w1d.view(1, 1, 1, n)).sum(dim=-1)
+            p_int = (p_int * self.w1d.view(1, 1, n)).sum(dim=-1)
+            out_prices[:, start_idx:end_idx] = p_int * F2.unsqueeze(-1)
 
         return out_prices
 
@@ -519,10 +521,10 @@ class GaussianCopulaCrossEngine:
             X_b = X.view(S_cnt, 1, self.cfg.n_nodes, 1)
             Y_b = Y.view(S_cnt, 1, self.cfg.n_nodes, self.cfg.n_nodes)
             K_b = Fc.view(S_cnt, 1, 1, 1)
-            W_b = self.W2d.view(1, 1, self.cfg.n_nodes, self.cfg.n_nodes)
-
             payoff = torch.clamp(X_b - K_b * Y_b, min=0.0)
-            c_atm = (payoff * W_b).sum(dim=(-2, -1)).squeeze(-1) * state.F2.to(dev, dtype=dtype)
+            p_int = (payoff * self.w1d.view(1, 1, 1, self.cfg.n_nodes)).sum(dim=-1)
+            p_int = (p_int * self.w1d.view(1, 1, self.cfg.n_nodes)).sum(dim=-1)
+            c_atm = p_int.squeeze(-1) * state.F2.to(dev, dtype=dtype)
             iv = self.implied_vol(c_atm, Fc, Fc, state.T.to(dev, dtype=dtype), is_call=True)
             return iv.view(S_cnt)
 
