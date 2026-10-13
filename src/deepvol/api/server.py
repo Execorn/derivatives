@@ -367,9 +367,7 @@ async def _hot_reload_model_weights(model_name: str):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        state = torch.load(
-            cached_container.path, map_location=device, weights_only=True
-        )
+        state = torch.load(cached_container.path, map_location=device, weights_only=True)
         if hasattr(cached_container.model, "base_fno"):
             cached_container.model.base_fno.load_state_dict(state)
         else:
@@ -2206,7 +2204,7 @@ async def reload_fx_cross_weights(weights_path: Union[str, Path]) -> None:
     """Safe model weight reload under AsyncReadWriteLock writer."""
     async with _FX_CROSS_RW_LOCK.writer():
         state = _get_fx_cross_state()
-        new_state = torch.load(weights_path, map_location="cpu")
+        new_state = torch.load(weights_path, map_location="cpu", weights_only=True)
         state["engine"].net.load_state_dict(new_state)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, state["runtime"].warmup_and_capture)

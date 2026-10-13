@@ -504,7 +504,7 @@ def save_checkpoint(
 
 def load_checkpoint(path: Union[Path, str], net: ResidualCrossVolNet) -> Dict[str, Any]:
     """Loads weights and frozen statistics from a checkpoint into ResidualCrossVolNet."""
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
     net.load_state_dict(ckpt["state_dict"])
     return cast(Dict[str, Any], ckpt)
 
@@ -1029,7 +1029,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             checksums[cp.name] = hashlib.sha256(f.read()).hexdigest()
 
     # Primary version from member 0
-    ref_ckpt = torch.load(ckpt_paths[0], map_location="cpu")
+    ref_ckpt = torch.load(ckpt_paths[0], map_location="cpu", weights_only=True)
     model_version = ref_ckpt.get("model_version", "v3.0.0")
 
     device_name = cfg.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -1037,7 +1037,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     eval_net = ResidualCrossVolNet(width=64, depth=3, members=cfg.members).to(eval_device)
     for m in range(cfg.members):
-        m_ckpt = torch.load(ckpt_paths[m], map_location=eval_device)
+        m_ckpt = torch.load(ckpt_paths[m], map_location=eval_device, weights_only=True)
         m_sd = m_ckpt["state_dict"]
         for l_idx in range(len(eval_net.weights)):
             eval_net.weights[l_idx].data[m].copy_(m_sd[f"weights.{l_idx}"][0])

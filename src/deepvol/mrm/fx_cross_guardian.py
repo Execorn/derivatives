@@ -159,7 +159,7 @@ class MarketStateOODDetector:
             box_hi = torch.tensor(box_bounds["hi"], dtype=torch.float64)
             return cls(mean=mean, cov_inv=cov_inv, q995=q995, box_lo=box_lo, box_hi=box_hi, margin=0.0)
 
-        ckpt = torch.load(p, map_location="cpu")
+        ckpt = torch.load(p, map_location="cpu", weights_only=True)
         ood_data = ckpt.get("ood_statistics", {})
         if not ood_data:
             raise KeyError(f"Checkpoint at {p} does not contain 'ood_statistics'")
