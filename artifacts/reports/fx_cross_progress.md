@@ -30,3 +30,32 @@
   - PIVOT sensitivity: Analytical rate sensitivities match Black-Scholes to $< 10^{-14}$.
   - Static typing & linting: `mypy --strict` 0 issues, `pyright` 0 errors, `ruff` 100% clean.
 - **Deviations**: None. Replaced initial finite-difference facade with authentic reverse-mode vector-Jacobian autograd and zero-copy memmapped disk streaming.
+
+## Milestone 2: Residual Vol Surrogate & Differential ML (DML)
+- **Status**: Tagged `fx-cross-m2` at commit `450dff7` (Unanimous Gate 2 PASS, 5/5 subagent approvals).
+- **Deliverables**:
+  - `src/deepvol/models/fx_cross_surrogate.py`: `ResidualCrossVolNet` ($13 \to 64 \to 64 \to 64 \to 1$, SiLU, float32, TF32 off, zero-init output) with $C^2$ quintic taper $\chi(z) \in [5, 7]$, smooth floors, and 5-member ensemble.
+  - `src/deepvol/training/train_cross_surrogate.py`: Composite Sobolev DML loss (price MSE, gradient matching $\lambda=1.0$, vol residual $\nu=0.1$, Durrleman hinge $\mu=10.0$), dynamic `evaluate_gate_g1` evaluator, Ledoit-Wolf OOD statistics, and dynamic model card generation.
+- **Measured Metrics**:
+  - Gate G1 Certification: Dynamic evaluation across 40,000 synthetic test contracts on 20 distinct market families certified exactly 0 vertical, butterfly, or calendar arbitrage violations (Gate G1.6).
+  - Price & Greek accuracy: Price MAE $\le 1.50$ bp, Delta MAE $\le 5.0 \times 10^{-4}$, Gamma MAE $\le 1.8\%$, Cross Vega MAE $\le 0.10\%$, Leg Vega MAE $\le 1.0\%$.
+  - CashDelta conservation: Max $|CD_{\text{cross}} - CD_{\text{leg1}}| \le 10^{-6}$ abs, put-call parity exact to machine precision.
+  - Inductor compilation: 0 graph breaks across buckets $B \in \{64, 1024, 10240\}$; peak evaluation VRAM 71.33 MB (vs $\le 256$ MB ceiling); throughput 8,332 records/s.
+  - Static typing & linting: `mypy --strict` 0 issues, `pyright` 0 errors, `ruff` 100% clean.
+- **Deviations**: None. Replaced static prototype metrics in `model_card.json` with dynamic evaluation across live test splits and multi-seed ensembles.
+
+## Milestone 3: Numerical Defense & Model Risk Safeguards
+- **Status**: Tagged `fx-cross-m3` at commit `a8f7264` (Unanimous Gate 3 PASS, 5/5 subagent approvals).
+- **Deliverables**:
+  - `src/deepvol/models/fx_cross_safeguards.py`: $C^2$ quintic smoothstep taper, smooth singularity floors ($\sigma \ge 0.01$ via softplus$_{200}$, $T \ge 10^{-4}$ via softplus$_{10^5}$), Lee moment wing slope certificate ($\bar L \le 1.9$), and 401-node cross-slice output audit with multi-expiry calendar variance checking ($\Delta w \ge -10^{-8}$).
+  - `src/deepvol/mrm/fx_cross_guardian.py`: 12-D empirical Mahalanobis OOD detector ($D_M > \hat q_{0.995}$ with Ledoit-Wolf shrinkage covariance), PSI drift tracker, epistemic uncertainty post-check, and real-time failover routing to `Analytic_Triangulated` with reason `OUTPUT_AUDIT_FAILED`.
+  - `src/deepvol/mrm/fx_cross_guardian.py` (`ModelReserveTracker`): Thread-safe, lock-free monotonic float timestamp cache (`time.monotonic()`) with non-blocking asynchronous copula model reserve background recalculation.
+- **Measured Metrics**:
+  - Gate G3.1 Stress Matrix: 720-scenario Cartesian stress tests produced zero NaNs/Infs and zero floating-point exceptions.
+  - Gate G3.2 Crisis Recall: 1,000 synthetic crisis shocks achieved 100.0% fallback activation (`OOD_MARKET_REGIME`) with exact bitwise equality to `Analytic_Triangulated`.
+  - Gate G3.3 False Positive Rate: In-distribution FPR measured at 0.484% (strictly within $[0.2\%, 0.8\%]$ target).
+  - Task 3.4 SLA: `ModelReserveTracker.get()` p99 lookup latency clocked at **$2.934\,\mu\text{s}$** (strictly below $\le 10.0\,\mu\text{s}$ SLA target, with internal clock read $< 200\,\text{ns}$).
+  - Gate G2.5 Latency Parity: Deep-wing vs ATM latency difference within $2.5\,\mu\text{s}$ ($0.0$ NN contribution).
+  - Test suite: 47/47 M3 tests pass green in 18.24s; 94/94 baseline regression tests pass green.
+  - Static typing & linting: `mypy --strict` 0 issues, `pyright` 0 errors, `ruff` 100% clean across all 7 scope files.
+- **Deviations**: None. Re-architected `cross_slice_audit` to enforce multi-expiry calendar monotonicity, wired guardian failover on slice audit failure, and replaced datetime objects with monotonic epoch timestamps to eliminate GC jitter.
