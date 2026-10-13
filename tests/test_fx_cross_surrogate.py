@@ -11,24 +11,20 @@ Verifies:
 from __future__ import annotations
 
 import math
-from typing import Dict, Final, Sequence, Tuple
+from typing import Dict, Tuple
 import pytest
 import torch
-import torch.nn as nn
 from torch import Tensor
 
 from deepvol.models.fx_cross_analytic import (
     AnalyticTriangulated,
     Col,
-    EngineOutputs,
     N_COLS,
 )
 from deepvol.models.fx_cross_surrogate import (
     CrossVolSurrogateEngine,
     ResidualCrossVolNet,
-    jtaper,
 )
-from deepvol.models import taylor_jets as tj
 
 
 @pytest.fixture
@@ -287,7 +283,6 @@ def test_ensemble_epistemic_uncertainty(device: str) -> None:
     engine5 = CrossVolSurrogateEngine(net5).to(device)
     X = _make_sample_input(B=4, device=device)
 
-    out = engine5(X)
     eps_std = engine5.epistemic_std_bps(X)
 
     assert eps_std.shape == (4,)

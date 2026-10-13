@@ -12,12 +12,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
 import numpy as np
 import pytest
 import torch
-import torch.nn as nn
-from torch import Tensor
 
 from deepvol.models.fx_cross_surrogate import CrossVolSurrogateEngine, ResidualCrossVolNet
 from deepvol.training.train_cross_surrogate import (
@@ -51,7 +48,6 @@ def _create_mock_shards(root: Path, n_states: int = 4, strikes_per_state: int = 
 
         # Populate synthetic features
         for s in range(n_states):
-            st_slice = slice(s * strikes_per_state, (s + 1) * strikes_per_state)
             sqrtT = 1.0 + 0.1 * s
             rho = -0.2 + 0.05 * s
             z_vals = np.linspace(-3.0, 3.0, strikes_per_state)
@@ -126,6 +122,9 @@ def test_sharded_dataset_mmap_and_bootstrap_resampling(tmp_path: Path) -> None:
 def test_composite_sobolev_dml_loss(device: str) -> None:
     """Test (g): Composite Sobolev DML loss calculation with double backward (create_graph=True)."""
     net = ResidualCrossVolNet(width=64, depth=3, members=1).to(device)
+    with torch.no_grad():
+        for p in net.parameters():
+            p.normal_(0.0, 0.05)
     B = 32
 
     # Synthetic batch
@@ -162,7 +161,7 @@ def test_composite_sobolev_dml_loss(device: str) -> None:
     assert "loss_vol" in metrics
 
     # Test backward pass populates gradients across all network parameters
-    loss.backward()
+    loss.backward()  # type: ignore[no-untyped-call]
     for w in net.weights:
         assert w.grad is not None
         assert torch.isfinite(w.grad).all()
