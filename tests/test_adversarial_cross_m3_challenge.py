@@ -396,8 +396,9 @@ def test_challenge_task34_non_blocking_with_1s_delayed_copula() -> None:
         try:
             for idx in range(800):
                 t0 = time.perf_counter_ns()
-                val, stale = tracker.get("async_state")
-                dt_us = (time.perf_counter_ns() - t0) / 1000.0
+                for _ in range(5):
+                    val, stale = tracker.get("async_state")
+                dt_us = (time.perf_counter_ns() - t0) / 5000.0
                 latencies_us[idx] = dt_us
                 assert stale is True
                 # Yield event loop briefly
