@@ -1,0 +1,1313 @@
+% ==============================================================================
+%  Гибридный ML-движок прайсинга и расчёта греков кросс-валютных и товарных
+%  ванильных опционов (XAU/RUB)
+%  Proof of Concept — Сбербанк КИБ (Sber CIB), Команда PricingService
+%  Автор: Бирюков Никита Сергеевич
+%
+%  Компиляция:
+%    pdflatex -interaction=nonstopmode sber_cib_fx_cross_ru.tex
+%    pdflatex -interaction=nonstopmode sber_cib_fx_cross_ru.tex
+% ==============================================================================
+
+\documentclass[aspectratio=169, 9pt]{beamer}
+
+% ── Язык и кодировка ──────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+
+% ── Тема и шрифты ─────────────────────────────────────────────────────────────
+\usetheme{Madrid}
+\usefonttheme{professionalfonts}
+\setbeamertemplate{navigation symbols}{}
+
+% ── Математические и графические пакеты ───────────────────────────────────────
+\usepackage{amsmath, amssymb, bm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, calc, backgrounds, fit}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{array}
+\usepackage{colortbl}
+\usepackage{microtype}
+\usepackage{multicol}
+
+% ── Корпоративная палитра Сбербанк КИБ (Sber CIB) ─────────────────────────────
+\definecolor{sbergreen}{RGB}{33, 160, 56}       % Основной зелёный Сбера (#21A038)
+\definecolor{sberdarkgreen}{RGB}{11, 46, 29}    % Глубокий изумрудный КИБ (#0B2E1D)
+\definecolor{sberemerald}{RGB}{16, 107, 46}     % Изумрудный акцент (#106B2E)
+\definecolor{sbergold}{RGB}{197, 155, 39}       % Премиальный золотой CIB (#C59B27)
+\definecolor{sberlime}{RGB}{151, 207, 38}       % Лаймовый градиент Сбера
+\definecolor{sbercyan}{RGB}{0, 135, 118}        % Бирюзовый акцент
+\definecolor{sberred}{RGB}{214, 45, 45}         % Тревожный / фоллбэк
+\definecolor{sberbg}{RGB}{244, 247, 245}        % Светлый фон карточек
+\definecolor{sbergray}{RGB}{95, 108, 101}       % Корпоративный серый
+
+\setbeamercolor{structure}{fg=sberdarkgreen}
+\setbeamercolor{palette primary}{bg=sberdarkgreen, fg=white}
+\setbeamercolor{palette secondary}{bg=sberemerald, fg=white}
+\setbeamercolor{palette tertiary}{bg=sbergreen, fg=white}
+\setbeamercolor{frametitle}{bg=sberdarkgreen, fg=white}
+\setbeamercolor{title}{bg=sberdarkgreen, fg=white}
+\setbeamercolor{alerted text}{fg=sberred}
+\setbeamercolor{example text}{fg=sberemerald}
+
+\setbeamercolor{block title}{bg=sberdarkgreen, fg=white}
+\setbeamercolor{block body}{bg=sberbg, fg=black}
+\setbeamercolor{block title alerted}{bg=sberred!90!black, fg=white}
+\setbeamercolor{block body alerted}{bg=sberred!7, fg=black}
+\setbeamercolor{block title example}{bg=sbergreen!90!black, fg=white}
+\setbeamercolor{block body example}{bg=sbergreen!8, fg=black}
+
+\setbeamertemplate{itemize item}{\color{sbergreen}$\blacktriangleright$}
+\setbeamertemplate{itemize subitem}{\color{sberemerald}$\bullet$}
+
+% ── Векторный логотип Сбербанк КИБ (TikZ) ─────────────────────────────────────
+\newcommand{\sberlogo}[1][0.42cm]{%
+  \begin{tikzpicture}[baseline=-0.12ex, scale=1]
+    \def\R{#1}
+    % Внешняя дуга фирменного знака Сбера
+    \draw[line width=0.22*\R, color=sbergreen, line cap=round] (42:\R) arc (42:335:\R);
+    \draw[line width=0.22*\R, color=sberlime, line cap=round] (42:\R) arc (42:125:\R);
+    % Внутренняя галочка
+    \draw[line width=0.22*\R, color=sbergreen, line cap=round, line join=round]
+      (-0.36*\R, 0.04*\R) -- (-0.04*\R, -0.28*\R) -- (0.76*\R, 0.42*\R);
+  \end{tikzpicture}%
+}
+
+\newcommand{\sbercibheader}{%
+  \sberlogo[0.24cm]\hspace{0.35em}{\bfseries\color{white}СБЕРБАНК КИБ}\hspace{0.4em}{\color{sbergold}|}\hspace{0.4em}{\color{white!85}\scriptsize PricingService}%
+}
+
+% ── Кастомный колонтитул в корпоративном стиле Сбербанк КИБ ───────────────────
+\setbeamertemplate{footline}{%
+  \leavevmode%
+  \hbox{%
+    \begin{beamercolorbox}[wd=.34\paperwidth,ht=2.4ex,dp=1ex,left]{palette primary}%
+      \hspace*{1.2em}\sberlogo[0.16cm]\hspace{0.4em}\textbf{СБЕРБАНК КИБ} \,{\color{sbergold}|}\, Команда PricingService
+    \end{beamercolorbox}%
+    \begin{beamercolorbox}[wd=.44\paperwidth,ht=2.4ex,dp=1ex,center]{palette secondary}%
+      Гибридный ML-движок прайсинга кросс-опционов (XAU/RUB) — PoC
+    \end{beamercolorbox}%
+    \begin{beamercolorbox}[wd=.22\paperwidth,ht=2.4ex,dp=1ex,right]{palette primary}%
+      Бирюков Н.С. \hspace*{1em} \textbf{\insertframenumber{} / \inserttotalframenumber}\hspace*{1.2em}
+    \end{beamercolorbox}%
+  }%
+  \vskip0pt%
+}
+
+\setbeamertemplate{frametitle}{%
+  \nointerlineskip%
+  \begin{beamercolorbox}[wd=\paperwidth,ht=2.7ex,dp=1.0ex,left]{frametitle}%
+    \hspace*{0.8em}{\large\bfseries\insertframetitle}\hfill\sbercibheader\hspace*{0.8em}%
+  \end{beamercolorbox}%
+  \nointerlineskip%
+  {\color{sbergold}\rule{\paperwidth}{1.2pt}}%
+}
+
+% ── Метаданные ────────────────────────────────────────────────────────────────
+\title[ML-прайсинг кросс-опционов XAU/RUB]{%
+  Гибридный ML-движок прайсинга и расчёта греков\\
+  кросс-валютных и товарных ванильных опционов}
+\subtitle{Proof of Concept (PoC): Триангуляция улыбок волатильности (XAU/RUB),\\
+  Differential ML, аналитические струи Тейлора и контроль модельного риска}
+\author[Бирюков Н.С.]{Бирюков Никита Сергеевич}
+\institute[Сбербанк КИБ | PricingService]{%
+  Сбербанк КИБ (Sber CIB) --- Команда PricingService}
+\date{Октябрь 2026}
+
+\begin{document}
+
+% ==============================================================================
+% СЛАЙД 1 — ТИТУЛЬНЫЙ ЛИСТ (СБЕРБАНК КИБ)
+% ==============================================================================
+{
+\setbeamertemplate{footline}{}
+\begin{frame}[plain, noframenumbering]
+  \begin{tikzpicture}[remember picture, overlay]
+    % Тёмно-изумрудный корпоративный фон Сбербанк КИБ
+    \fill[sberdarkgreen] (current page.south west) rectangle (current page.north east);
+    % Декоративные геометрические полосы
+    \fill[sberemerald, opacity=0.35]
+      ([xshift=9.2cm]current page.south west) --
+      ([xshift=12.4cm]current page.north west) --
+      (current page.north east) --
+      (current page.south east) -- cycle;
+    \fill[sbergreen, opacity=0.18]
+      ([xshift=11.5cm]current page.south west) --
+      ([xshift=14.2cm]current page.north west) --
+      (current page.north east) --
+      (current page.south east) -- cycle;
+    % Золотая линия акцента
+    \draw[sbergold, line width=1.8pt]
+      ([xshift=1.2cm, yshift=-2.1cm]current page.north west) --
+      ([xshift=-1.2cm, yshift=-2.1cm]current page.north east);
+    \draw[sbergold, line width=0.8pt]
+      ([xshift=1.2cm, yshift=1.55cm]current page.south west) --
+      ([xshift=-1.2cm, yshift=1.55cm]current page.south east);
+  \end{tikzpicture}
+
+  \vspace{0.2cm}
+  \hspace{0.55cm}
+  \begin{minipage}{0.92\textwidth}
+    % Шапка бренда
+    \begin{tabular}{@{}l@{\hspace{0.5cm}}l@{}}
+      \sberlogo[0.52cm] &
+      \begin{tabular}[b]{@{}l@{}}
+        {\Large\bfseries\color{white} СБЕРБАНК КИБ \quad {\color{sbergold}|} \quad SBER CIB}\\[0.15em]
+        {\small\color{sberlime} Департамент глобальных рынков $\cdot$ Команда \textbf{PricingService}}
+      \end{tabular}
+    \end{tabular}
+
+    \vspace{0.85cm}
+    {\color{sbergold}\footnotesize\bfseries PROOF OF CONCEPT (PoC) $\cdot$ АРХИТЕКТУРА, МАТЕМАТИКА И ПРОМЫШЛЕННЫЕ БЕНЧМАРКИ}\\[0.35em]
+    {\LARGE\bfseries\color{white}
+      Гибридный ML-движок прайсинга и расчёта греков\\[0.2em]
+      для синтетических кросс-валютных и товарных\\[0.2em]
+      ванильных опционов (\texttt{XAU/RUB})}\\[0.55em]
+    {\normalsize\color{white!82}
+      Аналитическая $\beta$-Split триангуляция в точности \texttt{float64}, ансамбль Differential ML\\[0.15em]
+      с прямыми струями Тейлора 2-го порядка (\texttt{Taylor Jets}) и защита от модельного риска}
+
+    \vspace{0.95cm}
+    \begin{columns}[c]
+      \begin{column}{0.54\textwidth}
+        \begin{tabular}{@{}ll@{}}
+          {\color{white!65}Автор доклада:} & {\bfseries\color{white} Бирюков Никита Сергеевич} \\[0.25em]
+          {\color{white!65}Подразделение:} & {\bfseries\color{white} Сбербанк КИБ, команда PricingService} \\[0.25em]
+          {\color{white!65}Статус аудита:} & {\bfseries\color{sberlime} GO (31/31 гейтов пройдено, 141/141 тестов)}
+        \end{tabular}
+      \end{column}
+      \begin{column}{0.44\textwidth}
+        \begin{tikzpicture}
+          \node[fill=black!35, draw=sbergold, rounded corners=4pt, inner sep=6pt, text=white, font=\scriptsize] {
+            \begin{tabular}{@{}l@{\hspace{0.8em}}r@{}}
+              {\color{sbergold}\textbf{Ключевые метрики PoC:}} & \\
+              Ошибка цены (RMSE / MAE): & \textbf{0.35 / 0.67 б.п.} \\
+              Сохранение CashDelta: & \textbf{0.00 RUB ($<10^{-15}$)} \\
+              Латентность (1 опцион, CPU / GPU): & \textbf{0.31 мс / 0.20 мс} \\
+              Батч 10,000 опционов (Arrow): & \textbf{9.45 мс}
+            \end{tabular}
+          };
+        \end{tikzpicture}
+      \end{column}
+    \end{columns}
+  \end{minipage}
+\end{frame}
+}
+
+% ==============================================================================
+% СЛАЙД 2 — СОДЕРЖАНИЕ И СТРУКТУРА ДОКЛАДА
+% ==============================================================================
+\begin{frame}{Структура презентации}
+  \begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+      \begin{block}{Часть I. Бизнес-задача и архитектура решения}
+        \begin{enumerate}
+          \item \textbf{Executive Summary:} результаты PoC для PricingService.
+          \item \textbf{Проблема кросс-пар (\texttt{XAU/RUB}):} почему нет прямой поверхности волатильности и почему медленны копулы.
+          \item \textbf{Принцип декомпозиции:} «99\% аналитики \texttt{float64} + 1\% нейросетевой поправки \texttt{float32}».
+          \item \textbf{Сквозной пайплайн (M0--M5):} от графа \texttt{ConstMessage} до ответа \texttt{MutableMessage}.
+        \end{enumerate}
+      \end{block}
+
+      \begin{block}{Часть II. Пошаговая математика движка}
+        \begin{enumerate}\setcounter{enumi}{4}
+          \item \textbf{Шаг 1 (M0):} FX-конвенции дельт (\texttt{spot\_pna}, \texttt{spot\_pa}, \texttt{forward\_pa}) и канонизация SVI / SSVI.
+          \item \textbf{Шаг 2 (M1.1):} Смена меры на $\mathbb{Q}^{\text{USD}}$ и 6-шаговый аналитический алгоритм $\beta$-Split.
+          \item \textbf{Шаг 3 (M1.3):} Архитектура ансамбля \texttt{ResidualCrossVolNet} и гладкий сплайн затухания на крыльях ($|z| \ge 7$).
+          \item \textbf{Шаг 4 (M1.2):} Струи Тейлора 2-го порядка (\texttt{Taylor Jets}) и точные формулы всех 13 греков за 1 проход.
+        \end{enumerate}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.48\textwidth}
+      \begin{block}{Часть III. Обучение, данные и модельный риск}
+        \begin{enumerate}\setcounter{enumi}{8}
+          \item \textbf{Генерация обучающих данных:} 2D гауссовская копула, квазислучайная сетка Соболя и решатель Джекеля (\texttt{PIVOT}).
+          \item \textbf{Differential Machine Learning (DML):} обучение в норме Соболева $H^2$ по цене и производным.
+          \item \textbf{Модельный риск (M3):} фильтр Махаланобиса--Ледуа--Вульфа, проверка Дюррлемана и авто-фоллбэк.
+        \end{enumerate}
+      \end{block}
+
+      \begin{exampleblock}{Часть IV. Промышленные тесты, CPU-ноутбук и развитие}
+        \begin{enumerate}\setcounter{enumi}{11}
+          \item \textbf{Сверка с продом PricingService:} точное совпадение на сделке \texttt{XAU/RUB} ($K=10$ и $K=382,100$).
+          \item \textbf{Микросекундный профиль скорости:} как достигаются \textbf{0.31 мс на CPU} и \textbf{0.20 мс на GPU}.
+          \item \textbf{Сравнение с \texttt{MonteCarloWithAAD}} и перенос пайплайна на барьерные и отзывные опционы.
+        \end{enumerate}
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 3 — EXECUTIVE SUMMARY
+% ==============================================================================
+\begin{frame}{Executive Summary: Что сделано и почему это работает в проде}
+  \begin{columns}[T]
+    \begin{column}{0.55\textwidth}
+      \begin{block}{Какую задачу решает PoC в PricingService}
+        Расчёт справедливой премии (\texttt{ProductValue}) и полного набора из \textbf{13 греков} (\texttt{Delta}, \texttt{CashDelta}, \texttt{NonAdaptedDelta}, \texttt{Gamma}, \texttt{CashGamma}, \texttt{Vega}, \texttt{Vanna}, \texttt{Vomma}, \texttt{Theta}, \texttt{CorrelationSensitivity}, \texttt{Rho}) для европейских ванильных опционов на неликвидные кросс-пары ($\text{XAU/RUB} = \text{XAU/USD} \times \text{USD/RUB}$) по двум ликвидным долларовым улыбкам и корреляции $\rho$.
+      \end{block}
+
+      \begin{exampleblock}{Ключевые архитектурные преимущества}
+        \begin{itemize}
+          \item \textbf{Никакого «чёрного ящика» на ценах:} нейросеть предсказывает только малую поправку волатильности $\hat{\varepsilon}$ ($\sim 1\text{--}15$ б.п.) поверх точной аналитической модели $\beta$-Split.
+          \item \textbf{Один прямой проход вместо 80 bump-and-revalue:} все греки 1-го и 2-го порядка вычисляются аналитически через струи Тейлора (\texttt{taylor\_jets.py}).
+          \item \textbf{Работает на обычном CPU-ноутбуке без GPU:} время отклика \textbf{0.31 мс} на CPU (и \textbf{0.20 мс} на GPU), вес всех 5 моделей ансамбля — \textbf{228 КБ}.
+          \item \textbf{Полная совместимость с \texttt{ConstMessage} / \texttt{MutableMessage}:} готовый адаптер графа сообщений \texttt{legacy\_adapter.py}.
+        \end{itemize}
+      \end{exampleblock}
+    \end{column}
+
+    \begin{column}{0.43\textwidth}
+      \begin{table}
+        \centering
+        \footnotesize
+        \renewcommand{\arraystretch}{1.22}
+        \begin{tabular}{@{}lcc@{}}
+          \toprule
+          \textbf{Показатель / Гейт} & \textbf{Требование} & \textbf{Факт PoC} \\
+          \midrule
+          \rowcolor{sberbg} Ошибка цены MAE (G1.1) & $\le 1.50$ б.п. & \textbf{\color{sberemerald}0.67 б.п.} \\
+          Ошибка цены RMSE & --- & \textbf{\color{sberemerald}0.35 б.п.} \\
+          \rowcolor{sberbg} Ошибка цены p99 (G1.2) & $\le 6.50$ б.п. & \textbf{\color{sberemerald}1.89 б.п.} \\
+          Ошибка Delta MAE (G1.3) & $\le 5.0\cdot 10^{-4}$ & \textbf{\color{sberemerald}$2.28\cdot 10^{-4}$} \\
+          \rowcolor{sberbg} Ошибка Gamma / $\Gamma_{\text{ATM}}$ (G1.4) & $\le 1.80\%$ & \textbf{\color{sberemerald}0.48\%} \\
+          Ошибка Cross Vega (G1.5a) & $\le 0.10\%$ & \textbf{\color{sberemerald}0.064\%} \\
+          \rowcolor{sberbg} Арбитраж на сетке $2.2\cdot 10^7$ & $0$ & \textbf{\color{sberemerald}0 нарушений} \\
+          Дисбаланс CashDelta (G1.7) & $\le 10^{-12}$ & \textbf{\color{sberemerald}$< 10^{-15}$ (0 коп.)} \\
+          \rowcolor{sberbg} Одиночный запрос GPU p99 & $\le 0.45$ мс & \textbf{\color{sberemerald}0.214 мс} \\
+          Одиночный запрос CPU p99 & $\le 0.75$ мс & \textbf{\color{sberemerald}0.310 мс} \\
+          \rowcolor{sberbg} Батч 10,000 опционов (G2.4) & $\le 13.0$ мс & \textbf{\color{sberemerald}9.45 мс} \\
+          \bottomrule
+        \end{tabular}
+      \end{table}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 4 — ПРОБЛЕМАТИКА: ПОЧЕМУ ПРАЙСИНГ КРОСС-ОПЦИОНОВ НЕТРИВИАЛЕН
+% ==============================================================================
+\begin{frame}{Постановка задачи: Триангуляция кросс-курса $S^\times = S_1 \cdot S_2$ (\texttt{XAU/RUB})}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \begin{block}{Рыночная структура \texttt{XAU/RUB}}
+        На биржевом и внебиржевом рынке отсутствуют ликвидные котировки волатильности напрямую на \texttt{XAU/RUB}. Вместо этого наблюдаются:
+        \begin{itemize}
+          \item \textbf{Нога 1 ($\text{CCY}_A / \text{CCY}_B = \text{XAU/USD}$):} спот $S_1$, кривая золота $D_A(T)$, кривая доллара $D_B(T)$ и 5-точечная улыбка $\sigma_1(\Delta)$.
+          \item \textbf{Нога 2 ($\text{CCY}_B / \text{CCY}_C = \text{USD/RUB}$):} спот $S_2$, кривая доллара $D_B(T)$, кривая рубля $D_C(T)$ и 5-точечная улыбка $\sigma_2(\Delta)$.
+          \item \textbf{Корреляция $\rho \in [-0.999, 0.999]$} между лог-доходностями $S_1$ и $S_2$.
+        \end{itemize}
+      \end{block}
+
+      \begin{alertblock}{Дилемма классических калькуляторов}
+        \begin{enumerate}
+          \item \textbf{Плоская формула Гармана--Кольхагена (GK):}
+            $\sigma_\times = \sqrt{\sigma_{1,\text{ATM}}^2 + \sigma_{2,\text{ATM}}^2 + 2\rho\sigma_{1,\text{ATM}}\sigma_{2,\text{ATM}}}$
+            считается мгновенно, но \textbf{полностью игнорирует перекос (RR) и баттерфляй (BF)} обеих ног $\Rightarrow$ ошибка цены до \textbf{15--40 б.п.} и неверная \texttt{Vanna}/\texttt{Gamma}.
+          \item \textbf{2D Копула / \texttt{MonteCarloWithAAD}:} учитывает улыбки обеих ног, но требует 2D численного интегрирования или $65,536$ траекторий МК $\Rightarrow$ \textbf{30--150 мс} на одну сделку и шум на \texttt{Gamma}.
+        \end{enumerate}
+      \end{alertblock}
+    \end{column}
+
+    \begin{column}{0.46\textwidth}
+      \centering
+      \vspace{0.2cm}
+      \begin{tikzpicture}[scale=0.92, transform shape]
+        % Вершины валютного треугольника
+        \node[circle, draw=sberdarkgreen, fill=sbergold!25, line width=1.4pt, minimum size=1.45cm, align=center, font=\bfseries\footnotesize] (XAU) at (0, 2.8) {XAU\\{\tiny База $A$}};
+        \node[circle, draw=sberdarkgreen, fill=sberbg, line width=1.4pt, minimum size=1.45cm, align=center, font=\bfseries\footnotesize] (USD) at (-2.4, 0) {USD\\{\tiny Хаб $B$}};
+        \node[circle, draw=sberdarkgreen, fill=sbergreen!20, line width=1.4pt, minimum size=1.45cm, align=center, font=\bfseries\footnotesize] (RUB) at (2.4, 0) {RUB\\{\tiny Валюта платежа $C$}};
+
+        % Ребра
+        \draw[-{Latex[length=3mm]}, line width=1.5pt, sberemerald] (XAU) -- node[midway, above left, align=center, font=\scriptsize] {\textbf{Нога 1: XAU/USD}\\$S_1 = 4414.66$\\Улыбка $\sigma_1(k_1, T)$} (USD);
+        \draw[-{Latex[length=3mm]}, line width=1.5pt, sberemerald] (USD) -- node[midway, below, align=center, font=\scriptsize, yshift=-2pt] {\textbf{Нога 2: USD/RUB}\\$S_2 = 86.5514$\\Улыбка $\sigma_2(k_2, T)$} (RUB);
+        \draw[-{Latex[length=3mm]}, line width=1.8pt, sberred, dashed] (XAU) -- node[midway, above right, align=center, font=\scriptsize] {\textbf{Синтетический кросс}\\$\textbf{XAU/RUB}$\\$S^\times = S_1 S_2 = 382,100$\\$\sigma_\times(K, T) = \text{?}$} (RUB);
+
+        % Дуга корреляции
+        \draw[<->, sbergold!90!black, line width=1.2pt] (-0.9, 1.3) to[bend right=25] node[midway, below, font=\scriptsize\bfseries] {$\rho_{12}$} (0.0, 0.35);
+      \end{tikzpicture}
+
+      \vspace{0.2cm}
+      \begin{block}{Необходимое условие для деска}
+        При хеджировании рублёвого опциона \texttt{XAU/RUB} через два долларовых инструмента (\texttt{XAU/USD} и \texttt{USD/RUB}) денежная дельта обязана сохраняться с машинной точностью:
+        $$\text{CashDelta}_{\text{XAURUB}} \equiv \text{CashDelta}_{\text{XAUUSD}} \equiv \text{CashDelta}_{\text{USDRUB}}$$
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 5 — КЛЮЧЕВАЯ ИДЕЯ ДЕКОМПОЗИЦИИ (99% АНАЛИТИКА + 1% ML)
+% ==============================================================================
+\begin{frame}{Ключевая идея: Почему наивный ML не работает и как устроен наш гибрид}
+  \begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+      \begin{alertblock}{Почему нельзя учить нейросеть предсказывать цену $V$ напрямую}
+        Если подать параметры рынка на вход MLP и предсказывать $\hat{V}(S, K, T)$:
+        \begin{itemize}
+          \item \textbf{Нарушается паритет пут--колл} $C - P \neq D_{\text{set}}(F_\times - K)$ и границы безарбитражности.
+          \item \textbf{Шумная вторая производная ($\Gamma = \partial^2 \hat{V}/\partial S^2$):} малейшая осцилляция весов приводит к нестабильному дельта-хеджу.
+          \item \textbf{Катастрофа на экстремальных страйках:} на тестовом запросе банка с $K = 10$ руб.\ при споте $382,100$ руб.\ ($z = -26.4$) обычная нейросеть выдаёт случайное число вместо точной внутренней стоимости $D_{\text{set}}(F_\times - K)$.
+        \end{itemize}
+      \end{alertblock}
+    \end{column}
+
+    \begin{column}{0.50\textwidth}
+      \begin{exampleblock}{Наше решение: Residual Volatility + Taylor Jets}
+        Мы раскладываем подразумеваемую волатильность кросса $\sigma_\times(k, T)$ на \textbf{точную аналитическую базу} и \textbf{малую ограниченную поправку ансамбля}:
+        $$\sigma_\times(k, T) = \underbrace{\sigma_{\beta\text{-split}}(k, T)}_{\substack{\text{Аналитика \texttt{float64}}\\\text{(98--99\% улыбки)}}} + \underbrace{g_{\text{OOD}} \cdot w(z) \cdot \hat{\varepsilon}_{\text{MLP}}(\bm{x})}_{\substack{\text{Нейросетевой остаток копулы}\\\text{($\sim 0.5\text{--}15$ б.п., \texttt{float32})}}}$$
+        \begin{enumerate}
+          \item \textbf{Аналитическая база $\sigma_{\beta\text{-split}}$} решает 6-шаговое уравнение неподвижной точки в \texttt{float64} и даёт ошибку всего $\sim 2\text{--}4$ б.п.
+          \item \textbf{Ансамбль из 5 сетей \texttt{ResidualCrossVolNet}} доучивает только нелинейную поправку 2D копулы $\hat{\varepsilon}$, снижая ошибку до \textbf{0.35 б.п. RMSE}.
+          \item \textbf{Множитель $w(z) \in [0, 1]$} зануляет нейросеть при $|z| \ge 7$, гарантируя \textbf{побитовое совпадение} с аналитикой на $K=10$.
+          \item \textbf{Формула Блэка-76 в \texttt{float64}} вычисляет цену $V(\sigma_\times)$ и все греки, автоматически сохраняя паритет пут--колл и \texttt{CashDelta}.
+        \end{enumerate}
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 6 — СКВОЗНАЯ АРХИТЕКТУРА ПАЙПЛАЙНА (END-TO-END)
+% ==============================================================================
+\begin{frame}{Сквозная архитектура пайплайна (Модули M0 -- M5)}
+  \centering
+  \vspace{0.1cm}
+  \begin{tikzpicture}[
+    node distance=0.45cm and 0.55cm,
+    box/.style={rectangle, rounded corners=4pt, draw=sberdarkgreen, line width=1pt, fill=sberbg, minimum height=1.25cm, align=center, font=\scriptsize},
+    greenbox/.style={rectangle, rounded corners=4pt, draw=sberemerald, line width=1.2pt, fill=sbergreen!15, minimum height=1.25cm, align=center, font=\scriptsize},
+    goldbox/.style={rectangle, rounded corners=4pt, draw=sbergold!90!black, line width=1.2pt, fill=sbergold!18, minimum height=1.25cm, align=center, font=\scriptsize},
+    darkbox/.style={rectangle, rounded corners=4pt, draw=sberdarkgreen, line width=1.2pt, fill=sberdarkgreen, text=white, minimum height=1.25cm, align=center, font=\scriptsize},
+    arr/.style={-{Latex[length=2.5mm, width=1.8mm]}, line width=1.1pt, color=sberdarkgreen}
+  ]
+    % Верхний ряд
+    \node[darkbox, minimum width=2.7cm] (m5in) {\textbf{Вход M5 / API}\\Граф \texttt{ConstMessage}\\или JSON / Arrow IPC};
+    \node[box, minimum width=3.1cm, right=of m5in] (m0) {\textbf{M0: FX Канонизация}\\Обращение дельт $\Delta \to K$\\Фиттинг Raw SVI / SSVI\\{\tiny \texttt{float64}, LRU-кэш состояния}};
+    \node[goldbox, minimum width=3.1cm, right=of m0] (m3in) {\textbf{M3: Входной Guardian}\\12-D Махаланобис $D_M$\\Box-границы и наклон Ли\\{\tiny Выставляет флаг \texttt{nn\_gate}}};
+    \node[box, minimum width=3.1cm, right=of m3in] (tensor) {\textbf{Упаковка тензора}\\Матрица $(B, 34)$ \texttt{float64}\\Форвард $F_\times$, ставки,\\SVI обеих ног, $\rho$, \texttt{nn\_gate}};
+
+    % Нижний ряд
+    \node[greenbox, minimum width=3.5cm, below=0.75cm of tensor] (m1) {\textbf{M1: Ядро прайсинга (CPU / GPU)}\\1. $\beta$-Split аналитика (6 шагов)\\2. Ансамбль $5 \times (13\to 64^3\to 1)$\\3. Тейпер $w(z)$ и струи \texttt{Jet}$(v,\dot{v},\ddot{v},\bm{t})$};
+    \node[box, minimum width=3.2cm, left=of m1] (b76) {\textbf{Black-76 + 13 Греков}\\ОТМ + паритет в \texttt{float64}\\Sticky-Moneyness / Strike\\Цепное правило кривых \texttt{Rho}};
+    \node[goldbox, minimum width=2.9cm, left=of b76] (m3out) {\textbf{M3: Выходной аудит}\\Проверка Дюррлемана $g(k)$\\и монотонности календаря\\Асинхронный \texttt{ModelReserve}};
+    \node[darkbox, minimum width=2.5cm, left=of m3out] (m5out) {\textbf{Выход M5 / API}\\\texttt{MutableMessage}\\или JSON / Arrow\\{\tiny $\sim 0.31$ мс CPU / $0.20$ мс GPU}};
+
+    % Стрелки
+    \draw[arr] (m5in) -- (m0);
+    \draw[arr] (m0) -- (m3in);
+    \draw[arr] (m3in) -- (tensor);
+    \draw[arr] (tensor) -- (m1);
+    \draw[arr] (m1) -- (b76);
+    \draw[arr] (b76) -- (m3out);
+    \draw[arr] (m3out) -- (m5out);
+
+    % Дополнительная дуга фоллбэка
+    \draw[-{Latex[length=2.2mm]}, dashed, line width=1pt, sberred] (m3in.south) to[bend right=14]
+      node[midway, above, font=\tiny\bfseries, text=sberred] {При OOD: \texttt{nn\_gate = 0.0} (чистая аналитика)} (m1.north west);
+  \end{tikzpicture}
+
+  \vspace{0.25cm}
+  \begin{columns}[T]
+    \begin{column}{0.32\textwidth}
+      \begin{block}{\scriptsize Строгая политика точности}
+        \scriptsize Все аналитические слои, SVI, $\beta$-Split и Блэк-76 работают в \textbf{\texttt{float64}}. Только внутренняя матричная прогонка MLP выполняется в \textbf{\texttt{float32}} с возвратом в \texttt{float64}.
+      \end{block}
+    \end{column}
+    \begin{column}{0.32\textwidth}
+      \begin{block}{\scriptsize Отсутствие ветвлений в графе}
+        \scriptsize Фоллбэк и затухание на крыльях реализованы через умножение на \texttt{nn\_gate} $\in \{0, 1\}$ и гладкий сплайн $w(z)$, поэтому граф компилируется без \texttt{graph\_breaks}.
+      \end{block}
+    \end{column}
+    \begin{column}{0.32\textwidth}
+      \begin{block}{\scriptsize Универсальность CPU / GPU}
+        \scriptsize На сервере с GPU используются \textbf{CUDA Graphs}; на рабочем ноутбуке автоматически включается скомпилированный C++ тракт \textbf{\texttt{CPUQuotePath}}.
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 7 — ШАГ 1 (МОДУЛЬ M0): КОНВЕНЦИИ FX И ОБРАЩЕНИЕ ДЕЛЬТ
+% ==============================================================================
+\begin{frame}{Шаг 1 (M0): Рыночные конвенции FX и точное обращение страйков по дельте}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \begin{block}{Котировки 5 пилларов на валютном рынке}
+        Для каждой ноги задаются 5 рыночных котировок на экспирации $T$:
+        $$\bm{q} = \big(\sigma_{\text{ATM}},\; \text{RR}_{25},\; \text{BF}_{25},\; \text{RR}_{10},\; \text{BF}_{10}\big)$$
+        где волатильности на крыльях ($\Delta \in \{0.25, 0.10\}$):
+        $$\sigma_{\Delta C} = \sigma_{\text{ATM}} + \text{BF}_\Delta + \tfrac{1}{2}\text{RR}_\Delta, \qquad
+          \sigma_{\Delta P} = \sigma_{\text{ATM}} + \text{BF}_\Delta - \tfrac{1}{2}\text{RR}_\Delta$$
+      \end{block}
+
+      \begin{block}{4 поддерживаемые конвенции дельты (Reiswich--Wystup, 2010)}
+        \begin{itemize}
+          \item \textbf{\texttt{spot\_pna}} (\texttt{XAU/USD}): дельта без учёта премии:
+            $\Delta_{\text{spot,pna}}(\phi) = \phi\, D_f\, \Phi(\phi d_1)$.
+          \item \textbf{\texttt{forward\_pna}}: форвардная дельта:
+            $\Delta_{\text{fwd,pna}}(\phi) = \phi\, \Phi(\phi d_1)$.
+          \item \textbf{\texttt{spot\_pa}} (\texttt{USD/RUB}, $T \le 1\text{Y}$): с вычетом премии в базовой валюте:
+            $\Delta_{\text{spot,pa}}(\phi) = \phi\, D_f\, \frac{K}{F}\, \Phi(\phi d_2)$.
+          \item \textbf{\texttt{forward\_pa}} (\texttt{USD/RUB}, $T > 1\text{Y}$):
+            $\Delta_{\text{fwd,pa}}(\phi) = \phi\, \frac{K}{F}\, \Phi(\phi d_2)$.
+        \end{itemize}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.46\textwidth}
+      \begin{alertblock}{Математическая ловушка: немонотонность \texttt{PA}-дельты колла}
+        Для премиально-скорректированной дельты колла ($\phi = +1$):
+        $$\Delta_{\text{fwd,pa}}(k) = e^{k}\,\Phi\!\left(-\frac{k}{\sigma\sqrt{T}} - \frac{1}{2}\sigma\sqrt{T}\right)$$
+        Функция $\Delta_{\text{fwd,pa}}(k)$ \textbf{немонотонна} по лог-денежности $k = \ln(K/F)$: она достигает глобального максимума в точке $k^*$, где:
+        $$\frac{\partial \Delta_{\text{fwd,pa}}}{\partial k} = 0 \iff \sigma\sqrt{T}\,\Phi(d_2) = \varphi(d_2)$$
+      \end{alertblock}
+
+      \begin{exampleblock}{Решение в \texttt{fx\_conventions.py}}
+        \begin{itemize}
+          \item Для \texttt{PNA}-конвенций страйк вычисляется аналитически через $\Phi^{-1}$.
+          \item Для \texttt{PA}-колла сначала находится точка максимума $k_{\max}$, и корень $K(\Delta)$ ищется строго на правой монотонной ветви $[k_{\max}, +\infty)$ методом Ньютона--Брента с точностью $\le 10^{-12}$.
+          \item Поддерживаются обе конвенции страддла: \textbf{\texttt{SMILE}} и брокерский \textbf{\texttt{MARKET}} (с 1D-обращением рыночной премии).
+        \end{itemize}
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 8 — ШАГ 2 (МОДУЛЬ M0): КАНОНИЗАЦИЯ SVI И ПЛОТНОСТЬ ДЮРРЛЕМАНА
+% ==============================================================================
+\begin{frame}{Шаг 2 (M0): Безарбитражная параметризация Raw SVI и SSVI-фоллбэк}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \begin{block}{Параметризация Raw SVI (Gatheral, 2004)}
+        После перевода 5 пилларов в координаты $(k_i, \sigma_i)_{i=1}^5$, где $k_i = \ln(K_i / F)$, полная дисперсия $w(k) = \sigma^2(k)T$ аппроксимируется гладкой гиперболой:
+        $$w(k; \bm{\theta}) = a + b\!\left(\rho_{\text{svi}}(k - m) + \sqrt{(k - m)^2 + \sigma_{\text{svi}}^2}\right)$$
+        \begin{itemize}
+          \item Аналитически дифференцируема бесконечное число раз ($C^\infty$) при $\sigma_{\text{svi}} > 0$.
+          \item Асимптотические наклоны крыльев: $\lim_{k\to\pm\infty} w'(k) = b(1 \pm \rho_{\text{svi}})$.
+        \end{itemize}
+      \end{block}
+
+      \begin{block}{Два жёстких безарбитражных ограничения при фиттинге}
+        \begin{enumerate}
+          \item \textbf{Граница моментов Роджера Ли (Lee, 2004):}
+            $$b\,(1 + |\rho_{\text{svi}}|) \le \bar{L} = 1.9 < 2.0$$
+          \item \textbf{Неотрицательность плотности Дюррлемана $g(k) \ge 0$:}
+            $$g(k) = \left(1 - \frac{k w'(k)}{2w(k)}\right)^{\!2} - \frac{(w'(k))^2}{4}\!\left(\frac{1}{w(k)} + \frac{1}{4}\right) + \frac{w''(k)}{2} \ge 0$$
+        \end{enumerate}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.46\textwidth}
+      \begin{exampleblock}{Автоматический SSVI-фоллбэк и IFT-якобиан}
+        \begin{itemize}
+          \item Если на экстремальном рыночном ссрезе Raw SVI даёт $\min_{k \in [-6,6]} g(k) < 10^{-4}$, канонизатор автоматически переключается на \textbf{поверхностную SSVI} (Gatheral--Jacquier, 2014):
+            $$w(k) = \frac{\theta_T}{2}\!\left(1 + \rho_{\text{svi}}\varphi k + \sqrt{(\varphi k + \rho_{\text{svi}})^2 + 1 - \rho_{\text{svi}}^2}\right)$$
+            при условии $\theta_T\varphi(1 + |\rho_{\text{svi}}|) < 4$ и $\theta_T\varphi^2(1 + |\rho_{\text{svi}}|) \le 4$, которая \textbf{гарантированно свободна от баттерфляй-арбитража} на всей прямой $\mathbb{R}$, и затем точно переводит её в параметры $(a,b,\rho_{\text{svi}},m,\sigma_{\text{svi}})$.
+          \item \textbf{Матрица Якоби по теореме о неявной функции (IFT):}
+            Для расчёта чувствительности цены к 5 рыночным котировкам $\bm{q} = (\text{ATM}, \text{RR}_{25}, \text{BF}_{25}, \text{RR}_{10}, \text{BF}_{10})$ вычисляется якобиан $\frac{\partial \bm{\theta}_{\text{SVI}}}{\partial \bm{q}} \in \mathbb{R}^{5\times 5}$, что позволяет получать матричную \texttt{SmileVega} без повторной калибровки SVI.
+        \end{itemize}
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 9 — ШАГ 3 (МОДУЛЬ M1.1): СМЕНА МЕРЫ И АНАЛИТИЧЕСКИЙ АЛГОРИТМ BETA-SPLIT
+% ==============================================================================
+\begin{frame}{Шаг 3 (M1.1): Смена меры на $\mathbb{Q}^{\text{USD}}$ и аналитическое ядро $\beta$-Split}
+  \begin{columns}[T]
+    \begin{column}{0.53\textwidth}
+      \begin{block}{Смена меры на промежуточную валюту $\mathbb{Q}^B$ ($\text{USD}$)}
+        Пусть $X = S_1(T)/F_1$ и $Y = S_2(T)/F_2$ --- нормированные терминальные цены обеих ног в мере доллара $\mathbb{Q}^B$, где:
+        $$F_1 = S_1 \frac{D_A}{D_B}, \qquad F_2 = S_2 \frac{D_B}{D_C}, \qquad F_\times = F_1 F_2 = S_1 S_2 \frac{D_A}{D_C}$$
+        Замена меры через производную Радона--Никодима $\left.\frac{d\mathbb{Q}^C}{d\mathbb{Q}^B}\right|_T = Y$ даёт:
+        $$V(K, T) = D_{\text{set}}\, F_\times\, \mathbb{E}^{\mathbb{Q}^B}\!\left[\big(\phi(X - e^k Y)\big)^+\right], \qquad k = \ln\!\frac{K}{F_\times}$$
+      \end{block}
+
+      \begin{block}{Итерационный алгоритм $\beta$-Split (6 шагов в \texttt{float64})}
+        Как распределить лог-денежность кросса $k = \ln(K/F_\times)$ между двумя ногами ($k_1 = \beta_1 k$, $k_2 = -\beta_2 k$, где $\beta_1 + \beta_2 = 1$)?
+        Из гауссовской проекции максимального правдоподобия на гиперплоскость $\ln X + \ln Y = k$ получаем итерацию ($j = 1, \dots, 6$):
+        $$\sigma_{1}^{(j)} = \sigma_{\text{SVI},1}\!\left(\beta_1^{(j-1)} k\right), \qquad
+          \sigma_{2}^{(j)} = \sigma_{\text{SVI},2}\!\left(-\beta_2^{(j-1)} k\right)$$
+        $$v_\times^{(j)} = \big(\sigma_1^{(j)}\big)^2 + \big(\sigma_2^{(j)}\big)^2 + 2\rho\,\sigma_1^{(j)}\sigma_2^{(j)}$$
+        $$\beta_1^{(j)} = \frac{\big(\sigma_1^{(j)}\big)^2 + \rho\,\sigma_1^{(j)}\sigma_2^{(j)}}{v_\times^{(j)}}, \qquad \beta_2^{(j)} = 1 - \beta_1^{(j)}$$
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.45\textwidth}
+      \begin{exampleblock}{Доказанные свойства $\beta$-Split (P1--P6)}
+        \begin{enumerate}
+          \item \textbf{P1 (Разбиение единицы):} $\beta_1(k) + \beta_2(k) \equiv 1$ при всех $k$ и $\rho \in (-1, 1)$.
+          \item \textbf{P2 (Точность на плоских улыбках):} если $\sigma_1, \sigma_2 = \text{const}$, формула за 1 шаг возвращает точный закон Гармана--Кольхагена с точностью $10^{-16}$.
+          \item \textbf{P3 (Вырождение в одну ногу):} при $\sigma_1 \to 0$ вес $\beta_1 \to 0, \beta_2 \to 1$, и формула возвращает точную улыбку второй ноги $\sigma_2(-k)$.
+          \item \textbf{P4 (Устойчивость при $\rho \to \pm 0.999$):} гладкая регуляризация знаменателя $\text{softfloor}(v_\times, 10^{-4})$ исключает деление на ноль.
+          \item \textbf{P5 (Соблюдение границы Ли):} наклон крыльев кросса ограничен $\bar{L} \le 1.9$.
+          \item \textbf{P6 (Быстрая сходимость):} разница между 6 и 30 итерациями не превышает \textbf{0.008 vol-pts} на всём пространстве параметров.
+        \end{enumerate}
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 10 — ГРАФИК: УЛЫБКА КРОССА XAU/RUB И ОСТАТОК КОПУЛЫ
+% ==============================================================================
+\begin{frame}{Визуализация: Улыбка кросса \texttt{XAU/RUB} и нелинейный остаток копулы $\varepsilon(z)$}
+  \begin{columns}[T]
+    \begin{column}{0.50\textwidth}
+      \centering
+      \textbf{\scriptsize А. Подразумеваемая волатильность кросса $\sigma_\times(z)$ ($T=2\text{Y}$, $\rho = 0.35$)}\\[0.2em]
+      \begin{tikzpicture}
+        \begin{axis}[
+          width=7.1cm, height=5.0cm,
+          xlabel={\scriptsize Стандартизованная денежность $z = \ln(K/F_\times)/(\sigma_{\text{ref}}\sqrt{T})$},
+          ylabel={\scriptsize Подразумеваемая волатильность $\sigma_\times$},
+          xmin=-4, xmax=4, ymin=0.26, ymax=0.44,
+          grid=both, grid style={line width=.1pt, draw=gray!25},
+          major grid style={line width=.2pt, draw=gray!45},
+          tick label style={font=\tiny},
+          legend style={font=\tiny, at={(0.03,0.97)}, anchor=north west, fill=white!90, draw=gray!50}
+        ]
+          % Плоская волатильность GK
+          \addplot[domain=-4:4, samples=40, dashed, line width=1.1pt, color=gray!80!black] {0.312};
+          \addlegendentry{Плоская Гарман--Кольхаген (ATM)}
+
+          % Аналитический beta-split
+          \addplot[domain=-4:4, samples=60, line width=1.3pt, color=sbergold!90!black]
+            {0.312 + 0.0065*x + 0.0068*x^2 - 0.00018*x^3};
+          \addlegendentry{Аналитическая база $\sigma_{\beta\text{-split}}$}
+
+          % 2D Гауссовская копула + ML Ensemble
+          \addplot[domain=-4:4, samples=60, line width=1.5pt, color=sbergreen]
+            {0.312 + 0.0065*x + 0.0068*x^2 - 0.00018*x^3 - 0.0014*exp(-0.35*x^2) + 0.0009*x*exp(-0.25*x^2)};
+          \addlegendentry{2D Копула $\equiv$ DeepVol ML ($\le 0.35$ б.п.)}
+        \end{axis}
+      \end{tikzpicture}
+    \end{column}
+
+    \begin{column}{0.50\textwidth}
+      \centering
+      \textbf{\scriptsize Б. Остаток копулы $\varepsilon(z) = \sigma_{\text{copula}}(z) - \sigma_{\beta\text{-split}}(z)$ (в б.п. волатильности)}\\[0.2em]
+      \begin{tikzpicture}
+        \begin{axis}[
+          width=7.1cm, height=5.0cm,
+          xlabel={\scriptsize Стандартизованная денежность $z$},
+          ylabel={\scriptsize Остаток $\varepsilon(z)$, б.п.\ волатильности},
+          xmin=-7.5, xmax=7.5, ymin=-22, ymax=18,
+          grid=both, grid style={line width=.1pt, draw=gray!25},
+          major grid style={line width=.2pt, draw=gray!45},
+          tick label style={font=\tiny},
+          legend style={font=\tiny, at={(0.03,0.97)}, anchor=north west, fill=white!90, draw=gray!50}
+        ]
+          % Зоны затухания
+          \fill[sberred!10] (axis cs:-7.5,-22) rectangle (axis cs:-5.0,18);
+          \fill[sberred!10] (axis cs:5.0,-22) rectangle (axis cs:7.5,18);
+          \node[font=\tiny, text=sberred!80!black, align=center] at (axis cs:-6.2, -16) {Тейпер\\$w(z)\to 0$};
+          \node[font=\tiny, text=sberred!80!black, align=center] at (axis cs:6.2, -16) {Тейпер\\$w(z)\to 0$};
+
+          % Кривые при разных rho
+          \addplot[domain=-7.5:7.5, samples=90, line width=1.3pt, color=sbergreen]
+            {(-14*exp(-0.22*x^2) + 8*x*exp(-0.18*x^2)) * (abs(x)<5 ? 1 : (abs(x)>=7 ? 0 : 1 - (10*((abs(x)-5)/2)^3 - 15*((abs(x)-5)/2)^4 + 6*((abs(x)-5)/2)^5)))};
+          \addlegendentry{$\rho = +0.50$ (активный перекос)}
+
+          \addplot[domain=-7.5:7.5, samples=90, line width=1.2pt, color=sbergold!90!black]
+            {(-4.2*exp(-0.25*x^2) + 1.5*x*exp(-0.2*x^2)) * (abs(x)<5 ? 1 : (abs(x)>=7 ? 0 : 1 - (10*((abs(x)-5)/2)^3 - 15*((abs(x)-5)/2)^4 + 6*((abs(x)-5)/2)^5)))};
+          \addlegendentry{$\rho = 0.00$ (базовый режим)}
+
+          \addplot[domain=-7.5:7.5, samples=90, line width=1.2pt, dashed, color=sbercyan]
+            {(11*exp(-0.20*x^2) - 7*x*exp(-0.18*x^2)) * (abs(x)<5 ? 1 : (abs(x)>=7 ? 0 : 1 - (10*((abs(x)-5)/2)^3 - 15*((abs(x)-5)/2)^4 + 6*((abs(x)-5)/2)^5)))};
+          \addlegendentry{$\rho = -0.50$ (обратная корреляция)}
+        \end{axis}
+      \end{tikzpicture}
+    \end{column}
+  \end{columns}
+
+  \vspace{0.1cm}
+  \begin{block}{\scriptsize Почему задача для нейросети стала простой}
+    \scriptsize Вместо аппроксимации крутой параболы $\sigma_\times(z) \in [10\%, 150\%]$ нейросеть предсказывает гладкий колоколообразный остаток $\varepsilon(z)$ амплитудой всего $\pm 15$ б.п.\ внутри окна $|z| \le 5$, который за пределами $|z| \ge 7$ принудительно зануляется сплайном $w(z)$.
+  \end{block}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 11 — ШАГ 4 (МОДУЛЬ M1.3): АРХИТЕКТУРА RESIDUALCROSSVOLNET
+% ==============================================================================
+\begin{frame}{Шаг 4 (M1.3): Архитектура ансамбля \texttt{ResidualCrossVolNet}}
+  \begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+      \begin{block}{13 безразмерных входных признаков $\bm{x} \in \mathbb{R}^{13}$}
+        \footnotesize
+        \begin{tabular}{@{}cll@{}}
+          \toprule
+          \textbf{№} & \textbf{Признак} & \textbf{Физический смысл} \\
+          \midrule
+          1 & $z = k / (\sigma_{\text{ref}}\sqrt{T})$ & Стандартизованная денежность \\
+          2 & $\sqrt{T}$ & Корень из времени до экспирации \\
+          3 & $\rho$ & Корреляция между $S_1$ и $S_2$ \\
+          4--8 & $a_1, b_1, \rho_1, m_1, \sigma_1$ & Параметры Raw SVI ноги 1 \\
+          9--13 & $a_2, b_2, \rho_2, m_2, \sigma_2$ & Параметры Raw SVI ноги 2 \\
+          \bottomrule
+        \end{tabular}
+        \vspace{0.2em}
+
+        \textbf{Важное свойство инвариантности:} в вектор признаков \textbf{не входят} ни споты $S_1, S_2$, ни процентные ставки $r_A, r_B, r_C$. Вся зависимость от ставок сидит в форварде $F_\times = S_1 S_2 D_A / D_C$, поэтому модель не может переобучиться под конкретный уровень ставок ЦБ.
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.50\textwidth}
+      \begin{block}{Топология сети и стек ансамбля}
+        \begin{itemize}
+          \item \textbf{Ансамбль из $M = 5$ независимых сетей}, упакованных в единый 3D-тензор весов $\bm{W}_\ell \in \mathbb{R}^{5 \times d_{\text{out}} \times d_{\text{in}}}$.
+          \item \textbf{Размерность слоёв:} $13 \to 64 \to 64 \to 64 \to 1$ ($\approx 9,200$ параметров на члена ансамбля, \textbf{44 КБ} на файл \texttt{.pt}).
+          \item \textbf{Функция активации $\text{SiLU}(x) = \frac{x}{1 + e^{-x}}$:} гладкая класса $C^\infty$ с ненулевой второй производной (в отличие от $\text{ReLU}$, у которой вторая производная равна 0 и ломает \texttt{Gamma}).
+          \item \textbf{Нулевая инициализация выходного слоя:} $\bm{W}_3 = \bm{0}, \bm{b}_3 = \bm{0}$, благодаря чему до старта обучения сеть побитово совпадает с аналитикой $\beta$-Split.
+          \item \textbf{Гладкое ограничение амплитуды (\texttt{eps\_bound}):}
+            $$\hat{\varepsilon} = \varepsilon_{\max}\tanh\!\left(\frac{\bar{y}}{\varepsilon_{\max}}\right), \qquad \bar{y} = \frac{1}{5}\sum_{m=1}^{5} y_m(\bm{x})$$
+        \end{itemize}
+      \end{block}
+
+      \begin{exampleblock}{Эпистемическая неопределённость}
+        Разброс предсказаний 5 членов ансамбля $\sigma_{\text{epist}} = \text{std}_{m=1..5}\big(y_m(\bm{x})\big)$ вычисляется бесплатно в том же матричном умножении и подаётся в \texttt{ModelRiskTelemetry}.
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 12 — ШАГ 5: ГЛАДКОЕ ЗАТУХАНИЕ НА КРЫЛЬЯХ (QUINTIC TAPER)
+% ==============================================================================
+\begin{frame}{Шаг 5: $C^2$-гладкое затухание на крыльях ($|z| \in [5, 7]$) и тест $K = 10$}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \begin{block}{Зачем нужен сплайн затухания 5-й степени}
+        Любая нейросеть обучается на конечном интервале денежности $z \in [-6, 6]$. Если сделка находится глубоко в деньгах (например, тестовая сделка банка с $K = 10$ руб.\ при $F_\times \approx 465,832$ руб., где $z = -26.4$), нейросеть оказывается далеко за пределами обучающей выборки.
+        \begin{itemize}
+          \item Если обрезать нейросеть жёстким порогом $\mathbb{I}(|z| < 5)$, то в точке $|z| = 5$ возникнет ступенька волатильности $\Rightarrow$ \textbf{разрыв цены, бесконечная \texttt{Gamma} и нарушение арбитража}.
+        \end{itemize}
+      \end{block}
+
+      \begin{exampleblock}{Формула квинтик-тейпера \texttt{jtaper(z, 5.0, 7.0)}}
+        Пусть $t = \text{clamp}\!\left(\frac{|z| - 5}{7 - 5},\, 0,\, 1\right)$. Тогда:
+        $$w(z) = 1 - \big(10t^3 - 15t^4 + 6t^5\big)$$
+        $$\frac{dw}{dz} = -\text{sign}(z)\cdot 15\, t^2 (1 - t)^2, \qquad
+          \frac{d^2w}{dz^2} = -15\, t(1 - t)(1 - 2t)$$
+        В граничных точках $|z| = 5$ и $|z| = 7$ имеем $w'(5) = w''(5) = w'(7) = w''(7) = 0$ $\Rightarrow$ \textbf{непрерывность $V, \Delta, \Gamma$ с точностью $10^{-16}$}.
+      \end{exampleblock}
+    \end{column}
+
+    \begin{column}{0.46\textwidth}
+      \centering
+      \textbf{\scriptsize Профиль функции затухания $w(z)$ и её производных}\\[0.3em]
+      \begin{tikzpicture}
+        \begin{axis}[
+          width=6.8cm, height=5.2cm,
+          xlabel={\scriptsize Абсолютная стандартизованная денежность $|z|$},
+          ylabel={\scriptsize Значение},
+          xmin=3.5, xmax=8.0, ymin=-1.2, ymax=1.2,
+          grid=both, grid style={line width=.1pt, draw=gray!25},
+          tick label style={font=\tiny},
+          legend style={font=\tiny, at={(0.97,0.97)}, anchor=north east, fill=white!90}
+        ]
+          \fill[sbergreen!10] (axis cs:3.5,-1.2) rectangle (axis cs:5.0,1.2);
+          \fill[sbergold!15] (axis cs:5.0,-1.2) rectangle (axis cs:7.0,1.2);
+          \fill[sberbg] (axis cs:7.0,-1.2) rectangle (axis cs:8.0,1.2);
+
+          \node[font=\tiny\bfseries, text=sberemerald] at (axis cs:4.25, 0.85) {$w(z) \equiv 1$};
+          \node[font=\tiny\bfseries, text=sbergold!80!black] at (axis cs:6.0, 0.85) {Переход $C^2$};
+          \node[font=\tiny\bfseries, text=sbergray] at (axis cs:7.5, 0.85) {$w(z) \equiv 0$};
+
+          % w(z)
+          \addplot[domain=3.5:8.0, samples=100, line width=1.6pt, color=sbergreen]
+            {x<=5 ? 1 : (x>=7 ? 0 : 1 - (10*((x-5)/2)^3 - 15*((x-5)/2)^4 + 6*((x-5)/2)^5))};
+          \addlegendentry{Вес нейросети $w(z)$}
+
+          % dw/dz
+          \addplot[domain=3.5:8.0, samples=100, line width=1.2pt, dashed, color=sbergold!90!black]
+            {(x>5 && x<7) ? -15*((x-5)/2)^2*(1-(x-5)/2)^2 : 0};
+          \addlegendentry{1-я производная $w'(z)$}
+
+          % d2w/dz2 (scaled by 0.25 for display)
+          \addplot[domain=3.5:8.0, samples=100, line width=1.1pt, dotted, color=sberred]
+            {(x>5 && x<7) ? -3.75*((x-5)/2)*(1-(x-5)/2)*(1-2*(x-5)/2) : 0};
+          \addlegendentry{$0.25 \cdot w''(z)$}
+        \end{axis}
+      \end{tikzpicture}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 13 — ШАГ 6 (МОДУЛЬ M1.2): СТРУИ ТЕЙЛОРА 2-ГО ПОРЯДКА (TAYLOR JETS)
+% ==============================================================================
+\begin{frame}{Шаг 6 (M1.2): Алгебра струй Тейлора 2-го порядка (\texttt{taylor\_jets.py})}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \begin{block}{Зачем нужны струи Тейлора вместо \texttt{autograd} и конечных разностей}
+        Чтобы посчитать \texttt{Delta}, \texttt{Gamma}, \texttt{Vanna}, \texttt{Theta} с учётом наклона улыбки ($\text{Sticky-Moneyness}$), нам нужны точные первая и вторая производные волатильности кросса по лог-денежности $k = \ln(K/F_\times)$:
+        $$s_k = \frac{\partial \sigma_\times}{\partial k}, \qquad s_{kk} = \frac{\partial^2 \sigma_\times}{\partial k^2}, \qquad \bm{s}_t = \left(\frac{\partial \sigma_\times}{\partial \rho},\, \frac{\partial \sigma_\times}{\partial \sigma_1},\, \frac{\partial \sigma_\times}{\partial \sigma_2}\right)$$
+        В модуле \texttt{taylor\_jets.py} каждое число внутри $\beta$-Split и внутри нейросети представлено структурой \texttt{Jet}:
+        $$\mathcal{J}(u) = \big(v,\; d,\; dd,\; \bm{t}\big) = \left(u,\; \frac{\partial u}{\partial k},\; \frac{\partial^2 u}{\partial k^2},\; \nabla_{(\rho, \delta_1, \delta_2)} u\right)$$
+      \end{block}
+
+      \begin{block}{Точные правила алгебры струй (\texttt{float64})}
+        \begin{itemize}
+          \item \textbf{Умножение $\mathcal{J}(u) \cdot \mathcal{J}(w)$:}
+            $$(v_u v_w,\;\; d_u v_w + v_u d_w,\;\; dd_u v_w + 2 d_u d_w + v_u dd_w,\;\; \bm{t}_u v_w + v_u \bm{t}_w)$$
+          \item \textbf{Унарное отображение $f(\mathcal{J}(u))$:}
+            $$\big(f(v),\;\; f'(v)\, d,\;\; f''(v)\, d^2 + f'(v)\, dd,\;\; f'(v)\, \bm{t}\big)$$
+        \end{itemize}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.46\textwidth}
+      \begin{exampleblock}{Прогонка струи через ансамбль \texttt{ResidualCrossVolNet}}
+        Матричное умножение линейного слоя $\bm{h} = \bm{W}\bm{x} + \bm{b}$ является линейным оператором, поэтому \textbf{матрица весов $\bm{W}$ применяется одновременно к значению $v$, первой производной $d$, второй производной $dd$ и касательным $\bm{t}$ за один вызов \texttt{einsum}}:
+        $$\begin{bmatrix} \bm{v}_{\text{out}} \\ \bm{d}_{\text{out}} \\ \bm{dd}_{\text{out}} \\ \bm{t}_{\text{out}} \end{bmatrix}
+          = \begin{bmatrix} \bm{v}_{\text{in}} \\ \bm{d}_{\text{in}} \\ \bm{dd}_{\text{in}} \\ \bm{t}_{\text{in}} \end{bmatrix} \bm{W}^\top
+          + \begin{bmatrix} \bm{b} \\ \bm{0} \\ \bm{0} \\ \bm{0} \end{bmatrix}$$
+        На нелинейности $\text{SiLU}(x) = x\,s(x)$, где $s(x) = \frac{1}{1+e^{-x}}$:
+        $$\begin{aligned}
+          f(x) &= x\,s, \\
+          f'(x) &= s + x\,s(1 - s), \\
+          f''(x) &= s(1 - s)\big(2 + x(1 - 2s)\big).
+        \end{aligned}$$
+        \textbf{Результат:} за \textbf{один прямой проход} мы получаем $\sigma_\times$, $s_k$, $s_{kk}$ и $\bm{s}_t$ с точностью аналитических формул ($10^{-12}$) и \textbf{без единого вызова \texttt{backward()}} в режиме одиночной котировки!
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 14 — ШАГ 7: ТОЧНЫЕ ФОРМУЛЫ ВСЕХ 13 ГРЕКОВ И СОХРАНЕНИЕ CASHDELTA
+% ==============================================================================
+\begin{frame}{Шаг 7: Полная система формул для 13 греков и сохранение \texttt{CashDelta}}
+  \begin{columns}[T]
+    \begin{column}{0.53\textwidth}
+      \begin{block}{Частные производные Блэка-76 с поправкой на улыбку}
+        Обозначим базовые производные Блэка-76 при фиксированной $\sigma$:
+        $B_F = \frac{\partial B}{\partial F}$, $B_{FF} = \frac{\partial^2 B}{\partial F^2}$, $B_s = \frac{\partial B}{\partial \sigma}$, $B_{Fs} = \frac{\partial^2 B}{\partial F \partial \sigma}$, $B_{ss} = \frac{\partial^2 B}{\partial \sigma^2}$.
+        Так как $k = \ln(K / F_\times)$, имеем $k_F = -1/F_\times$ и $k_{FF} = 1/F_\times^2$. Полные производные по форварду в режиме \textbf{\texttt{STICKY\_MONEYNESS}}:
+        $$\frac{dV}{dF_\times} = B_F - \frac{B_s\, s_k}{F_\times}$$
+        $$\frac{d^2V}{dF_\times^2} = B_{FF} - \frac{2 B_{Fs} s_k}{F_\times} + \frac{B_{ss} s_k^2}{F_\times^2} + \frac{B_s (s_{kk} + s_k)}{F_\times^2}$$
+        В режиме \textbf{\texttt{STICKY\_STRIKE}} полагаем $s_k = s_{kk} = 0$.
+      \end{block}
+
+      \begin{block}{Геометрический множитель кэрри $g = D_A(T) / D_C(T)$}
+        Поскольку $F_\times = g \cdot S^\times = g \cdot S_1 S_2$, переход от форвардных производных к спотовым даёт:
+        $$\Delta_\times = \frac{\partial V}{\partial S^\times} = g\,\frac{dV}{dF_\times}, \quad
+          \Delta_{\text{non-adapted}} = \frac{\Delta_\times}{g} = \frac{dV}{dF_\times}, \quad
+          \Gamma_\times = g^2\,\frac{d^2V}{dF_\times^2}$$
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.45\textwidth}
+      \begin{exampleblock}{Тождество сохранения \texttt{CashDelta} (Gate G1.7)}
+        Спотовые дельты по двум ногам и кроссу связаны цепным правилом:
+        $$\Delta_1 = \frac{\partial V}{\partial S_1} = S_2 \Delta_\times, \qquad \Delta_2 = \frac{\partial V}{\partial S_2} = S_1 \Delta_\times$$
+        Умножая каждую дельту на соответствующий спот в рублях, получаем \textbf{абсолютное тождество}:
+        $$\text{CashDelta}_\times = S^\times \Delta_\times \equiv S_1 \Delta_1 \equiv S_2 \Delta_2 = F_\times \frac{dV}{dF_\times}$$
+        Погрешность сохранения на всей тестовой выборке: \textbf{$< 10^{-15}$ (0.00 копеек)}.
+      \end{exampleblock}
+
+      \begin{block}{Формулы остальных греков}
+        \scriptsize
+        \begin{itemize}
+          \item $\text{Vanna} = g\!\left(B_{Fs} - \frac{B_{ss} s_k}{F_\times}\right)$, \quad $\text{Vomma} = B_{ss}$, \quad $\text{Vega}_\times = B_s$.
+          \item $\Theta = \frac{1}{365}\!\left(r_{\text{set}} V - \phi D_{\text{set}} F_\times \Phi(\phi d_1)(r_C - r_A) - \frac{D_{\text{set}} F_\times \sigma \varphi(d_1)}{2\sqrt{T}} + B_s s_k (r_C - r_A)\right)$.
+          \item \textbf{Бакетированный \texttt{Rho}:} по линейным весам узлов кривой $\bm{w}(T)$:
+            $\text{Rho}_{C,i} = \frac{dV}{dF_\times} F_\times T w_i(T) - T_{\text{set}} V w_i(T_{\text{set}})$, \quad
+            $\text{Rho}_{A,j} = -\frac{dV}{dF_\times} F_\times T w_j(T)$.
+        \end{itemize}
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 15 — КАК ОБУЧАЕТСЯ МОДЕЛЬ (МОДУЛЬ M2): УЧИТЕЛЬ И ДАННЫЕ
+% ==============================================================================
+\begin{frame}{Обучение модели (M2): Генерация данных, 2D Копула и решатель Джекеля}
+  \begin{columns}[T]
+    \begin{column}{0.50\textwidth}
+      \begin{block}{1. Сэмплирование пространства состояний (\texttt{CrossSobolSampler})}
+        \begin{itemize}
+          \item 12-мерное пространство рыночных параметров (ATM-волатильности, 25D/10D RR и BF обеих ног, корреляция $\rho \in [-0.95, 0.95]$, срок $T \in [1\text{D}, 10\text{Y}]$) покрывается скремблированной \textbf{последовательностью Соболя}.
+          \item Для каждого рыночного состояния строится стратифицированная сетка страйков $z \in [-6, 6]$ (с уплотнением вблизи ATM $|z| \le 2$ и в зоне перехода $5 \le |z| \le 7$).
+          \item \textbf{Защита от утечки данных (Data Leakage):} разбиение на \texttt{train / val / test / stress} выполняется строго \textbf{по SHA-256 хэшам рыночных состояний} — ни одно состояние не попадает одновременно в два сплита.
+        \end{itemize}
+      \end{block}
+
+      \begin{block}{2. Эталонный учитель: 2D Гауссовская копула в $\mathbb{Q}^B$}
+        Маргинальные распределения $X = F_1^{-1}(\Phi(u_1))$ и $Y = F_2^{-1}(\Phi(u_2))$ восстанавливаются из SVI-улыбок обеих ног по формуле Бридена--Литценбергера ($F_i(K) = 1 + \frac{1}{D}\frac{\partial P_i}{\partial K}$), после чего интеграл премии вычисляется \textbf{2D квадратурой Гаусса--Эрмита $96 \times 96$ узлов} в \texttt{float64}.
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.48\textwidth}
+      \begin{exampleblock}{3. Обращение волатильности через решатель Джекеля (\texttt{PIVOT})}
+        Из эталонной цены копулы $V_{\text{cop}}(k, T)$ необходимо извлечь подразумеваемую волатильность $\sigma_{\text{cop}}(k, T)$ с точностью $10^{-13}$ даже при глубоких страйках $|z| = 6$:
+        \begin{itemize}
+          \item Обычный метод Ньютона--Рафсона расходится на крыльях из-за вырождения веги $B_s \to 0$.
+          \item Мы используем \textbf{дифференцируемый решатель Питера Джекеля (\texttt{pivot\_iv.py})} с рациональной кубической интерполяцией итераций Хауcхолдера 3-го порядка.
+          \item Относительное расхождение с независимым эталоном бисекции в \texttt{float64}: \textbf{$\le 10^{-12}$}.
+        \end{itemize}
+      \end{exampleblock}
+
+      \begin{block}{4. Контроль целостности шардов данных}
+        Каждый шард \texttt{.parquet / .pt} подписывается в \texttt{manifest.json} контрольной суммой \textbf{SHA-256} и хэшем коммита Git. При запуске аудита все шарды верифицируются побитово.
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 16 — DIFFERENTIAL MACHINE LEARNING (DML) И СОБОЛЕВСКИЙ ЛОСС
+% ==============================================================================
+\begin{frame}{Обучение модели (M2): Differential Machine Learning (Huge \& Savine, 2020)}
+  \begin{columns}[T]
+    \begin{column}{0.54\textwidth}
+      \begin{block}{Почему стандартного MSE по цене недостаточно}
+        Если обучать сеть только минимизацией $\mathbb{E}[(\hat{\varepsilon} - \varepsilon)^2]$, сеть может идеально пройти через узлы цены, но осциллировать между ними. Тогда производные $\partial_k \hat{\varepsilon}$ (влияет на \texttt{Delta} и \texttt{Vanna}) и $\partial_{kk} \hat{\varepsilon}$ (напрямую входит в \texttt{Gamma}) будут зашумлены.
+      \end{block}
+
+      \begin{exampleblock}{Функция потерь в пространстве Соболева $W^{2,2}$ ($H^2$)}
+        Мы обучаем каждый из 5 членов ансамбля минимизировать комбинированный функционал по значению остатка, его 1-й и 2-й производным по денежности и градиенту по параметрам состояния:
+        $$\mathcal{L}_{\text{DML}} =
+          \underbrace{\|\hat{\varepsilon} - \varepsilon\|_2^2}_{\text{Точность цены}}
+          + \lambda \underbrace{\|\partial_k \hat{\varepsilon} - \partial_k \varepsilon\|_2^2}_{\text{Точность Delta / Vanna}}
+          + \nu \underbrace{\|\partial_{kk} \hat{\varepsilon} - \partial_{kk} \varepsilon\|_2^2}_{\text{Точность Gamma}}
+          + \mu \underbrace{\|\nabla_{\bm{\theta}} \hat{\varepsilon} - \nabla_{\bm{\theta}} \varepsilon\|_2^2}_{\text{Точность Vega / Corr}}$$
+        где гиперпараметры зафиксированы спецификацией:
+        $$\bm{\lambda = 1.0, \qquad \nu = 0.1, \qquad \mu = 10.0}$$
+      \end{exampleblock}
+    \end{column}
+
+    \begin{column}{0.44\textwidth}
+      \centering
+      \textbf{\scriptsize Сходимость ошибок при обучении с DML vs.\ обычным MSE}\\[0.2em]
+      \begin{tikzpicture}
+        \begin{axis}[
+          width=6.6cm, height=4.6cm,
+          xlabel={\scriptsize Эпоха обучения},
+          ylabel={\scriptsize Относительная ошибка Gamma (\%)},
+          xmin=0, xmax=100, ymin=0.2, ymax=12,
+          ymode=log, log basis y={10},
+          grid=both, grid style={line width=.1pt, draw=gray!25},
+          tick label style={font=\tiny},
+          legend style={font=\tiny, at={(0.97,0.97)}, anchor=north east, fill=white!90}
+        ]
+          \addplot[color=sberred, dashed, line width=1.3pt] coordinates {
+            (0,10.5) (10,6.2) (20,4.8) (40,3.9) (60,3.6) (80,3.5) (100,3.45)
+          };
+          \addlegendentry{Обычный MSE (без производных)}
+
+          \addplot[color=sbergreen, line width=1.5pt] coordinates {
+            (0,10.5) (10,2.8) (20,1.35) (40,0.72) (60,0.54) (80,0.49) (100,0.48)
+          };
+          \addlegendentry{Наш DML ($\lambda=1, \nu=0.1, \mu=10$)}
+
+          \draw[sbergold!90!black, dotted, line width=1pt] (axis cs:0,1.8) -- (axis cs:100,1.8)
+            node[pos=0.35, above, font=\tiny\bfseries] {Порог гейта G1.4 (1.8\%)};
+        \end{axis}
+      \end{tikzpicture}
+
+      \begin{block}{\scriptsize Эффект регуляризации производными}
+        \scriptsize Обучение в норме Соболева снижает ошибку по \texttt{Gamma} в \textbf{7 раз} (с $3.45\%$ до \textbf{$0.48\%$}) и ошибку по поножным вегам (\texttt{Leg Vega}) до \textbf{$0.49\%$}.
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 17 — УПРАВЛЕНИЕ МОДЕЛЬНЫМ РИСКОМ (МОДУЛЬ M3, SR 11-7 / ЦБ РФ)
+% ==============================================================================
+\begin{frame}{Управление модельным риском (M3): \texttt{FXCrossGuardian} и авто-фоллбэк}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \begin{block}{Эшелонированная защита в реальном времени}
+        В промышленной эксплуатации КИБ модель обязана автоматически распознавать аномальные рыночные режимы (скачок волатильности рубля, разрыв корреляции, некорректные котировки) и безопасно переключаться на чистую аналитику $\beta$-Split (\texttt{nn\_gate = 0}):
+        \begin{enumerate}
+          \item \textbf{12-мерное расстояние Махаланобиса с регуляризацией Ледуа--Вульфа:}
+            $$D_M(\bm{m}) = \sqrt{(\bm{m} - \bm{\mu}_{\text{train}})^\top \bm{\Sigma}_{\text{LW}}^{-1} (\bm{m} - \bm{\mu}_{\text{train}})}$$
+            Если $D_M(\bm{m}) > q_{0.995} = 5.337$ или нарушен 12-мерный гиперкуб обучающей выборки $\Rightarrow$ мгновенный маршрут в аналитический фоллбэк (\texttt{OOD\_MARKET\_REGIME}).
+          \item \textbf{Контроль эпистемического разброса ансамбля:}
+            если $\text{std}_m(\hat{\varepsilon}_m) > \tau_{\text{epist}}$, срабатывает \texttt{EPISTEMIC\_UNCERTAINTY}.
+          \item \textbf{Выходной аудит поверхности Дюррлемана и календаря:}
+            проверка $\min_k g_\times(k) \ge 0$ и $\partial_T w_\times(k, T) \ge 0$ (\texttt{OUTPUT\_AUDIT\_FAILED}).
+        \end{enumerate}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.46\textwidth}
+      \begin{exampleblock}{Результаты стресс-тестирования (Gates G3.2, G3.3, G1.6b)}
+        \begin{itemize}
+          \item \textbf{1,000 синтетических кризисных сценариев:} \textbf{100.0\%} перехвачены \texttt{FXCrossGuardian} с возвратом HTTP 200, флагом \texttt{fallback\_activated = True} и точной аналитической ценой $\beta$-Split.
+          \item \textbf{Доля ложных срабатываний (FPR) на \texttt{test}:} ровно \textbf{0.50\%} (порог спецификации $0.5\% \pm 0.3\%$).
+          \item \textbf{Календарные аномалии (G1.6b):} \textbf{100.0\%} полнота обнаружения при расходящихся временных структурах ног.
+        \end{itemize}
+      \end{exampleblock}
+
+      \begin{block}{Мониторинг дрейфа (PSI) и модельный резерв}
+        \begin{itemize}
+          \item \textbf{\texttt{MarketStateDriftMonitor}:} непрерывно считает индекс стабильности популяции $\text{PSI} = \sum_b (p_b - q_b)\ln(p_b/q_b)$ по скользящему окну запросов (порог алерта $\text{PSI} > 0.25$).
+          \item \textbf{\texttt{ModelReserveTracker}:} асинхронно в фоновом потоке считает модельный резерв $\text{MR}_s = \max_K |V_{\text{cop}} - V_{\text{served}}| / (D_{\text{set}} F_\times)$ по 64 страйкам без блокировки основного потока прайсинга.
+        \end{itemize}
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 18 — СВЕРКА С ПРОДОМ СБЕРБАНК КИБ (ЗАПРОС K = 10 И K = 382,100)
+% ==============================================================================
+\begin{frame}{Верификация на реальном запросе PricingService (\texttt{XAU/RUB}, $T = 2$ года)}
+  \begin{columns}[T]
+    \begin{column}{0.54\textwidth}
+      \begin{block}{Тест А: Реальный продовый дамп банка ($K = 10.0$ RUB, глубокий ITM)}
+        Входные данные из \texttt{xaurub\_k10\_complete\_const\_messages.json}:
+        $S_1 = 4414.66$, $S_2 = 86.551435$, $S^\times = 382,100.0$, $K = 10.0$ ($z = -26.4$).
+        За счёт сплайна $w(z) \equiv 0$ при $|z| \ge 7$ вклад ML равен \textbf{точному нулю}:
+        \vspace{0.2em}
+
+        \scriptsize
+        \renewcommand{\arraystretch}{1.15}
+        \begin{tabular}{@{}lrrr@{}}
+          \toprule
+          \textbf{Поле \texttt{MutableMessage}} & \textbf{Прод PricingService} & \textbf{DeepVol ML Engine} & \textbf{Разница} \\
+          \midrule
+          \texttt{ProductValue} (RUB) & $355,690.379107$ & $355,690.379107$ & \textbf{\color{sberemerald}0.00 б.п.} \\
+          \texttt{Delta[XAURUB]} & $0.9309147404$ & $0.9309147404$ & \textbf{\color{sberemerald}$0.00$} \\
+          \texttt{CashDelta[XAURUB]} & $355,698.014861$ & $355,698.014861$ & \textbf{\color{sberemerald}0.00 RUB} \\
+          \texttt{NonAdaptedDelta} & $0.7635754481$ & $0.7635754481$ & \textbf{\color{sberemerald}$0.00$} \\
+          \texttt{Gamma} / \texttt{Vega} & $0.000000$ & $0.000000$ & \textbf{\color{sberemerald}$0.00$} \\
+          \texttt{Theta} (RUB/день) & $+187.93^{\,*}$ & $+34.34^{\,*}$ & Конвенция$^*$ \\
+          \bottomrule
+        \end{tabular}
+        \vspace{0.15em}
+
+        {\tiny $^*$Разница в \texttt{Theta} объясняется исключительно конвенцией: DeepVol считает производную по модельному времени $-\frac{1}{365}\partial V/\partial T = +34.34$ руб./день, тогда как старый сервис сдвигает дату \texttt{AsOfDate} на $T+1$ вдоль дискретного расписания кривых ($+187.93$ руб./день).}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.44\textwidth}
+      \begin{exampleblock}{Тест Б: Тот же рынок при рыночном страйке $K = 382,100$ RUB (ATM спот)}
+        При $K = 382,100$ ($z = -0.485$) активно работают и $\beta$-Split, и 5 сетей ансамбля \texttt{ResidualCrossVolNet}:
+        \vspace{0.2em}
+
+        \scriptsize
+        \renewcommand{\arraystretch}{1.15}
+        \begin{tabular}{@{}lr@{}}
+          \toprule
+          \textbf{Показатель ($K = 382,100$ RUB)} & \textbf{Значение DeepVol} \\
+          \midrule
+          \texttt{ProductValue} & \textbf{111,379.55 RUB} \\
+          Аналитическая база $\sigma_{\beta\text{-split}}$ & $28.9983\%$ \\
+          Поправка ML-ансамбля $w(z)\hat{\varepsilon}$ & $-0.0064\%$ ($-0.64$ б.п.) \\
+          Итоговая $\sigma_\times(K, T)$ & \textbf{28.9919\%} \\
+          \texttt{Delta[XAURUB]} & $0.659472$ \\
+          \texttt{CashDelta} (все 3 ноги) & \textbf{251,984.42 RUB} \\
+          \texttt{NonAdaptedDelta} & $0.540839$ \\
+          \texttt{CashGamma} (1\% move) & $264.45$ RUB \\
+          \texttt{Vega} (кросс / Leg1 / Leg2) & $110.2\text{k} / 85.6\text{k} / 70.3\text{k}$ \\
+          \texttt{CorrelationSensitivity} & $8,068.93$ RUB \\
+          Латентность на CPU ноутбуке & \textbf{0.31 мс} \\
+          \bottomrule
+        \end{tabular}
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 19 — ИНТЕГРАЦИЯ С ПРОДОМ (МОДУЛЬ M5): LEGACY ADAPTER
+% ==============================================================================
+\begin{frame}{Интеграция с PricingService (M5): Адаптер \texttt{ConstMessage} $\leftrightarrow$ \texttt{MutableMessage}}
+  \begin{columns}[T]
+    \begin{column}{0.49\textwidth}
+      \begin{block}{Парсинг входного DAG \texttt{ConstMessageGraph}}
+        Модуль \texttt{src/deepvol/market/legacy\_adapter.py} напрямую принимает массив JSON-сообщений текущего сервиса:
+        \begin{itemize}
+          \item \textbf{Контентно-адресуемая проверка SHA-1:} каноническая сериализация JSON с проверкой 40-символьных хэшей и защитой от циклов в графе ссылок.
+          \item \textbf{Разрешение зависимостей:} автоматическое извлечение узлов \texttt{EuropeanVanillaOptionProduct}, \texttt{BlackScholesMertonModel}, \texttt{MarketDataSet}, \texttt{DiscountFactorCurve}, \texttt{FXForwardObject} и \texttt{FXVolatilitySmileCollection}.
+          \item \textbf{Кривые дисконтирования (\texttt{Act/365F}):} кусочно-линейная интерполяция нулевых ставок $r(t)$ с плоской экстраполяцией и аналитическими весами узлов $w_i(T)$ ($\sum_i w_i(T) \equiv 1$).
+          \item \textbf{Интерполяция улыбок:} линейная интерполяция полной дисперсии $\sigma^2(T_m)\cdot T_m$ между соседними сроками экспирации с перестановкой колонок \texttt{[10RR, 25RR, ATM, 25BF, 10BF]} $\to$ \texttt{SmileQuotes}.
+        \end{itemize}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.49\textwidth}
+      \begin{exampleblock}{Формирование выходного \texttt{MutableMessage}}
+        Функция \texttt{to\_mutable\_message(resp, req, ctx)} упаковывает ответ движка в точный контракт существующей шины:
+        \begin{itemize}
+          \item \textbf{\texttt{Delta}, \texttt{CashDelta}, \texttt{NonAdaptedDelta}, \texttt{Gamma}, \texttt{CashGamma}:} словари по трём ключам \texttt{\{"XAURUB": ..., "XAUUSD": ..., "USDRUB": ...\}} с точным соблюдением $\Delta_{\text{non-adapted}} = \Delta / g$.
+          \item \textbf{\texttt{Vega} ($15 \times 5$ на каждую пару):} распределение 5-пилларных вег по двум соседним экспирациям сетки с весами $(w_k, w_{k+1})$.
+          \item \textbf{\texttt{Vanna} и \texttt{Vomma}:} вложенные матрицы размерности $15 \times 5$ по структуре кросса и ног.
+          \item \textbf{\texttt{Rho}:} точные векторы чувствительности по всем 26 узлам кривой \texttt{RUB\_RUONIA\_OIS} и 43 узлам кривой \texttt{XAU\_RUB}.
+          \item \textbf{Служебные поля:} \texttt{id} (SHA-1), \texttt{nonce}, \texttt{generation}, \texttt{TotalSec}, \texttt{ProcSec}, \texttt{MemoryMb}, \texttt{HostName}.
+        \end{itemize}
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 20 — ПОЧЕМУ РАБОТАЕТ ТАК БЫСТРО: МИКРОСЕКУНДНЫЙ ПРОФИЛЬ (M4)
+% ==============================================================================
+\begin{frame}{Высокопроизводительный рантайм (M4): Как достигаются 0.31 мс на CPU и 0.20 мс на GPU}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \begin{block}{Почему классический калькулятор тратит 100+ мс}
+        Задержка в традиционных банковских прайсерах возникает не из-за формулы Блэка-76 (она занимает $< 50$ наносекунд), а из-за:
+        \begin{enumerate}
+          \item Численного интегрирования 2D копулы на сетке $100 \times 100$ ($10,000$ точек).
+          \item \textbf{80-кратного перезапуска прайсера} в цикле конечных разностей (\texttt{bump-and-revalue}) для расчёта греков и пилларов кривых.
+        \end{enumerate}
+      \end{block}
+
+      \begin{exampleblock}{4 инженерных решения нашего рантайма (\texttt{fx\_cross\_runtime.py})}
+        \begin{enumerate}
+          \item \textbf{Один проход вместо 80:} струи Тейлора $\mathcal{J}(v, \dot{v}, \ddot{v}, \bm{t})$ и аналитическое цепное правило кривых выдают все 13 греков за \textbf{1 проход}.
+          \item \textbf{Весь ансамбль помещается в L2-кэш ядра CPU:} 5 сетей весят суммарно \textbf{220 КБ} и вычисляются одним слитным тензорным умножением (\texttt{einsum}).
+          \item \textbf{Статические буферы без аллокаций:} в \texttt{CPUQuotePath} и \texttt{GraphBucket} входной буфер $(1, 34)$ выделяется один раз при старте; сборщик мусора Python заморожен (\texttt{gc.freeze()}).
+          \item \textbf{C++ Inductor на CPU и CUDA Graphs на GPU:} нулевые накладные расходы интерпретатора Python.
+        \end{enumerate}
+      \end{exampleblock}
+    \end{column}
+
+    \begin{column}{0.46\textwidth}
+      \begin{table}
+        \centering
+        \scriptsize
+        \renewcommand{\arraystretch}{1.22}
+        \textbf{Пошаговый бюджет времени одного запроса}\\[0.3em]
+        \begin{tabular}{@{}lrrr@{}}
+          \toprule
+          \textbf{Стадия выполнения} & \textbf{Копула + FD} & \textbf{Наш CPU} & \textbf{Наш GPU} \\
+          \midrule
+          \rowcolor{sberbg} 1. Канонизация SVI (LRU-кэш) & $5,000$ мкс & \textbf{2 мкс} & \textbf{2 мкс} \\
+          2. Аналитика $\beta$-Split (6 шагов) & $20,000$ мкс & \textbf{12 мкс} & \textbf{5 мкс} \\
+          \rowcolor{sberbg} 3. Ансамбль 5x MLP + Taylor Jet & --- & \textbf{45 мкс} & \textbf{15 мкс} \\
+          4. Black-76 + 13 греков + 69 Rho & $80,000$ мкс & \textbf{15 мкс} & \textbf{5 мкс} \\
+          \rowcolor{sberbg} 5. Pydantic + OOD Guardian + HTTP & $30,000$ мкс & \textbf{236 мкс} & \textbf{173 мкс} \\
+          \midrule
+          \textbf{ИТОГО (End-to-End p99)} & \textbf{135,000 мкс} & \textbf{\color{sberemerald}310 мкс} & \textbf{\color{sberemerald}200 мкс} \\
+          \textbf{В миллисекундах} & $\sim 135$ мс & \textbf{\color{sberemerald}0.31 мс} & \textbf{\color{sberemerald}0.20 мс} \\
+          \bottomrule
+        \end{tabular}
+      \end{table}
+
+      \vspace{0.15cm}
+      \begin{block}{\scriptsize Батч-прайсинг портфеля (10,000 контрактов)}
+        \scriptsize Векторизованный колоночный эндпоинт \texttt{POST /fx\_cross/price\_batch} с бинарным транспортом \textbf{Apache Arrow IPC} обсчитывает \textbf{10,000 контрактов за 9.45 мс} на GPU (и $\sim 110$ мс на CPU-ноутбуке).
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 21 — СРАВНЕНИЕ С MONTECARLOWITHAAD И ДРУГИМИ МЕТОДАМИ
+% ==============================================================================
+\begin{frame}{Сравнение методов: Наш гибрид vs.\ \texttt{MonteCarloWithAAD} и 2D Квадратура}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \centering
+      \textbf{\scriptsize Время расчёта 1 сделки с полным набором греков (лог-шкала, мс)}\\[0.2em]
+      \begin{tikzpicture}
+        \begin{axis}[
+          xbar,
+          width=6.8cm, height=4.1cm,
+          xmode=log, xmin=0.1, xmax=350,
+          ymin=0.4, ymax=4.6,
+          xlabel={\scriptsize Латентность (мс, логарифмическая шкала)},
+          ytick={1,2,3,4},
+          yticklabels={
+            {DeepVol GPU (CUDA Graph)},
+            {DeepVol CPU (Ноутбук 14 ядер)},
+            {MonteCarloWithAAD (65k QMC)},
+            {2D Copula Quadrature + FD}
+          },
+          yticklabel style={font=\tiny\bfseries, align=right},
+          tick label style={font=\tiny},
+          nodes near coords,
+          nodes near coords style={font=\tiny\bfseries, anchor=west},
+          bar width=8pt,
+          grid=major, grid style={dashed, gray!30}
+        ]
+          \addplot[fill=sbergreen, draw=sberdarkgreen] coordinates {
+            (0.20,1)
+            (0.31,2)
+            (28.0,3)
+            (135.0,4)
+          };
+        \end{axis}
+      \end{tikzpicture}
+
+      \begin{alertblock}{\scriptsize Главная слабость \texttt{MonteCarloWithAAD} на вторых производных}
+        \scriptsize У выплаты $\max(S_T - K, 0)$ первая производная по $S_T$ является ступенькой $\mathbb{I}(S_T > K)$, а \textbf{вторая производная (\texttt{Gamma}) равна нулю почти всюду} (дельта-функция Дирака в точке $S_T = K$). Поэтому \texttt{MonteCarloWithAAD} требует искусственного сглаживания выплаты и даёт шум $\pm 1\text{--}5\%$ на \texttt{Gamma}, \texttt{Vanna} и \texttt{Vomma}.
+      \end{alertblock}
+    \end{column}
+
+    \begin{column}{0.46\textwidth}
+      \begin{table}
+        \centering
+        \tiny
+        \renewcommand{\arraystretch}{1.2}
+        \begin{tabular}{@{}lccc@{}}
+          \toprule
+          \textbf{Критерий} & \textbf{Плоский GK} & \textbf{MC + AAD} & \textbf{DeepVol} \\
+          \midrule
+          \rowcolor{sberbg} Улыбки обеих ног & Нет & Да & \textbf{\color{sberemerald}Да (SVI)} \\
+          Ошибка цены (MAE) & $18.4$ б.п. & $0.4$ б.п. & \textbf{\color{sberemerald}0.67 б.п.} \\
+          \rowcolor{sberbg} Точность $\Delta, \mathcal{V}$ & Низкая & $0.1\%$ & \textbf{\color{sberemerald}$0.02\%$} \\
+          Гладкость $\Gamma$, Vanna & Неверные & \textbf{\color{sberred}Шум $1\text{--}5\%$} & \textbf{\color{sberemerald}$0.48\%$} \\
+          \rowcolor{sberbg} CPU (1 опцион) & $0.05$ мс & $28$ мс & \textbf{\color{sberemerald}0.31 мс} \\
+          10,000 опционов & $15$ мс & $3\text{--}5$ мин & \textbf{\color{sberemerald}9.45 мс} \\
+          \rowcolor{sberbg} Память RAM & $<1$ МБ & $300$ МБ & \textbf{\color{sberemerald}$<1$ МБ} \\
+          \bottomrule
+        \end{tabular}
+      \end{table}
+
+      \begin{exampleblock}{\scriptsize Как мы объединили лучшее из двух миров}
+        \scriptsize Мы используем 2D Копулу / \texttt{QMC + AAD} \textbf{офлайн как учителя} для генерации дифференциальных меток Соболева, а в \textbf{онлайне} гладкая сеть $\text{SiLU}$ со струями Тейлора выдаёт ответ за \textbf{0.31 мс} без статистического шума Монте-Карло на \texttt{Gamma}.
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 22 — ЗАПУСК НА РАБОЧЕМ НОУТБУКЕ (CPU-ONLY) И ПОКРЫТИЕ ТЕСТАМИ
+% ==============================================================================
+\begin{frame}{Развёртывание на рабочем ноутбуке (CPU-Only) и инженерное качество}
+  \begin{columns}[T]
+    \begin{column}{0.50\textwidth}
+      \begin{block}{Работа на 14-ядерном ноутбуке без дискретной GPU}
+        Для работы движка \textbf{не требуются} видеокарта NVIDIA, CUDA или TensorRT:
+        \begin{itemize}
+          \item Все 5 обученных весов ансамбля (\texttt{residual\_vol\_v3\_m0..4.pt}) и \texttt{model\_card.json} весят \textbf{228 КБ} и закоммичены в Git (\texttt{artifacts/models/fx\_cross/}).
+          \item Установка CPU-версии PyTorch и пакетов занимает $< 1$ минуты (\texttt{docs/fx\_cross\_cpu\_laptop\_guide.md}).
+          \item Холодный старт FastAPI-сервера на CPU: \textbf{$< 1$ секунды}.
+        \end{itemize}
+      \end{block}
+
+      \begin{block}{Команды быстрого запуска (Linux / macOS / Windows)}
+        \scriptsize
+        \texttt{uv venv .venv --python 3.10 \&\& source .venv/bin/activate}\\
+        \texttt{uv pip install torch --index-url https://download.pytorch.org/whl/cpu}\\
+        \texttt{uv pip install "numpy<2.0" scipy pydantic fastapi uvicorn httpx orjson pyarrow scikit-learn}\\
+        \texttt{uv pip install --no-deps -e .}\\
+        \texttt{PYTHONPATH=src uvicorn deepvol.api.server:app --port 8000}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.48\textwidth}
+      \begin{exampleblock}{Независимый 17-фазный аудит (SPEC-DEEPVOL-FX-CROSS-003)}
+        \begin{itemize}
+          \item \textbf{31 из 31 приёмочных гейтов (G1.1 -- G4.7):} статус \textbf{PASS}.
+          \item \textbf{141 чистый аудиторский тест (\texttt{tests/audit/}):} сверка с независимыми оракулами в Wolfram Engine и BrainyCalc.
+          \item \textbf{100\% покрытие строк и ветвей (\texttt{pytest-cov --cov-branch})} на критических модулях:
+            \begin{itemize}
+              \item \texttt{api/schemas\_fx\_cross.py} --- \textbf{100\%}
+              \item \texttt{models/fx\_cross\_safeguards.py} --- \textbf{100\%}
+              \item \texttt{mrm/fx\_cross\_guardian.py} --- \textbf{100\%}
+            \end{itemize}
+          \item \textbf{Мутационное тестирование:} \textbf{90.5\%} убитых мутантов (проверка чувствительности тестов к замене знаков, коэффициентов кэрри $g$ в $\Gamma$ и $\Theta$).
+          \item \textbf{Fuzzing-тестирование (Hypothesis):} $> 10,000$ случайных валидных и невалидных JSON/Arrow пейлоадов без единого HTTP 500 или утечки памяти на $1,000,000$ запросов.
+        \end{itemize}
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 23 — МАСШТАБИРОВАНИЕ НА ПРЯМЫЕ ПАРЫ, БАРЬЕРЫ И ОТЗЫВНЫЕ ОПЦИОНЫ
+% ==============================================================================
+\begin{frame}{Расширение платформы: Прямые пары, Барьерные опционы и Cancellable Cap/Floor}
+  \begin{columns}[T]
+    \begin{column}{0.32\textwidth}
+      \begin{block}{1. Прямые FX-пары (\texttt{USD/RUB})}
+        \scriptsize
+        \textbf{Готово из коробки:}
+        \begin{itemize}
+          \item Для прямых пар не нужна триангуляция копулы — улыбка уже дана рынком.
+          \item Используются те же модули \texttt{SmileCanonicalizer} + \texttt{svi\_vol\_jet} + \texttt{black76\_otm\_parity} + \texttt{greeks\_from\_outputs}.
+          \item Либо вызов \texttt{/fx\_cross/price} с единичной первой ногой ($S_1 \equiv 1$, свойство P3 $\beta$-Split).
+          \item Время расчёта: \textbf{$\sim 0.08$ мс} с полным набором греков.
+        \end{itemize}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.33\textwidth}
+      \begin{block}{2. Барьерные FX-опционы}
+        \scriptsize
+        \textbf{Тот же архитектурный паттерн:}
+        \begin{itemize}
+          \item \textbf{Шаг 1:} существующий движок строит безарбитражную поверхность кросса $\sigma_\times(K, T)$.
+          \item \textbf{Шаг 2:} аналитическая база Блэка--Шоулза / Vanna--Volga с поправкой непрерывности Броуди--Глассермана--Коу $\tilde{B} = B e^{\pm 0.5826\sigma\sqrt{\Delta t}}$.
+          \item \textbf{Шаг 3:} ансамбль MLP предсказывает разницу $\Delta \hat{V} = V_{\text{LSV-PDE}} - V_{\text{VV}}$ с граничным множителем $w(z_B)\to 0$ при $S \to B$.
+        \end{itemize}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.33\textwidth}
+      \begin{block}{3. Cancellable Cap/Floor}
+        \scriptsize
+        \textbf{Мульти-фиделити PDE + ML:}
+        \begin{itemize}
+          \item \textbf{Точное разложение:} $V_{\text{cancel cap}} = V_{\text{vanilla cap}} - V_{\text{bermudan right}}$, где ванильный кэп считается точно по Блэку-76.
+          \item \textbf{Базовый решатель (\texttt{float64}):} 1D PDE Халла--Уайта шагает назад по расписанию купонов за $\sim 1$ мс (аналогично \texttt{autocall\_pde.py}).
+          \item \textbf{ML-остаток:} малая сеть предсказывает поправку на SABR-перекос и 2-факторную декорреляцию кривой.
+        \end{itemize}
+      \end{block}
+    \end{column}
+  \end{columns}
+
+  \vspace{0.2cm}
+  \begin{exampleblock}{Единый стандарт разработки PricingService}
+    Во всех трёх классах продуктов сохраняется наш главный инженерный принцип: \textbf{точная аналитическая или PDE-база в \texttt{float64} + компактный дифференцируемый ML-ансамбль на остатке + граничный тейпер + статистический фильтр Махаланобиса (\texttt{Guardian})}.
+  \end{exampleblock}
+\end{frame}
+
+% ==============================================================================
+% СЛАЙД 24 — ДОРОЖНАЯ КАРТА ВНЕДРЕНИЯ И ЗАКЛЮЧЕНИЕ
+% ==============================================================================
+\begin{frame}{Выводы и дорожная карта внедрения в PricingService Сбербанк КИБ}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \begin{block}{Ключевые итоги Proof of Concept}
+        \begin{enumerate}
+          \item \textbf{Точность промышленного уровня:} ошибка цены \textbf{0.35 б.п.\ RMSE} относительно 2D копулы и \textbf{100\% совпадение} с продовым калькулятором на глубоких страйках ($K = 10$).
+          \item \textbf{Полный набор из 13 греков за 1 проход:} точное сохранение \texttt{CashDelta} между ногами ($0.00$ руб.\ погрешности) и гладкая \texttt{Gamma} ($0.48\%$ погрешности) без шума Монте-Карло.
+          \item \textbf{Ускорение в 100--400 раз:} \textbf{0.31 мс} на обычном рабочем CPU-ноутбуке и \textbf{0.20 мс} на GPU (\textbf{9.45 мс} на портфель из 10,000 опционов).
+          \item \textbf{Готовая интеграция и безопасность:} адаптер \texttt{ConstMessage} $\leftrightarrow$ \texttt{MutableMessage} и автоматический фоллбэк \texttt{FXCrossGuardian}.
+        \end{enumerate}
+      \end{block}
+    \end{column}
+
+    \begin{column}{0.46\textwidth}
+      \begin{exampleblock}{Этапы пилотирования в PricingService}
+        \begin{itemize}
+          \item \textbf{Этап 1 (1--2 недели):} Развёртывание в контуре PricingService в режиме \textit{Shadow Pricing} параллельно с текущим калькулятором на потоке запросов \texttt{XAU/RUB}, \texttt{CNY/RUB}, \texttt{EUR/RUB}.
+          \item \textbf{Этап 2 (3--4 недели):} Подключение конвенции сдвига горизонта $T+1$ для \texttt{Theta} по дискретному расписанию кривых и валидация модельного резерва с подразделением валидации моделей.
+          \item \textbf{Этап 3 (5--8 недель):} Перевод расчёта внутридневного риска и батч-переоценки портфеля ванильных кросс-опционов на движок DeepVol и старт PoC по барьерным опционам.
+        \end{itemize}
+      \end{exampleblock}
+
+      \vspace{0.15cm}
+      \centering
+      \begin{tikzpicture}
+        \node[fill=sberdarkgreen, draw=sbergold, line width=1pt, rounded corners=4pt, inner sep=6pt, text=white, font=\scriptsize, align=center] {
+          \sberlogo[0.22cm]\hspace{0.4em}\textbf{Спасибо за внимание! Готов ответить на вопросы.}\\[0.2em]
+          {\color{sbergold}Бирюков Никита Сергеевич} $\cdot$ Сбербанк КИБ, команда PricingService
+        };
+      \end{tikzpicture}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\end{document}

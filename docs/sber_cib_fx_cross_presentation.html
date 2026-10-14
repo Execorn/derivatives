@@ -1,0 +1,2314 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Сбербанк КИБ | PricingService — Гибридный ML-движок прайсинга кросс-опционов (XAU/RUB)</title>
+  <!-- KaTeX for crisp mathematical rendering -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters: [{left: '$$', right: '$$', display: true}, {left: '$', right: '$', display: false}]});"></script>
+  <style>
+    :root {
+      --sber-dark: #071F14;
+      --sber-forest: #0C3020;
+      --sber-emerald: #106B2E;
+      --sber-green: #21A038;
+      --sber-lime: #97CF26;
+      --sber-gold: #C59B27;
+      --sber-gold-light: #F5EFE0;
+      --bg-page: #0B1611;
+      --bg-slide: #FFFFFF;
+      --bg-card: #F5F8F6;
+      --bg-card-alt: #EDF3EF;
+      --border-subtle: #DCE5DF;
+      --text-main: #0E2218;
+      --text-muted: #52665B;
+      --danger: #D62D2D;
+      --danger-bg: #FDF2F2;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg-page);
+      color: var(--text-main);
+      overflow: hidden;
+      height: 100vh;
+      width: 100vw;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+    }
+
+    /* Slide viewport container (16:9 fixed aspect ratio scaled to screen) */
+    #deck-viewport {
+      position: relative;
+      width: 1280px;
+      height: 720px;
+      background: var(--bg-slide);
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.65);
+      border-radius: 6px;
+      overflow: hidden;
+      transform-origin: center center;
+    }
+
+    .slide {
+      position: absolute;
+      inset: 0;
+      width: 1280px;
+      height: 720px;
+      display: none;
+      flex-direction: column;
+      justify-content: space-between;
+      background: var(--bg-slide);
+      padding: 0;
+      opacity: 0;
+      transition: opacity 0.18s ease;
+    }
+
+    .slide.active {
+      display: flex;
+      opacity: 1;
+      z-index: 2;
+    }
+
+    /* Dark Cover & Section Divider Slides */
+    .slide.dark-slide {
+      background: linear-gradient(135deg, #061A11 0%, #0C3220 62%, #114A2E 100%);
+      color: #FFFFFF;
+    }
+
+    /* Top Corporate Header */
+    .slide-header {
+      height: 68px;
+      padding: 0 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border-subtle);
+      background: #FFFFFF;
+      flex-shrink: 0;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .section-tag {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--sber-emerald);
+      background: #E7F4EA;
+      padding: 4px 10px;
+      border-radius: 4px;
+    }
+
+    .slide-title {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--sber-dark);
+      letter-spacing: -0.02em;
+    }
+
+    .header-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--sber-dark);
+      letter-spacing: 0.02em;
+    }
+
+    .header-brand span.divider {
+      color: var(--sber-gold);
+      font-weight: 400;
+    }
+
+    .header-brand span.team {
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    /* Slide Body */
+    .slide-body {
+      flex: 1;
+      padding: 32px 48px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 22px;
+      overflow: hidden;
+    }
+
+    .lead-statement {
+      font-size: 17px;
+      line-height: 1.45;
+      color: var(--text-muted);
+      max-width: 1080px;
+      border-left: 3px solid var(--sber-green);
+      padding-left: 16px;
+    }
+
+    .lead-statement strong {
+      color: var(--text-main);
+    }
+
+    /* Grid Layouts */
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      align-items: stretch;
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+      align-items: stretch;
+    }
+
+    .grid-4 {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .grid-asym {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 24px;
+      align-items: stretch;
+    }
+
+    /* Cards */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 22px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .card.emerald {
+      background: #F0F8F2;
+      border-color: #B8DFC2;
+      border-top: 3px solid var(--sber-green);
+    }
+
+    .card.gold {
+      background: #FAF7F0;
+      border-color: #E5D6B0;
+      border-top: 3px solid var(--sber-gold);
+    }
+
+    .card.danger {
+      background: var(--danger-bg);
+      border-color: #F2C6C6;
+      border-top: 3px solid var(--danger);
+    }
+
+    .card.dark {
+      background: var(--sber-forest);
+      color: #FFFFFF;
+      border-color: var(--sber-emerald);
+    }
+
+    .card-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--sber-dark);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .card.dark .card-title {
+      color: #FFFFFF;
+    }
+
+    .card p, .card li {
+      font-size: 14px;
+      line-height: 1.5;
+      color: var(--text-main);
+    }
+
+    .card.dark p, .card.dark li {
+      color: #E2ECE6;
+    }
+
+    .card ul {
+      padding-left: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    /* KPI Big Metric Cards */
+    .kpi-card {
+      background: #FFFFFF;
+      border: 1px solid var(--border-subtle);
+      border-top: 4px solid var(--sber-green);
+      border-radius: 8px;
+      padding: 20px 22px;
+      box-shadow: 0 4px 14px rgba(11, 46, 29, 0.04);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+
+    .kpi-value {
+      font-size: 38px;
+      font-weight: 800;
+      color: var(--sber-emerald);
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+    }
+
+    .kpi-label {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text-main);
+      margin-top: 8px;
+    }
+
+    .kpi-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    /* Formula Box */
+    .formula-box {
+      background: #FFFFFF;
+      border: 1px solid #C8D9CE;
+      border-left: 4px solid var(--sber-emerald);
+      border-radius: 6px;
+      padding: 14px 20px;
+      font-size: 16px;
+      text-align: center;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.02);
+    }
+
+    /* Corporate Tables */
+    table.corp-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13.5px;
+      background: #FFFFFF;
+      border-radius: 6px;
+      overflow: hidden;
+      border: 1px solid var(--border-subtle);
+    }
+
+    table.corp-table th {
+      background: var(--sber-forest);
+      color: #FFFFFF;
+      text-align: left;
+      padding: 10px 14px;
+      font-weight: 600;
+      font-size: 12.5px;
+      letter-spacing: 0.02em;
+    }
+
+    table.corp-table td {
+      padding: 9px 14px;
+      border-bottom: 1px solid var(--border-subtle);
+      color: var(--text-main);
+    }
+
+    table.corp-table tr:nth-child(even) td {
+      background: #F8FAF9;
+    }
+
+    .badge-pass {
+      background: #E3F6E8;
+      color: #0D6826;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    code, pre {
+      font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+    }
+
+    pre.code-block {
+      background: #0D1F17;
+      color: #E6F2EC;
+      padding: 16px 20px;
+      border-radius: 8px;
+      font-size: 12.5px;
+      line-height: 1.5;
+      overflow-x: auto;
+      border-left: 4px solid var(--sber-green);
+    }
+
+    /* Slide Footer */
+    .slide-footer {
+      height: 40px;
+      padding: 0 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-top: 1px solid var(--border-subtle);
+      background: #FAFCFB;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+
+    .progress-bar {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      height: 3px;
+      background: linear-gradient(90deg, var(--sber-green), var(--sber-lime));
+      transition: width 0.2s ease;
+    }
+
+    /* Floating Navigation Controls */
+    #nav-controls {
+      position: fixed;
+      bottom: 14px;
+      right: 20px;
+      z-index: 100;
+      display: flex;
+      gap: 6px;
+      background: rgba(7, 31, 20, 0.85);
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid rgba(197, 155, 39, 0.4);
+      backdrop-filter: blur(6px);
+    }
+
+    #nav-controls button {
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      color: #FFFFFF;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    #nav-controls button:hover {
+      background: var(--sber-green);
+      border-color: var(--sber-green);
+    }
+
+    /* Print to PDF support */
+    @media print {
+      @page {
+        size: 1280px 720px;
+        margin: 0;
+      }
+      body {
+        background: #FFFFFF;
+        overflow: visible;
+        height: auto;
+        width: auto;
+        display: block;
+      }
+      #deck-viewport {
+        width: 100%;
+        height: auto;
+        box-shadow: none;
+        transform: none !important;
+      }
+      .slide {
+        position: relative !important;
+        display: flex !important;
+        opacity: 1 !important;
+        page-break-after: always;
+        break-after: page;
+        width: 1280px;
+        height: 720px;
+      }
+      #nav-controls {
+        display: none !important;
+      }
+    }
+  </style>
+</head>
+<body>
+
+<div id="deck-viewport">
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 01: ТИТУЛЬНЫЙ СЛАЙД (СБЕРБАНК КИБ)                              -->
+  <!-- ===================================================================== -->
+  <section class="slide dark-slide active">
+    <div style="padding: 56px 64px; display: flex; flex-direction: column; justify-content: space-between; height: 100%; position: relative;">
+      <!-- Декоративная золотая линия и геометрия -->
+      <svg style="position:absolute; right:0; top:0; height:100%; width:480px; opacity:0.16; pointer-events:none;" viewBox="0 0 480 720">
+        <polygon points="160,0 480,0 480,720 20,720" fill="#21A038"/>
+        <polygon points="280,0 480,0 480,720 140,720" fill="#97CF26"/>
+      </svg>
+
+      <!-- Верхний бренд-блок Сбербанк КИБ -->
+      <div style="display:flex; align-items:center; justify-content:space-between; border-bottom: 1px solid rgba(197,155,39,0.45); padding-bottom: 24px;">
+        <div style="display:flex; align-items:center; gap: 16px;">
+          <svg width="46" height="46" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="sberGrad" x1="0%" y1="100%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="#21A038"/>
+                <stop offset="70%" stop-color="#21A038"/>
+                <stop offset="100%" stop-color="#97CF26"/>
+              </linearGradient>
+            </defs>
+            <path d="M53.5 19.2 A25 25 0 1 0 57 32" fill="none" stroke="url(#sberGrad)" stroke-width="6.5" stroke-linecap="round"/>
+            <path d="M21 31.5 L29.5 39.5 L49.5 21.5" fill="none" stroke="#21A038" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <div>
+            <div style="font-size: 20px; font-weight: 800; letter-spacing: 0.04em; color: #FFFFFF;">
+              СБЕРБАНК КИБ <span style="color: var(--sber-gold); margin: 0 8px;">|</span> SBER CIB
+            </div>
+            <div style="font-size: 13px; color: #97CF26; font-weight: 600; letter-spacing: 0.02em;">
+              Департамент глобальных рынков · Команда PricingService
+            </div>
+          </div>
+        </div>
+        <div style="text-align:right; font-size:12px; color:#B5C9BE; border:1px solid rgba(197,155,39,0.5); padding:6px 14px; border-radius:4px;">
+          PROOF OF CONCEPT · PRODUCTION AUDIT: <strong style="color:#97CF26;">GO (31/31 GATES)</strong>
+        </div>
+      </div>
+
+      <!-- Центральный заголовок -->
+      <div style="max-width: 960px; my: auto;">
+        <div style="font-size: 13px; font-weight: 700; color: var(--sber-gold); letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 14px;">
+          Кросс-валютные и товарные деривативы · Архитектура и математика
+        </div>
+        <h1 style="font-size: 42px; font-weight: 800; line-height: 1.16; letter-spacing: -0.02em; color: #FFFFFF; margin-bottom: 20px;">
+          Гибридный ML-движок прайсинга и расчёта греков ванильных кросс-опционов (<code style="color:#97CF26;">XAU/RUB</code>)
+        </h1>
+        <p style="font-size: 18px; line-height: 1.5; color: #C8DBD0; max-width: 860px;">
+          Аналитическая $\beta$-Split триангуляция в точности <code>float64</code>, ансамбль Differential ML со струями Тейлора 2-го порядка и автоматическая защита от модельного риска
+        </p>
+      </div>
+
+      <!-- Нижний блок автора и ключевых цифр -->
+      <div style="display:flex; align-items:flex-end; justify-content:space-between; border-top: 1px solid rgba(255,255,255,0.14); padding-top: 22px;">
+        <div style="display:flex; gap: 48px;">
+          <div>
+            <div style="font-size: 11px; text-transform: uppercase; color: #8FA89B; letter-spacing: 0.06em;">Автор доклада</div>
+            <div style="font-size: 17px; font-weight: 700; color: #FFFFFF; margin-top: 3px;">Бирюков Никита Сергеевич</div>
+          </div>
+          <div>
+            <div style="font-size: 11px; text-transform: uppercase; color: #8FA89B; letter-spacing: 0.06em;">Подразделение</div>
+            <div style="font-size: 17px; font-weight: 700; color: #FFFFFF; margin-top: 3px;">Сбербанк КИБ · PricingService</div>
+          </div>
+        </div>
+        <div style="display:flex; gap: 28px; text-align:right;">
+          <div>
+            <div style="font-size: 22px; font-weight: 800; color: #97CF26;">0.35 б.п.</div>
+            <div style="font-size: 11px; color: #B5C9BE;">RMSE цены vs 2D Копула</div>
+          </div>
+          <div>
+            <div style="font-size: 22px; font-weight: 800; color: #97CF26;">0.31 мс</div>
+            <div style="font-size: 11px; color: #B5C9BE;">Прайсинг + 13 греков (CPU)</div>
+          </div>
+          <div>
+            <div style="font-size: 22px; font-weight: 800; color: var(--sber-gold);">0.00 ₽</div>
+            <div style="font-size: 11px; color: #B5C9BE;">Дисбаланс CashDelta</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 02: EXECUTIVE SUMMARY (КЛЮЧЕВЫЕ РЕЗУЛЬТАТЫ POC)                 -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Обзор</span>
+        <span class="slide-title">Executive Summary: Главные результаты PoC</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="lead-statement">
+        Разработан промышленный движок оценки европейских ванильных опционов на синтетические кросс-пары (<strong>XAU/RUB = XAU/USD × USD/RUB</strong>), объединяющий точность двумерной копулы со скоростью аналитических формул.
+      </div>
+      <div class="grid-4">
+        <div class="kpi-card">
+          <div>
+            <div class="kpi-value">0.35 б.п.</div>
+            <div class="kpi-label">Точность цены (RMSE)</div>
+          </div>
+          <div class="kpi-sub">MAE = 0.67 б.п., p99 = 1.89 б.п. относительно эталонной 2D гауссовской копулы</div>
+        </div>
+        <div class="kpi-card">
+          <div>
+            <div class="kpi-value">0.31 мс</div>
+            <div class="kpi-label">Отклик на CPU-ноутбуке</div>
+          </div>
+          <div class="kpi-sub">0.20 мс на GPU. Полная цена + 13 греков за 1 прямой проход без bump-and-revalue</div>
+        </div>
+        <div class="kpi-card">
+          <div>
+            <div class="kpi-value">0.00 ₽</div>
+            <div class="kpi-label">Сохранение CashDelta</div>
+          </div>
+          <div class="kpi-sub">Относительная погрешность $&lt; 10^{-15}$ между кроссом XAU/RUB и ногами XAU/USD, USD/RUB</div>
+        </div>
+        <div class="kpi-card">
+          <div>
+            <div class="kpi-value">9.45 мс</div>
+            <div class="kpi-label">Батч 10,000 опционов</div>
+          </div>
+          <div class="kpi-sub">Векторизованный расчёт портфеля по 64 рыночным состояниям через Apache Arrow IPC</div>
+        </div>
+      </div>
+      <div class="grid-3">
+        <div class="card emerald">
+          <div class="card-title">100% совпадение на $K = 10$</div>
+          <p>На реальном продовом запросе PricingService со страйком $K=10$ (глубокий ITM) цена и дельты совпадают с эталоном банка до <strong>16 значащих цифр</strong>.</p>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">Нулевой арбитраж ($2.2\cdot 10^7$ точек)</div>
+          <p>Проверено отсутствие вертикального, баттерфляй и календарного арбитража на сетке $100\times 100$ страйков и экспираций.</p>
+        </div>
+        <div class="card gold">
+          <div class="card-title">Автономность (228 КБ в Git)</div>
+          <p>Работает на обычном 14-ядерном рабочем ноутбуке без видеокарты NVIDIA. Полная совместимость с <code>ConstMessage</code> / <code>MutableMessage</code>.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд 2 из 28</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 03: БИЗНЕС-ЗАДАЧА И ВАЛЮТНЫЙ ТРЕУГОЛЬНИК XAU/RUB                -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Постановка задачи</span>
+        <span class="slide-title">Проблема неликвидных кросс-пар: XAU/RUB, CNY/RUB, EUR/RUB</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-asym">
+        <div style="display:flex; flex-direction:column; gap:16px; justify-content:center;">
+          <div class="card">
+            <div class="card-title">Рыночная реальность</div>
+            <ul>
+              <li>Клиенты банка запрашивают ванильные опционы на рублёвую цену золота <strong>XAU/RUB</strong> с расчётами в рублях (<code>CASH, RUB</code>).</li>
+              <li>Прямого биржевого стакана волатильности на <code>XAU/RUB</code> не существует.</li>
+              <li>Ликвидность сосредоточена в двух долларовых ногах: <strong>Нога 1 (<code>XAU/USD</code>)</strong> и <strong>Нога 2 (<code>USD/RUB</code>)</strong>.</li>
+            </ul>
+          </div>
+          <div class="card emerald">
+            <div class="card-title">Что подаётся на вход прайсера</div>
+            <ul>
+              <li>Улыбка <code>XAU/USD</code>: 5 котировок (<code>ATM, 25D RR/BF, 10D RR/BF</code>) в конвенции <code>spot_pna</code>.</li>
+              <li>Улыбка <code>USD/RUB</code>: 5 котировок в конвенции <code>spot_pa</code> / <code>forward_pa</code>.</li>
+              <li>Кривые дисконтирования <code>XAU</code>, <code>USD</code>, <code>RUB_RUONIA_OIS</code> и корреляция $\rho_{12}$.</li>
+            </ul>
+          </div>
+        </div>
+        <!-- Векторная схема валютного треугольника -->
+        <div class="card" style="align-items:center; justify-content:center; background:#FFFFFF;">
+          <svg width="460" height="360" viewBox="0 0 460 360">
+            <!-- Линии треугольника -->
+            <line x1="230" y1="65" x2="80" y2="285" stroke="#106B2E" stroke-width="3"/>
+            <line x1="80" y1="285" x2="380" y2="285" stroke="#106B2E" stroke-width="3"/>
+            <line x1="230" y1="65" x2="380" y2="285" stroke="#D62D2D" stroke-width="3.5" stroke-dasharray="8,6"/>
+
+            <!-- Дуга корреляции -->
+            <path d="M 145 190 Q 175 235 210 285" fill="none" stroke="#C59B27" stroke-width="2.5"/>
+            <text x="182" y="232" font-size="14" font-weight="700" fill="#9E7916">ρ₁₂ ∈ [-0.99, 0.99]</text>
+
+            <!-- Узлы -->
+            <circle cx="230" cy="65" r="42" fill="#FAF4E1" stroke="#C59B27" stroke-width="2.5"/>
+            <text x="230" y="62" text-anchor="middle" font-size="16" font-weight="800" fill="#0E2218">XAU</text>
+            <text x="230" y="80" text-anchor="middle" font-size="11" fill="#52665B">Актив A</text>
+
+            <circle cx="80" cy="285" r="42" fill="#F0F8F2" stroke="#106B2E" stroke-width="2.5"/>
+            <text x="80" y="282" text-anchor="middle" font-size="16" font-weight="800" fill="#0E2218">USD</text>
+            <text x="80" y="300" text-anchor="middle" font-size="11" fill="#52665B">Хаб-валюта B</text>
+
+            <circle cx="380" cy="285" r="42" fill="#E6F5EA" stroke="#21A038" stroke-width="2.5"/>
+            <text x="380" y="282" text-anchor="middle" font-size="16" font-weight="800" fill="#0E2218">RUB</text>
+            <text x="380" y="300" text-anchor="middle" font-size="11" fill="#52665B">Валюта платежа C</text>
+
+            <!-- Подписи рёбер -->
+            <rect x="30" y="135" width="145" height="50" rx="5" fill="#F5F8F6" stroke="#DCE5DF"/>
+            <text x="102" y="156" text-anchor="middle" font-size="12" font-weight="700" fill="#106B2E">Нога 1: XAU/USD</text>
+            <text x="102" y="174" text-anchor="middle" font-size="11" fill="#52665B">S₁ = 4414.66 · σ₁(k₁)</text>
+
+            <rect x="155" y="302" width="150" height="46" rx="5" fill="#F5F8F6" stroke="#DCE5DF"/>
+            <text x="230" y="321" text-anchor="middle" font-size="12" font-weight="700" fill="#106B2E">Нога 2: USD/RUB</text>
+            <text x="230" y="338" text-anchor="middle" font-size="11" fill="#52665B">S₂ = 86.5514 · σ₂(k₂)</text>
+
+            <rect x="282" y="135" width="162" height="54" rx="5" fill="#FDF2F2" stroke="#F2C6C6"/>
+            <text x="363" y="155" text-anchor="middle" font-size="12" font-weight="700" fill="#D62D2D">Кросс: XAU/RUB</text>
+            <text x="363" y="172" text-anchor="middle" font-size="11" fill="#0E2218">S× = S₁·S₂ = 382,100 ₽</text>
+            <text x="363" y="185" text-anchor="middle" font-size="10.5" font-weight="700" fill="#D62D2D">Как найти улыбку σ×(K,T)?</text>
+          </svg>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд 3 из 28</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 04: ДИЛЕММА СУЩЕСТВУЮЩИХ МЕТОДОВ                                -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Мотивация</span>
+        <span class="slide-title">Дилемма классических методов: Быстро и неточно vs. Точно и медленно</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-3">
+        <div class="card danger">
+          <div class="card-title">1. Плоская формула (Гарман–Кольхаген)</div>
+          <div class="formula-box" style="font-size:14px;">
+            $$\sigma_\times = \sqrt{\sigma_{1,\text{ATM}}^2 + \sigma_{2,\text{ATM}}^2 + 2\rho\sigma_1\sigma_2}$$
+          </div>
+          <ul>
+            <li><strong>Скорость:</strong> <code>0.05 мс</code> (мгновенно).</li>
+            <li><strong>Проблема:</strong> полностью игнорирует перекос (<code>RR</code>) и кривизну (<code>BF</code>) обеих ног.</li>
+            <li><strong>Последствие:</strong> ошибка цены до <strong>15–40 б.п.</strong> вне ATM и неверные <code>Gamma</code> / <code>Vanna</code>.</li>
+          </ul>
+        </div>
+
+        <div class="card gold">
+          <div class="card-title">2. 2D Копула / MonteCarloWithAAD</div>
+          <div class="formula-box" style="font-size:14px;">
+            $$V = D_{\text{set}} F_\times \iint (X - e^k Y)^+ c_\rho(u,v)\,du\,dv$$
+          </div>
+          <ul>
+            <li><strong>Точность цены:</strong> эталонная (<code>&lt; 0.5 б.п.</code>).</li>
+            <li><strong>Проблема 1:</strong> расчёт 1 сделки со всеми греками занимает <strong>30–135 мс</strong> (пакет 10,000 сделок — минуты).</li>
+            <li><strong>Проблема 2:</strong> в МК вторая производная $\max(S_T-K,0)$ — дельта-функция $\to$ <strong>шум 1–5% на Gamma</strong>.</li>
+          </ul>
+        </div>
+
+        <div class="card emerald">
+          <div class="card-title">3. Наш гибрид (DeepVol FX Cross)</div>
+          <div class="formula-box" style="font-size:14px;">
+            $$\sigma_\times(k) = \sigma_{\beta\text{-split}}(k) + w(z)\,\hat{\varepsilon}_{\text{MLP}}(\bm{x})$$
+          </div>
+          <ul>
+            <li><strong>Скорость:</strong> <strong>0.31 мс на CPU</strong> / <strong>0.20 мс на GPU</strong>.</li>
+            <li><strong>Точность цены:</strong> <strong>0.35 б.п. RMSE</strong> (неотличимо от 2D копулы).</li>
+            <li><strong>Греки:</strong> гладкие аналитические вторые производные (<code>Gamma 0.48%</code>) за <strong>1 проход</strong>.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд 4 из 28</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 05: ПРИНЦИП ДЕКОМПОЗИЦИИ (99% АНАЛИТИКА + 1% ML)                -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Архитектурный принцип</span>
+        <span class="slide-title">Декомпозиция: «99% точной аналитики float64 + 1% нейросетевой поправки»</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="formula-box" style="padding: 18px 28px; font-size: 18px;">
+        $$\sigma_\times(k, T) \;=\; \underbrace{\sigma_{\beta\text{-split}}(k, T)}_{\text{Аналитическая база в float64 (98–99\% улыбки)}} \;+\; \underbrace{g_{\text{OOD}} \cdot w(z) \cdot \hat{\varepsilon}_{\text{MLP}}(\bm{x})}_{\text{Поправка 5 сетей на копулу ($\pm 1\text{..}15$ б.п., float32)}} \quad\longrightarrow\quad V = \text{Black76}\big(F_\times, K, \sigma_\times, T, D_{\text{set}}\big)$$
+      </div>
+      <div class="grid-2">
+        <div class="card danger">
+          <div class="card-title">Почему нельзя предсказывать цену $\hat{V}$ нейросетью напрямую</div>
+          <ul>
+            <li>Нарушается паритет пут–колл $C - P = D_{\text{set}}(F_\times - K)$ и монотонность по страйку.</li>
+            <li>На экстремальных страйках (продовый тест банка $K = 10$ при споте $382,100$) любая сеть выдаёт случайную ошибку вместо точной внутренней стоимости.</li>
+            <li>Невозможно гарантировать сохранение денежной дельты <code>CashDelta</code> между тремя валютами.</li>
+          </ul>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">Что даёт вынос нейросети в остаток волатильности $\hat{\varepsilon}$</div>
+          <ul>
+            <li><strong>Автоматический паритет и границы:</strong> финальная цена всегда считается через точную формулу Блэка-76 в <code>float64</code>.</li>
+            <li><strong>Малый масштаб цели:</strong> аналитика $\sigma_{\beta\text{-split}}$ уже даёт точность $\sim 2\text{--}4$ б.п.; нейросети остаётся выучить только малую поправку копулы.</li>
+            <li><strong>Безопасный фоллбэк:</strong> при $g_{\text{OOD}} = 0$ или $|z| \ge 7$ движок побитово превращается в чистую аналитическую модель.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд 5 из 28</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 06: СКВОЗНОЙ ПАЙПЛАЙН ДВИЖКА (M0 - M5)                          -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Архитектура</span>
+        <span class="slide-title">Сквозной пайплайн прайсинга: От входного запроса до MutableMessage</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <!-- Чистая векторная блок-схема пайплайна -->
+      <div class="card" style="background:#FFFFFF; padding: 26px 20px; align-items:center;">
+        <svg width="1140" height="230" viewBox="0 0 1140 230">
+          <defs>
+            <marker id="arrowG" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#106B2E"/>
+            </marker>
+            <marker id="arrowR" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#D62D2D"/>
+            </marker>
+          </defs>
+
+          <!-- Блок 1 -->
+          <rect x="10" y="25" width="160" height="115" rx="8" fill="#0C3020"/>
+          <text x="90" y="55" text-anchor="middle" font-size="13" font-weight="700" fill="#97CF26">1. Вход (M5 / API)</text>
+          <text x="90" y="78" text-anchor="middle" font-size="11.5" fill="#FFFFFF">Граф ConstMessage</text>
+          <text x="90" y="96" text-anchor="middle" font-size="11.5" fill="#FFFFFF">JSON или Arrow IPC</text>
+          <text x="90" y="120" text-anchor="middle" font-size="10.5" fill="#B5C9BE">Кривые Act/365F</text>
+
+          <line x1="170" y1="82" x2="198" y2="82" stroke="#106B2E" stroke-width="2.5" marker-end="url(#arrowG)"/>
+
+          <!-- Блок 2 -->
+          <rect x="202" y="25" width="175" height="115" rx="8" fill="#F0F8F2" stroke="#21A038" stroke-width="2"/>
+          <text x="290" y="52" text-anchor="middle" font-size="13" font-weight="700" fill="#0C3020">2. Канонизация (M0)</text>
+          <text x="290" y="74" text-anchor="middle" font-size="11.5" fill="#0E2218">Инверсия дельт Δ → K</text>
+          <text x="290" y="92" text-anchor="middle" font-size="11.5" fill="#0E2218">Фиттинг Raw SVI / SSVI</text>
+          <text x="290" y="118" text-anchor="middle" font-size="10.5" font-weight="600" fill="#106B2E">float64 · LRU-кэш (2 мкс)</text>
+
+          <line x1="377" y1="82" x2="405" y2="82" stroke="#106B2E" stroke-width="2.5" marker-end="url(#arrowG)"/>
+
+          <!-- Блок 3 -->
+          <rect x="409" y="25" width="175" height="115" rx="8" fill="#FAF7F0" stroke="#C59B27" stroke-width="2"/>
+          <text x="496" y="52" text-anchor="middle" font-size="13" font-weight="700" fill="#0C3020">3. OOD Guardian (M3)</text>
+          <text x="496" y="74" text-anchor="middle" font-size="11.5" fill="#0E2218">12D Махаланобис D_M</text>
+          <text x="496" y="92" text-anchor="middle" font-size="11.5" fill="#0E2218">Box-границы + наклон Ли</text>
+          <text x="496" y="118" text-anchor="middle" font-size="10.5" font-weight="600" fill="#9E7916">Выставляет nn_gate ∈ {0,1}</text>
+
+          <line x1="584" y1="82" x2="612" y2="82" stroke="#106B2E" stroke-width="2.5" marker-end="url(#arrowG)"/>
+
+          <!-- Блок 4 -->
+          <rect x="616" y="25" width="195" height="115" rx="8" fill="#E6F5EA" stroke="#106B2E" stroke-width="2.5"/>
+          <text x="713" y="52" text-anchor="middle" font-size="13" font-weight="700" fill="#0C3020">4. Суррогат + Струи (M1)</text>
+          <text x="713" y="74" text-anchor="middle" font-size="11.5" fill="#0E2218">6 шагов β-Split (float64)</text>
+          <text x="713" y="92" text-anchor="middle" font-size="11.5" fill="#0E2218">5× MLP (13→64³→1) + w(z)</text>
+          <text x="713" y="118" text-anchor="middle" font-size="10.5" font-weight="600" fill="#106B2E">Выход: Jet(σ×, s_k, s_kk, s_t)</text>
+
+          <line x1="811" y1="82" x2="839" y2="82" stroke="#106B2E" stroke-width="2.5" marker-end="url(#arrowG)"/>
+
+          <!-- Блок 5 -->
+          <rect x="843" y="25" width="155" height="115" rx="8" fill="#F0F8F2" stroke="#21A038" stroke-width="2"/>
+          <text x="920" y="52" text-anchor="middle" font-size="13" font-weight="700" fill="#0C3020">5. Black-76 + Греки</text>
+          <text x="920" y="74" text-anchor="middle" font-size="11.5" fill="#0E2218">OTM + паритет float64</text>
+          <text x="920" y="92" text-anchor="middle" font-size="11.5" fill="#0E2218">13 греков + 69 Rho</text>
+          <text x="920" y="118" text-anchor="middle" font-size="10.5" font-weight="600" fill="#106B2E">Аудит Дюррлемана g(k)</text>
+
+          <line x1="998" y1="82" x2="1022" y2="82" stroke="#106B2E" stroke-width="2.5" marker-end="url(#arrowG)"/>
+
+          <!-- Блок 6 -->
+          <rect x="1026" y="25" width="104" height="115" rx="8" fill="#0C3020"/>
+          <text x="1078" y="55" text-anchor="middle" font-size="13" font-weight="700" fill="#97CF26">6. Выход</text>
+          <text x="1078" y="78" text-anchor="middle" font-size="11" fill="#FFFFFF">MutableMessage</text>
+          <text x="1078" y="96" text-anchor="middle" font-size="11" fill="#FFFFFF">JSON / Arrow</text>
+          <text x="1078" y="120" text-anchor="middle" font-size="10.5" fill="#97CF26">0.31 мс CPU</text>
+
+          <!-- Линия фоллбэка -->
+          <path d="M 496 140 L 496 195 L 713 195 L 713 145" fill="none" stroke="#D62D2D" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrowR)"/>
+          <rect x="520" y="178" width="170" height="26" rx="4" fill="#FDF2F2" stroke="#F2C6C6"/>
+          <text x="605" y="195" text-anchor="middle" font-size="11" font-weight="700" fill="#D62D2D">При OOD: nn_gate = 0.0</text>
+        </svg>
+      </div>
+
+      <div class="grid-3">
+        <div class="card">
+          <div class="card-title">Единый буфер $(B, 34)$</div>
+          <p>Все параметры состояния и контракта упаковываются в непрерывный массив из 34 чисел <code>float64</code> без создания промежуточных Python-объектов.</p>
+        </div>
+        <div class="card">
+          <div class="card-title">Без ветвлений в графе</div>
+          <p>Фоллбэк и крыльевой сплайн работают через умножение на <code>nn_gate</code> и $w(z)$, что позволяет компилировать граф с <code>fullgraph=True</code>.</p>
+        </div>
+        <div class="card">
+          <div class="card-title">CPU и GPU совместимость</div>
+          <p>На сервере используются CUDA Graphs; на рабочем ноутбуке автоматически активируется скомпилированный тракт <code>CPUQuotePath</code>.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд 6 из 28</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 07: РАЗДЕЛ I — МАТЕМАТИЧЕСКОЕ ЯДРО (DIVIDER)                    -->
+  <!-- ===================================================================== -->
+  <section class="slide dark-slide">
+    <div style="padding: 64px; display:flex; flex-direction:column; justify-content:center; height:100%;">
+      <div style="font-size: 14px; font-weight: 700; color: var(--sber-gold); letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 16px;">
+        Раздел 01 · Модули M0 и M1.1
+      </div>
+      <h2 style="font-size: 44px; font-weight: 800; color: #FFFFFF; line-height: 1.15; margin-bottom: 20px;">
+        Математическое ядро:<br/>Канонизация FX-улыбок и алгоритм $\beta$-Split
+      </h2>
+      <p style="font-size: 18px; color: #B8CEC2; max-width: 780px; line-height: 1.5;">
+        Как 5 рыночных дельта-котировок обеих ног переводятся в безарбитражные SVI-срезы и объединяются в аналитическую улыбку кросса в мере промежуточной валюты $\mathbb{Q}^{\text{USD}}$.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 08: ШАГ 1 (M0) — КОНВЕНЦИИ FX И ОБРАЩЕНИЕ ДЕЛЬТЫ                -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 1 · Модуль M0</span>
+        <span class="slide-title">Рыночные котировки FX и 4 конвенции дельты (fx_conventions.py)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div style="display:flex; flex-direction:column; gap:16px;">
+          <div class="card">
+            <div class="card-title">Восстановление 5 пилларов волатильности</div>
+            <p>На каждом сроке $T$ рынок котирует $\big(\sigma_{\text{ATM}}, \text{RR}_{25}, \text{BF}_{25}, \text{RR}_{10}, \text{BF}_{10}\big)$. Волатильности колла и пута на крыльях $\Delta \in \{0.25, 0.10\}$:</p>
+            <div class="formula-box" style="font-size:14.5px;">
+              $$\sigma_{\Delta C} = \sigma_{\text{ATM}} + \text{BF}_\Delta + \tfrac{1}{2}\text{RR}_\Delta, \qquad \sigma_{\Delta P} = \sigma_{\text{ATM}} + \text{BF}_\Delta - \tfrac{1}{2}\text{RR}_\Delta$$
+            </div>
+          </div>
+          <div class="card gold">
+            <div class="card-title">Ловушка немонотонности PA-дельты колла</div>
+            <p>Для <code>USD/RUB</code> премия котируется в базовой валюте (USD), поэтому используется <strong>премиально-скорректированная дельта</strong> $\Delta_{\text{pa}} \propto \frac{K}{F}\Phi(d_2)$. Для колла она <strong>немонотонна по страйку $K$</strong> и имеет максимум в точке $\sigma\sqrt{T}\Phi(d_2) = \varphi(d_2)$.</p>
+          </div>
+        </div>
+
+        <div style="display:flex; flex-direction:column; gap:16px;">
+          <table class="corp-table">
+            <thead>
+              <tr>
+                <th>Конвенция</th>
+                <th>Формула дельты ($\phi = \pm 1$)</th>
+                <th>Типичная пара</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>spot_pna</code></td>
+                <td>$\phi\, D_f\, \Phi(\phi d_1)$</td>
+                <td><code>XAU/USD</code>, <code>EUR/USD</code></td>
+              </tr>
+              <tr>
+                <td><code>forward_pna</code></td>
+                <td>$\phi\, \Phi(\phi d_1)$</td>
+                <td>Форвардные дески</td>
+              </tr>
+              <tr>
+                <td><code>spot_pa</code></td>
+                <td>$\phi\, D_f\, \frac{K}{F}\, \Phi(\phi d_2)$</td>
+                <td><code>USD/RUB</code> ($T \le 1\text{Y}$)</td>
+              </tr>
+              <tr>
+                <td><code>forward_pa</code></td>
+                <td>$\phi\, \frac{K}{F}\, \Phi(\phi d_2)$</td>
+                <td><code>USD/RUB</code> ($T &gt; 1\text{Y}$)</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="card emerald">
+            <div class="card-title">Гарантированное обращение $\Delta \to K$ до $10^{-12}$</div>
+            <p>В <code>fx_conventions.py</code> сначала локализуется пик $k_{\max}$, и корень $K(\Delta)$ ищется строго на правой монотонной ветви $[k_{\max}, +\infty)$ гибридным методом Ньютона–Брента.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд 8 из 28</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 09: ШАГ 2 (M0) — КАНОНИЗАЦИЯ SVI И ПЛОТНОСТЬ ДЮРРЛЕМАНА         -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 2 · Модуль M0</span>
+        <span class="slide-title">Безарбитражная параметризация Raw SVI и SSVI-фоллбэк</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="formula-box">
+        $$\text{Raw SVI (Gatheral, 2004):} \qquad w(k;\, \bm{\theta}) \;=\; \sigma^2(k)T \;=\; a + b\!\left(\rho_{\text{svi}}(k - m) + \sqrt{(k - m)^2 + \sigma_{\text{svi}}^2}\right), \qquad k = \ln\!\frac{K}{F}$$
+      </div>
+      <div class="grid-3">
+        <div class="card">
+          <div class="card-title">1. Ограничение наклона Роджера Ли</div>
+          <p>Асимптотический наклон полной дисперсии на крыльях жёстко ограничен неравенством моментов Ли (2004):</p>
+          <div class="formula-box" style="font-size:14px;">
+            $$b\,(1 + |\rho_{\text{svi}}|) \le \bar{L} = 1.9 &lt; 2.0$$
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">2. Условие Дюррлемана $g(k) \ge 0$</div>
+          <p>Для отсутствия баттерфляй-арбитража плотность вероятности риска должна быть неотрицательной на сетке $k \in [-6, 6]$:</p>
+          <div class="formula-box" style="font-size:13px;">
+            $$g(k) = \left(1 - \frac{k w'}{2w}\right)^{\!2} - \frac{(w')^2}{4}\!\left(\frac{1}{w}+\frac{1}{4}\right) + \frac{w''}{2} \ge 0$$
+          </div>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">3. Авто-фоллбэк на SSVI + IFT Якобиан</div>
+          <p>Если на стрессовом рынке $\min_k g(k) &lt; 10^{-4}$, включается глобально безарбитражная <strong>SSVI</strong> (Gatheral–Jacquier, 2014). Матрица $\frac{\partial \bm{\theta}_{\text{SVI}}}{\partial \bm{q}_{\text{mkt}}}$ считается по теореме о неявной функции.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд 9 из 28</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 09b: ATM И STRANGLE КОНВЕНЦИИ (DNS vs ATMF, SMILE vs MARKET)     -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 1B · Модуль M0</span>
+        <span class="slide-title">Конвенции ATM (DNS vs ATMF) и Баттерфляя (SMILE vs MARKET)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Страйк Delta-Neutral Straddle ($K_{\text{DNS}}$)</div>
+          <p>На валютном рынке котировка <code>ATM</code> означает страйк, на котором дельта колла равна по модулю дельте пута ($\Delta_C(K_{\text{DNS}}) + \Delta_P(K_{\text{DNS}}) = 0$):</p>
+          <div class="formula-box" style="font-size:15px;">
+            $$K_{\text{DNS}} = F \exp\!\left(\pm \tfrac{1}{2}\sigma_{\text{ATM}}^2 T\right)$$
+          </div>
+          <ul>
+            <li>Знак «$+$» для конвенций без премии (<code>spot_pna</code>, <code>forward_pna</code>).</li>
+            <li>Знак «$-$» для конвенций с вычетом премии (<code>spot_pa</code>, <code>forward_pa</code>).</li>
+          </ul>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">Улыбочный (SMILE) vs. Брокерский (MARKET) Стрэнгл</div>
+          <ul>
+            <li><strong>SMILE Butterfly:</strong> котируется напрямую как среднее арифметическое крыльев: $\sigma_{\text{BF}} = \frac{1}{2}(\sigma_{25C} + \sigma_{25P}) - \sigma_{\text{ATM}}$.</li>
+            <li><strong>MARKET (Broker) Butterfly:</strong> котируется через рыночную премию стрэнгл-пакета с единой волатильностью $\sigma_{\text{mkt}} = \sigma_{\text{ATM}} + \text{BF}_{\text{mkt}}$.</li>
+            <li>В <code>fx_conventions.py</code> брокерский стрэнгл обращается точным 1D-решателем Ньютона в истинные улыбочные пиллары $(\sigma_{25C}, \sigma_{25P})$.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 09c: ЯКОБИАН ПО ТЕОРЕМЕ О НЕЯВНОЙ ФУНКЦИИ (IFT SMILE VEGA)       -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 2B · Модуль M0</span>
+        <span class="slide-title">Матрица SmileVega (15×5) через теорему о неявной функции (IFT)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="lead-statement">
+        Трейдеру нужна вега не по внутренним параметрам SVI $(a,b,\rho,m,\sigma)$, а по <strong>5 рыночным котировкам терминала</strong> $\bm{q} = (\text{ATM}, \text{RR}_{25}, \text{BF}_{25}, \text{RR}_{10}, \text{BF}_{10})$ на каждую ногу.
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Аналитическое обращение вместо 10 рекалибровок</div>
+          <p>Пусть $\bm{R}(\bm{\theta}_{\text{SVI}}, \bm{q}) = \bm{0}$ — условие совпадения SVI с 5 рыночными пилларами. По теореме о неявной функции (IFT):</p>
+          <div class="formula-box" style="font-size:14.5px;">
+            $$\frac{\partial \bm{\theta}_{\text{SVI}}}{\partial \bm{q}} = -\left(\frac{\partial \bm{R}}{\partial \bm{\theta}_{\text{SVI}}}\right)^{-1} \frac{\partial \bm{R}}{\partial \bm{q}} \in \mathbb{R}^{5\times 5}$$
+          </div>
+          <p>Это избавляет от необходимости перекалибровывать SVI 10 раз на каждом запросе.</p>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">Свойство сохранения параллельной веги</div>
+          <p>Сумма пилларных вег по 5 колонкам матрицы <code>SmileVega</code> (при единичном сдвиге <code>ATM</code> и нулевых сдвигах <code>RR/BF</code>) сходится к параллельной веге ноги $\mathcal{V}_{\text{leg}, i}$ с точностью <strong>$\le 10^{-6}$</strong>:</p>
+          <div class="formula-box" style="font-size:14.5px;">
+            $$\frac{\partial V}{\partial \bm{q}_i} = \frac{\partial V}{\partial \bm{\theta}_{\text{SVI}, i}} \cdot \frac{\partial \bm{\theta}_{\text{SVI}, i}}{\partial \bm{q}_i}, \qquad i \in \{1, 2\}$$
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 10: ШАГ 3 (M1.1) — СМЕНА МЕРЫ И АЛГОРИТМ BETA-SPLIT             -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 3 · Модуль M1.1</span>
+        <span class="slide-title">Смена меры на $\mathbb{Q}^{\text{USD}}$ и аналитический алгоритм $\beta$-Split</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Переход в меру промежуточной валюты $\mathbb{Q}^{\text{USD}}$</div>
+          <p>Пусть $X = S_1(T)/F_1$ и $Y = S_2(T)/F_2$ — нормированные цены ног в мере доллара $\mathbb{Q}^B$ ($\mathbb{E}^{\mathbb{Q}^B}[X] = \mathbb{E}^{\mathbb{Q}^B}[Y] = 1$). Замена меры с $\mathbb{Q}^{\text{RUB}}$ на $\mathbb{Q}^{\text{USD}}$ через $\frac{d\mathbb{Q}^C}{d\mathbb{Q}^B} = Y$ даёт:</p>
+          <div class="formula-box" style="font-size:15px;">
+            $$V(K, T) = D_{\text{set}}\, F_\times\, \mathbb{E}^{\mathbb{Q}^{\text{USD}}}\!\Big[\big(\phi(X - e^k Y)\big)^+\Big]$$
+          </div>
+          <p>где $F_\times = F_1 F_2 = S_1 S_2 \frac{D_A(T)}{D_C(T)}$ — триангулированный кросс-форвард (не зависит от ставки доллара $D_B$!).</p>
+        </div>
+
+        <div class="card emerald">
+          <div class="card-title">6-шаговый цикл неподвижной точки $\beta$-Split</div>
+          <p>Лог-денежность кросса $k = \ln(K/F_\times)$ расщепляется между двумя ногами ($k_1 = \beta_1 k$, $k_2 = -\beta_2 k$, $\beta_1 + \beta_2 \equiv 1$) за 6 шагов:</p>
+          <div class="formula-box" style="font-size:14px;">
+            $$\begin{aligned}
+              v_\times^{(j)} &= \sigma_1^2(\beta_1 k) + \sigma_2^2(-\beta_2 k) + 2\rho\,\sigma_1(\beta_1 k)\sigma_2(-\beta_2 k), \\
+              \beta_1^{(j)} &= \frac{\sigma_1^2(\beta_1 k) + \rho\,\sigma_1(\beta_1 k)\sigma_2(-\beta_2 k)}{v_\times^{(j)}}, \quad \beta_2^{(j)} = 1 - \beta_1^{(j)}
+            \end{aligned}$$
+          </div>
+          <p><strong>Свойства P1–P6:</strong> сходимость за 6 итераций до <code>0.008 vol-pts</code>; точное вырождение в одну ногу при $\sigma_1 \to 0$.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 10b: ГЛАДКАЯ ЗАЩИТА ОТ СИНГУЛЯРНОСТЕЙ (SOFTFLOOR)                -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 3B · Численная устойчивость</span>
+        <span class="slide-title">Устранение сингулярностей без потери дифференцируемости (Gate G3.1)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="lead-statement">
+        Жёсткие отсечения <code>torch.clamp(x, min=0.01)</code> обнуляют производные на границе и ломают расчёт греков. Во всём движке используются только $C^\infty$-гладкие барьеры <code>softfloor</code>.
+      </div>
+      <div class="grid-3">
+        <div class="card">
+          <div class="card-title">1. Пол волатильности ($\sigma \ge 0.01$)</div>
+          <div class="formula-box" style="font-size:13.5px;">
+            $$\sigma_{\text{safe}} = \sigma_{\min} + \frac{1}{\beta}\ln\!\big(1 + e^{\beta(\sigma - \sigma_{\min})}\big)$$
+          </div>
+          <p>При $\beta = 200$ и $\sigma_{\min} = 0.01$ функция гладкая класса $C^\infty$ и исключает деление на ноль в $d_{1,2}$.</p>
+        </div>
+        <div class="card">
+          <div class="card-title">2. Пол времени ($T \ge 10^{-4}$)</div>
+          <div class="formula-box" style="font-size:13.5px;">
+            $$T_{\text{safe}} = \text{softfloor}\big(T,\; 10^{-4},\; \beta=10^5\big)$$
+          </div>
+          <p>Защищает вычисление $\sqrt{T}$ и дневной $\Theta$ за секунды до экспирации опциона.</p>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">3. OTM + Паритет в Блэке-76</div>
+          <div class="formula-box" style="font-size:13.5px;">
+            $$V = V_{\text{OTM}} + D_{\text{set}}\big[\phi(F_\times - K)\big]^+$$
+          </div>
+          <p>Позволяет считать глубокие ITM-опционы ($K = 10$) через $\text{erfc}(|d_{1,2}|/\sqrt{2})$ без потери мантиссы <code>float64</code>.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 11: ВИЗУАЛИЗАЦИЯ УЛЫБКИ XAU/RUB И ОСТАТКА КОПУЛЫ                -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Визуализация</span>
+        <span class="slide-title">Улыбка волатильности XAU/RUB и нелинейный остаток копулы $\varepsilon(z)$</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <!-- Левый график: Улыбка кросса -->
+        <div class="card" style="background:#FFFFFF; align-items:center;">
+          <div class="card-title">А. Подразумеваемая волатильность $\sigma_\times(z)$ ($T=2\text{Y}, \rho=0.35$)</div>
+          <svg width="520" height="290" viewBox="0 0 520 290">
+            <!-- Сетка -->
+            <line x1="55" y1="30" x2="55" y2="245" stroke="#BDC9C2" stroke-width="1.5"/>
+            <line x1="55" y1="245" x2="495" y2="245" stroke="#BDC9C2" stroke-width="1.5"/>
+            <line x1="55" y1="185" x2="495" y2="185" stroke="#E8EFEA" stroke-width="1"/>
+            <line x1="55" y1="125" x2="495" y2="125" stroke="#E8EFEA" stroke-width="1"/>
+            <line x1="55" y1="65" x2="495" y2="65" stroke="#E8EFEA" stroke-width="1"/>
+            <line x1="275" y1="30" x2="275" y2="245" stroke="#DCE5DF" stroke-dasharray="4,4"/>
+
+            <!-- Подписи осей -->
+            <text x="48" y="190" text-anchor="end" font-size="11" fill="#52665B">30%</text>
+            <text x="48" y="130" text-anchor="end" font-size="11" fill="#52665B">36%</text>
+            <text x="48" y="70" text-anchor="end" font-size="11" fill="#52665B">42%</text>
+            <text x="110" y="263" text-anchor="middle" font-size="11" fill="#52665B">z = -3</text>
+            <text x="275" y="263" text-anchor="middle" font-size="11" font-weight="700" fill="#0E2218">z = 0 (ATMF)</text>
+            <text x="440" y="263" text-anchor="middle" font-size="11" fill="#52665B">z = +3</text>
+
+            <!-- Плоская линия GK -->
+            <line x1="70" y1="175" x2="480" y2="175" stroke="#7A8B82" stroke-width="2" stroke-dasharray="7,5"/>
+
+            <!-- Кривая Beta-Split -->
+            <path d="M 70 105 Q 260 232 480 62" fill="none" stroke="#C59B27" stroke-width="3"/>
+
+            <!-- Кривая 2D Copula / DeepVol ML -->
+            <path d="M 70 98 Q 262 242 480 54" fill="none" stroke="#21A038" stroke-width="3" stroke-dasharray="3,0"/>
+
+            <!-- Легенда -->
+            <rect x="70" y="34" width="235" height="64" rx="4" fill="rgba(255,255,255,0.92)" stroke="#DCE5DF"/>
+            <line x1="80" y1="48" x2="105" y2="48" stroke="#7A8B82" stroke-width="2" stroke-dasharray="5,3"/>
+            <text x="112" y="52" font-size="11" fill="#52665B">Плоская Гарман–Кольхаген</text>
+            <line x1="80" y1="66" x2="105" y2="66" stroke="#C59B27" stroke-width="2.5"/>
+            <text x="112" y="70" font-size="11" fill="#0E2218">Аналитическая база β-Split</text>
+            <line x1="80" y1="84" x2="105" y2="84" stroke="#21A038" stroke-width="2.5"/>
+            <text x="112" y="88" font-size="11" font-weight="700" fill="#106B2E">2D Копула ≡ DeepVol ML</text>
+          </svg>
+        </div>
+
+        <!-- Правый график: Остаток копулы -->
+        <div class="card" style="background:#FFFFFF; align-items:center;">
+          <div class="card-title">Б. Остаток копулы $\varepsilon(z) = \sigma_{\text{copula}} - \sigma_{\beta\text{-split}}$ (б.п. волатильности)</div>
+          <svg width="520" height="290" viewBox="0 0 520 290">
+            <!-- Зоны квинтик-тейпера -->
+            <rect x="55" y="30" width="65" height="215" fill="#FDF2F2"/>
+            <rect x="430" y="30" width="65" height="215" fill="#FDF2F2"/>
+            <text x="87" y="52" text-anchor="middle" font-size="10" font-weight="700" fill="#D62D2D">Тейпер</text>
+            <text x="87" y="65" text-anchor="middle" font-size="9.5" fill="#D62D2D">|z|∈[5,7]</text>
+            <text x="462" y="52" text-anchor="middle" font-size="10" font-weight="700" fill="#D62D2D">Тейпер</text>
+            <text x="462" y="65" text-anchor="middle" font-size="9.5" fill="#D62D2D">|z|∈[5,7]</text>
+
+            <!-- Оси -->
+            <line x1="55" y1="30" x2="55" y2="245" stroke="#BDC9C2" stroke-width="1.5"/>
+            <line x1="55" y1="138" x2="495" y2="138" stroke="#8FA89B" stroke-width="1.2"/>
+            <line x1="55" y1="245" x2="495" y2="245" stroke="#BDC9C2" stroke-width="1.5"/>
+            <text x="48" y="85" text-anchor="end" font-size="11" fill="#52665B">+12 б.п.</text>
+            <text x="48" y="142" text-anchor="end" font-size="11" fill="#0E2218">0</text>
+            <text x="48" y="200" text-anchor="end" font-size="11" fill="#52665B">-12 б.п.</text>
+            <text x="60" y="263" text-anchor="middle" font-size="10.5" fill="#52665B">z = -7</text>
+            <text x="120" y="263" text-anchor="middle" font-size="10.5" fill="#D62D2D">z = -5</text>
+            <text x="275" y="263" text-anchor="middle" font-size="11" font-weight="700" fill="#0E2218">z = 0</text>
+            <text x="430" y="263" text-anchor="middle" font-size="10.5" fill="#D62D2D">z = +5</text>
+            <text x="490" y="263" text-anchor="middle" font-size="10.5" fill="#52665B">z = +7</text>
+
+            <!-- Кривая остатка rho = +0.5 -->
+            <path d="M 55 138 L 95 138 C 145 138, 185 85, 235 165 C 275 215, 330 70, 395 125 C 425 138, 455 138, 495 138" fill="none" stroke="#21A038" stroke-width="3"/>
+            <!-- Кривая остатка rho = -0.5 -->
+            <path d="M 55 138 L 95 138 C 145 138, 185 190, 235 110 C 275 68, 330 205, 395 150 C 425 138, 455 138, 495 138" fill="none" stroke="#C59B27" stroke-width="2.5" stroke-dasharray="6,4"/>
+
+            <rect x="145" y="34" width="215" height="44" rx="4" fill="rgba(255,255,255,0.92)" stroke="#DCE5DF"/>
+            <line x1="155" y1="48" x2="180" y2="48" stroke="#21A038" stroke-width="2.5"/>
+            <text x="188" y="52" font-size="11" fill="#0E2218">Остаток при ρ = +0.50</text>
+            <line x1="155" y1="66" x2="180" y2="66" stroke="#C59B27" stroke-width="2.5" stroke-dasharray="4,3"/>
+            <text x="188" y="70" font-size="11" fill="#0E2218">Остаток при ρ = -0.50</text>
+          </svg>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 12: РАЗДЕЛ II — НЕЙРОСЕТЕВОЙ АНСАМБЛЬ И DML (DIVIDER)           -->
+  <!-- ===================================================================== -->
+  <section class="slide dark-slide">
+    <div style="padding: 64px; display:flex; flex-direction:column; justify-content:center; height:100%;">
+      <div style="font-size: 14px; font-weight: 700; color: var(--sber-gold); letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 16px;">
+        Раздел 02 · Модули M1.3 и M2
+      </div>
+      <h2 style="font-size: 44px; font-weight: 800; color: #FFFFFF; line-height: 1.15; margin-bottom: 20px;">
+        Нейросетевой ансамбль <code>ResidualCrossVolNet</code><br/>и обучение Differential ML
+      </h2>
+      <p style="font-size: 18px; color: #B8CEC2; max-width: 800px; line-height: 1.5;">
+        Почему ансамбль из 5 компактных сетей весит всего 220 КБ, как сплайн 5-й степени защищает глубокие страйки и зачем учить нейросеть в пространстве Соболева $H^2$.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 13: АРХИТЕКТУРА RESIDUALCROSSVOLNET И 13 ПРИЗНАКОВ              -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 4 · Модуль M1.3</span>
+        <span class="slide-title">Архитектура ансамбля ResidualCrossVolNet (fx_cross_surrogate.py)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">13 безразмерных входных признаков $\bm{x} \in \mathbb{R}^{13}$</div>
+          <table class="corp-table" style="margin-top:4px;">
+            <thead>
+              <tr><th>Индекс</th><th>Признак</th><th>Описание</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>0</code></td><td>$z = k / (\sigma_{\text{ref}}\sqrt{T})$</td><td>Стандартизованная денежность кросса</td></tr>
+              <tr><td><code>1</code></td><td>$\sqrt{T}$</td><td>Корень из времени до экспирации</td></tr>
+              <tr><td><code>2</code></td><td>$\rho$</td><td>Корреляция лог-доходностей ног</td></tr>
+              <tr><td><code>3..7</code></td><td>$a_1, b_1, \rho_1, m_1, \sigma_1$</td><td>Параметры Raw SVI ноги 1 (<code>XAU/USD</code>)</td></tr>
+              <tr><td><code>8..12</code></td><td>$a_2, b_2, \rho_2, m_2, \sigma_2$</td><td>Параметры Raw SVI ноги 2 (<code>USD/RUB</code>)</td></tr>
+            </tbody>
+          </table>
+          <p style="font-size:13px; color:var(--sber-emerald); font-weight:600; margin-top:4px;">
+            Инвариантность к ставкам: ни споты $S_1, S_2$, ни процентные ставки $r_A, r_B, r_C$ не подаются в сеть — они входят только в точный форвард $F_\times$ и Блэк-76.
+          </p>
+        </div>
+
+        <div style="display:flex; flex-direction:column; gap:16px;">
+          <div class="card emerald">
+            <div class="card-title">Топология стекового ансамбля ($5 \times 64^3$)</div>
+            <ul>
+              <li><strong>5 независимых членов ансамбля</strong> ($13 \to 64 \to 64 \to 64 \to 1$), упакованных в единый 3D-тензор весов $\bm{W}_\ell \in \mathbb{R}^{5 \times d_{\text{out}} \times d_{\text{in}}}$.</li>
+              <li><strong>Гладкая активация $\text{SiLU}(x) = \frac{x}{1+e^{-x}}$:</strong> бесконечная гладкость $C^\infty$ обеспечивает непрерывную вторую производную для <code>Gamma</code>.</li>
+              <li><strong>Нулевая инициализация выхода:</strong> $\bm{W}_3 = \bm{0}, \bm{b}_3 = \bm{0}$ — необученная сеть побитово равна аналитике $\beta$-Split.</li>
+              <li><strong>Усреднение в пространстве волатильности</strong> до подстановки в Блэк-76.</li>
+            </ul>
+          </div>
+          <div class="card gold">
+            <div class="card-title">Помещается в L2-кэш одного ядра CPU</div>
+            <p>Один чекпоинт весит <strong>44 КБ</strong> (все 5 моделей — <strong>220 КБ</strong>), поэтому вычисление ансамбля не обращается к медленной оперативной памяти.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 14: КВИНТИК-ТЕЙПЕР НА КРЫЛЬЯХ (JTAPER)                          -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 5 · Защита крыльев</span>
+        <span class="slide-title">$C^2$-гладкое затухание на крыльях ($|z| \in [5, 7]$) и поведение при $K = 10$</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div style="display:flex; flex-direction:column; gap:16px;">
+          <div class="card">
+            <div class="card-title">Зачем нужно гладкое затухание</div>
+            <p>На глубоких страйках (например, $K = 10$ руб. при форварде $465,832$ руб., где $z = -26.4$) нейросеть находится далеко вне обучающего интервала $z \in [-6, 6]$. Но жёсткое отсечение $\mathbb{I}(|z| &lt; 5)$ создало бы ступеньку волатильности и бесконечный скачок <code>Gamma</code>.</p>
+          </div>
+          <div class="card emerald">
+            <div class="card-title">Квинтик-сплайн 5-й степени <code>jtaper(z, 5, 7)</code></div>
+            <p>Для $t = \text{clamp}\!\left(\frac{|z| - 5}{2},\, 0,\, 1\right)$ множитель затухания равен:</p>
+            <div class="formula-box" style="font-size:14.5px;">
+              $$w(z) = 1 - \big(10t^3 - 15t^4 + 6t^5\big)$$
+            </div>
+            <ul>
+              <li>При $|z| \le 5$: $w(z) \equiv 1$ (полный вклад ансамбля).</li>
+              <li>При $|z| \ge 7$: $w(z) \equiv 0.0$ (<strong>побитовое совпадение с аналитикой</strong>).</li>
+              <li>В точках $|z| = 5$ и $|z| = 7$: $w'(z) = w''(z) = 0$ (гладкая сшивка $V, \Delta, \Gamma$ до $10^{-16}$).</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="card" style="background:#FFFFFF; align-items:center; justify-content:center;">
+          <div class="card-title">Профиль сплайна $w(z)$ и его производных $w'(z), w''(z)$</div>
+          <svg width="500" height="280" viewBox="0 0 500 280">
+            <rect x="60" y="25" width="110" height="205" fill="#F0F8F2"/>
+            <rect x="170" y="25" width="180" height="205" fill="#FAF7F0"/>
+            <rect x="350" y="25" width="115" height="205" fill="#F5F8F6"/>
+
+            <line x1="60" y1="155" x2="465" y2="155" stroke="#8FA89B" stroke-width="1.2"/>
+            <line x1="60" y1="25" x2="60" y2="230" stroke="#BDC9C2" stroke-width="1.5"/>
+            <line x1="60" y1="230" x2="465" y2="230" stroke="#BDC9C2" stroke-width="1.5"/>
+
+            <text x="115" y="46" text-anchor="middle" font-size="11" font-weight="700" fill="#106B2E">w(z) ≡ 1</text>
+            <text x="260" y="46" text-anchor="middle" font-size="11" font-weight="700" fill="#9E7916">Переход C² (5 &lt; |z| &lt; 7)</text>
+            <text x="407" y="46" text-anchor="middle" font-size="11" font-weight="700" fill="#52665B">w(z) ≡ 0</text>
+
+            <!-- w(z) -->
+            <path d="M 60 65 L 170 65 C 225 65, 295 155, 350 155 L 465 155" fill="none" stroke="#21A038" stroke-width="3.5"/>
+            <!-- w'(z) -->
+            <path d="M 60 155 L 170 155 C 215 155, 235 215, 260 215 C 285 215, 305 155, 350 155 L 465 155" fill="none" stroke="#C59B27" stroke-width="2.5" stroke-dasharray="6,4"/>
+            <!-- w''(z) -->
+            <path d="M 170 155 Q 215 205 260 155 Q 305 105 350 155" fill="none" stroke="#D62D2D" stroke-width="2" stroke-dasharray="3,3"/>
+
+            <text x="170" y="248" text-anchor="middle" font-size="11" font-weight="700" fill="#0E2218">|z| = 5.0</text>
+            <text x="350" y="248" text-anchor="middle" font-size="11" font-weight="700" fill="#0E2218">|z| = 7.0</text>
+          </svg>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 15: ОБУЧЕНИЕ (M2) — ГЕНЕРАТОР ДАННЫХ SOBOL + 2D КОПУЛА          -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Обучение · Модуль M2</span>
+        <span class="slide-title">Генерация обучающих данных: 12D сетка Соболя и 2D Гауссовская Копула</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-3">
+        <div class="card">
+          <div class="card-title">1. Квазислучайный дизайн Соболя</div>
+          <p><code>CrossSobolSampler</code> равномерно заполняет 12-мерный гиперкуб рыночных состояний ($\sigma_{\text{ATM}}, \text{RR}_{25}, \text{BF}_{25}, \text{RR}_{10}, \text{BF}_{10}$ обеих ног, $\rho \in [-0.95, 0.95]$ и $T \in [1\text{D}, 10\text{Y}]$).</p>
+        </div>
+        <div class="card">
+          <div class="card-title">2. Интеграл 2D Копулы ($96 \times 96$)</div>
+          <p>Маргинальные квантили обеих ног извлекаются по теореме Бридена–Литценбергера ($F_i(K) = 1 + \frac{1}{D}\partial_K P_i$), а премия кросса интегрируется квадратурой Гаусса–Эрмита в <code>float64</code>.</p>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">3. Обращение Джекеля (PIVOT)</div>
+          <p>Из цены копулы $V_{\text{cop}}$ подразумеваемая волатильность $\sigma_{\text{cop}}$ извлекается рациональным кубическим решателем Джекеля (<code>pivot_iv.py</code>) с точностью $10^{-13}$ даже при $|z|=6$.</p>
+        </div>
+      </div>
+      <div class="card gold">
+        <div class="card-title">Криптографический контроль отсутствия утечки данных (Zero Data Leakage)</div>
+        <p>Каждое 12-мерное рыночное состояние хэшируется по <code>SHA-256</code>. Разбиение на <code>train / val / test / stress</code> производится строго по непересекающимся множествам хэшей состояний; нормализатор и матрица Ледуа–Вульфа считаются исключительно по <code>train</code>.</p>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 15b: DIFFERENTIAL MACHINE LEARNING (SOBOLEV H2 LOSS)            -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Обучение · Модуль M2</span>
+        <span class="slide-title">Differential Machine Learning: Функция потерь Соболева $H^2$</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="formula-box">
+        $$\mathcal{L}_{\text{DML}} \;=\; \underbrace{\|\hat{\varepsilon} - \varepsilon\|_2^2}_{\text{Ошибка волатильности}} \;+\; \lambda \underbrace{\|\partial_k \hat{\varepsilon} - \partial_k \varepsilon\|_2^2}_{\text{Наклон (Delta / Vanna)}} \;+\; \nu \underbrace{\|\partial_{kk} \hat{\varepsilon} - \partial_{kk} \varepsilon\|_2^2}_{\text{Кривизна (Gamma)}} \;+\; \mu \underbrace{\|\nabla_{\bm{\theta}} \hat{\varepsilon} - \nabla_{\bm{\theta}} \varepsilon\|_2^2}_{\text{Чувствительность к улыбкам и }\rho} \qquad (\lambda=1,\; \nu=0.1,\; \mu=10)$$
+      </div>
+      <div class="grid-2">
+        <div class="card danger">
+          <div class="card-title">Обучение только по цене (Обычный MSE)</div>
+          <ul>
+            <li>Сеть проходит близко к точкам цены, но создаёт микро-волны между страйками.</li>
+            <li>При двукратном дифференцировании по $S$ ошибка на <code>Gamma</code> возрастает до <strong>3.45%</strong> (провал гейта G1.4).</li>
+          </ul>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">Обучение в норме Соболева $H^2$ (Наш DML)</div>
+          <ul>
+            <li>Сеть одновременно учит высоту, наклон $\partial_k \varepsilon$, кривизну $\partial_{kk} \varepsilon$ и градиент по параметрам улыбок $\nabla_{\bm{\theta}} \varepsilon$.</li>
+            <li>Ошибка на <code>Gamma</code> падает в <strong>7 раз</strong> — до <strong>0.48%</strong> (при пороге 1.80%).</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 16: РАЗДЕЛ III — АНАЛИТИЧЕСКИЕ СТРУИ И ГРЕКИ (DIVIDER)          -->
+  <!-- ===================================================================== -->
+  <section class="slide dark-slide">
+    <div style="padding: 64px; display:flex; flex-direction:column; justify-content:center; height:100%;">
+      <div style="font-size: 14px; font-weight: 700; color: var(--sber-gold); letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 16px;">
+        Раздел 03 · Модули M1.2 и M3
+      </div>
+      <h2 style="font-size: 44px; font-weight: 800; color: #FFFFFF; line-height: 1.15; margin-bottom: 20px;">
+        Струи Тейлора 2-го порядка (<code>Taylor Jets</code>),<br/>13 греков за 1 проход и защита <code>FXCrossGuardian</code>
+      </h2>
+      <p style="font-size: 18px; color: #B8CEC2; max-width: 820px; line-height: 1.5;">
+        Как получить аналитические первые и вторые производные сквозь итерации $\beta$-Split и нейросеть без единого вызова <code>backward()</code> или конечных разностей.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 17: АЛГЕБРА СТРУЙ ТЕЙЛОРА 2-ГО ПОРЯДКА                          -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 6 · Модуль M1.2</span>
+        <span class="slide-title">Алгебра струй Тейлора 2-го порядка (taylor_jets.py)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="lead-statement">
+        Вместо 80-кратного перезапуска прайсера с пошаговыми сдвигами (bump-and-revalue) каждое число внутри модели представлено кортежем <strong>Jet</strong>, который несёт само значение и его точные производные.
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Структура 2-струй Тейлора</div>
+          <div class="formula-box" style="font-size:15px;">
+            $$\mathcal{J}(u) \;=\; \left(v,\;\; \frac{\partial u}{\partial k},\;\; \frac{\partial^2 u}{\partial k^2},\;\; \nabla_{(\rho, \delta_1, \delta_2)} u\right)$$
+          </div>
+          <ul>
+            <li><strong>Сложение и умножение:</strong> точное правило Лейбница 2-го порядка $(v_u v_w,\; d_u v_w + v_u d_w,\; dd_u v_w + 2d_u d_w + v_u dd_w)$.</li>
+            <li><strong>Цепное правило для любой $f(u)$:</strong>
+              $$\mathcal{J}(f(u)) = \big(f(v),\; f'(v)d,\; f''(v)d^2 + f'(v)dd,\; f'(v)\bm{t}\big)$$</li>
+          </ul>
+        </div>
+
+        <div class="card emerald">
+          <div class="card-title">Матричный проход струи через нейросеть</div>
+          <p>Линейный слой $\bm{h} = \bm{W}\bm{x} + \bm{b}$ умножает матрицу весов $\bm{W}$ <strong>одновременно на значение $v$, первую производную $d$, вторую производную $dd$ и касательные $\bm{t}$</strong> в одной операции <code>einsum</code>:</p>
+          <div class="formula-box" style="font-size:14px;">
+            $$\begin{bmatrix}\bm{v}_{\text{out}} \\ \bm{d}_{\text{out}} \\ \bm{dd}_{\text{out}}\end{bmatrix} = \begin{bmatrix}\bm{v}_{\text{in}} \\ \bm{d}_{\text{in}} \\ \bm{dd}_{\text{in}}\end{bmatrix}\bm{W}^\top + \begin{bmatrix}\bm{b} \\ \bm{0} \\ \bm{0}\end{bmatrix}$$
+          </div>
+          <p>На выходе за <strong>1 прямой проход</strong> получаем $(\sigma_\times, s_k, s_{kk}, \bm{s}_t)$ с машинной точностью $10^{-12}$.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 18: ФОРМУЛЫ 13 ГРЕКОВ И СОХРАНЕНИЕ CASHDELTA                    -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 7 · Аналитика греков</span>
+        <span class="slide-title">Полная система из 13 греков и закон сохранения CashDelta</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Греки с учётом движения улыбки (Sticky-Moneyness)</div>
+          <p>Обозначим $g = D_A(T)/D_C(T)$, так что $F_\times = g\, S^\times$. Полные производные по форварду с учётом наклона улыбки $s_k = \partial_k \sigma_\times$ и кривизны $s_{kk} = \partial_{kk}\sigma_\times$:</p>
+          <div class="formula-box" style="font-size:13.5px;">
+            $$\frac{dV}{dF_\times} = B_F - \frac{B_s s_k}{F_\times}, \qquad \frac{d^2V}{dF_\times^2} = B_{FF} - \frac{2B_{Fs}s_k}{F_\times} + \frac{B_{ss}s_k^2 + B_s(s_{kk}+s_k)}{F_\times^2}$$
+          </div>
+          <ul>
+            <li><strong>Спотовая и форвардная дельта:</strong> $\Delta_\times = g\,\frac{dV}{dF_\times}$, $\quad\Delta_{\text{non-adapted}} = \frac{\Delta_\times}{g} = \frac{dV}{dF_\times}$.</li>
+            <li><strong>Гамма и Ванна:</strong> $\Gamma_\times = g^2 \frac{d^2V}{dF_\times^2}$, $\quad\text{Vanna} = g\!\left(B_{Fs} - \frac{B_{ss}s_k}{F_\times}\right)$.</li>
+          </ul>
+        </div>
+
+        <div style="display:flex; flex-direction:column; gap:16px;">
+          <div class="card emerald">
+            <div class="card-title">Тождество сохранения CashDelta (G1.7)</div>
+            <p>По цепному правилу $\Delta_1 = S_2 \Delta_\times$ и $\Delta_2 = S_1 \Delta_\times$, откуда денежная дельта в рублях <strong>тождественно равна по всем трём инструментам</strong>:</p>
+            <div class="formula-box" style="font-size:14.5px;">
+              $$\text{CashDelta}_\times \equiv \text{CashDelta}_{\text{XAUUSD}} \equiv \text{CashDelta}_{\text{USDRUB}} = F_\times \frac{dV}{dF_\times}$$
+            </div>
+          </div>
+          <div class="card gold">
+            <div class="card-title">Аналитическое бакетирование кривых (69 пилларов Rho)</div>
+            <p>Вместо 69 сдвигов узлов кривых вектор <code>Rho</code> по 26 пилларам <code>RUB_RUONIA_OIS</code> и 43 пилларам <code>XAU_RUB</code> вычисляется за <strong>1 мкс</strong> через линейные веса интерполяции $w_i(T)$.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 18b: РЕЖИМЫ STICKY-MONEYNESS VS STICKY-STRIKE                   -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Шаг 7B · Динамика улыбки</span>
+        <span class="slide-title">Два режима расчёта греков: Sticky-Moneyness vs. Sticky-Strike</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div class="card emerald">
+          <div class="card-title">1. STICKY_MONEYNESS (По умолчанию для FX)</div>
+          <p>Предполагает, что при движении спота $S^\times$ улыбка волатильности движется вместе с форвардом $F_\times$, то есть $\sigma_\times = \sigma_\times\big(\ln(K/F_\times)\big)$:</p>
+          <ul>
+            <li>Включает поправку на наклон улыбки $-\frac{B_s s_k}{F_\times}$ в <code>Delta</code>.</li>
+            <li>Включает слагаемые $s_k, s_{kk}$ в <code>Gamma</code> и <code>Vanna</code>.</li>
+            <li>Включает кэрри-ролл улыбки $+B_s s_k (r_C - r_A)$ в дневную <code>Theta</code>.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <div class="card-title">2. STICKY_STRIKE (Фиксированная волатильность на страйке)</div>
+          <p>Предполагает, что при малом колебании спота волатильность конкретного страйка $K$ остаётся замороженной ($\frac{\partial \sigma_\times}{\partial F_\times} = 0$):</p>
+          <ul>
+            <li>В формулах греков полагается $s_k = 0$ и $s_{kk} = 0$.</li>
+            <li>Возвращает классические парциалы Блэка–Шоулза / Гармана–Кольхагена при текущей эффективной волатильности $\sigma_\times(K, T)$.</li>
+            <li>Переключается одним полем <code>"smile_dynamics": "STICKY_STRIKE"</code> в JSON-запросе.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 19: МОДЕЛЬНЫЙ РИСК И FXCROSSGUARDIAN (M3)                       -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Модельный риск · Модуль M3</span>
+        <span class="slide-title">Эшелонированная защита FXCrossGuardian и авто-фоллбэк (SR 11-7 / ЦБ РФ)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="lead-statement">
+        Перед тем как допустить нейросеть к формированию цены, модуль <code>fx_cross_guardian.py</code> проверяет рыночное состояние по 3 независимым критериям и при любой аномалии мгновенно выставляет <code>nn_gate = 0.0</code>.
+      </div>
+      <div class="grid-3">
+        <div class="card">
+          <div class="card-title">1. Фильтр Махаланобиса (12D)</div>
+          <div class="formula-box" style="font-size:13.5px;">
+            $$D_M(\bm{m}) = \sqrt{(\bm{m}-\bm{\mu})^\top \bm{\Sigma}_{\text{LW}}^{-1}(\bm{m}-\bm{\mu})}$$
+          </div>
+          <p>Ковариация Ледуа–Вульфа на обучающей выборке. При $D_M &gt; q_{0.995} = 5.337$ или выходе за 12D-бокс срабатывает <code>OOD_MARKET_REGIME</code> (100% перехват на 1,000 стресс-тестов).</p>
+        </div>
+        <div class="card">
+          <div class="card-title">2. Эпистемический разброс</div>
+          <div class="formula-box" style="font-size:13.5px;">
+            $$\sigma_{\text{epist}} = \text{std}_{m=1..5}\big(\hat{\varepsilon}_m(\bm{x})\big)$$
+          </div>
+          <p>Если 5 членов ансамбля расходятся в предсказании остатка волатильности выше порога, запрос маршрутизируется в аналитику с кодом <code>EPISTEMIC_UNCERTAINTY</code>.</p>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">3. Выходной аудит и резерв</div>
+          <div class="formula-box" style="font-size:13.5px;">
+            $$\min_{k} g_\times(k) \ge 0, \quad \partial_T w_\times \ge 0$$
+          </div>
+          <p>Проверка отсутствия баттерфляй и календарного арбитража на выдаче + фоновый расчёт модельного резерва <code>ModelReserveTracker</code> и мониторинг дрейфа <code>PSI</code>.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 19b: МОДЕЛЬНЫЙ РЕЗЕРВ И МОНИТОРИНГ ДРЕЙФА PSI                   -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Комплаенс · Модуль M3</span>
+        <span class="slide-title">Асинхронный модельный резерв (ModelReserve) и индекс дрейфа PSI</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Асинхронный расчёт резерва <code>ModelReserveTracker</code></div>
+          <p>По требованиям управления модельным риском банк оценивает максимальное расхождение между быстрой моделью и эталонной 2D копулой по сетке из 64 страйков:</p>
+          <div class="formula-box" style="font-size:14.5px;">
+            $$\text{MR}_s = \max_{K_1 \dots K_{64}} \frac{\big|V_{\text{copula}}(K_j) - V_{\text{served}}(K_j)\big|}{D_{\text{set}} F_\times} \times 10^4\;\text{(б.п.)}$$
+          </div>
+          <p>Расчёт выполняется в фоновом пуле потоков и кэшируется по хэшу рыночного состояния, <strong>не задерживая основной ответ клиенту</strong>.</p>
+        </div>
+        <div class="card gold">
+          <div class="card-title">Контроль сдвига распределения <code>MarketStateDriftMonitor</code></div>
+          <p>По скользящему окну входящих запросов вычисляется индекс стабильности популяции (Population Stability Index) по всем 12 признакам рынка:</p>
+          <div class="formula-box" style="font-size:14.5px;">
+            $$\text{PSI} = \sum_{b=1}^{10} \big(p_b^{\text{live}} - q_b^{\text{train}}\big)\ln\!\left(\frac{p_b^{\text{live}}}{q_b^{\text{train}}}\right)$$
+          </div>
+          <p>При $\text{PSI} &gt; 0.25$ формируется автоматический сигнал о необходимости дообучения ансамбля на новых рыночных данных.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 20: РАЗДЕЛ IV — ВЕРИФИКАЦИЯ НА ДАННЫХ СБЕРБАНК КИБ (DIVIDER)     -->
+  <!-- ===================================================================== -->
+  <section class="slide dark-slide">
+    <div style="padding: 64px; display:flex; flex-direction:column; justify-content:center; height:100%;">
+      <div style="font-size: 14px; font-weight: 700; color: var(--sber-gold); letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 16px;">
+        Раздел 04 · Промышленная верификация и бенчмарки
+      </div>
+      <h2 style="font-size: 44px; font-weight: 800; color: #FFFFFF; line-height: 1.15; margin-bottom: 20px;">
+        Сверка с продовым сервисом PricingService,<br/>профиль скорости и работа на CPU-ноутбуке
+      </h2>
+      <p style="font-size: 18px; color: #B8CEC2; max-width: 820px; line-height: 1.5;">
+        Покомпонентное сравнение на реальном дампе сообщений банка (<code>xaurub_k10_complete_const_messages.json</code>), микросекундный профиль задержки и сравнение с <code>MonteCarloWithAAD</code>.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 21: СВЕРКА НА РЕАЛЬНОМ ПРОДОВОМ ЗАПРОСЕ (K = 10 И K = 382,100)  -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Сверка с продом</span>
+        <span class="slide-title">Верификация на реальном запросе PricingService (XAU/RUB, T = 2 года)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Кейс А: Продовый дамп банка ($K = 10.0$ ₽, глубокий ITM $z = -26.4$)</div>
+          <table class="corp-table">
+            <thead>
+              <tr><th>Поле MutableMessage</th><th>Прод PricingService</th><th>DeepVol ML</th><th>Разница</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>ProductValue</code></td><td><code>355,690.379107 ₽</code></td><td><code>355,690.379107 ₽</code></td><td><span class="badge-pass">0.00 б.п.</span></td></tr>
+              <tr><td><code>Delta[XAURUB]</code></td><td><code>0.930914740423</code></td><td><code>0.930914740423</code></td><td><span class="badge-pass">0.00</span></td></tr>
+              <tr><td><code>CashDelta[XAURUB]</code></td><td><code>355,698.014861 ₽</code></td><td><code>355,698.014861 ₽</code></td><td><span class="badge-pass">0.00 ₽</span></td></tr>
+              <tr><td><code>NonAdaptedDelta</code></td><td><code>0.763575448125</code></td><td><code>0.763575448125</code></td><td><span class="badge-pass">0.00</span></td></tr>
+              <tr><td><code>Gamma</code> / <code>Vega</code></td><td><code>0.000000</code></td><td><code>0.000000</code></td><td><span class="badge-pass">0.00</span></td></tr>
+              <tr><td><code>Theta</code> (1 день)</td><td><code>+187.93 ₽/д*</code></td><td><code>+34.34 ₽/д*</code></td><td>Конвенция*</td></tr>
+            </tbody>
+          </table>
+          <p style="font-size:11.5px; color:var(--text-muted);">
+            *Разница в <code>Theta</code> вызвана только конвенцией: DeepVol считает производную $-\frac{1}{365}\partial_T V$, а старый калькулятор сдвигает дату <code>AsOfDate</code> на $T+1$ вдоль дискретной сетки узлов кривой.
+          </p>
+        </div>
+
+        <div class="card emerald">
+          <div class="card-title">Кейс Б: Тот же рынок при рыночном страйке $K = 382,100$ ₽ (ATM спот)</div>
+          <table class="corp-table">
+            <thead>
+              <tr><th>Показатель ($K = 382,100$ ₽, $z = -0.485$)</th><th>Значение DeepVol</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>ProductValue</code> (премия колла)</td><td><strong>111,379.55 ₽</strong></td></tr>
+              <tr><td>Аналитическая база $\sigma_{\beta\text{-split}}$ / Поправка ML $\hat{\varepsilon}$</td><td><code>28.9983%</code> / <code>-0.64 б.п.</code></td></tr>
+              <tr><td>Итоговая волатильность кросса $\sigma_\times(K,T)$</td><td><strong>28.9919%</strong></td></tr>
+              <tr><td><code>Delta[XAURUB]</code> / <code>NonAdaptedDelta</code></td><td><code>0.659472</code> / <code>0.540839</code></td></tr>
+              <tr><td><code>CashDelta</code> (все 3 ноги XAURUB, XAUUSD, USDRUB)</td><td><strong>251,984.42 ₽</strong></td></tr>
+              <tr><td><code>Vega</code> (Кросс / Нога 1 / Нога 2)</td><td><code>110.2k / 85.6k / 70.3k ₽</code></td></tr>
+              <tr><td>Время расчёта на 14-ядерном CPU ноутбуке</td><td><span class="badge-pass">0.31 мс</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 22: LEGACY ADAPTER (CONSTMESSAGE <-> MUTABLEMESSAGE)            -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Интеграция · Модуль M5</span>
+        <span class="slide-title">Бесшовная совместимость с графом ConstMessage ↔ MutableMessage</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Вход: Парсинг графа <code>ConstMessageGraph</code></div>
+          <ul>
+            <li>Принимает без изменений массив JSON-узлов шины банка (<code>EuropeanVanillaOptionProduct</code>, <code>BlackScholesMertonModel</code>, <code>MarketDataSet</code>, <code>DiscountFactorCurve</code>, <code>FXForwardObject</code>, <code>FXVolatilitySmileCollection</code>).</li>
+            <li>Верифицирует 40-символьные SHA-1 хэши узлов и проверяет отсутствие циклических ссылок.</li>
+            <li>Интерполирует дисконт-факторы в конвенции <code>Act/365F</code> и полную дисперсию улыбок $\sigma^2(T_m)T_m$ на дату экспирации сделки.</li>
+          </ul>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">Выход: Сериализация в <code>MutableMessage</code></div>
+          <ul>
+            <li>Формирует полный словарь <code>Result</code> со всеми требуемыми ключами: <code>ProductValue, Delta, CashDelta, NonAdaptedDelta, Gamma, CashGamma, Vega, CorrelationSensitivity, Theta, Vanna, Vomma, Rho</code>.</li>
+            <li>Матрицы <code>Vega</code>, <code>Vanna</code>, <code>Vomma</code> раскладываются в размерность $15 \times 5$ по сетке экспираций банка в порядке колонок <code>[10RR, 25RR, ATM, 25BF, 10BF]</code>.</li>
+            <li>Вектор <code>Rho</code> содержит точные чувствительности к 26 пилларам <code>RUB_RUONIA_OIS</code> и 43 пилларам <code>XAU_RUB</code>.</li>
+          </ul>
+        </div>
+      </div>
+      <pre class="code-block">graph = ConstMessageGraph(raw_messages, verify_hash=True)
+req, interest_rates, ctx = build_request(graph, root_id="1b4eef0d8162d4d520fe6bbebfed6798a4600b99")
+req.execution_options.engine = PricingEngineEnum.DIFFERENTIAL_ML
+resp = client.post("/fx_cross/price", json=req.model_dump(mode="json")).json()
+mutable_msg = to_mutable_message(TriangulatedFXOptionResponse.model_validate(resp), req, ctx, nonce="req-01", total_sec=0.0003, proc_sec=0.0003)</pre>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 23: ПОЧЕМУ ТАК БЫСТРО — МИКРОСЕКУНДНЫЙ ПРОФИЛЬ                  -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Производительность · Модуль M4</span>
+        <span class="slide-title">Как достигается время отклика 0.31 мс на CPU и 0.20 мс на GPU</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-asym">
+        <table class="corp-table">
+          <thead>
+            <tr>
+              <th>Этап расчёта одного запроса</th>
+              <th>Классическая 2D Копула + FD</th>
+              <th>Наш движок (CPU Ноутбук)</th>
+              <th>Наш движок (GPU CUDA Graph)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1. Канонизация SVI (LRU-кэш состояния)</td>
+              <td>5,000 мкс</td>
+              <td><strong>2 мкс</strong></td>
+              <td><strong>2 мкс</strong></td>
+            </tr>
+            <tr>
+              <td>2. Аналитическая база $\beta$-Split (6 шагов)</td>
+              <td>20,000 мкс (сетка $100^2$)</td>
+              <td><strong>12 мкс</strong></td>
+              <td><strong>5 мкс</strong></td>
+            </tr>
+            <tr>
+              <td>3. Ансамбль 5× MLP + Taylor Jet</td>
+              <td>—</td>
+              <td><strong>45 мкс</strong> (в L2-кэше)</td>
+              <td><strong>15 мкс</strong></td>
+            </tr>
+            <tr>
+              <td>4. Black-76 + 13 греков + 69 пилларов Rho</td>
+              <td>80,000 мкс (80 сдвигов)</td>
+              <td><strong>15 мкс</strong> (1 проход)</td>
+              <td><strong>5 мкс</strong></td>
+            </tr>
+            <tr>
+              <td>5. Валидация Pydantic + OOD Guardian</td>
+              <td>30,000 мкс</td>
+              <td><strong>236 мкс</strong></td>
+              <td><strong>173 мкс</strong></td>
+            </tr>
+            <tr style="background:#E6F5EA; font-weight:700;">
+              <td>ИТОГО (End-to-End p99)</td>
+              <td style="color:#D62D2D;">135,000 мкс (135 мс)</td>
+              <td style="color:#0D6826;">310 мкс (0.31 мс)</td>
+              <td style="color:#0D6826;">200 мкс (0.20 мс)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div style="display:flex; flex-direction:column; gap:14px;">
+          <div class="card emerald">
+            <div class="card-title">Статические буферы без GC</div>
+            <p>Входной буфер <code>_input_buf</code> формы $(1, 34)$ выделяется 1 раз при старте сервиса. Во время запроса не создаётся ни одного нового тензора.</p>
+          </div>
+          <div class="card gold">
+            <div class="card-title">Слитное матричное ядро</div>
+            <p>Все 5 сетей ансамбля вычисляются одной векторной инструкцией <code>torch.einsum</code> прямо в кэше процессора.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 23b: КОЛОНОЧНЫЙ БАТЧ-ПРАЙСИНГ И APACHE ARROW IPC                -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Пакетный режим · Модуль M4</span>
+        <span class="slide-title">Пакетная переоценка 10,000 опционов за 9.45 мс (Apache Arrow IPC)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-3">
+        <div class="card">
+          <div class="card-title">1. Колоночный формат (SoA)</div>
+          <p>В <code>POST /fx_cross/price_batch</code> до 64 рыночных состояний передаются один раз в массиве <code>states</code>, а 10,000 контрактов задаются плоскими векторами <code>strike</code>, <code>parity_sign</code>, <code>state_index</code>.</p>
+        </div>
+        <div class="card">
+          <div class="card-title">2. Zero-Copy Apache Arrow IPC</div>
+          <p>При заголовке <code>Content-Type: application/vnd.apache.arrow.stream</code> буферы <code>float64</code> отображаются в память без парсинга текстового JSON, экономя ~4 мс на сериализации.</p>
+        </div>
+        <div class="card emerald">
+          <div class="card-title">3. Бакеты графов (64, 1024, 10240)</div>
+          <p>Запросы автоматически маршрутизируются в предзахваченные бакеты $B \in \{64, 1024, 10240\}$, разделяющие единый пул видеопамяти <code>cudaGraphPool</code>.</p>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 24: СРАВНЕНИЕ С MONTECARLOWITHAAD                               -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Бенчмарк методов</span>
+        <span class="slide-title">Сравнение с методом MonteCarloWithAAD (65,536 траекторий QMC)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <!-- Визуальный бар-чарт сравнения -->
+        <div class="card" style="background:#FFFFFF; justify-content:center;">
+          <div class="card-title">Время расчёта цены и всех греков (лог-шкала)</div>
+          <svg width="520" height="230" viewBox="0 0 520 230">
+            <text x="10" y="42" font-size="12" font-weight="700" fill="#106B2E">DeepVol GPU (CUDA Graph)</text>
+            <rect x="210" y="26" width="24" height="22" rx="4" fill="#21A038"/>
+            <text x="242" y="42" font-size="12" font-weight="800" fill="#106B2E">0.20 мс (×675 быстрее)</text>
+
+            <text x="10" y="92" font-size="12" font-weight="700" fill="#0E2218">DeepVol CPU (Ноутбук 14 ядер)</text>
+            <rect x="210" y="76" width="36" height="22" rx="4" fill="#106B2E"/>
+            <text x="254" y="92" font-size="12" font-weight="800" fill="#106B2E">0.31 мс (×90 быстрее МК)</text>
+
+            <text x="10" y="142" font-size="12" font-weight="600" fill="#52665B">MonteCarloWithAAD (65k QMC)</text>
+            <rect x="210" y="126" width="175" height="22" rx="4" fill="#C59B27"/>
+            <text x="393" y="142" font-size="12" font-weight="700" fill="#9E7916">28.0 мс</text>
+
+            <text x="10" y="192" font-size="12" font-weight="600" fill="#52665B">2D Квадратура Копулы + FD</text>
+            <rect x="210" y="176" width="245" height="22" rx="4" fill="#D62D2D"/>
+            <text x="462" y="192" font-size="12" font-weight="700" fill="#D62D2D">135 мс</text>
+          </svg>
+        </div>
+
+        <div style="display:flex; flex-direction:column; gap:14px;">
+          <div class="card danger">
+            <div class="card-title">Фундаментальное ограничение MonteCarloWithAAD на Gamma</div>
+            <p>У выплаты $\max(S_T - K, 0)$ первая производная по $S_T$ является разрывной ступенькой $\mathbb{I}(S_T &gt; K)$, а <strong>вторая производная (Gamma) равна нулю на 100% траекторий</strong> (дельта-функция Дирака в точке $S_T = K$). Искусственное сглаживание выплаты в МК даёт шум <strong>1–5% на Gamma, Vanna и Vomma</strong>.</p>
+          </div>
+          <div class="card emerald">
+            <div class="card-title">Симбиоз двух методов в нашем решении</div>
+            <p>Мы используем 2D Копулу / <code>QMC + AAD</code> <strong>офлайн как учителя</strong> для генерации дифференциальных меток, а в <strong>онлайне</strong> гладкая сеть <code>SiLU</code> со струями Тейлора выдаёт ответ за <strong>0.31 мс</strong> с идеально гладкой <code>Gamma</code> (ошибка <code>0.48%</code>).</p>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 25: СВОДНАЯ ТАБЛИЦА ПРИЁМОЧНЫХ ГЕЙТОВ (31/31 PASS)              -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Аудит качества</span>
+        <span class="slide-title">Результаты независимого 17-фазного аудита (31/31 гейтов пройдено)</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <table class="corp-table">
+        <thead>
+          <tr>
+            <th>Код гейта</th>
+            <th>Проверяемый показатель</th>
+            <th>Порог спецификации</th>
+            <th>Измеренное значение</th>
+            <th>Статус</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>G1.1 / G1.2</strong></td>
+            <td>Ошибка цены кросса (MAE / RMSE / p99) на отложенной выборке <code>test</code></td>
+            <td>MAE $\le 1.50$ б.п. · p99 $\le 6.50$ б.п.</td>
+            <td><strong>0.67 б.п. MAE · 0.35 б.п. RMSE · 1.89 б.п. p99</strong></td>
+            <td><span class="badge-pass">PASS</span></td>
+          </tr>
+          <tr>
+            <td><strong>G1.3 / G1.4</strong></td>
+            <td>Точность спотовой <code>Delta</code> (MAE) и <code>Gamma</code> (относительно $\Gamma_{\text{ATM}}$)</td>
+            <td>$\Delta \le 5.0\cdot 10^{-4}$ · $\Gamma \le 1.80\%$</td>
+            <td><strong>$\Delta = 2.28\cdot 10^{-4}$ · $\Gamma = 0.48\%$</strong></td>
+            <td><span class="badge-pass">PASS</span></td>
+          </tr>
+          <tr>
+            <td><strong>G1.5a / G1.5b</strong></td>
+            <td>Точность <code>Cross Vega</code> и поножных вег <code>Leg1 / Leg2 Vega</code></td>
+            <td>$\le 0.10\%$ · $\le 1.00\%$</td>
+            <td><strong>0.064% (Cross) · 0.49% (Leg)</strong></td>
+            <td><span class="badge-pass">PASS</span></td>
+          </tr>
+          <tr>
+            <td><strong>G1.6 / G1.7</strong></td>
+            <td>Отсутствие арбитража на сетке $2.2\cdot 10^7$ точек и сохранение <code>CashDelta</code></td>
+            <td>0 нарушений · $\le 10^{-12}$</td>
+            <td><strong>0 нарушений · $2.55\cdot 10^{-16}$</strong></td>
+            <td><span class="badge-pass">PASS</span></td>
+          </tr>
+          <tr>
+            <td><strong>G2.1 – G2.4</strong></td>
+            <td>Латентность p99: одиночный запрос (GPU / CPU) и батч 10,000 контрактов</td>
+            <td>$\le 0.45$ мс · $\le 0.75$ мс · $\le 13.0$ мс</td>
+            <td><strong>0.214 мс (GPU) · 0.310 мс (CPU) · 9.45 мс (Batch)</strong></td>
+            <td><span class="badge-pass">PASS</span></td>
+          </tr>
+          <tr>
+            <td><strong>G3.1 – G3.4</strong></td>
+            <td>Стресс-матрица сингулярностей, 100% перехват OOD и $C^2$-непрерывность тейпера</td>
+            <td>0 NaN/Inf · 100% OOD · $\le 10^{-10}$</td>
+            <td><strong>0 NaN/Inf · 100.0% OOD · $< 10^{-15}$</strong></td>
+            <td><span class="badge-pass">PASS</span></td>
+          </tr>
+          <tr>
+            <td><strong>G4.1 – G4.7</strong></td>
+            <td>Покрытие ветвей критических модулей и мутационное тестирование</td>
+            <td>100% branch · $\ge 90\%$ мутаций</td>
+            <td><strong>100.0% покрытие · 90.5% мутационный скор</strong></td>
+            <td><span class="badge-pass">PASS</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 26: ЗАПУСК НА РАБОЧЕМ НОУТБУКЕ (CPU-ONLY)                       -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Развёртывание</span>
+        <span class="slide-title">Запуск на обычном рабочем ноутбуке (CPU-Only) за 1 минуту</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div style="display:flex; flex-direction:column; gap:14px;">
+          <div class="card emerald">
+            <div class="card-title">Не требует GPU, CUDA или TensorRT</div>
+            <ul>
+              <li>Все 5 обученных чекпоинтов <code>residual_vol_v3_m0..4.pt</code> и <code>model_card.json</code> весят суммарно <strong>228 КБ</strong> и включены напрямую в Git-репозиторий.</li>
+              <li>Автоматический выбор <code>device="cpu"</code> при старте сервера (время старта <strong>$&lt; 1$ секунды</strong>, потребление памяти $&lt; 250$ МБ).</li>
+              <li>Интерактивная документация OpenAPI / Swagger UI доступна по адресу <code>http://127.0.0.1:8000/docs</code>.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <div class="card-title">Подробная документация в репозитории</div>
+            <p>Файл <code>docs/fx_cross_cpu_laptop_guide.md</code> содержит полную JSON-схему с пометками <code>[optional]</code> и готовые скрипты для <code>XAU/RUB</code> и <code>USD/RUB</code>.</p>
+          </div>
+        </div>
+
+        <pre class="code-block"># 1. Создание виртуального окружения (Python 3.9 - 3.13)
+uv venv .venv --python 3.10
+source .venv/bin/activate
+
+# 2. Установка лёгкого CPU-дистрибутива PyTorch (~180 МБ)
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# 3. Установка зависимостей и пакета без GPU-библиотек
+uv pip install "numpy&lt;2.0" scipy pydantic fastapi \
+               uvicorn httpx orjson pyarrow scikit-learn
+uv pip install --no-deps -e .
+
+# 4. Запуск локального сервера PricingService
+PYTHONPATH=src uvicorn deepvol.api.server:app \
+               --host 127.0.0.1 --port 8000</pre>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 27: МАСШТАБИРОВАНИЕ НА ПРЯМЫЕ ПАРЫ, БАРЬЕРЫ И CANCELLABLE CAPS  -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Масштабирование</span>
+        <span class="slide-title">Применение архитектуры к прямым парам, барьерам и Cancellable Cap/Floor</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="lead-statement">
+        Паттерн <strong>«Точная аналитическая / PDE база в float64 + компактный Residual MLP + граничный тейпер + OOD Guardian»</strong> универсален и переносится на другие продуктовые линейки деска.
+      </div>
+      <div class="grid-3">
+        <div class="card emerald">
+          <div class="card-title">1. Прямые FX-пары (USD/RUB)</div>
+          <ul>
+            <li><strong>Статус:</strong> готово из коробки.</li>
+            <li>Прямая улыбка <code>USD/RUB</code> уже котируется рынком — триангуляция копулы не нужна.</li>
+            <li>Используются те же модули <code>SmileCanonicalizer</code> + <code>svi_vol_jet</code> + <code>black76_otm_parity</code>.</li>
+            <li>Латентность: <strong>~0.08 мс</strong> на CPU со всеми греками.</li>
+          </ul>
+        </div>
+
+        <div class="card gold">
+          <div class="card-title">2. Барьерные FX-опционы</div>
+          <ul>
+            <li><strong>Шаг 1:</strong> наш кросс-движок строит поверхность $\sigma_\times(K,T)$.</li>
+            <li><strong>Шаг 2:</strong> аналитическая база Vanna–Volga / Reiner–Rubinstein со сдвигом непрерывности $\tilde{B} = B e^{\pm 0.5826\sigma\sqrt{\Delta t}}$.</li>
+            <li><strong>Шаг 3:</strong> ансамбль MLP предсказывает разницу с LSV PDE, умноженную на тейпер $w(z_B)\to 0$ при $S\to B$.</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <div class="card-title">3. Cancellable Cap / Floor</div>
+          <ul>
+            <li><strong>Разложение по паритету:</strong> $\text{CancelCap} = \text{VanillaCap} - \text{BermudanRight}$.</li>
+            <li>Ванильный кэп считается точно по Блэку-76 (0.00 б.п.).</li>
+            <li>Право отмены считается через быструю <strong>1D Hull–White PDE</strong> (<code>~1 мс</code>) + малый MLP-остаток на SABR-перекос.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- СЛАЙД 28: ДОРОЖНАЯ КАРТА ВНЕДРЕНИЯ В PRICINGSERVICE                   -->
+  <!-- ===================================================================== -->
+  <section class="slide">
+    <div class="slide-header">
+      <div class="header-left">
+        <span class="section-tag">Заключение</span>
+        <span class="slide-title">Итоги PoC и дорожная карта внедрения в PricingService</span>
+      </div>
+      <div class="header-brand">СБЕРБАНК КИБ <span class="divider">|</span> <span class="team">PricingService</span></div>
+    </div>
+    <div class="slide-body">
+      <div class="grid-3">
+        <div class="card emerald">
+          <div class="card-title">Этап 1 · Shadow-пилот (1–2 нед.)</div>
+          <ul>
+            <li>Подключение контейнера / CPU-воркера к потоку <code>ConstMessage</code> в режиме параллельного расчёта (Shadow Pricing) на сделках <code>XAU/RUB</code>, <code>CNY/RUB</code>, <code>EUR/RUB</code>.</li>
+            <li>Сбор телеметрии расхождений и латентности на реальном боевом потоке.</li>
+          </ul>
+        </div>
+
+        <div class="card gold">
+          <div class="card-title">Этап 2 · Валидация (3–4 нед.)</div>
+          <ul>
+            <li>Добавление опционального режима расчёта <code>Theta</code> через сдвиг даты <code>AsOfDate</code> на $T+1$ для 100% совпадения с конвенцией старого сервиса.</li>
+            <li>Защита модельной карты <code>model_card.json</code> и отчёта аудита в подразделении валидации моделей.</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Этап 3 · Промышленный запуск</div>
+          <ul>
+            <li>Перевод расчёта внутридневного риска и пакетной переоценки книги ванильных кросс-опционов на новый движок.</li>
+            <li>Расширение гибридного пайплайна на барьерные FX-опционы.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card dark" style="flex-direction:row; align-items:center; justify-content:space-between; padding: 22px 32px;">
+        <div>
+          <div style="font-size: 18px; font-weight: 800; color: #FFFFFF;">Спасибо за внимание! Готов ответить на вопросы и показать живое демо на ноутбуке.</div>
+          <div style="font-size: 13.5px; color: #97CF26; margin-top: 4px;">Бирюков Никита Сергеевич · Сбербанк КИБ · Команда PricingService</div>
+        </div>
+        <div style="font-size: 13px; color: var(--sber-gold); font-weight: 700; border: 1px solid var(--sber-gold); padding: 8px 16px; border-radius: 6px;">
+          Swagger Demo: http://127.0.0.1:8000/docs
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Сбербанк КИБ · Команда PricingService · Бирюков Н.С.</span>
+      <span>Слайд</span>
+    </div>
+  </section>
+
+  <!-- Индикатор прогресса -->
+  <div class="progress-bar" id="progress-bar" style="width: 3.57%;"></div>
+</div>
+
+<!-- Панель управления презентацией -->
+<div id="nav-controls">
+  <button onclick="prevSlide()" title="Предыдущий слайд (←)">◀</button>
+  <span id="slide-counter" style="color:#FFFFFF; font-size:12px; font-weight:700; padding: 4px 8px; display:flex; align-items:center;">1 / 28</span>
+  <button onclick="nextSlide()" title="Следующий слайд (→)">▶</button>
+  <button onclick="toggleFullscreen()" title="Полный экран (F)">⛶ Полный экран</button>
+  <button onclick="window.print()" title="Сохранить в PDF (Ctrl+P)">⎙ PDF</button>
+</div>
+
+<script>
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  const totalSlides = slides.length;
+  const counterEl = document.getElementById('slide-counter');
+  const progressEl = document.getElementById('progress-bar');
+  const viewport = document.getElementById('deck-viewport');
+  let currentIdx = 0;
+
+  // Dynamic slide numbering & footer sync
+  slides.forEach((s, i) => {
+    const footSpans = s.querySelectorAll('.slide-footer span:last-child');
+    footSpans.forEach(sp => {
+      sp.textContent = `Слайд ${i + 1} из ${totalSlides}`;
+    });
+  });
+
+  function showSlide(idx) {
+    currentIdx = Math.max(0, Math.min(totalSlides - 1, idx));
+    slides.forEach((s, i) => s.classList.toggle('active', i === currentIdx));
+    counterEl.textContent = `${currentIdx + 1} / ${totalSlides}`;
+    progressEl.style.width = `${((currentIdx + 1) / totalSlides) * 100}%`;
+  }
+
+  function nextSlide() { showSlide(currentIdx + 1); }
+  function prevSlide() { showSlide(currentIdx - 1); }
+
+  function toggleFullscreen() {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen();
+    } else {
+      document.exitFullscreen();
+    }
+  }
+
+  function fitViewport() {
+    const scaleX = window.innerWidth / 1280;
+    const scaleY = window.innerHeight / 720;
+    const scale = Math.min(scaleX, scaleY) * 0.96;
+    viewport.style.transform = `scale(${scale})`;
+  }
+
+  window.addEventListener('resize', fitViewport);
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') {
+      e.preventDefault();
+      nextSlide();
+    } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+      e.preventDefault();
+      prevSlide();
+    } else if (e.key === 'Home') {
+      showSlide(0);
+    } else if (e.key === 'End') {
+      showSlide(totalSlides - 1);
+    } else if (e.key.toLowerCase() === 'f') {
+      toggleFullscreen();
+    }
+  });
+
+  fitViewport();
+  showSlide(0);
+</script>
+</body>
+</html>
