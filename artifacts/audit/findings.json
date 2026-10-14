@@ -5,7 +5,7 @@
     "phase": 9,
     "title": "Quote vs batch Greek assembly mathematical inconsistency in assemble_quote_greeks",
     "location": "src/deepvol/api/fx_cross_runtime.py:410-420",
-    "spec_ref": "§1.8, §2 Task 4.1, Phase 9 item 1",
+    "spec_ref": "\u00a71.8, \u00a72 Task 4.1, Phase 9 item 1",
     "evidence": {
       "command": "pytest tests/audit/test_runtime_audit.py -k test_F001",
       "output_path": "artifacts/audit/out/F001.txt",
@@ -17,7 +17,9 @@
     "impact": "Single quotes served to trading desks have incorrect risk sensitivities and theta carry decays, breaking Greek parity between single-quote and batch endpoints.",
     "recommendation": "Include the smile sensitivity chain rule and theta calendar roll term in assemble_quote_greeks to match batch GPU evaluation.",
     "proposed_patch": "artifacts/audit/patches/F001.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "acf4b83",
+    "verification_result": "PASS"
   },
   {
     "id": "F002",
@@ -25,7 +27,7 @@
     "phase": 9,
     "title": "Unsynchronized static buffer data race in CPUQuotePath during concurrent CPU fallback",
     "location": "src/deepvol/api/fx_cross_runtime.py:223, 241-248",
-    "spec_ref": "§2 Task 4.1, Phase 9 item 2",
+    "spec_ref": "\u00a72 Task 4.1, Phase 9 item 2",
     "evidence": {
       "command": "pytest tests/audit/test_runtime_audit.py -k test_F002",
       "output_path": "artifacts/audit/out/F002.txt",
@@ -37,7 +39,9 @@
     "impact": "Concurrent CPU fallback requests yield completely corrupted derivative prices and risk numbers, posing extreme market risk.",
     "recommendation": "Protect self._input_buf_np mutation and evaluation in CPUQuotePath.price_single with a thread lock (threading.Lock).",
     "proposed_patch": "artifacts/audit/patches/F002.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "a00bd29",
+    "verification_result": "PASS"
   },
   {
     "id": "F003",
@@ -45,7 +49,7 @@
     "phase": 9,
     "title": "FXCrossGPUExecutor cannot be restarted after stop() lifecycle call",
     "location": "src/deepvol/api/fx_cross_runtime.py:601-629",
-    "spec_ref": "§2 Task 4.1, Phase 9",
+    "spec_ref": "\u00a72 Task 4.1, Phase 9",
     "evidence": {
       "command": "pytest tests/audit/test_runtime_audit.py -k test_F003",
       "output_path": "artifacts/audit/out/F003.txt",
@@ -57,7 +61,9 @@
     "impact": "Executor restart during service lifecycle events (e.g. dynamic weights reload or worker pool recycle) leads to unrecoverable service degradation.",
     "recommendation": "Recreate self._cpu_fallback_pool in FXCrossGPUExecutor.start() if it is None or shut down.",
     "proposed_patch": "artifacts/audit/patches/F003.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "c624864",
+    "verification_result": "PASS"
   },
   {
     "id": "F004",
@@ -65,7 +71,7 @@
     "phase": 9,
     "title": "CUDA warmup and graph capture executed directly on asyncio event loop thread",
     "location": "src/deepvol/api/server.py:2210",
-    "spec_ref": "§2 Task 4.2, Phase 9 item 4",
+    "spec_ref": "\u00a72 Task 4.2, Phase 9 item 4",
     "evidence": {
       "command": "pytest tests/audit/test_runtime_audit.py -k test_F004",
       "output_path": "artifacts/audit/out/F004.txt",
@@ -77,7 +83,9 @@
     "impact": "HTTP server event loop is stalled during model reloads, causing severe latency spikes and connection timeouts for incoming HTTP requests.",
     "recommendation": "Wrap warmup_and_capture in loop.run_in_executor(None, state['runtime'].warmup_and_capture).",
     "proposed_patch": "artifacts/audit/patches/F004.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "9a9c904",
+    "verification_result": "PASS"
   },
   {
     "id": "F005",
@@ -85,7 +93,7 @@
     "phase": 9,
     "title": "Model version remains stale in server state after dynamic weights reload",
     "location": "src/deepvol/api/server.py:2204-2211",
-    "spec_ref": "§2 Task 4.2, Phase 9 item 5",
+    "spec_ref": "\u00a72 Task 4.2, Phase 9 item 5",
     "evidence": {
       "command": "pytest tests/audit/test_runtime_audit.py -k test_F005",
       "output_path": "artifacts/audit/out/F005.txt",
@@ -97,7 +105,9 @@
     "impact": "Telemetry and health responses continue reporting the pre-reload model version, breaking model provenance and regulatory traceability.",
     "recommendation": "Update state['model_version'] using the reloaded weights checkpoint metadata or filename stem.",
     "proposed_patch": "artifacts/audit/patches/F005.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "5ccb5ed",
+    "verification_result": "PASS"
   },
   {
     "id": "F006",
@@ -105,7 +115,7 @@
     "phase": 9,
     "title": "Health endpoint hardcodes status ok and fails to report degraded on CPU fallback",
     "location": "src/deepvol/api/server.py:2222-2231",
-    "spec_ref": "§2 Task 4.2, Phase 9 item 6",
+    "spec_ref": "\u00a72 Task 4.2, Phase 9 item 6",
     "evidence": {
       "command": "pytest tests/audit/test_runtime_audit.py -k test_F006",
       "output_path": "artifacts/audit/out/F006.txt",
@@ -117,7 +127,9 @@
     "impact": "Kubernetes / orchestrator health checks cannot detect when GPU acceleration has failed and nodes are degraded.",
     "recommendation": "Inspect state['device'] and runtime.graphs_captured; return status degraded if device is CPU or graphs are uncaptured.",
     "proposed_patch": "artifacts/audit/patches/F006.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "a10557e",
+    "verification_result": "PASS"
   },
   {
     "id": "F007",
@@ -125,7 +137,7 @@
     "phase": 9,
     "title": "Corrupted NaN network weights bypass Guardian routing checks and propagate to clients",
     "location": "src/deepvol/mrm/fx_cross_guardian.py:440-495",
-    "spec_ref": "§2 Task 4.3, Phase 9, Phase 12",
+    "spec_ref": "\u00a72 Task 4.3, Phase 9, Phase 12",
     "evidence": {
       "command": "pytest tests/audit/test_runtime_audit.py -k test_F007",
       "output_path": "artifacts/audit/out/F007.txt",
@@ -137,7 +149,9 @@
     "impact": "Model corruption results in invalid NaN quotes served to trading desks without triggering safety fallbacks.",
     "recommendation": "Add parameter validation in Guardian to verify that network weights contain zero NaN or Inf values, routing to fallback if detected.",
     "proposed_patch": "artifacts/audit/patches/F007.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "c577912",
+    "verification_result": "PASS"
   },
   {
     "id": "F008",
@@ -145,7 +159,7 @@
     "phase": 9,
     "title": "Queue depth busy GPU worker blindspot causes single quotes to queue behind saturated GPU",
     "location": "src/deepvol/api/fx_cross_runtime.py:657",
-    "spec_ref": "§2 Task 4.1, Phase 9",
+    "spec_ref": "\u00a72 Task 4.1, Phase 9",
     "evidence": {
       "command": "pytest tests/audit/test_runtime_audit.py -k test_F008",
       "output_path": "artifacts/audit/out/F008.txt",
@@ -157,7 +171,9 @@
     "impact": "Single-quote latency spikes under heavy batch workloads, violating the low-latency SLA.",
     "recommendation": "Track GPU worker busy state with an active flag; trigger CPU fallback if queue_depth > 0 or worker is actively executing.",
     "proposed_patch": "artifacts/audit/patches/F008.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "68ef582",
+    "verification_result": "PASS"
   },
   {
     "id": "F009",
@@ -165,7 +181,7 @@
     "phase": 10,
     "title": "Single option pricing endpoint catches and swallows SMILE_ARBITRAGE errors with synthetic flat smile",
     "location": "src/deepvol/api/server.py:2290, 2334",
-    "spec_ref": "§1.5, §1.9, Phase 4, Phase 10",
+    "spec_ref": "\u00a71.5, \u00a71.9, Phase 4, Phase 10",
     "evidence": {
       "command": "pytest tests/audit/test_api_audit.py -k test_F004",
       "output_path": "artifacts/audit/out/F009.txt",
@@ -177,7 +193,9 @@
     "impact": "Severe financial soundness breach: arbitrageable, physically impossible market quotes are quoted and priced rather than rejected, exposing trading desks to severe arbitrage losses.",
     "recommendation": "Propagate canonicalization ValueError as HTTP 422 with SMILE_ARBITRAGE detail rather than masking it behind a synthetic flat smile.",
     "proposed_patch": "artifacts/audit/patches/F009.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "be3a944",
+    "verification_result": "PASS"
   },
   {
     "id": "F010",
@@ -185,7 +203,7 @@
     "phase": 16,
     "title": "Insecure torch.load checkpoint deserialization without weights_only=True",
     "location": "src/deepvol/api/server.py:2208, src/deepvol/mrm/fx_cross_guardian.py:162, src/deepvol/training/train_cross_surrogate.py:507, 1032, 1040",
-    "spec_ref": "§1.7, §2 Task 4.2, Phase 2, Phase 6.7, Phase 16.2",
+    "spec_ref": "\u00a71.7, \u00a72 Task 4.2, Phase 2, Phase 6.7, Phase 16.2",
     "evidence": {
       "command": "pytest tests/audit/test_ml_integrity.py -k test_F010",
       "output_path": "artifacts/audit/out/F010.txt",
@@ -197,7 +215,9 @@
     "impact": "Remote code execution vulnerability (Bandit B614) via crafted pickle payload injected into model weights or OOD checkpoints.",
     "recommendation": "Add weights_only=True to all torch.load calls across server.py, fx_cross_guardian.py, and train_cross_surrogate.py.",
     "proposed_patch": "artifacts/audit/patches/F010.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "2b6cff0",
+    "verification_result": "PASS"
   },
   {
     "id": "F011",
@@ -205,7 +225,7 @@
     "phase": 6,
     "title": "Runtime crash in reload_fx_cross_weights on official checkpoint dictionary",
     "location": "src/deepvol/api/server.py:2208-2209",
-    "spec_ref": "§2 Task 4.2, Phase 6.7",
+    "spec_ref": "\u00a72 Task 4.2, Phase 6.7",
     "evidence": {
       "command": "pytest tests/audit/test_ml_integrity.py -k test_F011",
       "output_path": "artifacts/audit/out/F011.txt",
@@ -217,7 +237,9 @@
     "impact": "Dynamic weight reloading in production crashes unconditionally on official release checkpoints.",
     "recommendation": "Unpack new_state['state_dict'], update engine feature normalization buffers, and update model_version in reload_fx_cross_weights.",
     "proposed_patch": "artifacts/audit/patches/F011.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "11f7cfb",
+    "verification_result": "PASS"
   },
   {
     "id": "F012",
@@ -225,7 +247,7 @@
     "phase": 12,
     "title": "Omission of Federal Reserve SR 11-7 structured compliance audit logging on fallback and OOD activations",
     "location": "src/deepvol/api/server.py:2385-2417, src/deepvol/mrm/fx_cross_guardian.py:414-507",
-    "spec_ref": "§2 Task 4.3, Phase 12.5",
+    "spec_ref": "\u00a72 Task 4.3, Phase 12.5",
     "evidence": {
       "command": "pytest tests/audit/test_mrm_audit.py -k test_F012",
       "output_path": "artifacts/audit/out/F012.txt",
@@ -237,7 +259,9 @@
     "impact": "Non-compliance with Federal Reserve SR 11-7 model risk management standards; inability to reconstruct fallback triggers during regulatory audits.",
     "recommendation": "Add structured logging in Guardian and server.py recording request_id, fallback_reason, and model_version on every fallback activation.",
     "proposed_patch": "artifacts/audit/patches/F012.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "90db7f8",
+    "verification_result": "PASS"
   },
   {
     "id": "F013",
@@ -245,7 +269,7 @@
     "phase": 12,
     "title": "FXCrossGuardian MarketStateDriftMonitor is detached from central mrm.compliance framework",
     "location": "src/deepvol/mrm/fx_cross_guardian.py:242-317, src/deepvol/mrm/compliance.py",
-    "spec_ref": "§2 Task 4.3, Phase 12.3",
+    "spec_ref": "\u00a72 Task 4.3, Phase 12.3",
     "evidence": {
       "command": "pytest tests/audit/test_mrm_audit.py -k test_F013",
       "output_path": "artifacts/audit/out/F013.txt",
@@ -257,7 +281,9 @@
     "impact": "Central risk compliance dashboards are blind to FX cross feature drift and PSI alerts.",
     "recommendation": "Subclass compliance.DriftMonitor in MarketStateDriftMonitor, define FEATURE_NAMES_12D in compliance.py, and connect drift alerting.",
     "proposed_patch": "artifacts/audit/patches/F013.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "ed02007",
+    "verification_result": "PASS"
   },
   {
     "id": "F014",
@@ -265,7 +291,7 @@
     "phase": 12,
     "title": "Model version mismatch between server.py telemetry and official model_card.json",
     "location": "src/deepvol/api/server.py:2147",
-    "spec_ref": "§2 Task 4.3, Phase 12.4",
+    "spec_ref": "\u00a72 Task 4.3, Phase 12.4",
     "evidence": {
       "command": "pytest tests/audit/test_mrm_audit.py -k test_F014",
       "output_path": "artifacts/audit/out/F014.txt",
@@ -277,7 +303,9 @@
     "impact": "Telemetry logs record an untracked, conflicting model version hash, corrupting audit trails.",
     "recommendation": "Synchronize server.py default model_version to 1326b33ce012+afc6d3f.",
     "proposed_patch": "artifacts/audit/patches/F014.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "cb4d96a",
+    "verification_result": "PASS"
   },
   {
     "id": "F015",
@@ -285,7 +313,7 @@
     "phase": 10,
     "title": "Batch pricing endpoint missing HTTP content negotiation (415 on Content-Type and 406 on Accept)",
     "location": "src/deepvol/api/server.py:2499, 2689",
-    "spec_ref": "§1.10.2, Phase 10 item 3",
+    "spec_ref": "\u00a71.10.2, Phase 10 item 3",
     "evidence": {
       "command": "pytest tests/audit/test_api_audit.py -k test_F002",
       "output_path": "artifacts/audit/out/F015.txt",
@@ -297,7 +325,9 @@
     "impact": "Contract violation with external trading gateways; clients requesting binary Arrow IPC with invalid Accept headers or sending unexpected MIME types receive unexpected payloads.",
     "recommendation": "Validate Content-Type and Accept headers against allowed set and raise HTTP 415 / 406 accordingly.",
     "proposed_patch": "artifacts/audit/patches/F015.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "9dcb1d9",
+    "verification_result": "PASS"
   },
   {
     "id": "F016",
@@ -317,7 +347,9 @@
     "impact": "OOM crash risk and memory exhaustion denial-of-service vector under high-concurrency or malicious oversized streaming uploads.",
     "recommendation": "Enforce 50MB payload limit check on Content-Length header and request body, raising HTTP 413 if exceeded.",
     "proposed_patch": "artifacts/audit/patches/F016.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "b489ed8",
+    "verification_result": "PASS"
   },
   {
     "id": "F017",
@@ -325,7 +357,7 @@
     "phase": 11,
     "title": "Developer test suite loosened Gate G2.6 heartbeat jitter batch size and latency SLA",
     "location": "tests/test_api_fx_cross.py:793, 814, 831",
-    "spec_ref": "§4.3 Gate G2.6",
+    "spec_ref": "\u00a74.3 Gate G2.6",
     "evidence": {
       "command": "pytest tests/test_api_fx_cross.py -k test_websocket_heartbeat_jitter",
       "output_path": "artifacts/audit/out/F017.txt",
@@ -337,7 +369,9 @@
     "impact": "Masks SLA breach under true 10k institutional batch load.",
     "recommendation": "Restore test suite to 10k contracts and enforce strict < 2.0 ms jitter threshold.",
     "proposed_patch": null,
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "8cbd0af",
+    "verification_result": "PASS"
   },
   {
     "id": "F018",
@@ -357,6 +391,108 @@
     "impact": "Documentation delivery gap; deviation tracking is absent from git version control.",
     "recommendation": "Add !artifacts/reports/spec_deviations.md to .gitignore whitelist and commit the document.",
     "proposed_patch": "artifacts/audit/patches/F018.diff",
-    "status": "open"
+    "status": "fixed",
+    "fix_commit": "76a88cf",
+    "verification_result": "PASS"
+  },
+  {
+    "id": "F_TEST_01",
+    "severity": "S1",
+    "phase": 14,
+    "title": "Zero-tolerance modules coverage shortfall (< 100% line and branch coverage)",
+    "location": "src/deepvol/api/schemas_fx_cross.py, src/deepvol/models/fx_cross_safeguards.py, src/deepvol/mrm/fx_cross_guardian.py",
+    "spec_ref": "Phase 14 Zero-Tolerance Coverage Mandate",
+    "evidence": {
+      "command": "coverage report",
+      "commit": "04b99d8"
+    },
+    "reproduction_test": "tests/test_coverage_fx_cross_zero_tolerance.py",
+    "expected": "100% line and 100% branch coverage across all three zero-tolerance modules.",
+    "actual": "Pre-remediation coverage shortfalls identified in coverage_report.md.",
+    "impact": "Uncovered branches in safeguards, schemas, and guardian.",
+    "recommendation": "Implement exhaustive test suite covering all remaining branches.",
+    "status": "fixed",
+    "fix_commit": "04b99d8",
+    "verification_result": "PASS"
+  },
+  {
+    "id": "F_TEST_02",
+    "severity": "S2",
+    "phase": 14,
+    "title": "PyTorch autograd detect_anomaly state leakage across test cases",
+    "location": "tests/audit/test_edge_matrix.py",
+    "spec_ref": "Phase 14 Test Suite Isolation",
+    "evidence": {
+      "command": "pytest tests/audit/test_edge_matrix.py",
+      "commit": "e0e2fe3"
+    },
+    "reproduction_test": "tests/audit/test_edge_matrix.py",
+    "expected": "Anomaly detection enabled only within isolated context managers or cleaned up in finally blocks.",
+    "actual": "Global set_detect_anomaly(True) leaked across tests, adding runtime overhead and side-effects.",
+    "impact": "Test suite state leakage and performance degradation.",
+    "recommendation": "Wrap anomaly detection calls in context managers and restore prior state.",
+    "status": "fixed",
+    "fix_commit": "e0e2fe3",
+    "verification_result": "PASS"
+  },
+  {
+    "id": "F_TEST_03",
+    "severity": "S2",
+    "phase": 14,
+    "title": "Missing boundary condition assertions for extreme market states",
+    "location": "tests/test_coverage_fx_cross_zero_tolerance.py",
+    "spec_ref": "Phase 14 Edge Case Verification",
+    "evidence": {
+      "command": "pytest tests/test_coverage_fx_cross_zero_tolerance.py",
+      "commit": "04b99d8"
+    },
+    "reproduction_test": "tests/test_coverage_fx_cross_zero_tolerance.py",
+    "expected": "Strict assertion of boundaries and zero-tolerance paths.",
+    "actual": "Edge case testing expanded to cover full zero-tolerance surface.",
+    "impact": "Incomplete boundary verification.",
+    "recommendation": "Add comprehensive boundary parameter fixtures and property tests.",
+    "status": "fixed",
+    "fix_commit": "04b99d8",
+    "verification_result": "PASS"
+  },
+  {
+    "id": "F_TEST_04",
+    "severity": "S2",
+    "phase": 14,
+    "title": "Cross-engine Greek parity oracle tests",
+    "location": "tests/audit/test_math_oracles.py",
+    "spec_ref": "Phase 14 Greek Parity Mandate",
+    "evidence": {
+      "command": "pytest tests/audit/test_math_oracles.py",
+      "commit": "1255848"
+    },
+    "reproduction_test": "tests/audit/test_math_oracles.py",
+    "expected": "Exact mathematical oracle assertions across all Greek sensitivities.",
+    "actual": "Parity verified against closed-form Garman-Kohlhagen and copula oracles.",
+    "impact": "Assurance of Greek fidelity across pricing backends.",
+    "recommendation": "Implement independent clean-room mathematical oracles in test suite.",
+    "status": "fixed",
+    "fix_commit": "1255848",
+    "verification_result": "PASS"
+  },
+  {
+    "id": "F_TEST_05",
+    "severity": "S2",
+    "phase": 14,
+    "title": "Tautological isfinite() assertions masking numerical calculation errors",
+    "location": "tests/test_fx_cross_analytic.py:80-94, 434-439",
+    "spec_ref": "Phase 14 Test Quality Mandate",
+    "evidence": {
+      "command": "pytest tests/audit/test_math_oracles.py",
+      "commit": "1255848"
+    },
+    "reproduction_test": "tests/audit/test_math_oracles.py::test_analytic_triangulated_exact_oracle_parity",
+    "expected": "Strict assertion against closed-form numerical oracles; rejection of tautological assert isfinite().",
+    "actual": "Test cases asserted merely torch.isfinite() without validating numerical values or sign correctness.",
+    "impact": "Defects in sensitivity calculations went undetected because tests passed as long as output was finite.",
+    "recommendation": "Replace tautological assertions with exact analytical oracles and symmetry invariants.",
+    "status": "fixed",
+    "fix_commit": "1255848",
+    "verification_result": "PASS"
   }
 ]
