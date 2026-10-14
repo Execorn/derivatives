@@ -6,21 +6,22 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Next.js](https://img.shields.io/badge/Next.js-16+-black?style=for-the-badge&logo=next.js&logoColor=white)](https://nextjs.org/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://streamlit.io/)
-[![Tests](https://img.shields.io/badge/tests-1126%20passed-brightgreen?style=for-the-badge)](tests/)
+[![Tests](https://img.shields.io/badge/tests-1550%2B%20passed-brightgreen?style=for-the-badge)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
 > **Master's Thesis Project** — МФТИ ФПМИ, Кафедра БИТ, 2026
 > *Нейронные сети в ценообразовании производных финансовых инструментов*
 
 An end-to-end GPU-accelerated quantitative platform for **real-time calibration**,
-**deep hedging**, and **structured derivatives pricing** under rough stochastic volatility
-(El Euch, Gatheral & Rosenbaum 2019) and multi-asset jump dynamics.
+**deep hedging**, and **structured & cross-asset derivatives pricing** under rough stochastic volatility
+(El Euch, Gatheral & Rosenbaum 2019), multi-asset jump dynamics, and triangulated FX/commodity smiles.
 
 The system combines:
 1. **FiLM-conditioned Fourier Neural Operators (FNO)** pricing full 8×11 implied-volatility surfaces in under 1 ms.
 2. **SOTA Multi-Fidelity Autocallable Engines**: Crank-Nicolson Gatheral PDE base combined with a 5-member residual `CorrectionEnsemble` MLP delivering 0.99 bps accuracy with epistemic uncertainty estimation and SR 26-2 compliant model governance.
-3. **End-to-End Differentiable Risk & Deep Hedging**: PIVOT implied volatility solver, recurrent LSTM/GRU hedging policies under market frictions, and automated model risk fallback routing.
-4. **Full-Stack Institutional Delivery**: High-throughput FastAPI REST & WebSocket streaming services, Next.js 16+ Turbopack interface with interactive WebGL 3D surfaces, and multi-page Streamlit research dashboards.
+3. **Triangulated FX/Commodity Cross ML Pricing Engine (`SPEC-DEEPVOL-FX-CROSS-003`)**: $\beta$-split H1 analytical triangulation paired with a 5-member Sobolev DML residual MLP, 2nd-order exact Taylor jets ($s_k, s_{kk}$), CUDA-graph execution ($0.196\text{ ms}$ single-quote full Greeks), and Apache Arrow IPC zero-copy batch streaming ($9.45\text{ ms}$ for 10,000 contracts).
+4. **End-to-End Differentiable Risk & Deep Hedging**: PIVOT implied volatility solver, recurrent LSTM/GRU hedging policies under market frictions, and automated model risk fallback routing.
+5. **Full-Stack Institutional Delivery**: High-throughput FastAPI REST, Arrow IPC & WebSocket streaming services, Next.js 16+ Turbopack interface with interactive WebGL 3D surfaces, and multi-page Streamlit research dashboards.
 
 ---
 
@@ -55,6 +56,9 @@ The system combines:
 | Autocall Sobol-Brownian Bridge QMC | **< 12 ms** (50,000 paths, 252 steps, Milstein) |
 | Worst-Of (WoF) Basket Autocalls (EGNO) | **1.87 bps RMSE**, exact permutation equivariance |
 | Phoenix Memory Coupon Autocalls | **1.35 bps RMSE**, multi-barrier conditional payout |
+| FX/Commodity Cross ML Surrogate (P19) | **0.67 bp Price MAE (0.895 bp stress)**, 5-member Sobolev DML + $\beta$-split H1 |
+| FX/Commodity Cross Full-Greeks Latency | **0.196 ms p50 / 0.214 ms p99** (GPU single quote), **9.45 ms p99** (10k Arrow batch) |
+| FX/Commodity Cross Arbitrage Audit | **0 violations** across 200,000 valuations ($100\times 100$ grid $\times$ 20 families) |
 
 ---
 
@@ -139,7 +143,7 @@ $10^6$. We apply a **reparameterization** $(v_0, \zeta, \lambda)$ reducing it by
 
 ## DeepVol Model Zoo
 
-The DeepVol framework contains a diverse "Zoo" of 16 volatility and derivatives models, implemented with high-performance CPU/GPU solvers and integrated with real-time calibration:
+The DeepVol framework contains a diverse "Zoo" of 17 volatility and derivatives models, implemented with high-performance CPU/GPU solvers and integrated with real-time calibration:
 
 1. **Classic Heston Model**: Traditional stochastic volatility model where variance follows a Cox-Ingersoll-Ross (CIR) process. Option pricing is performed using the exact Fourier-COS series expansion method.
 2. **SABR Model (Hagan/Displaced)**: Industry-standard smile model for FX and interest rates. Supports normal (Bachelier) and lognormal (Black) implied volatility via Hagan (2002) asymptotic expansions with displacement shifts.
@@ -157,6 +161,7 @@ The DeepVol framework contains a diverse "Zoo" of 16 volatility and derivatives 
 14. **Autocallable Structured Notes (Multi-Fidelity PDE + Ensemble MLP)**: Crank-Nicolson Gatheral PDE base solver combined with a 5-member residual `CorrectionEnsemble` MLP in 19-dimensional barrier-aware feature space, delivering sub-basis-point accuracy (0.99 bps RMSE) with epistemic uncertainty estimation and SR 26-2 model governance.
 15. **Phoenix Memory Coupon Autocallables**: Structured notes with conditional memory coupons, knock-out barriers, and European/American protection barriers, accelerated via specialized residual MLP surrogates.
 16. **Worst-Of (WoF) Basket Autocallables (EGNO)**: High-dimensional multi-asset basket notes priced via Equivariant Graph Neural Operators (EGNO) enforcing exact permutation equivariance across underlying assets with spectral PSD projection.
+17. **Triangulated FX/Commodity Cross ML Engine ($\beta$-Split H1 + Sobolev DML Ensemble + Taylor Jets)**: Prices European options and full smile-inclusive Greeks on synthetic crosses $S^\times = S_1 S_2$ (e.g., XAU/RUB = XAU/USD $\times$ USD/RUB) using a 6-step $\beta$-split H1 analytical base, a 5-member $13\to 64^3\to 1$ SiLU residual ensemble trained via Differential Machine Learning (DML) against a 1601-node Gaussian copula teacher under $\mathbb{Q}^B$, exact 2nd-order Taylor jet propagation ($s_k, s_{kk}$), $C^2$ quintic wing tapering, and SR 11-7 / SR 26-2 Mahalanobis OOD routing.
 
 ---
 
@@ -720,6 +725,9 @@ uvicorn deepvol.api.server:app --reload --port 8000 --app-dir src
 | `POST` | `/hedge/simulate` | Recurrent Deep Hedging delta-hedging trajectory simulation |
 | `POST` | `/autocall/price` | Autocall pricing via Crank-Nicolson PDE base + 5-member residual ensemble with SR 26-2 guardian routing |
 | `POST` | `/autocall/price_batch` | Vectorized batch autocall pricing (up to 100 contracts per payload) |
+| `POST` | `/fx_cross/price` | Triangulated FX/Commodity cross single-option pricing + full smile-inclusive Greeks (CUDA graph B=2 / CPU fallback) |
+| `POST` | `/fx_cross/price_batch` | Columnar batch FX/Commodity cross pricing (up to 10,000 contracts & 64 market states; JSON or Apache Arrow IPC) |
+| `GET` | `/fx_cross/health` | FX/Commodity cross engine readiness, CUDA graph capture state, active `model_version`, and degraded status |
 | `WS` | `/ws/risk` | Streaming WebSocket risk telemetry with `ConflatedQueue` backpressure control |
 
 ### Example: POST /autocall/price
@@ -838,6 +846,13 @@ pytest tests/test_autocall_guardian.py              -v  # SR 26-2 OOD gating and
 pytest tests/test_api_autocall.py                   -v  # Autocall REST and batch endpoints
 pytest tests/test_wof_autocall.py                   -v  # Worst-of basket autocalls
 
+# Triangulated FX/Commodity cross engine & forensic audit suite
+pytest tests/test_fx_cross_analytic.py              -v  # Beta-split H1 triangulation & closed-form Greeks
+pytest tests/test_taylor_jets.py                    -v  # 2nd-order exact Taylor jet propagation
+pytest tests/test_fx_cross_surrogate.py             -v  # 5-member Sobolev DML residual ensemble
+pytest tests/test_api_fx_cross.py                   -v  # FastAPI JSON & Apache Arrow IPC endpoints
+pytest tests/audit/ -m audit                        -v  # 141-test clean-room forensic audit suite
+
 # High-throughput API and streaming
 pytest tests/test_api.py                            -v  # FastAPI REST endpoints
 pytest tests/test_websocket_server.py               -v  # WebSocket risk telemetry & conflation
@@ -861,6 +876,7 @@ pytest tests/test_grey_bergomi.py                   -v  # Generalized grey Brown
 | Autocalls | Correction Ensemble | `artifacts/weights/autocall_correction_mlp_member_{0..4}.pth` | 2.1M ea. | RMSE 0.99 bps | 5-member residual MLP ensemble |
 | Autocalls | Phoenix MLP | `artifacts/weights/phoenix_mlp_best.pth` | 3.2M | RMSE 1.35 bps | Memory coupon structured notes |
 | Autocalls | WoF EGNO | `artifacts/weights/wof_mlp_best.pth` | 1.6M | RMSE 1.87 bps | Worst-of basket autocalls |
+| FX Cross | ResidualCrossVolEnsemble | `artifacts/fx_cross/checkpoints/member_{0..4}.pt` | 9.2K ea. | MAE 0.67 bps | 5-member Sobolev DML residual cross vol ensemble |
 | Hedging | Deep Hedger | `artifacts/weights/deep_hedger_{european,barrier}_prod.pth` | 94K ea. | P&L std 0.43 | Recurrent LSTM policy networks |
 | Markets | Minimax GAN | `artifacts/weights/minimax_policy_prod.pth` | 92K | Error 3e-4 | Adversarial stylized facts generator |
 
@@ -888,22 +904,24 @@ derivatives/
 ├── src/                              Core Python library
 │   └── deepvol/
 │       ├── surrogates/               FiLM-FNO, CorrectionEnsemble, EGNO, Signature SDE
-│       ├── models/                   Stochastic vol models (Heston, SABR, rBergomi, gRB, Autocalls)
+│       ├── models/                   Stochastic vol & cross models (Heston, SABR, rBergomi, gRB, Autocalls, FX Cross)
 │       ├── calibration/              Gauss-Newton, Joint SPX+VIX, and MLSV particle calibrators
-│       ├── market/                   Data feeds (SPX chain cleaning, Deribit WebSocket)
+│       ├── market/                   Data feeds, FX delta/SVI conventions, and legacy DAG adapters
 │       ├── arbitrage/                SVI and no-arbitrage surface projection
 │       ├── greeks/                   GPU Greeks and Greek P&L attribution
 │       ├── hedging/                  Deep hedging, frictional trading envs, D-XVA loss
-│       ├── mrm/                      Model Risk Guardian (SR 26-2) and analytical fallbacks
-│       ├── api/                      FastAPI REST server and ConflatedQueue WebSocket
+│       ├── mrm/                      Model Risk Guardians (SR 11-7 / SR 26-2) and analytical fallbacks
+│       ├── api/                      FastAPI REST server, Arrow IPC codec, CUDA-graph runtime, WebSocket
 │       ├── app/                      Streamlit research hub (app_main.py) and 14 specialized pages
 │       └── deploy/                   TensorRT compilation and ONNX export
 │
-├── tests/                            pytest suite (1126 passed tests across 102 test modules)
+├── tests/                            pytest suite (unit, adversarial, and tests/audit/ clean-room suite)
 ├── notebooks/                        44 Jupyter notebooks covering theory and experiments
 ├── benchmarks/                       Performance benchmarks and latency profiling
 ├── artifacts/
 │   ├── weights/                      Production neural network weights (.pth)
+│   ├── fx_cross/                     FX Cross ensemble checkpoints, model card, and OOD statistics
+│   ├── audit/                        Forensic audit report, Wolfram/BrainyCalc logs, oracles, and patches
 │   ├── models/                       FNO parameter and surface normalizers (.npz)
 │   └── scalers/                      Autocall contract normalizers and calibration JSON
 ├── data/                             Dataset caches and quotes (gitignored)
@@ -964,6 +982,7 @@ pdflatex -interaction=nonstopmode main.tex
 | **P16**: Grey Rough Bergomi | Complete | C++/CUDA gRB path simulator, Mittag-Leffler CUDA kernel, uncertainty-guided active learning, Sobolev FNO |
 | **P17**: Autocall QMC Pipeline | Complete | Sobol-Brownian Bridge QMC path simulation, Milstein stepping, barrier monitoring, Phoenix coupons, Worst-of EGNO |
 | **P18 / Phase D**: Multi-Fidelity Ensemble | Complete | Crank-Nicolson Gatheral PDE base + 5-member residual MLP ensemble (0.99 bps RMSE), epistemic uncertainty ($\tau_{\text{OOD}} = 2.17$), SR 26-2 AutocallGuardian, Next.js 16+ & FastAPI UI integration |
+| **P19**: Triangulated FX/Commodity Cross ML Engine | Complete | $\beta$-split H1 analytic engine + 5-member Sobolev DML residual MLP (0.67 bp MAE), 2nd-order Taylor jets, CUDA-graph runtime ($0.196\text{ ms}$ p50), Apache Arrow IPC batch streaming ($9.45\text{ ms}$ @ 10k), legacy DAG adapter, and full 17-phase forensic audit certification |
 
 
 ---
