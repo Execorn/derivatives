@@ -600,6 +600,7 @@ async def test_F004_reload_weights_device_work_on_event_loop() -> None:
 
     invoked_thread = []
     original_warmup = state["runtime"].warmup_and_capture
+    original_model_version = state.get("model_version")
 
     def hook_warmup() -> None:
         invoked_thread.append(threading.get_ident())
@@ -619,6 +620,8 @@ async def test_F004_reload_weights_device_work_on_event_loop() -> None:
         )
     finally:
         state["runtime"].warmup_and_capture = original_warmup
+        if original_model_version is not None:
+            state["model_version"] = original_model_version
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
@@ -651,6 +654,7 @@ async def test_F005_reload_weights_missing_model_version_update() -> None:
             f"F005 VIOLATION: reload_fx_cross_weights did not update model_version (remained {old_version})"
         )
     finally:
+        state["model_version"] = old_version
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 

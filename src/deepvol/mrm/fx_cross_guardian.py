@@ -445,12 +445,13 @@ class FXCrossGuardian(ModelRiskGuardian):
 
         has_nan_weights = False
         models_to_check: List[Any] = []
-        if getattr(self, "model", None) is not None:
-            models_to_check.append(self.model)
+        m_attr = getattr(self, "model", None)
+        if m_attr is not None:
+            models_to_check.append(m_attr)
         try:
             from deepvol.models.fx_cross_surrogate import ResidualCrossVolNet
 
-            models_to_check.extend(list(ResidualCrossVolNet._instances))
+            models_to_check.extend(list(getattr(ResidualCrossVolNet, "_instances", set())))
         except Exception:
             pass
         for m_obj in models_to_check:

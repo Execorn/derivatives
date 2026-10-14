@@ -310,16 +310,18 @@ class TriangulatedFXOptionColumnarBatchRequest(BaseModel):
         if max(self.state_index) >= num_states:
             raise ValueError("state_index out of range")
         ident = self.identifier
+        ident_base = ident[:3]
+        ident_quote = ident[3:]
         pay_ccy = self.payment_currency
         for st in self.states:
             md = st.market_data
-            l1 = md.leg1
-            l2 = md.leg2
-            if ident != f"{l1.base}{l2.quote}":
+            l1_pair = md.leg1.pair
+            l2_pair = md.leg2.pair
+            if ident_base != l1_pair[:3] or ident_quote != l2_pair[3:]:
                 raise ValueError(
                     f"state {st.state_id}: identifier != leg1 base + leg2 quote"
                 )
-            if pay_ccy != l2.quote:
+            if pay_ccy != l2_pair[3:]:
                 raise ValueError(
                     f"state {st.state_id}: payment_currency must equal the cross quote ccy C"
                 )

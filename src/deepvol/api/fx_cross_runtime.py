@@ -410,10 +410,8 @@ class FXCrossRuntime:
 
             sd0 = sigma0 * math.sqrt(T0)
             d10 = (-math.log(K0 / F0) + 0.5 * sd0 * sd0) / sd0
-            d20 = d10 - sd0
             n10 = math.exp(-0.5 * d10 * d10) / _SQ2PI
 
-            k_F0 = -1.0 / F0
             B_s0 = D0 * F0 * math.sqrt(T0) * n10
             n_phi_d10 = 0.5 * (1.0 + math.erf(phi0 * d10 / math.sqrt(2.0)))
             B_F0 = phi0 * D0 * n_phi_d10
@@ -475,7 +473,6 @@ class FXCrossRuntime:
 
         sd = sigma * np.sqrt(T_val)
         d1 = (-np.log(K_val / F_val) + 0.5 * sd * sd) / sd
-        d2 = d1 - sd
         n1 = np.exp(-0.5 * d1 * d1) / _SQ2PI
 
         B_s = D_val * F_val * np.sqrt(T_val) * n1
@@ -621,7 +618,7 @@ class FXCrossGPUExecutor:
         if self._running:
             return
         self._running = True
-        if self._cpu_fallback_pool is None or getattr(self._cpu_fallback_pool, "_shutdown", False):
+        if getattr(self._cpu_fallback_pool, "_shutdown", False):
             self._cpu_fallback_pool = ThreadPoolExecutor(
                 max_workers=4, thread_name_prefix="deepvol-cpu-fallback"
             )
