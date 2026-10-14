@@ -436,3 +436,33 @@ def test_bucketed_rho(device: str) -> None:
     assert rho_A.shape == (B, 5)
     assert torch.all(torch.isfinite(rho_C))
     assert torch.all(torch.isfinite(rho_A))
+
+    # Mathematical Oracle 1: Partition of unity guarantees sum across pillars equals parallel rho
+    expected_parallel_rho_C = dVdF * F * T - T_set * V
+    expected_parallel_rho_A = -dVdF * F * T
+    torch.testing.assert_close(rho_C.sum(dim=-1), expected_parallel_rho_C, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(rho_A.sum(dim=-1), expected_parallel_rho_A, atol=1e-12, rtol=1e-12)
+
+    # Mathematical Oracle 2: Exact pillar localization for on-pillar tenors
+    # Batch item 0: T=1.0, T_set=1.0 -> on pillar 2 (pillars_C[2] = 1.0)
+    assert rho_C[0, 2].item() == 0.45 * 250000.0 * 1.0 - 1.0 * 120.0
+    assert (rho_C[0, :2] == 0.0).all() and (rho_C[0, 3:] == 0.0).all()
+    assert rho_A[0, 2].item() == -0.45 * 250000.0 * 1.0
+    assert (rho_A[0, :2] == 0.0).all() and (rho_A[0, 3:] == 0.0).all()
+
+    # Batch item 1: T=2.0, T_set=2.0 -> on pillar 3 (pillars_C[3] = 2.0)
+    assert rho_C[1, 3].item() == 0.55 * 250000.0 * 2.0 - 2.0 * 150.0
+    assert (rho_C[1, :3] == 0.0).all() and (rho_C[1, 4:] == 0.0).all()
+    assert rho_A[1, 3].item() == -0.55 * 250000.0 * 2.0
+    assert (rho_A[1, :3] == 0.0).all() and (rho_A[1, 4:] == 0.0).all()
+
+    # Mathematical Oracle 3: Off-pillar linear interpolation
+    T_mid = torch.tensor([0.75], dtype=torch.float64, device=device)
+    rho_C_mid, rho_A_mid = bucketed_rho(dVdF[:1], V[:1], F[:1], T_mid, T_mid, pillars_C, pillars_A)
+    dF_mid = 0.45 * 250000.0 * 0.75
+    expected_C_half = 0.5 * (dF_mid - 0.75 * 120.0)
+    expected_A_half = 0.5 * (-dF_mid)
+    torch.testing.assert_close(rho_C_mid[0, 1], torch.tensor(expected_C_half, dtype=torch.float64, device=device))
+    torch.testing.assert_close(rho_C_mid[0, 2], torch.tensor(expected_C_half, dtype=torch.float64, device=device))
+    torch.testing.assert_close(rho_A_mid[0, 1], torch.tensor(expected_A_half, dtype=torch.float64, device=device))
+    torch.testing.assert_close(rho_A_mid[0, 2], torch.tensor(expected_A_half, dtype=torch.float64, device=device))
