@@ -50,33 +50,35 @@ def test_probe_extreme_tenors_and_vols_pna_cartesian() -> None:
     """Probes T in [1e-4, 10.0] and sigma in [0.01, 3.0] across PNA conventions."""
     np.seterr(all="raise")
     torch.autograd.set_detect_anomaly(True)
+    try:
+        extreme_tenors = [1e-4, 1e-3, 1/365, 0.1, 1.0, 5.0, 10.0]
+        extreme_vols = [0.01, 0.05, 0.20, 1.0, 3.0]
+        spots = [0.5, 1.25, 150.0]
+        eps_mach = torch.finfo(torch.float64).eps
 
-    extreme_tenors = [1e-4, 1e-3, 1/365, 0.1, 1.0, 5.0, 10.0]
-    extreme_vols = [0.01, 0.05, 0.20, 1.0, 3.0]
-    spots = [0.5, 1.25, 150.0]
-    eps_mach = torch.finfo(torch.float64).eps
+        for T in extreme_tenors:
+            for vol in extreme_vols:
+                for spot in spots:
+                    leg = _make_leg(spot, 0.98, 0.95, T)
+                    sig = torch.tensor([vol], dtype=torch.float64)
 
-    for T in extreme_tenors:
-        for vol in extreme_vols:
-            for spot in spots:
-                leg = _make_leg(spot, 0.98, 0.95, T)
-                sig = torch.tensor([vol], dtype=torch.float64)
-
-                for conv in [DeltaConvention.FORWARD_PNA, DeltaConvention.SPOT_PNA]:
-                    for phi_val in [1.0, -1.0]:
-                        phi = torch.tensor([phi_val], dtype=torch.float64)
-                        for d_val in [0.01, 0.10, 0.25, 0.50, 0.90]:
-                            target = torch.tensor([d_val * phi_val], dtype=torch.float64)
-                            K = strike_from_delta(target, sig, leg, phi, conv)
-                            assert torch.isfinite(K).all() and (K > 0).all()
-                            rec = fx_delta(K, sig, leg, phi, conv)
-                            assert torch.isfinite(rec).all()
-                            tau = vol * math.sqrt(T)
-                            tol_eff = max(1e-12, 10.0 * eps_mach / max(tau, 1e-15))
-                            err = torch.abs(rec - target).item()
-                            assert err <= tol_eff, (
-                                f"PNA residual {err:.3e} > {tol_eff:.3e} at T={T}, vol={vol}, d={d_val}, conv={conv}"
-                            )
+                    for conv in [DeltaConvention.FORWARD_PNA, DeltaConvention.SPOT_PNA]:
+                        for phi_val in [1.0, -1.0]:
+                            phi = torch.tensor([phi_val], dtype=torch.float64)
+                            for d_val in [0.01, 0.10, 0.25, 0.50, 0.90]:
+                                target = torch.tensor([d_val * phi_val], dtype=torch.float64)
+                                K = strike_from_delta(target, sig, leg, phi, conv)
+                                assert torch.isfinite(K).all() and (K > 0).all()
+                                rec = fx_delta(K, sig, leg, phi, conv)
+                                assert torch.isfinite(rec).all()
+                                tau = vol * math.sqrt(T)
+                                tol_eff = max(1e-12, 10.0 * eps_mach / max(tau, 1e-15))
+                                err = torch.abs(rec - target).item()
+                                assert err <= tol_eff, (
+                                    f"PNA residual {err:.3e} > {tol_eff:.3e} at T={T}, vol={vol}, d={d_val}, conv={conv}"
+                                )
+    finally:
+        torch.autograd.set_detect_anomaly(False)
 
 
 # ── Probe 2: Deep Tail Deltas (1e-6 to 0.999999) ──
@@ -108,36 +110,39 @@ def test_probe_deep_tail_deltas() -> None:
 def test_probe_ssvi_fallback_autograd_backward() -> None:
     """Forces SSVI fallback and verifies backward pass, Jacobian finite differences, and zero LinAlgError."""
     torch.autograd.set_detect_anomaly(True)
-    np.seterr(all="raise")
+    try:
+        np.seterr(all="raise")
 
-    can = SmileCanonicalizer(cache_size=0)
-    leg = _make_leg(1.20, 0.98, 0.95, 0.5)
-    conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
+        can = SmileCanonicalizer(cache_size=0)
+        leg = _make_leg(1.20, 0.98, 0.95, 0.5)
+        conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
 
-    quotes_arb = torch.tensor([[0.20, 0.08, -0.015, 0.16, -0.025]], dtype=torch.float64, requires_grad=True)
+        quotes_arb = torch.tensor([[0.20, 0.08, -0.015, 0.16, -0.025]], dtype=torch.float64, requires_grad=True)
 
-    # 1. Autograd Function forward + backward
-    xi = cast(Tensor, ImplicitCanonicalMap.apply(quotes_arb, conv, leg, can))  # type: ignore[no-untyped-call]
-    assert xi.shape == (1, 5)
-    loss = (xi ** 2).sum()
-    loss.backward()  # type: ignore[no-untyped-call]
+        # 1. Autograd Function forward + backward
+        xi = cast(Tensor, ImplicitCanonicalMap.apply(quotes_arb, conv, leg, can))  # type: ignore[no-untyped-call]
+        assert xi.shape == (1, 5)
+        loss = (xi ** 2).sum()
+        loss.backward()  # type: ignore[no-untyped-call]
 
-    assert quotes_arb.grad is not None
-    assert torch.isfinite(quotes_arb.grad).all()
-    assert not torch.isnan(quotes_arb.grad).any()
-    assert not torch.isinf(quotes_arb.grad).any()
+        assert quotes_arb.grad is not None
+        assert torch.isfinite(quotes_arb.grad).all()
+        assert not torch.isnan(quotes_arb.grad).any()
+        assert not torch.isinf(quotes_arb.grad).any()
 
-    # 2. Forward pass with detached quotes to inspect Jacobian properties
-    canon = can.canonicalize_unmemoized(quotes_arb.detach(), conv, leg)
-    assert canon.used_ssvi.item() is True, "Expected SSVI fallback to be activated!"
-    assert canon.min_g.item() >= -1e-12, f"SSVI fallback produced butterfly violation {canon.min_g.item()}"
-    assert torch.isfinite(canon.jacobian).all()
-    assert torch.isfinite(canon.xi).all()
+        # 2. Forward pass with detached quotes to inspect Jacobian properties
+        canon = can.canonicalize_unmemoized(quotes_arb.detach(), conv, leg)
+        assert canon.used_ssvi.item() is True, "Expected SSVI fallback to be activated!"
+        assert canon.min_g.item() >= -1e-12, f"SSVI fallback produced butterfly violation {canon.min_g.item()}"
+        assert torch.isfinite(canon.jacobian).all()
+        assert torch.isfinite(canon.xi).all()
 
-    # 3. Verify that the autograd gradient matches canonicalizer.jacobian @ grad_output
-    expected_grad = 2.0 * xi.detach() @ canon.jacobian[0]
-    grad_err = (quotes_arb.grad - expected_grad).abs().max().item()
-    assert grad_err < 1e-10, f"Autograd gradient differs from manifold Jacobian by {grad_err:.3e}"
+        # 3. Verify that the autograd gradient matches canonicalizer.jacobian @ grad_output
+        expected_grad = 2.0 * xi.detach() @ canon.jacobian[0]
+        grad_err = (quotes_arb.grad - expected_grad).abs().max().item()
+        assert grad_err < 1e-10, f"Autograd gradient differs from manifold Jacobian by {grad_err:.3e}"
+    finally:
+        torch.autograd.set_detect_anomaly(False)
 
 
 # ── Probe 4: Convention Inversion Round-Trip Under Stress Regimes ──

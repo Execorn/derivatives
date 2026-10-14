@@ -41,32 +41,34 @@ def test_stress_cartesian_pna_roundtrip() -> None:
     """Stress tests PNA delta inversion across extreme spots, tenors, vols, and strikes."""
     np.seterr(all="raise")
     torch.autograd.set_detect_anomaly(True)
+    try:
+        spots = [1e-5, 1.0, 1e5]
+        tenors = [1/365, 0.1, 1.0, 5.0, 10.0]
+        vols = [0.01, 0.10, 0.50, 1.5, 3.0]
+        deltas = [0.05, 0.10, 0.25, 0.45]
 
-    spots = [1e-5, 1.0, 1e5]
-    tenors = [1/365, 0.1, 1.0, 5.0, 10.0]
-    vols = [0.01, 0.10, 0.50, 1.5, 3.0]
-    deltas = [0.05, 0.10, 0.25, 0.45]
+        for s in spots:
+            for t in tenors:
+                for v in vols:
+                    leg = _make_leg(s, 0.98, 0.95, t)
+                    sig = torch.tensor([v], dtype=torch.float64)
 
-    for s in spots:
-        for t in tenors:
-            for v in vols:
-                leg = _make_leg(s, 0.98, 0.95, t)
-                sig = torch.tensor([v], dtype=torch.float64)
+                    for conv in [DeltaConvention.FORWARD_PNA, DeltaConvention.SPOT_PNA]:
+                        for phi_val in [1.0, -1.0]:
+                            phi = torch.tensor([phi_val], dtype=torch.float64)
+                            for d_val in deltas:
+                                target = torch.tensor([d_val * phi_val], dtype=torch.float64)
+                                K = strike_from_delta(target, sig, leg, phi, conv)
+                                assert torch.isfinite(K).all() and (K > 0).all()
 
-                for conv in [DeltaConvention.FORWARD_PNA, DeltaConvention.SPOT_PNA]:
-                    for phi_val in [1.0, -1.0]:
-                        phi = torch.tensor([phi_val], dtype=torch.float64)
-                        for d_val in deltas:
-                            target = torch.tensor([d_val * phi_val], dtype=torch.float64)
-                            K = strike_from_delta(target, sig, leg, phi, conv)
-                            assert torch.isfinite(K).all() and (K > 0).all()
-
-                            rec = fx_delta(K, sig, leg, phi, conv)
-                            assert torch.isfinite(rec).all()
-                            err = torch.abs(rec - target).item()
-                            assert err <= 1e-12, (
-                                f"PNA residual {err:.3e} exceeds 1e-12 at s={s}, t={t}, v={v}, d={d_val}, conv={conv}"
-                            )
+                                rec = fx_delta(K, sig, leg, phi, conv)
+                                assert torch.isfinite(rec).all()
+                                err = torch.abs(rec - target).item()
+                                assert err <= 1e-12, (
+                                    f"PNA residual {err:.3e} exceeds 1e-12 at s={s}, t={t}, v={v}, d={d_val}, conv={conv}"
+                                )
+    finally:
+        torch.autograd.set_detect_anomaly(False)
 
 
 # ── Challenge 2: PA Argmax and Boundary Inversion ──
@@ -137,24 +139,26 @@ def test_stress_extreme_tail_boundary_trapping() -> None:
     """Validates that extreme strikes and deep tails produce zero NaNs or Infs."""
     np.seterr(all="raise")
     torch.autograd.set_detect_anomaly(True)
+    try:
+        leg = _make_leg(100.0, 0.98, 0.95, 1.0)
+        sig = torch.tensor([0.20], dtype=torch.float64)
 
-    leg = _make_leg(100.0, 0.98, 0.95, 1.0)
-    sig = torch.tensor([0.20], dtype=torch.float64)
+        # Extreme strike ratios K/F from 1e-6 (deep ITM put/OTM call) to 1e6 (deep OTM call/ITM put)
+        extreme_strikes = leg.forward * torch.tensor([1e-6, 1e-4, 0.01, 1.0, 100.0, 1e4, 1e6], dtype=torch.float64)
 
-    # Extreme strike ratios K/F from 1e-6 (deep ITM put/OTM call) to 1e6 (deep OTM call/ITM put)
-    extreme_strikes = leg.forward * torch.tensor([1e-6, 1e-4, 0.01, 1.0, 100.0, 1e4, 1e6], dtype=torch.float64)
-
-    for K in extreme_strikes:
-        K_ten = K.unsqueeze(0)
-        for conv in DeltaConvention:
-            for phi_val in [1.0, -1.0]:
-                phi = torch.tensor([phi_val], dtype=torch.float64)
-                d_val = fx_delta(K_ten, sig, leg, phi, conv)
-                assert torch.isfinite(d_val).all()
-                assert not torch.isnan(d_val).any()
-                assert not torch.isinf(d_val).any()
-                if conv in (DeltaConvention.FORWARD_PNA, DeltaConvention.SPOT_PNA):
-                    assert (d_val.abs() >= 0.0).all() and (d_val.abs() <= 1.0 + 1e-12).all()
+        for K in extreme_strikes:
+            K_ten = K.unsqueeze(0)
+            for conv in DeltaConvention:
+                for phi_val in [1.0, -1.0]:
+                    phi = torch.tensor([phi_val], dtype=torch.float64)
+                    d_val = fx_delta(K_ten, sig, leg, phi, conv)
+                    assert torch.isfinite(d_val).all()
+                    assert not torch.isnan(d_val).any()
+                    assert not torch.isinf(d_val).any()
+                    if conv in (DeltaConvention.FORWARD_PNA, DeltaConvention.SPOT_PNA):
+                        assert (d_val.abs() >= 0.0).all() and (d_val.abs() <= 1.0 + 1e-12).all()
+    finally:
+        torch.autograd.set_detect_anomaly(False)
 
 
 # ── Challenge 4: SVI / SSVI Robustness under Pathological & Noisy Quotes ──
@@ -212,26 +216,29 @@ def test_stress_svi_noisy_monte_carlo() -> None:
 def test_stress_autograd_jacobian_anomaly() -> None:
     """Stress tests PyTorch autograd anomaly detection through ImplicitCanonicalMap."""
     torch.autograd.set_detect_anomaly(True)
-    np.seterr(all="raise")
+    try:
+        np.seterr(all="raise")
 
-    can = SmileCanonicalizer(cache_size=64)
-    leg = _make_leg(1.08, 0.99, 0.96, 1.0)
-    conv = [(DeltaConvention.SPOT_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
+        can = SmileCanonicalizer(cache_size=64)
+        leg = _make_leg(1.08, 0.99, 0.96, 1.0)
+        conv = [(DeltaConvention.SPOT_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
 
-    # Realistic EUR/USD quote set
-    quotes = torch.tensor([[0.12, -0.012, 0.004, -0.025, 0.010]], dtype=torch.float64, requires_grad=True)
+        # Realistic EUR/USD quote set
+        quotes = torch.tensor([[0.12, -0.012, 0.004, -0.025, 0.010]], dtype=torch.float64, requires_grad=True)
 
-    xi = cast(Tensor, ImplicitCanonicalMap.apply(quotes, conv, leg, can))  # type: ignore[no-untyped-call]
-    assert xi.shape == (1, 5)
+        xi = cast(Tensor, ImplicitCanonicalMap.apply(quotes, conv, leg, can))  # type: ignore[no-untyped-call]
+        assert xi.shape == (1, 5)
 
-    # Backpropagate through arbitrary scalar loss
-    loss = (xi ** 2).sum()
-    loss.backward()  # type: ignore[no-untyped-call]
+        # Backpropagate through arbitrary scalar loss
+        loss = (xi ** 2).sum()
+        loss.backward()  # type: ignore[no-untyped-call]
 
-    assert quotes.grad is not None
-    assert torch.isfinite(quotes.grad).all()
-    assert not torch.isnan(quotes.grad).any()
-    assert not torch.isinf(quotes.grad).any()
+        assert quotes.grad is not None
+        assert torch.isfinite(quotes.grad).all()
+        assert not torch.isnan(quotes.grad).any()
+        assert not torch.isinf(quotes.grad).any()
+    finally:
+        torch.autograd.set_detect_anomaly(False)
 
 
 # ── Challenge 6: Market Strangle Inversion Precision ──
