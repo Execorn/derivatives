@@ -791,7 +791,7 @@ def test_websocket_heartbeat_jitter(
     client: TestClient,
 ) -> None:
     """Gate G2.6: WebSocket heartbeat jitter p99 < 2 ms during 10k batch pricing."""
-    batch_dict = make_columnar_batch(base_single_request, n_states=4, n_contracts=1000)
+    batch_dict = make_columnar_batch(base_single_request, n_states=4, n_contracts=10000)
 
     ping_latencies: List[float] = []
     stop_event = threading.Event()
@@ -810,6 +810,12 @@ def test_websocket_heartbeat_jitter(
         except Exception:
             pass
 
+    # Priming warmup call to ensure thread pools and buffers are warm
+    _ = client.post(
+        "/fx_cross/price_batch",
+        content=orjson.dumps(make_columnar_batch(base_single_request, n_states=2, n_contracts=10)),
+        headers={"content-type": "application/json"},
+    )
     gc.collect()
     payload = orjson.dumps(batch_dict)
     t_thread = threading.Thread(target=ping_worker, daemon=True)
@@ -833,8 +839,8 @@ def test_websocket_heartbeat_jitter(
         pings_sorted = sorted(ping_latencies)
         p99_idx = int(0.99 * len(pings_sorted))
         p99_val = pings_sorted[p99_idx]
-        assert p99_val < 3.0, (
-            f"WebSocket heartbeat jitter p99 {p99_val:.3f} ms >= 3.0 ms"
+        assert p99_val < 2.0, (
+            f"WebSocket heartbeat jitter p99 {p99_val:.3f} ms >= 2.0 ms"
         )
 
 

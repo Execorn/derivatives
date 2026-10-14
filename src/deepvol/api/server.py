@@ -2654,23 +2654,25 @@ async def _fx_cross_price_batch_impl(request: Request) -> Response:
         denom = np.where(denom <= 0, 1e-4, denom)
         z_arr = np.log(batch.strike / F_arr) / denom
 
-        for i in range(N_cnt):
-            s_i = batch.state_index[i]
-            if abs(z_arr[i]) >= 7.0:
-                fallback_mask[i] = True
-                fallback_reasons_arr[i] = FallbackReasonEnum.EXTREME_MONEYNESS.value
-                X[i, Col.NN_GATE] = 0.0
-            elif bool(state_decision.fallback_activated[s_i].item()):
-                fallback_mask[i] = True
-                fallback_reasons_arr[i] = (
-                    state_decision.fallback_reason[s_i]
-                    or FallbackReasonEnum.OOD_MARKET_REGIME.value
-                )
-                X[i, Col.NN_GATE] = 0.0
-            elif batch.options.engine == PricingEngineEnum.ANALYTIC_TRIANGULATED:
-                fallback_mask[i] = True
-                fallback_reasons_arr[i] = FallbackReasonEnum.ENGINE_REQUESTED.value
-                X[i, Col.NN_GATE] = 0.0
+        state_idx_arr = np.asarray(batch.state_index, dtype=np.int64)
+        is_extreme = np.abs(z_arr) >= 7.0
+        state_fb_act = state_decision.fallback_activated.cpu().numpy().astype(bool)
+        is_state_fb = state_fb_act[state_idx_arr]
+        is_analytic = (batch.options.engine == PricingEngineEnum.ANALYTIC_TRIANGULATED)
+
+        fallback_mask = is_extreme | is_state_fb | is_analytic
+        X[fallback_mask, Col.NN_GATE] = 0.0
+
+        fallback_reasons_arr = np.full(N_cnt, "", dtype=object)
+        if is_analytic:
+            fallback_reasons_arr[:] = FallbackReasonEnum.ENGINE_REQUESTED.value
+        if np.any(is_state_fb):
+            for s_idx, r_str in enumerate(state_decision.fallback_reason):
+                if state_fb_act[s_idx]:
+                    mask_s = (state_idx_arr == s_idx)
+                    fallback_reasons_arr[mask_s] = r_str or FallbackReasonEnum.OOD_MARKET_REGIME.value
+        if np.any(is_extreme):
+            fallback_reasons_arr[is_extreme] = FallbackReasonEnum.EXTREME_MONEYNESS.value
 
         return (
             X,
