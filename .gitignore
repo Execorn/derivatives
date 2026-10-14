@@ -94,7 +94,6 @@ artifacts/reports/
 !artifacts/reports/spec_deviations.md
 artifacts/data/
 artifacts/models/fno_v2_best.pth
-artifacts/models/fx_cross/
 
 # ── pytest cache ─────────────────────────────────────────────────────────────
 .pytest_cache/
