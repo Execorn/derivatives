@@ -57,7 +57,7 @@ Recurrent policy networks (LSTM/GRU) are trained end-to-end through Jäckel's di
 
 ## Installation
 
-Requires Python 3.9+, PyTorch 2.8+, and CUDA 12.8+ (CPU fallbacks are supported across all engines).
+Requires Python 3.9+, PyTorch 2.8+, and CUDA 12.8+ (CPU fallbacks are supported across all engines; see [`docs/fx_cross_cpu_laptop_guide.md`](docs/fx_cross_cpu_laptop_guide.md) for standalone CPU-only laptop installation and `XAU/RUB` examples).
 
 ```bash
 uv sync
@@ -133,7 +133,7 @@ payload = {
 
 with TestClient(app) as client:
     response = client.post("/fx_cross/price", json=payload).json()
-    print(response["product_value"], response["delta"], response["cash_delta"])
+    print(response["product_value"], response["delta"]["cross"], response["cash_delta"]["cross"])
 ```
 
 ---
@@ -167,6 +167,7 @@ derivatives/
 │   └── app/            Streamlit research dashboards
 ├── app_frontend/       Next.js 16 web frontend (WebGL surface viewer & Autocall pricer)
 ├── artifacts/          Trained checkpoints, normalizers, model cards, and audit verification reports
+├── docs/               CPU-only laptop guide, JSON schemas, and legacy ConstMessage examples
 ├── notebooks/          Jupyter notebooks for calibration, hedging, and empirical studies
 ├── tests/              Unit, integration, and clean-room audit test suites
 └── tex/                Master's thesis LaTeX source and presentation slides
