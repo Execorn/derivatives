@@ -91,6 +91,7 @@ artifacts/reports/
 !artifacts/reports/fx_cross_progress.md
 !artifacts/reports/wolfram_proofs.md
 !artifacts/reports/model_card.json
+!artifacts/reports/spec_deviations.md
 artifacts/data/
 artifacts/models/fno_v2_best.pth
 artifacts/models/fx_cross/
