@@ -8,7 +8,7 @@ epistemic uncertainty estimation, fused Black-76 with ITM parity, and forward-on
 from __future__ import annotations
 
 import math
-from typing import ClassVar, Optional, Sequence, Tuple, cast
+from typing import Any, ClassVar, Optional, Sequence, Tuple, cast
 import weakref
 import torch
 import torch.nn as nn

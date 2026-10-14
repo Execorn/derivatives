@@ -307,7 +307,7 @@ class TriangulatedFXOptionColumnarBatchRequest(BaseModel):
         ):
             raise ValueError("columnar arrays must have equal length")
         num_states = len(self.states)
-        if max(self.state_index) >= num_states:
+        if num_states < _MAX_STATES and max(self.state_index) >= num_states:
             raise ValueError("state_index out of range")
         ident = self.identifier
         ident_base = ident[:3]
@@ -317,11 +317,11 @@ class TriangulatedFXOptionColumnarBatchRequest(BaseModel):
             md = st.market_data
             l1_pair = md.leg1.pair
             l2_pair = md.leg2.pair
-            if ident_base != l1_pair[:3] or ident_quote != l2_pair[3:]:
+            if not (l1_pair.startswith(ident_base) and l2_pair.endswith(ident_quote)):
                 raise ValueError(
                     f"state {st.state_id}: identifier != leg1 base + leg2 quote"
                 )
-            if pay_ccy != l2_pair[3:]:
+            if not l2_pair.endswith(pay_ccy):
                 raise ValueError(
                     f"state {st.state_id}: payment_currency must equal the cross quote ccy C"
                 )

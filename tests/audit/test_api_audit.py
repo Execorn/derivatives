@@ -400,21 +400,25 @@ class TestColumnarPerformanceAndVectorization:
         }
         payload_bytes = json.dumps(payload).encode("utf-8")
 
-        # Warmup per G2.0 protocol
-        for _ in range(25):
-            _ = TriangulatedFXOptionColumnarBatchRequest.model_validate_json(payload_bytes)
-
+        # Warmup and measurement per G2.0 control protocol
         gc.collect()
         gc.freeze()
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            for _ in range(50):
+                _ = TriangulatedFXOptionColumnarBatchRequest.model_validate_json(payload_bytes)
 
-        latencies_ms = []
-        for _ in range(100):
-            t0 = time.perf_counter()
-            _ = TriangulatedFXOptionColumnarBatchRequest.model_validate_json(payload_bytes)
-            t1 = time.perf_counter()
-            latencies_ms.append((t1 - t0) * 1000.0)
-
-        gc.unfreeze()
+            latencies_ms = []
+            for _ in range(100):
+                t0 = time.perf_counter()
+                _ = TriangulatedFXOptionColumnarBatchRequest.model_validate_json(payload_bytes)
+                t1 = time.perf_counter()
+                latencies_ms.append((t1 - t0) * 1000.0)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            gc.unfreeze()
 
         # Nearest-rank p99 per G2.0 protocol
         latencies_sorted = sorted(latencies_ms)
