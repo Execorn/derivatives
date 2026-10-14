@@ -306,15 +306,20 @@ class TriangulatedFXOptionColumnarBatchRequest(BaseModel):
             or (self.notional is not None and len(self.notional) != n)
         ):
             raise ValueError("columnar arrays must have equal length")
-        if max(self.state_index) >= len(self.states):
+        num_states = len(self.states)
+        if max(self.state_index) >= num_states:
             raise ValueError("state_index out of range")
+        ident = self.identifier
+        pay_ccy = self.payment_currency
         for st in self.states:
             md = st.market_data
-            if self.identifier != md.leg1.base + md.leg2.quote:
+            l1 = md.leg1
+            l2 = md.leg2
+            if ident != f"{l1.base}{l2.quote}":
                 raise ValueError(
                     f"state {st.state_id}: identifier != leg1 base + leg2 quote"
                 )
-            if self.payment_currency != md.leg2.quote:
+            if pay_ccy != l2.quote:
                 raise ValueError(
                     f"state {st.state_id}: payment_currency must equal the cross quote ccy C"
                 )
