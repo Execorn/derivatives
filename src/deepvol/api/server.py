@@ -17,9 +17,12 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import time
 import os
+
+logger = logging.getLogger(__name__)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import uuid
