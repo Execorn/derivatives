@@ -177,7 +177,7 @@
         \begin{tabular}{@{}ll@{}}
           {\color{white!65}Автор доклада:} & {\bfseries\color{white} Бирюков Никита Сергеевич} \\[0.25em]
           {\color{white!65}Подразделение:} & {\bfseries\color{white} Сбербанк КИБ, команда PricingService} \\[0.25em]
-          {\color{white!65}Статус аудита:} & {\bfseries\color{sberlime} GO (31/31 гейтов пройдено, 141/141 тестов)}
+          {\color{white!65}Статус аудита:} & {\bfseries\color{sberlime} GO (31/31 гейтов пройдено, 436/436 тестов)}
         \end{tabular}
       \end{column}
       \begin{column}{0.44\textwidth}
@@ -185,9 +185,9 @@
           \node[fill=black!35, draw=sbergold, rounded corners=4pt, inner sep=6pt, text=white, font=\scriptsize] {
             \begin{tabular}{@{}l@{\hspace{0.8em}}r@{}}
               {\color{sbergold}\textbf{Ключевые метрики PoC:}} & \\
-              Ошибка цены (RMSE / MAE): & \textbf{0.35 / 0.67 б.п.} \\
+              Ошибка цены (MAE / Stress): & \textbf{0.67 / 0.90 б.п.} \\
               Сохранение CashDelta: & \textbf{0.00 RUB ($<10^{-15}$)} \\
-              Латентность (1 опцион, CPU / GPU): & \textbf{0.31 мс / 0.20 мс} \\
+              Латентность (GPU p50 / CPU p99): & \textbf{0.20 / 0.25 мс} \\
               Батч 10,000 опционов (Arrow): & \textbf{9.45 мс}
             \end{tabular}
           };
@@ -234,8 +234,8 @@
 
       \begin{exampleblock}{Часть IV. Промышленные тесты, CPU-ноутбук и развитие}
         \begin{enumerate}\setcounter{enumi}{11}
-          \item \textbf{Сверка с продом PricingService:} точное совпадение на сделке \texttt{XAU/RUB} ($K=10$ и $K=382,100$).
-          \item \textbf{Микросекундный профиль скорости:} как достигаются \textbf{0.31 мс на CPU} и \textbf{0.20 мс на GPU}.
+          \item \textbf{Сверка с продом PricingService:} фактическое расхождение на сделке \texttt{XAU/RUB} ($K=10$ и $K=382,100$).
+          \item \textbf{Микросекундный профиль скорости:} как достигаются \textbf{0.25--0.30 мс на CPU} и \textbf{0.20 мс на GPU}.
           \item \textbf{Сравнение с \texttt{MonteCarloWithAAD}} и перенос пайплайна на барьерные и отзывные опционы.
         \end{enumerate}
       \end{exampleblock}
@@ -257,7 +257,7 @@
         \begin{itemize}
           \item \textbf{Никакого «чёрного ящика» на ценах:} нейросеть предсказывает только малую поправку волатильности $\hat{\varepsilon}$ ($\sim 1\text{--}15$ б.п.) поверх точной аналитической модели $\beta$-Split.
           \item \textbf{Один прямой проход вместо 80 bump-and-revalue:} все греки 1-го и 2-го порядка вычисляются аналитически через струи Тейлора (\texttt{taylor\_jets.py}).
-          \item \textbf{Работает на обычном CPU-ноутбуке без GPU:} время отклика \textbf{0.31 мс} на CPU (и \textbf{0.20 мс} на GPU), вес всех 5 моделей ансамбля — \textbf{228 КБ}.
+          \item \textbf{Работает на обычном CPU-ноутбуке без GPU:} время отклика \textbf{0.25--0.30 мс} на CPU (и \textbf{0.20 мс} на GPU), вес всех 5 моделей ансамбля — \textbf{228 КБ}.
           \item \textbf{Полная совместимость с \texttt{ConstMessage} / \texttt{MutableMessage}:} готовый адаптер графа сообщений \texttt{legacy\_adapter.py}.
         \end{itemize}
       \end{exampleblock}
@@ -273,16 +273,16 @@
           \textbf{Показатель / Гейт} & \textbf{Требование} & \textbf{Факт PoC} \\
           \midrule
           \rowcolor{sberbg} Ошибка цены MAE (G1.1) & $\le 1.50$ б.п. & \textbf{\color{sberemerald}0.67 б.п.} \\
-          Ошибка цены RMSE & --- & \textbf{\color{sberemerald}0.35 б.п.} \\
-          \rowcolor{sberbg} Ошибка цены p99 (G1.2) & $\le 6.50$ б.п. & \textbf{\color{sberemerald}1.89 б.п.} \\
-          Ошибка Delta MAE (G1.3) & $\le 5.0\cdot 10^{-4}$ & \textbf{\color{sberemerald}$2.28\cdot 10^{-4}$} \\
-          \rowcolor{sberbg} Ошибка Gamma / $\Gamma_{\text{ATM}}$ (G1.4) & $\le 1.80\%$ & \textbf{\color{sberemerald}0.48\%} \\
-          Ошибка Cross Vega (G1.5a) & $\le 0.10\%$ & \textbf{\color{sberemerald}0.064\%} \\
-          \rowcolor{sberbg} Арбитраж на сетке $2.2\cdot 10^7$ & $0$ & \textbf{\color{sberemerald}0 нарушений} \\
+          Ошибка цены Stress MAE (G1.3b) & $\le 4.00$ б.п. & \textbf{\color{sberemerald}0.90 б.п.} \\
+          \rowcolor{sberbg} Ошибка цены p99 (G1.2) & $\le 6.50$ б.п. & \textbf{\color{sberemerald}6.29 б.п.} \\
+          Ошибка Delta MAE (G1.3) & $\le 5.0\cdot 10^{-4}$ & \textbf{\color{sberemerald}$4.90\cdot 10^{-4}$} \\
+          \rowcolor{sberbg} Ошибка Gamma / $\Gamma_{\text{ATM}}$ (G1.4) & $\le 1.80\%$ & \textbf{\color{sberemerald}0.0845\%} \\
+          Ошибка Cross / Leg Vega (G1.5) & $\le 0.10 / 1.00\%$ & \textbf{\color{sberemerald}0.044 / 0.104\%} \\
+          \rowcolor{sberbg} Арбитраж ($100\times 100\times 20$) & $0$ & \textbf{\color{sberemerald}0 нарушений} \\
           Дисбаланс CashDelta (G1.7) & $\le 10^{-12}$ & \textbf{\color{sberemerald}$< 10^{-15}$ (0 коп.)} \\
-          \rowcolor{sberbg} Одиночный запрос GPU p99 & $\le 0.45$ мс & \textbf{\color{sberemerald}0.214 мс} \\
-          Одиночный запрос CPU p99 & $\le 0.75$ мс & \textbf{\color{sberemerald}0.310 мс} \\
-          \rowcolor{sberbg} Батч 10,000 опционов (G2.4) & $\le 13.0$ мс & \textbf{\color{sberemerald}9.45 мс} \\
+          \rowcolor{sberbg} Одиночный запрос GPU (p50/p99) & $\le 0.25 / 0.45$ мс & \textbf{\color{sberemerald}0.196 / 0.214 мс} \\
+          Одиночный запрос CPU p99 & $\le 0.75$ мс & \textbf{\color{sberemerald}0.246--0.301 мс} \\
+          \rowcolor{sberbg} Батч 10k (JSON / Arrow) & $\le 13.0 / 10.0$ мс & \textbf{\color{sberemerald}11.51 / 9.45 мс} \\
           \bottomrule
         \end{tabular}
       \end{table}
@@ -310,7 +310,7 @@
           \item \textbf{Плоская формула Гармана--Кольхагена (GK):}
             $\sigma_\times = \sqrt{\sigma_{1,\text{ATM}}^2 + \sigma_{2,\text{ATM}}^2 + 2\rho\sigma_{1,\text{ATM}}\sigma_{2,\text{ATM}}}$
             считается мгновенно, но \textbf{полностью игнорирует перекос (RR) и баттерфляй (BF)} обеих ног $\Rightarrow$ ошибка цены до \textbf{15--40 б.п.} и неверная \texttt{Vanna}/\texttt{Gamma}.
-          \item \textbf{2D Копула / \texttt{MonteCarloWithAAD}:} учитывает улыбки обеих ног, но требует 2D численного интегрирования или $65,536$ траекторий МК $\Rightarrow$ \textbf{30--150 мс} на одну сделку и шум на \texttt{Gamma}.
+          \item \textbf{2D Копула / \texttt{MonteCarloWithAAD}:} учитывает улыбки обеих ног, но требует 2D численного интегрирования или $65,536$ траекторий МК $\Rightarrow$ \textbf{28--135 мс} на одну сделку и шум на \texttt{Gamma}.
         \end{enumerate}
       \end{alertblock}
     \end{column}
@@ -364,7 +364,7 @@
         $$\sigma_\times(k, T) = \underbrace{\sigma_{\beta\text{-split}}(k, T)}_{\substack{\text{Аналитика \texttt{float64}}\\\text{(98--99\% улыбки)}}} + \underbrace{g_{\text{OOD}} \cdot w(z) \cdot \hat{\varepsilon}_{\text{MLP}}(\bm{x})}_{\substack{\text{Нейросетевой остаток копулы}\\\text{($\sim 0.5\text{--}15$ б.п., \texttt{float32})}}}$$
         \begin{enumerate}
           \item \textbf{Аналитическая база $\sigma_{\beta\text{-split}}$} решает 6-шаговое уравнение неподвижной точки в \texttt{float64} и даёт ошибку всего $\sim 2\text{--}4$ б.п.
-          \item \textbf{Ансамбль из 5 сетей \texttt{ResidualCrossVolNet}} доучивает только нелинейную поправку 2D копулы $\hat{\varepsilon}$, снижая ошибку до \textbf{0.35 б.п. RMSE}.
+          \item \textbf{Ансамбль из 5 сетей \texttt{ResidualCrossVolNet}} доучивает только нелинейную поправку 2D копулы $\hat{\varepsilon}$, снижая ошибку до \textbf{0.67 б.п. MAE}.
           \item \textbf{Множитель $w(z) \in [0, 1]$} зануляет нейросеть при $|z| \ge 7$, гарантируя \textbf{побитовое совпадение} с аналитикой на $K=10$.
           \item \textbf{Формула Блэка-76 в \texttt{float64}} вычисляет цену $V(\sigma_\times)$ и все греки, автоматически сохраняя паритет пут--колл и \texttt{CashDelta}.
         \end{enumerate}
@@ -588,14 +588,14 @@
           % 2D Гауссовская копула + ML Ensemble
           \addplot[domain=-4:4, samples=60, line width=1.5pt, color=sbergreen]
             {0.312 + 0.0065*x + 0.0068*x^2 - 0.00018*x^3 - 0.0014*exp(-0.35*x^2) + 0.0009*x*exp(-0.25*x^2)};
-          \addlegendentry{2D Копула $\equiv$ DeepVol ML ($\le 0.35$ б.п.)}
+          \addlegendentry{2D Копула $\equiv$ DeepVol ML (MAE $0.67$ б.п.)}
         \end{axis}
       \end{tikzpicture}
     \end{column}
 
     \begin{column}{0.50\textwidth}
       \centering
-      \textbf{\scriptsize Б. Остаток копулы $\varepsilon(z) = \sigma_{\text{copula}}(z) - \sigma_{\beta\text{-split}}(z)$ (в б.п. волатильности)}\\[0.2em]
+      \textbf{\scriptsize Б. Остаток копулы $\varepsilon(z) = \sigma_{\text{copula}}(z) - \sigma_{\beta\text{-split}}(z)$ (в б.п.)}\\[0.2em]
       \begin{tikzpicture}
         \begin{axis}[
           width=7.1cm, height=5.0cm,
@@ -648,16 +648,16 @@
           \toprule
           \textbf{№} & \textbf{Признак} & \textbf{Физический смысл} \\
           \midrule
-          1 & $z = k / (\sigma_{\text{ref}}\sqrt{T})$ & Стандартизованная денежность \\
+          1 & $z_{\text{in}} = 7\tanh(z/7)$ & Гладко сжатая денежность $z$ \\
           2 & $\sqrt{T}$ & Корень из времени до экспирации \\
           3 & $\rho$ & Корреляция между $S_1$ и $S_2$ \\
-          4--8 & $a_1, b_1, \rho_1, m_1, \sigma_1$ & Параметры Raw SVI ноги 1 \\
-          9--13 & $a_2, b_2, \rho_2, m_2, \sigma_2$ & Параметры Raw SVI ноги 2 \\
+          4--8 & $\bm{\xi}_1 = (\sigma_{\text{ATM}}, \text{RR}_{25}, \text{BF}_{25}, \text{RR}_{10}, \text{BF}_{10})_1$ & Канонические котировки ноги 1 \\
+          9--13 & $\bm{\xi}_2 = (\sigma_{\text{ATM}}, \text{RR}_{25}, \text{BF}_{25}, \text{RR}_{10}, \text{BF}_{10})_2$ & Канонические котировки ноги 2 \\
           \bottomrule
         \end{tabular}
         \vspace{0.2em}
 
-        \textbf{Важное свойство инвариантности:} в вектор признаков \textbf{не входят} ни споты $S_1, S_2$, ни процентные ставки $r_A, r_B, r_C$. Вся зависимость от ставок сидит в форварде $F_\times = S_1 S_2 D_A / D_C$, поэтому модель не может переобучиться под конкретный уровень ставок ЦБ.
+        \textbf{Важное свойство инвариантности:} подача канонических котировок $\bm{\xi}_i$, снятых с SVI-среза, устраняет вырожденность сырых параметров SVI $(a,b,\rho,m,\sigma)$. Споты $S_{1,2}$ и ставки $r_{A,B,C}$ в сеть не входят.
       \end{block}
     \end{column}
 
@@ -896,7 +896,7 @@
           width=6.6cm, height=4.6cm,
           xlabel={\scriptsize Эпоха обучения},
           ylabel={\scriptsize Относительная ошибка Gamma (\%)},
-          xmin=0, xmax=100, ymin=0.2, ymax=12,
+          xmin=0, xmax=100, ymin=0.05, ymax=12,
           ymode=log, log basis y={10},
           grid=both, grid style={line width=.1pt, draw=gray!25},
           tick label style={font=\tiny},
@@ -908,7 +908,7 @@
           \addlegendentry{Обычный MSE (без производных)}
 
           \addplot[color=sbergreen, line width=1.5pt] coordinates {
-            (0,10.5) (10,2.8) (20,1.35) (40,0.72) (60,0.54) (80,0.49) (100,0.48)
+            (0,10.5) (10,1.8) (20,0.65) (40,0.22) (60,0.12) (80,0.09) (100,0.0845)
           };
           \addlegendentry{Наш DML ($\lambda=1, \nu=0.1, \mu=10$)}
 
@@ -918,7 +918,7 @@
       \end{tikzpicture}
 
       \begin{block}{\scriptsize Эффект регуляризации производными}
-        \scriptsize Обучение в норме Соболева снижает ошибку по \texttt{Gamma} в \textbf{7 раз} (с $3.45\%$ до \textbf{$0.48\%$}) и ошибку по поножным вегам (\texttt{Leg Vega}) до \textbf{$0.49\%$}.
+        \scriptsize Обучение в норме Соболева снижает ошибку по \texttt{Gamma} в \textbf{40 раз} (с $3.45\%$ до \textbf{$0.0845\%$}) и ошибку по поножным вегам (\texttt{Leg Vega}) до \textbf{$0.1035\%$}.
       \end{block}
     \end{column}
   \end{columns}
@@ -935,9 +935,9 @@
         \begin{enumerate}
           \item \textbf{12-мерное расстояние Махаланобиса с регуляризацией Ледуа--Вульфа:}
             $$D_M(\bm{m}) = \sqrt{(\bm{m} - \bm{\mu}_{\text{train}})^\top \bm{\Sigma}_{\text{LW}}^{-1} (\bm{m} - \bm{\mu}_{\text{train}})}$$
-            Если $D_M(\bm{m}) > q_{0.995} = 5.337$ или нарушен 12-мерный гиперкуб обучающей выборки $\Rightarrow$ мгновенный маршрут в аналитический фоллбэк (\texttt{OOD\_MARKET\_REGIME}).
+            Если $D_M(\bm{m}) > q_{0.995} = 2.849$ (эмпирический 99.5\%-квантиль на \texttt{train}) или нарушен 12-мерный гиперкуб обучающей выборки $\Rightarrow$ мгновенный маршрут в аналитический фоллбэк (\texttt{OOD\_MARKET\_REGIME}).
           \item \textbf{Контроль эпистемического разброса ансамбля:}
-            если $\text{std}_m(\hat{\varepsilon}_m) > \tau_{\text{epist}}$, срабатывает \texttt{EPISTEMIC\_UNCERTAINTY}.
+            если $\text{std}_m(\hat{\varepsilon}_m) > \tau_{\text{epist}} = 0.015$, срабатывает \texttt{EPISTEMIC\_UNCERTAINTY}.
           \item \textbf{Выходной аудит поверхности Дюррлемана и календаря:}
             проверка $\min_k g_\times(k) \ge 0$ и $\partial_T w_\times(k, T) \ge 0$ (\texttt{OUTPUT\_AUDIT\_FAILED}).
         \end{enumerate}
@@ -948,7 +948,7 @@
       \begin{exampleblock}{Результаты стресс-тестирования (Gates G3.2, G3.3, G1.6b)}
         \begin{itemize}
           \item \textbf{1,000 синтетических кризисных сценариев:} \textbf{100.0\%} перехвачены \texttt{FXCrossGuardian} с возвратом HTTP 200, флагом \texttt{fallback\_activated = True} и точной аналитической ценой $\beta$-Split.
-          \item \textbf{Доля ложных срабатываний (FPR) на \texttt{test}:} ровно \textbf{0.50\%} (порог спецификации $0.5\% \pm 0.3\%$).
+          \item \textbf{Доля ложных срабатываний (FPR) на \texttt{test}:} \textbf{0.484\%} (внутри целевого коридора спецификации $[0.2\%, 0.8\%]$).
           \item \textbf{Календарные аномалии (G1.6b):} \textbf{100.0\%} полнота обнаружения при расходящихся временных структурах ног.
         \end{itemize}
       \end{exampleblock}
@@ -968,34 +968,33 @@
 % ==============================================================================
 \begin{frame}{Верификация на реальном запросе PricingService (\texttt{XAU/RUB}, $T = 2$ года)}
   \begin{columns}[T]
-    \begin{column}{0.54\textwidth}
+    \begin{column}{0.55\textwidth}
       \begin{block}{Тест А: Реальный продовый дамп банка ($K = 10.0$ RUB, глубокий ITM)}
-        Входные данные из \texttt{xaurub\_k10\_complete\_const\_messages.json}:
-        $S_1 = 4414.66$, $S_2 = 86.551435$, $S^\times = 382,100.0$, $K = 10.0$ ($z = -26.4$).
-        За счёт сплайна $w(z) \equiv 0$ при $|z| \ge 7$ вклад ML равен \textbf{точному нулю}:
+        Входные данные из \texttt{xaurub\_k10\_mutable\_message\_reference.json}:
+        $S_1 = 4414.66$, $S_2 = 86.551433$, $S^\times = 382,100.0$, $K = 10.0$ ($z = -26.4$).
         \vspace{0.2em}
 
-        \scriptsize
-        \renewcommand{\arraystretch}{1.15}
+        \tiny
+        \renewcommand{\arraystretch}{1.18}
         \begin{tabular}{@{}lrrr@{}}
           \toprule
-          \textbf{Поле \texttt{MutableMessage}} & \textbf{Прод PricingService} & \textbf{DeepVol ML Engine} & \textbf{Разница} \\
+          \textbf{Поле \texttt{MutableMessage}} & \textbf{Прод PricingService} & \textbf{DeepVol (JSON / выровн.\ DF)} & \textbf{Разница (JSON / DF)} \\
           \midrule
-          \texttt{ProductValue} (RUB) & $355,690.379107$ & $355,690.379107$ & \textbf{\color{sberemerald}0.00 б.п.} \\
-          \texttt{Delta[XAURUB]} & $0.9309147404$ & $0.9309147404$ & \textbf{\color{sberemerald}$0.00$} \\
-          \texttt{CashDelta[XAURUB]} & $355,698.014861$ & $355,698.014861$ & \textbf{\color{sberemerald}0.00 RUB} \\
-          \texttt{NonAdaptedDelta} & $0.7635754481$ & $0.7635754481$ & \textbf{\color{sberemerald}$0.00$} \\
-          \texttt{Gamma} / \texttt{Vega} & $0.000000$ & $0.000000$ & \textbf{\color{sberemerald}$0.00$} \\
-          \texttt{Theta} (RUB/день) & $+187.93^{\,*}$ & $+34.34^{\,*}$ & Конвенция$^*$ \\
+          \texttt{ProductValue} (RUB) & $355,690.3791$ & $355,659.70$ / $355,690.3709$ & \textbf{\color{sberemerald}$-0.86$ / $-0.00023$ б.п.} \\
+          \texttt{Delta[XAURUB]} & $0.9309147404$ & $0.93083238$ / $0.9309147404$ & \textbf{\color{sberemerald}$-0.88$ б.п. / $<10^{-15}$} \\
+          \texttt{Delta[XAUUSD]} & $80.57200665$ & $80.564879$ / $80.57200478$ & \textbf{\color{sberemerald}$-0.88$ / $-0.00023$ б.п.} \\
+          \texttt{CashDelta} (3 ноги) & $355,698.0149$ & $355,666.54$ / $355,698.0066$ & \textbf{\color{sberemerald}$-0.88$ / $-0.00023$ б.п.} \\
+          \texttt{NonAdaptedDelta} & $0.7635754481$ & $0.68421053$ / $0.7635754481$ & \textbf{\color{sberemerald}Лаг DF / $<10^{-15}$} \\
+          \texttt{Theta} (RUB/день) & $+187.93^{\,*}$ & $+34.34^{\,*}$ & Конвенция $T+1^*$ \\
           \bottomrule
         \end{tabular}
         \vspace{0.15em}
 
-        {\tiny $^*$Разница в \texttt{Theta} объясняется исключительно конвенцией: DeepVol считает производную по модельному времени $-\frac{1}{365}\partial V/\partial T = +34.34$ руб./день, тогда как старый сервис сдвигает дату \texttt{AsOfDate} на $T+1$ вдоль дискретного расписания кривых ($+187.93$ руб./день).}
+        {\tiny \textbf{Почему разница PV не равна 0 б.п.:} (1) На аппроксимированных кривых JSON с 3-дн.\ лагом расчётов ($D_{\text{set}}/D_C = 0.9999115$) разница равна \textbf{$-30.68$ руб.\ ($-0.86$ б.п.)}. (2) При выравнивании DF с продом остаток \textbf{$-0.0082$ руб.\ ($-0.00023$ б.п.)} вызван 6-значным округлением спота \texttt{USDRUB = 86.551433} в JSON против \texttt{86.55143486}. $^*$В \texttt{Theta} прод сдвигает \texttt{AsOfDate} на $T+1$.}
       \end{block}
     \end{column}
 
-    \begin{column}{0.44\textwidth}
+    \begin{column}{0.43\textwidth}
       \begin{exampleblock}{Тест Б: Тот же рынок при рыночном страйке $K = 382,100$ RUB (ATM спот)}
         При $K = 382,100$ ($z = -0.485$) активно работают и $\beta$-Split, и 5 сетей ансамбля \texttt{ResidualCrossVolNet}:
         \vspace{0.2em}
@@ -1006,17 +1005,16 @@
           \toprule
           \textbf{Показатель ($K = 382,100$ RUB)} & \textbf{Значение DeepVol} \\
           \midrule
-          \texttt{ProductValue} & \textbf{111,379.55 RUB} \\
+          \texttt{ProductValue} (ошибка $0.42$ б.п.) & \textbf{111,379.55 RUB} \\
           Аналитическая база $\sigma_{\beta\text{-split}}$ & $28.9983\%$ \\
           Поправка ML-ансамбля $w(z)\hat{\varepsilon}$ & $-0.0064\%$ ($-0.64$ б.п.) \\
           Итоговая $\sigma_\times(K, T)$ & \textbf{28.9919\%} \\
+          Точность по выборке \texttt{test} (G1.1/G1.2) & \textbf{0.67 б.п.\ MAE / 6.29 p99} \\
           \texttt{Delta[XAURUB]} & $0.659472$ \\
           \texttt{CashDelta} (все 3 ноги) & \textbf{251,984.42 RUB} \\
           \texttt{NonAdaptedDelta} & $0.540839$ \\
-          \texttt{CashGamma} (1\% move) & $264.45$ RUB \\
           \texttt{Vega} (кросс / Leg1 / Leg2) & $110.2\text{k} / 85.6\text{k} / 70.3\text{k}$ \\
-          \texttt{CorrelationSensitivity} & $8,068.93$ RUB \\
-          Латентность на CPU ноутбуке & \textbf{0.31 мс} \\
+          Латентность (GPU p50 / CPU p99) & \textbf{0.20 / 0.25--0.30 мс} \\
           \bottomrule
         \end{tabular}
       \end{exampleblock}
@@ -1059,7 +1057,7 @@
 % ==============================================================================
 % СЛАЙД 20 — ПОЧЕМУ РАБОТАЕТ ТАК БЫСТРО: МИКРОСЕКУНДНЫЙ ПРОФИЛЬ (M4)
 % ==============================================================================
-\begin{frame}{Высокопроизводительный рантайм (M4): Как достигаются 0.31 мс на CPU и 0.20 мс на GPU}
+\begin{frame}{Высокопроизводительный рантайм (M4): Как достигаются 0.25--0.30 мс на CPU и 0.20 мс на GPU}
   \begin{columns}[T]
     \begin{column}{0.52\textwidth}
       \begin{block}{Почему классический калькулятор тратит 100+ мс}
@@ -1094,17 +1092,17 @@
           2. Аналитика $\beta$-Split (6 шагов) & $20,000$ мкс & \textbf{12 мкс} & \textbf{5 мкс} \\
           \rowcolor{sberbg} 3. Ансамбль 5x MLP + Taylor Jet & --- & \textbf{45 мкс} & \textbf{15 мкс} \\
           4. Black-76 + 13 греков + 69 Rho & $80,000$ мкс & \textbf{15 мкс} & \textbf{5 мкс} \\
-          \rowcolor{sberbg} 5. Pydantic + OOD Guardian + HTTP & $30,000$ мкс & \textbf{236 мкс} & \textbf{173 мкс} \\
+          \rowcolor{sberbg} 5. Pydantic + OOD Guardian + HTTP & $30,000$ мкс & \textbf{172--227 мкс} & \textbf{169--187 мкс} \\
           \midrule
-          \textbf{ИТОГО (End-to-End p99)} & \textbf{135,000 мкс} & \textbf{\color{sberemerald}310 мкс} & \textbf{\color{sberemerald}200 мкс} \\
-          \textbf{В миллисекундах} & $\sim 135$ мс & \textbf{\color{sberemerald}0.31 мс} & \textbf{\color{sberemerald}0.20 мс} \\
+          \textbf{ИТОГО (Сертифицировано G2)} & \textbf{135,000 мкс} & \textbf{\color{sberemerald}246--301 мкс} & \textbf{\color{sberemerald}196 / 214 мкс} \\
+          \textbf{В миллисекундах} & $\sim 135$ мс & \textbf{\color{sberemerald}0.25--0.30 мс} & \textbf{\color{sberemerald}0.20 / 0.21 мс} \\
           \bottomrule
         \end{tabular}
       \end{table}
 
       \vspace{0.15cm}
       \begin{block}{\scriptsize Батч-прайсинг портфеля (10,000 контрактов)}
-        \scriptsize Векторизованный колоночный эндпоинт \texttt{POST /fx\_cross/price\_batch} с бинарным транспортом \textbf{Apache Arrow IPC} обсчитывает \textbf{10,000 контрактов за 9.45 мс} на GPU (и $\sim 110$ мс на CPU-ноутбуке).
+        \scriptsize Векторизованный колоночный эндпоинт \texttt{POST /fx\_cross/price\_batch} обсчитывает \textbf{10,000 контрактов за 11.51 мс (JSON) и 9.45 мс (Apache Arrow IPC)} на GPU.
       \end{block}
     \end{column}
   \end{columns}
@@ -1141,7 +1139,7 @@
         ]
           \addplot[fill=sbergreen, draw=sberdarkgreen] coordinates {
             (0.20,1)
-            (0.31,2)
+            (0.25,2)
             (28.0,3)
             (135.0,4)
           };
@@ -1164,9 +1162,9 @@
           \midrule
           \rowcolor{sberbg} Улыбки обеих ног & Нет & Да & \textbf{\color{sberemerald}Да (SVI)} \\
           Ошибка цены (MAE) & $18.4$ б.п. & $0.4$ б.п. & \textbf{\color{sberemerald}0.67 б.п.} \\
-          \rowcolor{sberbg} Точность $\Delta, \mathcal{V}$ & Низкая & $0.1\%$ & \textbf{\color{sberemerald}$0.02\%$} \\
-          Гладкость $\Gamma$, Vanna & Неверные & \textbf{\color{sberred}Шум $1\text{--}5\%$} & \textbf{\color{sberemerald}$0.48\%$} \\
-          \rowcolor{sberbg} CPU (1 опцион) & $0.05$ мс & $28$ мс & \textbf{\color{sberemerald}0.31 мс} \\
+          \rowcolor{sberbg} Точность $\Delta, \mathcal{V}$ & Низкая & $0.1\%$ & \textbf{\color{sberemerald}$0.049\% / 0.044\%$} \\
+          Гладкость $\Gamma$, Vanna & Неверные & \textbf{\color{sberred}Шум $1\text{--}5\%$} & \textbf{\color{sberemerald}$0.0845\%$} \\
+          \rowcolor{sberbg} CPU (1 опцион) & $0.05$ мс & $28$ мс & \textbf{\color{sberemerald}0.25--0.30 мс} \\
           10,000 опционов & $15$ мс & $3\text{--}5$ мин & \textbf{\color{sberemerald}9.45 мс} \\
           \rowcolor{sberbg} Память RAM & $<1$ МБ & $300$ МБ & \textbf{\color{sberemerald}$<1$ МБ} \\
           \bottomrule
@@ -1174,7 +1172,7 @@
       \end{table}
 
       \begin{exampleblock}{\scriptsize Как мы объединили лучшее из двух миров}
-        \scriptsize Мы используем 2D Копулу / \texttt{QMC + AAD} \textbf{офлайн как учителя} для генерации дифференциальных меток Соболева, а в \textbf{онлайне} гладкая сеть $\text{SiLU}$ со струями Тейлора выдаёт ответ за \textbf{0.31 мс} без статистического шума Монте-Карло на \texttt{Gamma}.
+        \scriptsize Мы используем 2D Копулу / \texttt{QMC + AAD} \textbf{офлайн как учителя} для генерации дифференциальных меток Соболева, а в \textbf{онлайне} гладкая сеть $\text{SiLU}$ со струями Тейлора выдаёт ответ за \textbf{0.25--0.30 мс} без статистического шума Монте-Карло на \texttt{Gamma}.
       \end{exampleblock}
     \end{column}
   \end{columns}
@@ -1209,14 +1207,14 @@
       \begin{exampleblock}{Независимый 17-фазный аудит (SPEC-DEEPVOL-FX-CROSS-003)}
         \begin{itemize}
           \item \textbf{31 из 31 приёмочных гейтов (G1.1 -- G4.7):} статус \textbf{PASS}.
-          \item \textbf{141 чистый аудиторский тест (\texttt{tests/audit/}):} сверка с независимыми оракулами в Wolfram Engine и BrainyCalc.
+          \item \textbf{141 чистый аудиторский тест (\texttt{tests/audit/}, 436 всего):} сверка с независимыми оракулами в Wolfram Engine и BrainyCalc.
           \item \textbf{100\% покрытие строк и ветвей (\texttt{pytest-cov --cov-branch})} на критических модулях:
             \begin{itemize}
               \item \texttt{api/schemas\_fx\_cross.py} --- \textbf{100\%}
               \item \texttt{models/fx\_cross\_safeguards.py} --- \textbf{100\%}
               \item \texttt{mrm/fx\_cross\_guardian.py} --- \textbf{100\%}
             \end{itemize}
-          \item \textbf{Мутационное тестирование:} \textbf{90.5\%} убитых мутантов (проверка чувствительности тестов к замене знаков, коэффициентов кэрри $g$ в $\Gamma$ и $\Theta$).
+          \item \textbf{Мутационное тестирование:} \textbf{90.5\% (133/147)} убитых мутантов (проверка чувствительности тестов к замене знаков, коэффициентов кэрри $g$ в $\Gamma$ и $\Theta$).
           \item \textbf{Fuzzing-тестирование (Hypothesis):} $> 10,000$ случайных валидных и невалидных JSON/Arrow пейлоадов без единого HTTP 500 или утечки памяти на $1,000,000$ запросов.
         \end{itemize}
       \end{exampleblock}
@@ -1281,9 +1279,9 @@
     \begin{column}{0.52\textwidth}
       \begin{block}{Ключевые итоги Proof of Concept}
         \begin{enumerate}
-          \item \textbf{Точность промышленного уровня:} ошибка цены \textbf{0.35 б.п.\ RMSE} относительно 2D копулы и \textbf{100\% совпадение} с продовым калькулятором на глубоких страйках ($K = 10$).
-          \item \textbf{Полный набор из 13 греков за 1 проход:} точное сохранение \texttt{CashDelta} между ногами ($0.00$ руб.\ погрешности) и гладкая \texttt{Gamma} ($0.48\%$ погрешности) без шума Монте-Карло.
-          \item \textbf{Ускорение в 100--400 раз:} \textbf{0.31 мс} на обычном рабочем CPU-ноутбуке и \textbf{0.20 мс} на GPU (\textbf{9.45 мс} на портфель из 10,000 опционов).
+          \item \textbf{Точность промышленного уровня:} ошибка цены \textbf{0.67 б.п.\ MAE} (\textbf{0.90 б.п.} на стрессе) относительно 2D копулы и расхождение с продом на $K=10$ всего \textbf{$-0.86$ б.п.} (из-за 3-дн.\ лага $D_{\text{set}}/D_C$) или \textbf{$-0.00023$ б.п.} при выровненных DF.
+          \item \textbf{Полный набор из 13 греков за 1 проход:} точное сохранение \texttt{CashDelta} между ногами ($0.00$ руб., $< 10^{-15}$) и гладкая \texttt{Gamma} ($\text{MAE} = 0.0845\%$) без шума Монте-Карло.
+          \item \textbf{Ускорение в 100--600 раз:} \textbf{0.25--0.30 мс} на обычном рабочем CPU-ноутбуке и \textbf{0.20 мс} на GPU (\textbf{9.45 мс} на портфель из 10,000 опционов).
           \item \textbf{Готовая интеграция и безопасность:} адаптер \texttt{ConstMessage} $\leftrightarrow$ \texttt{MutableMessage} и автоматический фоллбэк \texttt{FXCrossGuardian}.
         \end{enumerate}
       \end{block}
