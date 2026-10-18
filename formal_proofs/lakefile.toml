@@ -1,0 +1,10 @@
+name = "DeepVolProofs"
+version = "0.1.0"
+defaultTargets = ["deepvolproofs"]
+
+[[lean_lib]]
+name = "DeepVolProofs"
+
+[[lean_exe]]
+name = "deepvolproofs"
+root = "Main"

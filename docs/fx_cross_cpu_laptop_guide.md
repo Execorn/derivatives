@@ -533,3 +533,182 @@ print(f"Gamma:                        {greeks['gamma'].item():.8f}")
 print(f"Vega (per 100 vol-pts):       {greeks['vega'].item():.4f} RUB")
 print(f"Theta (per calendar day):     {greeks['theta'].item():.4f} RUB/day")
 ```
+
+
+```
+Ran command: Grep smile in presentation (`grep -i -C 3 "smile" docs/sber_cib_fx_cross_presentation.html | head -n 40`)
+Ran command: Grep slide titles (`grep -n "СЛАЙД" docs/sber_cib_fx_cross_presentation.html`)
+Viewed sber_cib_fx_cross_presentation.html:1290-1350
+Viewed sber_cib_fx_cross_presentation.html:970-1094
+
+Error: API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server (Error ID: 290ed2ea-bb5e-46c9-9050-93c4ee349c69-572-2010)
+
+Error: API error (attempt 2): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server (Error ID: 290ed2ea-bb5e-46c9-9050-93c4ee349c69-573-2010)
+
+Viewed sber_cib_fx_cross_presentation.html:1795-1835
+Ran command: Grep FXVolatilitySmileCollection (`grep -n -C 10 "FXVolatilitySmileCollection" src/deepvol/legacy/message_adapter.py`)
+Ran command: Find legacy files (`find src/ -name "*message*" -o -name "*legacy*" -o -name "*adapter*"`)
+Ran command: Grep Smile in legacy_adapter.py (`grep -n -C 10 "Smile" src/deepvol/market/legacy_adapter.py`)
+Viewed legacy_adapter.py:485-540
+
+Error: API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server (Error ID: 290ed2ea-bb5e-46c9-9050-93c4ee349c69-584-2010)
+
+Viewed legacy_adapter.py:650-750
+Ran command: Inspect legacy smile fixture (`python3 -c '
+import json
+with open("tests/fixtures/legacy/xaurub_k10_const_messages.json") as f:
+    msgs = json.load(f)
+smiles = [m for m in msgs if m.get("Type") == "FXVolatilitySmileCollection"]
+for s in smiles:
+    val = s["Value"]
+    print("Identifier:", val.get("Identifier"))
+    print("ExpirationDates count:", len(val.get("ExpirationDates", [])))
+    print("Dates:", val.get("ExpirationDates", [])[:4], "...", val.get("ExpirationDates", [])[-2:])
+    quotes = val.get("VolatilityQuotes", [])
+    print("Quotes shape:", len(quotes), "x", len(quotes[0]) if quotes else 0)
+    print("First quote row:", quotes[0] if quotes else "")
+'`)
+Ran command: List legacy fixtures (`ls -la tests/fixtures/legacy/`)
+Ran command: Inspect const message types (`python3 -c '
+import json
+for fname in ["tests/fixtures/legacy/xaurub_k10_const_messages.json", "tests/fixtures/legacy/xaurub_k10_complete_const_messages.json"]:
+    with open(fname) as f:
+        data = json.load(f)
+    print(fname, "length:", len(data))
+    for m in data:
+        print(" ", m.get("Type"), m.get("Value", {}).get("Identifier"))
+'`)
+Ran command: Check JSON structure (`python3 -c '
+import json
+with open("tests/fixtures/legacy/xaurub_k10_complete_const_messages.json") as f:
+    data = json.load(f)
+for i, m in enumerate(data):
+    print(i, m.keys())
+    # print first key-value summary
+    val = list(m.values())[0] if m else {}
+    if isinstance(val, dict):
+        print("  inner keys:", list(val.keys()))
+        if "Type" in val:
+            print("  Type:", val.get("Type"), "Identifier:", val.get("Value", {}).get("Identifier"))
+'`)
+Ran command: Inspect inner types (`python3 -c '
+import json
+with open("tests/fixtures/legacy/xaurub_k10_complete_const_messages.json") as f:
+    data = json.load(f)
+for i, m in enumerate(data):
+    cm = m["ConstMessage"]
+    v = cm["value"]
+    print(i, v.get("Type"), v.get("Value", {}).get("Identifier"))
+'`)
+Ran command: Check keys in value (`python3 -c '
+import json
+with open("tests/fixtures/legacy/xaurub_k10_complete_const_messages.json") as f:
+    data = json.load(f)
+for i in range(min(5, len(data))):
+    print(i, list(data[i]["ConstMessage"]["value"].keys()))
+'`)
+
+Error: API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server (Error ID: 290ed2ea-bb5e-46c9-9050-93c4ee349c69-599-2010)
+
+Ran command: Check VolatilitySurfaces (`python3 -c '
+import json
+with open("tests/fixtures/legacy/xaurub_k10_complete_const_messages.json") as f:
+    data = json.load(f)
+v4 = data[4]["ConstMessage"]["value"]
+print("v4 keys:", list(v4.keys()))
+for vs in v4.get("VolatilitySurfaces", []):
+    print("Surface:", vs)
+'`)
+Ran command: Inspect surface nodes (`python3 -c '
+import json
+with open("tests/fixtures/legacy/xaurub_k10_complete_const_messages.json") as f:
+    data = json.load(f)
+nodes = {m["ConstMessage"]["id"]: m["ConstMessage"]["value"] for m in data}
+for s_id in ["3385a36f93e762e8a0ee7f565e715c3074ed91f2", "48097cfe9b9c3838fc0af016950ecdd65230e5e8"]:
+    val = nodes.get(s_id, {})
+    print("ID:", s_id)
+    print("  TypeName:", val.get("TypeName"))
+    print("  Identifier:", val.get("Identifier"))
+    print("  ExpirationDates:", len(val.get("ExpirationDates", [])), val.get("ExpirationDates", []))
+    print("  Quotes shape:", len(val.get("VolatilityQuotes", [])))
+    print("  Quotes[0]:", val.get("VolatilityQuotes", [])[0] if val.get("VolatilityQuotes") else None)
+'`)
+Ran command: Grep FXLegData in schemas (`grep -n -C 15 "class FXLegData" src/deepvol/api/schemas_fx_cross.py`)
+
+Вопрос затрагивает фундаментальную механику опционного прайсинга и архитектуру интеграции с шиной банка (`PricingService`).
+
+Разберём всё по трём пунктам: **почему смайл один (срез)**, **какой именно смайл берётся** и **нужна ли информация по датам до экспирации**.
+
+---
+
+### 1. Почему на вход подаётся только 1 срез смайла?
+
+В архитектуре движка ([слайд 13](file:///home/execorn/programming/derivatives/docs/sber_cib_fx_cross_presentation.html#L1296) и [`schemas_fx_cross.py`](file:///home/execorn/programming/derivatives/src/deepvol/api/schemas_fx_cross.py#L134-L143)) на вход нейросети и аналитики подаётся **один временной срез волатильности на дату экспирации $T$**, но для **двух базовых ног**:
+* 5 котировок для ноги 1 (`XAU/USD`): $\bm{\xi}_1 = (\sigma_{\text{ATM}}, \text{RR}_{25}, \text{BF}_{25}, \text{RR}_{10}, \text{BF}_{10})$
+* 5 котировок для ноги 2 (`USD/RUB`): $\bm{\xi}_2 = (\sigma_{\text{ATM}}, \text{RR}_{25}, \text{BF}_{25}, \text{RR}_{10}, \text{BF}_{10})$
+
+**Математическая причина:**
+Мы оцениваем **европейский ванильный опцион** (European Vanilla Option). 
+Его выплата зависит **исключительно от терминальной цены в дату экспирации $T$**:
+$$\text{Payoff} = (S^\times(T) - K)^+ = (S_1(T) \cdot S_2(T) - K)^+$$
+
+По фундаментальной теореме оценки активов (теорема Брейдена–Литценбергера):
+$$V(0) = D(0, T) \iint (s_1 s_2 - K)^+ \, p(s_1, s_2; T) \, ds_1 ds_2$$
+Для вычисления этого интеграла необходимо знать **только двумерную плотность вероятности на момент экспирации $T$**: $p(s_1, s_2; T)$. 
+* Маржинальные распределения $p(s_1; T)$ и $p(s_2; T)$ однозначно восстанавливаются из рыночных улыбок ног **именно на дату $T$**.
+* Совместная зависимость задаётся терминальной корреляцией $\rho$.
+
+То, по каким траекториям двигались цены активов $S_1(t)$ и $S_2(t)$ в моменты времени $t < T$, благодаря мартингальному свойству дисконтированной цены **никак не влияет на стоимость европейского опциона**.
+
+---
+
+### 2. Какой именно смайл мы берем?
+
+В реальной прод-системе Сбера (сообщения `ConstMessageGraph` в [legacy_adapter.py](file:///home/execorn/programming/derivatives/src/deepvol/market/legacy_adapter.py#L480-L545)):
+
+1. **На синтетический кросс (`XAU/RUB`) прямого ликвидного рынка опционов и биржевого смайла нет.** 
+   Поэтому из шины берутся две коллекции рыночных поверхностей (`FXVolatilitySmileCollection`):
+   * Поверхность ноги 1: `XAUUSD`
+   * Поверхность ноги 2: `USDRUB`
+2. **В каждой поверхности в банке содержится 15 сроков экспирации** (сетка теноров: `1W, 2W, 1M, 2M, 3M, 6M, 1Y, 2Y, 3Y, 4Y, 5Y, 7Y, 10Y`):
+   ```python
+   # tests/fixtures/legacy/xaurub_k10_complete_const_messages.json
+   "TypeName": "FXVolatilitySmileCollection",
+   "Identifier": "XAUUSD",
+   "ExpirationDates": ["2026-09-10", "2026-09-16", ..., "2036-09-09"] # 15 дат
+   ```
+3. **Какой срез извлекается для расчёта:**
+   Адаптер берёт дату экспирации оцениваемой сделки $T_{\text{exp}}$ (например, $T = 1.989$ года) и вызывает функцию `_interp_smile`:
+   * Находит два ближайших граничных пиллара сетки: $T_k \le T_{\text{exp}} \le T_{k+1}$ (например, $1\text{Y}$ и $2\text{Y}$).
+   * Выполняет безарбитражную **линейную интерполяцию полной дисперсии** (total variance interpolation):
+     $$w(T) = \sigma^2(T) \cdot T = w(T_k)\,\frac{T_{k+1} - T}{T_{k+1} - T_k} + w(T_{k+1})\,\frac{T - T_k}{T_{k+1} - T_k}$$
+   * Полученные 5 котировок на дату $T$ передаются в модель.
+4. **Результирующий кросс-смайл `XAU/RUB`:**
+   Модель сама аналитически строит результирующий кросс-смайл на дату $T$:
+   $$\sigma_\times(K, T) = \sigma_{\beta\text{-split}}(K, T) + w(z)\hat{\varepsilon}_{\text{ML}}$$
+
+---
+
+### 3. Все ли там до expiry date? (И как считается риск-менеджмент)
+
+Здесь важно разделить **прайсинг (PV)** и **управление рисками (Vega-матрица)**:
+
+#### А. Для прайсинга цены (PV)
+**Даты до $T$ не нужны вовсе.** Нам не нужна волатильность на 1 неделю, 1 месяц или 6 месяцев, если сделка экспирируется через 2 года. Терминальная выплата не зависит от промежуточных дат.
+
+#### Б. Для риск-менеджмента (матрица `Vega` 15×5 в `MutableMessage`)
+Трейдеру и риск-офицеру в системе банка требуется разложить чувствительность позиции по **всем 15 биржевым тенорам** кривой волатильности (строки [723–750 в legacy_adapter.py](file:///home/execorn/programming/derivatives/src/deepvol/market/legacy_adapter.py#L723-L750)):
+* Движок считает точную чувствительность цены к срезу на дату экспирации: $\frac{\partial V}{\partial \bm{\sigma}(T)}$.
+* По правилу дифференцирования сложной функции (chain rule) эта вега раскладывается на два соседних опорных пиллара с весами интерполяции $w_k$ и $w_{k+1}$:
+  $$\text{Vega}(T_k) = w_k \cdot \frac{\partial V}{\partial \bm{\sigma}(T)}, \qquad \text{Vega}(T_{k+1}) = w_{k+1} \cdot \frac{\partial V}{\partial \bm{\sigma}(T)}$$
+* Для **всех остальных 13 пилларов** (как тех, что до $T_k$, так и тех, что после $T_{k+1}$) значения в итоговой матрице `Vega` **строго равны 0.00**. Сдвиг 1-недельной или 5-летней волатильности не меняет стоимость 2-летнего ванильного опциона.
+
+#### В. Когда была бы необходима ВСЯ поверхность ДО даты экспирации?
+Вся поверхность волатильности $\sigma(K, t)$ для всех промежуточных моментов времени $0 \le t \le T$ (локальная волатильность Дюпира $\sigma_{\text{loc}}(S, t)$ или стохастическая волатильность) требуется **только для траекторно-зависимых (экзотических) продуктов** ([слайд 27](file:///home/execorn/programming/derivatives/docs/sber_cib_fx_cross_presentation.html#L2135)):
+1. **Барьерные опционы** (Knock-Out / Knock-In): событие касания барьера может произойти в любой день $t \in [0, T]$.
+2. **Американские / Бермудские опционы**: раннее исполнение возможно в даты $t_i < T$.
+3. **Азиатские опционы**: выплата зависит от средней цены $\frac{1}{N}\sum_{i=1}^N S(t_i)$.
+4. **Cancellable Cap / Floor**: право отзыва структурированной ноты анализируется на каждом купонном шаге.
+
+Для **кросс-ванили** достаточно терминального среза на дату экспирации, что и обеспечивает суб-миллисекундную скорость расчёта.
+```
