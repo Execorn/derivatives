@@ -190,6 +190,11 @@ ROADMAP_*.md
 *_TASK.md
 *implementation_plan*.md
 *_AUDIT*.md
+*prompt*.md
+SPEC-*.md
+docs/prompts/
+docs/specifications/
+artifacts/specifications/
 
 
 # ── Compiled Models & Engines ─────────────────────────────────────────────────

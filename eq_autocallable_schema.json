@@ -1,0 +1,783 @@
+{
+  "$comment": "Schema of the EQ autocallable pricing request built by create_eq_autocallable_trade_message (src/request_maker.h:7203). Notation: required = MANDATORY | OPTIONAL. Types: string, bool, int, double, date (qsTime), id (qsGlobalID reference to another message), object, map<string, T>, array<T>. Percent values from MX are divided by 100 before being sent.",
+  "message": "EQAutocallableTradeRequest",
+  "builder": "create_eq_autocallable_trade_message",
+  "fields": {
+    "Product": {
+      "required": "MANDATORY",
+      "type": "object",
+      "ref": "#/objects/AutoCallableProduct"
+    },
+    "Model": {
+      "required": "MANDATORY",
+      "type": "object",
+      "ref": "#/objects/DupireLocalVolatilityModel"
+    },
+    "CalculationMethod": {
+      "required": "MANDATORY",
+      "type": "string",
+      "const": "MonteCarloWithAAD"
+    },
+    "NumberOfPaths": {
+      "required": "MANDATORY",
+      "type": "int",
+      "values": "rtDLL_MODEL_SETTINGS_NUMBER_OF_PATHS, default 32767 when null; 2 when isProbe; divided by 2 when GMP UseSobol == \"1\""
+    },
+    "Queries": {
+      "required": "MANDATORY",
+      "type": "array<string>",
+      "always": ["ProductValue", "CashFlows"],
+      "conditional": {
+        "Delta": "mask(EQ_DELTA|FX_DELTA) && GMP IsDeltaCalc == \"1\"",
+        "Gamma": "mask(EQ_GAMMA|FX_GAMMA) && GMP OtherGreeksCalc == \"1\"",
+        "MultivariateAggregatedCashGamma": "mask(EQ_MULTIVARIATE_AGGREGATED_CASH_GAMMA) && GMP OtherGreeksCalc == \"1\"",
+        "Vega": "mask(EQ_VEGA|FX_VEGA|FX_REGA|FX_SEGA) && GMP IsVegaCalc == \"1\"",
+        "Rho": "mask(RHO|EQ_RHO|EQ_RHO_REPO|EQ_DIV|EQ_BUCKETED_DIV) && GMP IsRhoCalc == \"1\"",
+        "DividendsSensitivities": "mask(EQ_DIV|EQ_BUCKETED_DIV) && GMP IsRhoCalc == \"1\" && GMP IsDivSensCalc == \"1\"",
+        "Theta": "mask(THETA) && GMP OtherGreeksCalc == \"1\"",
+        "Cega": "mask(CEGA|EQ_CEGA_FX_FX) && GMP IsCegaCalc == \"1\"; value is \"ConvexCega\" when EQ_AUTOCALLABLE_CONVEX_CEGA (currently false), otherwise \"Cega\""
+      },
+      "comment": "When GMP Model is empty (no FLEX_MODELS_GREEKS_SETTINGS), all IsXxxCalc/OtherGreeksCalc flags default to true."
+    },
+    "TradeInfo": {
+      "required": "OPTIONAL",
+      "type": "string",
+      "present_if": "tradeNumber.trade > 0",
+      "values": "\"<trade>/<portfolio>\" or \"<trade>/- \" when portfolio is empty"
+    },
+    "StaticDataSet": {
+      "required": "MANDATORY",
+      "type": "id",
+      "values": "sds.get_id(client, mapping) where mapping = sds_get_mapping_for_date(trade, as_of_date)"
+    },
+    "GreekMetricsSettings": {
+      "required": "OPTIONAL",
+      "type": "object",
+      "present_if": "GMP Model is non-empty AND Queries.size() > 1",
+      "ref": "#/objects/GreekMetricsSettings"
+    }
+  },
+
+  "objects": {
+    "AutoCallableProduct": {
+      "TypeName": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "AutoCallableProduct"
+      },
+      "PaymentCurrency": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": "rtDLL_DEAL_PL_CURRENCY (validated equal to leg1/leg2 settlement ccy)"
+      },
+      "StartDate": {
+        "required": "MANDATORY",
+        "type": "date",
+        "values": "leg1 rtDLL_LOAN_START_DATE"
+      },
+      "PaymentDates": {
+        "required": "MANDATORY",
+        "type": "array<date>",
+        "values": "per leg1 period rtDLL_PERIOD_PAYMENT_DATE, length = number_of_periods"
+      },
+      "ObservationDates": {
+        "required": "MANDATORY",
+        "type": "array<date>",
+        "values": "per leg1 period final_fixing_date (last fixing of the period), length = number_of_periods"
+      },
+      "DayCountConvention": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": "convertDayCountConventionToString(numerator) + convertDayCountConventionToString(denominator) from leg1 rtDLL_LOAN_PAYMENT_RATE_CONVENTION_HANDLE",
+        "allowed_parts": ["Act", "30", "30E", "252", "360", "364", "365", "366", "365_25", "366_1", "366_2", "366_3"],
+        "examples": ["Act365", "Act360", "Act252", "30E360", "Act364", "Act366"]
+      },
+      "AutoCallTriggerAbsoluteDigitalSpread": {
+        "required": "MANDATORY",
+        "type": "double",
+        "values": "rtDLL_AUTOCALL_BOX_CALL_SPREAD_LEVEL / 100"
+      },
+      "Strike": {
+        "required": "MANDATORY",
+        "type": "double",
+        "values": "1.0 when FinalPayoffOption == Put (CALL_PUT_STRIKE / 100), otherwise 0.0000001"
+      },
+      "OptionGearing": {
+        "required": "MANDATORY",
+        "type": "double",
+        "values": "rtDLL_AUTOCALL_BOX_CALL_PUT_GEARING / 100 when Put, otherwise 0"
+      },
+      "CallabilityMonitoringIndex": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": ["WorstOf", "BestOf", "AverageOf", "Dispersion", "RatioAB", "RatioBA", "RatioBestWorst", "RatioBestAverage", "RatioAverageWorst", "DiffAB", "DiffBA", "DiffBestWorst", "DiffBestAverage", "DiffAverageWorst"],
+        "comment": "Without AUTOCALL PERF block (or block disabled) the value comes from rtDLL_AUTOCALL_BOX_BASKET_PERFORMANCE and is limited to WorstOf | BestOf | AverageOf. With an enabled block the value is the PS autocall performance type (14 values)."
+      },
+      "AutoCallTriggerLevels": {
+        "required": "MANDATORY",
+        "type": "array<double>",
+        "values": "rtDLL_EXOTIC_DATA_BARRIER_PERIOD_STRIKE(0, i) / 100 for i in [0, BARRIER_NUMBER_OF_DATES)",
+        "throws_if": "no rtDLL_DEAL_EXOTIC_DATA_HANDLE / NUMBER_OF_BARRIERS == 0 / BARRIER_NUMBER_OF_DATES == 0"
+      },
+      "UnderlyingIdentifiers": {
+        "required": "MANDATORY",
+        "type": "array<string>",
+        "values": "period 1 securities (clear_identifier of basket element display labels, HYBRID_DUMMY excluded, sorted)"
+      },
+      "UnderlyingReferenceSpots": {
+        "required": "MANDATORY",
+        "type": "array<double>",
+        "values": "period 1 initial fixing rates, same order as UnderlyingIdentifiers"
+      },
+      "LowerStrike": {
+        "required": "OPTIONAL",
+        "type": "double",
+        "present_if": "AUTOCALL block present && LENBL",
+        "values": "LOWSTR / 100"
+      },
+      "ParticipationCallStrike": {
+        "required": "OPTIONAL",
+        "type": "double",
+        "present_if": "AUTOCALL block present && BENBL",
+        "values": "CALLST / 100"
+      },
+      "ParticipationCallRate": {
+        "required": "OPTIONAL",
+        "type": "double",
+        "present_if": "AUTOCALL block present && BENBL",
+        "values": "CALLRT / 100"
+      },
+      "OneStarStrike": {
+        "required": "OPTIONAL",
+        "type": "double",
+        "present_if": "AUTOCALL block present && OENBL (note only)",
+        "values": "ONEST / 100"
+      },
+      "OneStarCoupon": {
+        "required": "OPTIONAL",
+        "type": "double",
+        "present_if": "AUTOCALL block present && OENBL (note only)",
+        "values": "ONECP / 100"
+      },
+      "ForceCouponsOnAutocall": {
+        "required": "OPTIONAL",
+        "type": "bool",
+        "present_if": "AUTOCALL block present && CAENBL",
+        "const": true
+      },
+      "AllowAutocallOnExpiry": {
+        "required": "OPTIONAL",
+        "type": "bool",
+        "present_if": "AUTOCALL block present && AEENBL",
+        "const": true
+      },
+      "IsLongBasket": {
+        "required": "OPTIONAL",
+        "type": "bool",
+        "present_if": "AUTOCALL block present && LBENBL (note only)",
+        "const": true
+      },
+      "FixedRate": {
+        "required": "OPTIONAL_CONSTRAINED",
+        "type": "double",
+        "present_if": "coupon type in {Fixed, Digital} && rtDLL_LOAN_GENERATOR_DAY_COUNT == true",
+        "values": "Fixed: rtDLL_AUTOCALL_BOX_COUPON / 100; Digital: rtDLL_PERIOD_DIGITAL_RATE(0) / 100",
+        "constraint": "mutually exclusive with FixedCouponAmount"
+      },
+      "FixedCouponAmount": {
+        "required": "OPTIONAL_CONSTRAINED",
+        "type": "double",
+        "present_if": "coupon type in {Fixed, Digital} && rtDLL_LOAN_GENERATOR_DAY_COUNT == false",
+        "values": "Fixed: rtDLL_AUTOCALL_BOX_COUPON / 100; Digital: rtDLL_PERIOD_DIGITAL_RATE(0) / 100",
+        "constraint": "mutually exclusive with FixedRate"
+      },
+      "CouponBarrierLevels": {
+        "required": "OPTIONAL",
+        "type": "array<double>",
+        "present_if": "coupon type == Digital",
+        "values": "rtDLL_PERIOD_MAIN_STRIKE(i) / 100 for i in [0, rtDLL_LOAN_NUMBER_OF_PERIODS)"
+      },
+      "CouponBarrierType": {
+        "required": "OPTIONAL",
+        "type": "string",
+        "present_if": "coupon type == Digital",
+        "const": "In"
+      },
+      "CouponBarrierDirection": {
+        "required": "OPTIONAL",
+        "type": "string",
+        "present_if": "coupon type == Digital",
+        "const": "Up"
+      },
+      "CouponBarrierAbsoluteDigitalSpread": {
+        "required": "OPTIONAL",
+        "type": "double",
+        "present_if": "coupon type == Digital",
+        "values": "AUTOCALL_BOX_CALL_SPREAD_COUPON / 100 when non-zero, otherwise AutoCallTriggerAbsoluteDigitalSpread"
+      },
+      "OptionDownAndInBarrierLevel": {
+        "required": "OPTIONAL",
+        "type": "double",
+        "present_if": "KI barrier type == rtDLL_CST_BARRIER_TYPE_EUROPEAN_DI",
+        "values": "rtDLL_AUTOCALL_BOX_KI_BARRIER / 100"
+      },
+      "OptionDownAndInBarrierAbsoluteDigitalSpread": {
+        "required": "OPTIONAL",
+        "type": "double",
+        "present_if": "KI barrier type == rtDLL_CST_BARRIER_TYPE_EUROPEAN_DI",
+        "values": "get_eq_autocallable_knock_in_spread(leg1) / 100 when non-zero, otherwise AutoCallTriggerAbsoluteDigitalSpread"
+      },
+      "CouponBarrierMonitoringIndex": {
+        "required": "OPTIONAL",
+        "type": "string",
+        "present_if": "AUTOCALL block present && ENBL",
+        "values": ["WorstOf", "BestOf", "AverageOf", "Dispersion", "RatioAB", "RatioBA", "RatioBestWorst", "RatioBestAverage", "RatioAverageWorst", "DiffAB", "DiffBA", "DiffBestWorst", "DiffBestAverage", "DiffAverageWorst"],
+        "source": "CPPERF"
+      },
+      "OptionMonitoringIndex": {
+        "required": "OPTIONAL",
+        "type": "string",
+        "present_if": "AUTOCALL block present && ENBL",
+        "values": ["WorstOf", "BestOf", "AverageOf", "Dispersion", "RatioAB", "RatioBA", "RatioBestWorst", "RatioBestAverage", "RatioAverageWorst", "DiffAB", "DiffBA", "DiffBestWorst", "DiffBestAverage", "DiffAverageWorst"],
+        "source": "POPERF"
+      },
+      "RateIdentifier": {
+        "required": "OPTIONAL",
+        "type": "string",
+        "present_if": "leg2 rtDLL_LOAN_RATE_NATURE == rtDLL_CST_FLOATING_RATE",
+        "values": "clear_identifier(leg2 rtDLL_INDEX_DISPLAY_LABEL)"
+      },
+      "FundingSpread": {
+        "required": "OPTIONAL",
+        "type": "double",
+        "present_if": "leg2 FLOATING || product is warrant",
+        "values": "leg2 rtDLL_LOAN_MAIN_RATE / 100"
+      },
+      "FundingLegPaymentDates": {
+        "required": "OPTIONAL",
+        "type": "array<date>",
+        "present_if": "leg2 rtDLL_LOAN_RATE_NATURE == rtDLL_CST_FLOATING_RATE",
+        "values": "leg2 rtDLL_PERIOD_PAYMENT_DATE(i) for i in [0, leg2 rtDLL_LOAN_NUMBER_OF_PERIODS)"
+      },
+      "NoNotionalRepayment": {
+        "required": "OPTIONAL",
+        "type": "bool",
+        "present_if": "product is swap or warrant",
+        "const": true
+      },
+      "IsMemory": {
+        "required": "OPTIONAL",
+        "type": "bool",
+        "present_if": "rtDLL_AUTOCALL_BOX_IS_MEMORY_EFFECT",
+        "const": true
+      },
+      "AutoCallCoupon": {
+        "required": "OPTIONAL",
+        "type": "double",
+        "present_if": "AUTOCALL block present && AENBL",
+        "values": "AUTOCP / 100"
+      },
+      "PredefinedDividends": {
+        "required": "OPTIONAL",
+        "type": "map<string, object>",
+        "present_if": "AUTOCALL block present && dividend_dates is not empty",
+        "comment": "Key = security identifier from UnderlyingIdentifiers; only securities listed in the UNDR column are emitted.",
+        "value": {
+          "ExDates": {
+            "required": "MANDATORY",
+            "type": "array<date>",
+            "values": "DATE column entries of the AUTOCALL PERF block for this security (mx_to_qstime)"
+          },
+          "Amounts": {
+            "required": "MANDATORY",
+            "type": "array<double>",
+            "values": "CNTDIV column entries of the AUTOCALL PERF block for this security"
+          }
+        }
+      }
+    },
+
+    "DupireLocalVolatilityModel": {
+      "TypeName": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "DupireLocalVolatilityModel"
+      },
+      "MarketDataSet": {
+        "required": "MANDATORY",
+        "type": "object",
+        "ref": "#/objects/MarketDataSet"
+      },
+      "FinancingCurveIdentifiers": {
+        "required": "MANDATORY",
+        "type": "array<string>",
+        "values": "tinfo.financing_curves: payment-currency discount curve plus every equity forward/discount curve (FX forward curves are not registered here)"
+      },
+      "UseNumeraireCurrencyParameterForCrossCurrency": {
+        "required": "MANDATORY",
+        "type": "bool",
+        "const": false
+      }
+    },
+
+    "MarketDataSet": {
+      "TypeName": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "MarketDataSet"
+      },
+      "AsOfDate": {
+        "required": "MANDATORY",
+        "type": "date",
+        "values": "rtDLL_EVALUATION_DATE"
+      },
+      "RatesCurvesBundles": {
+        "required": "MANDATORY",
+        "type": "map<string, id>",
+        "values": "all financing objects: payment ccy discount curve, equity forward curves, FX foreign/domestic forward curves (referencing DiscountFactorCurve messages)"
+      },
+      "VolatilitySurfaces": {
+        "required": "MANDATORY",
+        "type": "map<string, id>",
+        "values": "FX volatility surfaces keyed by cleared FX contract name, then equity vol surfaces keyed by cleared index name (referencing FXVolatilitySmileCollection and EquityVolatilitySmileCollection)"
+      },
+      "Spots": {
+        "required": "MANDATORY",
+        "type": "map<string, double>",
+        "values": "mid equity/security spots keyed by index name and FX spots keyed by cleared FX contract name"
+      },
+      "Correlations": {
+        "required": "MANDATORY",
+        "type": "map<string, double>",
+        "values": "key \"<name1>&<name2>\", all unique pairs of basket securities and FX contracts sorted lexicographically; rtDLL_MARKET_DATA_CORRELATION value"
+      },
+      "RepoSpreadCurves": {
+        "required": "OPTIONAL",
+        "type": "map<string, id>",
+        "present_if": "at least one basket element has a non-empty repo curve",
+        "values": "key = index name, value = RepoSpreadCurve message id"
+      },
+      "Dividends": {
+        "required": "OPTIONAL",
+        "type": "map<string, id>",
+        "present_if": "at least one basket element has dividend ex-dates after the reference date",
+        "values": "key = index name, value = Dividends message id"
+      },
+      "Fixings": {
+        "required": "OPTIONAL",
+        "type": "map<string, id>",
+        "present_if": "at least one security has past periods and/or leg2 (floating) has past fixings",
+        "values": "key = security identifier (equity) or leg2 index name (rates), value = Fixings message id"
+      }
+    },
+
+    "GreekMetricsSettings": {
+      "DifferentiationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": ["Bumps", "AAD", "LibTorch"],
+        "comment": "Any other value: the whole GreekMetricsSettings block is omitted."
+      },
+      "BumpParametersOverrides": {
+        "required": "OPTIONAL",
+        "type": "map<string, object>",
+        "present_if": "DifferentiationMethod == Bumps && filtered queries (Delta, Vega, Rho, Cega, DividendsSensitivities) is non-empty",
+        "value": {
+          "MetricMapping": {
+            "required": "MANDATORY",
+            "type": "string",
+            "values": "GMP <Xxx>BumpType (DivSensType for DividendsSensitivities); entry skipped if empty or \"None\""
+          },
+          "StepSize": {
+            "required": "MANDATORY",
+            "type": "array<double>",
+            "values": "[-bump, bump] if MetricMapping ends with \"UpDown\", else [bump]; bump = stod(GMP <Xxx>BumpSize | DivSensSize)"
+          }
+        }
+      },
+      "BatchSizeForMCPath": {
+        "required": "MANDATORY",
+        "type": "int",
+        "present_if": "DifferentiationMethod == LibTorch",
+        "values": "GMP BatchSizeForMCP"
+      },
+      "NumberGenerationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "present_if": "DifferentiationMethod == LibTorch && GMP UseSobol == \"1\"",
+        "const": "Sobol"
+      },
+      "NumberGenerationClass": {
+        "required": "MANDATORY",
+        "type": "string",
+        "present_if": "DifferentiationMethod == LibTorch && GMP UseSobol == \"1\"",
+        "const": "craft"
+      },
+      "PathGenerationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "present_if": "DifferentiationMethod == LibTorch && GMP UseSobol == \"1\"",
+        "const": "BrownianBridge"
+      }
+    },
+
+    "DiscountFactorCurve": {
+      "TypeName": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "DiscountFactorCurve"
+      },
+      "Identifier": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": "clear_identifier(rtDLL_RATE_CURVE_DISPLAY_LABEL)"
+      },
+      "Currency": {
+        "required": "MANDATORY",
+        "type": "string"
+      },
+      "AsOfDate": {
+        "required": "MANDATORY",
+        "type": "date"
+      },
+      "InterpolationDayCountConvention": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": "numerator+denominator from rtDLL_RATE_CURVE_RATE_CONVENTION_HANDLE, see AutoCallableProduct.DayCountConvention parts"
+      },
+      "InterpolationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": ["Linear", "CubicSpline", "MonotoneCubic", "PiecewiseConstantToTheRight", "PiecewiseConstantToTheLeft", "LogLinear", "LME", "Polynomial", "Spline", "Rational", "FwdFwdQuartic", "FwdFwdLinear", "ExpSpline", "ConstrainedCubicSpline", "Quadratic", "AdaptiveSpline", "NelsonSiegelContinuous", "NelsonSiegelDiscrete", "MonotoneConvex"]
+      },
+      "InterpolationSpaceCoordinates": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": ["Rates", "LogarithmOfDiscountFactors", "Factors", "DiscountFactors"],
+        "comment": "\"Rates\" is forced when InterpolationMethod == MonotoneCubic"
+      },
+      "ExtrapolationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "Flat"
+      },
+      "InterpolationLeftLength": {
+        "required": "OPTIONAL",
+        "type": "int",
+        "present_if": "interpolation_left_length != -1",
+        "values": "currently always omitted"
+      },
+      "RateQuoteExpression": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "Percentage"
+      },
+      "RatesSchedule": {
+        "required": "MANDATORY",
+        "type": "object",
+        "values": {
+          "Dates": {
+            "required": "MANDATORY",
+            "type": "array<date>",
+            "comment": "for basis curves an extra end_pillar date is prepended"
+          },
+          "Rates": {
+            "required": "MANDATORY",
+            "type": "array<double>",
+            "comment": "for basis curves the key is Spreads instead and a 0.0 is prepended"
+          },
+          "Spreads": {
+            "required": "OPTIONAL",
+            "type": "array<double>",
+            "present_if": "basis curve"
+          }
+        }
+      },
+      "SpreadType": {
+        "required": "OPTIONAL",
+        "type": "string",
+        "present_if": "basis curve path (currently disabled by '&& false' in create_rate_curve)",
+        "values": ["RatesAdditive", "DiscountFactorMultiplicative"]
+      },
+      "BaseCurve": {
+        "required": "OPTIONAL",
+        "type": "id",
+        "present_if": "basis curve path (currently disabled)"
+      }
+    },
+
+    "RepoSpreadCurve": {
+      "TypeName": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "RepoSpreadCurve"
+      },
+      "Identifier": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": "index name"
+      },
+      "InterpolationDayCountConvention": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "Act360"
+      },
+      "InterpolationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "CubicSpline"
+      },
+      "ExtrapolationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "Flat"
+      },
+      "InterpolationSpaceCoordinates": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "Rates"
+      },
+      "RateQuoteExpression": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "Percentage"
+      },
+      "RatesSchedule": {
+        "required": "MANDATORY",
+        "type": "object",
+        "values": {
+          "Periods": {
+            "required": "MANDATORY",
+            "type": "array<string>",
+            "values": "\"<n>D\" where n = pillar date - evaluation date"
+          },
+          "Rates": {
+            "required": "MANDATORY",
+            "type": "array<double>",
+            "values": "eqDLL_REPO_MARGINS * 100 (percent)"
+          }
+        }
+      }
+    },
+
+    "Dividends": {
+      "TypeName": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "Dividends"
+      },
+      "Identifier": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": "index name"
+      },
+      "CashDividendList": {
+        "required": "MANDATORY",
+        "type": "array<object>",
+        "values": {
+          "ExDate": {
+            "required": "MANDATORY",
+            "type": "date",
+            "comment": "only entries with ExDate > reference date are emitted"
+          },
+          "PaymentDate": {
+            "required": "MANDATORY",
+            "type": "date"
+          },
+          "Amount": {
+            "required": "MANDATORY",
+            "type": "double",
+            "comment": "taxed dividend amount"
+          }
+        }
+      }
+    },
+
+    "EquityVolatilitySmileCollection": {
+      "Identifier": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": "clear_identifier(rtDLL_INDEX_DISPLAY_LABEL)"
+      },
+      "TypeName": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "EquityVolatilitySmileCollection"
+      },
+      "DayCountConvention": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": ["Business252", "Act365"]
+      },
+      "SmileInterpolationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "CubicSpline"
+      },
+      "SmileExtrapolationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "Linear"
+      },
+      "ExpirationDates": {
+        "required": "MANDATORY",
+        "type": "array<date>",
+        "values": "smile option maturities (O/N tenor labelled 1D)"
+      },
+      "Strikes": {
+        "required": "MANDATORY",
+        "type": "array<double>",
+        "values": "strikes of the first maturity"
+      },
+      "VolatilityQuotes": {
+        "required": "MANDATORY",
+        "type": "array<array<double>>",
+        "values": "matrix [maturity][strike] of mid volatilities / 100 (absolute vol)"
+      }
+    },
+
+    "FXVolatilitySmileCollection": {
+      "Identifier": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": "clear_identifier(FX contract label, false)"
+      },
+      "TypeName": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "FXVolatilitySmileCollection"
+      },
+      "AsOfDate": {
+        "required": "MANDATORY",
+        "type": "date"
+      },
+      "Calendar": {
+        "required": "OPTIONAL",
+        "type": "string",
+        "present_if": "calendar label is not empty",
+        "values": "FX contract calendar display label with '_' replaced by ','"
+      },
+      "DayCountConvention": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": ["Bus252", "Act365"],
+        "comment": "Bus252 when rtDLL_FX_CONTRACT_VOLATILITY_CONVENTION == ON_BUSINESS_DAYS"
+      },
+      "SmileInterpolationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": ["Linear", "Smooth", "Polynomial", "CubicSpline"]
+      },
+      "SmileExtrapolationMethod": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": ["Flat", "Linear"]
+      },
+      "ForwardObject": {
+        "required": "OPTIONAL",
+        "type": "id",
+        "present_if": "forward curve id is not null",
+        "comment": "not passed on the eq autocallable path (qsGlobalID() are supplied)"
+      },
+      "FinancingCurve": {
+        "required": "OPTIONAL",
+        "type": "id",
+        "present_if": "financing curve id is not null",
+        "comment": "not passed on the eq autocallable path"
+      },
+      "Deltas": {
+        "required": "MANDATORY",
+        "type": "array<string>",
+        "values": ["ATM", "<n>C", "<n>P", "<n>RR", "<n>BF"],
+        "comment": "RR/BF only for symmetric 5-pillar surface when doRRBF is true, otherwise nC/nP"
+      },
+      "Tenors": {
+        "required": "MANDATORY",
+        "type": "array<string>",
+        "values": "smile maturity labels (O/N relabelled to 1D)"
+      },
+      "VolatilityQuotes": {
+        "required": "MANDATORY",
+        "type": "array<array<double>>",
+        "values": "matrix [maturity][delta] of volatilities with tiny-vol flooring"
+      }
+    },
+
+    "Fixings": {
+      "TypeName": {
+        "required": "MANDATORY",
+        "type": "string",
+        "const": "Fixings"
+      },
+      "Identifier": {
+        "required": "MANDATORY",
+        "type": "string",
+        "values": "equity: security identifier; rates: leg2 index name"
+      },
+      "Dates": {
+        "required": "MANDATORY",
+        "type": "array<date>",
+        "values": "final fixing dates per past period (equity) or fixing dates per past period (rates)"
+      },
+      "Values": {
+        "required": "MANDATORY",
+        "type": "array<double>",
+        "values": "fixing rates, same length and order as Dates"
+      }
+    }
+  },
+
+  "input_sources": {
+    "deal": [
+      "rtDLL_EVALUATION_DATE",
+      "rtDLL_DEAL_MODEL",
+      "rtDLL_DEAL_PL_CURRENCY",
+      "rtDLL_DEAL_GENERATOR_NAME",
+      "rtDLL_DEAL_MARKET_DATA_HANDLE",
+      "rtDLL_DEAL_AUTOCALL_BOX_HANDLE",
+      "rtDLL_DEAL_EXOTIC_DATA_HANDLE",
+      "rtDLL_DEAL_MODEL_SETTINGS_HANDLE (NUMBER_OF_PATHS)",
+      "rtDLL_DEAL_FLEX_HANDLE (AUTOCALL / HYBRID blocks)"
+    ],
+    "loan_leg1": [
+      "rtDLL_LOAN_START_DATE",
+      "rtDLL_LOAN_NUMBER_OF_PERIODS",
+      "rtDLL_LOAN_RATE_NATURE",
+      "rtDLL_LOAN_INDEX_HANDLE",
+      "rtDLL_LOAN_PAYMENT_RATE_CONVENTION_HANDLE",
+      "rtDLL_LOAN_FINAL_CAPITAL_PAYMENT_MODE",
+      "rtDLL_LOAN_LOAN_GENERATOR_HANDLE (DAY_COUNT, PAYMENT_CALENDAR)",
+      "rtDLL_PERIOD_MAIN_STRIKE",
+      "rtDLL_PERIOD_DIGITAL_RATE",
+      "rtDLL_PERIOD_CALC_START_DATE / CALC_END_DATE / PAYMENT_DATE",
+      "rtDLL_PERIOD_FIXING_RESULTS_HANDLE"
+    ],
+    "loan_leg2": [
+      "rtDLL_LOAN_RATE_NATURE",
+      "rtDLL_LOAN_MAIN_RATE",
+      "rtDLL_LOAN_NUMBER_OF_PERIODS",
+      "rtDLL_LOAN_FINAL_CAPITAL_PAYMENT_MODE",
+      "rtDLL_LOAN_INDEX_HANDLE",
+      "rtDLL_PERIOD_PAYMENT_DATE"
+    ],
+    "gmp": "FLEX_MODELS_GREEKS_SETTINGS (user group, fallback DEFAULT) keys: Model, DiffMethod, OtherGreeksCalc, IsDeltaCalc, DeltaBumpType, DeltaBumpSize, IsVegaCalc, VegaBumpType, VegaBumpSize, IsRhoCalc, RhoBumpType, RhoBumpSize, IsCegaCalc, CegaBumpType, CegaBumpSize, IsDivSensCalc, DivSensType, DivSensSize, UseSobol, BatchSizeForMCP"
+  },
+
+  "validation": {
+    "validate_eq_autocallable_trade": [
+      "settlement currency of legs must be empty or equal to trade settlement currency",
+      "only floating FX rate indexations, Factor xP operator with initial return/ratio, in-arrears fixing",
+      "basket index present in indexations and vice versa, no duplicate indices",
+      "non-empty equity basket, no duplicate underlyings, MultiPerf acts as AverageOf (no weights)",
+      "exotic data present, autocall barriers and levels present, counts equal to number of periods",
+      "no zero autocall level, autocall level >= coupon barrier level",
+      "supported performance type (WorstOf/BestOf/MultiPerf), coupon type (Fixed/Digital/Custom/RangeAccrual)",
+      "supported final payoff option type and barrier type, trade must be Note, Swap or Warrant"
+    ],
+    "create_eq_autocallable_product_message": [
+      "coupon type must be Fixed or Digital",
+      "KI barrier type must be None or EuropeanDI",
+      "AUTOCALL PERF block checks: valid perf types, ratio/diff types require a 2-asset basket, non-negative bonus/lower/one-star/autocall-coupon values, lower strike <= strike, one-star/long basket only on notes, dividend columns equal size with allowed underlyings, ascending dates, non-negative amounts, ex-date calendar/shifter set when enabled"
+    ]
+  }
+}

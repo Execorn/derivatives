@@ -17,24 +17,35 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
+import math
+import os
+from pathlib import Path
 import sys
 import time
-import os
+from typing import Any, Dict, List, Optional, Tuple, Union
+import uuid
+
+from cachetools import TTLCache
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
+from numpy.typing import NDArray
+import orjson
+from pydantic import BaseModel, Field, ValidationError, field_validator
+import torch
+
+from deepvol.api.compliance import compliance_monitor
+from deepvol.api.metrics import (
+    fno_greeks_calculation_seconds,
+    fno_pricing_latency_seconds,
+    setup_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-import uuid
-from functools import lru_cache
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
-from cachetools import TTLCache
-import orjson
-
-import numpy as np
-from numpy.typing import NDArray
-import torch
 
 # Limit intra-op threads to prevent CPU core thrashing when executing in thread pools
 try:
@@ -42,19 +53,6 @@ try:
     torch.set_num_interop_threads(1)
 except RuntimeError:
     pass
-
-import math
-from contextlib import asynccontextmanager
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, ValidationError, field_validator
-
-from deepvol.api.metrics import (
-    setup_metrics,
-    fno_pricing_latency_seconds,
-    fno_greeks_calculation_seconds,
-)
-from deepvol.api.compliance import compliance_monitor
 
 # ── path setup ────────────────────────────────────────────────────────────────
 _src = str(Path(__file__).parents[2])
@@ -394,7 +392,6 @@ async def _hot_reload_model_weights(model_name: str):
             pn_file = "param_normalizer_v2.npz"
             yn_file = "iv_normalizer_v2.npz"
 
-        from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
         from deepvol.utils.path_helpers import get_project_root
 
         artifacts_dir = get_project_root() / "artifacts"
@@ -1506,8 +1503,6 @@ async def predict_signature_vol(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ell_tensor = torch.tensor(req.ell, dtype=torch.float32, device=device)
 
-        t0 = time.time()
-
         def _run_pricing():
             S, V, _, _ = simulate_signature_vol_paths(
                 v0=torch.tensor(req.v0, dtype=torch.float32, device=device),
@@ -2047,8 +2042,8 @@ async def autocall_price_batch(
 
 
 # ── WebSocket Risk Streaming Endpoint ──────────────────────────────────────────
-from fastapi import WebSocket, WebSocketDisconnect
-from deepvol.api.websocket_server import ConnectionManager, JSONRouter, TaskGroup
+from fastapi import WebSocket, WebSocketDisconnect  # noqa: E402
+from deepvol.api.websocket_server import ConnectionManager, JSONRouter, TaskGroup  # noqa: E402
 
 manager = ConnectionManager()
 router = JSONRouter(manager)
@@ -2129,7 +2124,6 @@ from deepvol.market.fx_conventions import (  # noqa: E402
     StrangleConvention,
 )
 from deepvol.market.smile_canonicalizer import (  # noqa: E402
-    CanonicalSmile,
     SmileArbitrageError,
     SmileCanonicalizer,
 )
@@ -2758,6 +2752,284 @@ async def fx_cross_price_batch(request: Request) -> Response:
 
 
 app.include_router(fx_cross_router)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §P5  Multi-Asset Equity Autocallable Pricing Router (/eq_autocall)
+# ══════════════════════════════════════════════════════════════════════════════
+
+from deepvol.api.eq_autocall_arrow import (  # noqa: E402
+    ARROW_MIME as EQ_AUTOCALL_ARROW_MIME,
+)
+from deepvol.api.eq_autocall_runtime import (  # noqa: E402
+    EQAutocallRuntime,
+    EQAutocallRuntimeResponse,
+)
+
+_EQ_AUTOCALL_STATE: Dict[str, Any] = {
+    "runtime": None,
+}
+_EQ_AUTOCALL_RW_LOCK = AsyncReadWriteLock()
+
+
+def _init_eq_autocall_state() -> EQAutocallRuntime:
+    runtime = EQAutocallRuntime()
+    _EQ_AUTOCALL_STATE["runtime"] = runtime
+    return runtime
+
+
+def _get_eq_autocall_runtime() -> EQAutocallRuntime:
+    rt = _EQ_AUTOCALL_STATE.get("runtime")
+    if rt is None:
+        rt = _init_eq_autocall_state()
+    return rt
+
+
+eq_autocall_router = APIRouter(prefix="/eq_autocall", tags=["EQ Autocallable"])
+
+
+@eq_autocall_router.get("/health")
+async def eq_autocall_health() -> Dict[str, Any]:
+    """Liveness and model readiness endpoint for the Multi-Asset Equity Autocallable runtime."""
+    rt = _get_eq_autocall_runtime()
+    return {
+        "status": "ok",
+        "device": str(rt.device),
+        "model_version": rt.model_version,
+        "d_max": rt.d_max,
+        "m_max": rt.m_max,
+        "checkpoint_loaded": bool(
+            rt.checkpoint_path is not None and rt.checkpoint_path.is_file()
+        ),
+        "checkpoint_metrics": rt.checkpoint_metrics,
+    }
+
+
+@eq_autocall_router.post("/price", response_model=EQAutocallRuntimeResponse)
+async def eq_autocall_price(
+    request: Request,
+    engine: str = Query(default="auto", description="Pricing engine: auto, surrogate, proxy, or qmc"),
+    include_all_greeks: Optional[bool] = Query(default=None),
+) -> EQAutocallRuntimeResponse:
+    """Prices a single Multi-Asset Equity Autocallable trade from a JSON `EQAutocallableTradeRequest` payload."""
+    async with _EQ_AUTOCALL_RW_LOCK.reader():
+        rt = _get_eq_autocall_runtime()
+        try:
+            body_bytes = await request.body()
+            if not body_bytes:
+                raise ValueError("Empty request body")
+            payload = orjson.loads(body_bytes)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid JSON payload: {exc}") from exc
+
+        try:
+            return rt.price_trade(
+                payload,
+                engine,
+                include_all_greeks=include_all_greeks,
+            )
+        except (ValidationError, ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@eq_autocall_router.post("/price_murex_dag", response_model=EQAutocallRuntimeResponse)
+async def eq_autocall_price_murex_dag(
+    request: Request,
+    engine: str = Query(default="auto", description="Pricing engine: auto, surrogate, proxy, or qmc"),
+    include_all_greeks: bool = Query(default=True),
+) -> EQAutocallRuntimeResponse:
+    """Ingests and prices a raw Murex `ConstantMessageMap` DAG payload (text/plain or JSON `{\"dag_text\": ...}`)."""
+    async with _EQ_AUTOCALL_RW_LOCK.reader():
+        rt = _get_eq_autocall_runtime()
+        body_bytes = await request.body()
+        if not body_bytes:
+            raise HTTPException(status_code=422, detail="Empty Murex DAG request body")
+
+        content_type = request.headers.get("content-type", "text/plain").lower()
+        dag_input: Union[str, Dict[str, Any]]
+        if "application/json" in content_type:
+            try:
+                parsed_json = orjson.loads(body_bytes)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid JSON in Murex DAG request: {exc}") from exc
+            if isinstance(parsed_json, dict) and "dag_text" in parsed_json:
+                dag_input = str(parsed_json["dag_text"])
+            elif isinstance(parsed_json, dict):
+                dag_input = parsed_json
+            elif isinstance(parsed_json, str):
+                dag_input = parsed_json
+            else:
+                raise HTTPException(status_code=422, detail="Unsupported JSON structure for Murex DAG request")
+        else:
+            try:
+                dag_input = body_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid UTF-8 text in Murex DAG request: {exc}") from exc
+
+        try:
+            return rt.price_murex_dag(
+                dag_input,
+                engine,
+                include_all_greeks=include_all_greeks,
+            )
+        except (ValidationError, ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@eq_autocall_router.post("/price_arrow")
+async def eq_autocall_price_arrow(
+    request: Request,
+    compute_greeks: bool = Query(default=True),
+) -> Response:
+    """Vectorized Apache Arrow IPC stream endpoint (`application/vnd.apache.arrow.stream`)."""
+    async with _EQ_AUTOCALL_RW_LOCK.reader():
+        rt = _get_eq_autocall_runtime()
+        body_bytes = await request.body()
+        if not body_bytes:
+            raise HTTPException(status_code=422, detail="Empty Arrow IPC payload")
+
+        try:
+            out_bytes = rt.price_arrow_ipc(
+                body_bytes,
+                compute_greeks,
+            )
+        except (ValidationError, ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        return Response(content=out_bytes, media_type=EQ_AUTOCALL_ARROW_MIME)
+
+
+@eq_autocall_router.post("/price_batch")
+async def eq_autocall_price_batch(
+    request: Request,
+    compute_greeks: bool = Query(default=True),
+    engine: str = Query(default="auto"),
+) -> Response:
+    """Batched valuation and Greek evaluation supporting JSON trade lists, JSON tensor batches, and Apache Arrow IPC."""
+    async with _EQ_AUTOCALL_RW_LOCK.reader():
+        rt = _get_eq_autocall_runtime()
+        content_type = request.headers.get("content-type", "application/json").lower()
+        body_bytes = await request.body()
+        if not body_bytes:
+            raise HTTPException(status_code=422, detail="Empty batch request body")
+
+        if EQ_AUTOCALL_ARROW_MIME in content_type or "application/octet-stream" in content_type:
+            try:
+                arrow_resp = rt.price_arrow_ipc(
+                    body_bytes,
+                    compute_greeks,
+                )
+            except (ValidationError, ValueError, KeyError, TypeError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return Response(content=arrow_resp, media_type=EQ_AUTOCALL_ARROW_MIME)
+
+        try:
+            payload = orjson.loads(body_bytes)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid JSON batch payload: {exc}") from exc
+
+        def _eval_json_batch() -> bytes:
+            t0 = time.perf_counter()
+            if isinstance(payload, list):
+                res_list = rt.price_batch_json(payload, compute_greeks=compute_greeks, engine=engine)
+                dumped = [r.model_dump(mode="json") for r in res_list]
+                return orjson.dumps(dumped)
+
+            if isinstance(payload, dict):
+                if "node_feats" in payload and "sched_feats" in payload:
+                    batch_out = rt.price_tensor_batch(
+                        torch.as_tensor(payload["node_feats"], dtype=torch.float64),
+                        torch.as_tensor(payload["edge_feats"], dtype=torch.float64),
+                        torch.as_tensor(payload["asset_mask"], dtype=torch.float64),
+                        torch.as_tensor(payload["sched_feats"], dtype=torch.float64),
+                        torch.as_tensor(payload["sched_mask"], dtype=torch.float64),
+                        torch.as_tensor(payload["global_feats"], dtype=torch.float64),
+                        spots_t0=(
+                            torch.as_tensor(payload["spots_t0"], dtype=torch.float64)
+                            if "spots_t0" in payload and payload["spots_t0"] is not None
+                            else None
+                        ),
+                        ref_spots=(
+                            torch.as_tensor(payload["ref_spots"], dtype=torch.float64)
+                            if "ref_spots" in payload and payload["ref_spots"] is not None
+                            else None
+                        ),
+                        pv_in_transit=payload.get("pv_in_transit", 0.0),
+                        compute_greeks=bool(payload.get("compute_greeks", compute_greeks)),
+                        compute_cash_gamma=bool(payload.get("compute_greeks", compute_greeks)),
+                    )
+                    lat_ms = (time.perf_counter() - t0) * 1e3
+                    return orjson.dumps(
+                        {
+                            "status": "done",
+                            "batch_size": int(batch_out.product_value.shape[0]),
+                            "product_value": batch_out.product_value.detach().cpu().numpy(),
+                            "stopping_probs": batch_out.stopping_probs.detach().cpu().numpy(),
+                            "survival_probs": batch_out.survival_probs.detach().cpu().numpy(),
+                            "coupon_probs": batch_out.coupon_probs.detach().cpu().numpy(),
+                            "put_loss": batch_out.put_loss.detach().cpu().numpy(),
+                            "delta": batch_out.delta.detach().cpu().numpy(),
+                            "vega_atm": batch_out.vega_atm.detach().cpu().numpy(),
+                            "rho_df": batch_out.rho_df.detach().cpu().numpy(),
+                            "cega": batch_out.cega.detach().cpu().numpy(),
+                            "cash_gamma_euler": (
+                                batch_out.cash_gamma_euler.detach().cpu().numpy()
+                                if batch_out.cash_gamma_euler is not None
+                                else np.zeros(int(batch_out.product_value.shape[0]), dtype=np.float64)
+                            ),
+                            "engine_used": "MaskedEGNO_Surrogate",
+                            "latency_ms": round(lat_ms, 4),
+                        },
+                        option=orjson.OPT_SERIALIZE_NUMPY,
+                    )
+
+                trades_seq = payload.get("requests", payload.get("trades"))
+                if isinstance(trades_seq, list):
+                    eff_cg = bool(payload.get("compute_greeks", compute_greeks))
+                    eff_eng = str(payload.get("engine", engine))
+                    res_list = rt.price_batch_json(
+                        trades_seq,
+                        compute_greeks=eff_cg,
+                        engine=eff_eng,
+                    )
+                    lat_ms = (time.perf_counter() - t0) * 1e3
+                    dumped = [r.model_dump(mode="json") for r in res_list]
+                    return orjson.dumps(
+                        {
+                            "status": "done",
+                            "count": len(dumped),
+                            "results": dumped,
+                            "product_value": [r.ProductValue for r in res_list],
+                            "latency_ms": round(lat_ms, 4),
+                        }
+                    )
+
+            raise ValueError(
+                "JSON batch payload must be a list of trade requests, {'requests': [...]}, or tensor batch dict."
+            )
+
+        try:
+            json_bytes = _eval_json_batch()
+        except (ValidationError, ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        return Response(content=json_bytes, media_type="application/json")
+
+
+app.include_router(eq_autocall_router)
+app.add_api_route(
+    "/v1/price/eq_autocall",
+    eq_autocall_price,
+    methods=["POST"],
+    response_model=EQAutocallRuntimeResponse,
+    tags=["EQ Autocallable"],
+)
+app.add_api_route(
+    "/v1/price/eq_autocall/batch_arrow",
+    eq_autocall_price_arrow,
+    methods=["POST"],
+    tags=["EQ Autocallable"],
+)
 
 
 def main():
