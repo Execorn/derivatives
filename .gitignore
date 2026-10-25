@@ -83,13 +83,12 @@ results/size_*.json
 results/spx_calibration/
 results/vix_term_structure/
 benchmarks/*.npy
+benchmarks/*_results.txt
 
 # ── Model artifacts (legacy / archived weights) ───────────────────────────────
 artifacts/legacy/
 artifacts/reports/
 !artifacts/reports/fx_cross_gates.json
-!artifacts/reports/fx_cross_progress.md
-!artifacts/reports/wolfram_proofs.md
 !artifacts/reports/model_card.json
 !artifacts/reports/spec_deviations.md
 artifacts/data/
