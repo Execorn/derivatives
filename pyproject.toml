@@ -7,7 +7,7 @@ name = "deepvol"
 dynamic = ["version"]
 description = "Deep Volatility: Neural Network Pricing, Calibration, and Hedging Framework"
 readme = "README.md"
-requires-python = ">=3.9,<3.10"
+requires-python = ">=3.9,<3.13"
 license = {text = "MIT"}
 authors = [
     {name = "Execorn Derivatives Team", email = "info@execorn.com"}

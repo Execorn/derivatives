@@ -235,9 +235,7 @@ class CrossAssetDataPipeline:
 
         # Check cache folders
         cache_file = None
-        market_dir = Path("/home/execorn/programming/derivatives/data/market")
-        if not market_dir.exists():
-            market_dir = self.project_root / "data" / "market"
+        market_dir = self.project_root / "data" / "market"
 
         if asset_upper == "SPX":
             cache_file = market_dir / "spx" / f"spx_chain_{date_str}.parquet"

@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import pytest
 import torch
 import torch.nn as nn
@@ -12,9 +13,9 @@ from deepvol.surrogates.fno_model import MirrorPaddedFNO2d, arbitrage_free_regul
 from deepvol.surrogates.normalizers import IVSurfaceNormalizer
 
 def get_iv_normalizer() -> IVSurfaceNormalizer:
-    path = "/home/execorn/programming/derivatives-w3/artifacts/models/iv_normalizer_v2.npz"
-    if os.path.exists(path):
-        return IVSurfaceNormalizer.load(path)
+    path = Path(__file__).resolve().parents[1] / "artifacts" / "models" / "iv_normalizer_v2.npz"
+    if path.exists():
+        return IVSurfaceNormalizer.load(str(path))
     else:
         # Construct mock normalizer if not present
         norm = IVSurfaceNormalizer()

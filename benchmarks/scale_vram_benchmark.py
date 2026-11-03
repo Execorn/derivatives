@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from pathlib import Path
 import numpy as np
 import torch
 import gc
@@ -249,7 +250,10 @@ def run_benchmarks():
         "ceiling": ceiling_results,
         "var": var_results
     }
-    with open("/home/execorn/programming/derivatives/.agents/teamwork_preview_auditor_verification/benchmark_data.json", "w") as f:
+    repo_root = Path(__file__).resolve().parents[1]
+    out_dir = repo_root / "results" / "benchmarks"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "benchmark_data.json", "w") as f:
         json.dump(data, f, indent=4)
     print("\nBenchmark completed and data saved.")
 

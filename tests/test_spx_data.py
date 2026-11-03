@@ -6,6 +6,8 @@ from datetime import date
 from pathlib import Path
 import json
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 from deepvol.market.spx_data import download_spx_chain, clean_chain, to_iv_surface, calibrate_to_market
 
 # Mark the whole module to skip if CUDA is not available
@@ -106,7 +108,7 @@ def test_calibrate_to_market_smoke():
     
     # Clear cache before running to ensure clean run
     cache_dirs = [
-        Path("/home/execorn/programming/derivatives/data/market/spx"),
+        REPO_ROOT / "data" / "market" / "spx",
     ]
     for d in cache_dirs:
         cache_file = d / f"spx_chain_{snapshot_date.strftime('%Y-%m-%d')}.parquet"
@@ -143,7 +145,7 @@ def test_calibrate_to_market_smoke():
     assert res["rmse_bps"] < 5000.0, f"RMSE implausibly large: {res['rmse_bps']:.1f} bps"
     
     # 5. Check JSON result was written to the results directory
-    results_dir = Path("/home/execorn/programming/derivatives/results/spx_calibration")
+    results_dir = REPO_ROOT / "results" / "spx_calibration"
     json_file = results_dir / f"{snapshot_date.strftime('%Y-%m-%d')}.json"
     assert json_file.exists(), f"JSON file {json_file} was not written"
     with open(json_file, "r") as f:

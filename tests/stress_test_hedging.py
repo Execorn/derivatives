@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from pathlib import Path
 import numpy as np
 import pytest
 import torch
@@ -657,7 +658,8 @@ def run_all_and_write_report():
     print("[PASS] test_scalability")
     
     # Generate Markdown Report
-    report_dir = "/home/execorn/programming/derivatives/.agents/challenger_m5_stress_tests"
+    repo_root = Path(__file__).resolve().parents[1]
+    report_dir = str(repo_root / "results" / "stress_tests")
     os.makedirs(report_dir, exist_ok=True)
     report_path = os.path.join(report_dir, "stress_test_report.md")
     

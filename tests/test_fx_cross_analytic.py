@@ -381,7 +381,7 @@ def test_put_call_parity(device: str) -> None:
 
 def test_e1_copula_teacher_regression(device: str) -> None:
     """Test 1.1(i): E1 regression: H1 vs copula fixture <= 0.40 vol-pts (base), <= 1.4 (stress)."""
-    fixture_path = Path("/home/execorn/.gemini/antigravity/brain/68f5b0aa-6936-4500-bd93-1bf0d5ad6b07/scratch/e1_results.json")
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "e1_results.json"
     if not fixture_path.exists():
         pytest.skip("E1 results fixture file not found")
 

@@ -16,8 +16,7 @@ import pytest
 import torch
 
 # Ensure parent and src are in path
-# The test is in /home/execorn/programming/derivatives-w1/tests/
-# parents[0] is tests/, parents[1] is project root /home/execorn/programming/derivatives-w1/
+# parents[0] is tests/, parents[1] is project root
 project_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(project_root / "src"))
 

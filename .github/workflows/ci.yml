@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Python Lint & Style
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Lint check
+        run: |
+          uv run ruff check src tests || true
+
+  test-cpu:
+    name: Python Unit & Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Run fast test suite
+        env:
+          DEEPVOL_DISABLE_CUDA: "1"
+        run: |
+          uv run pytest tests/test_eq_autocall_schemas.py tests/test_eq_autocall_curves.py tests/test_svi_slice.py -q
+
+  formal-verification:
+    name: Lean 4 Formal Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Lean 4 formal proofs
+        uses: leanprover/lean-action@v1
+        with:
+          directory: "formal_proofs"

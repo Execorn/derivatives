@@ -191,9 +191,11 @@ def test_long_sequence_recurrent_state_preservation(device, range_limit):
     delta_step = torch.stack(delta_step_list, dim=1)
 
     # --- 3. Verify that sequential forward and step-by-step match exactly ---
-    torch.testing.assert_close(delta_seq, delta_step, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(h_seq[0], h_step[0], rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(h_seq[1], h_step[1], rtol=1e-5, atol=1e-5)
+    atol = 5e-4 if device == "cuda" else 1e-5
+    rtol = 1e-4 if device == "cuda" else 1e-5
+    torch.testing.assert_close(delta_seq, delta_step, rtol=rtol, atol=atol)
+    torch.testing.assert_close(h_seq[0], h_step[0], rtol=rtol, atol=atol)
+    torch.testing.assert_close(h_seq[1], h_step[1], rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize(

@@ -2,7 +2,7 @@
 
 Covers:
   - Gate G4.6 (`test_G4_6_legacy_murex_dag_end_to_end_ingestion`):
-      End-to-end ingestion of `/home/execorn/programming/derivatives/eq_autocallable_request.txt`
+      End-to-end ingestion of production `eq_autocallable_request.txt`
       via `/eq_autocall/price_murex_dag` and `EQAutocallRuntime.price_murex_dag`, verifying HTTP 200,
       `TradeInfo == "45476647/EMTN_CIB_SEC"`, Tier 0 stripped legacy fields, all 37 `CashFlows` rows,
       `ProductValue` accuracy vs `0.2181930543553945`, and all 8 Greek queries finite and shaped.
@@ -51,7 +51,11 @@ from deepvol.calibration.autocall_sobol_generator import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REF_REQUEST_PATH = REPO_ROOT / "eq_autocallable_request.txt"
+REF_REQUEST_PATH = (
+    REPO_ROOT / "data" / "autocall" / "eq_autocallable_request.txt"
+    if (REPO_ROOT / "data" / "autocall" / "eq_autocallable_request.txt").exists()
+    else REPO_ROOT / "eq_autocallable_request.txt"
+)
 SPEC_PATH = REPO_ROOT / "docs" / "specifications" / "SPEC-DEEPVOL-EQ-AUTOCALL-001.md"
 TRACEABILITY_MATRIX_PATH = (
     REPO_ROOT / "artifacts" / "audit" / "eq_autocall_traceability_matrix.md"

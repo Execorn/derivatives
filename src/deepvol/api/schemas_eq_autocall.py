@@ -1181,10 +1181,27 @@ def parse_murex_autocall_dag(
         return req, _enrich_expected_result(result_from_dict, req)
 
     if isinstance(raw_text_or_dict, Path):
-        text = raw_text_or_dict.read_text(encoding="utf-8")
+        p = raw_text_or_dict
+        if not p.exists():
+            repo_root = Path(__file__).resolve().parents[3]
+            for candidate in [repo_root / "data" / "autocall" / p.name, repo_root / p.name]:
+                if candidate.exists():
+                    p = candidate
+                    break
+        text = p.read_text(encoding="utf-8")
     elif isinstance(raw_text_or_dict, str):
-        if "\n" not in raw_text_or_dict and len(raw_text_or_dict) < 4096 and os.path.isfile(raw_text_or_dict):
-            text = Path(raw_text_or_dict).read_text(encoding="utf-8")
+        if "\n" not in raw_text_or_dict and len(raw_text_or_dict) < 4096:
+            p = Path(raw_text_or_dict)
+            if not p.is_file():
+                repo_root = Path(__file__).resolve().parents[3]
+                for candidate in [repo_root / "data" / "autocall" / p.name, repo_root / p.name]:
+                    if candidate.is_file():
+                        p = candidate
+                        break
+            if p.is_file():
+                text = p.read_text(encoding="utf-8")
+            else:
+                text = raw_text_or_dict
         else:
             text = raw_text_or_dict
     else:

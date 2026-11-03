@@ -5,6 +5,7 @@ Saves detailed log outputs to the challenger's folder.
 
 import sys
 import os
+from pathlib import Path
 import torch
 
 # Ensure we can import from src
@@ -163,8 +164,11 @@ def run_verification():
     log_content = "\n".join(log_lines)
     print(log_content)
 
-    # Save log to challenger folder
-    log_path = "/home/execorn/programming/derivatives/.agents/teamwork_preview_challenger_m3_1/stress_test_log.txt"
+    # Save log to results folder
+    repo_root = Path(__file__).resolve().parents[1]
+    log_dir = repo_root / "results" / "stress_tests"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "stress_test_log.txt"
     with open(log_path, "w") as f:
         f.write(log_content)
     print(f"\nSaved stress test results to {log_path}")

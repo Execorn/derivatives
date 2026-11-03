@@ -1,5 +1,12 @@
 # DeepVol: Neural Operators & Differentiable Pricing for Quantitative Derivatives
 
+[![CI](https://github.com/Execorn/derivatives/actions/workflows/ci.yml/badge.svg)](https://github.com/Execorn/derivatives/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![Tests 1,691 passing](https://img.shields.io/badge/tests-1%2C691%20passing-brightgreen.svg)]()
+[![Lean 4](https://img.shields.io/badge/Lean-4-orange.svg)](formal_proofs/)
+
 > **Master's Thesis Project** — MIPT (ФПМИ, Кафедра БИТ), 2026  
 > *Нейронные сети в ценообразовании производных финансовых инструментов*
 
@@ -95,7 +102,7 @@ from pathlib import Path
 from deepvol.api.eq_autocall_runtime import EQAutocallRuntime
 from deepvol.api.schemas_eq_autocall import parse_murex_autocall_dag
 
-req, bank_ref = parse_murex_autocall_dag(Path("eq_autocallable_request.txt"))
+req, bank_ref = parse_murex_autocall_dag(Path("data/autocall/eq_autocallable_request.txt"))
 req_with_greeks = req.model_copy(
     update={
         "Queries": [

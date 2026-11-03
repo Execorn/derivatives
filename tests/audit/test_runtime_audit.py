@@ -273,7 +273,7 @@ def test_padding_strict_xfail_b1_compile_exists() -> None:
     """A regression test compiling forward_single at GPU B=1 must exist and be marked strict=True."""
     import importlib.util
 
-    test_file = Path("/home/execorn/programming/derivatives/tests/test_api_fx_cross.py")
+    test_file = Path(__file__).resolve().parents[1] / "test_api_fx_cross.py"
     assert test_file.exists(), "tests/test_api_fx_cross.py must exist"
 
     spec = importlib.util.spec_from_file_location("test_api_fx_cross_mod", test_file)

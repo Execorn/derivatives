@@ -234,7 +234,7 @@ def test_grid_convergence(device: str) -> None:
 @pytest.mark.slow
 def test_e1_audit_scenario_reproduction(copula_engine: GaussianCopulaCrossEngine, device: str) -> None:
     """Test 1.2(f): E1 base/stress scenarios reproduce the audit cross vols to 0.02 vol-pts."""
-    fixture_path = Path("/home/execorn/.gemini/antigravity/brain/68f5b0aa-6936-4500-bd93-1bf0d5ad6b07/scratch/e1_results.json")
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "e1_results.json"
     if not fixture_path.exists():
         pytest.skip("E1 results fixture file not found")
 

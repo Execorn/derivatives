@@ -24,7 +24,11 @@ from deepvol.surrogates.eq_autocall_egno import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REF_REQUEST_PATH = REPO_ROOT / "eq_autocallable_request.txt"
+REF_REQUEST_PATH = (
+    REPO_ROOT / "data" / "autocall" / "eq_autocallable_request.txt"
+    if (REPO_ROOT / "data" / "autocall" / "eq_autocallable_request.txt").exists()
+    else REPO_ROOT / "eq_autocallable_request.txt"
+)
 DEFAULT_CKPT_PATH = REPO_ROOT / "artifacts" / "checkpoints" / "eq_autocall_egno.pt"
 
 GATE_G2_1_PROXY_P50_US = 50.0

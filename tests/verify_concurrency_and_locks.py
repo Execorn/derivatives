@@ -38,22 +38,23 @@ def create_patched_server():
         "    from deepvol.greeks.portfolio_greeks import bs_greeks"
     )
     
-    # 3. Fix all Path(__file__) parent resolutions to absolute paths
+    # 3. Fix all Path(__file__) parent resolutions to repo paths
+    repo_root = Path(__file__).resolve().parents[1]
     code = code.replace(
         'Path(__file__).parents[3] / "artifacts"',
-        'Path("/home/execorn/programming/derivatives/artifacts")'
+        f'Path("{repo_root}/artifacts")'
     )
     code = code.replace(
         'Path(__file__).parents[2] / "artifacts"',
-        'Path("/home/execorn/programming/derivatives/artifacts")'
+        f'Path("{repo_root}/artifacts")'
     )
     code = code.replace(
         'Path(__file__).parents[2] / "scripts"',
-        'Path("/home/execorn/programming/derivatives/scripts")'
+        f'Path("{repo_root}/scripts")'
     )
     code = code.replace(
         'Path(__file__).parents[2]',
-        'Path("/home/execorn/programming/derivatives")'
+        f'Path("{repo_root}")'
     )
     
     # 5. Fix the IndentationError in _hot_reload_model_weights

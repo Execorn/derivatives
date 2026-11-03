@@ -22,7 +22,12 @@ from deepvol.market.eq_curves import (
     year_fractions,
 )
 
-REQUEST_TXT_PATH = Path("/home/execorn/programming/derivatives/eq_autocallable_request.txt")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REQUEST_TXT_PATH = (
+    REPO_ROOT / "data" / "autocall" / "eq_autocallable_request.txt"
+    if (REPO_ROOT / "data" / "autocall" / "eq_autocallable_request.txt").exists()
+    else REPO_ROOT / "eq_autocallable_request.txt"
+)
 
 
 def test_G1_1_rub_ruonia_ois_terminal_discount_factor_zero_ulp() -> None:

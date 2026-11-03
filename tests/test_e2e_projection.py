@@ -6,6 +6,7 @@ violations and that the pricing MSE remains extremely low.
 """
 
 import os
+from pathlib import Path
 import pytest
 import numpy as np
 import torch
@@ -24,8 +25,8 @@ def test_e2e_no_arbitrage_and_low_mse():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running E2E tests on: {device}")
     
-    # 1. Resolve paths
-    dataset_path = "/home/execorn/programming/derivatives/data/HestonDataset_v1.npz"
+    repo_root = Path(__file__).resolve().parents[1]
+    dataset_path = str(repo_root / "data" / "HestonDataset_v1.npz")
     weights_path = "artifacts/weights/fno_heston_best.pth"
     norm_param_path = "artifacts/models/param_normalizer_heston.npz"
     norm_iv_path = "artifacts/models/iv_normalizer_heston.npz"

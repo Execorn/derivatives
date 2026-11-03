@@ -10,6 +10,7 @@ Supports CUDA execution and mixed-precision boundaries.
 import os
 import sys
 import time
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -22,10 +23,10 @@ from deepvol.surrogates.fno_model import MirrorPaddedFNO2d, arbitrage_free_regul
 from deepvol.surrogates.normalizers import ParameterNormalizerHeston, IVSurfaceNormalizer
 
 # --- Config ---
+REPO_ROOT = Path(__file__).resolve().parents[3]
 DATASET_PATH = os.environ.get(
     "DATASET_PATH",
-    "data/HestonDataset_v1.npz" if os.path.exists("data/HestonDataset_v1.npz")
-    else "/home/execorn/programming/derivatives/data/HestonDataset_v1.npz"
+    str(REPO_ROOT / "data" / "HestonDataset_v1.npz")
 )
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 K_GRID = np.linspace(-0.5, 0.5, 11)

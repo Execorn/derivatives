@@ -741,10 +741,9 @@ def main():
     # Save to file
     out_path = args.output
     if not out_path:
-        # Save to both locations: derivatives-w4 and derivatives
+        repo_root = Path(__file__).resolve().parents[3]
         out_paths = [
-            Path("/home/execorn/programming/derivatives-w4/results/latency_breakdown/results.json"),
-            Path("/home/execorn/programming/derivatives/results/latency_breakdown/results.json")
+            repo_root / "results" / "latency_breakdown" / "results.json"
         ]
     else:
         out_paths = [Path(out_path)]

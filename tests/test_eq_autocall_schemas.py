@@ -34,7 +34,12 @@ from deepvol.api.schemas_eq_autocall import (
     parse_murex_autocall_dag,
 )
 
-REQUEST_TXT_PATH = Path("/home/execorn/programming/derivatives/eq_autocallable_request.txt")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REQUEST_TXT_PATH = (
+    REPO_ROOT / "data" / "autocall" / "eq_autocallable_request.txt"
+    if (REPO_ROOT / "data" / "autocall" / "eq_autocallable_request.txt").exists()
+    else REPO_ROOT / "eq_autocallable_request.txt"
+)
 
 
 def test_enums_completeness() -> None:
@@ -97,7 +102,7 @@ def test_enums_completeness() -> None:
 
 
 def test_parse_murex_autocall_dag_production_fixture() -> None:
-    """Verifies 0-error parsing of `/home/execorn/programming/derivatives/eq_autocallable_request.txt`."""
+    """Verifies 0-error parsing of production autocall request fixture."""
     raw_text = REQUEST_TXT_PATH.read_text(encoding="utf-8")
     req, expected_res = parse_murex_autocall_dag(raw_text)
 

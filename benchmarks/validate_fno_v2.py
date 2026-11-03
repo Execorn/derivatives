@@ -9,8 +9,7 @@ Loads the FNO v2 model (trained on Fourier-COS dataset, N=20) and computes:
 Expected: R² > 0.92, MAE < 0.5% IV, all Jacobian columns non-zero.
 
 Usage:
-    /home/execorn/programming/derivatives/.venv/bin/python \
-        benchmarks/validate_fno_v2.py
+    python benchmarks/validate_fno_v2.py
 """
 
 import os

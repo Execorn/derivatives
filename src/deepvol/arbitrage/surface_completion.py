@@ -619,11 +619,11 @@ def complete_surface(sparse_iv: np.ndarray,
         model = MirrorPaddedFNO2d()
 
         # Find the weights file
+        repo_root = Path(__file__).resolve().parents[3]
         weights_paths = [
+            str(repo_root / "artifacts" / "weights" / "fno_v2_final_prod.pth"),
             "artifacts/weights/fno_v2_final_prod.pth",
-            "/home/execorn/programming/derivatives-w2/artifacts/weights/fno_v2_final_prod.pth",
-            "/home/execorn/programming/derivatives/artifacts/weights/fno_v2_final_prod.pth",
-            ]
+        ]
         weights_path = None
         for w_p in weights_paths:
             if Path(w_p).exists():

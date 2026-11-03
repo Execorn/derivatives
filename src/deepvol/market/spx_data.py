@@ -20,6 +20,7 @@ import threading
 import py_vollib_vectorized
 
 _LOCK = threading.Lock()
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # ── Grid definition (must match FNO training grid) ──────────────────────────
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])   # years
@@ -48,7 +49,7 @@ def download_spx_chain(snapshot_date: date, cache: bool = True) -> pd.DataFrame:
     
     # Check if parquet cache exists
     cache_dirs = [
-        Path("/home/execorn/programming/derivatives/data/market/spx"),
+        REPO_ROOT / "data" / "market" / "spx",
     ]
     for d in cache_dirs:
         cache_file = d / f"spx_chain_{date_str}.parquet"
@@ -131,7 +132,7 @@ def download_spx_chain(snapshot_date: date, cache: bool = True) -> pd.DataFrame:
         # The is_v3 comparison was broken: _NORM_VERSIONS["v1"] path tuple
         # never equals _NORM_VERSIONS["v3"] tuple, so version was always "v2".
         version = "v3"
-        weights_paths = ["/home/execorn/programming/derivatives/artifacts/weights/fno_v3_final_prod.pth"]
+        weights_paths = [str(REPO_ROOT / "artifacts" / "weights" / "fno_v3_final_prod.pth")]
         weights_path = None
         for w_p in weights_paths:
             if Path(w_p).exists():
@@ -382,7 +383,7 @@ def to_iv_surface(df: pd.DataFrame,
 
         # Always use v3 (6-param Rough Heston with learnable H).
         version = "v3"
-        weights_paths = ["/home/execorn/programming/derivatives/artifacts/weights/fno_v3_final_prod.pth"]
+        weights_paths = [str(REPO_ROOT / "artifacts" / "weights" / "fno_v3_final_prod.pth")]
         weights_path = None
         for w_p in weights_paths:
             if Path(w_p).exists():
@@ -512,9 +513,9 @@ def calibrate_to_market(snapshot_date: date,
         model = MirrorPaddedFNO2d()
         
         if fix_H:
-            weights_paths = ["/home/execorn/programming/derivatives/artifacts/weights/fno_v2_final_prod.pth"]
+            weights_paths = [str(REPO_ROOT / "artifacts" / "weights" / "fno_v2_final_prod.pth")]
         else:
-            weights_paths = ["/home/execorn/programming/derivatives/artifacts/weights/fno_v3_final_prod.pth"]
+            weights_paths = [str(REPO_ROOT / "artifacts" / "weights" / "fno_v3_final_prod.pth")]
             
         weights_path = None
         for w_p in weights_paths:
@@ -569,7 +570,7 @@ def calibrate_to_market(snapshot_date: date,
     
     # Save results to JSON
     results_dirs = [
-        Path("/home/execorn/programming/derivatives/results/spx_calibration"),
+        REPO_ROOT / "results" / "spx_calibration",
     ]
     for rd in results_dirs:
         rd.mkdir(parents=True, exist_ok=True)

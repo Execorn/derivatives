@@ -26,8 +26,7 @@ Thesis context: §4.1 — justification for discarding v1 and regenerating with
 the corrected Fourier-COS pipeline.
 
 Usage:
-    /home/execorn/programming/derivatives/.venv/bin/python \
-        benchmarks/vs_cuda_mc.py
+    python benchmarks/vs_cuda_mc.py
 """
 
 import os

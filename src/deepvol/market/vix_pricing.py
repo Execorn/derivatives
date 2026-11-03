@@ -33,8 +33,7 @@ def _get_fno_model():
         model = MirrorPaddedFNO2d()
         # Look for weights
         weights_paths = [
-            Path(__file__).parents[3] / "artifacts" / "weights" / "fno_v2_final_prod.pth",
-            Path("/home/execorn/programming/derivatives/artifacts/weights/fno_v2_final_prod.pth")
+            Path(__file__).resolve().parents[3] / "artifacts" / "weights" / "fno_v2_final_prod.pth",
         ]
         weights_path = None
         for w_p in weights_paths:

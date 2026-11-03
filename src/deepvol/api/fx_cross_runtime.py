@@ -270,6 +270,8 @@ class FXCrossRuntime:
         if not self.is_cuda:
             self.graphs_captured = True
             return
+        if self.graphs_captured:
+            return
 
         self.engine = self.engine.to(self.device)
         torch.cuda.empty_cache()
@@ -618,7 +620,7 @@ class FXCrossGPUExecutor:
         if self._running:
             return
         self._running = True
-        if getattr(self._cpu_fallback_pool, "_shutdown", False):
+        if self._cpu_fallback_pool is None or getattr(self._cpu_fallback_pool, "_shutdown", False):
             self._cpu_fallback_pool = ThreadPoolExecutor(
                 max_workers=4, thread_name_prefix="deepvol-cpu-fallback"
             )
@@ -644,8 +646,9 @@ class FXCrossGPUExecutor:
         self._running = False
         self._queue.put(self._stop_sentinel)
         if self._worker_thread is not None:
-            self._worker_thread.join(timeout=5.0)
-        self._cpu_fallback_pool.shutdown(wait=False)
+            self._worker_thread.join(timeout=10.0)
+            self._worker_thread = None
+        self._cpu_fallback_pool.shutdown(wait=True)
 
     @property
     def queue_depth(self) -> int:

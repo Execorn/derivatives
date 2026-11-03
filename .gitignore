@@ -42,9 +42,9 @@ Thumbs.db
 Desktop.ini
 *.bak
 
-# ── Logs (keep folder, ignore content) ───────────────────────────────────────
-logs/*
-!logs/.gitkeep
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
 
 # ── LaTeX compilation cache and aux files ────────────────────────────────────
 tex/.latex_cache/*
