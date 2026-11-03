@@ -50,7 +50,7 @@ jobs:
         env:
           DEEPVOL_DISABLE_CUDA: "1"
         run: |
-          uv run pytest tests/test_eq_autocall_schemas.py tests/test_eq_autocall_curves.py tests/test_svi_slice.py -q
+          uv run --extra test pytest tests/test_eq_autocall_schemas.py tests/test_eq_autocall_curves.py tests/test_svi_slice.py -q
 
   formal-verification:
     name: Lean 4 Formal Verification
