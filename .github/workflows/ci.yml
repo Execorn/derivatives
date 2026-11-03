@@ -62,4 +62,4 @@ jobs:
       - name: Build Lean 4 formal proofs
         uses: leanprover/lean-action@v1
         with:
-          directory: "formal_proofs"
+          lake-package-directory: "formal_proofs"

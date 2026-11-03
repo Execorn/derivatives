@@ -90,6 +90,9 @@ include = ["deepvol*"]
 [tool.setuptools.dynamic]
 version = {attr = "deepvol.__version__"}
 
+[tool.uv.extra-build-dependencies]
+iisignature = ["numpy"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
