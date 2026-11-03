@@ -14,8 +14,7 @@ if cpp_path not in sys.path:
 try:
     import deepvol_cuda
 except ImportError:
-    # Fallback to importing without path hacking if already on system path
-    import deepvol_cuda
+    deepvol_cuda = None
 
 from deepvol.hedging.pivot_iv import pivot_implied_vol
 
@@ -60,6 +59,11 @@ class GreyRoughBergomiCalibrator(nn.Module):
 
         T_max = float(self.T_grid.max().item())
         dt = T_max / steps
+
+        if deepvol_cuda is None:
+            raise RuntimeError(
+                "deepvol_cuda extension module is not installed or available."
+            )
 
         # Simulates paths using deepvol_cuda.generate_grey_paths_cuda
         # S shape: (B, paths, steps + 1)
