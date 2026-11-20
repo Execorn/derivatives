@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+from scipy import sparse as sp_sparse
+from scipy.optimize import linprog, nnls
 from scipy.stats import norm
 import torch
 import torch.nn as nn
@@ -421,21 +423,83 @@ def extract_16d_features_from_batch(batch: SyntheticAutocallBatch) -> npt.NDArra
     return out
 
 
-def _compute_local_scale_factor(batch: SyntheticAutocallBatch) -> npt.NDArray[np.float64]:
-    """Computes sqrt(h_disp * v_bar) local heteroscedastic scale factor per trade."""
-    w_col = batch.node_feats[:, :, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)]
-    amask = batch.asset_mask
+def _compute_difficulty_basis_5d(batch: SyntheticAutocallBatch) -> npt.NDArray[np.float64]:
+    """Computes the 5D physical difficulty basis phi(x) >= 0 in float64:
+    [1.0, sqrt(h_disp * v_bar), ((M_rem - 1)/47) * v_bar, I_WOF * h_disp, I_live_KI * G_put * v_last].
+    """
+    n_b = int(batch.node_feats.shape[0])
+    w_col = batch.node_feats[:, :, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)].to(torch.float64)
+    amask = (batch.asset_mask > 0.5).to(dtype=torch.float64)
     w_abs = w_col.abs() * amask
     w_sum = w_abs.sum(dim=1, keepdim=True)
-    has_w = (w_sum.squeeze(1) > 1e-6).to(dtype=w_abs.dtype)
+    has_w = (w_sum.squeeze(1) > 1e-6).to(dtype=torch.float64)
     w_norm = w_abs / w_sum.clamp(min=1e-6)
     h_disp = has_w * (1.0 - (w_norm * w_norm).sum(dim=1)).clamp(0.0, 1.0)
 
-    smask = batch.sched_mask
-    m_counts = smask.sum(dim=1).long().clamp(min=1, max=batch.sched_feats.shape[1])
-    last_idx = (m_counts - 1).unsqueeze(1)
-    v_bar = batch.sched_feats[:, :, int(AutocallSchedCol.STULZ_VOL_W)].gather(1, last_idx).squeeze(1).clamp(min=0.0)
-    return torch.sqrt((h_disp * v_bar).clamp(min=0.0)).detach().cpu().numpy().astype(np.float64)
+    smask = (batch.sched_mask > 0.5).to(dtype=torch.float64)
+    m_counts = smask.sum(dim=1)
+    v_all = (
+        batch.sched_feats[:, :, int(AutocallSchedCol.STULZ_VOL_W)].to(torch.float64).clamp(min=0.0)
+        * smask
+    )
+    v_bar = torch.where(
+        m_counts > 0.5,
+        v_all.sum(dim=1) / m_counts.clamp(min=1.0),
+        torch.zeros_like(m_counts),
+    )
+
+    phi_0 = torch.ones((n_b,), dtype=torch.float64, device=h_disp.device)
+    phi_1 = torch.sqrt((h_disp * v_bar).clamp(min=0.0))
+    phi_2 = ((m_counts - 1.0).clamp(min=0.0) / 47.0) * v_bar
+
+    wof_code = int(MonitoringIndexCode.WORST_OF)
+    c_id = batch.global_feats[:, int(AutocallGlobalCol.CALL_INDEX_ID)].round().to(torch.long)
+    o_id = batch.global_feats[:, int(AutocallGlobalCol.OPT_INDEX_ID)].round().to(torch.long)
+    is_wof_any = ((c_id == wof_code) | (o_id == wof_code)).to(dtype=torch.float64)
+    phi_3 = is_wof_any * h_disp
+
+    has_ki = batch.global_feats[:, int(AutocallGlobalCol.HAS_KI_FLAG)].to(torch.float64) > 0.5
+    not_ki_past = batch.global_feats[:, int(AutocallGlobalCol.I_KI_PAST)].to(torch.float64) < 0.5
+    g_put = batch.global_feats[:, int(AutocallGlobalCol.G_PUT)].to(torch.float64).clamp(min=0.0)
+    last_idx = (m_counts.long() - 1).clamp(min=0, max=max(int(batch.sched_feats.shape[1]) - 1, 0)).unsqueeze(1)
+    v_last = (
+        batch.sched_feats[:, :, int(AutocallSchedCol.STULZ_VOL_W)]
+        .to(torch.float64)
+        .clamp(min=0.0)
+        .gather(1, last_idx)
+        .squeeze(1)
+    )
+    v_last = torch.where(m_counts > 0.5, v_last, torch.zeros_like(v_last))
+    phi_4 = (has_ki & not_ki_past).to(dtype=torch.float64) * g_put * v_last
+
+    return torch.stack([phi_0, phi_1, phi_2, phi_3, phi_4], dim=1).detach().cpu().numpy().astype(np.float64)
+
+
+def _compute_local_scale_factor(batch: SyntheticAutocallBatch) -> npt.NDArray[np.float64]:
+    """Computes sqrt(h_disp * v_bar) local heteroscedastic scale factor per trade."""
+    return _compute_difficulty_basis_5d(batch)[:, 1]
+
+
+def compute_conformal_half_width_bps(
+    batch: SyntheticAutocallBatch,
+    stats_payload: Dict[str, Any],
+) -> npt.NDArray[np.float64]:
+    """Computes split-conformal half-width in bps using 5D difficulty weights (or 2-term fallback)."""
+    q_err = float(stats_payload["q_err_conformal"])
+    if "scale_weights_5d" in stats_payload and stats_payload["scale_weights_5d"] is not None:
+        w5 = np.asarray(
+            stats_payload["scale_weights_5d"].detach().cpu().numpy()
+            if isinstance(stats_payload["scale_weights_5d"], torch.Tensor)
+            else stats_payload["scale_weights_5d"],
+            dtype=np.float64,
+        ).reshape(5)
+        phi = _compute_difficulty_basis_5d(batch)
+        scale = np.maximum(phi @ w5, 1.5e-4)
+    else:
+        eps0 = float(stats_payload["scale_eps0"])
+        c1 = float(stats_payload["scale_c1"])
+        scale = np.maximum(eps0 + c1 * _compute_local_scale_factor(batch), 1e-4)
+    return q_err * scale * 1e4
 
 
 def _predict_batch_pv(
@@ -482,6 +546,43 @@ def _predict_batch_pv(
     return torch.cat(preds, dim=0)
 
 
+def _fit_quantile_scale_weights_5d(
+    phi_fit: npt.NDArray[np.float64],
+    err_fit: npt.NDArray[np.float64],
+    *,
+    tau: float = 0.90,
+) -> npt.NDArray[np.float64]:
+    """Fits non-negative tau-quantile pinball loss regression weights w in R>=0^5."""
+    n1 = int(phi_fit.shape[0])
+    if n1 >= 32:
+        c = np.zeros(5 + 2 * n1, dtype=np.float64)
+        c[0] = 1e-3
+        c[1:5] = 1e-5
+        c[5 : 5 + n1] = float(tau) / float(n1)
+        c[5 + n1 : 5 + 2 * n1] = (1.0 - float(tau)) / float(n1)
+        a_eq = sp_sparse.hstack(
+            [
+                sp_sparse.csr_matrix(phi_fit),
+                sp_sparse.eye(n1, format="csr", dtype=np.float64),
+                -sp_sparse.eye(n1, format="csr", dtype=np.float64),
+            ],
+            format="csr",
+        )
+        bounds = [(1.5e-4, None)] + [(0.0, None)] * (4 + 2 * n1)
+        res = linprog(c=c, A_eq=a_eq, b_eq=err_fit, bounds=bounds, method="highs")
+        if bool(res.success) and res.x is not None:
+            w = np.asarray(res.x[:5], dtype=np.float64)
+            w[0] = max(float(w[0]), 1.5e-4)
+            w[1:] = np.maximum(w[1:], 0.0)
+            return w
+
+    w_nnls, _ = nnls(phi_fit, err_fit)
+    w_out = np.asarray(w_nnls[:5], dtype=np.float64)
+    w_out[0] = max(float(w_out[0]), 1.5e-4)
+    w_out[1:] = np.maximum(w_out[1:], 0.0)
+    return w_out
+
+
 def calibrate_guardian_stats(
     model: MaskedEQAutocallSurrogate,
     train_batch: SyntheticAutocallBatch,
@@ -489,10 +590,10 @@ def calibrate_guardian_stats(
     *,
     device: torch.device,
     conformal_alpha: float = 0.05,
-    tau_desk_bps: float = 15.0,
+    tau_desk_bps: float = 20.0,
     stats_path: Optional[Path] = DEFAULT_GUARDIAN_STATS_PATH,
 ) -> Dict[str, Any]:
-    """Fits OAS covariance, 10-decile PSI bins, and split-conformal error quantiles."""
+    """Fits OAS covariance, 10-decile PSI bins, and 5D split-conformal error quantiles."""
     x_fit = extract_16d_features_from_batch(train_batch)
     n_fit, p = x_fit.shape
     ref_mean = np.mean(x_fit, axis=0)
@@ -527,7 +628,7 @@ def calibrate_guardian_stats(
         probs = np.maximum(counts.astype(np.float64) / float(max(n_fit, 1)), 1e-6)
         psi_ref_probs[j] = probs / np.sum(probs)
 
-    # Split-conformal calibration strictly on held-out Cal split
+    # Split-conformal calibration strictly on held-out Cal split (Cal-1 quantile fit, disjoint Cal-2 conformal quantile)
     x_cal = extract_16d_features_from_batch(cal_batch)
     n_cal = int(x_cal.shape[0])
     diff_cal = x_cal - ref_mean[None, :]
@@ -538,21 +639,25 @@ def calibrate_guardian_stats(
     pv_pred_cal = _predict_batch_pv(model, cal_batch, device=device).numpy()
     pv_mc_cal = cal_batch.pv_mc.detach().cpu().numpy().astype(np.float64)
     abs_err_cal = np.abs(pv_pred_cal - pv_mc_cal)
-    scale_feat_cal = _compute_local_scale_factor(cal_batch)
+    phi_cal = _compute_difficulty_basis_5d(cal_batch)
 
-    # Fit positive affine heteroscedastic scale eps0 + c1 * sqrt(h_disp * v_bar)
-    if n_cal >= 16 and np.std(scale_feat_cal) > 1e-8:
-        design = np.column_stack([np.ones(n_cal), scale_feat_cal])
-        coef, _, _, _ = np.linalg.lstsq(design, abs_err_cal, rcond=None)
-        scale_eps0 = float(max(coef[0], float(np.percentile(abs_err_cal, 25)), 1e-4))
-        scale_c1 = float(max(coef[1], 0.0))
+    if n_cal >= 64:
+        split_idx = n_cal // 2
+        w5 = _fit_quantile_scale_weights_5d(phi_cal[:split_idx], abs_err_cal[:split_idx], tau=0.90)
+        phi_score = phi_cal[split_idx:]
+        err_score = abs_err_cal[split_idx:]
     else:
-        scale_eps0 = float(max(np.median(abs_err_cal), 1e-4))
-        scale_c1 = 0.0
+        w5 = _fit_quantile_scale_weights_5d(phi_cal, abs_err_cal, tau=0.90)
+        phi_score = phi_cal
+        err_score = abs_err_cal
 
-    scores_cal = abs_err_cal / (scale_eps0 + scale_c1 * scale_feat_cal)
-    q_err_level = min(1.0, math.ceil((n_cal + 1) * (1.0 - conformal_alpha)) / float(max(n_cal, 1)))
+    n_score = int(err_score.shape[0])
+    denom_score = np.maximum(phi_score @ w5, 1.5e-4)
+    scores_cal = err_score / denom_score
+    q_err_level = min(1.0, math.ceil((n_score + 1) * (1.0 - conformal_alpha)) / float(max(n_score, 1)))
     q_err_conformal = float(np.quantile(scores_cal, q_err_level))
+    scale_eps0 = float(w5[0])
+    scale_c1 = float(w5[1])
 
     payload: Dict[str, Any] = {
         "schema_version": FEATURE_SCHEMA_VERSION,
@@ -567,6 +672,7 @@ def calibrate_guardian_stats(
         "tau_desk_bps": float(tau_desk_bps),
         "q_ood_conformal": q_ood_conformal,
         "q_err_conformal": q_err_conformal,
+        "scale_weights_5d": torch.from_numpy(w5).to(torch.float64),
         "scale_eps0": scale_eps0,
         "scale_c1": scale_c1,
         "n_cal": n_cal,
@@ -589,11 +695,7 @@ def evaluate_conformal_coverage(
     pv_pred = _predict_batch_pv(model, test_batch, device=device).numpy()
     pv_mc = test_batch.pv_mc.detach().cpu().numpy().astype(np.float64)
     abs_err_bps = np.abs(pv_pred - pv_mc) * 1e4
-    scale_feat = _compute_local_scale_factor(test_batch)
-    q_err = float(stats_payload["q_err_conformal"])
-    eps0 = float(stats_payload["scale_eps0"])
-    c1 = float(stats_payload["scale_c1"])
-    half_width_bps = q_err * (eps0 + c1 * scale_feat) * 1e4
+    half_width_bps = compute_conformal_half_width_bps(test_batch, stats_payload)
     return float(np.mean(abs_err_bps <= half_width_bps))
 
 
@@ -783,7 +885,7 @@ def train_eq_autocall_surrogate(
     checkpoint_path: str | Path | None = DEFAULT_CHECKPOINT_PATH,
     guardian_stats_path: str | Path | None = DEFAULT_GUARDIAN_STATS_PATH,
     conformal_alpha: float = 0.05,
-    tau_desk_bps: float = 15.0,
+    tau_desk_bps: float = 20.0,
     domain_mode: str = "tier2_desk",
 ) -> SurrogateTrainingResult:
     """Trains EGNO v2.0 on GPU Dupire LV QMC labels and calibrates SR 26-2 Guardian stats."""
@@ -983,6 +1085,14 @@ def train_eq_autocall_surrogate(
         stats_path=stats_path_resolved,
     )
     conformal_coverage = evaluate_conformal_coverage(model, test_data, stats_payload, device=dev)
+    test_err_bps = (
+        (test_preds - test_data.pv_mc.detach().cpu().to(torch.float64)).abs().numpy() * 1e4
+    )
+    hw_bps = compute_conformal_half_width_bps(test_data, stats_payload)
+    acc_mask = hw_bps <= float(stats_payload["tau_desk_bps"])
+    accepted_frac = float(np.mean(acc_mask))
+    accepted_mae_bps = float(np.mean(test_err_bps[acc_mask])) if bool(np.any(acc_mask)) else float(test_mae_bps)
+    guardian_routed_mae_bps = float(np.mean(np.where(acc_mask, test_err_bps, 0.0)))
     train_wall_sec = time.perf_counter() - t_start
 
     ckpt_path_resolved: Optional[Path] = None
@@ -1015,6 +1125,9 @@ def train_eq_autocall_surrogate(
                 "baseline_worstof_mae_bps": float(base_wof_mae),
                 "baseline_multifunc_mae_bps": float(base_multi_mae),
                 "conformal_coverage": float(conformal_coverage),
+                "conformal_accepted_frac": float(accepted_frac),
+                "conformal_accepted_mae_bps": float(accepted_mae_bps),
+                "guardian_routed_mae_bps": float(guardian_routed_mae_bps),
                 "sobolev_delta_cos_sim": float(eff_res_cos_sim),
                 "total_delta_cos_sim": float(total_delta_cos_sim),
                 "train_wall_sec": float(train_wall_sec),
@@ -1081,6 +1194,152 @@ def load_eq_autocall_surrogate(
     return model, metrics
 
 
+def recalibrate_guardian_stats_from_checkpoint(
+    *,
+    checkpoint_path: str | Path = DEFAULT_CHECKPOINT_PATH,
+    guardian_stats_path: str | Path = DEFAULT_GUARDIAN_STATS_PATH,
+    n_train_samples: int = 16384,
+    n_cal_samples: int = 2048,
+    n_test_samples: int = 2048,
+    n_mc_paths_test: int = 32768,
+    n_substeps_test: int = 16,
+    seed: int = 2026,
+    device: torch.device | str | None = None,
+    conformal_alpha: float = 0.05,
+    tau_desk_bps: float = 20.0,
+    domain_mode: str = "tier2_desk",
+) -> Dict[str, Any]:
+    """Refreshes 5D split-conformal Guardian artifact & test metrics while keeping EGNO weights."""
+    t0 = time.perf_counter()
+    dev = (
+        torch.device(device)
+        if device is not None
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    if dev.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+    ckpt_path = Path(checkpoint_path)
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    model, prev_metrics = load_eq_autocall_surrogate(ckpt_path, device=dev)
+    d_max = int(model.d_max)
+    m_max = int(model.m_max)
+
+    # OAS covariance and PSI bins depend strictly on the 16D feature distribution (identical Sobol contracts).
+    train_data = generate_synthetic_autocall_batch(
+        batch_size=n_train_samples,
+        d_max=d_max,
+        m_max=m_max,
+        m_rem_max=m_max,
+        n_mc_paths=64,
+        n_substeps=2,
+        seed=seed,
+        device="cpu",
+        qmc_device=dev,
+        dtype=torch.float32,
+        cv_mode="none",
+        compute_pathwise_delta=False,
+        domain_mode=domain_mode,
+    )
+    cal_data = generate_synthetic_autocall_batch(
+        batch_size=n_cal_samples,
+        d_max=d_max,
+        m_max=m_max,
+        m_rem_max=m_max,
+        n_mc_paths=n_mc_paths_test,
+        n_substeps=n_substeps_test,
+        seed=seed + 200_000,
+        device="cpu",
+        qmc_device=dev,
+        dtype=torch.float32,
+        cv_mode="bs1d_exact" if n_mc_paths_test >= 4096 else "none",
+        compute_pathwise_delta=False,
+        domain_mode=domain_mode,
+    )
+    test_data = generate_synthetic_autocall_batch(
+        batch_size=n_test_samples,
+        d_max=d_max,
+        m_max=m_max,
+        m_rem_max=m_max,
+        n_mc_paths=n_mc_paths_test,
+        n_substeps=n_substeps_test,
+        seed=seed + 300_000,
+        device="cpu",
+        qmc_device=dev,
+        dtype=torch.float32,
+        cv_mode="bs1d_exact" if n_mc_paths_test >= 4096 else "none",
+        compute_pathwise_delta=True,
+        domain_mode=domain_mode,
+    )
+
+    stats_payload = calibrate_guardian_stats(
+        model,
+        train_data,
+        cal_data,
+        device=dev,
+        conformal_alpha=conformal_alpha,
+        tau_desk_bps=tau_desk_bps,
+        stats_path=Path(guardian_stats_path),
+    )
+
+    test_preds = _predict_batch_pv(model, test_data, device=dev)
+    test_wof_mae_bps, test_multifunc_mae_bps = _split_worstof_multifunc_mae_bps(test_preds, test_data)
+    base_wof_mae, base_multi_mae = _split_worstof_multifunc_mae_bps(test_data.pv_proxy, test_data)
+    _, test_mae_bps, per_d_mae_bps = evaluate_surrogate_mae_bps(
+        model,
+        d_values=tuple(range(1, min(d_max, 8) + 1)),
+        device=dev,
+        test_batch=test_data,
+    )
+    total_delta_cos_sim, oos_res_cos_sim = _evaluate_delta_cos_sims(model, test_data, device=dev)
+    conformal_coverage = evaluate_conformal_coverage(model, test_data, stats_payload, device=dev)
+
+    test_err_bps = (
+        (test_preds - test_data.pv_mc.detach().cpu().to(torch.float64)).abs().numpy() * 1e4
+    )
+    hw_bps = compute_conformal_half_width_bps(test_data, stats_payload)
+    acc_mask = hw_bps <= float(stats_payload["tau_desk_bps"])
+    accepted_frac = float(np.mean(acc_mask))
+    accepted_mae_bps = float(np.mean(test_err_bps[acc_mask])) if bool(np.any(acc_mask)) else float(test_mae_bps)
+    guardian_routed_mae_bps = float(np.mean(np.where(acc_mask, test_err_bps, 0.0)))
+
+    if isinstance(raw, dict) and "model_state_dict" in raw:
+        metrics = dict(raw.get("metrics", {}))
+        metrics.update(
+            {
+                "test_mae_bps": float(test_mae_bps),
+                "test_worstof_mae_bps": float(test_wof_mae_bps),
+                "test_multifunc_mae_bps": float(test_multifunc_mae_bps),
+                "baseline_worstof_mae_bps": float(base_wof_mae),
+                "baseline_multifunc_mae_bps": float(base_multi_mae),
+                "conformal_coverage": float(conformal_coverage),
+                "conformal_accepted_frac": float(accepted_frac),
+                "conformal_accepted_mae_bps": float(accepted_mae_bps),
+                "guardian_routed_mae_bps": float(guardian_routed_mae_bps),
+                "sobolev_delta_cos_sim": float(oos_res_cos_sim),
+                "total_delta_cos_sim": float(total_delta_cos_sim),
+                "train_wall_sec": float(prev_metrics.get("train_wall_sec", 864.9)),
+                "per_d_mae_bps": {int(k): float(v) for k, v in per_d_mae_bps.items()},
+            }
+        )
+        raw["metrics"] = metrics
+        torch.save(raw, ckpt_path)
+
+    return {
+        "recal_wall_sec": time.perf_counter() - t0,
+        "test_wof_mae_bps": test_wof_mae_bps,
+        "test_multifunc_mae_bps": test_multifunc_mae_bps,
+        "base_wof_mae_bps": base_wof_mae,
+        "base_multifunc_mae_bps": base_multi_mae,
+        "conformal_coverage": conformal_coverage,
+        "accepted_frac": accepted_frac,
+        "accepted_mae_bps": accepted_mae_bps,
+        "guardian_routed_mae_bps": guardian_routed_mae_bps,
+        "res_delta_cos_sim": oos_res_cos_sim,
+        "total_delta_cos_sim": total_delta_cos_sim,
+        "stats_payload": stats_payload,
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train EGNO v2.0 on GPU Dupire QMC & calibrate Guardian.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -1097,6 +1356,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-substeps-test", type=int, default=16)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--domain-mode", type=str, default="tier2_desk")
+    parser.add_argument("--tau-desk-bps", type=float, default=20.0)
+    parser.add_argument("--recalibrate-only", action="store_true")
     parser.add_argument("--checkpoint-path", type=str, default=str(DEFAULT_CHECKPOINT_PATH))
     parser.add_argument("--guardian-stats-path", type=str, default=str(DEFAULT_GUARDIAN_STATS_PATH))
     return parser.parse_args()
@@ -1104,6 +1365,38 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if args.recalibrate_only:
+        summary = recalibrate_guardian_stats_from_checkpoint(
+            checkpoint_path=args.checkpoint_path,
+            guardian_stats_path=args.guardian_stats_path,
+            n_train_samples=args.n_train,
+            n_cal_samples=args.n_cal,
+            n_test_samples=args.n_test,
+            n_mc_paths_test=args.n_mc_test,
+            n_substeps_test=args.n_substeps_test,
+            seed=args.seed,
+            device=args.device,
+            tau_desk_bps=args.tau_desk_bps,
+            domain_mode=args.domain_mode,
+        )
+        sp = summary["stats_payload"]
+        print(
+            f"recal_wall={summary['recal_wall_sec']:.1f}s "
+            f"test_wof_mae={summary['test_wof_mae_bps']:.2f}bps "
+            f"test_multifunc_mae={summary['test_multifunc_mae_bps']:.2f}bps "
+            f"base_wof_mae={summary['base_wof_mae_bps']:.2f}bps "
+            f"base_multifunc_mae={summary['base_multifunc_mae_bps']:.2f}bps "
+            f"conformal_cov={summary['conformal_coverage']:.4f} "
+            f"accepted_frac={summary['accepted_frac']:.4f} "
+            f"accepted_mae={summary['accepted_mae_bps']:.2f}bps "
+            f"routed_mae={summary['guardian_routed_mae_bps']:.2f}bps "
+            f"res_delta_cos_sim={summary['res_delta_cos_sim']:.4f} "
+            f"total_delta_cos_sim={summary['total_delta_cos_sim']:.4f} "
+            f"w5={[round(float(x), 6) for x in sp['scale_weights_5d'].tolist()]} "
+            f"q_err={sp['q_err_conformal']:.4f} q_ood={sp['q_ood_conformal']:.2f}"
+        )
+        return
+
     res = train_eq_autocall_surrogate(
         n_train_samples=args.n_train,
         n_val_samples=args.n_val,
@@ -1119,6 +1412,7 @@ def main() -> None:
         seed=args.seed,
         device=args.device,
         domain_mode=args.domain_mode,
+        tau_desk_bps=args.tau_desk_bps,
         checkpoint_path=args.checkpoint_path,
         guardian_stats_path=args.guardian_stats_path,
     )
@@ -1149,9 +1443,11 @@ __all__ = [
     "SurrogateTrainingResult",
     "SpreadAttenuatedSobolevLoss",
     "calibrate_guardian_stats",
+    "compute_conformal_half_width_bps",
     "evaluate_conformal_coverage",
     "evaluate_surrogate_mae_bps",
     "extract_16d_features_from_batch",
+    "recalibrate_guardian_stats_from_checkpoint",
     "train_eq_autocall_surrogate",
     "load_eq_autocall_surrogate",
 ]

@@ -570,7 +570,7 @@ def _build_contract_state_and_jacs(
 
     def _draw_spread() -> float:
         if domain_mode == "tier2_desk":
-            return -(0.015 + 0.045 * float(rng.random()))
+            return -(0.005 + 0.135 * float(rng.random()))
         u_s = float(rng.random())
         if u_s < 0.05:
             return 0.0
