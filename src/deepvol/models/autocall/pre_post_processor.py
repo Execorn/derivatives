@@ -1328,7 +1328,10 @@ def preprocess_eq_autocall(
     delta_tau_t = torch.as_tensor(seasoned.delta_tau, dtype=torch.float64, device=device)
     tau_pay_t = torch.as_tensor(seasoned.tau_pay, dtype=torch.float64, device=device)
 
-    if d_assets > 0:
+    all_use_disc_curve = d_assets > 0 and all(
+        asset_fin_curves.get(t, disc_curve_obj) is disc_curve_obj for t in sorted_ids
+    )
+    if all_use_disc_curve:
         df_obs_t = div_out.df_fin_obs[0]
     else:
         df_obs_np = np.array([df_fin_fn(d) for d in seasoned.future_obs_dates], dtype=np.float64)
@@ -1657,6 +1660,7 @@ def assemble_autocall_cashflows_and_pv(
     option_se: float = 0.0,
     total_se: float | None = None,
     df_fin_fn_override: Callable[[datetime.datetime], torch.Tensor | float] | None = None,
+    df_fwd_fn_override: Callable[[datetime.datetime], torch.Tensor | float] | None = None,
     build_cashflow_items: bool = True,
 ) -> AutocallPostprocOutput:
     """Executes the W1 affine stopping-time cash-flow and ProductValue post-processor in float64."""
@@ -1784,7 +1788,9 @@ def assemble_autocall_cashflows_and_pv(
             or (f_curve_id is not None and disc_id is not None and f_curve_id == disc_id)
         )
         df_fwd_fn: Callable[[datetime.datetime], torch.Tensor | float]
-        if f_rid is not None and not same_curve:
+        if df_fwd_fn_override is not None:
+            df_fwd_fn = df_fwd_fn_override
+        elif f_rid is not None and not same_curve:
             _, df_fwd_fn = build_discount_rate_evaluator(f_curve, as_of_dt)
         else:
             df_fwd_fn = df_fin_fn
@@ -1817,8 +1823,18 @@ def assemble_autocall_cashflows_and_pv(
                 else:
                     df_prev_fwd = df_fwd_fn(prev_f_dt)
                     df_curr_fwd = df_fwd_fn(f_dt)
-                    if isinstance(df_curr_fwd, torch.Tensor):
-                        r_fwd_j = (df_prev_fwd / df_curr_fwd.clamp(min=1e-12) - 1.0) / max(alpha_j, 1e-8)
+                    if isinstance(df_curr_fwd, torch.Tensor) or isinstance(df_prev_fwd, torch.Tensor):
+                        df_prev_t = (
+                            df_prev_fwd
+                            if isinstance(df_prev_fwd, torch.Tensor)
+                            else torch.tensor(float(df_prev_fwd), dtype=torch.float64, device=device)
+                        )
+                        df_curr_t = (
+                            df_curr_fwd
+                            if isinstance(df_curr_fwd, torch.Tensor)
+                            else torch.tensor(float(df_curr_fwd), dtype=torch.float64, device=device)
+                        )
+                        r_fwd_j = (df_prev_t / df_curr_t.clamp(min=1e-12) - 1.0) / max(alpha_j, 1e-8)
                     else:
                         r_fwd_j = (
                             float(df_prev_fwd) / max(float(df_curr_fwd), 1e-12) - 1.0

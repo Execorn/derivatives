@@ -40,6 +40,7 @@ _INV_SQRT2PI: float = 0.39894228040143267793994605993438
 _SQRT_HALF_PI: float = 1.2533141373155002512078826424055
 _SQRT_TWO_OVER_PI: float = 0.79788456080286535587989211986876
 _TIE_TAU: float = 0.008
+_VOL_TIE_TAU: float = 0.004
 
 
 def _ndtr_scalar(x: float) -> float:
@@ -411,154 +412,147 @@ def _clark_symmetrized_torch(
     if w_tie_max < 1e-12:
         return _eval_masked_clark_order(ord_f)
 
-    # Symmetrized vol-ordered / cyclic reductions matching C++23 & PureNumPy exactly
+    def _symmetrized_vol_clark_batch(
+        f_b: torch.Tensor,
+        v_b: torch.Tensor,
+        c_b: torch.Tensor,
+        ord_v_b: torch.Tensor,
+        best_of: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pure-PyTorch C^inf vol-tie-blended Clark moments (f_sym, m2_sym, w_sym)."""
+        b_sub, d_sub = f_b.shape
+        if d_sub == 0:
+            z1 = torch.zeros(b_sub, dtype=torch.float64, device=device)
+            return z1, z1, torch.zeros((b_sub, 0), dtype=torch.float64, device=device)
+        if d_sub == 1:
+            f1 = f_b[:, 0]
+            v1 = v_b[:, 0]
+            return f1, f1 * f1 * torch.exp(v1 * v1), torch.ones((b_sub, 1), dtype=torch.float64, device=device)
+
+        def _avg_rev_pair(perm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            f1, v1, w1 = _clark_one_order_torch(f_b, v_b, c_b, perm, best_of)
+            f2, v2, w2 = _clark_one_order_torch(f_b, v_b, c_b, torch.flip(perm, dims=[1]), best_of)
+            return (
+                0.5 * (f1 + f2),
+                0.5 * (f1 * f1 * torch.exp(v1 * v1) + f2 * f2 * torch.exp(v2 * v2)),
+                0.5 * (w1 + w2),
+            )
+
+        if d_sub == 2:
+            return _avg_rev_pair(ord_v_b)
+
+        dv_mat = v_b.unsqueeze(2) - v_b.unsqueeze(1)
+        u_all = (0.5 * (dv_mat * dv_mat).sum(dim=(1, 2))) / (_VOL_TIE_TAU * _VOL_TIE_TAU)
+        w_v_all = torch.exp(-(u_all * u_all).clamp(max=80.0))
+        w_v_min = float(w_v_all.detach().min().item())
+        w_v_max = float(w_v_all.detach().max().item())
+
+        if w_v_min > 1.0 - 1e-15:
+            f_cyc, m2_cyc, w_cyc = _avg_rev_pair(ord_v_b)
+            for s in range(1, d_sub):
+                fs, m2s, ws = _avg_rev_pair(torch.roll(ord_v_b, shifts=-s, dims=1))
+                f_cyc = f_cyc + fs
+                m2_cyc = m2_cyc + m2s
+                w_cyc = w_cyc + ws
+            inv_d = 1.0 / float(d_sub)
+            return f_cyc * inv_d, m2_cyc * inv_d, w_cyc * inv_d
+
+        f_0, m2_0, w_0 = _avg_rev_pair(ord_v_b)
+        v_sorted = torch.gather(v_b, 1, ord_v_b)
+        f_pair_num = f_0
+        m2_pair_num = m2_0
+        w_pair_num = w_0
+        denom = torch.ones_like(f_0)
+        for k in range(d_sub - 1):
+            z_k = (v_sorted[:, k + 1] - v_sorted[:, k]) / _VOL_TIE_TAU
+            alpha_k = torch.exp(-(z_k * z_k * z_k * z_k).clamp(max=80.0))
+            if float(alpha_k.detach().max().item()) > 1e-15:
+                sw_k = ord_v_b.clone()
+                sw_k[:, k] = ord_v_b[:, k + 1]
+                sw_k[:, k + 1] = ord_v_b[:, k]
+                fk, m2k, wk = _avg_rev_pair(sw_k)
+                f_pair_num = f_pair_num + alpha_k * fk
+                m2_pair_num = m2_pair_num + alpha_k * m2k
+                w_pair_num = w_pair_num + alpha_k.unsqueeze(1) * wk
+                denom = denom + alpha_k
+        inv_den = 1.0 / denom
+        f_pair = f_pair_num * inv_den
+        m2_pair = m2_pair_num * inv_den
+        w_pair = w_pair_num * inv_den.unsqueeze(1)
+
+        if w_v_max < 1e-15:
+            return f_pair, m2_pair, w_pair
+
+        f_cyc = f_0
+        m2_cyc = m2_0
+        w_cyc = w_0
+        for s in range(1, d_sub):
+            fs, m2s, ws = _avg_rev_pair(torch.roll(ord_v_b, shifts=-s, dims=1))
+            f_cyc = f_cyc + fs
+            m2_cyc = m2_cyc + m2s
+            w_cyc = w_cyc + ws
+        inv_d = 1.0 / float(d_sub)
+        f_cyc = f_cyc * inv_d
+        m2_cyc = m2_cyc * inv_d
+        w_cyc = w_cyc * inv_d
+        one_m_w = 1.0 - w_v_all
+        return (
+            one_m_w * f_pair + w_v_all * f_cyc,
+            one_m_w * m2_pair + w_v_all * m2_cyc,
+            one_m_w.unsqueeze(1) * w_pair + w_v_all.unsqueeze(1) * w_cyc,
+        )
+
+    # Pure-PyTorch symmetrized vol-ordered / cyclic reductions (functorch-safe)
     v_key = torch.where(active_b, v_safe.detach(), torch.full_like(v_safe, 1e12))
     ord_v = torch.argsort(v_key, dim=1, stable=True)
 
-    # Check if masked or heterogeneous active counts across batch: run row-wise permutation list cleanly
-    # when all rows share the same active asset count (common batched case) or per-row.
     if mask_in is None:
-        # Build permutations over all d_max assets based on row 0 or batched
-        v_np = v_safe.detach().cpu().numpy()
-        ord_v_np = ord_v.cpu().numpy()
-        # Check whether all rows share the same v-tie regime
-        same_perms = True
-        row0_ord = ord_v_np[0].tolist()
-        v0 = v_np[0]
-        if float(v0[row0_ord[-1]] - v0[row0_ord[0]]) <= 1e-5:
-            perms_list = [row0_ord[s:] + row0_ord[:s] for s in range(d_max)]
-            perms_list = perms_list + [list(reversed(p)) for p in perms_list]
-        else:
-            perms_list = [row0_ord, list(reversed(row0_ord))]
-            for k in range(d_max - 1):
-                if abs(float(v0[row0_ord[k + 1]] - v0[row0_ord[k]])) <= 1e-5:
-                    sw = list(row0_ord)
-                    sw[k], sw[k + 1] = sw[k + 1], sw[k]
-                    perms_list.append(sw)
-                    perms_list.append(list(reversed(sw)))
-        # Check if every row has identical permutation count / tie structure, else evaluate full cyclic+rev
-        for r in range(1, b_size):
-            rr = ord_v_np[r].tolist()
-            vr = v_np[r]
-            if (float(vr[rr[-1]] - vr[rr[0]]) <= 1e-5) != (float(v0[row0_ord[-1]] - v0[row0_ord[0]]) <= 1e-5):
-                same_perms = False
-                break
-        if not same_perms:
-            # Uniform cyclic+rev over ord_v is always S_D symmetric on tied vols and C^inf
-            perms_t_list = [torch.roll(ord_v, shifts=-s, dims=1) for s in range(d_max)]
-            perms_t_list = perms_t_list + [torch.flip(p, dims=[1]) for p in perms_t_list]
-        else:
-            # Build per-row tensor permutations matching ord_v[r]
-            n_perms = len(perms_list)
-            perms_t_list = []
-            # If simple uniform case, build via torch ops on ord_v to stay general for all rows
-            if float(v0[row0_ord[-1]] - v0[row0_ord[0]]) <= 1e-5:
-                perms_t_list = [torch.roll(ord_v, shifts=-s, dims=1) for s in range(d_max)]
-                perms_t_list = perms_t_list + [torch.flip(p, dims=[1]) for p in perms_t_list]
-            elif n_perms == 2:
-                perms_t_list = [ord_v, torch.flip(ord_v, dims=[1])]
-            else:
-                # Per-row tie swap list
-                row_perms: List[List[List[int]]] = []
-                max_p = 0
-                for r in range(b_size):
-                    rr = ord_v_np[r].tolist()
-                    vr = v_np[r]
-                    rp = [rr, list(reversed(rr))]
-                    for k in range(d_max - 1):
-                        if abs(float(vr[rr[k + 1]] - vr[rr[k]])) <= 1e-5:
-                            sw = list(rr)
-                            sw[k], sw[k + 1] = sw[k + 1], sw[k]
-                            rp.append(sw)
-                            rp.append(list(reversed(sw)))
-                    row_perms.append(rp)
-                    max_p = max(max_p, len(rp))
-                if all(len(rp) == max_p for rp in row_perms):
-                    for pi in range(max_p):
-                        perms_t_list.append(
-                            torch.tensor([rp[pi] for rp in row_perms], dtype=torch.long, device=device)
-                        )
-                else:
-                    perms_t_list = [torch.roll(ord_v, shifts=-s, dims=1) for s in range(d_max)]
-                    perms_t_list = perms_t_list + [torch.flip(p, dims=[1]) for p in perms_t_list]
-
-        f_acc = torch.zeros(b_size, dtype=torch.float64, device=device)
-        m2_acc = torch.zeros(b_size, dtype=torch.float64, device=device)
-        w_acc = torch.zeros((b_size, d_max), dtype=torch.float64, device=device)
-        for p_t in perms_t_list:
-            fp, vp, wp = _clark_one_order_torch(f_safe, v_safe, c_safe, p_t, is_best_of)
-            f_acc = f_acc + fp
-            m2_acc = m2_acc + fp * fp * torch.exp(vp * vp)
-            w_acc = w_acc + wp
-        inv_k = 1.0 / float(len(perms_t_list))
-        f_sym = f_acc * inv_k
-        m2_sym = m2_acc * inv_k
-        v_sym = torch.sqrt(torch.clamp(torch.log(torch.clamp(m2_sym / (f_sym * f_sym).clamp(min=1e-30), min=1.0)), min=1e-16))
-        w_sym = w_acc * inv_k
+        f_sym, m2_sym, w_sym = _symmetrized_vol_clark_batch(f_safe, v_safe, c_safe, ord_v, is_best_of)
+        v_sym = torch.sqrt(
+            torch.clamp(torch.log(torch.clamp(m2_sym / (f_sym * f_sym).clamp(min=1e-30), min=1.0)), min=1e-16)
+        )
     else:
-        # Masked case: compact active counts by rotating only the active prefix of ord_v
         active_cnt = active_b.sum(dim=1).to(dtype=torch.long)
-        # Evaluate cyclic shifts + reverses on active prefix per row using ord_v
-        f_sym = torch.zeros(b_size, dtype=torch.float64, device=device)
-        m2_sym = torch.zeros(b_size, dtype=torch.float64, device=device)
-        w_sym = torch.zeros((b_size, d_max), dtype=torch.float64, device=device)
-        ord_v_np = ord_v.cpu().numpy()
-        v_np = v_safe.detach().cpu().numpy()
-        for r in range(b_size):
-            d_act = int(active_cnt[r].item())
-            act_ord = ord_v_np[r, :d_act].tolist()
-            inact_tail = ord_v_np[r, d_act:].tolist()
-            vr = v_np[r]
-            if d_act <= 1:
-                r_perms = [act_ord + inact_tail]
-            elif float(vr[act_ord[-1]] - vr[act_ord[0]]) <= 1e-5:
-                r_perms = [act_ord[s:] + act_ord[:s] + inact_tail for s in range(d_act)]
-                r_perms = r_perms + [list(reversed(p[:d_act])) + inact_tail for p in r_perms]
-            else:
-                r_perms = [act_ord + inact_tail, list(reversed(act_ord)) + inact_tail]
-                for k in range(d_act - 1):
-                    if abs(float(vr[act_ord[k + 1]] - vr[act_ord[k]])) <= 1e-5:
-                        sw = list(act_ord)
-                        sw[k], sw[k + 1] = sw[k + 1], sw[k]
-                        r_perms.append(sw + inact_tail)
-                        r_perms.append(list(reversed(sw)) + inact_tail)
-            f_r = torch.zeros(1, dtype=torch.float64, device=device)
-            m2_r = torch.zeros(1, dtype=torch.float64, device=device)
-            w_r = torch.zeros((1, d_max), dtype=torch.float64, device=device)
-            for rp in r_perms:
-                rp_t = torch.tensor([rp], dtype=torch.long, device=device)
-                # Single-row evaluation on slice r:r+1
-                f_sub = f_safe[r : r + 1]
-                v_sub = v_safe[r : r + 1]
-                c_sub = c_safe[r : r + 1]
-                m_sub = mask_in[r : r + 1]
-                # Use active slice
-                f_act = torch.gather(f_sub, 1, rp_t[:, :d_act])
-                v_act = torch.gather(v_sub, 1, rp_t[:, :d_act])
-                c_act = torch.gather(
-                    torch.gather(c_sub, 1, rp_t[:, :d_act].unsqueeze(2).expand(1, d_act, d_max)),
+        min_act = int(active_cnt.min().item())
+        max_act = int(active_cnt.max().item())
+        if min_act == max_act:
+            act_idx = ord_v[:, :min_act]
+            f_act = torch.gather(f_safe, 1, act_idx)
+            v_act = torch.gather(v_safe, 1, act_idx)
+            c_act = torch.gather(
+                torch.gather(c_safe, 1, act_idx.unsqueeze(2).expand(b_size, min_act, d_max)),
+                2,
+                act_idx.unsqueeze(1).expand(b_size, min_act, min_act),
+            )
+            id_ord = torch.arange(min_act, dtype=torch.long, device=device).unsqueeze(0).expand(b_size, min_act)
+            f_sym, m2_sym, w_act = _symmetrized_vol_clark_batch(f_act, v_act, c_act, id_ord, is_best_of)
+            w_sym = torch.zeros((b_size, d_max), dtype=torch.float64, device=device).scatter(1, act_idx, w_act)
+        else:
+            f_rows: List[torch.Tensor] = []
+            m2_rows: List[torch.Tensor] = []
+            w_rows: List[torch.Tensor] = []
+            for r in range(b_size):
+                d_act = int(active_cnt[r].item())
+                act_idx_r = ord_v[r : r + 1, :d_act]
+                f_act_r = torch.gather(f_safe[r : r + 1], 1, act_idx_r)
+                v_act_r = torch.gather(v_safe[r : r + 1], 1, act_idx_r)
+                c_act_r = torch.gather(
+                    torch.gather(c_safe[r : r + 1], 1, act_idx_r.unsqueeze(2).expand(1, d_act, d_max)),
                     2,
-                    rp_t[:, :d_act].unsqueeze(1).expand(1, d_act, d_act),
+                    act_idx_r.unsqueeze(1).expand(1, d_act, d_act),
                 )
-                if d_act == 1:
-                    fp_r = f_act[:, 0]
-                    vp_r = v_act[:, 0]
-                    wp_r = torch.zeros((1, d_max), dtype=torch.float64, device=device)
-                    wp_r[0, act_ord[0]] = 1.0
-                else:
-                    id_ord = torch.arange(d_act, dtype=torch.long, device=device).unsqueeze(0)
-                    fp_r, vp_r, wp_act = _clark_one_order_torch(f_act, v_act, c_act, id_ord, is_best_of)
-                    wp_r = torch.zeros((1, d_max), dtype=torch.float64, device=device)
-                    wp_r.scatter_(1, rp_t[:, :d_act], wp_act)
-                _ = m_sub
-                f_r = f_r + fp_r
-                m2_r = m2_r + fp_r * fp_r * torch.exp(vp_r * vp_r)
-                w_r = w_r + wp_r
-            inv_kr = 1.0 / float(len(r_perms))
-            f_sym[r] = f_r[0] * inv_kr
-            m2_sym[r] = m2_r[0] * inv_kr
-            w_sym[r] = w_r[0] * inv_kr
-        v_sym = torch.sqrt(torch.clamp(torch.log(torch.clamp(m2_sym / (f_sym * f_sym).clamp(min=1e-30), min=1.0)), min=1e-16))
+                id_ord_r = torch.arange(d_act, dtype=torch.long, device=device).unsqueeze(0)
+                f_r, m2_r, w_act_r = _symmetrized_vol_clark_batch(f_act_r, v_act_r, c_act_r, id_ord_r, is_best_of)
+                w_r = torch.zeros((1, d_max), dtype=torch.float64, device=device).scatter(1, act_idx_r, w_act_r)
+                f_rows.append(f_r)
+                m2_rows.append(m2_r)
+                w_rows.append(w_r)
+            f_sym = torch.cat(f_rows, dim=0)
+            m2_sym = torch.cat(m2_rows, dim=0)
+            w_sym = torch.cat(w_rows, dim=0)
+        v_sym = torch.sqrt(
+            torch.clamp(torch.log(torch.clamp(m2_sym / (f_sym * f_sym).clamp(min=1e-30), min=1.0)), min=1e-16)
+        )
 
     if float(g_sep.detach().max().item()) < 1e-15:
         return f_sym, v_sym, w_sym
@@ -583,22 +577,21 @@ def _clark_corr_min_max_torch(
         return torch.tensor(1.0, dtype=torch.float64, device=device)
     f_s = f_in.clamp(min=1e-16)
     v_s = v_in.clamp(min=1e-12)
-    f_np = f_s.detach().cpu().tolist()
-    v_np = v_s.detach().cpu().tolist()
-    ord_min = sorted(range(d), key=lambda i: (round(float(f_np[i]), 9), float(v_np[i])))
-    ord_max = sorted(range(d), key=lambda i: (-round(float(f_np[i]), 9), float(v_np[i])))
+    v_ord_0 = torch.argsort(v_s.detach(), stable=True)
+    f_round = torch.round(f_s.detach() * 1e9)
+    idx_min = v_ord_0[torch.argsort(f_round[v_ord_0], stable=True)]
+    idx_max = v_ord_0[torch.argsort(-f_round[v_ord_0], stable=True)]
 
-    idx_min = torch.tensor(ord_min, dtype=torch.long, device=device)
     fo = f_s[idx_min]
     vo = v_s[idx_min]
     f_cur = fo[0]
     v_cur = vo[0]
-    rho_m_p = corr[ord_min[0]]
+    rho_m_p = corr[idx_min[0]]
 
     for j in range(1, d):
         f_2 = fo[j]
         v_2 = vo[j]
-        rho_12 = rho_m_p[ord_min[j]].clamp(-0.999999, 0.999999)
+        rho_12 = rho_m_p[idx_min[j]].clamp(-0.999999, 0.999999)
         var_m = (v_cur * v_cur + v_2 * v_2 - 2.0 * rho_12 * v_cur * v_2).clamp(min=1e-16)
         sig_m = torch.sqrt(var_m)
         d1 = (torch.log(f_cur / f_2) + 0.5 * var_m) / sig_m
@@ -613,7 +606,7 @@ def _clark_corr_min_max_torch(
         e_m2 = f1_sq * torch.special.ndtr(-d1_sq) + f2_sq * torch.special.ndtr(d2_sq)
         v_new = torch.sqrt(torch.clamp(torch.log(torch.clamp(e_m2 / (e_m1 * e_m1).clamp(min=1e-30), min=1.0)), min=1e-16))
 
-        oj = ord_min[j]
+        oj = idx_min[j]
         f1_i = f_cur * torch.exp(rho_m_p * v_cur * v_s)
         f2_i = f_2 * torch.exp(corr[oj] * v_2 * v_s)
         d1_i = (torch.log(f1_i.clamp(min=1e-16) / f2_i.clamp(min=1e-16)) + 0.5 * var_m) / sig_m
@@ -625,14 +618,13 @@ def _clark_corr_min_max_torch(
         f_cur, v_cur = e_m1, v_new
 
     v_min = v_cur
-    idx_max = torch.tensor(ord_max, dtype=torch.long, device=device)
     fob = f_s[idx_max]
     vob = v_s[idx_max]
     cob = corr[idx_max][:, idx_max]
     f_b = fob[0]
     v_b = vob[0]
     rho_cur = cob[0]
-    rho_b_min = rho_m_p[ord_max[0]]
+    rho_b_min = rho_m_p[idx_max[0]]
 
     for j in range(1, d):
         f_2 = fob[j]
@@ -652,7 +644,7 @@ def _clark_corr_min_max_torch(
         e_m2 = f1_sq * torch.special.ndtr(d1_sq) + f2_sq * torch.special.ndtr(-d2_sq)
         v_new = torch.sqrt(torch.clamp(torch.log(torch.clamp(e_m2 / (e_m1 * e_m1).clamp(min=1e-30), min=1.0)), min=1e-16))
 
-        oj = ord_max[j]
+        oj = idx_max[j]
         f1_min = f_b * torch.exp(rho_b_min * v_b * v_min)
         f2_min = f_2 * torch.exp(rho_m_p[oj] * v_2 * v_min)
         d1_min = (torch.log(f1_min.clamp(min=1e-16) / f2_min.clamp(min=1e-16)) + 0.5 * var_m) / sig_m
@@ -1979,6 +1971,18 @@ def _baseline_cpu_via_cpp(
     )
 
 
+def _is_ad_active(*tensors: torch.Tensor) -> bool:
+    if torch._C._are_functorch_transforms_active():
+        return True
+    unpack_fn = getattr(torch.autograd.forward_ad, "unpack_dual", None)
+    for t in tensors:
+        if t.requires_grad:
+            return True
+        if unpack_fn is not None and unpack_fn(t).tangent is not None:
+            return True
+    return False
+
+
 def compute_analytical_autocall_baseline(
     preproc_state: Any,
     *,
@@ -2015,15 +2019,7 @@ def compute_analytical_autocall_baseline(
             and device.type == "cpu"
             and (
                 use_fast_cpu is True
-                or not (
-                    fp_t.requires_grad
-                    or vp_t.requires_grad
-                    or cm_t.requires_grad
-                    or df_t.requires_grad
-                    or ko_t.requires_grad
-                    or cb_t.requires_grad
-                    or cr_t.requires_grad
-                )
+                or not _is_ad_active(fp_t, vp_t, cm_t, df_t, ko_t, cb_t, cr_t)
             )
         )
         if can_cpu:
@@ -2313,15 +2309,7 @@ def compute_analytical_autocall_baseline(
     unsupported_tup = tuple(unsupported_list)
 
     device = fp_t.device
-    any_grad = (
-        fp_t.requires_grad
-        or vp_t.requires_grad
-        or cm_t.requires_grad
-        or df_t.requires_grad
-        or ko_t.requires_grad
-        or cb_t.requires_grad
-        or cr_t.requires_grad
-    )
+    any_grad = _is_ad_active(fp_t, vp_t, cm_t, df_t, ko_t, cb_t, cr_t)
     can_fast_cpu = (
         fp_t.ndim == 2
         and device.type == "cpu"
