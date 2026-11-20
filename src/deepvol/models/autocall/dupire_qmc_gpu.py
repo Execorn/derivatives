@@ -58,7 +58,7 @@ _SOBOL_LOCK = threading.Lock()
 
 _SURF_GPU_CACHE_LOCK = threading.Lock()
 _SURF_GPU_CACHE: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
-_SURF_GPU_CACHE_MAXSIZE: int = 512
+_SURF_GPU_CACHE_MAXSIZE: int = 4096
 
 
 @dataclass(frozen=True)
@@ -145,18 +145,62 @@ def _get_surface_gpu_tensors(surf: Any, device: torch.device) -> Dict[str, Any]:
     slice_c_np = getattr(surf, "_fast_slice_coeffs", None)
     if slice_c_np is None:
         raise RuntimeError("RegularizedVolSurface missing _fast_slice_coeffs.")
-    slice_c_t = torch.tensor(slice_c_np, dtype=torch.float64, device=device)
+    strikes_np = np.asarray(surf.strikes, dtype=np.float64).ravel()
+    tenors_np = np.asarray(surf.tenors, dtype=np.float64).ravel()
+    tenors_365_np = np.asarray(getattr(surf, "tenors_act365", surf.tenors), dtype=np.float64).ravel()
+    quotes_np = np.asarray(surf.quotes, dtype=np.float64)
+    slice_c_arr = np.asarray(slice_c_np, dtype=np.float64)
+    slice_c_tr_np = np.ascontiguousarray(np.transpose(slice_c_arr, (0, 2, 1)))
+    sl_left_np = np.asarray(surf._slopes_left, dtype=np.float64).ravel()
+    sl_right_np = np.asarray(surf._slopes_right, dtype=np.float64).ravel()
+
+    q_shape = quotes_np.shape
+    sc_shape = slice_c_arr.shape
+    sctr_shape = slice_c_tr_np.shape
+    packed_np = np.concatenate([
+        strikes_np,
+        tenors_np,
+        tenors_365_np,
+        quotes_np.ravel(),
+        slice_c_arr.ravel(),
+        slice_c_tr_np.ravel(),
+        sl_left_np,
+        sl_right_np,
+    ])
+    packed_gpu = torch.as_tensor(packed_np, dtype=torch.float64, device=device)
+    off = 0
+    n_k = strikes_np.size
+    strikes_t = packed_gpu[off : off + n_k]
+    off += n_k
+    n_e = tenors_np.size
+    tenors_t = packed_gpu[off : off + n_e]
+    off += n_e
+    n_e365 = tenors_365_np.size
+    tenors_365_t = packed_gpu[off : off + n_e365]
+    off += n_e365
+    n_q = quotes_np.size
+    quotes_t = packed_gpu[off : off + n_q].view(q_shape)
+    off += n_q
+    n_sc = slice_c_arr.size
+    slice_c_t = packed_gpu[off : off + n_sc].view(sc_shape)
+    off += n_sc
+    n_sctr = slice_c_tr_np.size
+    slice_c_tr_t = packed_gpu[off : off + n_sctr].view(sctr_shape)
+    off += n_sctr
+    n_sl = sl_left_np.size
+    slopes_left_t = packed_gpu[off : off + n_sl]
+    off += n_sl
+    slopes_right_t = packed_gpu[off : off + sl_right_np.size]
+
     entry = {
-        "strikes": torch.tensor(surf.strikes, dtype=torch.float64, device=device),
-        "tenors": torch.tensor(surf.tenors, dtype=torch.float64, device=device),
-        "tenors_365": torch.tensor(
-            getattr(surf, "tenors_act365", surf.tenors), dtype=torch.float64, device=device
-        ),
-        "quotes": torch.tensor(surf.quotes, dtype=torch.float64, device=device),
+        "strikes": strikes_t,
+        "tenors": tenors_t,
+        "tenors_365": tenors_365_t,
+        "quotes": quotes_t,
         "slice_c": slice_c_t,
-        "slice_c_tr": slice_c_t.permute(0, 2, 1).contiguous(),
-        "slopes_left": torch.tensor(surf._slopes_left, dtype=torch.float64, device=device),
-        "slopes_right": torch.tensor(surf._slopes_right, dtype=torch.float64, device=device),
+        "slice_c_tr": slice_c_tr_t,
+        "slopes_left": slopes_left_t,
+        "slopes_right": slopes_right_t,
     }
     with _SURF_GPU_CACHE_LOCK:
         _SURF_GPU_CACHE[key] = entry
@@ -283,7 +327,7 @@ if _HAS_TRITON:
         sqrt_dt_ptr,    # (B_c,) float32
         inv_dt_grid_ptr,# (B_c,) float32
         r_reps: tl.constexpr,
-        d_assets: tl.constexpr,
+        d_assets,
         n_rep: tl.constexpr,
         n_sub: tl.constexpr,
         N_t: tl.constexpr,
@@ -301,7 +345,7 @@ if _HAS_TRITON:
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_n = offs_n < n_rep
 
-        lx_off = ((pid_b * r_reps + pid_r) * d_assets + pid_d) * n_rep + offs_n
+        lx_off = ((pid_b * d_assets + pid_d) * r_reps + pid_r) * n_rep + offs_n
         lx = tl.load(log_x_ptr + lx_off, mask=mask_n, other=0.0)
         dlx = tl.load(dlog_x_ptr + lx_off, mask=mask_n, other=0.0) if COMPUTE_DELTA else tl.zeros((BLOCK_N,), dtype=tl.float32)
 
@@ -341,9 +385,9 @@ if _HAS_TRITON:
             v1 = v10 + fy * (v11 - v10)
             lv = v0 + ft * (v1 - v0)
 
-            # Inline Cholesky correlation across D <= 8 inside registers
+            # Inline Cholesky correlation across D inside registers
             z_c = tl.zeros((BLOCK_N,), dtype=tl.float32)
-            for k in tl.static_range(d_assets):
+            for k in range(d_assets):
                 l_dk = tl.load(chol_ptr + chol_row_base + k)
                 z_k_off = ((pid_r * d_assets + k) * n_sub + s) * n_rep + offs_n
                 z_k = tl.load(z_indep_ptr + z_k_off, mask=mask_n, other=0.0)
@@ -551,6 +595,96 @@ if _HAS_TRITON:
         out_off = (pid_a * N_t + pid_t) * N_y + offs_y
         tl.store(lv_out_ptr + out_off, lv_365.to(tl.float32))
 
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _training_period_step_triton_kernel(  # type: ignore[no-untyped-def]
+        alive_ptr,      # (B_c, N_tot) f64
+        unpaid_ptr,     # (B_c, N_tot) f64
+        total_pv_ptr,   # (B_c, N_tot) f64
+        ko_ptr,         # (B_c, N_tot) f64
+        cpn_ptr,        # (B_c, N_tot) f64 (raw cpn_ind)
+        dko_dw_ptr,     # (B_c, N_tot) f64
+        dcpn_dw_ptr,    # (B_c, N_tot) f64
+        d_alive_ptr,    # (B_c, D, N_tot) f64
+        d_unpaid_ptr,   # (B_c, D, N_tot) f64
+        d_total_pv_ptr, # (B_c, D, N_tot) f64
+        dw_call_ptr,    # (B_c, D, N_tot) f64
+        dw_cpn_ptr,     # (B_c, D, N_tot) f64
+        df_pay_m_ptr,   # (B_c,) f64
+        cpn_amt_m_ptr,  # (B_c,) f64
+        w_fund_m_ptr,   # (B_c,) f64
+        ac_cpn_ptr,     # (B_c,) f64
+        is_mem_ptr,     # (B_c,) f64
+        force_cpn_ptr,  # (B_c,) f64
+        no_not_ptr,     # (B_c,) f64
+        n_tot,
+        d_assets,
+        is_last,
+        COMPUTE_DELTA: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < n_tot
+        bn_off = pid_b * n_tot + offs_n
+
+        al = tl.load(alive_ptr + bn_off, mask=mask_n, other=0.0)
+        unp = tl.load(unpaid_ptr + bn_off, mask=mask_n, other=0.0)
+        tpv = tl.load(total_pv_ptr + bn_off, mask=mask_n, other=0.0)
+        ko = tl.load(ko_ptr + bn_off, mask=mask_n, other=0.0)
+        cpn_i = tl.load(cpn_ptr + bn_off, mask=mask_n, other=0.0)
+
+        df_m = tl.load(df_pay_m_ptr + pid_b)
+        c_m = tl.load(cpn_amt_m_ptr + pid_b)
+        wf_m = tl.load(w_fund_m_ptr + pid_b)
+        ac_c = tl.load(ac_cpn_ptr + pid_b)
+        is_mem = tl.load(is_mem_ptr + pid_b)
+        force_cpn = tl.load(force_cpn_ptr + pid_b)
+        no_not = tl.load(no_not_ptr + pid_b)
+
+        force_cond = (force_cpn > 0.5) & (ko > cpn_i)
+        cpn_e = tl.where(force_cond, ko, cpn_i)
+        eff_c = tl.where(is_mem > 0.5, c_m + unp, c_m)
+        stop_m = al * ko
+
+        tpv_next = tpv - al * wf_m + df_m * (al * cpn_e * eff_c + stop_m * ac_c)
+        al_next = al * (1.0 - ko)
+        unp_next = tl.where(is_mem > 0.5, eff_c * (1.0 - cpn_e), unp)
+        not_mult = (1.0 - no_not) * df_m
+        tpv_next = tpv_next + not_mult * tl.where(is_last != 0, stop_m + al_next, stop_m)
+
+        tl.store(alive_ptr + bn_off, al_next, mask=mask_n)
+        tl.store(unpaid_ptr + bn_off, unp_next, mask=mask_n)
+        tl.store(total_pv_ptr + bn_off, tpv_next, mask=mask_n)
+
+        if COMPUTE_DELTA:
+            dko_w = tl.load(dko_dw_ptr + bn_off, mask=mask_n, other=0.0)
+            dcpn_w = tl.load(dcpn_dw_ptr + bn_off, mask=mask_n, other=0.0)
+            for d in range(d_assets):
+                off_3d = (pid_b * d_assets + d) * n_tot + offs_n
+                d_al = tl.load(d_alive_ptr + off_3d, mask=mask_n, other=0.0)
+                d_unp = tl.load(d_unpaid_ptr + off_3d, mask=mask_n, other=0.0)
+                d_tpv = tl.load(d_total_pv_ptr + off_3d, mask=mask_n, other=0.0)
+                dwc = tl.load(dw_call_ptr + off_3d, mask=mask_n, other=0.0)
+                dwq = tl.load(dw_cpn_ptr + off_3d, mask=mask_n, other=0.0)
+
+                d_ko = dko_w * dwc
+                d_cpn = tl.where(force_cond, d_ko, dcpn_w * dwq)
+                d_stop = d_al * ko + al * d_ko
+                d_eff_c = tl.where(is_mem > 0.5, d_unp, d_unp * 0.0)
+                d_cpn_pay = (
+                    d_al * (cpn_e * eff_c)
+                    + al * (d_cpn * eff_c + cpn_e * d_eff_c)
+                    + d_stop * ac_c
+                )
+                d_al_next = d_al * (1.0 - ko) - al * d_ko
+                d_unp_next = tl.where(is_mem > 0.5, d_eff_c * (1.0 - cpn_e) - eff_c * d_cpn, d_unp)
+                d_tpv_next = d_tpv - d_al * wf_m + df_m * d_cpn_pay + not_mult * tl.where(is_last != 0, d_stop + d_al_next, d_stop)
+
+                tl.store(d_alive_ptr + off_3d, d_al_next, mask=mask_n)
+                tl.store(d_unpaid_ptr + off_3d, d_unp_next, mask=mask_n)
+                tl.store(d_total_pv_ptr + off_3d, d_tpv_next, mask=mask_n)
+
 
 def _generate_gpu_sobol_tile(
     *,
@@ -605,7 +739,7 @@ def _generate_gpu_sobol_tile(
             acc ^= shifts.to(torch.int64).unsqueeze(-1)
             u = (acc.to(torch.float32) + 0.5) * _SOBOL_INV_SCALE
             u = u.clamp(1e-6, 1.0 - 1e-6)
-            z_sobol = math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+            z_sobol = torch.special.ndtri(u)
         parts.append(z_sobol)
 
     if n_philox > 0:
@@ -1008,52 +1142,59 @@ def _evaluate_monitoring_index_gpu(
     perf: torch.Tensor,
     index_name: str,
     inv_lex_perm_t: Optional[torch.Tensor] = None,
+    *,
+    asset_dim: int = -1,
 ) -> torch.Tensor:
-    """Evaluates any of the 14 Murex monitoring functionals along the last axis on GPU."""
+    """Evaluates any of the 14 Murex monitoring functionals along `asset_dim` on GPU."""
     idx = str(index_name).strip()
     if idx in ("RatioAB", "RatioBA", "DiffAB", "DiffBA", "Outperformance", "Spread") and inv_lex_perm_t is not None:
-        p = perf.index_select(-1, inv_lex_perm_t)
+        p = perf.index_select(asset_dim, inv_lex_perm_t)
     else:
         p = perf
 
+    d_len = int(p.shape[asset_dim])
     if idx in ("WorstOf", "Lookback"):
-        return p.min(dim=-1).values
+        return p.min(dim=asset_dim).values
     if idx == "BestOf":
-        return p.max(dim=-1).values
+        return p.max(dim=asset_dim).values
     if idx in ("Average", "AverageOf", "MultiPerf"):
-        return p.mean(dim=-1)
+        return p.mean(dim=asset_dim)
     if idx == "Dispersion":
-        mean_p = p.mean(dim=-1, keepdim=True)
-        return torch.sqrt(((p - mean_p) ** 2).mean(dim=-1).clamp(min=0.0))
+        mean_p = p.mean(dim=asset_dim, keepdim=True)
+        return torch.sqrt(((p - mean_p) ** 2).mean(dim=asset_dim).clamp(min=0.0))
     if idx == "RatioBestWorst":
-        return p.max(dim=-1).values / p.min(dim=-1).values.clamp(min=1e-12)
+        return p.max(dim=asset_dim).values / p.min(dim=asset_dim).values.clamp(min=1e-12)
     if idx == "RatioBestAverage":
-        return p.max(dim=-1).values / p.mean(dim=-1).clamp(min=1e-12)
+        return p.max(dim=asset_dim).values / p.mean(dim=asset_dim).clamp(min=1e-12)
     if idx == "RatioAverageWorst":
-        return p.mean(dim=-1) / p.min(dim=-1).values.clamp(min=1e-12)
+        return p.mean(dim=asset_dim) / p.min(dim=asset_dim).values.clamp(min=1e-12)
     if idx in ("DiffBestWorst", "Rainbow"):
-        return p.max(dim=-1).values - p.min(dim=-1).values
+        return p.max(dim=asset_dim).values - p.min(dim=asset_dim).values
     if idx == "DiffBestAverage":
-        return p.max(dim=-1).values - p.mean(dim=-1)
+        return p.max(dim=asset_dim).values - p.mean(dim=asset_dim)
     if idx == "DiffAverageWorst":
-        return p.mean(dim=-1) - p.min(dim=-1).values
+        return p.mean(dim=asset_dim) - p.min(dim=asset_dim).values
     if idx in ("RatioAB", "Outperformance"):
-        if p.shape[-1] < 2:
-            return p[..., 0]
-        return p[..., 0] / p[..., 1].clamp(min=1e-12)
+        p0 = p.select(asset_dim, 0)
+        if d_len < 2:
+            return p0
+        return p0 / p.select(asset_dim, 1).clamp(min=1e-12)
     if idx == "RatioBA":
-        if p.shape[-1] < 2:
-            return p[..., 0]
-        return p[..., 1] / p[..., 0].clamp(min=1e-12)
+        p0 = p.select(asset_dim, 0)
+        if d_len < 2:
+            return p0
+        return p.select(asset_dim, 1) / p0.clamp(min=1e-12)
     if idx in ("DiffAB", "Spread"):
-        if p.shape[-1] < 2:
-            return p[..., 0]
-        return p[..., 0] - p[..., 1]
+        p0 = p.select(asset_dim, 0)
+        if d_len < 2:
+            return p0
+        return p0 - p.select(asset_dim, 1)
     if idx == "DiffBA":
-        if p.shape[-1] < 2:
-            return p[..., 0]
-        return p[..., 1] - p[..., 0]
-    return p.min(dim=-1).values
+        p0 = p.select(asset_dim, 0)
+        if d_len < 2:
+            return p0
+        return p.select(asset_dim, 1) - p0
+    return p.min(dim=asset_dim).values
 
 
 def _digital_ramp_torch(
@@ -1737,102 +1878,137 @@ class GpuTorchDupireQMC:
         dev = self.device
         d_assets = int(state.d_assets)
         m_rem = int(state.m_rem)
-        n_rep_mf = _next_power_of_two(min(max(n_cheap // 2, 2048), 65536))
+        n_rep_mf = _next_power_of_two(min(max(n_cheap // 4, 2048), 16384))
         r_mf = max(1, (n_cheap + n_rep_mf - 1) // n_rep_mf)
         chunk_sz = r_mf * n_rep_mf
 
-        log_x = torch.zeros((r_mf, n_rep_mf, d_assets), dtype=torch.float32, device=dev)
-        alive = torch.ones((r_mf, n_rep_mf), dtype=torch.float64, device=dev)
-        unpaid = torch.full(
-            (r_mf, n_rep_mf), float(state.seasoned_state.c_mem_0), dtype=torch.float64, device=dev
+        var_cum = (iv_at_fwd_np ** 2) * tau_obs_np[None, :]  # (D, M_rem)
+        var_prev_mat = np.concatenate(
+            [np.zeros((d_assets, 1), dtype=np.float64), var_cum[:, :-1]], axis=1
         )
-        pv = torch.zeros((r_mf, n_rep_mf), dtype=torch.float64, device=dev)
-        var_prev = np.zeros(d_assets, dtype=np.float64)
-
+        dv_mat = np.maximum(var_cum - var_prev_mat, 1e-12)  # (D, M_rem)
+        # Ensure strict telescoping increment matches sequential loop
+        var_run = np.zeros(d_assets, dtype=np.float64)
         for m in range(m_rem):
-            z_ind = _generate_gpu_sobol_tile(
+            dv_col = np.maximum(var_cum[:, m] - var_run, 1e-12)
+            var_run = var_run + dv_col
+            dv_mat[:, m] = dv_col
+
+        dv_all_f32 = torch.tensor(dv_mat.T.copy(), dtype=torch.float32, device=dev)  # (M_rem, D)
+        sqrt_dv_f32 = torch.sqrt(dv_all_f32)
+        fwd_rel_32 = (fwd_prices_gpu / ref_spots_gpu[:, None]).T.to(torch.float32).contiguous()
+
+        r_chunk = max(1, min(r_mf, (4 * 1024 * 1024) // max(m_rem * d_assets * n_rep_mf, 1)))
+        pv_sum = 0.0
+        for r0 in range(0, r_mf, r_chunk):
+            rc = min(r_chunk, r_mf - r0)
+            z_all = _generate_gpu_sobol_tile(
                 n_rep=n_rep_mf,
-                n_replicates=r_mf,
-                n_dims=d_assets,
-                dim_offset=m * d_assets,
-                seed=seed,
+                n_replicates=rc,
+                n_dims=m_rem * d_assets,
+                dim_offset=0,
+                seed=seed + r0 * 997,
                 device=dev,
                 use_triton=self._use_triton,
-            )  # (r_mf, d_assets, n_rep_mf)
-            z_c = torch.einsum("ij,rjn->rni", chol_f32, z_ind)
-            var_c = (iv_at_fwd_np[:, m] ** 2) * tau_obs_np[m]
-            dv = np.maximum(var_c - var_prev, 1e-12)
-            var_prev = var_prev + dv
-            dv_t = torch.as_tensor(dv, dtype=torch.float32, device=dev).view(1, 1, d_assets)
-            log_x = log_x - 0.5 * dv_t + torch.sqrt(dv_t) * z_c
-            s_m = fwd_prices_gpu[:, m].view(1, 1, d_assets) * torch.exp(log_x.to(torch.float64))
-            perf_m = s_m / ref_spots_gpu.view(1, 1, d_assets)
+            ).view(rc, m_rem, d_assets, n_rep_mf)
+            z_c = torch.einsum("ij,rmjn->rmni", chol_f32, z_all)
+            del z_all
+            dlog_all = -0.5 * dv_all_f32.view(1, m_rem, 1, d_assets) + sqrt_dv_f32.view(1, m_rem, 1, d_assets) * z_c
+            del z_c
+            log_x_all = torch.cumsum(dlog_all, dim=1)
+            del dlog_all
+            perf_all = fwd_rel_32.view(1, m_rem, 1, d_assets) * torch.exp(log_x_all)
+            del log_x_all
 
-            wc = _evaluate_monitoring_index_gpu(perf_m, state.callability_index, inv_perm_gpu)
-            wq = _evaluate_monitoring_index_gpu(perf_m, eff_cpn_idx, inv_perm_gpu)
-            ko_i = (
-                _digital_ramp_torch(wc, float(ko_barriers_np[m]), float(state.ko_spread))
-                if is_callable_np[m] > 0.5
+            w_call_all = _evaluate_monitoring_index_gpu(perf_all, state.callability_index, inv_perm_gpu)
+            w_cpn_all = (
+                w_call_all
+                if eff_cpn_idx == state.callability_index
+                else _evaluate_monitoring_index_gpu(perf_all, eff_cpn_idx, inv_perm_gpu)
+            )
+            perf_term = perf_all[:, -1, :, :]
+            del perf_all
+
+            ko_bar_t = torch.tensor(ko_barriers_np, dtype=torch.float32, device=dev).view(1, m_rem, 1)
+            is_call_t = torch.tensor(is_callable_np, dtype=torch.float32, device=dev).view(1, m_rem, 1)
+            ko_spr_val = float(state.ko_spread)
+            if abs(ko_spr_val) < 1e-9:
+                ko_all_t = (w_call_all >= ko_bar_t).to(torch.float32) * is_call_t
+            else:
+                b_l = torch.minimum(ko_bar_t, ko_bar_t + ko_spr_val)
+                b_h = torch.maximum(ko_bar_t, ko_bar_t + ko_spr_val)
+                ko_all_t = torch.clamp((w_call_all - b_l) / torch.clamp(b_h - b_l, min=1e-9), 0.0, 1.0) * is_call_t
+            del w_call_all
+
+            cpn_bar_t = torch.tensor(cpn_barriers_np, dtype=torch.float32, device=dev).view(1, m_rem, 1)
+            is_guar_t = torch.tensor(is_guar_np, dtype=torch.float32, device=dev).view(1, m_rem, 1) > 0.5
+            s_cpn_eff = -float(state.cpn_spread) if cpn_dir == "down" else float(state.cpn_spread)
+            if abs(s_cpn_eff) < 1e-9:
+                bc_all = (w_cpn_all >= cpn_bar_t).to(torch.float32)
+            else:
+                bl_c = torch.minimum(cpn_bar_t, cpn_bar_t + s_cpn_eff)
+                bh_c = torch.maximum(cpn_bar_t, cpn_bar_t + s_cpn_eff)
+                bc_all = torch.clamp((w_cpn_all - bl_c) / torch.clamp(bh_c - bl_c, min=1e-9), 0.0, 1.0)
+            del w_cpn_all
+            if cpn_dir == "down":
+                bc_all = 1.0 - bc_all
+            cp_all_t = (1.0 - bc_all) if cpn_type == "out" else bc_all
+            cp_all_t = torch.where(is_guar_t, torch.ones_like(cp_all_t), cp_all_t)
+            if state.force_coupons_on_autocall:
+                cp_all_t = torch.maximum(cp_all_t, ko_all_t)
+
+            alive = torch.ones((rc, n_rep_mf), dtype=torch.float32, device=dev)
+            unpaid = torch.full(
+                (rc, n_rep_mf), float(state.seasoned_state.c_mem_0), dtype=torch.float32, device=dev
+            )
+            pv = torch.zeros((rc, n_rep_mf), dtype=torch.float32, device=dev)
+            for m in range(m_rem):
+                ko_i = ko_all_t[:, m, :]
+                cp_i = cp_all_t[:, m, :]
+                if w_fund_np[m] != 0.0:
+                    pv = pv - alive * float(w_fund_np[m])
+                st_m = alive * ko_i
+                c_m = float(coupon_amounts_np[m])
+                ec = (c_m + unpaid) if state.is_memory else c_m
+                pv = pv + float(df_pay_np[m]) * (alive * cp_i * ec + st_m * float(state.autocall_coupon))
+                if state.is_memory:
+                    unpaid = (unpaid + c_m) * (1.0 - cp_i)
+                alive = alive * (1.0 - ko_i)
+                if not state.no_notional_repayment:
+                    pv = pv + float(df_pay_np[m]) * (st_m if m < m_rem - 1 else (st_m + alive))
+            del ko_all_t, cp_all_t
+            w_opt = _evaluate_monitoring_index_gpu(perf_term, eff_opt_idx, inv_perm_gpu)
+            st_term: Optional[torch.Tensor] = None
+            if state.one_star_strike is not None and float(state.one_star_strike) > 0.0:
+                st_term = (
+                    _evaluate_monitoring_index_gpu(perf_term, "BestOf", inv_perm_gpu)
+                    >= float(state.one_star_strike)
+                ).to(torch.float32)
+            if state.strike > 1e-6 and state.option_gearing > 0.0:
+                pi = torch.clamp(float(state.strike) - w_opt, min=0.0)
+                if state.lower_strike is not None and float(state.lower_strike) > 0.0:
+                    pi = torch.clamp(pi, max=max(float(state.strike) - float(state.lower_strike), 0.0))
+                if state.ki_barrier is not None and float(state.ki_barrier) > 0.0 and state.seasoned_state.i_ki_past < 0.5:
+                    pi = pi * (1.0 - _digital_ramp_torch(w_opt, float(state.ki_barrier), -float(state.ki_spread)))
+                if st_term is not None:
+                    pi = pi * (1.0 - st_term)
+                up = alive * pi
+            else:
+                up = torch.zeros_like(alive)
+            uc = (
+                alive * torch.clamp(w_opt - float(state.participation_call_strike), min=0.0)
+                if (state.participation_call_strike is not None and float(state.participation_call_rate) > 0.0)
                 else torch.zeros_like(alive)
             )
-            if is_guar_np[m] > 0.5:
-                cp_i = torch.ones_like(alive)
-            else:
-                b_cpn_m = float(cpn_barriers_np[m])
-                s_cpn = float(state.cpn_spread)
-                bc = (
-                    (1.0 - _digital_ramp_torch(wq, b_cpn_m, -s_cpn))
-                    if cpn_dir == "down"
-                    else _digital_ramp_torch(wq, b_cpn_m, s_cpn)
-                )
-                cp_i = (1.0 - bc) if cpn_type == "out" else bc
-            if state.force_coupons_on_autocall:
-                cp_i = torch.maximum(cp_i, ko_i)
-            if w_fund_np[m] != 0.0:
-                pv = pv - alive * float(w_fund_np[m])
-            st_m = alive * ko_i
-            c_m = float(coupon_amounts_np[m])
-            ec = (c_m + unpaid) if state.is_memory else c_m
-            pv = pv + float(df_pay_np[m]) * (alive * cp_i * ec + st_m * float(state.autocall_coupon))
-            if state.is_memory:
-                unpaid = (unpaid + c_m) * (1.0 - cp_i)
-            alive = alive * (1.0 - ko_i)
-            if not state.no_notional_repayment:
-                pv = pv + float(df_pay_np[m]) * (st_m if m < m_rem - 1 else (st_m + alive))
-            if m == m_rem - 1:
-                perf_term = perf_m
+            put_sign = 1.0 if state.is_long_basket else -1.0
+            pv = pv + float(df_pay_np[-1]) * (
+                put_sign * float(state.option_gearing) * up + float(state.participation_call_rate) * uc
+            )
+            if st_term is not None and float(state.one_star_coupon) > 0.0:
+                pv = pv + float(df_pay_np[-1]) * alive * st_term * float(state.one_star_coupon)
+            pv_sum += float(pv.sum(dtype=torch.float64).item())
 
-        w_opt = _evaluate_monitoring_index_gpu(perf_term, eff_opt_idx, inv_perm_gpu)
-        st_term: Optional[torch.Tensor] = None
-        if state.one_star_strike is not None and float(state.one_star_strike) > 0.0:
-            st_term = (
-                _evaluate_monitoring_index_gpu(perf_term, "BestOf", inv_perm_gpu)
-                >= float(state.one_star_strike)
-            ).to(torch.float64)
-        if state.strike > 1e-6 and state.option_gearing > 0.0:
-            pi = torch.clamp(float(state.strike) - w_opt, min=0.0)
-            if state.lower_strike is not None and float(state.lower_strike) > 0.0:
-                pi = torch.clamp(pi, max=max(float(state.strike) - float(state.lower_strike), 0.0))
-            if state.ki_barrier is not None and float(state.ki_barrier) > 0.0 and state.seasoned_state.i_ki_past < 0.5:
-                pi = pi * (1.0 - _digital_ramp_torch(w_opt, float(state.ki_barrier), -float(state.ki_spread)))
-            if st_term is not None:
-                pi = pi * (1.0 - st_term)
-            up = alive * pi
-        else:
-            up = torch.zeros_like(alive)
-        uc = (
-            alive * torch.clamp(w_opt - float(state.participation_call_strike), min=0.0)
-            if (state.participation_call_strike is not None and float(state.participation_call_rate) > 0.0)
-            else torch.zeros_like(alive)
-        )
-        put_sign = 1.0 if state.is_long_basket else -1.0
-        pv = pv + float(df_pay_np[-1]) * (
-            put_sign * float(state.option_gearing) * up + float(state.participation_call_rate) * uc
-        )
-        if st_term is not None and float(state.one_star_coupon) > 0.0:
-            pv = pv + float(df_pay_np[-1]) * alive * st_term * float(state.one_star_coupon)
-
-        return float(pv.sum().item()) / float(chunk_sz)
+        return pv_sum / float(chunk_sz)
 
     def simulate_batch_for_training(
         self,
@@ -1867,6 +2043,11 @@ class GpuTorchDupireQMC:
             key = (int(st.d_assets), int(st.m_rem))
             buckets.setdefault(key, []).append(idx)
 
+        dev = self.device
+        eff_r_bkt = max(1, int(cfg.n_replicates))
+        n_rep_bkt = _next_power_of_two(max(2, int(cfg.n_paths) // eff_r_bkt))
+        n_sub_bkt = max(1, int(cfg.n_substeps))
+
         for (d_act, m_act), indices in buckets.items():
             if m_act == 0:
                 for idx in indices:
@@ -1875,8 +2056,45 @@ class GpuTorchDupireQMC:
                 continue
             chunk_cap = max(
                 8,
-                min(128, (48 * 1024 * 1024) // max(d_act * max(int(cfg.n_paths), 1024) * 8, 1)),
+                min(32, (10 * 1024 * 1024) // max(d_act * max(int(cfg.n_paths), 1024) * 8, 1)),
             )
+            # Precompute bucket-shared coarse Sobol tiles once across chunks; reuse z_steps when <= 16 MB
+            z_coarse_raw_bkt = _generate_gpu_sobol_tile(
+                n_rep=n_rep_bkt,
+                n_replicates=eff_r_bkt,
+                n_dims=m_act * d_act,
+                dim_offset=0,
+                seed=cfg.seed,
+                device=dev,
+                use_triton=self._use_triton,
+            )
+            z_coarse_bkt = (
+                z_coarse_raw_bkt.view(eff_r_bkt, m_act, d_act, n_rep_bkt)
+                .permute(1, 0, 2, 3)
+                .contiguous()
+            )
+            del z_coarse_raw_bkt
+            z_steps_bkt: Optional[torch.Tensor] = None
+            steps_elems = m_act * eff_r_bkt * d_act * n_sub_bkt * n_rep_bkt
+            if len(indices) > chunk_cap and n_sub_bkt > 1 and steps_elems <= 4 * 1024 * 1024:
+                z_sub_bkt = (
+                    _generate_gpu_sobol_tile(
+                        n_rep=n_rep_bkt,
+                        n_replicates=eff_r_bkt,
+                        n_dims=m_act * d_act * n_sub_bkt,
+                        dim_offset=m_act * d_act,
+                        seed=cfg.seed + 31337,
+                        device=dev,
+                        use_triton=self._use_triton,
+                    )
+                    .view(eff_r_bkt, m_act, d_act, n_sub_bkt, n_rep_bkt)
+                    .permute(1, 0, 2, 3, 4)
+                    .contiguous()
+                )
+                z_sub_bkt.sub_(z_sub_bkt.mean(dim=3, keepdim=True))
+                z_sub_bkt.add_(z_coarse_bkt.unsqueeze(3) * (1.0 / math.sqrt(float(n_sub_bkt))))
+                z_steps_bkt = z_sub_bkt
+
             for start in range(0, len(indices), chunk_cap):
                 chunk_idx = indices[start : start + chunk_cap]
                 self._run_training_bucket(
@@ -1891,7 +2109,10 @@ class GpuTorchDupireQMC:
                     q_out=q_out,
                     l_out=l_out,
                     delta_out=delta_out,
+                    z_coarse_all=z_coarse_bkt,
+                    z_steps_cached=z_steps_bkt,
                 )
+            del z_coarse_bkt, z_steps_bkt
 
         return pv_out, p_out, q_out, l_out, delta_out
 
@@ -1909,6 +2130,8 @@ class GpuTorchDupireQMC:
         q_out: torch.Tensor,
         l_out: torch.Tensor,
         delta_out: Optional[torch.Tensor],
+        z_coarse_all: Optional[torch.Tensor] = None,
+        z_steps_cached: Optional[torch.Tensor] = None,
     ) -> None:
         dev = self.device
         b_c = len(chunk_idx)
@@ -1917,56 +2140,89 @@ class GpuTorchDupireQMC:
         n_tot = eff_r * n_rep
         n_sub = max(1, int(cfg.n_substeps))
 
-        # Pack per-contract market & schedule arrays
-        corr_np_list: List[npt.NDArray[np.float64]] = []
-        tau_b = np.zeros((b_c, m_act), dtype=np.float64)
-        df_pay_b = np.zeros((b_c, m_act), dtype=np.float64)
-        ko_b = np.zeros((b_c, m_act), dtype=np.float64)
-        is_call_b = np.zeros((b_c, m_act), dtype=np.float64)
-        cpn_b = np.zeros((b_c, m_act), dtype=np.float64)
-        is_guar_b = np.zeros((b_c, m_act), dtype=np.float64)
-        cpn_amt_b = np.zeros((b_c, m_act), dtype=np.float64)
-        fwd_b = np.zeros((b_c, d_act, m_act), dtype=np.float64)
-        cash_lev_b = np.zeros((b_c, d_act, m_act), dtype=np.float64)
-        ref_b = np.zeros((b_c, d_act), dtype=np.float64)
-        w_fund_b = np.zeros((b_c, m_act), dtype=np.float64)
-        inv_dt_grid_b = np.zeros(b_c, dtype=np.float32)
-        spots_b = np.zeros((b_c, d_act), dtype=np.float64)
-        r_tot_b = np.zeros((b_c, d_act, m_act), dtype=np.float64)
-        df_fin_b = np.zeros((b_c, d_act, m_act), dtype=np.float64)
-        v_term_b = np.zeros((b_c, d_act), dtype=np.float64)
+        # Bulk-pack contract tensors on CPU so H2D uses 4 transfers instead of ~35
+        st_chunk = [states[i] for i in chunk_idx]
+        corr_stack_64 = torch.stack(
+            [st.corr_matrix.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0
+        ).to(dev)
+        m2d_cpu = torch.stack(
+            [
+                torch.stack([st.tau_obs.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.df_pay.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.ko_barriers.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.is_callable.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.cpn_barriers.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.is_guaranteed_cpn.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.coupon_amounts.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack(
+                    [
+                        torch.as_tensor(_compute_funding_weights_np(st), dtype=torch.float64)
+                        if getattr(st, "funding_leg", None) is not None
+                        else torch.zeros(m_act, dtype=torch.float64)
+                        for st in st_chunk
+                    ],
+                    dim=0,
+                ),
+            ],
+            dim=0,
+        ).to(dev)  # (8, B_c, M)
+        tau_t, df_pay_t, ko_t, is_call_t, cpn_t, is_guar_t, cpn_amt_t, w_fund_t = m2d_cpu.unbind(dim=0)
+
+        m3d_cpu = torch.stack(
+            [
+                torch.stack([st.dividend_schedule.forward_price.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.cash_div_leverage.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.dividend_schedule.r_tot_obs.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.dividend_schedule.df_fin_obs.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+            ],
+            dim=0,
+        ).to(dev)  # (4, B_c, D, M)
+        fwd_t, cash_lev_t, r_tot_t, df_fin_t = m3d_cpu.unbind(dim=0)
+
+        d1d_cpu = torch.stack(
+            [
+                torch.stack([st.ref_spots.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.spots_t0.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([st.v_perf[:, -1].detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+            ],
+            dim=0,
+        ).to(dev)  # (3, B_c, D)
+        ref_t, spots_t, v_term_t = d1d_cpu.unbind(dim=0)
+
+        scal_np = np.empty((18, b_c), dtype=np.float64)
         surfs_flat: List[Any] = []
         div_events_flat: List[Sequence[Any]] = []
-
-        for bi, orig_idx in enumerate(chunk_idx):
-            st = states[orig_idx]
-            corr_np_list.append(st.corr_matrix.detach().cpu().numpy().astype(np.float64))
-
-            tau_i = st.tau_obs.detach().cpu().numpy().astype(np.float64)
-            tau_b[bi] = tau_i
-            inv_dt_grid_b[bi] = float(cfg.lv_grid_nt - 1) / max(float(tau_i[-1]), 1e-4)
-            df_pay_b[bi] = st.df_pay.detach().cpu().numpy().astype(np.float64)
-            ko_b[bi] = st.ko_barriers.detach().cpu().numpy().astype(np.float64)
-            is_call_b[bi] = st.is_callable.detach().cpu().numpy().astype(np.float64)
-            cpn_b[bi] = st.cpn_barriers.detach().cpu().numpy().astype(np.float64)
-            is_guar_b[bi] = st.is_guaranteed_cpn.detach().cpu().numpy().astype(np.float64)
-            cpn_amt_b[bi] = st.coupon_amounts.detach().cpu().numpy().astype(np.float64)
-            fwd_b[bi] = st.dividend_schedule.forward_price.detach().cpu().numpy().astype(np.float64)
-            cash_lev_b[bi] = st.cash_div_leverage.detach().cpu().numpy().astype(np.float64)
-            ref_b[bi] = st.ref_spots.detach().cpu().numpy().astype(np.float64)
-            if getattr(st, "funding_leg", None) is not None:
-                w_fund_b[bi] = _compute_funding_weights_np(st)
-
-            spots_b[bi] = st.spots_t0.detach().cpu().numpy().astype(np.float64)
-            r_tot_b[bi] = st.dividend_schedule.r_tot_obs.detach().cpu().numpy().astype(np.float64)
-            df_fin_b[bi] = st.dividend_schedule.df_fin_obs.detach().cpu().numpy().astype(np.float64)
-            v_term_b[bi] = st.v_perf[:, -1].detach().cpu().numpy().astype(np.float64)
+        for bi, st in enumerate(st_chunk):
+            scal_np[0, bi] = float(st.seasoned_state.c_mem_0)
+            scal_np[1, bi] = 1.0 if st.is_memory else 0.0
+            scal_np[2, bi] = 1.0 if st.force_coupons_on_autocall else 0.0
+            scal_np[3, bi] = 1.0 if st.no_notional_repayment else 0.0
+            scal_np[4, bi] = float(st.autocall_coupon)
+            scal_np[5, bi] = float(st.ko_spread)
+            scal_np[6, bi] = float(st.cpn_spread)
+            scal_np[7, bi] = float(st.pv_in_transit)
+            scal_np[8, bi] = float(st.strike)
+            scal_np[9, bi] = float(st.option_gearing)
+            lk = st.lower_strike
+            scal_np[10, bi] = float(lk) if (lk is not None and float(lk) > 0.0) else -1.0
+            kb = st.ki_barrier
+            scal_np[11, bi] = float(kb) if (kb is not None and float(kb) > 0.0 and st.seasoned_state.i_ki_past < 0.5) else -1.0
+            scal_np[12, bi] = -float(st.ki_spread)
+            sk = st.one_star_strike
+            scal_np[13, bi] = float(sk) if (sk is not None and float(sk) > 0.0) else -1.0
+            scal_np[14, bi] = float(st.one_star_coupon)
+            pk = st.participation_call_strike
+            pr = st.participation_call_rate
+            scal_np[15, bi] = float(pk) if (pk is not None and float(pr) > 0.0) else -1.0
+            scal_np[16, bi] = float(pr)
+            scal_np[17, bi] = 1.0 if st.is_long_basket else -1.0
             div_ev_map = getattr(st.dividend_schedule, "dividend_events", {})
             for ticker in st.sorted_identifiers:
                 surfs_flat.append(st.vol_surfaces[ticker])
                 div_events_flat.append(div_ev_map.get(ticker, []))
 
-        corr_stack_64 = torch.tensor(np.stack(corr_np_list, axis=0), dtype=torch.float64, device=dev)
+        scal_gpu = torch.as_tensor(scal_np, dtype=torch.float64, device=dev)
+
         corr_sym_t = 0.5 * (corr_stack_64 + corr_stack_64.transpose(-1, -2))
         chol_64, chol_info = torch.linalg.cholesky_ex(corr_sym_t)
         if torch.any(chol_info != 0):
@@ -1978,43 +2234,36 @@ class GpuTorchDupireQMC:
                 di = torch.rsqrt(torch.clamp(torch.diag(c_psd), min=1e-12))
                 c_psd = c_psd * torch.outer(di, di)
                 chol_64[r_i] = torch.linalg.cholesky(c_psd)
-        chol_t = chol_64.to(torch.float32)  # (B_c, D, D)
+        chol_t = chol_64.to(torch.float32).contiguous()  # (B_c, D, D)
 
-        tau_rep_gpu = (
-            torch.tensor(tau_b, dtype=torch.float64, device=dev)
-            .unsqueeze(1)
-            .expand(b_c, d_act, m_act)
-            .reshape(b_c * d_act, m_act)
-        )
+        tau_rep_gpu = tau_t.unsqueeze(1).expand(b_c, d_act, m_act).reshape(b_c * d_act, m_act)
         lv_flat, ymin_flat, invdy_flat = _build_lv_tables_batch(
             surfs_flat,
-            torch.tensor(spots_b.reshape(-1), dtype=torch.float64, device=dev),
-            torch.tensor(r_tot_b.reshape(-1, m_act), dtype=torch.float64, device=dev),
-            torch.tensor(df_fin_b.reshape(-1, m_act), dtype=torch.float64, device=dev),
+            spots_t.reshape(-1),
+            r_tot_t.reshape(-1, m_act),
+            df_fin_t.reshape(-1, m_act),
             tau_rep_gpu,
             div_events_flat,
-            torch.tensor(v_term_b.reshape(-1), dtype=torch.float64, device=dev),
+            v_term_t.reshape(-1),
             cfg.lv_grid_nt,
             cfg.lv_grid_ny,
             dev,
             use_triton=self._use_triton,
         )
         lv_table_b = lv_flat.view(b_c, d_act, cfg.lv_grid_nt, cfg.lv_grid_ny).contiguous()
-        ymin_t = ymin_flat.view(b_c, d_act)
-        invdy_t = invdy_flat.view(b_c, d_act)
-        inv_dt_grid_t = torch.as_tensor(inv_dt_grid_b, dtype=torch.float32, device=dev)
+        ymin_t = ymin_flat.view(b_c, d_act).contiguous()
+        invdy_t = invdy_flat.view(b_c, d_act).contiguous()
+        inv_dt_grid_t = (float(cfg.lv_grid_nt - 1) / torch.clamp(tau_t[:, -1], min=1e-4)).to(torch.float32).contiguous()
 
         # Precompute grouped index descriptors to avoid per-contract loops in time steps
         perm_cache: Dict[Tuple[int, ...], torch.Tensor] = {}
         call_groups: Dict[Tuple[str, Optional[Tuple[int, ...]]], List[int]] = {}
         cpn_groups: Dict[Tuple[str, Optional[Tuple[int, ...]]], List[int]] = {}
         opt_groups: Dict[Tuple[str, Optional[Tuple[int, ...]]], List[int]] = {}
-        cpn_same_as_call_idx: List[int] = []
         cpn_diff_list: List[int] = []
         cpn_down_flags: List[bool] = []
         cpn_out_flags: List[bool] = []
-        for bi, orig_idx in enumerate(chunk_idx):
-            st = states[orig_idx]
+        for bi, st in enumerate(st_chunk):
             inv_raw = getattr(st, "inv_lex_perm", None)
             p_key = tuple(int(x) for x in inv_raw) if inv_raw is not None else None
             if p_key is not None and p_key not in perm_cache:
@@ -2022,101 +2271,124 @@ class GpuTorchDupireQMC:
             c_idx = str(st.callability_index)
             call_groups.setdefault((c_idx, p_key), []).append(bi)
             e_cpn = str(st.coupon_index if st.coupon_index else st.callability_index)
-            if e_cpn == c_idx:
-                cpn_same_as_call_idx.append(bi)
-            else:
+            if e_cpn != c_idx:
                 cpn_diff_list.append(bi)
                 cpn_groups.setdefault((e_cpn, p_key), []).append(bi)
             e_opt = str(st.option_index if st.option_index else st.callability_index)
             opt_groups.setdefault((e_opt, p_key), []).append(bi)
             cpn_down_flags.append(str(getattr(st, "coupon_barrier_direction", "Up") or "Up").strip().lower() == "down")
             cpn_out_flags.append(str(getattr(st, "coupon_barrier_type", "In") or "In").strip().lower() == "out")
+        call_groups_t = [
+            (k, torch.tensor(v, dtype=torch.long, device=dev)) for k, v in call_groups.items()
+        ]
+        cpn_groups_t = [
+            (k, torch.tensor(v, dtype=torch.long, device=dev)) for k, v in cpn_groups.items()
+        ]
+        opt_groups_t = [
+            (k, torch.tensor(v, dtype=torch.long, device=dev)) for k, v in opt_groups.items()
+        ]
         cpn_down_mask_t = torch.tensor(cpn_down_flags, dtype=torch.bool, device=dev).view(b_c, 1)
         cpn_out_mask_t = torch.tensor(cpn_out_flags, dtype=torch.bool, device=dev).view(b_c, 1)
 
-        tau_prev_np = np.concatenate([np.zeros((b_c, 1), dtype=np.float64), tau_b[:, :-1]], axis=1)
-        dt_per_np = np.maximum(tau_b - tau_prev_np, 1e-8)
-        dt_sub_np = dt_per_np / float(n_sub)
-        sqrt_dt_np = np.sqrt(dt_sub_np)
-        t_start_all_t = torch.tensor(tau_prev_np, dtype=torch.float32, device=dev).contiguous()
-        dt_sub_all_t = torch.tensor(dt_sub_np, dtype=torch.float32, device=dev).contiguous()
-        sqrt_dt_all_t = torch.tensor(sqrt_dt_np, dtype=torch.float32, device=dev).contiguous()
+        tau_prev_t = torch.cat([torch.zeros((b_c, 1), dtype=torch.float64, device=dev), tau_t[:, :-1]], dim=1)
+        dt_per_t = torch.clamp(tau_t - tau_prev_t, min=1e-8)
+        dt_sub_t_all = dt_per_t / float(n_sub)
+        # (m_act, b_c) contiguous layout so slice [m] is stride-1 contiguous for Triton
+        t_start_all_t = tau_prev_t.transpose(0, 1).to(torch.float32).contiguous()
+        dt_sub_all_t = dt_sub_t_all.transpose(0, 1).to(torch.float32).contiguous()
+        sqrt_dt_all_t = torch.sqrt(dt_sub_t_all).transpose(0, 1).to(torch.float32).contiguous()
 
-        fwd_t = torch.as_tensor(fwd_b, dtype=torch.float64, device=dev)
-        ref_t = torch.as_tensor(ref_b, dtype=torch.float64, device=dev)
-        cash_lev_t = torch.as_tensor(cash_lev_b, dtype=torch.float64, device=dev)
-        df_pay_t = torch.as_tensor(df_pay_b, dtype=torch.float64, device=dev)
-        ko_t = torch.as_tensor(ko_b, dtype=torch.float64, device=dev)
-        is_call_t = torch.as_tensor(is_call_b, dtype=torch.float64, device=dev)
-        cpn_t = torch.as_tensor(cpn_b, dtype=torch.float64, device=dev)
-        is_guar_t = torch.as_tensor(is_guar_b, dtype=torch.float64, device=dev)
-        cpn_amt_t = torch.as_tensor(cpn_amt_b, dtype=torch.float64, device=dev)
-        w_fund_t = torch.as_tensor(w_fund_b, dtype=torch.float64, device=dev)
+        df_pay_m_t = df_pay_t.transpose(0, 1).contiguous()
+        cpn_amt_m_t = cpn_amt_t.transpose(0, 1).contiguous()
+        w_fund_m_t = w_fund_t.transpose(0, 1).contiguous()
 
-        # Scalar contract arrays on GPU
-        c_mem0_t = torch.tensor([float(states[i].seasoned_state.c_mem_0) for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
-        is_mem_t = torch.tensor([1.0 if states[i].is_memory else 0.0 for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
-        force_cpn_t = torch.tensor([1.0 if states[i].force_coupons_on_autocall else 0.0 for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
-        no_notional_t = torch.tensor([1.0 if states[i].no_notional_repayment else 0.0 for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
-        ac_cpn_t = torch.tensor([float(states[i].autocall_coupon) for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
-        ko_spread_t = torch.tensor([float(states[i].ko_spread) for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
-        cpn_spread_t = torch.tensor([float(states[i].cpn_spread) for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
-        pv_in_trans_t = torch.tensor([float(states[i].pv_in_transit) for i in chunk_idx], dtype=torch.float64, device=dev)
+        c_mem0_t = scal_gpu[0].view(b_c, 1)
+        is_mem_t = scal_gpu[1].view(b_c, 1)
+        force_cpn_t = scal_gpu[2].view(b_c, 1)
+        no_notional_t = scal_gpu[3].view(b_c, 1)
+        ac_cpn_t = scal_gpu[4].view(b_c, 1)
+        ko_spread_t = scal_gpu[5].view(b_c, 1)
+        cpn_spread_t = scal_gpu[6].view(b_c, 1)
+        pv_in_trans_t = scal_gpu[7]
 
-        log_x = torch.zeros((b_c, eff_r, d_act, n_rep), dtype=torch.float32, device=dev)
-        dlog_x = torch.zeros((b_c, eff_r, d_act, n_rep), dtype=torch.float32, device=dev)
+        is_mem_1d = scal_gpu[1].contiguous()
+        force_cpn_1d = scal_gpu[2].contiguous()
+        no_not_1d = scal_gpu[3].contiguous()
+        ac_cpn_1d = scal_gpu[4].contiguous()
+
+        # SoA layout: (B_c, D, R, N_rep) and (B_c, D, N_tot) for coalesced GPU reads/writes
+        log_x = torch.zeros((b_c, d_act, eff_r, n_rep), dtype=torch.float32, device=dev)
+        empty_f32_stub = torch.empty(1, dtype=torch.float32, device=dev)
         alive = torch.ones((b_c, n_tot), dtype=torch.float64, device=dev)
         unpaid_mem = c_mem0_t.expand(b_c, n_tot).clone()
         total_pv = torch.zeros((b_c, n_tot), dtype=torch.float64, device=dev)
 
-        # Forward-mode pathwise tangent state wrt log(S_0) per asset d in 0..D-1
-        d_alive = torch.zeros((b_c, n_tot, d_act), dtype=torch.float64, device=dev) if compute_pathwise_delta else None
-        d_unpaid = torch.zeros((b_c, n_tot, d_act), dtype=torch.float64, device=dev) if compute_pathwise_delta else None
-        d_total_pv = torch.zeros((b_c, n_tot, d_act), dtype=torch.float64, device=dev) if compute_pathwise_delta else None
+        # Forward-mode pathwise tangent state wrt log(S_0) in coalesced SoA (B_c, D, N_tot)
+        d_alive = torch.zeros((b_c, d_act, n_tot), dtype=torch.float64, device=dev) if compute_pathwise_delta else None
+        d_unpaid = torch.zeros((b_c, d_act, n_tot), dtype=torch.float64, device=dev) if compute_pathwise_delta else None
+        d_total_pv = torch.zeros((b_c, d_act, n_tot), dtype=torch.float64, device=dev) if compute_pathwise_delta else None
+        empty_3d_stub = torch.empty(1, dtype=torch.float64, device=dev)
 
         p_stop_b = torch.zeros((b_c, m_act), dtype=torch.float64, device=dev)
         q_cpn_b = torch.zeros((b_c, m_act), dtype=torch.float64, device=dev)
 
         sub_dim_base = m_act * d_act
-
-        for m in range(m_act):
-
-            z_coarse_indep = _generate_gpu_sobol_tile(
-                n_rep=n_rep,
-                n_replicates=eff_r,
-                n_dims=d_act,
-                dim_offset=m * d_act,
-                seed=cfg.seed,
-                device=dev,
-                use_triton=self._use_triton,
-            )  # (R, D, N_rep)
-            if n_sub == 1:
-                z_steps_indep = z_coarse_indep.unsqueeze(2).contiguous()
-            else:
-                z_sub_raw = _generate_gpu_sobol_tile(
+        if z_coarse_all is None:
+            z_coarse_all = (
+                _generate_gpu_sobol_tile(
                     n_rep=n_rep,
                     n_replicates=eff_r,
-                    n_dims=d_act * n_sub,
-                    dim_offset=sub_dim_base + m * (d_act * n_sub),
-                    seed=cfg.seed + 31337,
+                    n_dims=m_act * d_act,
+                    dim_offset=0,
+                    seed=cfg.seed,
                     device=dev,
                     use_triton=self._use_triton,
-                ).view(eff_r, d_act, n_sub, n_rep)
-                z_steps_indep = (
-                    z_sub_raw
-                    - z_sub_raw.mean(dim=2, keepdim=True)
-                    + z_coarse_indep.unsqueeze(2) / math.sqrt(float(n_sub))
-                ).contiguous()
+                )
+                .view(eff_r, m_act, d_act, n_rep)
+                .permute(1, 0, 2, 3)
+                .contiguous()
+            )
+        m_blk_cap = max(1, min(m_act, (4 * 1024 * 1024) // max(eff_r * d_act * n_sub * n_rep, 1)))
+        z_steps_blk: Optional[torch.Tensor] = z_steps_cached
+        blk_end = m_act if z_steps_cached is not None else 0
+        blk_start = 0
+
+        for m in range(m_act):
+            if n_sub == 1:
+                z_steps_indep = z_coarse_all[m].unsqueeze(2).contiguous()
+            else:
+                if z_steps_blk is None or m >= blk_end:
+                    blk_start = m
+                    blk_end = min(m_act, m + m_blk_cap)
+                    m_len = blk_end - blk_start
+                    z_sub_raw = (
+                        _generate_gpu_sobol_tile(
+                            n_rep=n_rep,
+                            n_replicates=eff_r,
+                            n_dims=m_len * d_act * n_sub,
+                            dim_offset=sub_dim_base + blk_start * (d_act * n_sub),
+                            seed=cfg.seed + 31337,
+                            device=dev,
+                            use_triton=self._use_triton,
+                        )
+                        .view(eff_r, m_len, d_act, n_sub, n_rep)
+                        .permute(1, 0, 2, 3, 4)
+                        .contiguous()
+                    )
+                    z_sub_raw.sub_(z_sub_raw.mean(dim=3, keepdim=True))
+                    z_sub_raw.add_(z_coarse_all[blk_start:blk_end].unsqueeze(3) * (1.0 / math.sqrt(float(n_sub))))
+                    z_steps_blk = z_sub_raw
+                z_steps_indep = z_steps_blk[m - blk_start]
 
             if self._use_triton:
-                t_start_t = t_start_all_t[:, m]
-                dt_sub_t = dt_sub_all_t[:, m]
-                sqrt_dt_t = sqrt_dt_all_t[:, m]
+                t_start_t = t_start_all_t[m]
+                dt_sub_t = dt_sub_all_t[m]
+                sqrt_dt_t = sqrt_dt_all_t[m]
                 block_n = min(256, n_rep)
                 grid_b = (triton.cdiv(n_rep, block_n), b_c * d_act, eff_r)
                 _dupire_batch_substep_triton_kernel[grid_b](
                     log_x,
-                    dlog_x,
+                    empty_f32_stub,
                     z_steps_indep,
                     chol_t,
                     lv_table_b,
@@ -2133,19 +2405,19 @@ class GpuTorchDupireQMC:
                     N_t=cfg.lv_grid_nt,
                     N_y=cfg.lv_grid_ny,
                     BLOCK_N=block_n,
-                    COMPUTE_DELTA=1 if compute_pathwise_delta else 0,
+                    COMPUTE_DELTA=0,
                 )
             else:
-                z_steps_corr = torch.einsum("bij,rjsn->brisn", chol_t, z_steps_indep)
+                z_steps_corr = torch.einsum("bij,rjsn->brisn", chol_t, z_steps_indep).permute(0, 2, 1, 3, 4)
                 max_t_f = float(cfg.lv_grid_nt - 1) - 1e-4
                 max_y_f = float(cfg.lv_grid_ny - 1) - 1e-4
-                dt_sub_t = dt_sub_all_t[:, m].view(b_c, 1, 1, 1)
-                sqrt_dt_t = sqrt_dt_all_t[:, m].view(b_c, 1, 1, 1)
-                t_start_t = t_start_all_t[:, m].view(b_c, 1, 1, 1)
+                dt_sub_t = dt_sub_all_t[m].view(b_c, 1, 1, 1)
+                sqrt_dt_t = sqrt_dt_all_t[m].view(b_c, 1, 1, 1)
+                t_start_t = t_start_all_t[m].view(b_c, 1, 1, 1)
                 b_idx = torch.arange(b_c, device=dev).view(b_c, 1, 1, 1)
-                d_idx = torch.arange(d_act, device=dev).view(1, 1, d_act, 1)
-                ym_v = ymin_t.view(b_c, 1, d_act, 1)
-                idy_v = invdy_t.view(b_c, 1, d_act, 1)
+                d_idx = torch.arange(d_act, device=dev).view(1, d_act, 1, 1)
+                ym_v = ymin_t.view(b_c, d_act, 1, 1)
+                idy_v = invdy_t.view(b_c, d_act, 1, 1)
                 idg_v = inv_dt_grid_t.view(b_c, 1, 1, 1)
                 for s in range(n_sub):
                     t_step = t_start_t + (s + 0.5) * dt_sub_t
@@ -2164,47 +2436,43 @@ class GpuTorchDupireQMC:
                     lv_s = (1.0 - ft) * (v00 + fy * (v01 - v00)) + ft * (v10 + fy * (v11 - v10))
                     z_s = z_steps_corr[:, :, :, s, :]
                     log_x = log_x + (-0.5 * lv_s * lv_s * dt_sub_t + lv_s * sqrt_dt_t * z_s)
-                    if compute_pathwise_delta:
-                        dlv_dy = ((1.0 - ft) * (v01 - v00) + ft * (v11 - v10)) * idy_v
-                        dlog_x = dlog_x + (-lv_s * dlv_dy * dt_sub_t + dlv_dy * sqrt_dt_t * z_s) * (1.0 + dlog_x)
 
-            # Martingale renormalization per (b, r, d) with pathwise tangent
+            # Martingale renormalization per (b, d, r) with zero-copy SoA perf_m (B_c, D, N_tot)
             lx_f64 = log_x.to(torch.float64)
             exp_lx = torch.exp(lx_f64)
             mean_x = torch.clamp(exp_lx.mean(dim=-1, keepdim=True), min=1e-12)
             lx_f64 = lx_f64 - torch.log(mean_x)
             log_x = lx_f64.to(torch.float32)
-            if compute_pathwise_delta:
-                dlx_corr = dlog_x.to(torch.float64)
-                d_shift = (exp_lx * dlx_corr).mean(dim=-1, keepdim=True) / mean_x
-                dlog_x = (dlx_corr - d_shift).to(torch.float32)
 
-            s_m = fwd_t[:, :, m].view(b_c, 1, d_act, 1) * torch.exp(lx_f64)
-            perf_m = (s_m / ref_t.view(b_c, 1, d_act, 1)).permute(0, 1, 3, 2).reshape(b_c, n_tot, d_act)
+            s_m = fwd_t[:, :, m].view(b_c, d_act, 1, 1) * (exp_lx / mean_x)
+            perf_m = (s_m / ref_t.view(b_c, d_act, 1, 1)).reshape(b_c, d_act, n_tot)
+            del lx_f64, exp_lx, mean_x, s_m
 
-            # d_perf_m_d_log_s0[b, n, i] (diagonal in asset index)
             if compute_pathwise_delta:
-                dlx_f64 = dlog_x.to(torch.float64).permute(0, 1, 3, 2).reshape(b_c, n_tot, d_act)
-                dperf_diag = perf_m * (cash_lev_t[:, :, m].unsqueeze(1) + dlx_f64)
+                # Sticky-moneyness Dupire LV tangent avoids unbounded (1 + dlx) Euler amplification
+                dperf_diag: Optional[torch.Tensor] = perf_m * cash_lev_t[:, :, m].unsqueeze(-1)
             else:
                 dperf_diag = None
 
-            # Vectorized grouped monitoring indices & derivatives
-            if len(call_groups) == 1:
-                (c_idx_only, p_key_only) = next(iter(call_groups.keys()))
+            # Vectorized grouped monitoring indices & derivatives in coalesced SoA (B_c, D, N_tot)
+            if len(call_groups_t) == 1:
+                (c_idx_only, p_key_only), _ = call_groups_t[0]
                 inv_p_only = perm_cache.get(p_key_only) if p_key_only is not None else None
                 w_call, gwc = _eval_index_and_grad_gpu(
-                    perf_m, c_idx_only, inv_p_only, compute_grad=compute_pathwise_delta
+                    perf_m, c_idx_only, inv_p_only, compute_grad=compute_pathwise_delta, asset_dim=1
                 )
-                dw_call = (gwc * dperf_diag) if (compute_pathwise_delta and gwc is not None and dperf_diag is not None) else None
+                if compute_pathwise_delta and gwc is not None and dperf_diag is not None:
+                    dw_call: Optional[torch.Tensor] = gwc * dperf_diag
+                    del gwc
+                else:
+                    dw_call = None
             else:
                 w_call = torch.empty((b_c, n_tot), dtype=torch.float64, device=dev)
-                dw_call = torch.empty((b_c, n_tot, d_act), dtype=torch.float64, device=dev) if compute_pathwise_delta else None
-                for (c_idx_g, p_key_g), bi_list in call_groups.items():
+                dw_call = torch.empty((b_c, d_act, n_tot), dtype=torch.float64, device=dev) if compute_pathwise_delta else None
+                for (c_idx_g, p_key_g), idx_t in call_groups_t:
                     inv_p_g = perm_cache.get(p_key_g) if p_key_g is not None else None
-                    idx_t = torch.tensor(bi_list, dtype=torch.long, device=dev)
                     wc_g, gwc_g = _eval_index_and_grad_gpu(
-                        perf_m[idx_t], c_idx_g, inv_p_g, compute_grad=compute_pathwise_delta
+                        perf_m[idx_t], c_idx_g, inv_p_g, compute_grad=compute_pathwise_delta, asset_dim=1
                     )
                     w_call[idx_t] = wc_g
                     if dw_call is not None and gwc_g is not None and dperf_diag is not None:
@@ -2216,15 +2484,17 @@ class GpuTorchDupireQMC:
             else:
                 w_cpn = w_call.clone()
                 dw_cpn = dw_call.clone() if dw_call is not None else None
-                for (e_cpn_g, p_key_g), bi_list in cpn_groups.items():
+                for (e_cpn_g, p_key_g), idx_t in cpn_groups_t:
                     inv_p_g = perm_cache.get(p_key_g) if p_key_g is not None else None
-                    idx_t = torch.tensor(bi_list, dtype=torch.long, device=dev)
                     wq_g, gwq_g = _eval_index_and_grad_gpu(
-                        perf_m[idx_t], e_cpn_g, inv_p_g, compute_grad=compute_pathwise_delta
+                        perf_m[idx_t], e_cpn_g, inv_p_g, compute_grad=compute_pathwise_delta, asset_dim=1
                     )
                     w_cpn[idx_t] = wq_g
                     if dw_cpn is not None and gwq_g is not None and dperf_diag is not None:
                         dw_cpn[idx_t] = gwq_g * dperf_diag[idx_t]
+
+            if m < m_act - 1:
+                del perf_m, dperf_diag
 
             ko_ind, dko_dw = _digital_ramp_and_deriv_batch(
                 w_call, ko_t[:, m : m + 1], ko_spread_t, compute_deriv=compute_pathwise_delta
@@ -2247,74 +2517,113 @@ class GpuTorchDupireQMC:
                 dcpn_raw = torch.where(cpn_out_mask_t, -dbase, dbase)
                 dcpn_dw = torch.where(guar_m, torch.zeros_like(dcpn_raw), dcpn_raw)
 
-            # Force coupons on autocall
             force_mask = (force_cpn_t > 0.5) & (ko_ind > cpn_ind)
             cpn_ind_eff = torch.where(force_mask, ko_ind, cpn_ind)
-
-            if compute_pathwise_delta and dw_call is not None and dw_cpn is not None and dko_dw is not None and dcpn_dw is not None and d_alive is not None and d_unpaid is not None and d_total_pv is not None:
-                d_ko = dko_dw.unsqueeze(-1) * dw_call
-                d_cpn_raw = dcpn_dw.unsqueeze(-1) * dw_cpn
-                d_cpn = torch.where(force_mask.unsqueeze(-1), d_ko, d_cpn_raw)
-
-                # Funding before autocall
-                wf_m = w_fund_t[:, m : m + 1].unsqueeze(-1)
-                d_total_pv = d_total_pv - d_alive * wf_m
-
-                d_stop_m = d_alive * ko_ind.unsqueeze(-1) + alive.unsqueeze(-1) * d_ko
-                c_m_v = cpn_amt_t[:, m : m + 1]
-                eff_c = torch.where(is_mem_t > 0.5, c_m_v + unpaid_mem, c_m_v)
-                d_eff_c = torch.where(is_mem_t.unsqueeze(-1) > 0.5, d_unpaid, torch.zeros_like(d_unpaid))
-                d_cpn_pay = (
-                    d_alive * (cpn_ind_eff * eff_c).unsqueeze(-1)
-                    + alive.unsqueeze(-1) * (d_cpn * eff_c.unsqueeze(-1) + cpn_ind_eff.unsqueeze(-1) * d_eff_c)
-                    + d_stop_m * ac_cpn_t.unsqueeze(-1)
-                )
-                d_total_pv = d_total_pv + df_pay_t[:, m : m + 1].unsqueeze(-1) * d_cpn_pay
-
-                if torch.any(is_mem_t > 0.5):
-                    d_unpaid_next = d_eff_c * (1.0 - cpn_ind_eff).unsqueeze(-1) - eff_c.unsqueeze(-1) * d_cpn
-                    d_unpaid = torch.where(is_mem_t.unsqueeze(-1) > 0.5, d_unpaid_next, d_unpaid)
-
-                d_alive_next = d_alive * (1.0 - ko_ind).unsqueeze(-1) - alive.unsqueeze(-1) * d_ko
-                not_mask = (1.0 - no_notional_t).unsqueeze(-1) * df_pay_t[:, m : m + 1].unsqueeze(-1)
-                if m < m_act - 1:
-                    d_total_pv = d_total_pv + not_mask * d_stop_m
-                else:
-                    d_total_pv = d_total_pv + not_mask * (d_stop_m + d_alive_next)
-                d_alive = d_alive_next
-
-            # Forward accumulation
-            total_pv = total_pv - alive * w_fund_t[:, m : m + 1]
-            stop_m = alive * ko_ind
-            p_stop_b[:, m] = stop_m.mean(dim=1)
+            p_stop_b[:, m] = (alive * ko_ind).mean(dim=1)
             surv_bm = alive.mean(dim=1)
             q_cpn_b[:, m] = torch.where(
                 surv_bm > 1e-12,
                 (alive * cpn_ind_eff).mean(dim=1) / torch.clamp(surv_bm, min=1e-12),
                 torch.zeros_like(surv_bm),
             )
-            c_m_v = cpn_amt_t[:, m : m + 1]
-            eff_c = torch.where(is_mem_t > 0.5, c_m_v + unpaid_mem, c_m_v)
-            total_pv = total_pv + df_pay_t[:, m : m + 1] * (alive * cpn_ind_eff * eff_c + stop_m * ac_cpn_t)
-            unpaid_mem = torch.where(is_mem_t > 0.5, eff_c * (1.0 - cpn_ind_eff), unpaid_mem)
-            alive = alive * (1.0 - ko_ind)
-            not_mult = (1.0 - no_notional_t) * df_pay_t[:, m : m + 1]
-            if m < m_act - 1:
-                total_pv = total_pv + not_mult * stop_m
-            else:
-                total_pv = total_pv + not_mult * (stop_m + alive)
 
+            if self._use_triton:
+                block_step = min(256, n_tot)
+                grid_step = (triton.cdiv(n_tot, block_step), b_c)
+                has_pw = bool(
+                    compute_pathwise_delta
+                    and dw_call is not None
+                    and dw_cpn is not None
+                    and dko_dw is not None
+                    and dcpn_dw is not None
+                    and d_alive is not None
+                    and d_unpaid is not None
+                    and d_total_pv is not None
+                )
+                _training_period_step_triton_kernel[grid_step](
+                    alive,
+                    unpaid_mem,
+                    total_pv,
+                    ko_ind,
+                    cpn_ind,
+                    dko_dw if dko_dw is not None else empty_3d_stub,
+                    dcpn_dw if dcpn_dw is not None else empty_3d_stub,
+                    d_alive if d_alive is not None else empty_3d_stub,
+                    d_unpaid if d_unpaid is not None else empty_3d_stub,
+                    d_total_pv if d_total_pv is not None else empty_3d_stub,
+                    dw_call if dw_call is not None else empty_3d_stub,
+                    dw_cpn if dw_cpn is not None else empty_3d_stub,
+                    df_pay_m_t[m],
+                    cpn_amt_m_t[m],
+                    w_fund_m_t[m],
+                    ac_cpn_1d,
+                    is_mem_1d,
+                    force_cpn_1d,
+                    no_not_1d,
+                    n_tot=n_tot,
+                    d_assets=d_act,
+                    is_last=1 if m == m_act - 1 else 0,
+                    COMPUTE_DELTA=1 if has_pw else 0,
+                    BLOCK_N=block_step,
+                )
+            else:
+                if compute_pathwise_delta and dw_call is not None and dw_cpn is not None and dko_dw is not None and dcpn_dw is not None and d_alive is not None and d_unpaid is not None and d_total_pv is not None:
+                    d_ko = dko_dw.unsqueeze(1) * dw_call
+                    d_cpn_raw = dcpn_dw.unsqueeze(1) * dw_cpn
+                    d_cpn = torch.where(force_mask.unsqueeze(1), d_ko, d_cpn_raw)
+
+                    wf_m = w_fund_t[:, m : m + 1].unsqueeze(1)
+                    d_total_pv = d_total_pv - d_alive * wf_m
+
+                    d_stop_m = d_alive * ko_ind.unsqueeze(1) + alive.unsqueeze(1) * d_ko
+                    c_m_v = cpn_amt_t[:, m : m + 1]
+                    eff_c = torch.where(is_mem_t > 0.5, c_m_v + unpaid_mem, c_m_v)
+                    d_eff_c = torch.where(is_mem_t.unsqueeze(1) > 0.5, d_unpaid, torch.zeros_like(d_unpaid))
+                    d_cpn_pay = (
+                        d_alive * (cpn_ind_eff * eff_c).unsqueeze(1)
+                        + alive.unsqueeze(1) * (d_cpn * eff_c.unsqueeze(1) + cpn_ind_eff.unsqueeze(1) * d_eff_c)
+                        + d_stop_m * ac_cpn_t.unsqueeze(1)
+                    )
+                    d_total_pv = d_total_pv + df_pay_t[:, m : m + 1].unsqueeze(1) * d_cpn_pay
+
+                    if torch.any(is_mem_t > 0.5):
+                        d_unpaid_next = d_eff_c * (1.0 - cpn_ind_eff).unsqueeze(1) - eff_c.unsqueeze(1) * d_cpn
+                        d_unpaid = torch.where(is_mem_t.unsqueeze(1) > 0.5, d_unpaid_next, d_unpaid)
+
+                    d_alive_next = d_alive * (1.0 - ko_ind).unsqueeze(1) - alive.unsqueeze(1) * d_ko
+                    not_mask = (1.0 - no_notional_t).unsqueeze(1) * df_pay_t[:, m : m + 1].unsqueeze(1)
+                    if m < m_act - 1:
+                        d_total_pv = d_total_pv + not_mask * d_stop_m
+                    else:
+                        d_total_pv = d_total_pv + not_mask * (d_stop_m + d_alive_next)
+                    d_alive = d_alive_next
+
+                total_pv = total_pv - alive * w_fund_t[:, m : m + 1]
+                stop_m = alive * ko_ind
+                c_m_v = cpn_amt_t[:, m : m + 1]
+                eff_c = torch.where(is_mem_t > 0.5, c_m_v + unpaid_mem, c_m_v)
+                total_pv = total_pv + df_pay_t[:, m : m + 1] * (alive * cpn_ind_eff * eff_c + stop_m * ac_cpn_t)
+                unpaid_mem = torch.where(is_mem_t > 0.5, eff_c * (1.0 - cpn_ind_eff), unpaid_mem)
+                alive = alive * (1.0 - ko_ind)
+                not_mult = (1.0 - no_notional_t) * df_pay_t[:, m : m + 1]
+                if m < m_act - 1:
+                    total_pv = total_pv + not_mult * stop_m
+                else:
+                    total_pv = total_pv + not_mult * (stop_m + alive)
+
+            del dw_call, dw_cpn
             if m == m_act - 1:
                 perf_term = perf_m
                 if compute_pathwise_delta:
                     dperf_term_diag = dperf_diag
+                del perf_m, dperf_diag
 
-        # Vectorized terminal option & tangent across bucket
-        if len(opt_groups) == 1:
-            (o_idx_only, p_key_only) = next(iter(opt_groups.keys()))
+        # Vectorized terminal option & tangent across bucket in SoA (B_c, D, N_tot)
+        if len(opt_groups_t) == 1:
+            (o_idx_only, p_key_only), _ = opt_groups_t[0]
             inv_p_only = perm_cache.get(p_key_only) if p_key_only is not None else None
             w_opt_b, gw_opt_b = _eval_index_and_grad_gpu(
-                perf_term, o_idx_only, inv_p_only, compute_grad=compute_pathwise_delta
+                perf_term, o_idx_only, inv_p_only, compute_grad=compute_pathwise_delta, asset_dim=1
             )
             dw_opt_b = (
                 (gw_opt_b * dperf_term_diag)
@@ -2324,62 +2633,50 @@ class GpuTorchDupireQMC:
         else:
             w_opt_b = torch.empty((b_c, n_tot), dtype=torch.float64, device=dev)
             dw_opt_b = (
-                torch.empty((b_c, n_tot, d_act), dtype=torch.float64, device=dev)
+                torch.empty((b_c, d_act, n_tot), dtype=torch.float64, device=dev)
                 if compute_pathwise_delta
                 else None
             )
-            for (o_idx_g, p_key_g), bi_list in opt_groups.items():
+            for (o_idx_g, p_key_g), idx_t in opt_groups_t:
                 inv_p_g = perm_cache.get(p_key_g) if p_key_g is not None else None
-                idx_t = torch.tensor(bi_list, dtype=torch.long, device=dev)
                 wo_g, gwo_g = _eval_index_and_grad_gpu(
-                    perf_term[idx_t], o_idx_g, inv_p_g, compute_grad=compute_pathwise_delta
+                    perf_term[idx_t], o_idx_g, inv_p_g, compute_grad=compute_pathwise_delta, asset_dim=1
                 )
                 w_opt_b[idx_t] = wo_g
                 if dw_opt_b is not None and gwo_g is not None and dperf_term_diag is not None:
                     dw_opt_b[idx_t] = gwo_g * dperf_term_diag[idx_t]
 
-        strike_b = torch.tensor([float(states[i].strike) for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
-        gearing_b = torch.tensor([float(states[i].option_gearing) for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
+        strike_b = scal_gpu[8].view(b_c, 1)
+        gearing_b = scal_gpu[9].view(b_c, 1)
         has_put_b = (strike_b > 1e-6) & (gearing_b > 0.0)
-        low_k_vals = [
-            float(lk) if (lk is not None and float(lk) > 0.0) else -1.0
-            for lk in (states[i].lower_strike for i in chunk_idx)
-        ]
-        low_k_b = torch.tensor(low_k_vals, dtype=torch.float64, device=dev).view(b_c, 1)
+        low_k_b = scal_gpu[10].view(b_c, 1)
         has_low_b = low_k_b > 0.0
-        ki_vals = [
-            float(kb) if (kb is not None and float(kb) > 0.0 and kp < 0.5) else -1.0
-            for kb, kp in ((states[i].ki_barrier, states[i].seasoned_state.i_ki_past) for i in chunk_idx)
-        ]
-        ki_bar_b = torch.tensor(ki_vals, dtype=torch.float64, device=dev).view(b_c, 1)
-        ki_spr_b = torch.tensor([-float(states[i].ki_spread) for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
+        ki_bar_b = scal_gpu[11].view(b_c, 1)
+        ki_spr_b = scal_gpu[12].view(b_c, 1)
         has_ki_b = ki_bar_b > 0.0
-        star_k_vals = [
-            float(sk) if (sk is not None and float(sk) > 0.0) else -1.0
-            for sk in (states[i].one_star_strike for i in chunk_idx)
-        ]
-        star_k_b = torch.tensor(star_k_vals, dtype=torch.float64, device=dev).view(b_c, 1)
-        star_cpn_b = torch.tensor([float(states[i].one_star_coupon) for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
+        star_k_b = scal_gpu[13].view(b_c, 1)
+        star_cpn_b = scal_gpu[14].view(b_c, 1)
         has_star_b = star_k_b > 0.0
-        pcall_k_vals = [
-            float(pk) if (pk is not None and float(pr) > 0.0) else -1.0
-            for pk, pr in ((states[i].participation_call_strike, states[i].participation_call_rate) for i in chunk_idx)
-        ]
-        pcall_k_b = torch.tensor(pcall_k_vals, dtype=torch.float64, device=dev).view(b_c, 1)
-        pcall_rate_b = torch.tensor([float(states[i].participation_call_rate) for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
+        pcall_k_b = scal_gpu[15].view(b_c, 1)
+        pcall_rate_b = scal_gpu[16].view(b_c, 1)
         has_pcall_b = pcall_k_b >= 0.0
-        put_sign_b = torch.tensor([1.0 if states[i].is_long_basket else -1.0 for i in chunk_idx], dtype=torch.float64, device=dev).view(b_c, 1)
+        put_sign_b = scal_gpu[17].view(b_c, 1)
+
+        has_any_low = bool(np.any(scal_np[10] > 0.0))
+        has_any_ki = bool(np.any(scal_np[11] > 0.0))
+        has_any_star = bool(np.any(scal_np[13] > 0.0))
+        has_any_star_cpn = bool(np.any((scal_np[13] > 0.0) & (scal_np[14] > 0.0)))
 
         raw_put_b = torch.where(has_put_b, torch.clamp(strike_b - w_opt_b, min=0.0), torch.zeros_like(w_opt_b))
         d_put_dw_b = torch.where(has_put_b & (w_opt_b < strike_b), -torch.ones_like(w_opt_b), torch.zeros_like(w_opt_b))
 
-        if bool(torch.any(has_low_b)):
+        if has_any_low:
             cap_b = torch.clamp(strike_b - low_k_b, min=0.0)
             under_cap = raw_put_b < cap_b
             raw_put_b = torch.where(has_low_b, torch.minimum(raw_put_b, cap_b), raw_put_b)
             d_put_dw_b = torch.where(has_low_b & (~under_cap), torch.zeros_like(d_put_dw_b), d_put_dw_b)
 
-        if bool(torch.any(has_ki_b)):
+        if has_any_ki:
             ki_up_b, dki_up_b = _digital_ramp_and_deriv_batch(
                 w_opt_b, ki_bar_b, ki_spr_b, compute_deriv=compute_pathwise_delta
             )
@@ -2391,8 +2688,8 @@ class GpuTorchDupireQMC:
             raw_put_b = raw_put_b * ki_ind_b
 
         star_ind_b = torch.zeros_like(w_opt_b)
-        if bool(torch.any(has_star_b)):
-            w_best_b = _evaluate_monitoring_index_gpu(perf_term, "BestOf", None)
+        if has_any_star:
+            w_best_b = _evaluate_monitoring_index_gpu(perf_term, "BestOf", None, asset_dim=1)
             star_ind_b = torch.where(has_star_b, (w_best_b >= star_k_b).to(torch.float64), star_ind_b)
             raw_put_b = raw_put_b * (1.0 - star_ind_b)
             d_put_dw_b = d_put_dw_b * (1.0 - star_ind_b)
@@ -2405,27 +2702,27 @@ class GpuTorchDupireQMC:
 
         df_term_b = df_pay_t[:, -1:]
         opt_pv_b = df_term_b * (put_sign_b * gearing_b * unit_put_b + pcall_rate_b * unit_call_b)
-        if bool(torch.any(has_star_b & (star_cpn_b > 0.0))):
+        if has_any_star_cpn:
             opt_pv_b = opt_pv_b + df_term_b * alive * star_ind_b * star_cpn_b
         total_pv = total_pv + opt_pv_b
 
         if compute_pathwise_delta and dw_opt_b is not None and d_alive is not None and d_total_pv is not None:
             d_unit_put_b = (
-                d_alive * raw_put_b.unsqueeze(-1)
-                + (alive * d_put_dw_b).unsqueeze(-1) * dw_opt_b
+                d_alive * raw_put_b.unsqueeze(1)
+                + (alive * d_put_dw_b).unsqueeze(1) * dw_opt_b
             )
             dc_dw_b = torch.where(has_pcall_b & (w_opt_b > pcall_k_b), torch.ones_like(w_opt_b), torch.zeros_like(w_opt_b))
             c_int_b = torch.where(has_pcall_b, torch.clamp(w_opt_b - pcall_k_b, min=0.0), torch.zeros_like(w_opt_b))
             d_unit_call_b = (
-                d_alive * c_int_b.unsqueeze(-1)
-                + (alive * dc_dw_b).unsqueeze(-1) * dw_opt_b
+                d_alive * c_int_b.unsqueeze(1)
+                + (alive * dc_dw_b).unsqueeze(1) * dw_opt_b
             )
-            d_opt_b = df_term_b.unsqueeze(-1) * (
-                (put_sign_b * gearing_b).unsqueeze(-1) * d_unit_put_b
-                + pcall_rate_b.unsqueeze(-1) * d_unit_call_b
+            d_opt_b = df_term_b.unsqueeze(1) * (
+                (put_sign_b * gearing_b).unsqueeze(1) * d_unit_put_b
+                + pcall_rate_b.unsqueeze(1) * d_unit_call_b
             )
-            if bool(torch.any(has_star_b & (star_cpn_b > 0.0))):
-                d_opt_b = d_opt_b + df_term_b.unsqueeze(-1) * d_alive * (star_ind_b * star_cpn_b).unsqueeze(-1)
+            if has_any_star_cpn:
+                d_opt_b = d_opt_b + df_term_b.unsqueeze(1) * d_alive * (star_ind_b * star_cpn_b).unsqueeze(1)
             d_total_pv = d_total_pv + d_opt_b
 
         pv_means = total_pv.mean(dim=1) + pv_in_trans_t
@@ -2434,7 +2731,7 @@ class GpuTorchDupireQMC:
         q_cpu = q_cpn_b.detach().cpu()
         l_cpu = l_put_b.detach().cpu()
         if compute_pathwise_delta and d_total_pv is not None and delta_out is not None:
-            d_cpu = d_total_pv.mean(dim=1).detach().cpu()
+            d_cpu = d_total_pv.mean(dim=2).detach().cpu()
         else:
             d_cpu = None
 
@@ -2448,121 +2745,123 @@ class GpuTorchDupireQMC:
 
 
 def _eval_index_and_grad_gpu(
-    perf: torch.Tensor,  # (N, D)
+    perf: torch.Tensor,
     index_name: str,
     inv_lex_perm_t: Optional[torch.Tensor],
     *,
     compute_grad: bool = False,
+    asset_dim: int = -1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Evaluates monitoring functional and its exact pathwise subgradient dW/dP_sorted."""
     idx = str(index_name).strip()
     is_asym = idx in ("RatioAB", "RatioBA", "DiffAB", "DiffBA", "Outperformance", "Spread")
-    p = perf.index_select(-1, inv_lex_perm_t) if (is_asym and inv_lex_perm_t is not None) else perf
-    d = int(p.shape[-1])
+    p = perf.index_select(asset_dim, inv_lex_perm_t) if (is_asym and inv_lex_perm_t is not None) else perf
+    d = int(p.shape[asset_dim])
 
     if idx in ("WorstOf", "Lookback"):
-        w_val, min_idx = p.min(dim=-1)
+        w_val, _ = p.min(dim=asset_dim)
         if not compute_grad:
             return w_val, None
-        ties = (p == w_val.unsqueeze(-1)).to(p.dtype)
-        grad = ties / torch.clamp(ties.sum(dim=-1, keepdim=True), min=1.0)
+        ties = (p == w_val.unsqueeze(asset_dim)).to(p.dtype)
+        grad = ties / torch.clamp(ties.sum(dim=asset_dim, keepdim=True), min=1.0)
         return w_val, grad
     if idx == "BestOf":
-        w_val, _ = p.max(dim=-1)
+        w_val, _ = p.max(dim=asset_dim)
         if not compute_grad:
             return w_val, None
-        ties = (p == w_val.unsqueeze(-1)).to(p.dtype)
-        grad = ties / torch.clamp(ties.sum(dim=-1, keepdim=True), min=1.0)
+        ties = (p == w_val.unsqueeze(asset_dim)).to(p.dtype)
+        grad = ties / torch.clamp(ties.sum(dim=asset_dim, keepdim=True), min=1.0)
         return w_val, grad
     if idx in ("Average", "AverageOf", "MultiPerf"):
-        w_val = p.mean(dim=-1)
+        w_val = p.mean(dim=asset_dim)
         if not compute_grad:
             return w_val, None
         grad = torch.full_like(p, 1.0 / float(max(d, 1)))
         return w_val, grad
     if idx == "Dispersion":
-        mean_p = p.mean(dim=-1, keepdim=True)
+        mean_p = p.mean(dim=asset_dim, keepdim=True)
         diff = p - mean_p
-        w_val = torch.sqrt((diff * diff).mean(dim=-1).clamp(min=1e-12))
+        w_val = torch.sqrt((diff * diff).mean(dim=asset_dim).clamp(min=1e-12))
         if not compute_grad:
             return w_val, None
-        grad = diff / (float(max(d, 1)) * w_val.unsqueeze(-1).clamp(min=1e-12))
+        grad = diff / (float(max(d, 1)) * w_val.unsqueeze(asset_dim).clamp(min=1e-12))
         return w_val, grad
 
-    w_val = _evaluate_monitoring_index_gpu(perf, idx, inv_lex_perm_t)
+    w_val = _evaluate_monitoring_index_gpu(perf, idx, inv_lex_perm_t, asset_dim=asset_dim)
     if not compute_grad:
         return w_val, None
 
     grad = torch.zeros_like(p)
     if idx == "RatioBestWorst":
-        w_max = p.max(dim=-1, keepdim=True).values
-        w_min = p.min(dim=-1, keepdim=True).values.clamp(min=1e-12)
+        w_max = p.max(dim=asset_dim, keepdim=True).values
+        w_min = p.min(dim=asset_dim, keepdim=True).values.clamp(min=1e-12)
         t_max = (p == w_max).to(p.dtype)
-        t_max = t_max / t_max.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        t_max = t_max / t_max.sum(dim=asset_dim, keepdim=True).clamp(min=1.0)
         t_min = (p == w_min).to(p.dtype)
-        t_min = t_min / t_min.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        t_min = t_min / t_min.sum(dim=asset_dim, keepdim=True).clamp(min=1.0)
         grad = t_max / w_min - (w_max / (w_min * w_min)) * t_min
     elif idx == "RatioBestAverage":
-        w_max = p.max(dim=-1, keepdim=True).values
-        w_avg = p.mean(dim=-1, keepdim=True).clamp(min=1e-12)
+        w_max = p.max(dim=asset_dim, keepdim=True).values
+        w_avg = p.mean(dim=asset_dim, keepdim=True).clamp(min=1e-12)
         t_max = (p == w_max).to(p.dtype)
-        t_max = t_max / t_max.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        t_max = t_max / t_max.sum(dim=asset_dim, keepdim=True).clamp(min=1.0)
         grad = t_max / w_avg - (w_max / (w_avg * w_avg)) / float(max(d, 1))
     elif idx == "RatioAverageWorst":
-        w_avg = p.mean(dim=-1, keepdim=True)
-        w_min = p.min(dim=-1, keepdim=True).values.clamp(min=1e-12)
+        w_avg = p.mean(dim=asset_dim, keepdim=True)
+        w_min = p.min(dim=asset_dim, keepdim=True).values.clamp(min=1e-12)
         t_min = (p == w_min).to(p.dtype)
-        t_min = t_min / t_min.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        t_min = t_min / t_min.sum(dim=asset_dim, keepdim=True).clamp(min=1.0)
         grad = (1.0 / float(max(d, 1))) / w_min - (w_avg / (w_min * w_min)) * t_min
     elif idx in ("DiffBestWorst", "Rainbow"):
-        w_max = p.max(dim=-1, keepdim=True).values
-        w_min = p.min(dim=-1, keepdim=True).values
+        w_max = p.max(dim=asset_dim, keepdim=True).values
+        w_min = p.min(dim=asset_dim, keepdim=True).values
         t_max = (p == w_max).to(p.dtype)
-        t_max = t_max / t_max.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        t_max = t_max / t_max.sum(dim=asset_dim, keepdim=True).clamp(min=1.0)
         t_min = (p == w_min).to(p.dtype)
-        t_min = t_min / t_min.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        t_min = t_min / t_min.sum(dim=asset_dim, keepdim=True).clamp(min=1.0)
         grad = t_max - t_min
     elif idx == "DiffBestAverage":
-        w_max = p.max(dim=-1, keepdim=True).values
+        w_max = p.max(dim=asset_dim, keepdim=True).values
         t_max = (p == w_max).to(p.dtype)
-        t_max = t_max / t_max.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        t_max = t_max / t_max.sum(dim=asset_dim, keepdim=True).clamp(min=1.0)
         grad = t_max - 1.0 / float(max(d, 1))
     elif idx == "DiffAverageWorst":
-        w_min = p.min(dim=-1, keepdim=True).values
+        w_min = p.min(dim=asset_dim, keepdim=True).values
         t_min = (p == w_min).to(p.dtype)
-        t_min = t_min / t_min.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        t_min = t_min / t_min.sum(dim=asset_dim, keepdim=True).clamp(min=1.0)
         grad = 1.0 / float(max(d, 1)) - t_min
     elif idx in ("RatioAB", "Outperformance"):
         if d >= 2:
-            b_safe = p[..., 1].clamp(min=1e-12)
-            grad[..., 0] = 1.0 / b_safe
-            grad[..., 1] = -p[..., 0] / (b_safe * b_safe)
+            b_safe = p.select(asset_dim, 1).clamp(min=1e-12)
+            grad.select(asset_dim, 0).copy_(1.0 / b_safe)
+            grad.select(asset_dim, 1).copy_(-p.select(asset_dim, 0) / (b_safe * b_safe))
         else:
-            grad[..., 0] = 1.0
+            grad.select(asset_dim, 0).fill_(1.0)
     elif idx == "RatioBA":
         if d >= 2:
-            a_safe = p[..., 0].clamp(min=1e-12)
-            grad[..., 1] = 1.0 / a_safe
-            grad[..., 0] = -p[..., 1] / (a_safe * a_safe)
+            a_safe = p.select(asset_dim, 0).clamp(min=1e-12)
+            grad.select(asset_dim, 1).copy_(1.0 / a_safe)
+            grad.select(asset_dim, 0).copy_(-p.select(asset_dim, 1) / (a_safe * a_safe))
         else:
-            grad[..., 0] = 1.0
+            grad.select(asset_dim, 0).fill_(1.0)
     elif idx in ("DiffAB", "Spread"):
         if d >= 2:
-            grad[..., 0] = 1.0
-            grad[..., 1] = -1.0
+            grad.select(asset_dim, 0).fill_(1.0)
+            grad.select(asset_dim, 1).fill_(-1.0)
         else:
-            grad[..., 0] = 1.0
+            grad.select(asset_dim, 0).fill_(1.0)
     elif idx == "DiffBA":
         if d >= 2:
-            grad[..., 1] = 1.0
-            grad[..., 0] = -1.0
+            grad.select(asset_dim, 1).fill_(1.0)
+            grad.select(asset_dim, 0).fill_(-1.0)
         else:
-            grad[..., 0] = 1.0
+            grad.select(asset_dim, 0).fill_(1.0)
 
     if is_asym and inv_lex_perm_t is not None:
         grad_sorted = torch.zeros_like(grad)
-        perm_view = inv_lex_perm_t.view(*([1] * (grad.ndim - 1)), d).expand_as(grad)
-        grad_sorted.scatter_(-1, perm_view, grad)
+        perm_shape = [1] * grad.ndim
+        perm_shape[asset_dim] = d
+        grad_sorted.scatter_(asset_dim, inv_lex_perm_t.view(*perm_shape).expand_as(grad), grad)
         return w_val, grad_sorted
     return w_val, grad
 
