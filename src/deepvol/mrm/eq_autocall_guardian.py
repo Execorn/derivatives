@@ -1718,8 +1718,13 @@ class EQAutocallModelGuardian:
         if do_record and b_sz > 0:
             finite_rows = summary_batch[finite_mask]
             if len(finite_rows) > 0:
-                rounded = np.round(finite_rows, 6)
-                uniq_vals, uniq_idx = np.unique(rounded, axis=0, return_index=True)
+                if len(finite_rows) > 1 and bool(np.all(finite_rows == finite_rows[0])):
+                    uniq_vals = np.round(finite_rows[:1], 6)
+                    distinct_rows = finite_rows[:1]
+                else:
+                    rounded = np.round(finite_rows, 6)
+                    uniq_vals, uniq_idx = np.unique(rounded, axis=0, return_index=True)
+                    distinct_rows = finite_rows[np.sort(uniq_idx)]
                 batch_sig = hashlib.blake2b(uniq_vals.tobytes(), digest_size=16).digest()
                 should_record_batch = True
                 with self._lock:
@@ -1728,7 +1733,6 @@ class EQAutocallModelGuardian:
                     else:
                         self._recent_psi_batch_hashes.append(batch_sig)
                 if should_record_batch:
-                    distinct_rows = finite_rows[np.sort(uniq_idx)]
                     stride = max(
                         1, len(distinct_rows) // min(len(distinct_rows), self.psi_window_size)
                     )

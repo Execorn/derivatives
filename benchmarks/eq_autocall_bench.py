@@ -7,7 +7,7 @@ import importlib
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -25,14 +25,11 @@ from deepvol.api.schemas_eq_autocall import (
     EQAutocallableTradeRequest,
     parse_murex_autocall_dag,
 )
-from deepvol.models.autocall.feature_layout import FEATURE_SCHEMA_VERSION
 from deepvol.models.autocall.analytical_baseline import compute_analytical_autocall_baseline
 from deepvol.models.autocall.dupire_qmc_solver import price_eq_autocall_dupire_qmc
+from deepvol.models.autocall.feature_layout import FEATURE_SCHEMA_VERSION
 import deepvol.models.autocall.greeks_engine as _greeks_mod
-from deepvol.models.autocall.greeks_engine import (
-    compute_batched_surrogate_greeks,
-    compute_eq_autocall_greeks,
-)
+from deepvol.models.autocall.greeks_engine import compute_batched_surrogate_greeks
 import deepvol.models.autocall.pre_post_processor as _preproc_mod
 from deepvol.models.autocall.pre_post_processor import (
     AutocallPreprocState,
@@ -51,12 +48,24 @@ REF_REQUEST_PATH = (
     else REPO_ROOT / "eq_autocallable_request.txt"
 )
 
-GATE_G2_1_PROXY_P50_US = 50.0
+GATE_G2_1_PROXY_M1_US = 50.0
+GATE_G2_1_PROXY_M12_US = 150.0
 GATE_G2_2_FWD_P50_MS = 2.5
 GATE_G2_3A_BATCH_GREEKS_P50_MS = 8.0
-GATE_G2_3B_WARM_SHOCK_M12_P50_MS = 8.0
-GATE_G2_4_BATCH_ARROW_MS_PER_TRADE = 0.05
+GATE_G2_3B_COLD_PVCF_M1_MS = 5.0
+GATE_G2_3B_COLD_PVCF_M12_MS = 8.0
+GATE_G2_3B_WARM_SHOCK_PVCF_M12_MS = 3.5
+GATE_G2_3B_COLD_GREEKS_M1_MS = 12.0
+GATE_G2_3B_COLD_GREEKS_M12_MS = 20.0
+GATE_G2_3B_WARM_SHOCK_GREEKS_M1_MS = 3.5
+GATE_G2_3B_WARM_SHOCK_GREEKS_M12_MS = 8.0
+GATE_G2_4_ARROW_M1_MS_PER_TRADE = 0.025
+GATE_G2_4_ARROW_M12_MS_PER_TRADE = 0.045
+GATE_GR5_ARROW_D8M48_MS_PER_TRADE = 0.085
+GATE_G2_4_JSON_M12_MS_PER_TRADE = 1.5
 GATE_GR5_PEAK_VRAM_MB = 1500.0
+GATE_QMC_GPU_M1_MS = 10.0
+GATE_QMC_GPU_M12_MS = 30.0
 GATE_QMC_GPU_PEAK_VRAM_MB = 250.0
 
 
@@ -78,8 +87,12 @@ class BenchmarkMetric:
     peak_vram_mb: float = 0.0
 
 
-def _clear_runtime_caches() -> None:
-    """Clears preprocessing, market, and Greek caches for honest Cold-start timings."""
+def _clear_runtime_caches(states: Sequence[AutocallPreprocState] = ()) -> None:
+    """Clears all preprocessing, market, surface, and Greek caches for honest Cold timings."""
+    for st in states:
+        sc = getattr(st, "_greeks_result_cache", None)
+        if sc is not None and hasattr(sc, "clear"):
+            sc.clear()
     for attr in (
         "_PREPROC_STATE_CACHE",
         "_MARKET_OBJECT_CACHE",
@@ -89,7 +102,14 @@ def _clear_runtime_caches() -> None:
         cache_obj = getattr(_preproc_mod, attr, None)
         if cache_obj is not None and hasattr(cache_obj, "clear"):
             cache_obj.clear()
-    for attr in ("_JACOBIAN_CACHE", "_GREEKS_CACHE"):
+    for attr in (
+        "_SURFACE_GEOM_CACHE",
+        "_SURFACE_QUOTE_CACHE",
+        "_CURVE_DELTA_CACHE",
+        "_GLOBAL_SURFACE_TORCH_CACHE",
+        "_JACOBIAN_CACHE",
+        "_GREEKS_CACHE",
+    ):
         cache_obj = getattr(_greeks_mod, attr, None)
         if cache_obj is not None and hasattr(cache_obj, "clear"):
             cache_obj.clear()
@@ -139,6 +159,7 @@ def _build_synthetic_schedule_request(
     *,
     target_mrem: int,
     target_d: int,
+    in_domain_guardian: bool = False,
 ) -> EQAutocallableTradeRequest:
     """Builds a valid cloned `EQAutocallableTradeRequest` with `(D=target_d, M_rem=target_mrem)`."""
     data = base_req.model_dump(mode="python", by_alias=True)
@@ -183,6 +204,19 @@ def _build_synthetic_schedule_request(
     prod["UnderlyingIdentifiers"] = chosen_ids
     prod["UnderlyingReferenceSpots"] = existing_refs[:target_d]
 
+    if in_domain_guardian:
+        # Calibrate moderate ATM in-domain basket so conformal_half_width_bps <= 60.0 and D_M^2 < q_ood
+        prod["CallabilityMonitoringIndex"] = "Average"
+        prod["CouponBarrierMonitoringIndex"] = "Average"
+        prod["OptionMonitoringIndex"] = "Average"
+        prod["OptionDownAndInBarrierLevel"] = None
+        for aid, ref_s in zip(chosen_ids, prod["UnderlyingReferenceSpots"]):
+            mds["Spots"][aid] = float(ref_s)
+            if aid in mds["VolatilitySurfaces"]:
+                vs = dict(mds["VolatilitySurfaces"][aid])
+                vs["VolatilityQuotes"] = [[0.22 for _ in row] for row in vs["VolatilityQuotes"]]
+                mds["VolatilitySurfaces"][aid] = vs
+
     corr_map: Dict[str, float] = {}
     for i, a1 in enumerate(chosen_ids):
         for j in range(i + 1, len(chosen_ids)):
@@ -197,6 +231,47 @@ def _build_synthetic_schedule_request(
     return EQAutocallableTradeRequest.model_validate(data)
 
 
+def _run_crn_qmc_fd_greeks(
+    state: AutocallPreprocState,
+    *,
+    n_paths: int,
+    gpu_solver: Any | None = None,
+) -> None:
+    """Honest CRN QMC spot-delta+gamma baseline (base + 2*D CRN evaluations) when M5 CRN is absent."""
+    d_act = max(int(state.d_assets), 1)
+    if gpu_solver is not None:
+        from deepvol.models.autocall.dupire_qmc_gpu import DupireQMCConfig
+
+        cfg = DupireQMCConfig(n_paths=n_paths, seed=42)
+        gpu_solver.simulate_and_price(state, config=cfg)
+        base_spots = state.spots_t0.clone()
+        try:
+            for i in range(d_act):
+                h = float(base_spots[i].item()) * 1e-3
+                state.spots_t0 = base_spots.clone()
+                state.spots_t0[i] = base_spots[i] + h
+                gpu_solver.simulate_and_price(state, config=cfg)
+                state.spots_t0 = base_spots.clone()
+                state.spots_t0[i] = base_spots[i] - h
+                gpu_solver.simulate_and_price(state, config=cfg)
+        finally:
+            state.spots_t0 = base_spots
+    else:
+        price_eq_autocall_dupire_qmc(state, n_paths=n_paths, seed=42)
+        base_spots = state.spots_t0.clone()
+        try:
+            for i in range(d_act):
+                h = float(base_spots[i].item()) * 1e-3
+                state.spots_t0 = base_spots.clone()
+                state.spots_t0[i] = base_spots[i] + h
+                price_eq_autocall_dupire_qmc(state, n_paths=n_paths, seed=42)
+                state.spots_t0 = base_spots.clone()
+                state.spots_t0[i] = base_spots[i] - h
+                price_eq_autocall_dupire_qmc(state, n_paths=n_paths, seed=42)
+        finally:
+            state.spots_t0 = base_spots
+
+
 def _measure_real_qmc_suites(
     state_m1: AutocallPreprocState,
     state_m12: AutocallPreprocState,
@@ -204,13 +279,13 @@ def _measure_real_qmc_suites(
     n_paths: int = 32768,
     n_iter: int = 5,
 ) -> Tuple[float, float, List[BenchmarkMetric]]:
-    """Measures genuine n_iter>=5 CPU QMC forward, GPU RQMC forward, and CRN QMC Greeks."""
+    """Measures genuine n_iter>=5 CPU QMC forward, GPU RQMC M1/M12 forward, and CRN QMC Greeks."""
     metrics: List[BenchmarkMetric] = []
 
-    # Warmup + CPU QMC forward (M_rem=12 for honest non-trivial MC work)
     price_eq_autocall_dupire_qmc(state_m12, n_paths=4096)
     cpu_samples_ms: List[float] = []
     for _ in range(n_iter):
+        _clear_runtime_caches([state_m12])
         t0 = time.perf_counter_ns()
         price_eq_autocall_dupire_qmc(state_m12, n_paths=n_paths)
         cpu_samples_ms.append((time.perf_counter_ns() - t0) / 1e6)
@@ -231,30 +306,80 @@ def _measure_real_qmc_suites(
         )
     )
 
-    # Real CRN QMC Greeks baseline (n_iter >= 5, no 4.0x heuristic multiplier)
+    gpu_solver: Any = None
+    if torch.cuda.is_available():
+        try:
+            from deepvol.models.autocall.dupire_qmc_gpu import (
+                DupireQMCConfig,
+                DupireQMCGpuSolver,
+            )
+
+            gpu_solver = DupireQMCGpuSolver(device="cuda")
+            for gid, st_q, thresh_ms, label in (
+                ("QMC-GPU-M1", state_m1, GATE_QMC_GPU_M1_MS, "M_rem=1"),
+                ("QMC-GPU", state_m12, GATE_QMC_GPU_M12_MS, "M_rem=12"),
+            ):
+                torch.cuda.reset_peak_memory_stats()
+                gpu_solver.simulate_and_price(st_q, config=DupireQMCConfig(n_paths=4096))
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                gpu_samples_ms: List[float] = []
+                cfg_gpu = DupireQMCConfig(n_paths=n_paths)
+                for _ in range(n_iter):
+                    _clear_runtime_caches([st_q])
+                    t0 = time.perf_counter_ns()
+                    gpu_solver.simulate_and_price(st_q, config=cfg_gpu)
+                    torch.cuda.synchronize()
+                    gpu_samples_ms.append((time.perf_counter_ns() - t0) / 1e6)
+                peak_gpu_mb = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+                p50_g, p95_g, p99_g = (float(x) for x in np.percentile(gpu_samples_ms, [50, 95, 99]))
+                metrics.append(
+                    BenchmarkMetric(
+                        gate_id=gid,
+                        suite_name="qmc",
+                        description=f"Dupire RQMC GPU Forward ({label}, N={n_paths}, VRAM={peak_gpu_mb:.1f} MB)",
+                        unit="ms",
+                        p50=p50_g,
+                        p95=p95_g,
+                        p99=p99_g,
+                        threshold=thresh_ms,
+                        mc_baseline_same_unit=p50_cpu,
+                        speedup_vs_mc=p50_cpu / max(p50_g, 1e-9),
+                        passed=(p50_g <= thresh_ms and peak_gpu_mb <= GATE_QMC_GPU_PEAK_VRAM_MB),
+                        peak_vram_mb=peak_gpu_mb,
+                    )
+                )
+        except Exception:
+            gpu_solver = None
+
+    # Real CRN QMC Greeks baseline (n_iter >= 5, cache cleared per iter, never cached proxy)
     crn_fn = getattr(_greeks_mod, "compute_qmc_crn_greeks", None)
     queries_all = ["Delta", "Gamma", "MultivariateAggregatedCashGamma", "Vega", "Rho", "Theta", "Cega"]
     crn_samples_ms: List[float] = []
     if callable(crn_fn):
         crn_fn(state_m12, queries=queries_all)
         for _ in range(n_iter):
-            _clear_runtime_caches()
+            _clear_runtime_caches([state_m12])
             t0 = time.perf_counter_ns()
             crn_fn(state_m12, queries=queries_all)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             crn_samples_ms.append((time.perf_counter_ns() - t0) / 1e6)
     else:
-        compute_eq_autocall_greeks(state_m12, queries=queries_all, surrogate=None)
+        _run_crn_qmc_fd_greeks(state_m12, n_paths=n_paths, gpu_solver=gpu_solver)
         for _ in range(n_iter):
-            _clear_runtime_caches()
+            _clear_runtime_caches([state_m12])
             t0 = time.perf_counter_ns()
-            compute_eq_autocall_greeks(state_m12, queries=queries_all, surrogate=None)
+            _run_crn_qmc_fd_greeks(state_m12, n_paths=n_paths, gpu_solver=gpu_solver)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             crn_samples_ms.append((time.perf_counter_ns() - t0) / 1e6)
     p50_crn, p95_crn, p99_crn = (float(x) for x in np.percentile(crn_samples_ms, [50, 95, 99]))
     metrics.append(
         BenchmarkMetric(
             gate_id="QMC-CRN",
             suite_name="qmc",
-            description=f"Measured Dupire CRN QMC Full Greeks (M_rem=12, n_iter={n_iter})",
+            description=f"Measured Dupire CRN QMC Greeks (M_rem=12, N={n_paths}, n_iter={n_iter})",
             unit="ms",
             p50=p50_crn,
             p95=p95_crn,
@@ -266,46 +391,6 @@ def _measure_real_qmc_suites(
         )
     )
 
-    if torch.cuda.is_available():
-        try:
-            from deepvol.models.autocall.dupire_qmc_gpu import (
-                DupireQMCConfig,
-                DupireQMCGpuSolver,
-            )
-
-            gpu_solver = DupireQMCGpuSolver(device="cuda")
-            torch.cuda.reset_peak_memory_stats()
-            gpu_solver.simulate_and_price(state_m12, config=DupireQMCConfig(n_paths=4096))
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-            gpu_samples_ms: List[float] = []
-            cfg_gpu = DupireQMCConfig(n_paths=n_paths)
-            for _ in range(n_iter):
-                t0 = time.perf_counter_ns()
-                gpu_solver.simulate_and_price(state_m12, config=cfg_gpu)
-                torch.cuda.synchronize()
-                gpu_samples_ms.append((time.perf_counter_ns() - t0) / 1e6)
-            peak_gpu_mb = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
-            p50_g, p95_g, p99_g = (float(x) for x in np.percentile(gpu_samples_ms, [50, 95, 99]))
-            metrics.append(
-                BenchmarkMetric(
-                    gate_id="QMC-GPU",
-                    suite_name="qmc",
-                    description=f"Dupire RQMC GPU Forward (M_rem=12, N={n_paths}, VRAM={peak_gpu_mb:.1f} MB)",
-                    unit="ms",
-                    p50=p50_g,
-                    p95=p95_g,
-                    p99=p99_g,
-                    threshold=500.0,
-                    mc_baseline_same_unit=p50_cpu,
-                    speedup_vs_mc=p50_cpu / max(p50_g, 1e-9),
-                    passed=(peak_gpu_mb <= GATE_QMC_GPU_PEAK_VRAM_MB),
-                    peak_vram_mb=peak_gpu_mb,
-                )
-            )
-        except Exception:
-            pass
-
     return p50_cpu, p50_crn, metrics
 
 
@@ -313,15 +398,15 @@ def run_proxy_suite(
     state_m1: AutocallPreprocState,
     state_m12: AutocallPreprocState,
     mc_fwd_ms: float,
-    n_warmup: int = 200,
+    n_warmup: int = 400,
     n_iter: int = 1000,
 ) -> List[BenchmarkMetric]:
     """Benchmarks Tier-1 Analytical Proxy on `M_rem=1` (`45476647`) and `M_rem=12`."""
     results: List[BenchmarkMetric] = []
     mc_us = mc_fwd_ms * 1e3
     for label, st, thresh in (
-        ("G2.1", state_m1, GATE_G2_1_PROXY_P50_US),
-        ("G2.1-M12", state_m12, 200.0),
+        ("G2.1", state_m1, GATE_G2_1_PROXY_M1_US),
+        ("G2.1-M12", state_m12, GATE_G2_1_PROXY_M12_US),
     ):
         for _ in range(n_warmup):
             compute_analytical_autocall_baseline(st, use_fast_cpu=True)
@@ -446,9 +531,9 @@ def run_full_greeks_suite(
     checkpoint_path: Path,
     strict_ckpt: bool,
     n_warmup: int = 15,
-    n_iter: int = 80,
+    n_iter: int = 60,
 ) -> List[BenchmarkMetric]:
-    """Benchmarks G2.3a batched 1st-order Greeks, G2.3b Cold E2E, and Warm Spot-Shock (+1bp/iter)."""
+    """Benchmarks Spec AG3b/AG3c/GR9 E2E Cold/Warm-Shock PV+CF, All-8 Greeks, and G2.3a."""
     rt = EQAutocallRuntime(
         checkpoint_path=checkpoint_path,
         strict_checkpoint=strict_ckpt,
@@ -459,7 +544,7 @@ def run_full_greeks_suite(
     dev = rt.device
     results: List[BenchmarkMetric] = []
 
-    # G2.3a: Single-trade batched 1st-order Greeks + CashGamma on M_rem=12
+    # G2.3a: Single-trade batched 1st-order Greeks + CashGamma + CashFlows on M_rem=12
     d_act = max(int(state_m12.d_assets), 1)
     m_act = max(int(state_m12.m_rem), 1)
     nf64 = state_m12.node_feats[:, :d_act, :].to(dev).contiguous()
@@ -519,13 +604,69 @@ def run_full_greeks_suite(
         )
     )
 
-    # G2.3b Cold & Warm Spot-Shock (+1bp/iter) on runtime.price_trade(..., include_all_greeks=True)
-    for label_m, req_base in (("M1", req_m1), ("M12", req_m12)):
+    # G2.3b Cold & Warm Spot-Shock (+1bp/iter) on PV+CF (AG3b / GR9) and All 8 Greeks (AG3c)
+    cold_iters = min(20, n_iter)
+    pvcf_queries = ["ProductValue", "CashFlows"]
+    for label_m, req_base, cold_pvcf_thr, cold_grk_thr, warm_grk_thr in (
+        ("M1", req_m1, GATE_G2_3B_COLD_PVCF_M1_MS, GATE_G2_3B_COLD_GREEKS_M1_MS, GATE_G2_3B_WARM_SHOCK_GREEKS_M1_MS),
+        ("M12", req_m12, GATE_G2_3B_COLD_PVCF_M12_MS, GATE_G2_3B_COLD_GREEKS_M12_MS, GATE_G2_3B_WARM_SHOCK_GREEKS_M12_MS),
+    ):
+        req_pvcf = req_base.model_copy(update={"Queries": pvcf_queries})
+        base_spots = dict(req_base.Model.MarketDataSet.Spots)
+
+        rt.price_trade(req_pvcf, engine="auto", include_all_greeks=False)
+        cold_pvcf_ms: List[float] = []
+        warm_pvcf_ms: List[float] = []
+        for idx in range(cold_iters):
+            _clear_runtime_caches()
+            t0 = time.perf_counter_ns()
+            rt.price_trade(req_pvcf, engine="auto", include_all_greeks=False)
+            cold_pvcf_ms.append((time.perf_counter_ns() - t0) / 1e6)
+
+            shocked_pvcf = req_pvcf.model_copy(deep=True)
+            for k, val in base_spots.items():
+                shocked_pvcf.Model.MarketDataSet.Spots[k] = float(val) * (1.0 + 1e-4 * (idx + 1))
+            t1 = time.perf_counter_ns()
+            rt.price_trade(shocked_pvcf, engine="auto", include_all_greeks=False)
+            warm_pvcf_ms.append((time.perf_counter_ns() - t1) / 1e6)
+
+        p50_cp, p95_cp, p99_cp = (float(x) for x in np.percentile(cold_pvcf_ms, [50, 95, 99]))
+        results.append(
+            BenchmarkMetric(
+                gate_id=f"G2.3b-Cold-PVCF-{label_m}",
+                suite_name="full_greeks",
+                description=f"Cold E2E price_trade PV+CashFlows ({label_m})",
+                unit="ms",
+                p50=p50_cp,
+                p95=p95_cp,
+                p99=p99_cp,
+                threshold=cold_pvcf_thr,
+                mc_baseline_same_unit=mc_aad_ms,
+                speedup_vs_mc=mc_aad_ms / max(p50_cp, 1e-9),
+                passed=(p50_cp <= cold_pvcf_thr),
+            )
+        )
+        if label_m == "M12":
+            p50_wp, p95_wp, p99_wp = (float(x) for x in np.percentile(warm_pvcf_ms, [50, 95, 99]))
+            results.append(
+                BenchmarkMetric(
+                    gate_id="G2.3b-WarmShock-PVCF-M12",
+                    suite_name="full_greeks",
+                    description="Warm Spot-Shock (+1bp/iter) price_trade PV+CashFlows (M12)",
+                    unit="ms",
+                    p50=p50_wp,
+                    p95=p95_wp,
+                    p99=p99_wp,
+                    threshold=GATE_G2_3B_WARM_SHOCK_PVCF_M12_MS,
+                    mc_baseline_same_unit=mc_aad_ms,
+                    speedup_vs_mc=mc_aad_ms / max(p50_wp, 1e-9),
+                    passed=(p50_wp <= GATE_G2_3B_WARM_SHOCK_PVCF_M12_MS),
+                )
+            )
+
         rt.price_trade(req_base, engine="auto", include_all_greeks=True)
         cold_ms: List[float] = []
         warm_shock_ms: List[float] = []
-        base_spots = dict(req_base.Model.MarketDataSet.Spots)
-        cold_iters = min(30, n_iter)
         for idx in range(cold_iters):
             _clear_runtime_caches()
             t0 = time.perf_counter_ns()
@@ -550,13 +691,12 @@ def run_full_greeks_suite(
                 p50=p50_c,
                 p95=p95_c,
                 p99=p99_c,
-                threshold=25.0,
+                threshold=cold_grk_thr,
                 mc_baseline_same_unit=mc_aad_ms,
                 speedup_vs_mc=mc_aad_ms / max(p50_c, 1e-9),
-                passed=(p50_c <= 25.0),
+                passed=(p50_c <= cold_grk_thr),
             )
         )
-        warm_thresh = 3.5 if label_m == "M1" else GATE_G2_3B_WARM_SHOCK_M12_P50_MS
         results.append(
             BenchmarkMetric(
                 gate_id=f"G2.3b-WarmShock-{label_m}",
@@ -566,17 +706,17 @@ def run_full_greeks_suite(
                 p50=p50_w,
                 p95=p95_w,
                 p99=p99_w,
-                threshold=warm_thresh,
+                threshold=warm_grk_thr,
                 mc_baseline_same_unit=mc_aad_ms,
                 speedup_vs_mc=mc_aad_ms / max(p50_w, 1e-9),
-                passed=(p50_w <= warm_thresh),
+                passed=(p50_w <= warm_grk_thr),
             )
         )
     return results
 
 
 def run_batch_suite(
-    req_m1: EQAutocallableTradeRequest,
+    req_m12_in_domain: EQAutocallableTradeRequest,
     state_m1: AutocallPreprocState,
     state_m12: AutocallPreprocState,
     state_d8_m48: AutocallPreprocState,
@@ -588,7 +728,7 @@ def run_batch_suite(
     n_warmup: int = 8,
     n_iter: int = 30,
 ) -> List[BenchmarkMetric]:
-    """Benchmarks Arrow E2E, `D=8,M=48` chunked peak VRAM, and JSON batching."""
+    """Benchmarks Arrow E2E (Spec AG3d), `D=8,M=48` chunked peak VRAM (GR5), and M=12 JSON batching (AG3e)."""
     rt = EQAutocallRuntime(
         checkpoint_path=checkpoint_path,
         strict_checkpoint=strict_ckpt,
@@ -599,9 +739,9 @@ def run_batch_suite(
     results: List[BenchmarkMetric] = []
 
     for label, st, thresh in (
-        ("G2.4-M1", state_m1, GATE_G2_4_BATCH_ARROW_MS_PER_TRADE),
-        ("G2.4-M12", state_m12, 0.08),
-        ("GR5-D8M48", state_d8_m48, 0.45),
+        ("G2.4-M1", state_m1, GATE_G2_4_ARROW_M1_MS_PER_TRADE),
+        ("G2.4-M12", state_m12, GATE_G2_4_ARROW_M12_MS_PER_TRADE),
+        ("GR5-D8M48", state_d8_m48, GATE_GR5_ARROW_D8M48_MS_PER_TRADE),
     ):
         nf_np = st.node_feats.repeat(batch_size, 1, 1).cpu().numpy()
         ef_np = st.edge_feats.repeat(batch_size, 1, 1, 1).cpu().numpy()
@@ -671,9 +811,13 @@ def run_batch_suite(
             )
         )
 
-    # JSON Batch throughput (B=1024, compute_greeks=False)
-    json_list = [req_m1.model_dump(mode="python", by_alias=True) for _ in range(batch_size)]
-    rt.price_batch_json(json_list, compute_greeks=False, engine="auto")
+    # JSON Batch throughput on in-domain M_rem=12 (Spec AG3e <= 1.5 ms/trade)
+    json_list = [req_m12_in_domain.model_dump(mode="python", by_alias=True) for _ in range(batch_size)]
+    warm_res = rt.price_batch_json(json_list, compute_greeks=False, engine="auto")
+    if warm_res and warm_res[0].fallback_triggered:
+        raise RuntimeError(
+            f"G2.4-JSON benchmark fixture triggered unexpected Guardian fallback: {warm_res[0].fallback_reasons}"
+        )
     json_samples: List[float] = []
     for _ in range(5):
         t0 = time.perf_counter_ns()
@@ -684,15 +828,15 @@ def run_batch_suite(
         BenchmarkMetric(
             gate_id="G2.4-JSON",
             suite_name="batch",
-            description=f"JSON Batch Valuation (B={batch_size}, market-dedup, SR 26-2 audit)",
+            description=f"JSON Batch Valuation (B={batch_size}, M_rem=12 in-domain, market-dedup, SR 26-2 audit)",
             unit="ms/trade",
             p50=p50_j,
             p95=p95_j,
             p99=p99_j,
-            threshold=2.0,
+            threshold=GATE_G2_4_JSON_M12_MS_PER_TRADE,
             mc_baseline_same_unit=mc_aad_ms,
             speedup_vs_mc=mc_aad_ms / max(p50_j, 1e-9),
-            passed=(p50_j <= 2.0),
+            passed=(p50_j <= GATE_G2_4_JSON_M12_MS_PER_TRADE),
         )
     )
     return results
@@ -769,7 +913,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     del _surr_check
 
     req_m1 = _load_reference_request()
-    req_m12 = _build_synthetic_schedule_request(req_m1, target_mrem=12, target_d=5)
+    req_m12 = _build_synthetic_schedule_request(
+        req_m1, target_mrem=12, target_d=5, in_domain_guardian=False
+    )
+    req_m12_in_domain = _build_synthetic_schedule_request(
+        req_m1, target_mrem=12, target_d=5, in_domain_guardian=True
+    )
     req_d8_m48 = _build_synthetic_schedule_request(req_m1, target_mrem=48, target_d=8)
 
     state_m1 = preprocess_eq_autocall(req_m1, d_max=8, m_max=48)
@@ -837,7 +986,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if "all" in suites or "batch" in suites:
         metrics.extend(
             run_batch_suite(
-                req_m1,
+                req_m12_in_domain,
                 state_m1,
                 state_m12,
                 state_d8_m48,

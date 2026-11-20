@@ -34,6 +34,8 @@ from deepvol.api.schemas_eq_autocall import (
 from deepvol.models.autocall.analytical_baseline import (
     compute_analytical_autocall_baseline,
 )
+from deepvol.market.eq_curves import year_fraction
+from deepvol.models.autocall.escrowed_dividend import build_discount_rate_evaluator
 from deepvol.models.autocall.feature_layout import (
     AutocallGlobalCol,
     AutocallSchedCol,
@@ -49,6 +51,7 @@ from deepvol.models.autocall.pre_post_processor import (
     D_MAX_DEFAULT,
     M_MAX_DEFAULT,
     AutocallPreprocState,
+    _lookup_funding_fixing,
     assemble_autocall_cashflows_and_pv,
     preprocess_eq_autocall,
 )
@@ -382,6 +385,73 @@ def _market_dedup_key(req: EQAutocallableTradeRequest) -> str:
     return hashlib.blake2b(raw, digest_size=16).hexdigest()
 
 
+def _compute_w_fund_per_period(state: AutocallPreprocState, m_max: int) -> torch.Tensor:
+    """Computes survival-weighted funding-leg cashflow coefficients per period `[0..m_max-1]`."""
+    out = torch.zeros(m_max, dtype=torch.float64)
+    m_rem = int(state.m_rem)
+    if state.funding_leg is None or m_rem <= 0 or state.already_autocalled:
+        return out
+    f_leg = state.funding_leg
+    cached_w_pair = f_leg.get("_cached_w_fund_per_period")
+    if cached_w_pair is not None:
+        w_cached = torch.as_tensor(cached_w_pair[1], dtype=torch.float64).reshape(-1)
+        n_copy = min(m_rem, int(w_cached.numel()), m_max)
+        out[:n_copy] = w_cached[:n_copy]
+        return out
+
+    f_rid = f_leg.get("rate_identifier")
+    f_curve = f_leg.get("funding_curve")
+    f_curve_id = f_leg.get("funding_curve_id")
+    disc_id = state.discount_curve_id
+    as_of_dt = state.seasoned_state.as_of_date
+    start_dt = state.seasoned_state.start_date
+    f_dcc = state.seasoned_state.day_count_convention
+    _, df_fin_fn = build_discount_rate_evaluator(state.discount_curve, as_of_dt)
+    same_curve = (
+        f_curve is None
+        or f_curve is state.discount_curve
+        or (f_curve_id is not None and disc_id is not None and f_curve_id == disc_id)
+    )
+    if f_rid is not None and not same_curve:
+        _, df_fwd_fn = build_discount_rate_evaluator(f_curve, as_of_dt)
+    else:
+        df_fwd_fn = df_fin_fn
+
+    f_spread = float(f_leg.get("funding_spread", 0.0))
+    f_dates = f_leg.get("payment_dates", ())
+    f_fixings = f_leg.get("funding_fixings", ())
+    prev_f_dt = start_dt
+    for f_dt in f_dates:
+        if f_dt <= as_of_dt:
+            prev_f_dt = f_dt
+            continue
+        alpha_j = year_fraction(prev_f_dt, f_dt, f_dcc)
+        df_curr = float(df_fin_fn(f_dt))
+        if f_rid is None:
+            r_fwd_j = 0.0
+        else:
+            fixed_reset = _lookup_funding_fixing(f_fixings, prev_f_dt) if prev_f_dt < as_of_dt else None
+            if fixed_reset is not None:
+                r_fwd_j = float(fixed_reset)
+            elif prev_f_dt < as_of_dt:
+                alpha_rem = max(year_fraction(as_of_dt, f_dt, f_dcc), 1e-8)
+                df_curr_fwd = max(float(df_fwd_fn(f_dt)), 1e-12)
+                r_fwd_j = (1.0 / df_curr_fwd - 1.0) / alpha_rem
+            else:
+                df_prev_fwd = float(df_fwd_fn(prev_f_dt))
+                df_curr_fwd = max(float(df_fwd_fn(f_dt)), 1e-12)
+                r_fwd_j = (df_prev_fwd / df_curr_fwd - 1.0) / max(alpha_j, 1e-8)
+        m_idx = m_rem - 1
+        for m in range(m_rem):
+            if state.seasoned_state.future_pay_dates[m] >= f_dt:
+                m_idx = m
+                break
+        if m_idx < m_max:
+            out[m_idx] = out[m_idx] + df_curr * (r_fwd_j + f_spread) * alpha_j
+        prev_f_dt = f_dt
+    return out
+
+
 class EQAutocallRuntime:
     """Unified 4-Tier pricing, Greek sensitivity, Murex DAG, and Apache Arrow IPC runtime for Equity Autocallables."""
 
@@ -585,6 +655,7 @@ class EQAutocallRuntime:
 
         force_qmc = eng_norm == "qmc"
         use_proxy_only = eng_norm == "proxy"
+        force_surrogate = eng_norm == "surrogate"
 
         requested_queries = [str(getattr(q, "value", q)) for q in req_model.Queries]
         compute_all_8 = is_dag if include_all_greeks is None else bool(include_all_greeks)
@@ -618,6 +689,101 @@ class EQAutocallRuntime:
             surrogate_for_greeks: MaskedEQAutocallSurrogate | None = None
             if len(greek_queries_present) > 0:
                 greeks_engine_used = "Tier1_AnalyticalProxy"
+        elif force_surrogate and state.m_rem > 0 and not state.seasoned_state.already_autocalled:
+            pre_passed, pre_reasons, r_psd, diag = self.guardian.evaluate_pre_inference(state)
+            if bool(diag.get("correlation_shrunk_applied", diag.get("correlation_shrunk", False))):
+                _ = self.guardian._apply_shrunk_correlation_to_state(state, r_psd)
+            if len(greek_queries_present) > 0:
+                greeks_out = compute_eq_autocall_greeks(
+                    state,
+                    queries=requested_queries,
+                    surrogate=self._cpu_surrogate,
+                )
+                post_surr = greeks_out.postproc_output
+                greeks_engine_used = "Tier2_SingleVJP_AD"
+                m_rem_s = int(state.m_rem)
+                s_dev = state.spots_t0.device
+                p_stop_t = (
+                    post_surr.p_stop.detach().to(dtype=torch.float64, device=s_dev)
+                    if post_surr is not None
+                    else torch.zeros(m_rem_s, dtype=torch.float64, device=s_dev)
+                )
+                q_cpn_t = (
+                    post_surr.q_cpn.detach().to(dtype=torch.float64, device=s_dev)
+                    if post_surr is not None
+                    else torch.zeros(m_rem_s, dtype=torch.float64, device=s_dev)
+                )
+                l_put_t = (
+                    post_surr.l_put.detach().to(dtype=torch.float64, device=s_dev)
+                    if post_surr is not None
+                    else torch.tensor(0.0, dtype=torch.float64, device=s_dev)
+                )
+            else:
+                t2_inputs = state.to_tier2_float32_tensors()
+                with torch.no_grad():
+                    s_out = self._cpu_surrogate(
+                        node_feats=t2_inputs["node_feats"],
+                        edge_feats=t2_inputs["edge_feats"],
+                        asset_mask=t2_inputs["asset_mask"],
+                        sched_feats=t2_inputs["sched_feats"],
+                        sched_mask=t2_inputs["sched_mask"],
+                        global_feats=t2_inputs["global_feats"],
+                    )
+                m_rem_s = int(state.m_rem)
+                s_dev = state.spots_t0.device
+                p_stop_t = (
+                    s_out.stopping_probs[0, :m_rem_s].to(dtype=torch.float64, device=s_dev)
+                    * state.is_callable
+                )
+                q_cpn_t = s_out.coupon_probs[0, :m_rem_s].to(dtype=torch.float64, device=s_dev)
+                l_put_t = s_out.put_loss[0].to(dtype=torch.float64, device=s_dev)
+                post_surr = assemble_autocall_cashflows_and_pv(
+                    state,
+                    p_stop=p_stop_t,
+                    q_cpn=q_cpn_t,
+                    l_put=l_put_t,
+                )
+            assert post_surr is not None
+            post_passed, post_reasons = self.guardian.evaluate_post_inference(
+                {"stopping_probs": p_stop_t, "coupon_probs": q_cpn_t, "put_loss": l_put_t},
+                post_surr,
+                state,
+            )
+            fb_reasons_str = [r.value for r in (*pre_reasons, *post_reasons)]
+            audit_rec = SR262AuditRecord(
+                trade_id=state.trade_info if state.trade_info is not None else "UNSPECIFIED_TRADE",
+                timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                pre_gate_passed=bool(pre_passed),
+                post_gate_passed=bool(post_passed),
+                fallback_triggered=False,
+                fallback_reasons=fb_reasons_str,
+                warnings=list(diag.get("warnings", [])),
+                min_corr_eigenvalue_raw=float(diag.get("min_corr_eigenvalue_raw", 1.0)),
+                min_corr_eigenvalue_shrunk=float(diag.get("min_corr_eigenvalue_shrunk", 1.0)),
+                correlation_shrunk_applied=bool(diag.get("correlation_shrunk_applied", False)),
+                mahalanobis_d2=float(diag.get("mahalanobis_d2", 0.0)),
+                max_psi_score=float(diag.get("max_psi_score", 0.0)),
+                min_pin_risk_z=float(diag.get("min_pin_risk_z", 100.0)),
+                engine_selected="MaskedEGNO_Surrogate",
+                conformal_half_width_bps=float(diag.get("conformal_half_width_bps", 0.0)),
+                greeks_engine_used=greeks_engine_used,
+            )
+            with self.guardian._lock:
+                self.guardian.audit_log.append(audit_rec)
+            pv_val = float(post_surr.product_value.detach().cpu().item())
+            se_val = 0.0
+            notional_val = float(post_surr.notional_pv.detach().cpu().item())
+            coupon_val = float(post_surr.coupon_pv.detach().cpu().item())
+            option_val = float(post_surr.option_pv.detach().cpu().item())
+            funding_val = float(-post_surr.funding_pv.detach().cpu().item())
+            ccy_val = post_surr.reporting_currency
+            cash_today_val = float(post_surr.cash_to_settle_today)
+            cf_items = post_surr.cashflows
+            engine_used_str = "MaskedEGNO_Surrogate"
+            fb_triggered = False
+            audit_dict = audit_rec.to_dict()
+            active_state = state
+            surrogate_for_greeks = self._cpu_surrogate
         else:
             greeks_fn = (
                 (
@@ -1217,7 +1383,10 @@ class EQAutocallRuntime:
             need_batched_greeks = bool(
                 compute_greeks
                 and any(
-                    bool(parsed_items[i][3] & {"Delta", "MultivariateAggregatedCashGamma", "Cega"})
+                    bool(
+                        parsed_items[i][3]
+                        & {"Delta", "MultivariateAggregatedCashGamma", "Cega", "ConvexCega"}
+                    )
                     for i in b_indices
                 )
             )
@@ -1227,6 +1396,7 @@ class EQAutocallRuntime:
             )
             b_surr = len(b_states)
             d_max = self.d_max
+            m_max = self.m_max
             node_b = torch.cat([s.node_feats for s in b_states], dim=0)
             edge_b = torch.cat([s.edge_feats for s in b_states], dim=0)
             amask_b = torch.cat([s.asset_mask for s in b_states], dim=0)
@@ -1239,6 +1409,9 @@ class EQAutocallRuntime:
             pvit_b = torch.zeros(b_surr, dtype=torch.float64)
             ilb_b = torch.zeros(b_surr, dtype=torch.float64)
             lstrike_b = torch.zeros(b_surr, dtype=torch.float64)
+            has_any_funding = any(s.funding_leg is not None for s in b_states)
+            w_fund_b = torch.zeros((b_surr, m_max), dtype=torch.float64) if has_any_funding else None
+            w_fund_cache: dict[int, torch.Tensor] = {}
             for k, s in enumerate(b_states):
                 d_act = int(s.d_assets)
                 spots_b[k, :d_act] = s.spots_t0.detach().cpu().to(dtype=torch.float64)
@@ -1246,6 +1419,12 @@ class EQAutocallRuntime:
                 pvit_b[k] = float(s.seasoned_state.pv_in_transit)
                 ilb_b[k] = 1.0 if bool(s.is_long_basket) else 0.0
                 lstrike_b[k] = float(s.lower_strike) if s.lower_strike is not None else 0.0
+                if w_fund_b is not None and s.funding_leg is not None:
+                    w_vec = w_fund_cache.get(id(s))
+                    if w_vec is None:
+                        w_vec = _compute_w_fund_per_period(s, m_max)
+                        w_fund_cache[id(s)] = w_vec
+                    w_fund_b[k, :] = w_vec
 
             batch_out = self.price_tensor_batch(
                 node_b,
@@ -1263,6 +1442,7 @@ class EQAutocallRuntime:
                 autocall_coupon=ac_cpn,
                 force_coupons_on_autocall=force_cpn_flag,
                 is_long_basket=ilb_b,
+                w_fund_per_period=w_fund_b,
                 lower_strike=lstrike_b,
                 run_guardian=False,
             )
@@ -1358,6 +1538,7 @@ class EQAutocallRuntime:
 
                 fb_reasons_enum = [*pre_reasons_k, *post_reasons_k]
                 fb_reasons = [r.value for r in fb_reasons_enum]
+                fb_triggered_k = False if engine_norm == "surrogate" else bool(len(fb_reasons) > 0)
                 min_pin_z = float(pre_diag_k.get("min_pin_risk_z", 100.0))
                 conf_hw = float(pre_diag_k.get("conformal_half_width_bps", 0.0))
                 audit_rec = SR262AuditRecord(
@@ -1365,7 +1546,7 @@ class EQAutocallRuntime:
                     timestamp_utc=ts_now,
                     pre_gate_passed=(len(pre_reasons_k) == 0),
                     post_gate_passed=bool(post_passed),
-                    fallback_triggered=bool(len(fb_reasons) > 0),
+                    fallback_triggered=fb_triggered_k,
                     fallback_reasons=fb_reasons,
                     warnings=list(pre_diag_k.get("warnings", [])),
                     min_corr_eigenvalue_raw=float(pre_diag_k.get("min_corr_eigenvalue_raw", 1.0)),
@@ -1389,7 +1570,7 @@ class EQAutocallRuntime:
                     "CashFlows": list(cf_rows_k),
                     "TradeInfo": req_m.TradeInfo,
                     "engine_used": "MaskedEGNO_Surrogate",
-                    "fallback_triggered": bool(len(fb_reasons) > 0),
+                    "fallback_triggered": fb_triggered_k,
                     "fallback_reason": primary_fb_reason,
                     "fallback_reasons": fb_reasons,
                     "stripped_legacy_fields": stripped_f,
@@ -1407,7 +1588,7 @@ class EQAutocallRuntime:
                     }
                 if "MultivariateAggregatedCashGamma" in q_set:
                     resp_kwargs["MultivariateAggregatedCashGamma"] = float(cg_np[k])
-                if "Cega" in q_set:
+                if "Cega" in q_set or "ConvexCega" in q_set:
                     cega_orig = cega_np[k, :d_act, :d_act][np.ix_(inv_perm, inv_perm)]
                     resp_kwargs["Cega"] = {
                         orig_ids[i]: {
