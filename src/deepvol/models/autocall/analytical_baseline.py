@@ -1,29 +1,45 @@
-"""analytical_baseline.py — Recursive Stulz-Margrabe Moment-Matched Analytical Basket Proxy (Task 1.2).
+"""analytical_baseline.py: Analytical Multi-Asset Autocallable Basket Proxy.
 
-Implements SPEC-DEEPVOL-EQ-AUTOCALL-001 §1.2.D and Empirical Benchmark E3 in strict
-IEEE-754 float64 precision (`torch.float64` / `np.float64`):
-  - Exact two-asset minimum/maximum lognormal first and second moments (Margrabe 1978, Stulz 1982)
-    with measure-change cross-correlation updates under Q^{(k)}.
-  - Supports `WorstOf`, `BestOf`, and `Average` / `AverageOf` (Levy 1992 Wilkinson lognormal moment matching).
-  - Provides both:
-      1. Ultra-fast scalar CPU evaluation using `math.erfc` (< 30 us single-trade latency for Gate G2.1).
-      2. Fully differentiable `torch.float64` tensor evaluation using `torch.special.ndtr` for autograd
-         Greeks (Delta, Gamma, CashGamma, Vega, Cega) and batched GPU execution.
-  - Reproduces the 32,768-path Sobol Terminal IV MC on `eq_autocallable_request.txt` within 0.0047 bps
-    (Gate G1.4 threshold <= 0.5 bps).
+Implements IEEE-754 float64 (`torch.float64` / `np.float64`) moment-matched pricing:
+  - Tie-symmetrized Stulz-Margrabe recursive moments (`WorstOf`, `BestOf`), exact
+    Levy-Wilkinson (`AverageOf`), exact lognormal (`RatioAB`/`RatioBA` respecting
+    `inv_lex_perm`), shifted-normal (`Diff*`), and explicit flagging of exotic indices.
+  - Exact closed-form truncated-normal + ramp survival moments via branch-cut-free
+    `erfcx` Inverse Mills Ratio + continued-fraction tail, with Euler-weighted
+    inter-period correlation and distinct `coupon_index` / `option_index` conditioning.
+  - Exact piecewise terminal put/call integration over `LowerStrike`, conditional KI ramp,
+    `AllowAutocallOnExpiry`, and 16-point bivariate Gauss-Legendre `OneStar` coupling.
+  - Stateless CPU execution delegated to `Tier1MathBackend` (C++23 `-fno-fast-math` with
+    automatic pure-NumPy fallback) and parity-matched differentiable `torch.float64` path.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Any
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 import numpy.typing as npt
 import torch
 
-_INV_SQRT2 = 0.70710678118654752440084436210485
+from deepvol.models.autocall._tier1_backend import (
+    _GL16_W,
+    _GL16_X,
+    _GL16_Y_NORM,
+    _GW4,
+    _GX4,
+    _eval_index_moments,
+    get_tier1_backend,
+    is_exact_analytical_index,
+    monitoring_index_to_code,
+)
+
+_INV_SQRT2: float = 0.70710678118654752440084436210485
+_INV_SQRT2PI: float = 0.39894228040143267793994605993438
+_SQRT_HALF_PI: float = 1.2533141373155002512078826424055
+_SQRT_TWO_OVER_PI: float = 0.79788456080286535587989211986876
+_TIE_TAU: float = 0.008
 
 
 def _ndtr_scalar(x: float) -> float:
@@ -49,6 +65,8 @@ class AutocallBaselineOutput:
     product_value_proxy: torch.Tensor
     l_call_proxy: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0, dtype=torch.float64))
     l_onestar_proxy: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0, dtype=torch.float64))
+    has_unsupported_exotic_index: bool = False
+    unsupported_indices: Tuple[str, ...] = ()
 
 
 def _black76_call_scalar(f: float, k: float, v: float) -> float:
@@ -72,23 +90,18 @@ def _black76_put_scalar(f: float, k: float, v: float) -> float:
 
 
 def _digital_call_spread_prob_scalar(f: float, v: float, barrier: float, spread: float) -> float:
-    """Fast scalar float64 call-spread digital ramp expectation."""
+    """Exact lognormal expectation of a call-spread digital ramp in float64."""
     f_c = f if f > 1e-16 else 1e-16
     v_c = v if v > 1e-12 else 1e-12
     b_c = barrier if barrier > 1e-8 else 1e-8
-    b_low = min(b_c, b_c + spread)
-    if b_low < 1e-8:
-        b_low = 1e-8
-    d2_low = (math.log(f_c / b_low) - 0.5 * v_c * v_c) / v_c
-    if d2_low < -4.75:
-        return 0.0
     if abs(spread) <= 1e-6:
-        d1_pt = (math.log(f_c / b_c) + 0.5 * v_c * v_c) / v_c
-        return min(max(_ndtr_scalar(d1_pt - v_c), 0.0), 1.0)
+        d2_pt = (math.log(f_c / b_c) - 0.5 * v_c * v_c) / v_c
+        return min(max(_ndtr_scalar(d2_pt), 0.0), 1.0)
+    b_low = min(b_c, b_c + spread)
     b_high = max(b_c, b_c + spread)
-    if b_high <= b_low + 1e-9:
-        b_high = b_low + 1e-9
-    c_low = _black76_call_scalar(f_c, b_low, v_c)
+    if b_high <= 0.0:
+        return 1.0
+    c_low = _black76_call_scalar(f_c, b_low, v_c) if b_low > 0.0 else (f_c - b_low)
     c_high = _black76_call_scalar(f_c, b_high, v_c)
     return min(max((c_low - c_high) / (b_high - b_low), 0.0), 1.0)
 
@@ -99,145 +112,569 @@ def fast_stulz_margrabe_cpu(
     corr: npt.NDArray[np.float64] | list[list[float]],
     k_strike: float = 0.90,
     monitoring_index: str = "WorstOf",
+    inv_lex_perm: Optional[Sequence[int] | npt.NDArray[np.int64]] = None,
 ) -> tuple[float, float, float, npt.NDArray[np.float64]]:
-    """Fast scalar float64 Stulz-Margrabe moment matching for single-trade CPU execution (< 25 us).
-
-    Args:
-        f_arr: 1D float64 array of asset forward performances F_{P,i}(t_m), shape (D,).
-        v_arr: 1D float64 array of asset total log-volatilities v_{i,m} = sigma_i * sqrt(tau_m), shape (D,).
-        corr: 2D float64 correlation matrix, shape (D, D).
-        k_strike: Put strike K_put (default 0.90).
-        monitoring_index: 'WorstOf', 'BestOf', or 'Average'/'AverageOf'.
-
-    Returns:
-        put_undisc: Black-76 undiscounted unit put price E[max(K_strike - W_T, 0)].
-        f_w: Effective basket first moment E[W_T].
-        v_w: Effective basket log-standard deviation sqrt(ln(E[W_T^2] / E[W_T]^2)).
-        delta_weights: Analytical Euler sensitivity weights d(F_W)/d(F_{P,i}) of shape (D,).
-    """
-    f_list = f_arr.tolist() if isinstance(f_arr, np.ndarray) else list(f_arr)
-    v_list = v_arr.tolist() if isinstance(v_arr, np.ndarray) else list(v_arr)
-    c_list = corr.tolist() if isinstance(corr, np.ndarray) else corr
-    d_assets = len(f_list)
-
-    if d_assets == 1:
-        f_cur = float(f_list[0])
-        v_cur = max(float(v_list[0]), 1e-12)
-        w_out = np.ones(1, dtype=np.float64)
-        if k_strike <= 0.0:
-            return 0.0, f_cur, v_cur, w_out
-        put_val = _black76_put_scalar(f_cur, k_strike, v_cur)
-        return put_val, f_cur, v_cur, w_out
-
-    idx_mode = monitoring_index.strip()
-    if idx_mode in ("Average", "AverageOf", "MultiPerf"):
-        f_w = sum(f_list) / d_assets
-        m2_sum = 0.0
-        for i in range(d_assets):
-            fi = f_list[i]
-            vi = v_list[i]
-            ci_row = c_list[i]
-            for j in range(d_assets):
-                m2_sum += fi * f_list[j] * math.exp(ci_row[j] * vi * v_list[j])
-        m2 = m2_sum / (d_assets * d_assets)
-        v_w = math.sqrt(max(math.log(max(m2 / max(f_w * f_w, 1e-30), 1.0)), 1e-16))
-        w_out = np.full(d_assets, 1.0 / d_assets, dtype=np.float64)
-        if k_strike <= 0.0:
-            return 0.0, f_w, v_w, w_out
-        put_val = _black76_put_scalar(f_w, k_strike, v_w)
+    """Fast scalar float64 Stulz-Margrabe moment matching for single-trade CPU execution."""
+    code = monitoring_index_to_code(monitoring_index)
+    backend = get_tier1_backend()
+    eval_mom = getattr(backend, "eval_index_moments_np", None)
+    if (
+        eval_mom is not None
+        and isinstance(f_arr, np.ndarray)
+        and isinstance(v_arr, np.ndarray)
+        and isinstance(corr, np.ndarray)
+    ):
+        perm_np: Optional[npt.NDArray[np.int64]] = (
+            inv_lex_perm
+            if isinstance(inv_lex_perm, np.ndarray)
+            else (np.asarray(inv_lex_perm, dtype=np.int64) if inv_lex_perm is not None else None)
+        )
+        f_w, v_w, w_out = eval_mom(f_arr, v_arr, corr, code, perm_np)
+    else:
+        f_list = f_arr.tolist() if isinstance(f_arr, np.ndarray) else [float(x) for x in f_arr]
+        v_list = v_arr.tolist() if isinstance(v_arr, np.ndarray) else [float(x) for x in v_arr]
+        c_list = corr.tolist() if isinstance(corr, np.ndarray) else [[float(z) for z in row] for row in corr]
+        d_assets = len(f_list)
+        perm_seq: Optional[Sequence[int]] = (
+            inv_lex_perm.tolist() if isinstance(inv_lex_perm, np.ndarray) else inv_lex_perm
+        )
+        f_w, v_w, w_list = _eval_index_moments(d_assets, f_list, v_list, c_list, perm_seq, code)
+        w_out = np.asarray(w_list, dtype=np.float64)
+    if k_strike <= 0.0:
+        return 0.0, f_w, v_w, w_out
+    if 9 <= code <= 13:
+        s_c = max(v_w, 1e-12)
+        z = (k_strike - f_w) / s_c
+        put_val = (k_strike - f_w) * _ndtr_scalar(z) + s_c * _INV_SQRT2PI * math.exp(-0.5 * z * z)
         return put_val, f_w, v_w, w_out
+    put_val = _black76_put_scalar(f_w, k_strike, v_w)
+    return put_val, f_w, v_w, w_out
 
-    is_best_of = idx_mode == "BestOf"
-    order = sorted(range(d_assets), key=f_list.__getitem__, reverse=is_best_of)
-    f_ord = [float(f_list[i]) for i in order]
-    v_ord = [max(float(v_list[i]), 1e-12) for i in order]
 
-    f_cur = f_ord[0] if f_ord[0] > 1e-16 else 1e-16
-    v_cur = v_ord[0]
-    row0 = c_list[order[0]]
-    rho_cur = [float(row0[order[k]]) for k in range(d_assets)]
-    w_ord = [0.0] * d_assets
-    w_ord[0] = 1.0
+def _truncated_upper_std_moments_torch(alpha: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Exact C^inf posterior (mu_u, var_u) of U ~ N(0,1) | U <= alpha via erfcx IMR + CF."""
+    use_cf = alpha <= -4.0
+    use_zero = alpha >= 26.0
+    # CF branch (safe clamp keeps inactive branch finite)
+    x_cf = -torch.where(use_cf, alpha, torch.full_like(alpha, -4.0))
+    v = torch.zeros_like(x_cf)
+    for k in range(80, 2, -1):
+        v = float(k) / (x_cf + v)
+    r2_cf = 2.0 / (x_cf + v)
+    psi_cf = 1.0 / (x_cf + r2_cf)
+    mu_cf = -x_cf - psi_cf
+    var_cf = (psi_cf * (r2_cf - psi_cf)).clamp(min=1e-12)
+
+    # erfcx IMR branch for -4.0 < alpha < 26.0
+    a_mid = alpha.clamp(min=-4.0, max=25.999)
+    lam_mid = _SQRT_TWO_OVER_PI / torch.special.erfcx(-a_mid * _INV_SQRT2)
+    mu_mid = -lam_mid
+    var_mid = (1.0 - a_mid * lam_mid - lam_mid * lam_mid).clamp(min=1e-12)
+
+    mu = torch.where(use_cf, mu_cf, torch.where(use_zero, torch.zeros_like(alpha), mu_mid))
+    var = torch.where(use_cf, var_cf, torch.where(use_zero, torch.ones_like(alpha), var_mid))
+    return mu, var
+
+
+def _clark_one_order_torch(
+    f_in: torch.Tensor,
+    v_in: torch.Tensor,
+    c_in: torch.Tensor,
+    order: torch.Tensor,
+    is_best_of: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched differentiable Clark reduction along explicit integer permutation `order` (B, D)."""
+    b_size, d_assets = f_in.shape
+    device = f_in.device
+    inv_order = torch.argsort(order, dim=1)
+    f_ord = torch.gather(f_in, 1, order).clamp(min=1e-16)
+    v_ord = torch.gather(v_in, 1, order).clamp(min=1e-12)
+    ord_row = order.unsqueeze(2).expand(b_size, d_assets, d_assets)
+    ord_col = order.unsqueeze(1).expand(b_size, d_assets, d_assets)
+    c_ord = torch.gather(torch.gather(c_in, 1, ord_row), 2, ord_col)
+
+    f_cur = f_ord[:, 0]
+    v_cur = v_ord[:, 0]
+    rho_rem = c_ord[:, 0, 1:]
+    w1_steps: List[torch.Tensor] = []
+    w2_steps: List[torch.Tensor] = []
 
     for j in range(1, d_assets):
-        f_2 = f_ord[j] if f_ord[j] > 1e-16 else 1e-16
-        v_2 = v_ord[j]
-        rho_12 = rho_cur[j]
-        if rho_12 > 0.999999:
-            rho_12 = 0.999999
-        elif rho_12 < -0.999999:
-            rho_12 = -0.999999
-
-        var_m = v_cur * v_cur + v_2 * v_2 - 2.0 * rho_12 * v_cur * v_2
-        if var_m < 1e-16:
-            var_m = 1e-16
-        sig_m = math.sqrt(var_m)
-
-        d1 = (math.log(f_cur / f_2) + 0.5 * var_m) / sig_m
+        f_2 = f_ord[:, j]
+        v_2 = v_ord[:, j]
+        rho_12 = rho_rem[:, 0].clamp(-0.999999, 0.999999)
+        v_cur_sq = v_cur * v_cur
+        v_2_sq = v_2 * v_2
+        var_m = (v_cur_sq + v_2_sq - 2.0 * rho_12 * v_cur * v_2).clamp(min=1e-16)
+        sig_m = torch.sqrt(var_m)
+        log_f_ratio = torch.log(f_cur / f_2)
+        d1 = (log_f_ratio + 0.5 * var_m) / sig_m
         d2 = d1 - sig_m
 
         if is_best_of:
-            w1 = _ndtr_scalar(d1)
-            w2 = _ndtr_scalar(-d2)
+            w1 = torch.special.ndtr(d1)
+            w2 = torch.special.ndtr(-d2)
         else:
-            w1 = _ndtr_scalar(-d1)
-            w2 = _ndtr_scalar(d2)
+            w1 = torch.special.ndtr(-d1)
+            w2 = torch.special.ndtr(d2)
 
-        e_m1 = f_cur * w1 + f_2 * w2
-        if e_m1 < 1e-16:
-            e_m1 = 1e-16
-        for prev_i in range(j):
-            w_ord[prev_i] *= w1
-        w_ord[j] = w2
+        e_m1 = (f_cur * w1 + f_2 * w2).clamp(min=1e-16)
+        w1_steps.append(w1)
+        w2_steps.append(w2)
 
-        # Second moment E[min(M^2, P_j^2)] or E[max(M^2, P_j^2)]
-        f1_sq = (f_cur * f_cur) * math.exp(v_cur * v_cur)
-        f2_sq = (f_2 * f_2) * math.exp(v_2 * v_2)
+        f1_sq = (f_cur * f_cur) * torch.exp(v_cur_sq)
+        f2_sq = (f_2 * f_2) * torch.exp(v_2_sq)
         sig_m2 = 2.0 * sig_m
         var_m2 = sig_m2 * sig_m2
-        d1_sq = (math.log(max(f1_sq, 1e-30) / max(f2_sq, 1e-30)) + 0.5 * var_m2) / sig_m2
+        d1_sq = (torch.log(f1_sq.clamp(min=1e-30) / f2_sq.clamp(min=1e-30)) + 0.5 * var_m2) / sig_m2
         d2_sq = d1_sq - sig_m2
 
         if is_best_of:
-            e_m2 = f1_sq * _ndtr_scalar(d1_sq) + f2_sq * _ndtr_scalar(-d2_sq)
+            e_m2 = f1_sq * torch.special.ndtr(d1_sq) + f2_sq * torch.special.ndtr(-d2_sq)
         else:
-            e_m2 = f1_sq * _ndtr_scalar(-d1_sq) + f2_sq * _ndtr_scalar(d2_sq)
+            e_m2 = f1_sq * torch.special.ndtr(-d1_sq) + f2_sq * torch.special.ndtr(d2_sq)
 
-        ratio_m2 = e_m2 / (e_m1 * e_m1)
-        v_new = math.sqrt(math.log(ratio_m2) if ratio_m2 > 1.0 + 1e-16 else 1e-16)
+        v_new = torch.sqrt(
+            torch.clamp(torch.log(torch.clamp(e_m2 / (e_m1 * e_m1).clamp(min=1e-30), min=1.0)), min=1e-16)
+        )
 
-        # Update cross-correlations with remaining assets k > j under measure Q^{(k)}
-        row_j = c_list[order[j]]
-        for k in range(j + 1, d_assets):
-            v_k = v_ord[k]
-            f1_k = f_cur * math.exp(rho_cur[k] * v_cur * v_k)
-            f2_k = f_2 * math.exp(float(row_j[order[k]]) * v_2 * v_k)
-            d1_k = (math.log(max(f1_k, 1e-16) / max(f2_k, 1e-16)) + 0.5 * var_m) / sig_m
-            d2_k = d1_k - sig_m
+        if j + 1 < d_assets:
+            v_rem = v_ord[:, j + 1 :]
+            rho_1_rem = rho_rem[:, 1:]
+            rho_2_rem = c_ord[:, j, j + 1 :]
+            exp_arg_1 = rho_1_rem * v_cur.unsqueeze(1) * v_rem
+            exp_arg_2 = rho_2_rem * v_2.unsqueeze(1) * v_rem
+            f1_k = f_cur.unsqueeze(1) * torch.exp(exp_arg_1)
+            f2_k = f_2.unsqueeze(1) * torch.exp(exp_arg_2)
+            var_m_col = var_m.unsqueeze(1)
+            sig_m_col = sig_m.unsqueeze(1)
+            d1_k = (log_f_ratio.unsqueeze(1) + (exp_arg_1 - exp_arg_2) + 0.5 * var_m_col) / sig_m_col
+            d2_k = d1_k - sig_m_col
             if is_best_of:
-                e_m_pk = f1_k * _ndtr_scalar(d1_k) + f2_k * _ndtr_scalar(-d2_k)
+                e_m_pk = f1_k * torch.special.ndtr(d1_k) + f2_k * torch.special.ndtr(-d2_k)
             else:
-                e_m_pk = f1_k * _ndtr_scalar(-d1_k) + f2_k * _ndtr_scalar(d2_k)
-            cov_log = math.log(max(e_m_pk / e_m1, 1e-16))
-            denom_k = v_new * v_k
-            r_new = cov_log / (denom_k if denom_k > 1e-16 else 1e-16)
-            if r_new > 0.999999:
-                r_new = 0.999999
-            elif r_new < -0.999999:
-                r_new = -0.999999
-            rho_cur[k] = r_new
+                e_m_pk = f1_k * torch.special.ndtr(-d1_k) + f2_k * torch.special.ndtr(d2_k)
+            cov_log = torch.log(torch.clamp(e_m_pk / e_m1.unsqueeze(1), min=1e-16))
+            rho_rem = torch.clamp(
+                cov_log / (v_new.unsqueeze(1) * v_rem).clamp(min=1e-16),
+                -0.999999,
+                0.999999,
+            )
 
         f_cur = e_m1
         v_cur = v_new
 
-    w_out = np.empty(d_assets, dtype=np.float64)
-    for idx_ord, orig_i in enumerate(order):
-        w_out[orig_i] = w_ord[idx_ord]
+    w1_rev = torch.stack(w1_steps[::-1], dim=1)
+    suff = torch.cumprod(w1_rev, dim=1).flip(1)
+    ones_col = torch.ones((b_size, 1), dtype=torch.float64, device=device)
+    w2_all = torch.cat([ones_col, torch.stack(w2_steps, dim=1)], dim=1)
+    suff_all = torch.cat([suff, ones_col], dim=1)
+    w_ord_t = w2_all * suff_all
+    w_unsorted = torch.gather(w_ord_t, 1, inv_order)
+    return f_cur, v_cur, w_unsorted
 
-    if k_strike <= 0.0:
-        return 0.0, f_cur, v_cur, w_out
-    put_val = _black76_put_scalar(f_cur, k_strike, v_cur)
-    return put_val, f_cur, v_cur, w_out
+
+def _clark_symmetrized_torch(
+    f_in: torch.Tensor,
+    v_in: torch.Tensor,
+    c_in: torch.Tensor,
+    mask_in: Optional[torch.Tensor],
+    is_best_of: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Smooth tie-symmetrized Clark reduction eliminating dynamic argsort step jumps."""
+    b_size, d_max = f_in.shape
+    device = f_in.device
+
+    if d_max == 1:
+        f_0 = f_in[:, 0].clamp(min=1e-16)
+        v_0 = v_in[:, 0].clamp(min=1e-12)
+        w_0 = torch.ones_like(f_in) if mask_in is None else mask_in
+        return f_0, v_0, w_0
+
+    f_safe = f_in.clamp(min=1e-16)
+    v_safe = v_in.clamp(min=1e-12)
+    if mask_in is not None:
+        active_b = mask_in > 0.5
+        f_safe = torch.where(active_b, f_safe, torch.ones_like(f_safe))
+        v_safe = torch.where(active_b, v_safe, torch.full_like(v_safe, 0.1))
+        pair_active = active_b.unsqueeze(2) & active_b.unsqueeze(1)
+        eye_d = torch.eye(d_max, dtype=torch.float64, device=device).unsqueeze(0)
+        c_safe = torch.where(pair_active, c_in, eye_d)
+    else:
+        active_b = torch.ones((b_size, d_max), dtype=torch.bool, device=device)
+        c_safe = c_in
+
+    # Smooth C^inf tie indicator across active asset pairs
+    g_sep = torch.ones(b_size, dtype=torch.float64, device=device)
+    for i in range(d_max):
+        for j in range(i + 1, d_max):
+            dl = torch.log(f_safe[:, i] / f_safe[:, j])
+            p_ij = torch.exp(-(dl * dl) / (2.0 * _TIE_TAU * _TIE_TAU))
+            one_m = 1.0 - p_ij
+            pair_on = active_b[:, i] & active_b[:, j]
+            factor = torch.where(pair_on, one_m * one_m, torch.ones_like(one_m))
+            g_sep = g_sep * factor
+    w_tie = 1.0 - g_sep
+
+    # Move inactive slots to the end so active prefix reduces cleanly
+    if mask_in is None:
+        sort_key_f = -f_safe.detach() if is_best_of else f_safe.detach()
+    else:
+        base_key = -f_safe.detach() if is_best_of else f_safe.detach()
+        sort_key_f = torch.where(active_b, base_key, torch.full_like(base_key, 1e12))
+    ord_f = torch.argsort(sort_key_f, dim=1, stable=True)
+
+    # Fast path when all rows have well-separated forwards and no mask padding complications
+    w_tie_max = float(w_tie.detach().max().item())
+
+    def _eval_masked_clark_order(order_b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if mask_in is None:
+            return _clark_one_order_torch(f_safe, v_safe, c_safe, order_b, is_best_of)
+        # Compact active slots first while respecting order_b on active elements
+        inv_o = torch.argsort(order_b, dim=1)
+        f_o = torch.gather(f_safe, 1, order_b)
+        v_o = torch.gather(v_safe, 1, order_b)
+        m_o = torch.gather(mask_in, 1, order_b)
+        ord_row = order_b.unsqueeze(2).expand(b_size, d_max, d_max)
+        ord_col = order_b.unsqueeze(1).expand(b_size, d_max, d_max)
+        c_o = torch.gather(torch.gather(c_safe, 1, ord_row), 2, ord_col)
+
+        f_cur = f_o[:, 0]
+        v_cur = v_o[:, 0]
+        rho_cur = c_o[:, 0, :]
+        w_list: List[torch.Tensor] = [torch.ones((b_size,), dtype=torch.float64, device=device)]
+        for _ in range(1, d_max):
+            w_list.append(torch.zeros((b_size,), dtype=torch.float64, device=device))
+
+        for j in range(1, d_max):
+            active_j = m_o[:, j] > 0.5
+            if not bool(torch.any(active_j)):
+                break
+            f_2 = f_o[:, j]
+            v_2 = v_o[:, j]
+            rho_12 = rho_cur[:, j].clamp(-0.999999, 0.999999)
+            var_m = (v_cur * v_cur + v_2 * v_2 - 2.0 * rho_12 * v_cur * v_2).clamp(min=1e-16)
+            sig_m = torch.sqrt(var_m)
+            d1 = (torch.log(f_cur / f_2) + 0.5 * var_m) / sig_m
+            d2 = d1 - sig_m
+            if is_best_of:
+                w1 = torch.special.ndtr(d1)
+                w2 = torch.special.ndtr(-d2)
+            else:
+                w1 = torch.special.ndtr(-d1)
+                w2 = torch.special.ndtr(d2)
+            e_m1 = (f_cur * w1 + f_2 * w2).clamp(min=1e-16)
+            f1_sq = (f_cur * f_cur) * torch.exp(v_cur * v_cur)
+            f2_sq = (f_2 * f_2) * torch.exp(v_2 * v_2)
+            sig_m2 = 2.0 * sig_m
+            var_m2 = sig_m2 * sig_m2
+            d1_sq = (torch.log(f1_sq.clamp(min=1e-30) / f2_sq.clamp(min=1e-30)) + 0.5 * var_m2) / sig_m2
+            d2_sq = d1_sq - sig_m2
+            if is_best_of:
+                e_m2 = f1_sq * torch.special.ndtr(d1_sq) + f2_sq * torch.special.ndtr(-d2_sq)
+            else:
+                e_m2 = f1_sq * torch.special.ndtr(-d1_sq) + f2_sq * torch.special.ndtr(d2_sq)
+            v_new = torch.sqrt(
+                torch.clamp(torch.log(torch.clamp(e_m2 / (e_m1 * e_m1).clamp(min=1e-30), min=1.0)), min=1e-16)
+            )
+            for prev_idx in range(j):
+                w_list[prev_idx] = torch.where(active_j, w_list[prev_idx] * w1, w_list[prev_idx])
+            w_list[j] = torch.where(active_j, w2, torch.zeros_like(w2))
+            if j + 1 < d_max:
+                v_rem = v_o[:, j + 1 :]
+                rho_1_rem = rho_cur[:, j + 1 :]
+                rho_2_rem = c_o[:, j, j + 1 :]
+                f1_k = f_cur.unsqueeze(1) * torch.exp(rho_1_rem * v_cur.unsqueeze(1) * v_rem)
+                f2_k = f_2.unsqueeze(1) * torch.exp(rho_2_rem * v_2.unsqueeze(1) * v_rem)
+                var_m_col = var_m.unsqueeze(1)
+                sig_m_col = sig_m.unsqueeze(1)
+                d1_k = (torch.log(f1_k.clamp(min=1e-16) / f2_k.clamp(min=1e-16)) + 0.5 * var_m_col) / sig_m_col
+                d2_k = d1_k - sig_m_col
+                if is_best_of:
+                    e_m_pk = f1_k * torch.special.ndtr(d1_k) + f2_k * torch.special.ndtr(-d2_k)
+                else:
+                    e_m_pk = f1_k * torch.special.ndtr(-d1_k) + f2_k * torch.special.ndtr(d2_k)
+                cov_log = torch.log(torch.clamp(e_m_pk / e_m1.unsqueeze(1), min=1e-16))
+                rho_new_rem = torch.clamp(
+                    cov_log / (v_new.unsqueeze(1) * v_rem).clamp(min=1e-16),
+                    -0.999999,
+                    0.999999,
+                )
+                updated_rem = torch.where(active_j.unsqueeze(1), rho_new_rem, rho_1_rem)
+                rho_cur = torch.cat([rho_cur[:, : j + 1], updated_rem], dim=1)
+            f_cur = torch.where(active_j, e_m1, f_cur)
+            v_cur = torch.where(active_j, v_new, v_cur)
+
+        w_o_t = torch.stack(w_list, dim=1) * m_o
+        return f_cur, v_cur, torch.gather(w_o_t, 1, inv_o)
+
+    if w_tie_max < 1e-12:
+        return _eval_masked_clark_order(ord_f)
+
+    # Symmetrized vol-ordered / cyclic reductions matching C++23 & PureNumPy exactly
+    v_key = torch.where(active_b, v_safe.detach(), torch.full_like(v_safe, 1e12))
+    ord_v = torch.argsort(v_key, dim=1, stable=True)
+
+    # Check if masked or heterogeneous active counts across batch: run row-wise permutation list cleanly
+    # when all rows share the same active asset count (common batched case) or per-row.
+    if mask_in is None:
+        # Build permutations over all d_max assets based on row 0 or batched
+        v_np = v_safe.detach().cpu().numpy()
+        ord_v_np = ord_v.cpu().numpy()
+        # Check whether all rows share the same v-tie regime
+        same_perms = True
+        row0_ord = ord_v_np[0].tolist()
+        v0 = v_np[0]
+        if float(v0[row0_ord[-1]] - v0[row0_ord[0]]) <= 1e-5:
+            perms_list = [row0_ord[s:] + row0_ord[:s] for s in range(d_max)]
+            perms_list = perms_list + [list(reversed(p)) for p in perms_list]
+        else:
+            perms_list = [row0_ord, list(reversed(row0_ord))]
+            for k in range(d_max - 1):
+                if abs(float(v0[row0_ord[k + 1]] - v0[row0_ord[k]])) <= 1e-5:
+                    sw = list(row0_ord)
+                    sw[k], sw[k + 1] = sw[k + 1], sw[k]
+                    perms_list.append(sw)
+                    perms_list.append(list(reversed(sw)))
+        # Check if every row has identical permutation count / tie structure, else evaluate full cyclic+rev
+        for r in range(1, b_size):
+            rr = ord_v_np[r].tolist()
+            vr = v_np[r]
+            if (float(vr[rr[-1]] - vr[rr[0]]) <= 1e-5) != (float(v0[row0_ord[-1]] - v0[row0_ord[0]]) <= 1e-5):
+                same_perms = False
+                break
+        if not same_perms:
+            # Uniform cyclic+rev over ord_v is always S_D symmetric on tied vols and C^inf
+            perms_t_list = [torch.roll(ord_v, shifts=-s, dims=1) for s in range(d_max)]
+            perms_t_list = perms_t_list + [torch.flip(p, dims=[1]) for p in perms_t_list]
+        else:
+            # Build per-row tensor permutations matching ord_v[r]
+            n_perms = len(perms_list)
+            perms_t_list = []
+            # If simple uniform case, build via torch ops on ord_v to stay general for all rows
+            if float(v0[row0_ord[-1]] - v0[row0_ord[0]]) <= 1e-5:
+                perms_t_list = [torch.roll(ord_v, shifts=-s, dims=1) for s in range(d_max)]
+                perms_t_list = perms_t_list + [torch.flip(p, dims=[1]) for p in perms_t_list]
+            elif n_perms == 2:
+                perms_t_list = [ord_v, torch.flip(ord_v, dims=[1])]
+            else:
+                # Per-row tie swap list
+                row_perms: List[List[List[int]]] = []
+                max_p = 0
+                for r in range(b_size):
+                    rr = ord_v_np[r].tolist()
+                    vr = v_np[r]
+                    rp = [rr, list(reversed(rr))]
+                    for k in range(d_max - 1):
+                        if abs(float(vr[rr[k + 1]] - vr[rr[k]])) <= 1e-5:
+                            sw = list(rr)
+                            sw[k], sw[k + 1] = sw[k + 1], sw[k]
+                            rp.append(sw)
+                            rp.append(list(reversed(sw)))
+                    row_perms.append(rp)
+                    max_p = max(max_p, len(rp))
+                if all(len(rp) == max_p for rp in row_perms):
+                    for pi in range(max_p):
+                        perms_t_list.append(
+                            torch.tensor([rp[pi] for rp in row_perms], dtype=torch.long, device=device)
+                        )
+                else:
+                    perms_t_list = [torch.roll(ord_v, shifts=-s, dims=1) for s in range(d_max)]
+                    perms_t_list = perms_t_list + [torch.flip(p, dims=[1]) for p in perms_t_list]
+
+        f_acc = torch.zeros(b_size, dtype=torch.float64, device=device)
+        m2_acc = torch.zeros(b_size, dtype=torch.float64, device=device)
+        w_acc = torch.zeros((b_size, d_max), dtype=torch.float64, device=device)
+        for p_t in perms_t_list:
+            fp, vp, wp = _clark_one_order_torch(f_safe, v_safe, c_safe, p_t, is_best_of)
+            f_acc = f_acc + fp
+            m2_acc = m2_acc + fp * fp * torch.exp(vp * vp)
+            w_acc = w_acc + wp
+        inv_k = 1.0 / float(len(perms_t_list))
+        f_sym = f_acc * inv_k
+        m2_sym = m2_acc * inv_k
+        v_sym = torch.sqrt(torch.clamp(torch.log(torch.clamp(m2_sym / (f_sym * f_sym).clamp(min=1e-30), min=1.0)), min=1e-16))
+        w_sym = w_acc * inv_k
+    else:
+        # Masked case: compact active counts by rotating only the active prefix of ord_v
+        active_cnt = active_b.sum(dim=1).to(dtype=torch.long)
+        # Evaluate cyclic shifts + reverses on active prefix per row using ord_v
+        f_sym = torch.zeros(b_size, dtype=torch.float64, device=device)
+        m2_sym = torch.zeros(b_size, dtype=torch.float64, device=device)
+        w_sym = torch.zeros((b_size, d_max), dtype=torch.float64, device=device)
+        ord_v_np = ord_v.cpu().numpy()
+        v_np = v_safe.detach().cpu().numpy()
+        for r in range(b_size):
+            d_act = int(active_cnt[r].item())
+            act_ord = ord_v_np[r, :d_act].tolist()
+            inact_tail = ord_v_np[r, d_act:].tolist()
+            vr = v_np[r]
+            if d_act <= 1:
+                r_perms = [act_ord + inact_tail]
+            elif float(vr[act_ord[-1]] - vr[act_ord[0]]) <= 1e-5:
+                r_perms = [act_ord[s:] + act_ord[:s] + inact_tail for s in range(d_act)]
+                r_perms = r_perms + [list(reversed(p[:d_act])) + inact_tail for p in r_perms]
+            else:
+                r_perms = [act_ord + inact_tail, list(reversed(act_ord)) + inact_tail]
+                for k in range(d_act - 1):
+                    if abs(float(vr[act_ord[k + 1]] - vr[act_ord[k]])) <= 1e-5:
+                        sw = list(act_ord)
+                        sw[k], sw[k + 1] = sw[k + 1], sw[k]
+                        r_perms.append(sw + inact_tail)
+                        r_perms.append(list(reversed(sw)) + inact_tail)
+            f_r = torch.zeros(1, dtype=torch.float64, device=device)
+            m2_r = torch.zeros(1, dtype=torch.float64, device=device)
+            w_r = torch.zeros((1, d_max), dtype=torch.float64, device=device)
+            for rp in r_perms:
+                rp_t = torch.tensor([rp], dtype=torch.long, device=device)
+                # Single-row evaluation on slice r:r+1
+                f_sub = f_safe[r : r + 1]
+                v_sub = v_safe[r : r + 1]
+                c_sub = c_safe[r : r + 1]
+                m_sub = mask_in[r : r + 1]
+                # Use active slice
+                f_act = torch.gather(f_sub, 1, rp_t[:, :d_act])
+                v_act = torch.gather(v_sub, 1, rp_t[:, :d_act])
+                c_act = torch.gather(
+                    torch.gather(c_sub, 1, rp_t[:, :d_act].unsqueeze(2).expand(1, d_act, d_max)),
+                    2,
+                    rp_t[:, :d_act].unsqueeze(1).expand(1, d_act, d_act),
+                )
+                if d_act == 1:
+                    fp_r = f_act[:, 0]
+                    vp_r = v_act[:, 0]
+                    wp_r = torch.zeros((1, d_max), dtype=torch.float64, device=device)
+                    wp_r[0, act_ord[0]] = 1.0
+                else:
+                    id_ord = torch.arange(d_act, dtype=torch.long, device=device).unsqueeze(0)
+                    fp_r, vp_r, wp_act = _clark_one_order_torch(f_act, v_act, c_act, id_ord, is_best_of)
+                    wp_r = torch.zeros((1, d_max), dtype=torch.float64, device=device)
+                    wp_r.scatter_(1, rp_t[:, :d_act], wp_act)
+                _ = m_sub
+                f_r = f_r + fp_r
+                m2_r = m2_r + fp_r * fp_r * torch.exp(vp_r * vp_r)
+                w_r = w_r + wp_r
+            inv_kr = 1.0 / float(len(r_perms))
+            f_sym[r] = f_r[0] * inv_kr
+            m2_sym[r] = m2_r[0] * inv_kr
+            w_sym[r] = w_r[0] * inv_kr
+        v_sym = torch.sqrt(torch.clamp(torch.log(torch.clamp(m2_sym / (f_sym * f_sym).clamp(min=1e-30), min=1.0)), min=1e-16))
+
+    if float(g_sep.detach().max().item()) < 1e-15:
+        return f_sym, v_sym, w_sym
+
+    f_f, v_f, w_f = _eval_masked_clark_order(ord_f)
+    f_out = g_sep * f_f + w_tie * f_sym
+    m2_out = g_sep * (f_f * f_f * torch.exp(v_f * v_f)) + w_tie * m2_sym
+    v_out = torch.sqrt(torch.clamp(torch.log(torch.clamp(m2_out / (f_out * f_out).clamp(min=1e-30), min=1.0)), min=1e-16))
+    w_out = g_sep.unsqueeze(1) * w_f + w_tie.unsqueeze(1) * w_sym
+    return f_out, v_out, w_out
+
+
+def _clark_corr_min_max_torch(
+    f_in: torch.Tensor,
+    v_in: torch.Tensor,
+    corr: torch.Tensor,
+) -> torch.Tensor:
+    """Computes Stulz-Clark correlation between ln(W_min) and ln(W_max) for 1D inputs (D,)."""
+    d = int(f_in.shape[0])
+    device = f_in.device
+    if d <= 1:
+        return torch.tensor(1.0, dtype=torch.float64, device=device)
+    f_s = f_in.clamp(min=1e-16)
+    v_s = v_in.clamp(min=1e-12)
+    f_np = f_s.detach().cpu().tolist()
+    v_np = v_s.detach().cpu().tolist()
+    ord_min = sorted(range(d), key=lambda i: (round(float(f_np[i]), 9), float(v_np[i])))
+    ord_max = sorted(range(d), key=lambda i: (-round(float(f_np[i]), 9), float(v_np[i])))
+
+    idx_min = torch.tensor(ord_min, dtype=torch.long, device=device)
+    fo = f_s[idx_min]
+    vo = v_s[idx_min]
+    f_cur = fo[0]
+    v_cur = vo[0]
+    rho_m_p = corr[ord_min[0]]
+
+    for j in range(1, d):
+        f_2 = fo[j]
+        v_2 = vo[j]
+        rho_12 = rho_m_p[ord_min[j]].clamp(-0.999999, 0.999999)
+        var_m = (v_cur * v_cur + v_2 * v_2 - 2.0 * rho_12 * v_cur * v_2).clamp(min=1e-16)
+        sig_m = torch.sqrt(var_m)
+        d1 = (torch.log(f_cur / f_2) + 0.5 * var_m) / sig_m
+        d2 = d1 - sig_m
+        e_m1 = (f_cur * torch.special.ndtr(-d1) + f_2 * torch.special.ndtr(d2)).clamp(min=1e-16)
+        f1_sq = f_cur * f_cur * torch.exp(v_cur * v_cur)
+        f2_sq = f_2 * f_2 * torch.exp(v_2 * v_2)
+        sig_m2 = 2.0 * sig_m
+        var_m2 = sig_m2 * sig_m2
+        d1_sq = (torch.log(f1_sq.clamp(min=1e-30) / f2_sq.clamp(min=1e-30)) + 0.5 * var_m2) / sig_m2
+        d2_sq = d1_sq - sig_m2
+        e_m2 = f1_sq * torch.special.ndtr(-d1_sq) + f2_sq * torch.special.ndtr(d2_sq)
+        v_new = torch.sqrt(torch.clamp(torch.log(torch.clamp(e_m2 / (e_m1 * e_m1).clamp(min=1e-30), min=1.0)), min=1e-16))
+
+        oj = ord_min[j]
+        f1_i = f_cur * torch.exp(rho_m_p * v_cur * v_s)
+        f2_i = f_2 * torch.exp(corr[oj] * v_2 * v_s)
+        d1_i = (torch.log(f1_i.clamp(min=1e-16) / f2_i.clamp(min=1e-16)) + 0.5 * var_m) / sig_m
+        d2_i = d1_i - sig_m
+        e_mp_i = f1_i * torch.special.ndtr(-d1_i) + f2_i * torch.special.ndtr(d2_i)
+        rho_m_p = (torch.log(torch.clamp(e_mp_i / e_m1, min=1e-16)) / (v_new * v_s).clamp(min=1e-16)).clamp(
+            -0.999999, 0.999999
+        )
+        f_cur, v_cur = e_m1, v_new
+
+    v_min = v_cur
+    idx_max = torch.tensor(ord_max, dtype=torch.long, device=device)
+    fob = f_s[idx_max]
+    vob = v_s[idx_max]
+    cob = corr[idx_max][:, idx_max]
+    f_b = fob[0]
+    v_b = vob[0]
+    rho_cur = cob[0]
+    rho_b_min = rho_m_p[ord_max[0]]
+
+    for j in range(1, d):
+        f_2 = fob[j]
+        v_2 = vob[j]
+        rho_12 = rho_cur[j].clamp(-0.999999, 0.999999)
+        var_m = (v_b * v_b + v_2 * v_2 - 2.0 * rho_12 * v_b * v_2).clamp(min=1e-16)
+        sig_m = torch.sqrt(var_m)
+        d1 = (torch.log(f_b / f_2) + 0.5 * var_m) / sig_m
+        d2 = d1 - sig_m
+        e_m1 = (f_b * torch.special.ndtr(d1) + f_2 * torch.special.ndtr(-d2)).clamp(min=1e-16)
+        f1_sq = f_b * f_b * torch.exp(v_b * v_b)
+        f2_sq = f_2 * f_2 * torch.exp(v_2 * v_2)
+        sig_m2 = 2.0 * sig_m
+        var_m2 = sig_m2 * sig_m2
+        d1_sq = (torch.log(f1_sq.clamp(min=1e-30) / f2_sq.clamp(min=1e-30)) + 0.5 * var_m2) / sig_m2
+        d2_sq = d1_sq - sig_m2
+        e_m2 = f1_sq * torch.special.ndtr(d1_sq) + f2_sq * torch.special.ndtr(-d2_sq)
+        v_new = torch.sqrt(torch.clamp(torch.log(torch.clamp(e_m2 / (e_m1 * e_m1).clamp(min=1e-30), min=1.0)), min=1e-16))
+
+        oj = ord_max[j]
+        f1_min = f_b * torch.exp(rho_b_min * v_b * v_min)
+        f2_min = f_2 * torch.exp(rho_m_p[oj] * v_2 * v_min)
+        d1_min = (torch.log(f1_min.clamp(min=1e-16) / f2_min.clamp(min=1e-16)) + 0.5 * var_m) / sig_m
+        d2_min = d1_min - sig_m
+        e_b_min = f1_min * torch.special.ndtr(d1_min) + f2_min * torch.special.ndtr(-d2_min)
+        rho_b_min = (torch.log(torch.clamp(e_b_min / e_m1, min=1e-16)) / (v_new * v_min).clamp(min=1e-16)).clamp(
+            -0.999999, 0.999999
+        )
+
+        if j + 1 < d:
+            v_rem = vob[j + 1 :]
+            f1_k = f_b * torch.exp(rho_cur[j + 1 :] * v_b * v_rem)
+            f2_k = f_2 * torch.exp(cob[j, j + 1 :] * v_2 * v_rem)
+            d1_k = (torch.log(f1_k.clamp(min=1e-16) / f2_k.clamp(min=1e-16)) + 0.5 * var_m) / sig_m
+            d2_k = d1_k - sig_m
+            e_mp_k = f1_k * torch.special.ndtr(d1_k) + f2_k * torch.special.ndtr(-d2_k)
+            rho_rem = (torch.log(torch.clamp(e_mp_k / e_m1, min=1e-16)) / (v_new * v_rem).clamp(min=1e-16)).clamp(
+                -0.999999, 0.999999
+            )
+            rho_cur = torch.cat([rho_cur[: j + 1], rho_rem])
+        f_b, v_b = e_m1, v_new
+    return rho_b_min.clamp(-0.9999, 0.9999)
 
 
 def stulz_margrabe_moments_with_weights(
@@ -246,11 +683,9 @@ def stulz_margrabe_moments_with_weights(
     corr: torch.Tensor,
     asset_mask: torch.Tensor | None = None,
     monitoring_index: str = "WorstOf",
+    inv_lex_perm: Optional[Sequence[int] | npt.NDArray[np.int64]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Differentiable torch.float64 Stulz-Margrabe moment matching returning (F_W, v_W, delta_weights).
-
-    Supports both 1D inputs `(D,)` and batched 2D inputs `(B, D_max)` with binary `asset_mask`.
-    """
+    """Differentiable torch.float64 moment matching returning (F_W, v_W, delta_weights)."""
     squeeze_batch = f_perf.ndim == 1
     f_in = f_perf if f_perf.dtype == torch.float64 else f_perf.to(dtype=torch.float64)
     v_in = v_perf if v_perf.dtype == torch.float64 else v_perf.to(dtype=torch.float64)
@@ -274,17 +709,40 @@ def stulz_margrabe_moments_with_weights(
 
     b_size, d_max = f_in.shape
     device = f_in.device
+    code = monitoring_index_to_code(monitoring_index)
+
+    # Clean inactive slots upfront so NaN/Inf in dummy assets never propagate
+    if mask_in is not None:
+        active_b = mask_in > 0.5
+        f_in = torch.where(active_b, f_in, torch.ones_like(f_in))
+        v_in = torch.where(active_b, v_in, torch.full_like(v_in, 0.1))
+        pair_active = active_b.unsqueeze(2) & active_b.unsqueeze(1)
+        eye_d = torch.eye(d_max, dtype=torch.float64, device=device).unsqueeze(0)
+        c_in = torch.where(pair_active, c_in, eye_d)
 
     if d_max == 1:
-        f_0 = f_in[:, 0].clamp(min=1e-16)
-        v_0 = v_in[:, 0].clamp(min=1e-12)
-        w_0 = torch.ones_like(f_in) if mask_in is None else mask_in
+        if 9 <= code <= 13:
+            f_0 = torch.zeros(b_size, dtype=torch.float64, device=device)
+            v_0 = torch.full((b_size,), 1e-12, dtype=torch.float64, device=device)
+            w_0 = torch.zeros_like(f_in)
+        else:
+            f_0 = f_in[:, 0].clamp(min=1e-16)
+            v_0 = v_in[:, 0].clamp(min=1e-12)
+            w_0 = torch.ones_like(f_in) if mask_in is None else mask_in
         if squeeze_batch:
             return f_0.squeeze(0), v_0.squeeze(0), w_0.squeeze(0)
         return f_0, v_0, w_0
 
-    idx_mode = monitoring_index.strip()
-    if idx_mode in ("Average", "AverageOf", "MultiPerf"):
+    def _ab_indices() -> Tuple[int, int]:
+        if inv_lex_perm is not None and len(inv_lex_perm) >= 2:
+            return int(inv_lex_perm[0]), int(inv_lex_perm[1])
+        return 0, 1
+
+    if code in (0, 14):
+        f_w, v_w, weights = _clark_symmetrized_torch(f_in, v_in, c_in, mask_in, False)
+    elif code == 1:
+        f_w, v_w, weights = _clark_symmetrized_torch(f_in, v_in, c_in, mask_in, True)
+    elif code == 2:
         if mask_in is None:
             inv_d = 1.0 / float(d_max)
             f_w = f_in.sum(dim=1) * inv_d
@@ -307,230 +765,132 @@ def stulz_margrabe_moments_with_weights(
                 torch.clamp(torch.log(torch.clamp(m2 / (f_w * f_w).clamp(min=1e-30), min=1.0)), min=1e-16)
             )
             weights = mask_in / active_cnt.unsqueeze(1)
-        if squeeze_batch:
-            return f_w.squeeze(0), v_w.squeeze(0), weights.squeeze(0)
-        return f_w, v_w, weights
-
-    is_best_of = idx_mode == "BestOf"
-    if mask_in is None:
-        sort_key = -f_in.detach() if is_best_of else f_in.detach()
-        order = torch.argsort(sort_key, dim=1)
-        inv_order = torch.argsort(order, dim=1)
-        f_ord = torch.gather(f_in, 1, order).clamp(min=1e-16)
-        v_ord = torch.gather(v_in, 1, order).clamp(min=1e-12)
-        ord_row = order.unsqueeze(2).expand(b_size, d_max, d_max)
-        ord_col = order.unsqueeze(1).expand(b_size, d_max, d_max)
-        c_ord = torch.gather(torch.gather(c_in, 1, ord_row), 2, ord_col)
-
-        f_cur = f_ord[:, 0]
-        v_cur = v_ord[:, 0]
-        rho_rem = c_ord[:, 0, 1:]  # (B, d_max - 1)
-        w1_steps: list[torch.Tensor] = []
-        w2_steps: list[torch.Tensor] = []
-
-        for j in range(1, d_max):
-            f_2 = f_ord[:, j]
-            v_2 = v_ord[:, j]
-            rho_12 = rho_rem[:, 0].clamp(-0.999999, 0.999999)
-
-            v_cur_sq = v_cur * v_cur
-            v_2_sq = v_2 * v_2
-            var_m = (v_cur_sq + v_2_sq - 2.0 * rho_12 * v_cur * v_2).clamp(min=1e-16)
-            sig_m = torch.sqrt(var_m)
-            log_f_ratio = torch.log(f_cur / f_2)
-
-            d1 = (log_f_ratio + 0.5 * var_m) / sig_m
-            d2 = d1 - sig_m
-
-            if is_best_of:
-                w1 = torch.special.ndtr(d1)
-                w2 = torch.special.ndtr(-d2)
-            else:
-                w1 = torch.special.ndtr(-d1)
-                w2 = torch.special.ndtr(d2)
-
-            e_m1 = (f_cur * w1 + f_2 * w2).clamp(min=1e-16)
-            w1_steps.append(w1)
-            w2_steps.append(w2)
-
-            f1_sq = (f_cur * f_cur) * torch.exp(v_cur_sq)
-            f2_sq = (f_2 * f_2) * torch.exp(v_2_sq)
-            sig_m2 = 2.0 * sig_m
-            var_m2 = sig_m2 * sig_m2
-            d1_sq = (torch.log(f1_sq.clamp(min=1e-30) / f2_sq.clamp(min=1e-30)) + 0.5 * var_m2) / sig_m2
-            d2_sq = d1_sq - sig_m2
-
-            if is_best_of:
-                e_m2 = f1_sq * torch.special.ndtr(d1_sq) + f2_sq * torch.special.ndtr(-d2_sq)
-            else:
-                e_m2 = f1_sq * torch.special.ndtr(-d1_sq) + f2_sq * torch.special.ndtr(d2_sq)
-
-            v_new = torch.sqrt(
-                torch.clamp(torch.log(torch.clamp(e_m2 / (e_m1 * e_m1).clamp(min=1e-30), min=1.0)), min=1e-16)
-            )
-
-            if j + 1 < d_max:
-                v_rem = v_ord[:, j + 1 :]
-                rho_1_rem = rho_rem[:, 1:]
-                rho_2_rem = c_ord[:, j, j + 1 :]
-
-                exp_arg_1 = rho_1_rem * v_cur.unsqueeze(1) * v_rem
-                exp_arg_2 = rho_2_rem * v_2.unsqueeze(1) * v_rem
-                f1_k = f_cur.unsqueeze(1) * torch.exp(exp_arg_1)
-                f2_k = f_2.unsqueeze(1) * torch.exp(exp_arg_2)
-                var_m_col = var_m.unsqueeze(1)
-                sig_m_col = sig_m.unsqueeze(1)
-
-                d1_k = (log_f_ratio.unsqueeze(1) + (exp_arg_1 - exp_arg_2) + 0.5 * var_m_col) / sig_m_col
-                d2_k = d1_k - sig_m_col
-
-                if is_best_of:
-                    e_m_pk = f1_k * torch.special.ndtr(d1_k) + f2_k * torch.special.ndtr(-d2_k)
-                else:
-                    e_m_pk = f1_k * torch.special.ndtr(-d1_k) + f2_k * torch.special.ndtr(d2_k)
-
-                cov_log = torch.log(torch.clamp(e_m_pk / e_m1.unsqueeze(1), min=1e-16))
-                rho_rem = torch.clamp(
-                    cov_log / (v_new.unsqueeze(1) * v_rem).clamp(min=1e-16),
-                    -0.999999,
-                    0.999999,
-                )
-
-            f_cur = e_m1
-            v_cur = v_new
-
-        # Assemble Euler weights w_ord[k] = w2_k * prod_{m=k+1}^{d_max-1} w1_m without loops
-        w1_rev = torch.stack(w1_steps[::-1], dim=1)  # (B, d_max - 1)
-        suff = torch.cumprod(w1_rev, dim=1).flip(1)  # (B, d_max - 1)
-        ones_col = torch.ones((b_size, 1), dtype=torch.float64, device=device)
-        w2_all = torch.cat([ones_col, torch.stack(w2_steps, dim=1)], dim=1)
-        suff_all = torch.cat([suff, ones_col], dim=1)
-        w_ord_t = w2_all * suff_all
-        w_unsorted = torch.gather(w_ord_t, 1, inv_order)
-
-        if squeeze_batch:
-            return f_cur.squeeze(0), v_cur.squeeze(0), w_unsorted.squeeze(0)
-        return f_cur, v_cur, w_unsorted
-
-    # Sort active assets first: ascending for WorstOf (inactive -> +inf), descending for BestOf (inactive -> -inf)
-    if is_best_of:
-        sort_key = torch.where(mask_in > 0.5, -f_in.detach(), torch.full_like(f_in, 1e12))
-    else:
-        sort_key = torch.where(mask_in > 0.5, f_in.detach(), torch.full_like(f_in, 1e12))
-
-    order = torch.argsort(sort_key, dim=1)  # (B, D_max)
-    inv_order = torch.argsort(order, dim=1)
-
-    f_ord = torch.gather(f_in, 1, order)
-    v_ord = torch.gather(v_in, 1, order).clamp(min=1e-12)
-    m_ord = torch.gather(mask_in, 1, order)
-
-    # Gather 2D correlation matrix C_ord[b, i, j] = c_in[b, order[b, i], order[b, j]]
-    ord_row = order.unsqueeze(2).expand(b_size, d_max, d_max)
-    ord_col = order.unsqueeze(1).expand(b_size, d_max, d_max)
-    c_ord = torch.gather(torch.gather(c_in, 1, ord_row), 2, ord_col)
-
-    f_cur = f_ord[:, 0].clamp(min=1e-16)
-    v_cur = v_ord[:, 0].clamp(min=1e-12)
-    rho_cur = c_ord[:, 0, :]  # (B, D_max)
-
-    # Track analytical Euler weights d(F_W)/d(F_ord)
-    w_list: list[torch.Tensor] = [torch.ones((b_size,), dtype=torch.float64, device=device)]
-    for _ in range(1, d_max):
-        w_list.append(torch.zeros((b_size,), dtype=torch.float64, device=device))
-
-    for j in range(1, d_max):
-        active_j = m_ord[:, j] > 0.5
-        if not torch.any(active_j):
-            break
-
-        f_2 = f_ord[:, j].clamp(min=1e-16)
-        v_2 = v_ord[:, j].clamp(min=1e-12)
-        rho_12 = rho_cur[:, j].clamp(-0.999999, 0.999999)
-
-        var_m = (v_cur * v_cur + v_2 * v_2 - 2.0 * rho_12 * v_cur * v_2).clamp(min=1e-16)
-        sig_m = torch.sqrt(var_m)
-
-        d1 = (torch.log(f_cur / f_2) + 0.5 * var_m) / sig_m
-        d2 = d1 - sig_m
-
-        if is_best_of:
-            w1 = torch.special.ndtr(d1)
-            w2 = torch.special.ndtr(-d2)
-        else:
-            w1 = torch.special.ndtr(-d1)
-            w2 = torch.special.ndtr(d2)
-
-        e_m1 = (f_cur * w1 + f_2 * w2).clamp(min=1e-16)
-
-        f1_sq = (f_cur * f_cur) * torch.exp(v_cur * v_cur)
-        f2_sq = (f_2 * f_2) * torch.exp(v_2 * v_2)
-        sig_m2 = 2.0 * sig_m
-        var_m2 = sig_m2 * sig_m2
-        d1_sq = (torch.log(f1_sq.clamp(min=1e-30) / f2_sq.clamp(min=1e-30)) + 0.5 * var_m2) / sig_m2
-        d2_sq = d1_sq - sig_m2
-
-        if is_best_of:
-            e_m2 = f1_sq * torch.special.ndtr(d1_sq) + f2_sq * torch.special.ndtr(-d2_sq)
-        else:
-            e_m2 = f1_sq * torch.special.ndtr(-d1_sq) + f2_sq * torch.special.ndtr(d2_sq)
-
-        v_new = torch.sqrt(
-            torch.clamp(torch.log(torch.clamp(e_m2 / (e_m1 * e_m1).clamp(min=1e-30), min=1.0)), min=1e-16)
+    elif code == 3:
+        m_w = torch.ones_like(f_in) if mask_in is None else mask_in
+        active_cnt = m_w.sum(dim=1).clamp(min=1.0)
+        f_masked = f_in * m_w
+        f_mean = f_masked.sum(dim=1) / active_cnt
+        m2_p = ((f_masked * f_masked) * torch.exp(v_in * v_in)).sum(dim=1) / active_cnt
+        pair_mask = m_w.unsqueeze(2) * m_w.unsqueeze(1)
+        cov_mat = c_in * v_in.unsqueeze(2) * v_in.unsqueeze(1)
+        m2_avg = ((f_masked.unsqueeze(2) * f_masked.unsqueeze(1)) * torch.exp(cov_mat) * pair_mask).sum(
+            dim=(1, 2)
+        ) / (active_cnt * active_cnt)
+        ew2 = (m2_p - m2_avg).clamp(min=1e-12)
+        var_f = (((f_in - f_mean.unsqueeze(1)) ** 2) * m_w).sum(dim=1) / active_cnt
+        sig_approx = torch.sqrt(ew2)
+        use_var = var_f > 1e-10
+        var_f_safe = var_f.clamp(min=1e-10)
+        f_w = torch.where(use_var, torch.sqrt(var_f_safe), sig_approx)
+        v_w = torch.where(
+            use_var,
+            torch.sqrt(torch.clamp(torch.log(torch.clamp(ew2 / var_f_safe, min=1.0)), min=1e-16)),
+            torch.full_like(ew2, 0.35),
         )
-
-        # Update Euler weights for active_j
-        for prev_idx in range(j):
-            w_list[prev_idx] = torch.where(active_j, w_list[prev_idx] * w1, w_list[prev_idx])
-        w_list[j] = torch.where(active_j, w2, torch.zeros_like(w2))
-
-        # Vectorized correlation update for remaining assets k > j under measure Q^{(k)}
-        if j + 1 < d_max:
-            v_rem = v_ord[:, j + 1 :]  # (B, D_rem)
-            rho_1_rem = rho_cur[:, j + 1 :]
-            rho_2_rem = c_ord[:, j, j + 1 :]
-
-            f1_k = f_cur.unsqueeze(1) * torch.exp(rho_1_rem * v_cur.unsqueeze(1) * v_rem)
-            f2_k = f_2.unsqueeze(1) * torch.exp(rho_2_rem * v_2.unsqueeze(1) * v_rem)
-            var_m_col = var_m.unsqueeze(1)
-            sig_m_col = sig_m.unsqueeze(1)
-
-            d1_k = (torch.log(f1_k.clamp(min=1e-16) / f2_k.clamp(min=1e-16)) + 0.5 * var_m_col) / sig_m_col
-            d2_k = d1_k - sig_m_col
-
-            if is_best_of:
-                e_m_pk = f1_k * torch.special.ndtr(d1_k) + f2_k * torch.special.ndtr(-d2_k)
+        weights = (m_w / active_cnt.unsqueeze(1)) * (f_in - f_mean.unsqueeze(1)) / sig_approx.clamp(min=1e-8).unsqueeze(1)
+    elif code in (4, 5):
+        ia, ib = _ab_indices()
+        if code == 5:
+            ia, ib = ib, ia
+        fa = f_in[:, ia].clamp(min=1e-16)
+        fb = f_in[:, ib].clamp(min=1e-16)
+        va = v_in[:, ia].clamp(min=1e-12)
+        vb = v_in[:, ib].clamp(min=1e-12)
+        rab = c_in[:, ia, ib]
+        var_r = (va * va + vb * vb - 2.0 * rab * va * vb).clamp(min=1e-16)
+        f_w = (fa / fb) * torch.exp(vb * vb - rab * va * vb)
+        v_w = torch.sqrt(var_r)
+        weights = torch.zeros_like(f_in)
+        weights[:, ia] = 1.0
+        weights[:, ib] = -1.0
+    elif code in (6, 7, 8):
+        if code == 6:
+            f_num, v_num, w_num = _clark_symmetrized_torch(f_in, v_in, c_in, mask_in, True)
+            f_den, v_den, w_den = _clark_symmetrized_torch(f_in, v_in, c_in, mask_in, False)
+            rho_nd = torch.stack([_clark_corr_min_max_torch(f_in[b], v_in[b], c_in[b]) for b in range(b_size)], dim=0)
+        else:
+            if code == 7:
+                f_num, v_num, w_num = _clark_symmetrized_torch(f_in, v_in, c_in, mask_in, True)
+                f_den, v_den, w_den = stulz_margrabe_moments_with_weights(
+                    f_in, v_in, c_in, asset_mask=mask_in, monitoring_index="AverageOf", inv_lex_perm=inv_lex_perm
+                )
             else:
-                e_m_pk = f1_k * torch.special.ndtr(-d1_k) + f2_k * torch.special.ndtr(d2_k)
-
-            cov_log = torch.log(torch.clamp(e_m_pk / e_m1.unsqueeze(1), min=1e-16))
-            rho_new_rem = torch.clamp(
-                cov_log / (v_new.unsqueeze(1) * v_rem).clamp(min=1e-16),
-                -0.999999,
-                0.999999,
-            )
-            updated_rem = torch.where(active_j.unsqueeze(1), rho_new_rem, rho_1_rem)
-            rho_cur = torch.cat([rho_cur[:, : j + 1], updated_rem], dim=1)
-
-        f_cur = torch.where(active_j, e_m1, f_cur)
-        v_cur = torch.where(active_j, v_new, v_cur)
-
-    w_ord_t = torch.stack(w_list, dim=1) * m_ord
-    w_unsorted = torch.gather(w_ord_t, 1, inv_order)
+                f_num, v_num, w_num = stulz_margrabe_moments_with_weights(
+                    f_in, v_in, c_in, asset_mask=mask_in, monitoring_index="AverageOf", inv_lex_perm=inv_lex_perm
+                )
+                f_den, v_den, w_den = _clark_symmetrized_torch(f_in, v_in, c_in, mask_in, False)
+            cij = c_in * v_in.unsqueeze(2) * v_in.unsqueeze(1)
+            cov = (w_num.unsqueeze(2) * w_den.unsqueeze(1) * cij).sum(dim=(1, 2))
+            vn2 = (w_num.unsqueeze(2) * w_num.unsqueeze(1) * cij).sum(dim=(1, 2))
+            vd2 = (w_den.unsqueeze(2) * w_den.unsqueeze(1) * cij).sum(dim=(1, 2))
+            rho_nd = (cov / torch.sqrt((vn2 * vd2).clamp(min=1e-30))).clamp(-0.9999, 0.9999)
+        var_r = (v_num * v_num + v_den * v_den - 2.0 * rho_nd * v_num * v_den).clamp(min=1e-16)
+        f_w = (f_num / f_den.clamp(min=1e-16)) * torch.exp(v_den * v_den - rho_nd * v_num * v_den)
+        v_w = torch.sqrt(var_r)
+        weights = w_num - w_den
+    elif code in (9, 10):
+        ia, ib = _ab_indices()
+        if code == 10:
+            ia, ib = ib, ia
+        fa = f_in[:, ia]
+        fb = f_in[:, ib]
+        va = v_in[:, ia]
+        vb = v_in[:, ib]
+        rab = c_in[:, ia, ib]
+        f_w = fa - fb
+        var_d = (
+            fa * fa * torch.expm1(va * va)
+            + fb * fb * torch.expm1(vb * vb)
+            - 2.0 * fa * fb * torch.expm1(rab * va * vb)
+        ).clamp(min=1e-16)
+        v_w = torch.sqrt(var_d)
+        weights = torch.zeros_like(f_in)
+        weights[:, ia] = 1.0
+        weights[:, ib] = -1.0
+    else:
+        # DiffBestWorst (11), DiffBestAverage (12), DiffAverageWorst (13)
+        if code == 11:
+            f_a, v_a, w_a = _clark_symmetrized_torch(f_in, v_in, c_in, mask_in, True)
+            f_b, v_b, w_b = _clark_symmetrized_torch(f_in, v_in, c_in, mask_in, False)
+            rho_ab = torch.stack([_clark_corr_min_max_torch(f_in[b], v_in[b], c_in[b]) for b in range(b_size)], dim=0)
+        else:
+            if code == 12:
+                f_a, v_a, w_a = _clark_symmetrized_torch(f_in, v_in, c_in, mask_in, True)
+                f_b, v_b, w_b = stulz_margrabe_moments_with_weights(
+                    f_in, v_in, c_in, asset_mask=mask_in, monitoring_index="AverageOf", inv_lex_perm=inv_lex_perm
+                )
+            else:
+                f_a, v_a, w_a = stulz_margrabe_moments_with_weights(
+                    f_in, v_in, c_in, asset_mask=mask_in, monitoring_index="AverageOf", inv_lex_perm=inv_lex_perm
+                )
+                f_b, v_b, w_b = _clark_symmetrized_torch(f_in, v_in, c_in, mask_in, False)
+            cij = c_in * v_in.unsqueeze(2) * v_in.unsqueeze(1)
+            cov = (w_a.unsqueeze(2) * w_b.unsqueeze(1) * cij).sum(dim=(1, 2))
+            va2 = (w_a.unsqueeze(2) * w_a.unsqueeze(1) * cij).sum(dim=(1, 2))
+            vb2 = (w_b.unsqueeze(2) * w_b.unsqueeze(1) * cij).sum(dim=(1, 2))
+            rho_ab = (cov / torch.sqrt((va2 * vb2).clamp(min=1e-30))).clamp(-0.9999, 0.9999)
+        f_w = f_a - f_b
+        var_d = (
+            f_a * f_a * torch.expm1(v_a * v_a)
+            + f_b * f_b * torch.expm1(v_b * v_b)
+            - 2.0 * f_a * f_b * torch.expm1(rho_ab * v_a * v_b)
+        ).clamp(min=1e-16)
+        v_w = torch.sqrt(var_d)
+        weights = w_a - w_b
 
     if squeeze_batch:
-        return f_cur.squeeze(0), v_cur.squeeze(0), w_unsorted.squeeze(0)
-    return f_cur, v_cur, w_unsorted
+        return f_w.squeeze(0), v_w.squeeze(0), weights.squeeze(0)
+    return f_w, v_w, weights
 
 
 def stulz_margrabe_worst_of_moments(
-    f_perf: torch.Tensor,  # (B, D_max) or (D,) float64
-    v_perf: torch.Tensor,  # (B, D_max) or (D,) float64
-    corr: torch.Tensor,    # (B, D_max, D_max) or (D, D) float64
-    asset_mask: torch.Tensor | None = None,  # (B, D_max) or (D,) float64
+    f_perf: torch.Tensor,
+    v_perf: torch.Tensor,
+    corr: torch.Tensor,
+    asset_mask: torch.Tensor | None = None,
     monitoring_index: str = "WorstOf",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Normative Task 1.2 entrypoint returning effective lognormal parameters (F_W, v_W) in torch.float64."""
+    """Normative entrypoint returning effective moments (F_W, v_W) in torch.float64."""
     f_w, v_w, _ = stulz_margrabe_moments_with_weights(
         f_perf=f_perf,
         v_perf=v_perf,
@@ -563,72 +923,85 @@ def _black76_put_torch(f: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tor
     return res
 
 
+def _normal_call_torch(mu: torch.Tensor, sig: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    s_c = sig.clamp(min=1e-12)
+    z = (mu - k) / s_c
+    phi_z = torch.exp(-0.5 * z * z) * _INV_SQRT2PI
+    return cast(torch.Tensor, (mu - k) * torch.special.ndtr(z) + s_c * phi_z)
+
+
 def _digital_call_spread_prob_torch(
     f: torch.Tensor,
     v: torch.Tensor,
     barrier: torch.Tensor,
     spread: float | torch.Tensor,
 ) -> torch.Tensor:
-    """Exact lognormal expectation of a call-spread digital ramp I_{Delta B}(W, B) in torch.float64.
-
-    For spread != 0, the linear ramp between B_low = min(B, B + spread) and B_high = max(B, B + spread)
-    equals (Call(B_low) - Call(B_high)) / (B_high - B_low).
-    When the lower ramp edge is > 5.0 standard deviations out-of-the-money (so a 32,768-path
-    simulation has 0 hits), tapers smoothly to 0.0.
-    """
+    """NaN-safe exact lognormal expectation of a call-spread digital ramp in torch.float64."""
     f_c = f.clamp(min=1e-16)
     v_c = v.clamp(min=1e-12)
     b_c = barrier.clamp(min=1e-8)
 
-    if isinstance(spread, torch.Tensor):
-        s_t = spread.to(dtype=torch.float64, device=f.device)
-    else:
-        s_t = torch.tensor(float(spread), dtype=torch.float64, device=f.device)
+    if not isinstance(spread, torch.Tensor) and abs(float(spread)) <= 1e-6:
+        d2_pt = (torch.log(f_c / b_c) - 0.5 * v_c * v_c) / v_c
+        return cast(torch.Tensor, torch.special.ndtr(d2_pt).clamp(0.0, 1.0))
 
+    s_t = (
+        spread.to(dtype=torch.float64, device=f.device)
+        if isinstance(spread, torch.Tensor)
+        else torch.tensor(float(spread), dtype=torch.float64, device=f.device)
+    )
     abs_s = torch.abs(s_t)
-    b_low = torch.minimum(b_c, b_c + s_t).clamp(min=1e-8)
-    b_high = torch.maximum(b_c, b_c + s_t).clamp(min=1e-8 + 1e-9)
+    is_spread = abs_s > 1e-6
 
-    # Exact call-spread expectation
-    c_low = _black76_call_torch(f_c, b_low, v_c)
-    c_high = _black76_call_torch(f_c, b_high, v_c)
-    prob_spread = ((c_low - c_high) / (b_high - b_low)).clamp(0.0, 1.0)
+    b_low_raw = torch.minimum(b_c, b_c + s_t)
+    b_high_raw = torch.maximum(b_c, b_c + s_t)
 
-    # Point digital Phi(d2) fallback when |spread| < 1e-6
-    d1_pt = (torch.log(f_c / b_c) + 0.5 * v_c * v_c) / v_c
-    d2_pt = d1_pt - v_c
-    prob_pt = torch.special.ndtr(d2_pt)
+    # Guard b_high_safe and positivity BEFORE Black-76 evaluation and division (zero 0/0 NaNs)
+    b_low_pos = torch.where(b_low_raw > 0.0, b_low_raw, torch.ones_like(b_low_raw))
+    c_low_call = _black76_call_torch(f_c, b_low_pos, v_c)
+    c_low = torch.where(b_low_raw > 0.0, c_low_call, f_c - b_low_raw)
 
-    prob = torch.where(abs_s > 1e-6, prob_spread, prob_pt)
+    b_high_pos = torch.where(b_high_raw > 0.0, b_high_raw, torch.ones_like(b_high_raw))
+    b_high_safe = torch.where(is_spread & (b_high_raw > 0.0), b_high_pos, b_low_pos + 1.0)
+    c_high_call = _black76_call_torch(f_c, b_high_safe, v_c)
+    c_high = torch.where(b_high_raw > 0.0, c_high_call, f_c - b_high_raw)
 
-    # Check z-score to b_low: if d2(b_low) < -4.75 (< 1e-6 tail probability), zero out negligible numerical tail
-    d2_low = (torch.log(f_c / b_low) - 0.5 * v_c * v_c) / v_c
-    prob = torch.where(d2_low < -4.75, torch.zeros_like(prob), prob)
-    return prob.clamp(0.0, 1.0)
+    denom_safe = torch.where(is_spread & (b_high_raw > 0.0), b_high_raw - b_low_raw, torch.ones_like(b_low_raw))
+    prob_spread = torch.where(
+        b_high_raw <= 0.0,
+        torch.ones_like(f_c),
+        ((c_low - c_high) / denom_safe).clamp(0.0, 1.0),
+    )
 
-
-# Precompute 32-node probabilist Gauss-Hermite quadrature nodes (U = sqrt(2)*x) and weights (w / sqrt(pi))
-_GH32_X_RAW, _GH32_W_RAW = np.polynomial.hermite.hermgauss(32)  # type: ignore[no-untyped-call]
-_U_GH32_NP: npt.NDArray[np.float64] = np.asarray(_GH32_X_RAW * math.sqrt(2.0), dtype=np.float64)
-_W_GH32_NP: npt.NDArray[np.float64] = np.asarray(_GH32_W_RAW / math.sqrt(math.pi), dtype=np.float64)
-_U_GH32_LIST: list[float] = _U_GH32_NP.tolist()
-_W_GH32_LIST: list[float] = _W_GH32_NP.tolist()
+    d2_pt = (torch.log(f_c / b_c) - 0.5 * v_c * v_c) / v_c
+    prob_pt = torch.special.ndtr(d2_pt).clamp(0.0, 1.0)
+    return torch.where(is_spread, prob_spread, prob_pt).clamp(0.0, 1.0)
 
 
-def _eval_coupon_prob_scalar(
-    f: float,
-    v: float,
-    barrier: float,
-    spread: float,
-    direction: str = "Up",
-    b_type: str = "In",
-) -> float:
-    dir_down = direction.strip().lower() == "down"
-    type_out = b_type.strip().lower() == "out"
-    eff_spread = -spread if dir_down else spread
-    p_up = _digital_call_spread_prob_scalar(f, v, barrier, eff_spread)
-    p_ev = (1.0 - p_up) if dir_down else p_up
-    return (1.0 - p_ev) if type_out else p_ev
+def _digital_call_spread_normal_torch(
+    mu: torch.Tensor,
+    sig: torch.Tensor,
+    barrier: torch.Tensor,
+    spread: float | torch.Tensor,
+) -> torch.Tensor:
+    s_c = sig.clamp(min=1e-12)
+    if not isinstance(spread, torch.Tensor) and abs(float(spread)) <= 1e-6:
+        return cast(torch.Tensor, torch.special.ndtr((mu - barrier) / s_c).clamp(0.0, 1.0))
+    s_t = (
+        spread.to(dtype=torch.float64, device=mu.device)
+        if isinstance(spread, torch.Tensor)
+        else torch.tensor(float(spread), dtype=torch.float64, device=mu.device)
+    )
+    is_spread = torch.abs(s_t) > 1e-6
+    b_low = torch.minimum(barrier, barrier + s_t)
+    b_high = torch.maximum(barrier, barrier + s_t)
+    b_high_safe = torch.where(is_spread, b_high, b_low + 1.0)
+    c_low = _normal_call_torch(mu, s_c, b_low)
+    c_high = _normal_call_torch(mu, s_c, b_high_safe)
+    denom_safe = torch.where(is_spread, b_high_safe - b_low, torch.ones_like(b_low))
+    prob_spread = ((c_low - c_high) / denom_safe).clamp(0.0, 1.0)
+    prob_pt = torch.special.ndtr((mu - barrier) / s_c).clamp(0.0, 1.0)
+    return torch.where(is_spread, prob_spread, prob_pt).clamp(0.0, 1.0)
 
 
 def _eval_coupon_prob_torch(
@@ -638,1140 +1011,1828 @@ def _eval_coupon_prob_torch(
     spread: float | torch.Tensor,
     direction: str = "Up",
     b_type: str = "In",
+    *,
+    is_normal: bool = False,
+    index_code: int = 0,
 ) -> torch.Tensor:
     dir_down = direction.strip().lower() == "down"
     type_out = b_type.strip().lower() == "out"
+    if index_code == 14:
+        b_twin_dn = 2.0 - barrier
+        p_up = _digital_call_spread_prob_torch(f, v, barrier, spread)
+        p_dn_raw = 1.0 - _digital_call_spread_prob_torch(f, v, b_twin_dn.clamp(min=1e-8), -spread)
+        p_dn = torch.where(b_twin_dn > 0.0, p_dn_raw, torch.zeros_like(p_up))
+        p_ge = torch.where(barrier <= 1.0, torch.ones_like(p_up), (p_up + p_dn).clamp(0.0, 1.0))
+        p_ev = (1.0 - p_ge) if dir_down else p_ge
+        return (1.0 - p_ev) if type_out else p_ev
     eff_spread = -spread if dir_down else spread
-    p_up = _digital_call_spread_prob_torch(f, v, barrier, eff_spread)
+    p_up = (
+        _digital_call_spread_normal_torch(f, v, barrier, eff_spread)
+        if is_normal
+        else _digital_call_spread_prob_torch(f, v, barrier, eff_spread)
+    )
     p_ev = (1.0 - p_up) if dir_down else p_up
     return (1.0 - p_ev) if type_out else p_ev
 
 
-def _conditional_ki_put_scalar(
-    f_cond: float,
-    v_cond: float,
-    strike: float,
-    lower_strike: float | None,
-    ki_barrier: float | None,
-    i_ki_past: float,
-    ki_spread: float,
-) -> float:
-    """Exact Black-76 down-and-in put conditioned on terminal survival distribution (f_cond, v_cond)."""
-    has_active_ki = (ki_barrier is not None) and (float(ki_barrier) > 0.0) and (i_ki_past < 0.5)
-    if not has_active_ki:
-        put_val = _black76_put_scalar(f_cond, strike, v_cond)
-        if lower_strike is not None and float(lower_strike) > 0.0:
-            put_val = max(put_val - _black76_put_scalar(f_cond, float(lower_strike), v_cond), 0.0)
-        return put_val
-
-    b_ki = float(ki_barrier)  # type: ignore[arg-type]
-    ki_up = _digital_call_spread_prob_scalar(f_cond, v_cond, b_ki, -ki_spread)
-    ki_prob = min(max(1.0 - ki_up, 0.0), 1.0)
-
-    def _di_put_single_strike(k_val: float) -> float:
-        if k_val <= 1e-8:
-            return 0.0
-        k_eff = min(k_val, b_ki)
-        put_part = _black76_put_scalar(f_cond, k_eff, v_cond)
-        gap_part = max(k_val - b_ki, 0.0) * ki_prob
-        return put_part + gap_part
-
-    res = _di_put_single_strike(strike)
-    if lower_strike is not None and float(lower_strike) > 0.0:
-        res = max(res - _di_put_single_strike(float(lower_strike)), 0.0)
-    return res
-
-
-def _conditional_ki_put_torch(
+def _ramp_survival_post_moments_lognormal_torch(
     f_cond: torch.Tensor,
-    v_cond: torch.Tensor,
+    lam: torch.Tensor,
+    b_ko: torch.Tensor,
+    ko_spread: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Exact closed-form truncated-lognormal posterior (mu_u, var_u) under KO ramp survival."""
+    f_c = f_cond.clamp(min=1e-16)
+    l_c = lam.clamp(min=1e-12)
+    b_c = b_ko.clamp(min=1e-8)
+    m_u = torch.log(f_c) - 0.5 * l_c * l_c
+
+    if abs(ko_spread) <= 1e-6:
+        u_star = (torch.log(b_c) - m_u) / l_c
+        return _truncated_upper_std_moments_torch(u_star)
+
+    b_lo = torch.minimum(b_c, b_c + ko_spread)
+    b_hi = torch.maximum(b_c, b_c + ko_spread)
+    if bool((b_hi <= 0.0).all()):
+        return torch.zeros_like(f_c), torch.ones_like(f_c)
+
+    b_hi_safe = b_hi.clamp(min=1e-16)
+    db = (b_hi_safe - b_lo).clamp(min=1e-12)
+    u_hi = (torch.log(b_hi_safe) - m_u) / l_c
+    has_lo = b_lo > 0.0
+    b_lo_pos = torch.where(has_lo, b_lo, torch.ones_like(b_lo))
+    u_lo = torch.where(has_lo, (torch.log(b_lo_pos) - m_u) / l_c, torch.full_like(u_hi, -100.0))
+
+    use_scaled = u_hi < -4.0
+
+    # Branch 1 (u_hi >= -4.0): guard inactive branch so f_cond_d and M0_d are well-conditioned
+    f_cond_d = torch.where(use_scaled, b_hi_safe, f_c)
+    u_hi_d = torch.where(use_scaled, torch.zeros_like(u_hi), u_hi)
+    u_lo_d = torch.where(use_scaled | (~has_lo), torch.full_like(u_hi, -100.0), u_lo)
+    Phi_hi = torch.special.ndtr(u_hi_d)
+    Phi_hi_m = torch.special.ndtr(u_hi_d - l_c)
+    phi_hi = torch.exp(-0.5 * u_hi_d * u_hi_d) * _INV_SQRT2PI
+    Phi_lo = torch.where(has_lo, torch.special.ndtr(u_lo_d), torch.zeros_like(u_hi))
+    Phi_lo_m = torch.where(has_lo, torch.special.ndtr(u_lo_d - l_c), torch.zeros_like(u_hi))
+    phi_lo = torch.where(has_lo, torch.exp(-0.5 * u_lo_d * u_lo_d) * _INV_SQRT2PI, torch.zeros_like(u_hi))
+
+    M0_d = (b_hi_safe * Phi_hi - b_lo * Phi_lo - f_cond_d * (Phi_hi_m - Phi_lo_m)) / db
+    M1_d = -(l_c * f_cond_d / db) * (Phi_hi_m - Phi_lo_m)
+    M2_d = M0_d + l_c * M1_d + (l_c / db) * (b_hi_safe * phi_hi - b_lo * phi_lo)
+    d_tiny = M0_d <= 1e-300
+    M0_d_safe = torch.where(use_scaled | d_tiny, torch.ones_like(M0_d), M0_d)
+    mu_d = M1_d / M0_d_safe
+    var_d = (M2_d / M0_d_safe - mu_d * mu_d).clamp(min=1e-12)
+
+    # Branch 2 (u_hi < -4.0): factored by phi(u_hi) via erfcx
+    u_hi_s = torch.where(use_scaled, u_hi, torch.full_like(u_hi, -4.0))
+    u_lo_s = torch.where(use_scaled & has_lo, u_lo, torch.full_like(u_hi, -1e9))
+    exp_lo = torch.where(has_lo, torch.exp(-0.5 * (u_lo_s - u_hi_s) * (u_lo_s + u_hi_s)), torch.zeros_like(u_hi))
+    r_hi = _SQRT_HALF_PI * torch.special.erfcx(-u_hi_s * _INV_SQRT2)
+    r_hi_m = _SQRT_HALF_PI * torch.special.erfcx(-(u_hi_s - l_c) * _INV_SQRT2)
+    r_lo = torch.where(has_lo, _SQRT_HALF_PI * torch.special.erfcx(-u_lo_s * _INV_SQRT2), torch.zeros_like(u_hi))
+    r_lo_m = torch.where(
+        has_lo, _SQRT_HALF_PI * torch.special.erfcx(-(u_lo_s - l_c) * _INV_SQRT2), torch.zeros_like(u_hi)
+    )
+
+    M0_s = (b_hi_safe * (r_hi - r_hi_m) - b_lo * exp_lo * (r_lo - r_lo_m)) / db
+    M1_s = -(l_c / db) * (b_hi_safe * r_hi_m - b_lo * exp_lo * r_lo_m)
+    M2_s = M0_s + l_c * M1_s + (l_c / db) * (b_hi_safe - b_lo * exp_lo)
+    s_tiny = M0_s <= 1e-300
+    M0_s_safe = torch.where((~use_scaled) | s_tiny, torch.ones_like(M0_s), M0_s)
+    mu_s = M1_s / M0_s_safe
+    var_s = (M2_s / M0_s_safe - mu_s * mu_s).clamp(min=1e-12)
+
+    mu = torch.where(use_scaled, mu_s, mu_d)
+    var = torch.where(use_scaled, var_s, var_d)
+    tiny_mask = torch.where(use_scaled, s_tiny, d_tiny)
+    if bool(tiny_mask.any()):
+        mu_fb, var_fb = _truncated_upper_std_moments_torch(u_hi)
+        mu = torch.where(tiny_mask, mu_fb, mu)
+        var = torch.where(tiny_mask, var_fb, var)
+    return mu, var
+
+
+def _ramp_survival_post_moments_normal_torch(
+    mu_cond: torch.Tensor,
+    sig_cond: torch.Tensor,
+    b_ko: torch.Tensor,
+    ko_spread: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    s_c = sig_cond.clamp(min=1e-12)
+    if abs(ko_spread) <= 1e-6:
+        return _truncated_upper_std_moments_torch((b_ko - mu_cond) / s_c)
+    b_lo = torch.minimum(b_ko, b_ko + ko_spread)
+    b_hi = torch.maximum(b_ko, b_ko + ko_spread)
+    u_lo = (b_lo - mu_cond) / s_c
+    u_hi = (b_hi - mu_cond) / s_c
+    du = (u_hi - u_lo).clamp(min=1e-12)
+    use_scaled = u_hi < -4.0
+
+    u_hi_d = torch.where(use_scaled, torch.zeros_like(u_hi), u_hi)
+    u_lo_d = torch.where(use_scaled, torch.full_like(u_hi, -1.0), u_lo)
+    phi_hi = torch.exp(-0.5 * u_hi_d * u_hi_d) * _INV_SQRT2PI
+    phi_lo = torch.exp(-0.5 * u_lo_d * u_lo_d) * _INV_SQRT2PI
+    Phi_hi = torch.special.ndtr(u_hi_d)
+    Phi_lo = torch.special.ndtr(u_lo_d)
+    M0_d = ((u_hi_d * Phi_hi + phi_hi) - (u_lo_d * Phi_lo + phi_lo)) / du
+    M1_d = -(Phi_hi - Phi_lo) / du
+    M2_d = M0_d + (phi_hi - phi_lo) / du
+    d_tiny = M0_d <= 1e-300
+    M0_d_safe = torch.where(use_scaled | d_tiny, torch.ones_like(M0_d), M0_d)
+    mu_d = M1_d / M0_d_safe
+    var_d = (M2_d / M0_d_safe - mu_d * mu_d).clamp(min=1e-12)
+
+    u_hi_s = torch.where(use_scaled, u_hi, torch.full_like(u_hi, -4.0))
+    u_lo_s = torch.where(use_scaled, u_lo, torch.full_like(u_hi, -5.0))
+    exp_lo = torch.exp(-0.5 * (u_lo_s - u_hi_s) * (u_lo_s + u_hi_s))
+    r_hi = _SQRT_HALF_PI * torch.special.erfcx(-u_hi_s * _INV_SQRT2)
+    r_lo = _SQRT_HALF_PI * torch.special.erfcx(-u_lo_s * _INV_SQRT2)
+    M0_s = ((u_hi_s * r_hi + 1.0) - exp_lo * (u_lo_s * r_lo + 1.0)) / du
+    M1_s = -(r_hi - exp_lo * r_lo) / du
+    M2_s = M0_s + (1.0 - exp_lo) / du
+    s_tiny = M0_s <= 1e-300
+    M0_s_safe = torch.where((~use_scaled) | s_tiny, torch.ones_like(M0_s), M0_s)
+    mu_s = M1_s / M0_s_safe
+    var_s = (M2_s / M0_s_safe - mu_s * mu_s).clamp(min=1e-12)
+
+    return torch.where(use_scaled, mu_s, mu_d), torch.where(use_scaled, var_s, var_d)
+
+
+def _lognormal_moments_interval_torch(
+    f: torch.Tensor,
+    v: torch.Tensor,
+    a: float,
+    b: float,
+    max_order: int,
+) -> List[torch.Tensor]:
+    if b <= a or b <= 0.0:
+        return [torch.zeros_like(f) for _ in range(max_order + 1)]
+    f_c = f.clamp(min=1e-16)
+    v_c = v.clamp(min=1e-12)
+    m_u = torch.log(f_c) - 0.5 * v_c * v_c
+    u_b = (math.log(b) - m_u) / v_c
+    has_a = a > 0.0
+    u_a = (math.log(a) - m_u) / v_c if has_a else None
+    out: List[torch.Tensor] = []
+    fp = torch.ones_like(f_c)
+    for k in range(max_order + 1):
+        scale = fp * torch.exp(0.5 * float(k * (k - 1)) * (v_c * v_c))
+        pb = torch.special.ndtr(u_b - float(k) * v_c)
+        pa = torch.special.ndtr(u_a - float(k) * v_c) if u_a is not None else 0.0
+        out.append(scale * (pb - pa))
+        fp = fp * f_c
+    return out
+
+
+def _normal_moments_interval_torch(
+    mu: torch.Tensor,
+    sig: torch.Tensor,
+    a: float,
+    b: float,
+    max_order: int,
+) -> List[torch.Tensor]:
+    if b <= a:
+        return [torch.zeros_like(mu) for _ in range(max_order + 1)]
+    s_c = sig.clamp(min=1e-12)
+    u_b = (b - mu) / s_c
+    has_a = a > -1e50
+    phi_b = torch.exp(-0.5 * u_b * u_b) * _INV_SQRT2PI
+    if has_a:
+        u_a = (a - mu) / s_c
+        phi_a = torch.exp(-0.5 * u_a * u_a) * _INV_SQRT2PI
+        j0 = torch.special.ndtr(u_b) - torch.special.ndtr(u_a)
+        j1 = phi_a - phi_b
+        j2 = j0 + u_a * phi_a - u_b * phi_b
+        j3 = 2.0 * j1 + (u_a * u_a) * phi_a - (u_b * u_b) * phi_b
+    else:
+        j0 = torch.special.ndtr(u_b)
+        j1 = -phi_b
+        j2 = j0 - u_b * phi_b
+        j3 = 2.0 * j1 - (u_b * u_b) * phi_b
+    out = [j0]
+    if max_order >= 1:
+        out.append(mu * j0 + s_c * j1)
+    if max_order >= 2:
+        out.append(mu * mu * j0 + 2.0 * mu * s_c * j1 + (s_c * s_c) * j2)
+    if max_order >= 3:
+        out.append(
+            mu * mu * mu * j0
+            + 3.0 * mu * mu * s_c * j1
+            + 3.0 * mu * (s_c * s_c) * j2
+            + (s_c * s_c * s_c) * j3
+        )
+    return out
+
+
+def _exact_piecewise_terminal_put_torch(
+    f_or_mu: torch.Tensor,
+    v_or_sig: torch.Tensor,
+    is_normal: bool,
     strike: float,
-    lower_strike: float | None,
-    ki_barrier: float | None,
-    i_ki_past: float,
+    lower_strike: float,
+    has_active_ki: bool,
+    ki_barrier: float,
     ki_spread: float,
+    has_expiry_ko: bool,
+    ko_barrier: float,
+    ko_spread: float,
 ) -> torch.Tensor:
-    """Differentiable Black-76 down-and-in put conditioned on terminal survival distribution (f_cond, v_cond)."""
-    device = f_cond.device
-    k_t = torch.tensor(float(strike), dtype=torch.float64, device=device)
-    has_active_ki = (ki_barrier is not None) and (float(ki_barrier) > 0.0) and (i_ki_past < 0.5)
-    if not has_active_ki:
-        put_base = _black76_put_torch(f_cond, k_t, v_cond)
-        if lower_strike is not None and float(lower_strike) > 0.0:
-            k_low_t = torch.tensor(float(lower_strike), dtype=torch.float64, device=device)
-            put_base = (put_base - _black76_put_torch(f_cond, k_low_t, v_cond)).clamp(min=0.0)
-        return put_base
+    if strike <= 1e-8:
+        return torch.zeros_like(f_or_mu)
+    k_low = max(float(lower_strike), 0.0)
+    if k_low >= strike:
+        return torch.zeros_like(f_or_mu)
+    low_bound = -1e60 if is_normal else 0.0
+    pts: List[float] = [low_bound, strike]
+    if k_low > low_bound:
+        pts.append(k_low)
+    if has_active_ki:
+        if abs(ki_spread) <= 1e-6:
+            pts.append(ki_barrier)
+        else:
+            pts.append(min(ki_barrier, ki_barrier - ki_spread))
+            pts.append(max(ki_barrier, ki_barrier - ki_spread))
+    if has_expiry_ko:
+        if abs(ko_spread) <= 1e-6:
+            pts.append(ko_barrier)
+        else:
+            pts.append(min(ko_barrier, ko_barrier + ko_spread))
+            pts.append(max(ko_barrier, ko_barrier + ko_spread))
+    pts = sorted(x for x in pts if low_bound <= x <= strike)
 
-    b_ki = float(ki_barrier)  # type: ignore[arg-type]
-    b_ki_t = torch.tensor(b_ki, dtype=torch.float64, device=device)
-    ki_up_prob = _digital_call_spread_prob_torch(f_cond, v_cond, b_ki_t, -ki_spread)
-    ki_prob = (1.0 - ki_up_prob).clamp(0.0, 1.0)
+    total = torch.zeros_like(f_or_mu)
+    for idx in range(len(pts) - 1):
+        a = pts[idx]
+        b = pts[idx + 1]
+        if b - a <= 1e-14:
+            continue
+        mid = (b - 1.0) if a < -1e30 else 0.5 * (a + b)
+        if mid <= k_low:
+            c0, c1 = strike - k_low, 0.0
+        else:
+            c0, c1 = strike, -1.0
 
-    def _di_put_single_strike_t(k_val: float) -> torch.Tensor:
-        if k_val <= 1e-8:
-            return torch.tensor(0.0, dtype=torch.float64, device=device)
-        k_eff_t = torch.tensor(min(k_val, b_ki), dtype=torch.float64, device=device)
-        put_part = _black76_put_torch(f_cond, k_eff_t, v_cond)
-        gap_part: torch.Tensor = max(k_val - b_ki, 0.0) * ki_prob
-        res_part: torch.Tensor = put_part + gap_part
-        return res_part
+        d0, d1 = 1.0, 0.0
+        if has_active_ki:
+            if abs(ki_spread) <= 1e-6:
+                if mid >= ki_barrier:
+                    continue
+            else:
+                b_ki_lo = min(ki_barrier, ki_barrier - ki_spread)
+                b_ki_hi = max(ki_barrier, ki_barrier - ki_spread)
+                if mid >= b_ki_hi:
+                    continue
+                if mid > b_ki_lo:
+                    db = b_ki_hi - b_ki_lo
+                    d0, d1 = b_ki_hi / db, -1.0 / db
 
-    res = _di_put_single_strike_t(float(strike))
-    if lower_strike is not None and float(lower_strike) > 0.0:
-        res = (res - _di_put_single_strike_t(float(lower_strike))).clamp(min=0.0)
-    return res
+        e0, e1 = 1.0, 0.0
+        if has_expiry_ko:
+            if abs(ko_spread) <= 1e-6:
+                if mid >= ko_barrier:
+                    continue
+            else:
+                b_ko_lo = min(ko_barrier, ko_barrier + ko_spread)
+                b_ko_hi = max(ko_barrier, ko_barrier + ko_spread)
+                if mid >= b_ko_hi:
+                    continue
+                if mid > b_ko_lo:
+                    db_k = b_ko_hi - b_ko_lo
+                    e0, e1 = b_ko_hi / db_k, -1.0 / db_k
+
+        cd0 = c0 * d0
+        cd1 = c0 * d1 + c1 * d0
+        cd2 = c1 * d1
+        q0 = cd0 * e0
+        q1 = cd0 * e1 + cd1 * e0
+        q2 = cd1 * e1 + cd2 * e0
+        q3 = cd2 * e1
+        max_k = 3 if q3 != 0.0 else (2 if q2 != 0.0 else 1)
+        moms = (
+            _normal_moments_interval_torch(f_or_mu, v_or_sig, a, b, max_k)
+            if is_normal
+            else _lognormal_moments_interval_torch(f_or_mu, v_or_sig, a, b, max_k)
+        )
+        total = total + q0 * moms[0] + q1 * moms[1]
+        if max_k >= 2:
+            total = total + q2 * moms[2]
+        if max_k >= 3:
+            total = total + q3 * moms[3]
+    return total
+
+
+def _exact_piecewise_terminal_call_torch(
+    f_or_mu: torch.Tensor,
+    v_or_sig: torch.Tensor,
+    is_normal: bool,
+    k_call: float,
+    has_expiry_ko: bool,
+    ko_barrier: float,
+    ko_spread: float,
+) -> torch.Tensor:
+    if not has_expiry_ko:
+        k_t = torch.tensor(k_call, dtype=torch.float64, device=f_or_mu.device)
+        return _normal_call_torch(f_or_mu, v_or_sig, k_t) if is_normal else _black76_call_torch(f_or_mu, k_t, v_or_sig)
+    if abs(ko_spread) <= 1e-6:
+        if k_call >= ko_barrier:
+            return torch.zeros_like(f_or_mu)
+        moms = (
+            _normal_moments_interval_torch(f_or_mu, v_or_sig, k_call, ko_barrier, 1)
+            if is_normal
+            else _lognormal_moments_interval_torch(f_or_mu, v_or_sig, k_call, ko_barrier, 1)
+        )
+        return moms[1] - k_call * moms[0]
+    b_ko_lo = min(ko_barrier, ko_barrier + ko_spread)
+    b_ko_hi = max(ko_barrier, ko_barrier + ko_spread)
+    if k_call >= b_ko_hi:
+        return torch.zeros_like(f_or_mu)
+    pts = [k_call]
+    if b_ko_lo > k_call:
+        pts.append(b_ko_lo)
+    pts.append(b_ko_hi)
+    pts.sort()
+    total = torch.zeros_like(f_or_mu)
+    for idx in range(len(pts) - 1):
+        a = pts[idx]
+        b = pts[idx + 1]
+        if b - a <= 1e-14:
+            continue
+        mid = 0.5 * (a + b)
+        e0, e1 = 1.0, 0.0
+        if mid > b_ko_lo:
+            db = b_ko_hi - b_ko_lo
+            e0, e1 = b_ko_hi / db, -1.0 / db
+        q0 = -k_call * e0
+        q1 = e0 - k_call * e1
+        q2 = e1
+        max_k = 2 if q2 != 0.0 else 1
+        moms = (
+            _normal_moments_interval_torch(f_or_mu, v_or_sig, a, b, max_k)
+            if is_normal
+            else _lognormal_moments_interval_torch(f_or_mu, v_or_sig, a, b, max_k)
+        )
+        total = total + q0 * moms[0] + q1 * moms[1]
+        if max_k >= 2:
+            total = total + q2 * moms[2]
+    return total
+
+
+def _onestar_payoff_fn_scalar(
+    w: float,
+    strike: float,
+    k_low: float,
+    has_active_ki: bool,
+    ki_barrier: float,
+    ki_spread: float,
+    use_direct_ko: bool,
+    ko_b_term: float,
+    ko_spread: float,
+) -> float:
+    if w >= strike:
+        return 0.0
+    pay = strike - w
+    if k_low > 0.0:
+        pay = min(pay, max(strike - k_low, 0.0))
+    if has_active_ki:
+        if abs(ki_spread) <= 1e-6:
+            if w >= ki_barrier:
+                return 0.0
+        else:
+            blo = min(ki_barrier, ki_barrier - ki_spread)
+            bhi = max(ki_barrier, ki_barrier - ki_spread)
+            pay *= min(max((bhi - w) / (bhi - blo), 0.0), 1.0)
+    if use_direct_ko:
+        if abs(ko_spread) <= 1e-6:
+            if w >= ko_b_term:
+                return 0.0
+        else:
+            blo = min(ko_b_term, ko_b_term + ko_spread)
+            bhi = max(ko_b_term, ko_b_term + ko_spread)
+            pay *= min(max((bhi - w) / (bhi - blo), 0.0), 1.0)
+    return pay
+
+
+def _eval_1factor_onestar_torch(
+    f_c: torch.Tensor,
+    v_c: torch.Tensor,
+    corr: torch.Tensor,
+    strike: float,
+    lower_strike: float,
+    has_active_ki: bool,
+    ki_barrier: float,
+    ki_spread: float,
+    use_direct_ko: bool,
+    ko_b_term: float,
+    ko_spread: float,
+    one_star_strike: float,
+    one_star_coupon: float,
+    surv_cur: torch.Tensor,
+    surv_prev_term: torch.Tensor,
+    option_gearing: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Differentiable 1-factor CDF-mapped GL16 OneStar put & coupon expectation for (B, D)."""
+    b_sz, d_assets = int(f_c.shape[0]), int(f_c.shape[1])
+    device = f_c.device
+    k_low = lower_strike if lower_strike > 0.0 else 0.0
+    log_ks = math.log(max(one_star_strike, 1e-16))
+
+    if d_assets == 1:
+        f0 = f_c[:, 0].clamp(min=1e-16)
+        v0 = v_c[:, 0].clamp(min=1e-12)
+        m0 = torch.log(f0) - 0.5 * v0 * v0
+        if one_star_coupon > 0.0:
+            if use_direct_ko:
+                p_os = torch.zeros(b_sz, dtype=torch.float64, device=device)
+                if abs(ko_spread) <= 1e-6:
+                    if ko_b_term > one_star_strike:
+                        p_os = (
+                            torch.special.ndtr((math.log(ko_b_term) - m0) / v0)
+                            - torch.special.ndtr((log_ks - m0) / v0)
+                        ).clamp(min=0.0)
+                else:
+                    blo = min(ko_b_term, ko_b_term + ko_spread)
+                    bhi = max(ko_b_term, ko_b_term + ko_spread)
+                    mid = 0.5 * (blo + bhi)
+                    hw = 0.5 * (bhi - blo)
+                    for q in range(16):
+                        u = max(mid + hw * _GL16_X[q], 1e-16)
+                        if u > one_star_strike:
+                            p_os = p_os + 0.5 * _GL16_W[q] * (
+                                torch.special.ndtr((math.log(u) - m0) / v0)
+                                - torch.special.ndtr((log_ks - m0) / v0)
+                            ).clamp(min=0.0)
+                l_onestar_out = surv_prev_term * one_star_coupon * p_os
+            else:
+                b_st = torch.full((b_sz,), one_star_strike, dtype=torch.float64, device=device)
+                l_onestar_out = surv_cur * one_star_coupon * _digital_call_spread_prob_torch(f0, v0, b_st, 0.0)
+        else:
+            l_onestar_out = torch.zeros(b_sz, dtype=torch.float64, device=device)
+
+        l_put_out = torch.zeros(b_sz, dtype=torch.float64, device=device)
+        if strike > 1e-6 and option_gearing > 0.0 and one_star_strike > 1e-16:
+            hi = min(strike, one_star_strike)
+            if hi > 0.0:
+                u_hi = (math.log(hi) - m0) / v0
+                u_lo = u_hi - 12.0
+                mid_u = 0.5 * (u_lo + u_hi)
+                hw_u = 0.5 * (u_hi - u_lo)
+                gl_x = torch.tensor(_GL16_X, dtype=torch.float64, device=device).view(1, 16)
+                gl_w = torch.tensor(_GL16_W, dtype=torch.float64, device=device).view(1, 16)
+                u_g = mid_u.unsqueeze(1) + hw_u.unsqueeze(1) * gl_x
+                w_g = torch.exp(m0.unsqueeze(1) + v0.unsqueeze(1) * u_g)
+                pay_g = (strike - w_g).clamp(min=0.0)
+                if k_low > 0.0:
+                    pay_g = torch.minimum(pay_g, torch.full_like(pay_g, max(strike - k_low, 0.0)))
+                if has_active_ki:
+                    if abs(ki_spread) <= 1e-6:
+                        pay_g = torch.where(w_g < ki_barrier, pay_g, torch.zeros_like(pay_g))
+                    else:
+                        blo_ki = min(ki_barrier, ki_barrier - ki_spread)
+                        bhi_ki = max(ki_barrier, ki_barrier - ki_spread)
+                        pay_g = pay_g * ((bhi_ki - w_g) / (bhi_ki - blo_ki)).clamp(0.0, 1.0)
+                if use_direct_ko:
+                    if abs(ko_spread) <= 1e-6:
+                        pay_g = torch.where(w_g < ko_b_term, pay_g, torch.zeros_like(pay_g))
+                    else:
+                        blo_ko = min(ko_b_term, ko_b_term + ko_spread)
+                        bhi_ko = max(ko_b_term, ko_b_term + ko_spread)
+                        pay_g = pay_g * ((bhi_ko - w_g) / (bhi_ko - blo_ko)).clamp(0.0, 1.0)
+                phi_g = torch.exp(-0.5 * u_g * u_g) * _INV_SQRT2PI
+                acc = (gl_w * phi_g * pay_g).sum(dim=1)
+                l_put_out = (surv_prev_term if use_direct_ko else surv_cur) * hw_u * acc
+        return l_put_out, l_onestar_out
+
+    # Rank-1 off-diagonal fit via 8 differentiable Rayleigh power iterations
+    corr_sum = corr.sum()
+    rho_off = ((corr_sum - float(d_assets)) / float(d_assets * (d_assets - 1))).clamp(0.0, 0.999)
+    b_vec = torch.sqrt(rho_off).expand(d_assets).clone()
+    eye_d = torch.eye(d_assets, dtype=torch.float64, device=device)
+    corr_off = corr * (1.0 - eye_d)
+    for _ in range(8):
+        mb = torch.mv(corr_off, b_vec) + (b_vec * b_vec) * b_vec
+        mb_norm = torch.sqrt((mb * mb).sum().clamp(min=1e-30))
+        u_vec = mb / mb_norm
+        sgn = torch.where(u_vec.sum() < 0.0, -1.0, 1.0)
+        u_vec = u_vec * sgn
+        mu_vec = torch.mv(corr_off, u_vec) + (b_vec * b_vec) * u_vec
+        lam = (u_vec * mu_vec).sum().clamp(min=0.0)
+        b_vec = (u_vec * torch.sqrt(lam)).clamp(0.0, 0.999)
+
+    f_s = f_c.clamp(min=1e-16)
+    v_s = v_c.clamp(min=1e-12)
+    s_eps = torch.sqrt((1.0 - b_vec * b_vec).clamp(min=1e-12)).unsqueeze(0)
+    mu_bd = torch.log(f_s) - 0.5 * v_s * v_s
+    vb_bd = v_s * b_vec.unsqueeze(0)
+    vs_bd = (v_s * s_eps).clamp(min=1e-12)
+
+    y_q = torch.tensor(_GL16_Y_NORM, dtype=torch.float64, device=device).view(1, 16, 1)
+    w_q = torch.tensor(_GL16_W, dtype=torch.float64, device=device).view(1, 16)
+    c_ks = torch.special.ndtr(
+        (log_ks - mu_bd.unsqueeze(1) - vb_bd.unsqueeze(1) * y_q) / vs_bd.unsqueeze(1)
+    )
+    p_max_lt_ks_y = c_ks.prod(dim=2)  # (B, 16)
+
+    if one_star_coupon > 0.0:
+        if use_direct_ko:
+            if abs(ko_spread) <= 1e-6:
+                ko_pts = [ko_b_term]
+            else:
+                blo = min(ko_b_term, ko_b_term + ko_spread)
+                bhi = max(ko_b_term, ko_b_term + ko_spread)
+                mid = 0.5 * (blo + bhi)
+                hw = 0.5 * (bhi - blo)
+                ko_pts = [max(mid + hw * _GX4[r], 1e-16) for r in range(4)]
+            n_ko = len(ko_pts)
+            p_sub = torch.zeros((b_sz, 16), dtype=torch.float64, device=device)
+            for r in range(n_ko):
+                log_ko = math.log(max(ko_pts[r], 1e-16))
+                c_ko = torch.special.ndtr(
+                    (log_ko - mu_bd.unsqueeze(1) - vb_bd.unsqueeze(1) * y_q) / vs_bd.unsqueeze(1)
+                )
+                p_ge_ko = (1.0 - c_ko).prod(dim=2)
+                if ko_pts[r] < one_star_strike:
+                    p_in = (c_ks - c_ko).clamp(min=0.0).prod(dim=2)
+                else:
+                    p_in = torch.zeros_like(p_ge_ko)
+                p_term = ((1.0 - p_ge_ko) - (p_max_lt_ks_y - p_in)).clamp(min=0.0)
+                wt_r = 1.0 if n_ko == 1 else (0.5 * _GW4[r])
+                p_sub = p_sub + wt_r * p_term
+            os_acc = (0.5 * w_q * p_sub).sum(dim=1)
+            l_onestar_out = surv_prev_term * one_star_coupon * os_acc
+        else:
+            os_acc = (0.5 * w_q * (1.0 - p_max_lt_ks_y)).sum(dim=1)
+            l_onestar_out = surv_cur * one_star_coupon * os_acc
+    else:
+        l_onestar_out = torch.zeros(b_sz, dtype=torch.float64, device=device)
+
+    l_put_out = torch.zeros(b_sz, dtype=torch.float64, device=device)
+    if strike > 1e-6 and option_gearing > 0.0:
+        def _eval_cum_joint_t(x_val: float) -> torch.Tensor:
+            if x_val <= 0.0:
+                return torch.zeros(b_sz, dtype=torch.float64, device=device)
+            log_x = math.log(x_val)
+            c_x = torch.special.ndtr(
+                (log_x - mu_bd.unsqueeze(1) - vb_bd.unsqueeze(1) * y_q) / vs_bd.unsqueeze(1)
+            )
+            p_in = (c_ks - c_x).clamp(min=0.0).prod(dim=2)
+            return cast(torch.Tensor, (0.5 * w_q * (p_max_lt_ks_y - p_in).clamp(min=0.0)).sum(dim=1))
+
+        pts_list: List[float] = [0.0, strike]
+        if 0.0 < k_low < strike:
+            pts_list.append(k_low)
+        if has_active_ki:
+            if abs(ki_spread) <= 1e-6:
+                if 0.0 <= ki_barrier <= strike:
+                    pts_list.append(ki_barrier)
+            else:
+                for p_v in (min(ki_barrier, ki_barrier - ki_spread), max(ki_barrier, ki_barrier - ki_spread)):
+                    if 0.0 <= p_v <= strike:
+                        pts_list.append(p_v)
+        if use_direct_ko:
+            if abs(ko_spread) <= 1e-6:
+                if 0.0 <= ko_b_term <= strike:
+                    pts_list.append(ko_b_term)
+            else:
+                for p_v in (min(ko_b_term, ko_b_term + ko_spread), max(ko_b_term, ko_b_term + ko_spread)):
+                    if 0.0 <= p_v <= strike:
+                        pts_list.append(p_v)
+        pts_list.sort()
+
+        put_acc = torch.zeros(b_sz, dtype=torch.float64, device=device)
+        for idx in range(len(pts_list) - 1):
+            a = pts_list[idx]
+            b_pt = pts_list[idx + 1]
+            span = b_pt - a
+            if span <= 1e-12:
+                continue
+            mid_x = 0.5 * (a + b_pt)
+            hw_x = 0.5 * span
+            ga = _onestar_payoff_fn_scalar(
+                a + 1e-10 * span, strike, k_low, has_active_ki, ki_barrier, ki_spread, use_direct_ko, ko_b_term, ko_spread
+            )
+            gb_m = _onestar_payoff_fn_scalar(
+                b_pt - 1e-10 * span, strike, k_low, has_active_ki, ki_barrier, ki_spread, use_direct_ko, ko_b_term, ko_spread
+            )
+            gb_p = _onestar_payoff_fn_scalar(
+                b_pt + 1e-10, strike, k_low, has_active_ki, ki_barrier, ki_spread, use_direct_ko, ko_b_term, ko_spread
+            )
+            if ga > 0.0 or gb_m > 0.0:
+                linear_unit = (not has_active_ki) and (not use_direct_ko) and (a >= k_low - 1e-12)
+                for r in range(16):
+                    xr = mid_x + hw_x * _GL16_X[r]
+                    if linear_unit:
+                        neg_gp = 1.0
+                    else:
+                        h_fd = 1e-7 * max(span, 1e-3)
+                        xp = min(xr + h_fd, b_pt - 1e-12 * span)
+                        xm = max(xr - h_fd, a + 1e-12 * span)
+                        dx_fd = xp - xm
+                        g_p = _onestar_payoff_fn_scalar(
+                            xp, strike, k_low, has_active_ki, ki_barrier, ki_spread, use_direct_ko, ko_b_term, ko_spread
+                        )
+                        g_m = _onestar_payoff_fn_scalar(
+                            xm, strike, k_low, has_active_ki, ki_barrier, ki_spread, use_direct_ko, ko_b_term, ko_spread
+                        )
+                        neg_gp = (-(g_p - g_m) / dx_fd) if dx_fd > 0.0 else 0.0
+                    if abs(neg_gp) > 1e-15:
+                        put_acc = put_acc + hw_x * _GL16_W[r] * neg_gp * _eval_cum_joint_t(xr)
+            jump = gb_m - gb_p
+            if abs(jump) > 1e-12:
+                put_acc = put_acc + jump * _eval_cum_joint_t(b_pt)
+        l_put_out = (surv_prev_term if use_direct_ko else surv_cur) * put_acc
+
+    return l_put_out, l_onestar_out
+
+
+def _euler_next_corr_torch(
+    f_cur: torch.Tensor,
+    v_cur: torch.Tensor,
+    w_cur: torch.Tensor,
+    f_nxt: torch.Tensor,
+    v_nxt: torch.Tensor,
+    w_nxt: torch.Tensor,
+    corr: torch.Tensor,
+    is_normal: bool,
+) -> torch.Tensor:
+    """Computes Euler-weighted inter-period correlation rho_{m,m+1}^{eff} clipped to [-0.9999, 0.9999]."""
+    wi_c = w_cur * f_cur if is_normal else w_cur
+    wj_n = w_nxt * f_nxt if is_normal else w_nxt
+    v_min = torch.minimum(v_cur.unsqueeze(-2), v_nxt.unsqueeze(-2))
+    # w_cur[..., i] * w_nxt[..., j] * corr[..., i, j] * v_cur[..., i] * min(v_cur[..., j], v_nxt[..., j])
+    num = (
+        wi_c.unsqueeze(-1)
+        * wj_n.unsqueeze(-2)
+        * corr
+        * v_cur.unsqueeze(-1)
+        * v_min
+    ).sum(dim=(-2, -1))
+    den_cur = (
+        wi_c.unsqueeze(-1) * wi_c.unsqueeze(-2) * corr * v_cur.unsqueeze(-1) * v_cur.unsqueeze(-2)
+    ).sum(dim=(-2, -1)).clamp(min=1e-30)
+    den_nxt = (
+        wj_n.unsqueeze(-1) * wj_n.unsqueeze(-2) * corr * v_nxt.unsqueeze(-1) * v_nxt.unsqueeze(-2)
+    ).sum(dim=(-2, -1)).clamp(min=1e-30)
+    denom = (torch.sqrt(den_cur) * torch.sqrt(den_nxt)).clamp(min=1e-30)
+    return (num / denom).clamp(-0.9999, 0.9999)
+
+
+def _compute_cross_index_corr_torch(
+    f_in: torch.Tensor,
+    v_in: torch.Tensor,
+    corr: torch.Tensor,
+    code_a: int,
+    w_a: torch.Tensor,
+    code_b: int,
+    w_b: torch.Tensor,
+) -> torch.Tensor:
+    """Cross-index correlation for 1D (D,), 2D (B, D), or 3D (B, M, D) inputs."""
+    if code_a == code_b:
+        return torch.ones(f_in.shape[:-1], dtype=torch.float64, device=f_in.device)
+    if (code_a == 0 and code_b == 1) or (code_a == 1 and code_b == 0):
+        if f_in.ndim == 1:
+            return _clark_corr_min_max_torch(f_in, v_in, corr)
+        lead_shape = f_in.shape[:-1]
+        d_assets = int(f_in.shape[-1])
+        f_flat = f_in.reshape(-1, d_assets)
+        v_flat = v_in.reshape(-1, d_assets)
+        c_bc = corr.expand(*lead_shape, d_assets, d_assets).reshape(-1, d_assets, d_assets)
+        vals = torch.stack(
+            [_clark_corr_min_max_torch(f_flat[k], v_flat[k], c_bc[k]) for k in range(int(f_flat.shape[0]))],
+            dim=0,
+        )
+        return vals.view(lead_shape)
+    da_diff = 9 <= code_a <= 13
+    db_diff = 9 <= code_b <= 13
+    wa = w_a * f_in if da_diff else w_a
+    wb = w_b * f_in if db_diff else w_b
+    cij = corr * v_in.unsqueeze(-1) * v_in.unsqueeze(-2)
+    num = (wa.unsqueeze(-1) * wb.unsqueeze(-2) * cij).sum(dim=(-2, -1))
+    da = (wa.unsqueeze(-1) * wa.unsqueeze(-2) * cij).sum(dim=(-2, -1)).clamp(min=1e-30)
+    db = (wb.unsqueeze(-1) * wb.unsqueeze(-2) * cij).sum(dim=(-2, -1)).clamp(min=1e-30)
+    return (num / torch.sqrt(da * db)).clamp(-0.9999, 0.9999)
+
+
+def _extract_state_fields(
+    preproc_state: Any,
+    coupon_index: Optional[str],
+    option_index: Optional[str],
+    lower_strike: float,
+    allow_autocall_on_expiry: bool,
+    inv_lex_perm: Optional[Sequence[int] | npt.NDArray[np.int64]],
+    coupon_barrier_type: str,
+    coupon_barrier_direction: str,
+) -> Dict[str, Any]:
+    is_dict = isinstance(preproc_state, dict)
+
+    def _get(key: str, default: Any = None) -> Any:
+        if is_dict:
+            return preproc_state.get(key, default)
+        return getattr(preproc_state, key, default)
+
+    call_idx = str(_get("callability_index", "WorstOf"))
+    raw_cpn_idx = coupon_index if coupon_index is not None else _get("coupon_index", None)
+    raw_opt_idx = option_index if option_index is not None else _get("option_index", None)
+    eff_cpn_idx = str(raw_cpn_idx) if raw_cpn_idx else call_idx
+    eff_opt_idx = str(raw_opt_idx) if raw_opt_idx else call_idx
+
+    raw_ls_state = _get("lower_strike", None)
+    if lower_strike != 0.0:
+        eff_lower_strike = float(lower_strike)
+    elif raw_ls_state is not None:
+        eff_lower_strike = float(raw_ls_state)
+    else:
+        eff_lower_strike = 0.0
+
+    eff_allow_exp = bool(allow_autocall_on_expiry) or bool(_get("allow_autocall_on_expiry", False))
+    eff_perm = inv_lex_perm if inv_lex_perm is not None else _get("inv_lex_perm", None)
+
+    state_cbt = _get("coupon_barrier_type", "In") or "In"
+    state_cbd = _get("coupon_barrier_direction", "Up") or "Up"
+    eff_cbt = str(coupon_barrier_type if coupon_barrier_type != "In" else state_cbt)
+    eff_cbd = str(coupon_barrier_direction if coupon_barrier_direction != "Up" else state_cbd)
+
+    ki_raw = _get("ki_barrier", None)
+    ki_val = float(ki_raw) if ki_raw is not None else 0.0
+    part_raw = _get("participation_call_strike", None)
+    part_val = float(part_raw) if part_raw is not None else 0.0
+    os_raw = _get("one_star_strike", None)
+    os_val = float(os_raw) if os_raw is not None else 0.0
+
+    return {
+        "forward_perf": preproc_state["forward_perf"] if is_dict else preproc_state.forward_perf,
+        "v_perf": preproc_state["v_perf"] if is_dict else preproc_state.v_perf,
+        "corr_matrix": preproc_state["corr_matrix"] if is_dict else preproc_state.corr_matrix,
+        "df_pay": preproc_state["df_pay"] if is_dict else preproc_state.df_pay,
+        "tau_obs": _get("tau_obs", None),
+        "ko_barriers": preproc_state["ko_barriers"] if is_dict else preproc_state.ko_barriers,
+        "is_callable": preproc_state["is_callable"] if is_dict else preproc_state.is_callable,
+        "cpn_barriers": preproc_state["cpn_barriers"] if is_dict else preproc_state.cpn_barriers,
+        "is_guaranteed_cpn": preproc_state["is_guaranteed_cpn"] if is_dict else preproc_state.is_guaranteed_cpn,
+        "coupon_amounts": preproc_state["coupon_amounts"] if is_dict else preproc_state.coupon_amounts,
+        "strike": float(_get("strike", 0.90)),
+        "option_gearing": float(_get("option_gearing", 1.11111)),
+        "lower_strike": eff_lower_strike,
+        "ki_barrier": ki_val,
+        "has_ki": ki_raw is not None and ki_val > 0.0,
+        "i_ki_past": float(_get("i_ki_past", 0.0)),
+        "c_mem_0": float(_get("c_mem_0", 0.0)),
+        "is_memory": bool(_get("is_memory", True)),
+        "ko_spread": float(_get("ko_spread", -0.15)),
+        "cpn_spread": float(_get("cpn_spread", -0.15)),
+        "ki_spread": float(_get("ki_spread", -0.15)),
+        "no_notional_repayment": bool(_get("no_notional_repayment", False)),
+        "autocall_coupon": float(_get("autocall_coupon", 0.0)),
+        "force_coupons_on_autocall": bool(_get("force_coupons_on_autocall", False)),
+        "allow_autocall_on_expiry": eff_allow_exp,
+        "inv_lex_perm": eff_perm,
+        "coupon_barrier_type": eff_cbt,
+        "coupon_barrier_direction": eff_cbd,
+        "is_long_basket": bool(_get("is_long_basket", False)),
+        "pv_in_transit": float(_get("pv_in_transit", 0.0)),
+        "already_autocalled": bool(_get("already_autocalled", False)),
+        "callability_index": call_idx,
+        "coupon_index": eff_cpn_idx,
+        "option_index": eff_opt_idx,
+        "part_call_strike": part_val,
+        "part_call_rate": float(_get("participation_call_rate", 0.0) or 0.0),
+        "one_star_strike": os_val,
+        "one_star_coupon": float(_get("one_star_coupon", 0.0) or 0.0),
+    }
+
+
+_EMPTY_F64 = np.empty(0, dtype=np.float64)
+
+
+def _tensor_to_np_ro(t: torch.Tensor) -> npt.NDArray[np.float64]:
+    return t.detach().numpy() if t.requires_grad else t.numpy()
+
+
+def _tensor_ptr_f64(t: torch.Tensor, keep: List[Any]) -> int:
+    if t.dtype is torch.float64 and t.is_contiguous():
+        return int(t.data_ptr())
+    arr = np.ascontiguousarray(t.detach().cpu().numpy(), dtype=np.float64)
+    keep.append(arr)
+    return int(arr.ctypes.data)
+
+
+def _baseline_cpu_via_cpp(
+    backend: Any,
+    d_assets: int,
+    m_rem: int,
+    fp_t: torch.Tensor,
+    vp_t: torch.Tensor,
+    cm_t: torch.Tensor,
+    tau_raw: Any,
+    df_t: torch.Tensor,
+    ko_t: torch.Tensor,
+    ic_t: torch.Tensor,
+    cb_t: torch.Tensor,
+    ig_t: torch.Tensor,
+    cr_t: torch.Tensor,
+    cbt_i: int,
+    cbd_i: int,
+    eff_perm: Any,
+    strike: float,
+    lower_strike: float,
+    ki_val: float,
+    has_ki: bool,
+    i_ki_past: float,
+    ko_spread: float,
+    cpn_spread: float,
+    ki_spread: float,
+    call_code: int,
+    cpn_code: int,
+    opt_code: int,
+    allow_autocall_on_expiry: bool,
+    c_mem_0: float,
+    is_memory: bool,
+    autocall_coupon: float,
+    force_coupons_on_autocall: bool,
+    no_notional_repayment: bool,
+    is_long_basket: bool,
+    option_gearing: float,
+    part_call_strike: float,
+    part_call_rate: float,
+    one_star_strike: float,
+    one_star_coupon: float,
+    pv_in_transit: float,
+    has_unsupported: bool,
+    unsupported_tup: Tuple[str, ...],
+) -> AutocallBaselineOutput:
+    keep: List[Any] = []
+    if fp_t.is_contiguous() and vp_t.is_contiguous() and cm_t.is_contiguous() and df_t.is_contiguous():
+        fp_p = fp_t.data_ptr()
+        vp_p = vp_t.data_ptr()
+        cm_p = cm_t.data_ptr()
+        df_p = df_t.data_ptr()
+        ko_p = ko_t.data_ptr() if ko_t.is_contiguous() else _tensor_ptr_f64(ko_t, keep)
+        ic_p = ic_t.data_ptr() if ic_t.is_contiguous() else _tensor_ptr_f64(ic_t, keep)
+        cb_p = cb_t.data_ptr() if cb_t.is_contiguous() else _tensor_ptr_f64(cb_t, keep)
+        ig_p = ig_t.data_ptr() if ig_t.is_contiguous() else _tensor_ptr_f64(ig_t, keep)
+        cr_p = cr_t.data_ptr() if cr_t.is_contiguous() else _tensor_ptr_f64(cr_t, keep)
+    else:
+        fp_p = _tensor_ptr_f64(fp_t, keep)
+        vp_p = _tensor_ptr_f64(vp_t, keep)
+        cm_p = _tensor_ptr_f64(cm_t, keep)
+        df_p = _tensor_ptr_f64(df_t, keep)
+        ko_p = _tensor_ptr_f64(ko_t, keep)
+        ic_p = _tensor_ptr_f64(ic_t, keep)
+        cb_p = _tensor_ptr_f64(cb_t, keep)
+        ig_p = _tensor_ptr_f64(ig_t, keep)
+        cr_p = _tensor_ptr_f64(cr_t, keep)
+
+    if tau_raw is None:
+        tau_p = 0
+    elif isinstance(tau_raw, torch.Tensor):
+        tau_p = tau_raw.data_ptr() if (tau_raw.dtype is torch.float64 and tau_raw.is_contiguous()) else _tensor_ptr_f64(tau_raw, keep)
+    else:
+        tau_arr = np.ascontiguousarray(tau_raw, dtype=np.float64)
+        keep.append(tau_arr)
+        tau_p = int(tau_arr.ctypes.data) if tau_arr.size > 0 else 0
+
+    if eff_perm is None:
+        perm_p = 0
+    elif isinstance(eff_perm, torch.Tensor) and eff_perm.dtype is torch.int64 and eff_perm.is_contiguous():
+        perm_p = int(eff_perm.data_ptr())
+    else:
+        perm_arr = np.ascontiguousarray(eff_perm, dtype=np.int64)
+        keep.append(perm_arr)
+        perm_p = int(perm_arr.ctypes.data) if perm_arr.size > 0 else 0
+
+    m_bytes = m_rem * 8
+    arr_6m = torch.empty((6, m_rem), dtype=torch.float64)
+    dw_all = torch.empty((d_assets, m_rem), dtype=torch.float64)
+    sc_buf = torch.empty(7, dtype=torch.float64)
+    arr_ptr = arr_6m.data_ptr()
+    packed = backend._args_pack(
+        d_assets,
+        m_rem,
+        fp_p,
+        vp_p,
+        cm_p,
+        tau_p,
+        df_p,
+        ko_p,
+        ic_p,
+        cb_p,
+        ig_p,
+        cr_p,
+        perm_p,
+        strike,
+        lower_strike,
+        ki_val,
+        i_ki_past,
+        ko_spread,
+        cpn_spread,
+        ki_spread,
+        c_mem_0,
+        autocall_coupon,
+        option_gearing,
+        part_call_strike,
+        part_call_rate,
+        one_star_strike,
+        one_star_coupon,
+        pv_in_transit,
+        cbt_i,
+        cbd_i,
+        1 if has_ki else 0,
+        call_code,
+        cpn_code,
+        opt_code,
+        1 if allow_autocall_on_expiry else 0,
+        1 if is_memory else 0,
+        1 if force_coupons_on_autocall else 0,
+        1 if no_notional_repayment else 0,
+        1 if is_long_basket else 0,
+        0,
+        arr_ptr,
+        arr_ptr + m_bytes,
+        dw_all.data_ptr(),
+        arr_ptr + 2 * m_bytes,
+        arr_ptr + 3 * m_bytes,
+        arr_ptr + 4 * m_bytes,
+        arr_ptr + 5 * m_bytes,
+        sc_buf.data_ptr(),
+    )
+    backend._fn_struct(packed)
+    f_w_t, v_w_t, p_t, surv_t, h_t, q_t = torch.unbind(arr_6m, 0)
+    dw_t = dw_all.squeeze(1) if m_rem == 1 else dw_all[:, -1].contiguous()
+    s0, s1, s2, s3, s4, s5, s6 = torch.unbind(sc_buf, 0)
+    return AutocallBaselineOutput(
+        f_w=f_w_t,
+        v_w=v_w_t,
+        h_proxy=h_t,
+        p_proxy=p_t,
+        survival_proxy=surv_t,
+        q_proxy=q_t,
+        l_put_proxy=s0,
+        proxy_delta_weights=dw_t,
+        option_pv_proxy=s1,
+        notional_pv_proxy=s2,
+        coupon_pv_proxy=s3,
+        product_value_proxy=s4,
+        l_call_proxy=s5,
+        l_onestar_proxy=s6,
+        has_unsupported_exotic_index=has_unsupported,
+        unsupported_indices=unsupported_tup,
+    )
 
 
 def compute_analytical_autocall_baseline(
     preproc_state: Any,
     *,
     use_fast_cpu: bool | None = None,
+    coupon_index: str | None = None,
+    option_index: str | None = None,
+    lower_strike: float = 0.0,
+    allow_autocall_on_expiry: bool = False,
+    inv_lex_perm: Sequence[int] | npt.NDArray[np.int64] | None = None,
+    coupon_barrier_type: str = "In",
+    coupon_barrier_direction: str = "Up",
 ) -> AutocallBaselineOutput:
-    """Evaluates the Stulz-Margrabe recursive moment-matching baseline across all future periods.
+    """Evaluates the exact analytical moment-matched baseline across all future periods.
 
-    Uses a 32-node Gauss-Hermite Markovian conditional survival bridge across multi-period
-    schedules ($M_{\\text{rem}} > 1$) and an exact conditional Black-76 down-and-in put formula,
-    while preserving 0-ULP equivalence when $M_{\\text{rem}} = 1$.
+    Uses closed-form truncated-normal + ramp survival moments via `erfcx` Inverse Mills Ratio,
+    Euler-weighted inter-period basket correlation, distinct multi-index conditioning, exact
+    piecewise terminal put/call integrals, and 16-point bivariate Gauss-Legendre `OneStar`.
+    Stateless across calls (no mutable buffer caching).
     """
     is_dict = isinstance(preproc_state, dict)
-    fp_t = preproc_state["forward_perf"] if is_dict else preproc_state.forward_perf
-    vp_t = preproc_state["v_perf"] if is_dict else preproc_state.v_perf
-    cm_t = preproc_state["corr_matrix"] if is_dict else preproc_state.corr_matrix
-    df_t = preproc_state["df_pay"] if is_dict else preproc_state.df_pay
-    if fp_t.ndim == 2 and (
-        use_fast_cpu
-        or (
-            use_fast_cpu is None
-            and not (
-                fp_t.requires_grad
-                or vp_t.requires_grad
-                or cm_t.requires_grad
-                or df_t.requires_grad
+    if not is_dict and use_fast_cpu is not False:
+        fp_t: torch.Tensor = preproc_state.forward_perf
+        vp_t: torch.Tensor = preproc_state.v_perf
+        cm_t: torch.Tensor = preproc_state.corr_matrix
+        df_t: torch.Tensor = preproc_state.df_pay
+        ko_t: torch.Tensor = preproc_state.ko_barriers
+        ic_t: torch.Tensor = preproc_state.is_callable
+        cb_t: torch.Tensor = preproc_state.cpn_barriers
+        ig_t: torch.Tensor = preproc_state.is_guaranteed_cpn
+        cr_t: torch.Tensor = preproc_state.coupon_amounts
+        device = fp_t.device
+        can_cpu = (
+            fp_t.ndim == 2
+            and device.type == "cpu"
+            and (
+                use_fast_cpu is True
+                or not (
+                    fp_t.requires_grad
+                    or vp_t.requires_grad
+                    or cm_t.requires_grad
+                    or df_t.requires_grad
+                    or ko_t.requires_grad
+                    or cb_t.requires_grad
+                    or cr_t.requires_grad
+                )
             )
-            and fp_t.device.type == "cpu"
         )
-    ):
-        cache_key = (
-            fp_t.data_ptr(),
-            fp_t._version,
-            vp_t.data_ptr(),
-            vp_t._version,
-            cm_t.data_ptr(),
-            cm_t._version,
-            df_t.data_ptr(),
-            df_t._version,
-        )
-        cached_bundle = (
-            preproc_state.get("_fast_cpu_cache")
-            if is_dict
-            else getattr(preproc_state, "_fast_cpu_cache", None)
-        )
-        if cached_bundle is not None and cached_bundle[0] == cache_key:
-            (
-                _,
-                d_assets,
-                m_rem,
-                already_autocalled,
-                f_cols,
-                v_cols,
-                c_list,
-                df_list,
-                ko_list,
-                call_list,
-                cpn_b_list,
-                guar_list,
-                cpn_amt_list,
-                strike,
-                option_gearing,
-                lower_strike,
-                ki_barrier,
-                i_ki_past,
-                c_mem_0,
-                is_memory,
-                ko_spread,
-                cpn_spread,
-                ki_spread,
-                no_notional_repayment,
-                autocall_coupon,
-                force_coupons_on_autocall,
-                cpn_barrier_type,
-                cpn_barrier_direction,
-                cpn_dir_down,
-                cpn_type_out,
-                opt_sign,
-                pv_in_transit,
-                callability_index,
-                simple_put,
-                part_call_strike,
-                part_call_rate,
-                one_star_strike,
-                one_star_coupon,
-                f_w_arr,
-                v_w_arr,
-                h_arr,
-                p_arr,
-                surv_arr,
-                q_arr,
-                w_slice,
-                s_slice,
-                cached_out,
-            ) = cached_bundle
-            cached_out_typed: AutocallBaselineOutput = cached_out
+        if can_cpu:
+            is_preproc = hasattr(preproc_state, "baseline")
+            if is_preproc:
+                call_idx = preproc_state.callability_index
+                raw_cpn_idx = coupon_index if coupon_index is not None else preproc_state.coupon_index
+                raw_opt_idx = option_index if option_index is not None else preproc_state.option_index
+                already_autocalled = preproc_state.already_autocalled
+                pv_in_transit = preproc_state.pv_in_transit
+            else:
+                call_idx = str(getattr(preproc_state, "callability_index", "WorstOf"))
+                raw_cpn_idx = coupon_index if coupon_index is not None else getattr(preproc_state, "coupon_index", None)
+                raw_opt_idx = option_index if option_index is not None else getattr(preproc_state, "option_index", None)
+                already_autocalled = bool(getattr(preproc_state, "already_autocalled", False))
+                pv_in_transit = float(getattr(preproc_state, "pv_in_transit", 0.0))
+
+            call_code = 0 if call_idx == "WorstOf" else monitoring_index_to_code(call_idx)
+            if raw_cpn_idx:
+                cpn_idx = str(raw_cpn_idx)
+                cpn_code = 0 if cpn_idx == "WorstOf" else monitoring_index_to_code(cpn_idx)
+            else:
+                cpn_idx = call_idx
+                cpn_code = call_code
+            if raw_opt_idx:
+                opt_idx = str(raw_opt_idx)
+                opt_code = 0 if opt_idx == "WorstOf" else monitoring_index_to_code(opt_idx)
+            else:
+                opt_idx = call_idx
+                opt_code = call_code
+
+            if call_code <= 2 and cpn_code <= 2 and opt_code <= 2:
+                has_unsupported = False
+                unsupported_tup: Tuple[str, ...] = ()
+            else:
+                unsupported_list: List[str] = []
+                for idx_str, idx_c in ((call_idx, call_code), (cpn_idx, cpn_code), (opt_idx, opt_code)):
+                    if not is_exact_analytical_index(idx_c) and idx_str not in unsupported_list:
+                        unsupported_list.append(idx_str)
+                has_unsupported = len(unsupported_list) > 0
+                unsupported_tup = tuple(unsupported_list)
+
+            d_assets, m_rem = int(fp_t.shape[0]), int(fp_t.shape[1])
             if m_rem == 0 or already_autocalled:
-                return cached_out_typed
-        else:
-            d_assets, m_rem = fp_t.shape
-            already_autocalled = bool(
-                preproc_state.get("already_autocalled", False)
-                if is_dict
-                else preproc_state.already_autocalled
-            )
-            pv_in_transit = float(
-                preproc_state.get("pv_in_transit", 0.0)
-                if is_dict
-                else preproc_state.pv_in_transit
-            )
-            if m_rem == 0 or already_autocalled:
-                device = fp_t.device
                 z_m = torch.zeros(m_rem, dtype=torch.float64, device=device)
                 z_s = torch.tensor(0.0, dtype=torch.float64, device=device)
-                pv_t = torch.tensor(pv_in_transit, dtype=torch.float64, device=device)
                 return AutocallBaselineOutput(
                     f_w=z_m,
-                    v_w=z_m,
-                    h_proxy=z_m,
-                    p_proxy=z_m,
-                    survival_proxy=z_m,
-                    q_proxy=z_m,
+                    v_w=z_m.clone(),
+                    h_proxy=z_m.clone(),
+                    p_proxy=z_m.clone(),
+                    survival_proxy=z_m.clone(),
+                    q_proxy=z_m.clone(),
                     l_put_proxy=z_s,
                     proxy_delta_weights=torch.zeros(d_assets, dtype=torch.float64, device=device),
-                    option_pv_proxy=z_s,
-                    notional_pv_proxy=z_s,
-                    coupon_pv_proxy=z_s,
-                    product_value_proxy=pv_t,
-                    l_call_proxy=z_s,
-                    l_onestar_proxy=z_s,
+                    option_pv_proxy=z_s.clone(),
+                    notional_pv_proxy=z_s.clone(),
+                    coupon_pv_proxy=z_s.clone(),
+                    product_value_proxy=torch.tensor(pv_in_transit, dtype=torch.float64, device=device),
+                    l_call_proxy=z_s.clone(),
+                    l_onestar_proxy=z_s.clone(),
+                    has_unsupported_exotic_index=has_unsupported,
+                    unsupported_indices=unsupported_tup,
                 )
-            f_cols = fp_t.T.tolist()
-            v_cols = vp_t.T.tolist()
-            c_list = cm_t.tolist()
-            df_list = df_t.tolist()
-            if is_dict:
-                ko_list = preproc_state["ko_barriers"].tolist()
-                call_list = [x > 0.5 for x in preproc_state["is_callable"].tolist()]
-                cpn_b_list = preproc_state["cpn_barriers"].tolist()
-                guar_list = [x > 0.5 for x in preproc_state["is_guaranteed_cpn"].tolist()]
-                cpn_amt_list = preproc_state["coupon_amounts"].tolist()
-                strike = float(preproc_state.get("strike", 0.90))
-                option_gearing = float(preproc_state.get("option_gearing", 1.11111))
-                lower_strike_raw = preproc_state.get("lower_strike", None)
-                lower_strike = float(lower_strike_raw) if lower_strike_raw is not None else None
-                ki_barrier_raw = preproc_state.get("ki_barrier", None)
-                ki_barrier = float(ki_barrier_raw) if ki_barrier_raw is not None else None
-                i_ki_past = float(preproc_state.get("i_ki_past", 0.0))
-                c_mem_0 = float(preproc_state.get("c_mem_0", 0.0))
-                is_memory = bool(preproc_state.get("is_memory", True))
-                ko_spread = float(preproc_state.get("ko_spread", -0.15))
-                cpn_spread = float(preproc_state.get("cpn_spread", -0.15))
-                ki_spread = float(preproc_state.get("ki_spread", -0.15))
-                no_notional_repayment = bool(preproc_state.get("no_notional_repayment", False))
-                autocall_coupon = float(preproc_state.get("autocall_coupon", 0.0))
-                force_coupons_on_autocall = bool(preproc_state.get("force_coupons_on_autocall", False))
-                cpn_barrier_type = str(preproc_state.get("coupon_barrier_type", "In") or "In")
-                cpn_barrier_direction = str(preproc_state.get("coupon_barrier_direction", "Up") or "Up")
-                opt_sign = -1.0 if bool(preproc_state.get("is_long_basket", False)) else 1.0
-                callability_index = str(preproc_state.get("callability_index", "WorstOf"))
-                part_call_strike_raw = preproc_state.get("participation_call_strike", None)
-                part_call_strike = float(part_call_strike_raw) if part_call_strike_raw is not None else None
-                part_call_rate = float(preproc_state.get("participation_call_rate", 0.0) or 0.0)
-                one_star_strike_raw = preproc_state.get("one_star_strike", None)
-                one_star_strike = float(one_star_strike_raw) if one_star_strike_raw is not None else None
-                one_star_coupon = float(preproc_state.get("one_star_coupon", 0.0) or 0.0)
-            else:
-                ko_list = preproc_state.ko_barriers.tolist()
-                call_list = [x > 0.5 for x in preproc_state.is_callable.tolist()]
-                cpn_b_list = preproc_state.cpn_barriers.tolist()
-                guar_list = [x > 0.5 for x in preproc_state.is_guaranteed_cpn.tolist()]
-                cpn_amt_list = preproc_state.coupon_amounts.tolist()
-                strike = float(preproc_state.strike)
-                option_gearing = float(preproc_state.option_gearing)
-                lower_strike = float(preproc_state.lower_strike) if preproc_state.lower_strike is not None else None
-                ki_barrier = float(preproc_state.ki_barrier) if preproc_state.ki_barrier is not None else None
-                i_ki_past = float(preproc_state.i_ki_past)
-                c_mem_0 = float(preproc_state.c_mem_0)
-                is_memory = bool(preproc_state.is_memory)
-                ko_spread = float(preproc_state.ko_spread)
-                cpn_spread = float(preproc_state.cpn_spread)
-                ki_spread = float(preproc_state.ki_spread)
-                no_notional_repayment = bool(preproc_state.no_notional_repayment)
-                autocall_coupon = float(preproc_state.autocall_coupon)
-                force_coupons_on_autocall = bool(preproc_state.force_coupons_on_autocall)
-                cpn_barrier_type = str(preproc_state.coupon_barrier_type)
-                cpn_barrier_direction = str(preproc_state.coupon_barrier_direction)
-                opt_sign = -1.0 if bool(preproc_state.is_long_basket) else 1.0
-                callability_index = str(preproc_state.callability_index)
-                part_call_strike = (
-                    float(preproc_state.participation_call_strike)
-                    if getattr(preproc_state, "participation_call_strike", None) is not None
-                    else None
+
+            if is_preproc:
+                raw_ls_state = preproc_state.lower_strike
+                eff_lower_strike = (
+                    float(lower_strike)
+                    if lower_strike != 0.0
+                    else (float(raw_ls_state) if raw_ls_state is not None else 0.0)
                 )
-                part_call_rate = float(getattr(preproc_state, "participation_call_rate", 0.0) or 0.0)
-                one_star_strike = (
-                    float(preproc_state.one_star_strike)
-                    if getattr(preproc_state, "one_star_strike", None) is not None
-                    else None
+                eff_allow_exp = bool(allow_autocall_on_expiry) or preproc_state.allow_autocall_on_expiry
+                eff_perm = inv_lex_perm if inv_lex_perm is not None else preproc_state.inv_lex_perm
+                eff_cbt = coupon_barrier_type if coupon_barrier_type != "In" else (preproc_state.coupon_barrier_type or "In")
+                eff_cbd = coupon_barrier_direction if coupon_barrier_direction != "Up" else (preproc_state.coupon_barrier_direction or "Up")
+                ki_raw = preproc_state.ki_barrier
+                ki_val = float(ki_raw) if ki_raw is not None else 0.0
+                part_raw = preproc_state.participation_call_strike
+                os_raw = preproc_state.one_star_strike
+                tau_raw = preproc_state.tau_obs
+                strike_v = preproc_state.strike
+                i_ki_past_v = preproc_state.i_ki_past
+                ko_sp_v = preproc_state.ko_spread
+                cpn_sp_v = preproc_state.cpn_spread
+                ki_sp_v = preproc_state.ki_spread
+                c_mem_0_v = preproc_state.c_mem_0
+                is_mem_v = preproc_state.is_memory
+                ac_cpn_v = preproc_state.autocall_coupon
+                force_cpn_v = preproc_state.force_coupons_on_autocall
+                no_not_v = preproc_state.no_notional_repayment
+                is_long_v = preproc_state.is_long_basket
+                opt_gear_v = preproc_state.option_gearing
+                part_rate_v = preproc_state.participation_call_rate or 0.0
+                os_cpn_v = preproc_state.one_star_coupon or 0.0
+            else:
+                raw_ls_state = getattr(preproc_state, "lower_strike", None)
+                eff_lower_strike = (
+                    float(lower_strike)
+                    if lower_strike != 0.0
+                    else (float(raw_ls_state) if raw_ls_state is not None else 0.0)
                 )
-                one_star_coupon = float(getattr(preproc_state, "one_star_coupon", 0.0) or 0.0)
-            cpn_dir_down = cpn_barrier_direction.strip().lower() == "down"
-            cpn_type_out = cpn_barrier_type.strip().lower() == "out"
-            simple_put = (
-                (ki_barrier is None or ki_barrier <= 0.0 or i_ki_past >= 0.5)
-                and (lower_strike is None or lower_strike <= 0.0)
-                and (one_star_strike is None or one_star_strike <= 0.0)
-            )
-
-            total_len = 6 * m_rem + d_assets + 7
-            buf = np.empty(total_len, dtype=np.float64)
-            buf_t = torch.from_numpy(buf)
-            s_base = 6 * m_rem + d_assets
-            f_w_arr = buf[0:m_rem]
-            v_w_arr = buf[m_rem : 2 * m_rem]
-            h_arr = buf[2 * m_rem : 3 * m_rem]
-            p_arr = buf[3 * m_rem : 4 * m_rem]
-            surv_arr = buf[4 * m_rem : 5 * m_rem]
-            q_arr = buf[5 * m_rem : 6 * m_rem]
-            w_slice = buf[6 * m_rem : s_base]
-            s_slice = buf[s_base:]
-            cached_out_typed = AutocallBaselineOutput(
-                f_w=buf_t[0:m_rem],
-                v_w=buf_t[m_rem : 2 * m_rem],
-                h_proxy=buf_t[2 * m_rem : 3 * m_rem],
-                p_proxy=buf_t[3 * m_rem : 4 * m_rem],
-                survival_proxy=buf_t[4 * m_rem : 5 * m_rem],
-                q_proxy=buf_t[5 * m_rem : 6 * m_rem],
-                l_put_proxy=buf_t[s_base],
-                proxy_delta_weights=buf_t[6 * m_rem : s_base],
-                option_pv_proxy=buf_t[s_base + 1],
-                notional_pv_proxy=buf_t[s_base + 2],
-                coupon_pv_proxy=buf_t[s_base + 3],
-                product_value_proxy=buf_t[s_base + 4],
-                l_call_proxy=buf_t[s_base + 5],
-                l_onestar_proxy=buf_t[s_base + 6],
-            )
-            if not is_dict:
-                try:
-                    object.__setattr__(
-                        preproc_state,
-                        "_fast_cpu_cache",
-                        (
-                            cache_key,
-                            d_assets,
-                            m_rem,
-                            already_autocalled,
-                            f_cols,
-                            v_cols,
-                            c_list,
-                            df_list,
-                            ko_list,
-                            call_list,
-                            cpn_b_list,
-                            guar_list,
-                            cpn_amt_list,
-                            strike,
-                            option_gearing,
-                            lower_strike,
-                            ki_barrier,
-                            i_ki_past,
-                            c_mem_0,
-                            is_memory,
-                            ko_spread,
-                            cpn_spread,
-                            ki_spread,
-                            no_notional_repayment,
-                            autocall_coupon,
-                            force_coupons_on_autocall,
-                            cpn_barrier_type,
-                            cpn_barrier_direction,
-                            cpn_dir_down,
-                            cpn_type_out,
-                            opt_sign,
-                            pv_in_transit,
-                            callability_index,
-                            simple_put,
-                            part_call_strike,
-                            part_call_rate,
-                            one_star_strike,
-                            one_star_coupon,
-                            f_w_arr,
-                            v_w_arr,
-                            h_arr,
-                            p_arr,
-                            surv_arr,
-                            q_arr,
-                            w_slice,
-                            s_slice,
-                            cached_out_typed,
-                        ),
-                    )
-                except Exception:
-                    pass
-
-        fw_py: list[float] = []
-        vw_py: list[float] = []
-        for m in range(m_rem):
-            _, fw_m, vw_m, w_m = fast_stulz_margrabe_cpu(
-                f_cols[m],
-                v_cols[m],
-                c_list,
-                k_strike=strike,
-                monitoring_index=callability_index,
-            )
-            fw_py.append(fw_m)
-            vw_py.append(vw_m)
-            f_w_arr[m] = fw_m
-            v_w_arr[m] = vw_m
-            if m == m_rem - 1:
-                w_slice[:] = w_m
-
-        surv_cur = 1.0
-        mem_cur = c_mem_0
-        cpn_pv_sum = 0.0
-        notional_pv_sum = 0.0
-        z_mean = 0.0
-        z_std = 1.0
-        z_mean_term = 0.0
-        z_std_term = 1.0
-        f_cond_term = fw_py[-1]
-        v_cond_term = vw_py[-1]
-
-        for m in range(m_rem):
-            fw_m = fw_py[m] if fw_py[m] > 1e-16 else 1e-16
-            vw_m = vw_py[m] if vw_py[m] > 1e-12 else 1e-12
-            if z_mean == 0.0 and z_std == 1.0:
-                f_cond = fw_m
-                v_cond = vw_m
-            else:
-                f_cond = fw_m * math.exp(vw_m * z_mean - 0.5 * vw_m * vw_m * (1.0 - z_std * z_std))
-                v_cond = vw_m * z_std if vw_m * z_std > 1e-12 else 1e-12
-            if m == m_rem - 1:
-                f_cond_term = f_cond
-                v_cond_term = v_cond
-                z_mean_term = z_mean
-                z_std_term = z_std
-
-            ko_b_m = ko_list[m]
-            is_call_m = call_list[m]
-            if is_call_m:
-                ko_raw = _digital_call_spread_prob_scalar(f_cond, v_cond, ko_b_m, ko_spread)
-                h_m = 0.0 if ko_raw < 0.0 else (1.0 - 1e-7 if ko_raw > 1.0 - 1e-7 else ko_raw)
-            else:
-                h_m = 0.0
-            h_arr[m] = h_m
-            p_m = surv_cur * h_m
-            p_arr[m] = p_m
-            surv_next = surv_cur * (1.0 - h_m)
-            surv_arr[m] = surv_next
-
-            if guar_list[m]:
-                q_m = 1.0
-            else:
-                cpn_b_m = cpn_b_list[m]
-                if force_coupons_on_autocall and is_call_m and not cpn_dir_down and not cpn_type_out:
-                    if ko_b_m < cpn_b_m:
-                        cpn_b_m = ko_b_m
-                if not cpn_dir_down and not cpn_type_out:
-                    q_m = _digital_call_spread_prob_scalar(f_cond, v_cond, cpn_b_m, cpn_spread)
-                else:
-                    q_m = _eval_coupon_prob_scalar(
-                        f_cond,
-                        v_cond,
-                        cpn_b_m,
-                        cpn_spread,
-                        direction=cpn_barrier_direction,
-                        b_type=cpn_barrier_type,
-                    )
-                if force_coupons_on_autocall and is_call_m and h_m > q_m:
-                    q_m = h_m
-            q_arr[m] = q_m
-
-            c_m = cpn_amt_list[m]
-            eff_c_m = (c_m + mem_cur) if is_memory else c_m
-            df_m = df_list[m]
-            cpn_pv_sum += df_m * (surv_cur * q_m * eff_c_m + p_m * autocall_coupon)
-            if is_memory:
-                mem_cur = eff_c_m * (1.0 - q_m)
-
-            if not no_notional_repayment:
-                if m < m_rem - 1:
-                    notional_pv_sum += df_m * p_m
-                else:
-                    notional_pv_sum += df_m * (p_m + surv_next)
-
-            if is_call_m and m < m_rem - 1:
-                mu_m = math.log(fw_m) - 0.5 * vw_m * vw_m
-                b_lo = min(ko_b_m, ko_b_m + ko_spread)
-                b_hi = max(ko_b_m, ko_b_m + ko_spread)
-                width = max(b_hi - b_lo, 1e-8)
-                sw_sum = 0.0
-                sz_sum = 0.0
-                sz2_sum = 0.0
-                for u_q, w_q in zip(_U_GH32_LIST, _W_GH32_LIST):
-                    z_q = z_mean + z_std * u_q
-                    w_pt = math.exp(mu_m + vw_m * z_q)
-                    if abs(ko_spread) <= 1e-6:
-                        ko_q = 1.0 if w_pt >= ko_b_m else 0.0
-                    else:
-                        ko_q = min(max((w_pt - b_lo) / width, 0.0), 1.0)
-                    wt_q = w_q * (1.0 - ko_q)
-                    sw_sum += wt_q
-                    sz_sum += wt_q * z_q
-                    sz2_sum += wt_q * z_q * z_q
-                if sw_sum > 1e-12:
-                    z_post_mean = sz_sum / sw_sum
-                    z_post_var = max(sz2_sum / sw_sum - z_post_mean * z_post_mean, 1e-6)
-                else:
-                    z_post_mean = z_mean
-                    z_post_var = z_std * z_std
-                vw_next = max(vw_py[m + 1], 1e-12)
-                r_next = min(max(vw_m / vw_next, 0.0), 0.9999)
-                z_mean = r_next * z_post_mean
-                z_std = math.sqrt(r_next * r_next * z_post_var + (1.0 - r_next * r_next))
-            elif m < m_rem - 1 and (z_mean != 0.0 or z_std != 1.0):
-                vw_next = max(vw_py[m + 1], 1e-12)
-                r_next = min(max(vw_m / vw_next, 0.0), 0.9999)
-                z_mean = r_next * z_mean
-                z_std = math.sqrt(r_next * r_next * (z_std * z_std) + (1.0 - r_next * r_next))
-
-            surv_cur = surv_next
-
-        star_prob_val = 0.0
-        if one_star_strike is not None and one_star_strike > 0.0:
-            _, fw_best, vw_best, _ = fast_stulz_margrabe_cpu(
-                f_cols[-1],
-                v_cols[-1],
-                c_list,
-                k_strike=0.0,
-                monitoring_index="BestOf",
-            )
-            if z_mean_term == 0.0 and z_std_term == 1.0:
-                f_best_cond = fw_best
-                v_best_cond = vw_best
-            else:
-                f_best_cond = fw_best * math.exp(
-                    vw_best * z_mean_term - 0.5 * vw_best * vw_best * (1.0 - z_std_term * z_std_term)
+                eff_allow_exp = bool(allow_autocall_on_expiry) or bool(
+                    getattr(preproc_state, "allow_autocall_on_expiry", False)
                 )
-                v_best_cond = max(vw_best * z_std_term, 1e-12)
-            star_prob_val = _digital_call_spread_prob_scalar(f_best_cond, v_best_cond, one_star_strike, ko_spread)
+                eff_perm = inv_lex_perm if inv_lex_perm is not None else getattr(preproc_state, "inv_lex_perm", None)
+                state_cbt = getattr(preproc_state, "coupon_barrier_type", "In") or "In"
+                state_cbd = getattr(preproc_state, "coupon_barrier_direction", "Up") or "Up"
+                eff_cbt = str(coupon_barrier_type if coupon_barrier_type != "In" else state_cbt)
+                eff_cbd = str(coupon_barrier_direction if coupon_barrier_direction != "Up" else state_cbd)
+                ki_raw = getattr(preproc_state, "ki_barrier", None)
+                ki_val = float(ki_raw) if ki_raw is not None else 0.0
+                part_raw = getattr(preproc_state, "participation_call_strike", None)
+                os_raw = getattr(preproc_state, "one_star_strike", None)
+                tau_raw = getattr(preproc_state, "tau_obs", None)
+                strike_v = float(getattr(preproc_state, "strike", 0.90))
+                i_ki_past_v = float(getattr(preproc_state, "i_ki_past", 0.0))
+                ko_sp_v = float(getattr(preproc_state, "ko_spread", -0.15))
+                cpn_sp_v = float(getattr(preproc_state, "cpn_spread", -0.15))
+                ki_sp_v = float(getattr(preproc_state, "ki_spread", -0.15))
+                c_mem_0_v = float(getattr(preproc_state, "c_mem_0", 0.0))
+                is_mem_v = bool(getattr(preproc_state, "is_memory", True))
+                ac_cpn_v = float(getattr(preproc_state, "autocall_coupon", 0.0))
+                force_cpn_v = bool(getattr(preproc_state, "force_coupons_on_autocall", False))
+                no_not_v = bool(getattr(preproc_state, "no_notional_repayment", False))
+                is_long_v = bool(getattr(preproc_state, "is_long_basket", False))
+                opt_gear_v = float(getattr(preproc_state, "option_gearing", 1.11111))
+                part_rate_v = float(getattr(preproc_state, "participation_call_rate", 0.0) or 0.0)
+                os_cpn_v = float(getattr(preproc_state, "one_star_coupon", 0.0) or 0.0)
 
-        if strike <= 1e-6 or option_gearing <= 0.0:
-            l_put_val = 0.0
-        elif simple_put:
-            l_put_val = surv_cur * _black76_put_scalar(f_cond_term, strike, v_cond_term)
-        else:
-            put_cond = _conditional_ki_put_scalar(
-                f_cond=f_cond_term,
-                v_cond=v_cond_term,
-                strike=strike,
-                lower_strike=lower_strike,
-                ki_barrier=ki_barrier,
-                i_ki_past=i_ki_past,
-                ki_spread=ki_spread,
-            )
-            l_put_val = surv_cur * put_cond * (1.0 - star_prob_val)
+            backend = get_tier1_backend()
+            if hasattr(backend, "_fn_struct"):
+                cbt_i = 1 if (eff_cbt == "Out" or eff_cbt.strip().lower() == "out") else 0
+                cbd_i = 1 if (eff_cbd == "Down" or eff_cbd.strip().lower() == "down") else 0
+                return _baseline_cpu_via_cpp(
+                    backend,
+                    d_assets,
+                    m_rem,
+                    fp_t,
+                    vp_t,
+                    cm_t,
+                    tau_raw,
+                    df_t,
+                    ko_t,
+                    ic_t,
+                    cb_t,
+                    ig_t,
+                    cr_t,
+                    cbt_i,
+                    cbd_i,
+                    eff_perm,
+                    strike_v,
+                    eff_lower_strike,
+                    ki_val,
+                    ki_raw is not None and ki_val > 0.0,
+                    i_ki_past_v,
+                    ko_sp_v,
+                    cpn_sp_v,
+                    ki_sp_v,
+                    call_code,
+                    cpn_code,
+                    opt_code,
+                    eff_allow_exp,
+                    c_mem_0_v,
+                    is_mem_v,
+                    ac_cpn_v,
+                    force_cpn_v,
+                    no_not_v,
+                    is_long_v,
+                    opt_gear_v,
+                    float(part_raw) if part_raw is not None else 0.0,
+                    part_rate_v,
+                    float(os_raw) if os_raw is not None else 0.0,
+                    os_cpn_v,
+                    pv_in_transit,
+                    has_unsupported,
+                    unsupported_tup,
+                )
 
-        if part_call_strike is not None and part_call_rate > 0.0:
-            l_call_val = surv_cur * _black76_call_scalar(f_cond_term, part_call_strike, v_cond_term)
-        else:
-            l_call_val = 0.0
+            eval_fn = getattr(backend, "eval_autocall_baseline_cpu", None)
+            if eval_fn is not None:
+                tau_np = (
+                    _tensor_to_np_ro(tau_raw)
+                    if isinstance(tau_raw, torch.Tensor)
+                    else (np.asarray(tau_raw, dtype=np.float64) if tau_raw is not None else _EMPTY_F64)
+                )
+                perm_np = (
+                    np.asarray(eff_perm, dtype=np.int64)
+                    if eff_perm is not None
+                    else np.arange(d_assets, dtype=np.int64)
+                )
+                f_w_np, v_w_np, dw_np, p_np, surv_np, h_np, q_np, sc_np = eval_fn(
+                    fwd_perf=_tensor_to_np_ro(fp_t),
+                    vol_perf=_tensor_to_np_ro(vp_t),
+                    corr=_tensor_to_np_ro(cm_t),
+                    tau_obs=tau_np,
+                    df_pay=_tensor_to_np_ro(df_t),
+                    ko_barriers=_tensor_to_np_ro(ko_t),
+                    is_callable=_tensor_to_np_ro(ic_t),
+                    cpn_barriers=_tensor_to_np_ro(cb_t),
+                    is_guaranteed_cpn=_tensor_to_np_ro(ig_t),
+                    coupon_rates=_tensor_to_np_ro(cr_t),
+                    coupon_barrier_type=eff_cbt,
+                    coupon_barrier_direction=eff_cbd,
+                    inv_lex_perm=perm_np,
+                    strike=strike_v,
+                    lower_strike=eff_lower_strike,
+                    ki_barrier=ki_val,
+                    has_ki=ki_raw is not None and ki_val > 0.0,
+                    i_ki_past=i_ki_past_v,
+                    ko_spread=ko_sp_v,
+                    cpn_spread=cpn_sp_v,
+                    ki_spread=ki_sp_v,
+                    call_index_code=call_code,
+                    cpn_index_code=cpn_code,
+                    opt_index_code=opt_code,
+                    allow_autocall_on_expiry=eff_allow_exp,
+                    c_mem_0=c_mem_0_v,
+                    is_memory=is_mem_v,
+                    autocall_coupon=ac_cpn_v,
+                    force_coupons_on_autocall=force_cpn_v,
+                    no_notional_repayment=no_not_v,
+                    is_long_basket=is_long_v,
+                    option_gearing=opt_gear_v,
+                    part_call_strike=float(part_raw) if part_raw is not None else 0.0,
+                    part_call_rate=part_rate_v,
+                    one_star_strike=float(os_raw) if os_raw is not None else 0.0,
+                    one_star_coupon=os_cpn_v,
+                    pv_in_transit=pv_in_transit,
+                )
+                sc_t = torch.from_numpy(sc_np)
+                dw_col = torch.from_numpy(dw_np)[:, -1]
+                if m_rem > 1:
+                    dw_col = dw_col.contiguous()
+                return AutocallBaselineOutput(
+                    f_w=torch.from_numpy(f_w_np),
+                    v_w=torch.from_numpy(v_w_np),
+                    h_proxy=torch.from_numpy(h_np),
+                    p_proxy=torch.from_numpy(p_np),
+                    survival_proxy=torch.from_numpy(surv_np),
+                    q_proxy=torch.from_numpy(q_np),
+                    l_put_proxy=sc_t[0],
+                    proxy_delta_weights=dw_col,
+                    option_pv_proxy=sc_t[1],
+                    notional_pv_proxy=sc_t[2],
+                    coupon_pv_proxy=sc_t[3],
+                    product_value_proxy=sc_t[4],
+                    l_call_proxy=sc_t[5],
+                    l_onestar_proxy=sc_t[6],
+                    has_unsupported_exotic_index=has_unsupported,
+                    unsupported_indices=unsupported_tup,
+                )
 
-        if one_star_strike is not None and one_star_coupon > 0.0:
-            l_onestar_val = surv_cur * star_prob_val * one_star_coupon
-        else:
-            l_onestar_val = 0.0
+    fields = _extract_state_fields(
+        preproc_state,
+        coupon_index=coupon_index,
+        option_index=option_index,
+        lower_strike=lower_strike,
+        allow_autocall_on_expiry=allow_autocall_on_expiry,
+        inv_lex_perm=inv_lex_perm,
+        coupon_barrier_type=coupon_barrier_type,
+        coupon_barrier_direction=coupon_barrier_direction,
+    )
 
-        opt_pv_val = df_list[-1] * (
-            -opt_sign * option_gearing * l_put_val
-            + part_call_rate * l_call_val
-            + l_onestar_val
-        )
-        pv_val = pv_in_transit + notional_pv_sum + cpn_pv_sum + opt_pv_val
-        s_slice[0] = l_put_val
-        s_slice[1] = opt_pv_val
-        s_slice[2] = notional_pv_sum
-        s_slice[3] = cpn_pv_sum
-        s_slice[4] = pv_val
-        s_slice[5] = l_call_val
-        s_slice[6] = l_onestar_val
+    fp_t = fields["forward_perf"]
+    vp_t = fields["v_perf"]
+    cm_t = fields["corr_matrix"]
+    df_t = fields["df_pay"]
+    ko_t = fields["ko_barriers"]
+    ic_t = fields["is_callable"]
+    cb_t = fields["cpn_barriers"]
+    ig_t = fields["is_guaranteed_cpn"]
+    cr_t = fields["coupon_amounts"]
 
-        return cached_out_typed
+    call_idx = fields["callability_index"]
+    cpn_idx = fields["coupon_index"]
+    opt_idx = fields["option_index"]
+    call_code = monitoring_index_to_code(call_idx)
+    cpn_code = monitoring_index_to_code(cpn_idx)
+    opt_code = monitoring_index_to_code(opt_idx)
 
-    if isinstance(preproc_state, dict):
-        forward_perf: torch.Tensor = preproc_state["forward_perf"]
-        v_perf: torch.Tensor = preproc_state["v_perf"]
-        corr_matrix: torch.Tensor = preproc_state["corr_matrix"]
-        df_pay: torch.Tensor = preproc_state["df_pay"]
-        ko_barriers: torch.Tensor = preproc_state["ko_barriers"]
-        is_callable: torch.Tensor = preproc_state["is_callable"]
-        cpn_barriers: torch.Tensor = preproc_state["cpn_barriers"]
-        is_guaranteed_cpn: torch.Tensor = preproc_state["is_guaranteed_cpn"]
-        coupon_amounts: torch.Tensor = preproc_state["coupon_amounts"]
-        strike = float(preproc_state.get("strike", 0.90))
-        option_gearing = float(preproc_state.get("option_gearing", 1.11111))
-        lower_strike = preproc_state.get("lower_strike", None)
-        ki_barrier = preproc_state.get("ki_barrier", None)
-        i_ki_past = float(preproc_state.get("i_ki_past", 0.0))
-        c_mem_0 = float(preproc_state.get("c_mem_0", 0.0))
-        is_memory = bool(preproc_state.get("is_memory", True))
-        ko_spread = float(preproc_state.get("ko_spread", -0.15))
-        cpn_spread = float(preproc_state.get("cpn_spread", -0.15))
-        ki_spread = float(preproc_state.get("ki_spread", -0.15))
-        no_notional_repayment = bool(preproc_state.get("no_notional_repayment", False))
-        autocall_coupon = float(preproc_state.get("autocall_coupon", 0.0))
-        force_coupons_on_autocall = bool(preproc_state.get("force_coupons_on_autocall", False))
-        cpn_barrier_type = str(preproc_state.get("coupon_barrier_type", "In") or "In")
-        cpn_barrier_direction = str(preproc_state.get("coupon_barrier_direction", "Up") or "Up")
-        is_long_basket = bool(preproc_state.get("is_long_basket", False))
-        pv_in_transit = float(preproc_state.get("pv_in_transit", 0.0))
-        already_autocalled = bool(preproc_state.get("already_autocalled", False))
-        callability_index = str(preproc_state.get("callability_index", "WorstOf"))
-        part_call_strike = preproc_state.get("participation_call_strike", None)
-        part_call_rate = float(preproc_state.get("participation_call_rate", 0.0) or 0.0)
-        one_star_strike = preproc_state.get("one_star_strike", None)
-        one_star_coupon = float(preproc_state.get("one_star_coupon", 0.0) or 0.0)
-    else:
-        forward_perf = preproc_state.forward_perf
-        v_perf = preproc_state.v_perf
-        corr_matrix = preproc_state.corr_matrix
-        df_pay = preproc_state.df_pay
-        ko_barriers = preproc_state.ko_barriers
-        is_callable = preproc_state.is_callable
-        cpn_barriers = preproc_state.cpn_barriers
-        is_guaranteed_cpn = preproc_state.is_guaranteed_cpn
-        coupon_amounts = preproc_state.coupon_amounts
-        strike = float(preproc_state.strike)
-        option_gearing = float(preproc_state.option_gearing)
-        lower_strike = preproc_state.lower_strike
-        ki_barrier = preproc_state.ki_barrier
-        i_ki_past = float(preproc_state.i_ki_past)
-        c_mem_0 = float(preproc_state.c_mem_0)
-        is_memory = bool(preproc_state.is_memory)
-        ko_spread = float(preproc_state.ko_spread)
-        cpn_spread = float(preproc_state.cpn_spread)
-        ki_spread = float(preproc_state.ki_spread)
-        no_notional_repayment = bool(preproc_state.no_notional_repayment)
-        autocall_coupon = float(preproc_state.autocall_coupon)
-        force_coupons_on_autocall = bool(preproc_state.force_coupons_on_autocall)
-        cpn_barrier_type = preproc_state.coupon_barrier_type
-        cpn_barrier_direction = preproc_state.coupon_barrier_direction
-        is_long_basket = bool(preproc_state.is_long_basket)
-        pv_in_transit = float(preproc_state.pv_in_transit)
-        already_autocalled = bool(preproc_state.already_autocalled)
-        callability_index = str(preproc_state.callability_index)
-        part_call_strike = getattr(preproc_state, "participation_call_strike", None)
-        part_call_rate = float(getattr(preproc_state, "participation_call_rate", 0.0) or 0.0)
-        one_star_strike = getattr(preproc_state, "one_star_strike", None)
-        one_star_coupon = float(getattr(preproc_state, "one_star_coupon", 0.0) or 0.0)
+    unsupported_list = []
+    for idx_str, idx_c in ((call_idx, call_code), (cpn_idx, cpn_code), (opt_idx, opt_code)):
+        if not is_exact_analytical_index(idx_c) and idx_str not in unsupported_list:
+            unsupported_list.append(idx_str)
+    has_unsupported = len(unsupported_list) > 0
+    unsupported_tup = tuple(unsupported_list)
 
-    device = forward_perf.device
-    opt_sign = -1.0 if is_long_basket else 1.0
+    device = fp_t.device
+    any_grad = (
+        fp_t.requires_grad
+        or vp_t.requires_grad
+        or cm_t.requires_grad
+        or df_t.requires_grad
+        or ko_t.requires_grad
+        or cb_t.requires_grad
+        or cr_t.requires_grad
+    )
+    can_fast_cpu = (
+        fp_t.ndim == 2
+        and device.type == "cpu"
+        and (use_fast_cpu is True or (use_fast_cpu is None and not any_grad))
+    )
 
-    if forward_perf.ndim == 3:
-        b_sz, d_assets, m_rem = forward_perf.shape
+    if can_fast_cpu:
+        d_assets, m_rem = int(fp_t.shape[0]), int(fp_t.shape[1])
+        already_autocalled = bool(fields["already_autocalled"])
+        pv_in_transit = float(fields["pv_in_transit"])
         if m_rem == 0 or already_autocalled:
+            z_m = torch.zeros(m_rem, dtype=torch.float64, device=device)
+            z_s = torch.tensor(0.0, dtype=torch.float64, device=device)
+            pv_t = torch.tensor(pv_in_transit, dtype=torch.float64, device=device)
+            return AutocallBaselineOutput(
+                f_w=z_m,
+                v_w=z_m.clone(),
+                h_proxy=z_m.clone(),
+                p_proxy=z_m.clone(),
+                survival_proxy=z_m.clone(),
+                q_proxy=z_m.clone(),
+                l_put_proxy=z_s,
+                proxy_delta_weights=torch.zeros(d_assets, dtype=torch.float64, device=device),
+                option_pv_proxy=z_s.clone(),
+                notional_pv_proxy=z_s.clone(),
+                coupon_pv_proxy=z_s.clone(),
+                product_value_proxy=pv_t,
+                l_call_proxy=z_s.clone(),
+                l_onestar_proxy=z_s.clone(),
+                has_unsupported_exotic_index=has_unsupported,
+                unsupported_indices=unsupported_tup,
+            )
+
+        tau_raw = fields["tau_obs"]
+        tau_np = (
+            _tensor_to_np_ro(tau_raw)
+            if isinstance(tau_raw, torch.Tensor)
+            else (np.asarray(tau_raw, dtype=np.float64) if tau_raw is not None else _EMPTY_F64)
+        )
+        perm_raw = fields["inv_lex_perm"]
+        perm_np = (
+            np.asarray(perm_raw, dtype=np.int64)
+            if perm_raw is not None
+            else np.arange(d_assets, dtype=np.int64)
+        )
+
+        backend = get_tier1_backend()
+        eval_fn = getattr(backend, "eval_autocall_baseline_cpu", None)
+        if eval_fn is not None:
+            f_w_np, v_w_np, dw_np, p_np, surv_np, h_np, q_np, sc_np = eval_fn(
+                fwd_perf=_tensor_to_np_ro(fp_t),
+                vol_perf=_tensor_to_np_ro(vp_t),
+                corr=_tensor_to_np_ro(cm_t),
+                tau_obs=tau_np,
+                df_pay=_tensor_to_np_ro(df_t),
+                ko_barriers=_tensor_to_np_ro(ko_t),
+                is_callable=_tensor_to_np_ro(ic_t),
+                cpn_barriers=_tensor_to_np_ro(cb_t),
+                is_guaranteed_cpn=_tensor_to_np_ro(ig_t),
+                coupon_rates=_tensor_to_np_ro(cr_t),
+                coupon_barrier_type=fields["coupon_barrier_type"],
+                coupon_barrier_direction=fields["coupon_barrier_direction"],
+                inv_lex_perm=perm_np,
+                strike=fields["strike"],
+                lower_strike=fields["lower_strike"],
+                ki_barrier=fields["ki_barrier"],
+                has_ki=fields["has_ki"],
+                i_ki_past=fields["i_ki_past"],
+                ko_spread=fields["ko_spread"],
+                cpn_spread=fields["cpn_spread"],
+                ki_spread=fields["ki_spread"],
+                call_index_code=call_code,
+                cpn_index_code=cpn_code,
+                opt_index_code=opt_code,
+                allow_autocall_on_expiry=fields["allow_autocall_on_expiry"],
+                c_mem_0=fields["c_mem_0"],
+                is_memory=fields["is_memory"],
+                autocall_coupon=fields["autocall_coupon"],
+                force_coupons_on_autocall=fields["force_coupons_on_autocall"],
+                no_notional_repayment=fields["no_notional_repayment"],
+                is_long_basket=fields["is_long_basket"],
+                option_gearing=fields["option_gearing"],
+                part_call_strike=fields["part_call_strike"],
+                part_call_rate=fields["part_call_rate"],
+                one_star_strike=fields["one_star_strike"],
+                one_star_coupon=fields["one_star_coupon"],
+                pv_in_transit=pv_in_transit,
+            )
+            sc_t = torch.from_numpy(sc_np)
+            dw_col = torch.from_numpy(dw_np)[:, -1]
+            if m_rem > 1:
+                dw_col = dw_col.contiguous()
+            return AutocallBaselineOutput(
+                f_w=torch.from_numpy(f_w_np),
+                v_w=torch.from_numpy(v_w_np),
+                h_proxy=torch.from_numpy(h_np),
+                p_proxy=torch.from_numpy(p_np),
+                survival_proxy=torch.from_numpy(surv_np),
+                q_proxy=torch.from_numpy(q_np),
+                l_put_proxy=sc_t[0],
+                proxy_delta_weights=dw_col,
+                option_pv_proxy=sc_t[1],
+                notional_pv_proxy=sc_t[2],
+                coupon_pv_proxy=sc_t[3],
+                product_value_proxy=sc_t[4],
+                l_call_proxy=sc_t[5],
+                l_onestar_proxy=sc_t[6],
+                has_unsupported_exotic_index=has_unsupported,
+                unsupported_indices=unsupported_tup,
+            )
+
+    # Differentiable PyTorch float64 path (2D single-trade or 3D batched)
+    is_batched = fp_t.ndim == 3
+    if not is_batched:
+        forward_perf = fp_t.unsqueeze(0)
+        v_perf = vp_t.unsqueeze(0)
+    else:
+        forward_perf = fp_t
+        v_perf = vp_t
+
+    b_sz, d_assets, m_rem = forward_perf.shape
+    already_autocalled = bool(fields["already_autocalled"])
+    pv_in_transit = float(fields["pv_in_transit"])
+    if m_rem == 0 or already_autocalled:
+        if is_batched:
             z_m_b = torch.zeros((b_sz, m_rem), dtype=torch.float64, device=device)
             z_s_b = torch.zeros(b_sz, dtype=torch.float64, device=device)
             pv_t_b = torch.full((b_sz,), pv_in_transit, dtype=torch.float64, device=device)
             return AutocallBaselineOutput(
                 f_w=z_m_b,
-                v_w=z_m_b,
-                h_proxy=z_m_b,
-                p_proxy=z_m_b,
-                survival_proxy=z_m_b,
-                q_proxy=z_m_b,
+                v_w=z_m_b.clone(),
+                h_proxy=z_m_b.clone(),
+                p_proxy=z_m_b.clone(),
+                survival_proxy=z_m_b.clone(),
+                q_proxy=z_m_b.clone(),
                 l_put_proxy=z_s_b,
                 proxy_delta_weights=torch.zeros((b_sz, d_assets), dtype=torch.float64, device=device),
-                option_pv_proxy=z_s_b,
-                notional_pv_proxy=z_s_b,
-                coupon_pv_proxy=z_s_b,
+                option_pv_proxy=z_s_b.clone(),
+                notional_pv_proxy=z_s_b.clone(),
+                coupon_pv_proxy=z_s_b.clone(),
                 product_value_proxy=pv_t_b,
-                l_call_proxy=z_s_b,
-                l_onestar_proxy=z_s_b,
+                l_call_proxy=z_s_b.clone(),
+                l_onestar_proxy=z_s_b.clone(),
+                has_unsupported_exotic_index=has_unsupported,
+                unsupported_indices=unsupported_tup,
             )
-
-        f_batch_b = forward_perf.transpose(1, 2).reshape(b_sz * m_rem, d_assets)
-        v_batch_b = v_perf.transpose(1, 2).reshape(b_sz * m_rem, d_assets)
-        c_batch_b = corr_matrix.unsqueeze(0).expand(b_sz * m_rem, d_assets, d_assets)
-        f_w_flat, v_w_flat, w_all_flat = stulz_margrabe_moments_with_weights(
-            f_perf=f_batch_b,
-            v_perf=v_batch_b,
-            corr=c_batch_b,
-            asset_mask=None,
-            monitoring_index=callability_index,
-        )
-        f_w = f_w_flat.view(b_sz, m_rem)
-        v_w = v_w_flat.view(b_sz, m_rem)
-        proxy_delta_weights = w_all_flat.view(b_sz, m_rem, d_assets)[:, -1, :]
-
-        z_mean_term_b = torch.zeros(b_sz, dtype=torch.float64, device=device)
-        z_std_term_b = torch.ones(b_sz, dtype=torch.float64, device=device)
-
-        if m_rem == 1:
-            ko_prob_raw_b = _digital_call_spread_prob_torch(f_w, v_w, ko_barriers.unsqueeze(0), ko_spread)
-            h_proxy = is_callable.unsqueeze(0) * ko_prob_raw_b.clamp(0.0, 1.0 - 1e-7)
-            survival_proxy = 1.0 - h_proxy
-            surv_prev = torch.ones((b_sz, 1), dtype=torch.float64, device=device)
-            p_proxy = surv_prev * h_proxy
-
-            eff_cpn_b_1 = (
-                torch.where(is_callable > 0.5, torch.minimum(cpn_barriers, ko_barriers), cpn_barriers)
-                if (
-                    force_coupons_on_autocall
-                    and cpn_barrier_direction.strip().lower() != "down"
-                    and cpn_barrier_type.strip().lower() != "out"
-                )
-                else cpn_barriers
-            )
-            cpn_prob_raw_b = _eval_coupon_prob_torch(
-                f_w,
-                v_w,
-                eff_cpn_b_1.unsqueeze(0),
-                cpn_spread,
-                direction=cpn_barrier_direction,
-                b_type=cpn_barrier_type,
-            )
-            if force_coupons_on_autocall:
-                cpn_prob_raw_b = torch.maximum(cpn_prob_raw_b, h_proxy)
-            q_proxy = torch.where(
-                is_guaranteed_cpn.unsqueeze(0) > 0.5,
-                torch.ones_like(cpn_prob_raw_b),
-                cpn_prob_raw_b,
-            )
-            f_cond_term_b = f_w[:, -1]
-            v_cond_term_b = v_w[:, -1]
-        else:
-            u_gh_b = torch.as_tensor(_U_GH32_NP, dtype=torch.float64, device=device).unsqueeze(0)
-            w_gh_b = torch.as_tensor(_W_GH32_NP, dtype=torch.float64, device=device).unsqueeze(0)
-            z_mean_b = torch.zeros(b_sz, dtype=torch.float64, device=device)
-            z_std_b = torch.ones(b_sz, dtype=torch.float64, device=device)
-            surv_cur_b = torch.ones(b_sz, dtype=torch.float64, device=device)
-
-            h_list_b: list[torch.Tensor] = []
-            p_list_b: list[torch.Tensor] = []
-            surv_list_b: list[torch.Tensor] = []
-            surv_prev_list_b: list[torch.Tensor] = []
-            q_list_b: list[torch.Tensor] = []
-            f_cond_term_b = f_w[:, -1]
-            v_cond_term_b = v_w[:, -1]
-
-            for m in range(m_rem):
-                fw_m_b = f_w[:, m].clamp(min=1e-16)
-                vw_m_b = v_w[:, m].clamp(min=1e-12)
-                f_cond_m_b = fw_m_b * torch.exp(
-                    vw_m_b * z_mean_b - 0.5 * (vw_m_b * vw_m_b) * (1.0 - z_std_b * z_std_b)
-                )
-                v_cond_m_b = (vw_m_b * z_std_b).clamp(min=1e-12)
-                if m == m_rem - 1:
-                    f_cond_term_b = f_cond_m_b
-                    v_cond_term_b = v_cond_m_b
-                    z_mean_term_b = z_mean_b
-                    z_std_term_b = z_std_b
-
-                ko_b_m = ko_barriers[m]
-                call_m_b = is_callable[m]
-                ko_raw_m_b = _digital_call_spread_prob_torch(f_cond_m_b, v_cond_m_b, ko_b_m, ko_spread)
-                h_m_b = call_m_b * ko_raw_m_b.clamp(0.0, 1.0 - 1e-7)
-                p_m_b = surv_cur_b * h_m_b
-                surv_next_b = surv_cur_b * (1.0 - h_m_b)
-
-                eff_cpn_b_m_b = (
-                    torch.minimum(cpn_barriers[m], ko_b_m)
-                    if (
-                        force_coupons_on_autocall
-                        and float(call_m_b.detach().item()) > 0.5
-                        and cpn_barrier_direction.strip().lower() != "down"
-                        and cpn_barrier_type.strip().lower() != "out"
-                    )
-                    else cpn_barriers[m]
-                )
-                q_raw_m_b = _eval_coupon_prob_torch(
-                    f_cond_m_b,
-                    v_cond_m_b,
-                    eff_cpn_b_m_b,
-                    cpn_spread,
-                    direction=cpn_barrier_direction,
-                    b_type=cpn_barrier_type,
-                )
-                if force_coupons_on_autocall:
-                    q_raw_m_b = torch.maximum(q_raw_m_b, h_m_b)
-                q_m_b = torch.where(is_guaranteed_cpn[m] > 0.5, torch.ones_like(q_raw_m_b), q_raw_m_b)
-
-                h_list_b.append(h_m_b)
-                p_list_b.append(p_m_b)
-                surv_prev_list_b.append(surv_cur_b)
-                surv_list_b.append(surv_next_b)
-                q_list_b.append(q_m_b)
-
-                if m < m_rem - 1:
-                    vw_next_b = v_w[:, m + 1].clamp(min=1e-12)
-                    r_next_b = (vw_m_b / vw_next_b).clamp(0.0, 0.9999)
-                    if float(call_m_b.detach().item()) > 0.5:
-                        mu_m_b = (torch.log(fw_m_b) - 0.5 * (vw_m_b * vw_m_b)).unsqueeze(-1)
-                        z_pts_b = z_mean_b.unsqueeze(-1) + z_std_b.unsqueeze(-1) * u_gh_b
-                        w_pts_b = torch.exp(mu_m_b + vw_m_b.unsqueeze(-1) * z_pts_b)
-                        b_lo_b = torch.minimum(ko_b_m, ko_b_m + ko_spread)
-                        b_hi_b = torch.maximum(ko_b_m, ko_b_m + ko_spread)
-                        if abs(ko_spread) <= 1e-6:
-                            ko_pts_b = torch.sigmoid((w_pts_b - ko_b_m) / 1e-3)
-                        else:
-                            ko_pts_b = ((w_pts_b - b_lo_b) / (b_hi_b - b_lo_b).clamp(min=1e-8)).clamp(0.0, 1.0)
-                        surv_wt_b = w_gh_b * (1.0 - call_m_b * ko_pts_b)
-                        sw_sum_b = surv_wt_b.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-                        p_norm_b = surv_wt_b / sw_sum_b
-                        z_post_mean_b = (p_norm_b * z_pts_b).sum(dim=-1)
-                        z_post_var_b = (
-                            (p_norm_b * ((z_pts_b - z_post_mean_b.unsqueeze(-1)) ** 2))
-                            .sum(dim=-1)
-                            .clamp(min=1e-6)
-                        )
-                        z_mean_b = r_next_b * z_post_mean_b
-                        z_std_b = torch.sqrt(r_next_b * r_next_b * z_post_var_b + (1.0 - r_next_b * r_next_b))
-                    else:
-                        z_mean_b = r_next_b * z_mean_b
-                        z_std_b = torch.sqrt(r_next_b * r_next_b * (z_std_b * z_std_b) + (1.0 - r_next_b * r_next_b))
-
-                surv_cur_b = surv_next_b
-
-            h_proxy = torch.stack(h_list_b, dim=1)
-            p_proxy = torch.stack(p_list_b, dim=1)
-            survival_proxy = torch.stack(surv_list_b, dim=1)
-            surv_prev = torch.stack(surv_prev_list_b, dim=1)
-            q_proxy = torch.stack(q_list_b, dim=1)
-
-        surv_term_b = survival_proxy[:, -1]
-
-        star_prob_b = torch.zeros(b_sz, dtype=torch.float64, device=device)
-        if one_star_strike is not None and float(one_star_strike) > 0.0:
-            f_best_b, v_best_b, _ = stulz_margrabe_moments_with_weights(
-                f_perf=forward_perf[:, :, -1],
-                v_perf=v_perf[:, :, -1],
-                corr=corr_matrix.unsqueeze(0).expand(b_sz, d_assets, d_assets),
-                asset_mask=None,
-                monitoring_index="BestOf",
-            )
-            f_best_c_b = f_best_b.clamp(min=1e-16) * torch.exp(
-                v_best_b * z_mean_term_b - 0.5 * (v_best_b * v_best_b) * (1.0 - z_std_term_b * z_std_term_b)
-            )
-            v_best_c_b = (v_best_b * z_std_term_b).clamp(min=1e-12)
-            b_star_b = torch.tensor(float(one_star_strike), dtype=torch.float64, device=device)
-            star_prob_b = _digital_call_spread_prob_torch(f_best_c_b, v_best_c_b, b_star_b, ko_spread)
-
-        if strike <= 1e-6 or option_gearing <= 0.0:
-            l_put_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
-        else:
-            put_cond_b = _conditional_ki_put_torch(
-                f_cond=f_cond_term_b,
-                v_cond=v_cond_term_b,
-                strike=strike,
-                lower_strike=float(lower_strike) if lower_strike is not None else None,
-                ki_barrier=float(ki_barrier) if ki_barrier is not None else None,
-                i_ki_past=i_ki_past,
-                ki_spread=ki_spread,
-            )
-            l_put_proxy = surv_term_b * put_cond_b * (1.0 - star_prob_b)
-
-        if part_call_strike is not None and part_call_rate > 0.0:
-            k_call_b = torch.tensor(float(part_call_strike), dtype=torch.float64, device=device)
-            l_call_proxy = surv_term_b * _black76_call_torch(f_cond_term_b, k_call_b, v_cond_term_b)
-        else:
-            l_call_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
-
-        if one_star_strike is not None and one_star_coupon > 0.0:
-            l_onestar_proxy = surv_term_b * star_prob_b * float(one_star_coupon)
-        else:
-            l_onestar_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
-
-        if no_notional_repayment:
-            notional_pv_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
-        else:
-            notional_flows_b = df_pay.unsqueeze(0) * p_proxy
-            notional_flows_term_b = notional_flows_b[:, -1] + df_pay[-1] * surv_term_b
-            if m_rem > 1:
-                notional_pv_proxy = notional_flows_b[:, :-1].sum(dim=1) + notional_flows_term_b
-            else:
-                notional_pv_proxy = notional_flows_term_b
-
-        cpn_pv_terms_b: list[torch.Tensor] = []
-        mem_acc_b = torch.full((b_sz,), c_mem_0, dtype=torch.float64, device=device)
-        for m in range(m_rem):
-            c_m_b = coupon_amounts[m]
-            eff_c_m_b = (c_m_b + mem_acc_b) if is_memory else c_m_b
-            cf_cpn_m_b = df_pay[m] * (surv_prev[:, m] * q_proxy[:, m] * eff_c_m_b + p_proxy[:, m] * autocall_coupon)
-            cpn_pv_terms_b.append(cf_cpn_m_b)
-            if is_memory:
-                mem_acc_b = eff_c_m_b * (1.0 - q_proxy[:, m])
-
-        coupon_pv_proxy = torch.stack(cpn_pv_terms_b, dim=1).sum(dim=1)
-        option_pv_proxy = df_pay[-1] * (
-            -opt_sign * option_gearing * l_put_proxy
-            + part_call_rate * l_call_proxy
-            + l_onestar_proxy
-        )
-        product_value_proxy = (
-            torch.tensor(pv_in_transit, dtype=torch.float64, device=device)
-            + notional_pv_proxy
-            + coupon_pv_proxy
-            + option_pv_proxy
-        )
-
-        return AutocallBaselineOutput(
-            f_w=f_w,
-            v_w=v_w,
-            h_proxy=h_proxy,
-            p_proxy=p_proxy,
-            survival_proxy=survival_proxy,
-            q_proxy=q_proxy,
-            l_put_proxy=l_put_proxy,
-            proxy_delta_weights=proxy_delta_weights,
-            option_pv_proxy=option_pv_proxy,
-            notional_pv_proxy=notional_pv_proxy,
-            coupon_pv_proxy=coupon_pv_proxy,
-            product_value_proxy=product_value_proxy,
-            l_call_proxy=l_call_proxy,
-            l_onestar_proxy=l_onestar_proxy,
-        )
-
-    d_assets, m_rem = forward_perf.shape
-
-    if m_rem == 0 or already_autocalled:
         z_m = torch.zeros(m_rem, dtype=torch.float64, device=device)
         z_s = torch.tensor(0.0, dtype=torch.float64, device=device)
         pv_t = torch.tensor(pv_in_transit, dtype=torch.float64, device=device)
         return AutocallBaselineOutput(
             f_w=z_m,
-            v_w=z_m,
-            h_proxy=z_m,
-            p_proxy=z_m,
-            survival_proxy=z_m,
-            q_proxy=z_m,
+            v_w=z_m.clone(),
+            h_proxy=z_m.clone(),
+            p_proxy=z_m.clone(),
+            survival_proxy=z_m.clone(),
+            q_proxy=z_m.clone(),
             l_put_proxy=z_s,
             proxy_delta_weights=torch.zeros(d_assets, dtype=torch.float64, device=device),
-            option_pv_proxy=z_s,
-            notional_pv_proxy=z_s,
-            coupon_pv_proxy=z_s,
+            option_pv_proxy=z_s.clone(),
+            notional_pv_proxy=z_s.clone(),
+            coupon_pv_proxy=z_s.clone(),
             product_value_proxy=pv_t,
-            l_call_proxy=z_s,
-            l_onestar_proxy=z_s,
+            l_call_proxy=z_s.clone(),
+            l_onestar_proxy=z_s.clone(),
+            has_unsupported_exotic_index=has_unsupported,
+            unsupported_indices=unsupported_tup,
         )
 
-    # Differentiable PyTorch path across all M_rem future periods
-    f_batch = forward_perf.transpose(0, 1).contiguous()  # (M_rem, D)
-    v_batch = v_perf.transpose(0, 1).contiguous()        # (M_rem, D)
-    c_batch = corr_matrix.unsqueeze(0).expand(m_rem, d_assets, d_assets)
-    f_w, v_w, w_all = stulz_margrabe_moments_with_weights(
-        f_perf=f_batch,
-        v_perf=v_batch,
-        corr=c_batch,
-        asset_mask=None,
-        monitoring_index=callability_index,
+    perm_seq: Optional[Sequence[int]] = (
+        fields["inv_lex_perm"].tolist()
+        if isinstance(fields["inv_lex_perm"], np.ndarray)
+        else fields["inv_lex_perm"]
     )
-    proxy_delta_weights = w_all[-1]
+    f_batch_all = forward_perf.transpose(1, 2).reshape(b_sz * m_rem, d_assets)
+    v_batch_all = v_perf.transpose(1, 2).reshape(b_sz * m_rem, d_assets)
+    c_batch_all = cm_t.unsqueeze(0).expand(b_sz * m_rem, d_assets, d_assets)
+    f_w_flat, v_w_flat, w_all_flat = stulz_margrabe_moments_with_weights(
+        f_perf=f_batch_all,
+        v_perf=v_batch_all,
+        corr=c_batch_all,
+        asset_mask=None,
+        monitoring_index=call_idx,
+        inv_lex_perm=perm_seq,
+    )
+    f_w = f_w_flat.view(b_sz, m_rem)
+    v_w = v_w_flat.view(b_sz, m_rem)
+    w_call_all = w_all_flat.view(b_sz, m_rem, d_assets)
+    proxy_delta_weights = w_call_all[:, -1, :]
 
-    z_mean_term_t = torch.tensor(0.0, dtype=torch.float64, device=device)
-    z_std_term_t = torch.tensor(1.0, dtype=torch.float64, device=device)
+    call_is_normal = 9 <= call_code <= 13
+    cpn_is_normal = 9 <= cpn_code <= 13
+    opt_is_normal = 9 <= opt_code <= 13
+    cpn_differs = cpn_code != call_code
+    opt_differs = opt_code != call_code
+    cpn_b_type: str = fields["coupon_barrier_type"]
+    cpn_b_dir: str = fields["coupon_barrier_direction"]
+    cpn_dir_down = cpn_b_dir.strip().lower() == "down"
+    cpn_type_out = cpn_b_type.strip().lower() == "out"
+    force_cpn = bool(fields["force_coupons_on_autocall"])
+    ko_spread = float(fields["ko_spread"])
+    cpn_spread = float(fields["cpn_spread"])
+    ki_spread = float(fields["ki_spread"])
 
-    if m_rem == 1:
-        ko_prob_raw = _digital_call_spread_prob_torch(f_w, v_w, ko_barriers, ko_spread)
-        h_proxy = is_callable * ko_prob_raw.clamp(0.0, 1.0 - 1e-7)
-        one_minus_h = 1.0 - h_proxy
-        survival_proxy = torch.cumprod(one_minus_h, dim=0)
-        surv_prev = torch.ones(1, dtype=torch.float64, device=device)
-        p_proxy = surv_prev * h_proxy
-
-        eff_cpn_b = (
-            torch.where(is_callable > 0.5, torch.minimum(cpn_barriers, ko_barriers), cpn_barriers)
-            if (
-                force_coupons_on_autocall
-                and cpn_barrier_direction.strip().lower() != "down"
-                and cpn_barrier_type.strip().lower() != "out"
-            )
-            else cpn_barriers
-        )
-        cpn_prob_raw = _eval_coupon_prob_torch(
-            f_w, v_w, eff_cpn_b, cpn_spread, direction=cpn_barrier_direction, b_type=cpn_barrier_type
-        )
-        if force_coupons_on_autocall:
-            cpn_prob_raw = torch.maximum(cpn_prob_raw, h_proxy)
-        q_proxy = torch.where(
-            is_guaranteed_cpn > 0.5,
-            torch.ones_like(cpn_prob_raw),
-            cpn_prob_raw,
-        )
-        f_cond_term_t = f_w[-1]
-        v_cond_term_t = v_w[-1]
-    else:
-        u_gh_t = torch.as_tensor(_U_GH32_NP, dtype=torch.float64, device=device)
-        w_gh_t = torch.as_tensor(_W_GH32_NP, dtype=torch.float64, device=device)
-        z_mean_t = torch.tensor(0.0, dtype=torch.float64, device=device)
-        z_std_t = torch.tensor(1.0, dtype=torch.float64, device=device)
-        surv_cur_t = torch.tensor(1.0, dtype=torch.float64, device=device)
-
-        h_list: list[torch.Tensor] = []
-        p_list: list[torch.Tensor] = []
-        surv_list: list[torch.Tensor] = []
-        surv_prev_list: list[torch.Tensor] = []
-        q_list: list[torch.Tensor] = []
-        f_cond_term_t = f_w[-1]
-        v_cond_term_t = v_w[-1]
-
-        for m in range(m_rem):
-            fw_m_t = f_w[m].clamp(min=1e-16)
-            vw_m_t = v_w[m].clamp(min=1e-12)
-            f_cond_m = fw_m_t * torch.exp(vw_m_t * z_mean_t - 0.5 * (vw_m_t * vw_m_t) * (1.0 - z_std_t * z_std_t))
-            v_cond_m = (vw_m_t * z_std_t).clamp(min=1e-12)
-            if m == m_rem - 1:
-                f_cond_term_t = f_cond_m
-                v_cond_term_t = v_cond_m
-                z_mean_term_t = z_mean_t
-                z_std_term_t = z_std_t
-
-            ko_b_t = ko_barriers[m]
-            call_m_t = is_callable[m]
-            ko_raw_m = _digital_call_spread_prob_torch(f_cond_m, v_cond_m, ko_b_t, ko_spread)
-            h_m_t = call_m_t * ko_raw_m.clamp(0.0, 1.0 - 1e-7)
-            p_m_t = surv_cur_t * h_m_t
-            surv_next_t = surv_cur_t * (1.0 - h_m_t)
-
-            eff_cpn_b_m = (
-                torch.minimum(cpn_barriers[m], ko_b_t)
-                if (
-                    force_coupons_on_autocall
-                    and float(call_m_t.detach().item()) > 0.5
-                    and cpn_barrier_direction.strip().lower() != "down"
-                    and cpn_barrier_type.strip().lower() != "out"
-                )
-                else cpn_barriers[m]
-            )
-            q_raw_m = _eval_coupon_prob_torch(
-                f_cond_m,
-                v_cond_m,
-                eff_cpn_b_m,
-                cpn_spread,
-                direction=cpn_barrier_direction,
-                b_type=cpn_barrier_type,
-            )
-            if force_coupons_on_autocall:
-                q_raw_m = torch.maximum(q_raw_m, h_m_t)
-            q_m_t = torch.where(is_guaranteed_cpn[m] > 0.5, torch.ones_like(q_raw_m), q_raw_m)
-
-            h_list.append(h_m_t)
-            p_list.append(p_m_t)
-            surv_prev_list.append(surv_cur_t)
-            surv_list.append(surv_next_t)
-            q_list.append(q_m_t)
-
-            if m < m_rem - 1:
-                vw_next_t = v_w[m + 1].clamp(min=1e-12)
-                r_next_t = (vw_m_t / vw_next_t).clamp(0.0, 0.9999)
-                if float(call_m_t.detach().item()) > 0.5:
-                    mu_m_t = torch.log(fw_m_t) - 0.5 * (vw_m_t * vw_m_t)
-                    z_pts = z_mean_t + z_std_t * u_gh_t
-                    w_pts = torch.exp(mu_m_t + vw_m_t * z_pts)
-                    b_lo_t = torch.minimum(ko_b_t, ko_b_t + ko_spread)
-                    b_hi_t = torch.maximum(ko_b_t, ko_b_t + ko_spread)
-                    if abs(ko_spread) <= 1e-6:
-                        ko_pts = torch.sigmoid((w_pts - ko_b_t) / 1e-3)
-                    else:
-                        ko_pts = ((w_pts - b_lo_t) / (b_hi_t - b_lo_t).clamp(min=1e-8)).clamp(0.0, 1.0)
-                    surv_wt = w_gh_t * (1.0 - call_m_t * ko_pts)
-                    sw_sum_t = surv_wt.sum().clamp(min=1e-12)
-                    p_norm_t = surv_wt / sw_sum_t
-                    z_post_mean_t = (p_norm_t * z_pts).sum()
-                    z_post_var_t = (p_norm_t * ((z_pts - z_post_mean_t) ** 2)).sum().clamp(min=1e-6)
-                    z_mean_t = r_next_t * z_post_mean_t
-                    z_std_t = torch.sqrt(r_next_t * r_next_t * z_post_var_t + (1.0 - r_next_t * r_next_t))
-                else:
-                    z_mean_t = r_next_t * z_mean_t
-                    z_std_t = torch.sqrt(r_next_t * r_next_t * (z_std_t * z_std_t) + (1.0 - r_next_t * r_next_t))
-
-            surv_cur_t = surv_next_t
-
-        h_proxy = torch.stack(h_list, dim=0)
-        p_proxy = torch.stack(p_list, dim=0)
-        survival_proxy = torch.stack(surv_list, dim=0)
-        surv_prev = torch.stack(surv_prev_list, dim=0)
-        q_proxy = torch.stack(q_list, dim=0)
-
-    # Terminal unit put loss L_{put,proxy} at m = M_rem - 1
-    surv_term = survival_proxy[-1]
-
-    star_prob_t = torch.tensor(0.0, dtype=torch.float64, device=device)
-    if one_star_strike is not None and float(one_star_strike) > 0.0:
-        f_best_t, v_best_t, _ = stulz_margrabe_moments_with_weights(
-            f_perf=f_batch[-1],
-            v_perf=v_batch[-1],
-            corr=corr_matrix,
+    if cpn_differs:
+        f_cpn_flat, v_cpn_flat, w_cpn_flat = stulz_margrabe_moments_with_weights(
+            f_perf=f_batch_all,
+            v_perf=v_batch_all,
+            corr=c_batch_all,
             asset_mask=None,
-            monitoring_index="BestOf",
+            monitoring_index=cpn_idx,
+            inv_lex_perm=perm_seq,
         )
-        f_best_c = f_best_t.clamp(min=1e-16) * torch.exp(
-            v_best_t * z_mean_term_t - 0.5 * (v_best_t * v_best_t) * (1.0 - z_std_term_t * z_std_term_t)
+        f_cpn_raw = f_cpn_flat.view(b_sz, m_rem)
+        v_cpn_raw = v_cpn_flat.view(b_sz, m_rem)
+        w_cpn_all = w_cpn_flat.view(b_sz, m_rem, d_assets)
+        rho_cc_all = _compute_cross_index_corr_torch(
+            forward_perf.transpose(1, 2),
+            v_perf.transpose(1, 2),
+            cm_t.unsqueeze(0).unsqueeze(0),
+            call_code,
+            w_call_all,
+            cpn_code,
+            w_cpn_all,
         )
-        v_best_c = (v_best_t * z_std_term_t).clamp(min=1e-12)
-        b_star_t = torch.tensor(float(one_star_strike), dtype=torch.float64, device=device)
-        star_prob_t = _digital_call_spread_prob_torch(f_best_c, v_best_c, b_star_t, ko_spread)
-
-    if strike <= 1e-6 or option_gearing <= 0.0:
-        l_put_proxy = torch.tensor(0.0, dtype=torch.float64, device=device)
     else:
-        put_cond_t = _conditional_ki_put_torch(
-            f_cond=f_cond_term_t,
-            v_cond=v_cond_term_t,
-            strike=strike,
-            lower_strike=float(lower_strike) if lower_strike is not None else None,
-            ki_barrier=float(ki_barrier) if ki_barrier is not None else None,
-            i_ki_past=i_ki_past,
-            ki_spread=ki_spread,
+        f_cpn_raw = f_w
+        v_cpn_raw = v_w
+        rho_cc_all = torch.ones((b_sz, m_rem), dtype=torch.float64, device=device)
+
+    z_mean = torch.zeros(b_sz, dtype=torch.float64, device=device)
+    z_std = torch.ones(b_sz, dtype=torch.float64, device=device)
+    surv_cur = torch.ones(b_sz, dtype=torch.float64, device=device)
+
+    h_list: List[torch.Tensor] = []
+    p_list: List[torch.Tensor] = []
+    surv_list: List[torch.Tensor] = []
+    surv_prev_list: List[torch.Tensor] = []
+    q_list: List[torch.Tensor] = []
+
+    z_mean_term = z_mean
+    z_std_term = z_std
+    f_cond_term = f_w[:, -1]
+    v_cond_term = v_w[:, -1]
+
+    for m in range(m_rem):
+        fw_m = f_w[:, m] if call_is_normal else f_w[:, m].clamp(min=1e-16)
+        vw_m = v_w[:, m].clamp(min=1e-12)
+        if m == 0:
+            f_cond_m = fw_m
+            v_cond_m = vw_m
+        elif call_is_normal:
+            f_cond_m = fw_m + vw_m * z_mean
+            v_cond_m = (vw_m * z_std).clamp(min=1e-12)
+        else:
+            f_cond_m = fw_m * torch.exp(vw_m * z_mean - 0.5 * (vw_m * vw_m) * (1.0 - z_std * z_std))
+            v_cond_m = (vw_m * z_std).clamp(min=1e-12)
+
+        if m == m_rem - 1:
+            f_cond_term = f_cond_m
+            v_cond_term = v_cond_m
+            z_mean_term = z_mean
+            z_std_term = z_std
+
+        ko_b_m = ko_t[m]
+        call_m = ic_t[m]
+        is_call_bool = bool(float(call_m.detach().item()) > 0.5)
+        if is_call_bool:
+            if call_code == 14:
+                ko_raw_m = _eval_coupon_prob_torch(
+                    f_cond_m, v_cond_m, ko_b_m, ko_spread, direction="Up", b_type="In", index_code=14
+                )
+            elif call_is_normal:
+                ko_raw_m = _digital_call_spread_normal_torch(f_cond_m, v_cond_m, ko_b_m, ko_spread)
+            else:
+                ko_raw_m = _digital_call_spread_prob_torch(f_cond_m, v_cond_m, ko_b_m, ko_spread)
+            h_m = call_m * ko_raw_m.clamp(0.0, 1.0 - 1e-7)
+        else:
+            h_m = torch.zeros(b_sz, dtype=torch.float64, device=device)
+
+        p_m = surv_cur * h_m
+        surv_next = surv_cur * (1.0 - h_m)
+
+        if cpn_differs:
+            fc_raw = f_cpn_raw[:, m]
+            vc_raw = v_cpn_raw[:, m].clamp(min=1e-12)
+            rho_cc = rho_cc_all[:, m]
+            z_mc = rho_cc * z_mean
+            z_vc = rho_cc * rho_cc * (z_std * z_std) + (1.0 - rho_cc * rho_cc)
+            z_sc = torch.sqrt(z_vc.clamp(min=1e-12))
+            if cpn_is_normal:
+                f_cpn_cond = fc_raw + vc_raw * z_mc
+                v_cpn_cond = (vc_raw * z_sc).clamp(min=1e-12)
+            else:
+                f_cpn_cond = fc_raw.clamp(min=1e-16) * torch.exp(vc_raw * z_mc - 0.5 * (vc_raw * vc_raw) * (1.0 - z_vc))
+                v_cpn_cond = (vc_raw * z_sc).clamp(min=1e-12)
+        else:
+            f_cpn_cond = f_cond_m
+            v_cpn_cond = v_cond_m
+
+        eff_cpn_b_m = (
+            torch.minimum(cb_t[m], ko_b_m)
+            if (not cpn_differs and force_cpn and is_call_bool and not cpn_dir_down and not cpn_type_out)
+            else cb_t[m]
         )
-        l_put_proxy = surv_term * put_cond_t * (1.0 - star_prob_t)
+        q_raw_m = _eval_coupon_prob_torch(
+            f_cpn_cond,
+            v_cpn_cond,
+            eff_cpn_b_m,
+            cpn_spread,
+            direction=cpn_b_dir,
+            b_type=cpn_b_type,
+            is_normal=cpn_is_normal,
+            index_code=cpn_code,
+        )
+        if force_cpn and is_call_bool:
+            q_raw_m = torch.maximum(q_raw_m, h_m)
+        q_m = torch.where(ig_t[m] > 0.5, torch.ones_like(q_raw_m), q_raw_m)
 
-    if part_call_strike is not None and part_call_rate > 0.0:
-        k_call_t = torch.tensor(float(part_call_strike), dtype=torch.float64, device=device)
-        l_call_proxy = surv_term * _black76_call_torch(f_cond_term_t, k_call_t, v_cond_term_t)
-    else:
-        l_call_proxy = torch.tensor(0.0, dtype=torch.float64, device=device)
+        h_list.append(h_m)
+        p_list.append(p_m)
+        surv_prev_list.append(surv_cur)
+        surv_list.append(surv_next)
+        q_list.append(q_m)
 
-    if one_star_strike is not None and one_star_coupon > 0.0:
-        l_onestar_proxy = surv_term * star_prob_t * float(one_star_coupon)
-    else:
-        l_onestar_proxy = torch.tensor(0.0, dtype=torch.float64, device=device)
+        if m < m_rem - 1:
+            if is_call_bool:
+                if call_is_normal:
+                    mu_u, var_u = _ramp_survival_post_moments_normal_torch(f_cond_m, v_cond_m, ko_b_m, ko_spread)
+                else:
+                    mu_u, var_u = _ramp_survival_post_moments_lognormal_torch(f_cond_m, v_cond_m, ko_b_m, ko_spread)
+                z_post_mean = z_mean + z_std * mu_u
+                z_post_var = (z_std * z_std * var_u).clamp(min=1e-12)
+            else:
+                z_post_mean = z_mean
+                z_post_var = z_std * z_std
 
-    # Assemble proxy PV components in float64
-    if no_notional_repayment:
-        notional_pv_proxy = torch.tensor(0.0, dtype=torch.float64, device=device)
+            if is_call_bool or m > 0:
+                r_next = _euler_next_corr_torch(
+                    forward_perf[:, :, m],
+                    v_perf[:, :, m].clamp(min=1e-12),
+                    w_call_all[:, m, :],
+                    forward_perf[:, :, m + 1],
+                    v_perf[:, :, m + 1].clamp(min=1e-12),
+                    w_call_all[:, m + 1, :],
+                    cm_t.unsqueeze(0),
+                    call_is_normal,
+                )
+                z_mean = r_next * z_post_mean
+                z_std = torch.sqrt((r_next * r_next * z_post_var + (1.0 - r_next * r_next)).clamp(min=1e-12))
+
+        surv_cur = surv_next
+
+    h_proxy = torch.stack(h_list, dim=1)
+    p_proxy = torch.stack(p_list, dim=1)
+    survival_proxy = torch.stack(surv_list, dim=1)
+    surv_prev = torch.stack(surv_prev_list, dim=1)
+    q_proxy = torch.stack(q_list, dim=1)
+
+    surv_term = survival_proxy[:, -1]
+    surv_prev_term = surv_prev[:, -1]
+    expiry_ko_active = bool(fields["allow_autocall_on_expiry"]) and bool(float(ic_t[-1].detach().item()) > 0.5)
+
+    if opt_differs:
+        f_opt_raw, v_opt_raw, w_opt_t = stulz_margrabe_moments_with_weights(
+            f_perf=forward_perf[:, :, -1],
+            v_perf=v_perf[:, :, -1],
+            corr=cm_t.unsqueeze(0).expand(b_sz, d_assets, d_assets),
+            asset_mask=None,
+            monitoring_index=opt_idx,
+            inv_lex_perm=perm_seq,
+        )
+        rho_co = _compute_cross_index_corr_torch(
+            forward_perf[:, :, -1],
+            v_perf[:, :, -1],
+            cm_t.unsqueeze(0),
+            call_code,
+            w_call_all[:, -1, :],
+            opt_code,
+            w_opt_t,
+        )
+        z_mo = rho_co * z_mean_term
+        z_vo = rho_co * rho_co * (z_std_term * z_std_term) + (1.0 - rho_co * rho_co)
+        z_so = torch.sqrt(z_vo.clamp(min=1e-12))
+        v_opt_r = v_opt_raw.clamp(min=1e-12)
+        if opt_is_normal:
+            f_opt_cond = f_opt_raw + v_opt_r * z_mo
+            v_opt_cond = (v_opt_r * z_so).clamp(min=1e-12)
+        else:
+            f_opt_cond = f_opt_raw.clamp(min=1e-16) * torch.exp(
+                v_opt_r * z_mo - 0.5 * (v_opt_r * v_opt_r) * (1.0 - z_vo)
+            )
+            v_opt_cond = (v_opt_r * z_so).clamp(min=1e-12)
     else:
-        notional_flows = df_pay * p_proxy
-        notional_flows_term = notional_flows[-1] + df_pay[-1] * surv_term
+        f_opt_cond = f_cond_term
+        v_opt_cond = v_cond_term
+
+    strike = float(fields["strike"])
+    option_gearing = float(fields["option_gearing"])
+    lower_strike_val = float(fields["lower_strike"])
+    ki_barrier_val = float(fields["ki_barrier"])
+    has_active_ki = bool(fields["has_ki"]) and (float(fields["i_ki_past"]) < 0.5)
+    one_star_strike = float(fields["one_star_strike"])
+    one_star_coupon = float(fields["one_star_coupon"])
+    part_call_strike = float(fields["part_call_strike"])
+    part_call_rate = float(fields["part_call_rate"])
+    ko_b_term = float(ko_t[-1].detach().item())
+
+    if one_star_strike > 0.0:
+        f_ot_c = forward_perf[:, :, -1]
+        v_ot_c = v_perf[:, :, -1]
         if m_rem > 1:
-            notional_pv_proxy = notional_flows[:-1].sum() + notional_flows_term
+            wc_term = w_call_all[:, -1, :]
+            wi_c = wc_term * f_ot_c if call_is_normal else wc_term
+            c_exp = cm_t.unsqueeze(0)
+            vc_n2 = (
+                wi_c.unsqueeze(-1) * wi_c.unsqueeze(-2) * c_exp * v_ot_c.unsqueeze(-1) * v_ot_c.unsqueeze(-2)
+            ).sum(dim=(-2, -1)).clamp(min=1e-30)
+            vc_n = torch.sqrt(vc_n2).unsqueeze(-1)
+            cov_i = (
+                c_exp * v_ot_c.unsqueeze(-1) * (v_ot_c * wi_c).unsqueeze(-2)
+            ).sum(dim=-1)
+            v_r = v_ot_c.clamp(min=1e-12)
+            rho_ic = (cov_i / (v_r * vc_n)).clamp(-0.9999, 0.9999)
+            z_mc = rho_ic * z_mean_term.unsqueeze(-1)
+            z_vc = rho_ic * rho_ic * (z_std_term * z_std_term).unsqueeze(-1) + (1.0 - rho_ic * rho_ic)
+            f_ot_c = f_ot_c.clamp(min=1e-16) * torch.exp(
+                v_r * z_mc - 0.5 * (v_r * v_r) * (1.0 - z_vc)
+            )
+            v_ot_c = (v_r * torch.sqrt(z_vc.clamp(min=1e-12))).clamp(min=1e-12)
+        use_direct_ko = expiry_ko_active and not opt_differs
+        l_put_proxy, l_onestar_proxy = _eval_1factor_onestar_torch(
+            f_ot_c,
+            v_ot_c,
+            cm_t,
+            strike,
+            lower_strike_val,
+            has_active_ki,
+            ki_barrier_val,
+            ki_spread,
+            use_direct_ko,
+            ko_b_term,
+            ko_spread,
+            one_star_strike,
+            one_star_coupon,
+            surv_term,
+            surv_prev_term,
+            option_gearing,
+        )
+    else:
+        l_onestar_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
+        if strike <= 1e-6 or option_gearing <= 0.0:
+            l_put_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
+        else:
+            use_direct_ko = expiry_ko_active and not opt_differs
+            surv_mult = surv_prev_term if use_direct_ko else surv_term
+            put_cond = _exact_piecewise_terminal_put_torch(
+                f_opt_cond,
+                v_opt_cond,
+                opt_is_normal,
+                strike,
+                lower_strike_val,
+                has_active_ki,
+                ki_barrier_val,
+                ki_spread,
+                use_direct_ko,
+                ko_b_term,
+                ko_spread,
+            )
+            l_put_proxy = surv_mult * put_cond
+
+    if part_call_strike > 0.0 and part_call_rate > 0.0:
+        use_direct_ko_c = expiry_ko_active and not opt_differs
+        surv_mult_c = surv_prev_term if use_direct_ko_c else surv_term
+        l_call_proxy = surv_mult_c * _exact_piecewise_terminal_call_torch(
+            f_opt_cond,
+            v_opt_cond,
+            opt_is_normal,
+            part_call_strike,
+            use_direct_ko_c,
+            ko_b_term,
+            ko_spread,
+        )
+    else:
+        l_call_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
+
+    if bool(fields["no_notional_repayment"]):
+        notional_pv_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
+    else:
+        notional_flows = df_t.unsqueeze(0) * p_proxy
+        notional_flows_term = notional_flows[:, -1] + df_t[-1] * surv_term
+        if m_rem > 1:
+            notional_pv_proxy = notional_flows[:, :-1].sum(dim=1) + notional_flows_term
         else:
             notional_pv_proxy = notional_flows_term
 
-    # Memory coupon accumulation across future periods under proxy probabilities
-    cpn_pv_terms: list[torch.Tensor] = []
-    mem_acc = torch.tensor(c_mem_0, dtype=torch.float64, device=device)
+    cpn_pv_terms: List[torch.Tensor] = []
+    mem_acc = torch.full((b_sz,), float(fields["c_mem_0"]), dtype=torch.float64, device=device)
+    is_memory = bool(fields["is_memory"])
+    autocall_coupon = float(fields["autocall_coupon"])
     for m in range(m_rem):
-        c_m_t = coupon_amounts[m]
+        c_m_t = cr_t[m]
         eff_c_m_t = (c_m_t + mem_acc) if is_memory else c_m_t
-        cf_cpn_m = df_pay[m] * (surv_prev[m] * q_proxy[m] * eff_c_m_t + p_proxy[m] * autocall_coupon)
+        cf_cpn_m = df_t[m] * (surv_prev[:, m] * q_proxy[:, m] * eff_c_m_t + p_proxy[:, m] * autocall_coupon)
         cpn_pv_terms.append(cf_cpn_m)
         if is_memory:
-            mem_acc = eff_c_m_t * (1.0 - q_proxy[m])
+            mem_acc = eff_c_m_t * (1.0 - q_proxy[:, m])
 
-    coupon_pv_proxy = torch.stack(cpn_pv_terms).sum()
-    option_pv_proxy = df_pay[-1] * (
-        -opt_sign * option_gearing * l_put_proxy
-        + part_call_rate * l_call_proxy
-        + l_onestar_proxy
+    coupon_pv_proxy = torch.stack(cpn_pv_terms, dim=1).sum(dim=1)
+    opt_sign = -1.0 if bool(fields["is_long_basket"]) else 1.0
+    option_pv_proxy = df_t[-1] * (
+        -opt_sign * option_gearing * l_put_proxy + part_call_rate * l_call_proxy + l_onestar_proxy
     )
     product_value_proxy = (
         torch.tensor(pv_in_transit, dtype=torch.float64, device=device)
@@ -1779,6 +2840,26 @@ def compute_analytical_autocall_baseline(
         + coupon_pv_proxy
         + option_pv_proxy
     )
+
+    if not is_batched:
+        return AutocallBaselineOutput(
+            f_w=f_w.squeeze(0),
+            v_w=v_w.squeeze(0),
+            h_proxy=h_proxy.squeeze(0),
+            p_proxy=p_proxy.squeeze(0),
+            survival_proxy=survival_proxy.squeeze(0),
+            q_proxy=q_proxy.squeeze(0),
+            l_put_proxy=l_put_proxy.squeeze(0),
+            proxy_delta_weights=proxy_delta_weights.squeeze(0),
+            option_pv_proxy=option_pv_proxy.squeeze(0),
+            notional_pv_proxy=notional_pv_proxy.squeeze(0),
+            coupon_pv_proxy=coupon_pv_proxy.squeeze(0),
+            product_value_proxy=product_value_proxy.squeeze(0),
+            l_call_proxy=l_call_proxy.squeeze(0),
+            l_onestar_proxy=l_onestar_proxy.squeeze(0),
+            has_unsupported_exotic_index=has_unsupported,
+            unsupported_indices=unsupported_tup,
+        )
 
     return AutocallBaselineOutput(
         f_w=f_w,
@@ -1795,6 +2876,8 @@ def compute_analytical_autocall_baseline(
         product_value_proxy=product_value_proxy,
         l_call_proxy=l_call_proxy,
         l_onestar_proxy=l_onestar_proxy,
+        has_unsupported_exotic_index=has_unsupported,
+        unsupported_indices=unsupported_tup,
     )
 
 
