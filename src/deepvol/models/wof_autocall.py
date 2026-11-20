@@ -11,10 +11,11 @@ Mathematical References:
   - Glasserman, P. (2004). Monte Carlo Methods in Financial Engineering. Springer.
 """
 
+from __future__ import annotations
+
 from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor
-from deepvol.models.autocall import price_autocall_mc
 
 
 @torch.compile(mode="default", dynamic=True)

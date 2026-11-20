@@ -1,30 +1,18 @@
-"""seasoned_collapser.py — Seasoned Schedule Partitioning & Markovian State Collapse (Task 1.1a).
-
-Implements SPEC-DEEPVOL-EQ-AUTOCALL-001 §1.1 & §1.2.B in strict IEEE-754 float64 precision:
-  - Partitions observation/payment schedule (t_m, T_m) relative to AsOfDate t_0 into:
-      * Settled (T_m <= t_0)
-      * In-Transit (t_m <= t_0 < T_m)
-      * Future (t_m > t_0)
-  - Reconstructs historical basket performances W_{t_m} from Fixings across all 14 Murex
-    monitoring index functionals.
-  - Collapses path history into Markovian sufficient statistics at t_0:
-      * Lexicographical asset canonicalization permutation pi_lex and inverse pi_lex^{-1}
-      * Differentiable seasoned spot moneyness M_{0,i} = S_i(t_0) / S_i(0) in torch.float64
-      * Accumulated unpaid Phoenix memory coupon buffer C_{mem,0}
-      * Historical knock-in breach indicator I_{KI,past} in {0.0, 1.0}
-  - Normalizes sentinel lock-out barriers (B_KO >= 10.0 -> c_{call,m} = 0.0, ln min(B_KO, 3.0))
-    and guaranteed coupon sentinels (B_cpn <= 1e-3 -> is_guaranteed = 1.0).
-"""
+"""Seasoned schedule partitioning, historical fixing collapse, and Markovian state construction."""
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
 import torch
+
+from deepvol.market.eq_curves import year_fraction as _eq_year_fraction
+from deepvol.models.autocall.feature_layout import PAIR_ORDER_DEPENDENT_INDICES
 
 
 def _to_utc_datetime(dt_or_str: datetime | date | str) -> datetime:
@@ -39,7 +27,7 @@ def _to_utc_datetime(dt_or_str: datetime | date | str) -> datetime:
         s = dt_or_str.strip()
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
-        parsed = datetime.fromisoformat(s)
+        parsed = datetime.datetime.fromisoformat(s) if hasattr(datetime, "datetime") else datetime.fromisoformat(s)
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
@@ -57,27 +45,8 @@ def _year_fraction(
     d2: datetime | date | str,
     dcc: str = "Act365",
 ) -> float:
-    """Computes day-count fraction between d1 and d2 in float64."""
-    dt1 = _to_utc_datetime(d1)
-    dt2 = _to_utc_datetime(d2)
-    days = float((dt2 - dt1).total_seconds() / 86400.0)
-    dcc_norm = dcc.upper().replace("/", "").replace("_", "").replace("-", "")
-    if dcc_norm in ("ACT360", "ACTUAL360"):
-        return days / 360.0
-    if dcc_norm in ("ACT365", "ACT365F", "ACTUAL365", "ACT365FIXED"):
-        return days / 365.0
-    if dcc_norm in ("ACT252", "BUS252", "BUSINESS252"):
-        bus_days = float(np.busday_count(dt1.date(), dt2.date()))
-        return bus_days / 252.0
-    if dcc_norm in ("30360", "30E360", "THIRTY360", "30360ISDA"):
-        y1, m1, day1 = dt1.year, dt1.month, min(dt1.day, 30)
-        y2, m2, day2 = dt2.year, dt2.month, min(dt2.day, 30)
-        return float(360 * (y2 - y1) + 30 * (m2 - m1) + (day2 - day1)) / 360.0
-    if dcc_norm in ("ACT364",):
-        return days / 364.0
-    if dcc_norm in ("ACT366",):
-        return days / 366.0
-    return days / 365.0
+    """Computes day-count fraction between d1 and d2 in float64 via canonical eq_curves."""
+    return float(_eq_year_fraction(_to_utc_datetime(d1), _to_utc_datetime(d2), dcc))
 
 
 @dataclass(frozen=True)
@@ -112,7 +81,7 @@ class CashFlowItem:
 
 @dataclass(frozen=True)
 class SentinelBarrierResult:
-    """Normalized barrier schedule features after sentinel lock-out & guaranteed coupon handling."""
+    """Normalized barrier schedule features after sentinel lock-out and guaranteed coupon handling."""
 
     ko_barriers_raw: npt.NDArray[np.float64]
     cpn_barriers_raw: npt.NDArray[np.float64]
@@ -190,18 +159,13 @@ class SeasonedScheduleState:
         default_factory=lambda: np.empty(0, dtype=np.float64)
     )
     sentinel_barriers: SentinelBarrierResult | None = None
+    cash_to_settle_today: float = 0.0
 
 
 def canonicalize_asset_order(
     identifiers: Sequence[str],
 ) -> tuple[list[str], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
-    """Sorts UnderlyingIdentifiers into strict ASCII lexicographical order.
-
-    Returns:
-        sorted_identifiers: Lexicographically sorted ticker strings.
-        lex_perm: Permutation array pi_lex such that [identifiers[i] for i in lex_perm] == sorted_identifiers.
-        inv_lex_perm: Inverse permutation array pi_lex^{-1} such that sorted_arr[inv_lex_perm] restores original order.
-    """
+    """Sorts UnderlyingIdentifiers into strict ASCII lexicographical order."""
     n = len(identifiers)
     if n == 0:
         raise ValueError("UnderlyingIdentifiers must be non-empty.")
@@ -215,22 +179,18 @@ def canonicalize_asset_order(
 def evaluate_monitoring_index_np(
     perf: npt.NDArray[np.float64],
     index_name: str = "WorstOf",
+    inv_lex_perm: npt.NDArray[np.int64] | Sequence[int] | None = None,
 ) -> npt.NDArray[np.float64] | float:
-    """Evaluates any of the 14 Murex basket performance functionals along the last axis in float64.
-
-    Args:
-        perf: Array of individual asset performances P_i(t) = S_i(t) / S_i(0) with shape (..., D).
-        index_name: Murex MonitoringIndex name.
-
-    Returns:
-        Scalar float if input is 1D (D,), else float64 ndarray of shape (...).
-    """
+    """Evaluates any of the Murex basket performance functionals along the last axis in float64."""
     p = np.asarray(perf, dtype=np.float64)
     scalar_input = p.ndim == 1
     if scalar_input:
         p = p[None, :]
 
     idx = index_name.strip()
+    if inv_lex_perm is not None and idx in PAIR_ORDER_DEPENDENT_INDICES:
+        p = p[..., np.asarray(inv_lex_perm, dtype=np.int64)]
+
     if idx == "WorstOf" or idx == "Lookback":
         out = np.min(p, axis=-1)
     elif idx == "BestOf":
@@ -240,39 +200,27 @@ def evaluate_monitoring_index_np(
     elif idx == "Dispersion":
         mean_p = np.mean(p, axis=-1, keepdims=True)
         out = np.sqrt(np.mean((p - mean_p) ** 2, axis=-1))
-    elif idx in ("RatioBestWorst",):
+    elif idx == "RatioBestWorst":
         out = np.max(p, axis=-1) / np.maximum(np.min(p, axis=-1), 1e-12)
-    elif idx in ("RatioBestAverage",):
+    elif idx == "RatioBestAverage":
         out = np.max(p, axis=-1) / np.maximum(np.mean(p, axis=-1), 1e-12)
-    elif idx in ("RatioAverageWorst",):
+    elif idx == "RatioAverageWorst":
         out = np.mean(p, axis=-1) / np.maximum(np.min(p, axis=-1), 1e-12)
     elif idx in ("DiffBestWorst", "Rainbow"):
         out = np.max(p, axis=-1) - np.min(p, axis=-1)
-    elif idx in ("DiffBestAverage",):
+    elif idx == "DiffBestAverage":
         out = np.max(p, axis=-1) - np.mean(p, axis=-1)
-    elif idx in ("DiffAverageWorst",):
+    elif idx == "DiffAverageWorst":
         out = np.mean(p, axis=-1) - np.min(p, axis=-1)
-    elif idx in ("RatioAB",):
-        if p.shape[-1] < 2:
-            out = p[..., 0]
-        else:
-            out = p[..., 0] / np.maximum(p[..., 1], 1e-12)
-    elif idx in ("RatioBA",):
-        if p.shape[-1] < 2:
-            out = p[..., 0]
-        else:
-            out = p[..., 1] / np.maximum(p[..., 0], 1e-12)
+    elif idx == "RatioAB":
+        out = p[..., 0] if p.shape[-1] < 2 else p[..., 0] / np.maximum(p[..., 1], 1e-12)
+    elif idx == "RatioBA":
+        out = p[..., 0] if p.shape[-1] < 2 else p[..., 1] / np.maximum(p[..., 0], 1e-12)
     elif idx in ("DiffAB", "Outperformance", "Spread"):
-        if p.shape[-1] < 2:
-            out = p[..., 0]
-        else:
-            out = p[..., 0] - p[..., 1]
-    elif idx in ("DiffBA",):
-        if p.shape[-1] < 2:
-            out = p[..., 0]
-        else:
-            out = p[..., 1] - p[..., 0]
-    elif idx in ("TwinWin",):
+        out = p[..., 0] if p.shape[-1] < 2 else p[..., 0] - p[..., 1]
+    elif idx == "DiffBA":
+        out = p[..., 0] if p.shape[-1] < 2 else p[..., 1] - p[..., 0]
+    elif idx == "TwinWin":
         w_min = np.min(p, axis=-1)
         out = np.where(w_min < 1.0, 2.0 - w_min, w_min)
     else:
@@ -288,18 +236,17 @@ def evaluate_monitoring_index_torch(
     perf: torch.Tensor,
     index_name: str = "WorstOf",
     asset_mask: torch.Tensor | None = None,
+    inv_lex_perm: torch.Tensor | Sequence[int] | None = None,
 ) -> torch.Tensor:
-    """Differentiable torch.float64 evaluation of the 14 Murex basket performance functionals.
-
-    Args:
-        perf: Tensor of shape (..., D) in torch.float64.
-        index_name: Murex MonitoringIndex name.
-        asset_mask: Optional binary mask of shape (..., D) where 1.0 indicates an active asset.
-
-    Returns:
-        Tensor of shape (...) in torch.float64.
-    """
+    """Differentiable torch.float64 evaluation of the Murex basket performance functionals."""
     p = perf.to(dtype=torch.float64)
+    idx = index_name.strip()
+    if inv_lex_perm is not None and idx in PAIR_ORDER_DEPENDENT_INDICES:
+        perm_t = torch.as_tensor(inv_lex_perm, dtype=torch.long, device=p.device)
+        p = p.index_select(-1, perm_t)
+        if asset_mask is not None:
+            asset_mask = asset_mask.index_select(-1, perm_t)
+
     if asset_mask is None:
         mask = torch.ones_like(p, dtype=torch.float64)
     else:
@@ -310,7 +257,6 @@ def evaluate_monitoring_index_torch(
     p_for_max = torch.where(mask > 0.5, p, torch.full_like(p, -1e12))
     p_mean = (p * mask).sum(dim=-1) / active_count
 
-    idx = index_name.strip()
     if idx in ("WorstOf", "Lookback"):
         return torch.min(p_for_min, dim=-1).values
     if idx == "BestOf":
@@ -357,14 +303,7 @@ def normalize_sentinel_barriers(
     guaranteed_cpn_threshold: float = 1e-3,
     min_cpn_feature_level: float = 0.05,
 ) -> SentinelBarrierResult:
-    """Normalizes sentinel lock-out autocall barriers (e.g. 500.0) and guaranteed coupon barriers (1e-5).
-
-    Per SPEC-DEEPVOL-EQ-AUTOCALL-001 §1.1.3 & §1.3.A:
-      - Any period m with B_KO(t_m) >= 10.0 (or m == M_rem - 1 when allow_autocall_on_expiry is False)
-        gets is_callable[m] = 0.0 and clamped feature ln(min(B_KO(t_m), 3.0)).
-      - Any period m with B_cpn(t_m) <= 1e-3 gets is_guaranteed_cpn[m] = 1.0 and
-        clamped feature ln(max(B_cpn(t_m), 0.05)).
-    """
+    """Normalizes sentinel lock-out autocall barriers and guaranteed coupon barriers."""
     ko_arr = np.asarray(ko_barriers, dtype=np.float64).copy()
     cpn_arr = np.asarray(cpn_barriers, dtype=np.float64).copy()
     m_len = len(ko_arr)
@@ -375,10 +314,7 @@ def normalize_sentinel_barriers(
 
     is_callable = (ko_arr < sentinel_ko_threshold).astype(np.float64)
     if includes_expiry_period and m_len > 0 and not allow_autocall_on_expiry:
-        # Note: in Murex requests where AllowAutocallOnExpiry is omitted/False, the final period
-        # either already has B_KO = 500.0 or cannot early-redeem as an autocall.
-        if ko_arr[-1] >= sentinel_ko_threshold or not allow_autocall_on_expiry:
-            is_callable[-1] = 0.0
+        is_callable[-1] = 0.0
 
     ko_clamped = np.clip(ko_arr, 1e-4, max_ko_feature_level)
     log_ko_feat = np.log(ko_clamped).astype(np.float64)
@@ -397,27 +333,102 @@ def normalize_sentinel_barriers(
     )
 
 
-def _lookup_fixing_value(
-    fixing_dates: Sequence[datetime],
-    fixing_values: Sequence[float],
-    target_date: datetime,
-) -> float:
-    """Finds the fixing value for an asset on target_date (matching by UTC calendar date)."""
+_IndexedFixing = Tuple[dict[date, float], list[int], list[float]]
+
+
+def _build_fixing_index(raw_dates: Sequence[Any], raw_vals: Sequence[Any]) -> _IndexedFixing:
+    date_map: dict[date, float] = {}
+    pairs: list[Tuple[int, float]] = []
+    for d, v in zip(raw_dates, raw_vals):
+        d_date = _to_utc_datetime(d).date()
+        f_val = float(v)
+        if d_date not in date_map:
+            date_map[d_date] = f_val
+        pairs.append((d_date.toordinal(), f_val))
+    pairs.sort(key=lambda item: item[0])
+    return date_map, [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+def _lookup_fixing_indexed(indexed: _IndexedFixing, target_date: datetime) -> float:
+    date_map, sorted_ords, sorted_vals = indexed
     target_d = target_date.date()
-    for d, val in zip(fixing_dates, fixing_values):
-        if _to_utc_datetime(d).date() == target_d:
-            return float(val)
-    # Fallback: nearest past fixing on or before target_date within 5 days
-    best_val: float | None = None
-    best_diff = 999999
-    for d, val in zip(fixing_dates, fixing_values):
-        diff = (target_d - _to_utc_datetime(d).date()).days
-        if 0 <= diff < best_diff:
-            best_diff = diff
-            best_val = float(val)
-    if best_val is not None and best_diff <= 7:
-        return best_val
-    raise KeyError(f"Missing historical fixing for observation date {target_date.date().isoformat()}.")
+    exact = date_map.get(target_d)
+    if exact is not None:
+        return exact
+    target_ord = target_d.toordinal()
+    pos = bisect_right(sorted_ords, target_ord) - 1
+    if pos >= 0 and (target_ord - sorted_ords[pos]) <= 7:
+        return sorted_vals[pos]
+    raise KeyError(f"Missing historical fixing for observation date {target_d.isoformat()}.")
+
+
+def _lookup_fixing_optional(indexed: _IndexedFixing | None, target_date: datetime) -> float | None:
+    if indexed is None or not indexed[1]:
+        return None
+    date_map, sorted_ords, sorted_vals = indexed
+    target_d = target_date.date()
+    exact = date_map.get(target_d)
+    if exact is not None:
+        return exact
+    target_ord = target_d.toordinal()
+    pos = bisect_right(sorted_ords, target_ord) - 1
+    if pos >= 0 and (target_ord - sorted_ords[pos]) <= 7:
+        return sorted_vals[pos]
+    return None
+
+
+def _extract_fixings_entry(f_obj: Any) -> _IndexedFixing:
+    if isinstance(f_obj, Mapping):
+        raw_dates = f_obj.get("Dates", f_obj.get("dates", []))
+        raw_vals = f_obj.get("Values", f_obj.get("values", []))
+    else:
+        raw_dates = getattr(f_obj, "Dates", getattr(f_obj, "dates", []))
+        raw_vals = getattr(f_obj, "Values", getattr(f_obj, "values", []))
+    return _build_fixing_index(raw_dates, raw_vals)
+
+
+def _eval_terminal_option_payoff(
+    *,
+    perf_m: npt.NDArray[np.float64],
+    w_opt: float,
+    strike: float,
+    lower_strike: float | None,
+    option_gearing: float,
+    ki_barrier: float | None,
+    i_ki_past: float,
+    is_long_basket: bool,
+    participation_call_strike: float | None,
+    participation_call_rate: float,
+    one_star_strike: float | None,
+    one_star_coupon: float,
+) -> float:
+    """Evaluates deterministic terminal Option payoff from observed expiry performances."""
+    opt_paid = 0.0
+    if strike > 1e-6 and option_gearing > 0.0:
+        put_intrinsic = max(float(strike) - w_opt, 0.0)
+        if lower_strike is not None and float(lower_strike) > 0.0:
+            put_intrinsic = min(put_intrinsic, max(float(strike) - float(lower_strike), 0.0))
+        if ki_barrier is not None and float(ki_barrier) > 0.0 and i_ki_past < 0.5:
+            if w_opt >= float(ki_barrier):
+                put_intrinsic = 0.0
+        if one_star_strike is not None and float(one_star_strike) > 0.0:
+            w_best = float(evaluate_monitoring_index_np(perf_m, "BestOf"))
+            if w_best >= float(one_star_strike):
+                put_intrinsic = 0.0
+        put_sign = 1.0 if is_long_basket else -1.0
+        opt_paid += put_sign * float(option_gearing) * put_intrinsic
+
+    if participation_call_strike is not None and float(participation_call_rate) > 0.0:
+        opt_paid += float(participation_call_rate) * max(
+            w_opt - float(participation_call_strike), 0.0
+        )
+
+    if one_star_strike is not None and float(one_star_coupon) > 0.0:
+        w_best = float(evaluate_monitoring_index_np(perf_m, "BestOf"))
+        if w_best >= float(one_star_strike):
+            opt_paid += float(one_star_coupon)
+
+    return float(opt_paid)
 
 
 def collapse_seasoned_schedule(
@@ -431,8 +442,8 @@ def collapse_seasoned_schedule(
     spots_t0: Mapping[str, float] | Sequence[float] | torch.Tensor,
     ko_barriers: Sequence[float],
     cpn_barriers: Sequence[float] | None = None,
-    fixed_coupon_amount: float | None = None,
-    fixed_rate: float | None = None,
+    fixed_coupon_amount: float | Sequence[float] | None = None,
+    fixed_rate: float | Sequence[float] | None = None,
     coupon_amounts: Sequence[float] | None = None,
     day_count_convention: str = "Act360",
     time_day_count_convention: str = "Act365",
@@ -449,12 +460,19 @@ def collapse_seasoned_schedule(
     no_notional_repayment: bool = False,
     payment_currency: str = "RUB",
     df_pay_fn: Callable[[datetime], float] | None = None,
+    coupon_barrier_type: str = "In",
+    coupon_barrier_direction: str = "Up",
+    strike: float = 0.90,
+    option_gearing: float = 1.0,
+    lower_strike: float | None = None,
+    is_long_basket: bool = False,
+    participation_call_strike: float | None = None,
+    participation_call_rate: float = 0.0,
+    one_star_strike: float | None = None,
+    one_star_coupon: float = 0.0,
+    funding_leg: Mapping[str, Any] | None = None,
 ) -> SeasonedScheduleState:
-    """Partitions the observation schedule relative to AsOfDate and collapses past fixings.
-
-    Executes entirely in IEEE-754 float64 precision (REM-S0-01) and preserves PyTorch autograd
-    differentiability of `moneyness_t0` with respect to `spots_t0`.
-    """
+    """Partitions the observation schedule relative to AsOfDate and collapses past fixings in float64."""
     t0_dt = _to_utc_datetime(as_of_date)
     start_dt = _to_utc_datetime(start_date)
     obs_dts = [_to_utc_datetime(d) for d in observation_dates]
@@ -472,7 +490,6 @@ def collapse_seasoned_schedule(
     ref_spots_sorted = ref_spots_orig[lex_perm]
     ref_spots_t = torch.as_tensor(ref_spots_sorted, dtype=torch.float64)
 
-    # Construct spots_t0 tensor in canonical sorted order while preserving autograd graph
     if isinstance(spots_t0, torch.Tensor):
         if spots_t0.dtype != torch.float64:
             spots_t0 = spots_t0.to(dtype=torch.float64)
@@ -486,19 +503,36 @@ def collapse_seasoned_schedule(
         spots_arr = np.asarray(spots_t0, dtype=np.float64)[lex_perm]
         spots_sorted_t = torch.as_tensor(spots_arr, dtype=torch.float64)
 
-    moneyness_t0 = spots_sorted_t / ref_spots_t
+    moneyness_t0 = spots_sorted_t / ref_spots_t.clamp(min=1e-12)
 
-    # Build per-period coupon amounts c_m
+    # Build per-period coupon amounts c_m supporting scalar and sequence inputs
     if coupon_amounts is not None:
         cpn_rates = np.asarray(coupon_amounts, dtype=np.float64)
     elif fixed_coupon_amount is not None:
-        cpn_rates = np.full(m_total, float(fixed_coupon_amount), dtype=np.float64)
+        if isinstance(fixed_coupon_amount, Sequence) and not isinstance(fixed_coupon_amount, (str, bytes)):
+            if len(fixed_coupon_amount) != m_total:
+                raise ValueError(
+                    f"FixedCouponAmount length ({len(fixed_coupon_amount)}) != number of periods ({m_total})."
+                )
+            cpn_rates = np.asarray(fixed_coupon_amount, dtype=np.float64)
+        else:
+            cpn_rates = np.full(m_total, float(fixed_coupon_amount), dtype=np.float64)
     elif fixed_rate is not None:
         cpn_rates = np.empty(m_total, dtype=np.float64)
+        rate_seq: list[float] | None = (
+            [float(x) for x in fixed_rate]
+            if isinstance(fixed_rate, Sequence) and not isinstance(fixed_rate, (str, bytes))
+            else None
+        )
+        if rate_seq is not None and len(rate_seq) != m_total:
+            raise ValueError(
+                f"FixedRate length ({len(rate_seq)}) != number of periods ({m_total})."
+            )
         prev_d = start_dt
         for m in range(m_total):
             dcf_m = _year_fraction(prev_d, pay_dts[m], day_count_convention)
-            cpn_rates[m] = float(fixed_rate) * dcf_m
+            rate_m = rate_seq[m] if rate_seq is not None else float(fixed_rate)  # type: ignore[arg-type]
+            cpn_rates[m] = rate_m * dcf_m
             prev_d = pay_dts[m]
     else:
         cpn_rates = np.zeros(m_total, dtype=np.float64)
@@ -511,22 +545,46 @@ def collapse_seasoned_schedule(
 
     eff_cpn_index = coupon_index if coupon_index else callability_index
     eff_opt_index = option_index if option_index else callability_index
+    type_out = coupon_barrier_type.strip().lower() == "out"
+    dir_down = coupon_barrier_direction.strip().lower() == "down"
 
-    # Parse Fixings dictionary in sorted_ids order
-    parsed_fixings: dict[str, tuple[list[datetime], list[float]]] = {}
+    # Pre-index Fixings dictionary for O(1) lookup
+    indexed_fixings: dict[str, _IndexedFixing] = {}
     if fixings:
         for ticker in sorted_ids:
             if ticker in fixings:
-                f_obj = fixings[ticker]
-                if isinstance(f_obj, Mapping):
-                    f_dates = [_to_utc_datetime(x) for x in f_obj.get("Dates", f_obj.get("dates", []))]
-                    f_vals = [float(x) for x in f_obj.get("Values", f_obj.get("values", []))]
-                else:
-                    raw_dates = getattr(f_obj, "Dates", getattr(f_obj, "dates", []))
-                    raw_vals = getattr(f_obj, "Values", getattr(f_obj, "values", []))
-                    f_dates = [_to_utc_datetime(x) for x in raw_dates]
-                    f_vals = [float(x) for x in raw_vals]
-                parsed_fixings[ticker] = (f_dates, f_vals)
+                indexed_fixings[ticker] = _extract_fixings_entry(fixings[ticker])
+
+    # Precompute past/in-transit FundingLeg amounts mapped to product periods
+    past_funding_by_period: dict[int, float] = {}
+    if funding_leg is not None and m_total > 0:
+        f_rid = funding_leg.get("rate_identifier")
+        f_spread = float(funding_leg.get("funding_spread", 0.0) or 0.0)
+        f_dates = [_to_utc_datetime(d) for d in funding_leg.get("payment_dates", [])]
+        rate_fix_idx: _IndexedFixing | None = None
+        if f_rid is not None and fixings and f_rid in fixings:
+            rate_fix_idx = _extract_fixings_entry(fixings[f_rid])
+        f_curve = funding_leg.get("funding_curve")
+        prev_f_dt = start_dt
+        for f_dt in f_dates:
+            if f_dt > pay_dts[-1] and f_dt > t0_dt:
+                break
+            if f_dt <= t0_dt:
+                alpha_j = _year_fraction(prev_f_dt, f_dt, day_count_convention)
+                r_fix = _lookup_fixing_optional(rate_fix_idx, prev_f_dt) if f_rid is not None else 0.0
+                if r_fix is None and f_rid is not None:
+                    r_fix = _lookup_fixing_optional(rate_fix_idx, f_dt)
+                if r_fix is None and f_rid is not None and f_curve is not None and hasattr(f_curve, "zero_rate"):
+                    r_fix = float(f_curve.zero_rate(f_dt)) if f_dt > t0_dt else 0.0
+                r_val = float(r_fix or 0.0)
+                amt_j = (r_val + f_spread) * alpha_j
+                m_idx = m_total - 1
+                for m_cand in range(m_total):
+                    if pay_dts[m_cand] >= f_dt:
+                        m_idx = m_cand
+                        break
+                past_funding_by_period[m_idx] = past_funding_by_period.get(m_idx, 0.0) + amt_j
+            prev_f_dt = f_dt
 
     settled_indices: list[int] = []
     in_transit_indices: list[int] = []
@@ -560,8 +618,9 @@ def collapse_seasoned_schedule(
         # Reconstruct fixing performances at t_m for all D assets in sorted_ids order
         perf_m = np.empty(d_assets, dtype=np.float64)
         for i, ticker in enumerate(sorted_ids):
-            if ticker in parsed_fixings and len(parsed_fixings[ticker][0]) > 0:
-                fix_val = _lookup_fixing_value(parsed_fixings[ticker][0], parsed_fixings[ticker][1], t_m)
+            idx_fix = indexed_fixings.get(ticker)
+            if idx_fix is not None and idx_fix[1]:
+                fix_val = _lookup_fixing_indexed(idx_fix, t_m)
             elif t_m.date() == t0_dt.date():
                 fix_val = float(spots_sorted_t[i].detach().cpu().item())
             else:
@@ -570,9 +629,9 @@ def collapse_seasoned_schedule(
                 )
             perf_m[i] = fix_val / ref_spots_sorted[i]
 
-        w_call = float(evaluate_monitoring_index_np(perf_m, callability_index))
-        w_cpn = float(evaluate_monitoring_index_np(perf_m, eff_cpn_index))
-        w_opt = float(evaluate_monitoring_index_np(perf_m, eff_opt_index))
+        w_call = float(evaluate_monitoring_index_np(perf_m, callability_index, inv_lex_perm=inv_lex_perm))
+        w_cpn = float(evaluate_monitoring_index_np(perf_m, eff_cpn_index, inv_lex_perm=inv_lex_perm))
+        w_opt = float(evaluate_monitoring_index_np(perf_m, eff_opt_index, inv_lex_perm=inv_lex_perm))
 
         if ki_monitored_past and ki_barrier is not None and w_opt < float(ki_barrier):
             i_ki_past = 1.0
@@ -583,15 +642,21 @@ def collapse_seasoned_schedule(
 
         is_callable_m = (b_ko < 10.0) and (m < m_total - 1 or allow_autocall_on_expiry)
         df_m = float(df_pay_fn(T_m)) if (period_status == "In-Transit" and df_pay_fn is not None) else 1.0
+        fund_amt_m = float(past_funding_by_period.get(m, 0.0))
 
+        opt_paid = 0.0
         if already_autocalled:
             cpn_trig = False
             ko_trig = False
             cpn_paid = 0.0
             notional_paid = 0.0
+            fund_amt_m = 0.0
         else:
             ko_trig = bool(is_callable_m and (w_call >= b_ko))
-            cpn_trig = bool((b_cpn <= 1e-3) or (w_cpn >= b_cpn) or (ko_trig and force_coupons_on_autocall))
+            hit_dir = (w_cpn <= b_cpn) if dir_down else (w_cpn >= b_cpn)
+            base_cpn = (not hit_dir) if type_out else hit_dir
+            is_guaranteed_m = (b_cpn <= 1e-3) and (not type_out) and (not dir_down)
+            cpn_trig = bool(is_guaranteed_m or base_cpn or (ko_trig and force_coupons_on_autocall))
 
             if cpn_trig:
                 cpn_paid = (c_m + c_mem_0) if is_memory else c_m
@@ -606,18 +671,40 @@ def collapse_seasoned_schedule(
                 notional_paid = 0.0 if no_notional_repayment else 1.0
                 already_autocalled = True
                 autocalled_period_index = m
+            elif m == m_total - 1:
+                notional_paid = 0.0 if no_notional_repayment else 1.0
+                opt_paid = _eval_terminal_option_payoff(
+                    perf_m=perf_m,
+                    w_opt=w_opt,
+                    strike=strike,
+                    lower_strike=lower_strike,
+                    option_gearing=option_gearing,
+                    ki_barrier=ki_barrier,
+                    i_ki_past=i_ki_past,
+                    is_long_basket=is_long_basket,
+                    participation_call_strike=participation_call_strike,
+                    participation_call_rate=participation_call_rate,
+                    one_star_strike=one_star_strike,
+                    one_star_coupon=one_star_coupon,
+                )
             else:
                 notional_paid = 0.0
 
         if period_status == "In-Transit":
             disc_cpn = float(df_m * cpn_paid)
             disc_notional = float(df_m * notional_paid)
-            pv_in_transit = float(pv_in_transit + disc_cpn + disc_notional)
+            disc_opt = float(df_m * opt_paid)
+            disc_fund = float(df_m * fund_amt_m)
+            pv_in_transit = float(pv_in_transit + disc_cpn + disc_notional + disc_opt - disc_fund)
             cf_cpn_amt = disc_cpn
             cf_notional_amt = disc_notional
+            cf_opt_amt = disc_opt
+            cf_fund_amt = -disc_fund if disc_fund != 0.0 else 0.0
         else:
             cf_cpn_amt = float(cpn_paid)
             cf_notional_amt = float(notional_paid)
+            cf_opt_amt = float(opt_paid)
+            cf_fund_amt = -float(fund_amt_m) if fund_amt_m != 0.0 else 0.0
 
         historical_records.append(
             HistoricalPeriodRecord(
@@ -640,12 +727,11 @@ def collapse_seasoned_schedule(
             )
         )
 
-        # Emit the 3 canonical Murex rows per period: FundingLeg, Coupon, Notional
         past_cashflows.append(
             CashFlowItem(
                 Description="FundingLeg",
                 Date=T_m,
-                Amount=0.0,
+                Amount=cf_fund_amt,
                 StandardError=0.0,
                 Currency=payment_currency,
                 Leg=0,
@@ -663,6 +749,18 @@ def collapse_seasoned_schedule(
                 StatusText=cf_status,
             )
         )
+        if m == m_total - 1:
+            past_cashflows.append(
+                CashFlowItem(
+                    Description="Option",
+                    Date=T_m,
+                    Amount=cf_opt_amt,
+                    StandardError=0.0,
+                    Currency=payment_currency,
+                    Leg=0,
+                    StatusText=cf_status,
+                )
+            )
         past_cashflows.append(
             CashFlowItem(
                 Description="Notional",
@@ -675,7 +773,10 @@ def collapse_seasoned_schedule(
             )
         )
 
-    # Extract remaining future schedule (t_m > t_0)
+    cash_to_settle_today = float(
+        sum(cf.Amount for cf in past_cashflows if cf.Date.date() == t0_dt.date())
+    )
+
     future_obs_dates = [obs_dts[m] for m in future_indices]
     future_pay_dates = [pay_dts[m] for m in future_indices]
     m_rem = len(future_indices)
@@ -736,6 +837,7 @@ def collapse_seasoned_schedule(
         tau_pay=tau_pay,
         future_coupon_rates=future_cpn_rates,
         sentinel_barriers=sentinel_res,
+        cash_to_settle_today=cash_to_settle_today,
     )
 
 

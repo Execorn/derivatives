@@ -3,13 +3,13 @@ rbergomi_gpu.py — GPU-accelerated Monte Carlo pricing for the Rough Bergomi mo
 Uses the Bennedsen, Lunde & Pakkanen (2017) hybrid scheme with F.conv1d for fast fBm simulation.
 """
 
-import sys
-if sys.version_info >= (3, 14):
-    import os
-    os.environ["NUMBA_DISABLE_JIT"] = "1"
+from __future__ import annotations
+
+from typing import Any, Tuple, Union
+
 import numpy as np
+import numpy.typing as npt
 import torch
-import torch.nn.functional as F
 
 
 def simulate_rbergomi_paths(
@@ -18,9 +18,9 @@ def simulate_rbergomi_paths(
     steps_per_unit: int = 200,
     N_paths: int = 10000,
     antithetic: bool = True,
-    device: str = "cuda",
+    device: Union[str, torch.device] = "cuda",
     dtype: torch.dtype = torch.float32,
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Simulates Rough Bergomi stock and variance paths on GPU using Bennedsen hybrid scheme
     and Euler step on log-price.
@@ -75,7 +75,6 @@ def simulate_rbergomi_paths(
 
     zeros = torch.zeros(B, 1, device=device, dtype=dtype)
     w_full = torch.cat([zeros, w], dim=1)   # (B, N_t)
-    w_rev = torch.flip(w_full, dims=[1]).unsqueeze(1)   # (B, 1, N_t)
 
     # 3. Perform FFT-based causal convolution
     # Z1 shape: (B, N_paths, N_t)
@@ -124,7 +123,7 @@ def simulate_rbergomi_paths(
     return S, V, t_grid
 
 
-def fill_nans(ivs: np.ndarray, default_val: float = 0.3) -> np.ndarray:
+def fill_nans(ivs: npt.NDArray[Any], default_val: float = 0.3) -> npt.NDArray[Any]:
     """
     Interpolates or fills NaN values in IV surfaces.
     """
@@ -156,14 +155,14 @@ def fill_nans(ivs: np.ndarray, default_val: float = 0.3) -> np.ndarray:
 
 @torch.no_grad()
 def batch_rbergomi_iv_surface(
-    params,
-    T_grid: np.ndarray,
-    K_grid: np.ndarray,
+    params: Union[npt.NDArray[Any], torch.Tensor],
+    T_grid: npt.NDArray[Any],
+    K_grid: npt.NDArray[Any],
     N_paths: int = 10000,
     antithetic: bool = True,
-    device: str = "cuda",
+    device: Union[str, torch.device] = "cuda",
     dtype: torch.dtype = torch.float32,
-) -> np.ndarray:
+) -> npt.NDArray[Any]:
     """
     Prices options for a batch of Rough Bergomi parameters and inverts them to get Black-Scholes IVs.
 
@@ -195,7 +194,7 @@ def batch_rbergomi_iv_surface(
     idx_200 = np.where(H_vals >= 0.07)[0]
 
     prices = torch.zeros((B, M, L), device=device, dtype=dtype)
-    def price_subbatch(sub_indices, steps_per_unit):
+    def price_subbatch(sub_indices: npt.NDArray[Any], steps_per_unit: int) -> None:
         if len(sub_indices) == 0:
             return
         chunk_size = max(1, 40000 // N_paths)
@@ -244,13 +243,13 @@ def rbergomi_iv_surface(
     H: float,
     eta: float,
     rho: float,
-    T_grid: np.ndarray,
-    K_grid: np.ndarray,
+    T_grid: npt.NDArray[Any],
+    K_grid: npt.NDArray[Any],
     N_paths: int = 10000,
     antithetic: bool = True,
-    device: str = "cuda",
+    device: Union[str, torch.device] = "cuda",
     dtype: torch.dtype = torch.float32,
-) -> np.ndarray:
+) -> npt.NDArray[Any]:
     """
     Computes a single Rough Bergomi implied volatility surface.
     """
@@ -264,7 +263,7 @@ def rbergomi_iv_surface(
         device=device,
         dtype=dtype,
     )
-    return ivs[0]
+    return np.asarray(ivs[0])
 
 
 class rBergomiEngine:
@@ -275,9 +274,9 @@ class rBergomiEngine:
         steps_per_unit: int = 200,
         N_paths: int = 10000,
         antithetic: bool = True,
-        device: str = "cpu",
+        device: Union[str, torch.device] = "cpu",
         dtype: torch.dtype = torch.float32,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Simulates Rough Bergomi stock and variance paths on GPU/CPU.
         """
@@ -297,13 +296,13 @@ class rBergomiEngine:
         H: float,
         eta: float,
         rho: float,
-        T_grid: np.ndarray,
-        K_grid: np.ndarray,
+        T_grid: npt.NDArray[Any],
+        K_grid: npt.NDArray[Any],
         N_paths: int = 10000,
         antithetic: bool = True,
-        device: str = "cpu",
+        device: Union[str, torch.device] = "cpu",
         dtype: torch.dtype = torch.float32,
-    ) -> np.ndarray:
+    ) -> npt.NDArray[Any]:
         """
         Computes a single Rough Bergomi implied volatility surface.
         """
@@ -322,14 +321,14 @@ class rBergomiEngine:
         
     def batch_price_surface(
         self,
-        params: np.ndarray,
-        T_grid: np.ndarray,
-        K_grid: np.ndarray,
+        params: npt.NDArray[Any],
+        T_grid: npt.NDArray[Any],
+        K_grid: npt.NDArray[Any],
         N_paths: int = 10000,
         antithetic: bool = True,
-        device: str = "cpu",
+        device: Union[str, torch.device] = "cpu",
         dtype: torch.dtype = torch.float32,
-    ) -> np.ndarray:
+    ) -> npt.NDArray[Any]:
         """
         Computes batched Rough Bergomi implied volatility surfaces.
         """
