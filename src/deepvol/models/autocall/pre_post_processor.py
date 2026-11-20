@@ -1,34 +1,29 @@
-"""pre_post_processor.py — Tier 1 Deterministic float64 Pre- and Post-Processor (Task 1.1c).
-
-Implements SPEC-DEEPVOL-EQ-AUTOCALL-001 §1.2, §1.3.A, and Symbolic Proof W1 in strict
-IEEE-754 float64 precision (`torch.float64` / `np.float64`):
-  - Fixed-padding feature coordinate enums (`AutocallNodeCol`, `AutocallEdgeCol`,
-    `AutocallSchedCol`, `AutocallGlobalCol`) with D_max = 8 and M_max = 48.
-  - `preprocess_eq_autocall(...)`: end-to-end differentiable `torch.float64` pre-processor
-    constructing `AutocallPreprocState` from `EQAutocallableTradeRequest`, raw Murex
-    `ConstantMessageMap` text/files (`eq_autocallable_request.txt`), or structured dicts.
-  - `.to_tier2_float32_tensors()`: single precision-segregation boundary (REM-S0-01 & Gate G4.4)
-    casting only the 6 padded neural input tensors to `torch.float32` while preserving autograd.
-  - `assemble_autocall_cashflows_and_pv(...)`: exact affine stopping-time cash-flow & PV
-    post-processor (`W1`), reproducing all 37 `CashFlows` rows of `eq_autocallable_request.txt`
-    (Gate G1.3).
-"""
+"""Tier 1 deterministic float64 pre- and post-processor for EQAutocallable."""
 
 from __future__ import annotations
 
-import ast
-import copy
-from dataclasses import dataclass, field
+from collections import OrderedDict
+from dataclasses import dataclass, field, fields as dc_fields, replace as dc_replace
 import datetime
-from enum import IntEnum
+from enum import Enum
+import hashlib
+import inspect
 from pathlib import Path
-import re
-from typing import Any, Callable, Mapping, Sequence
+import struct
+import threading
+from typing import Any, Callable, Mapping, Sequence, TypeVar, cast
 
 import numpy as np
 import numpy.typing as npt
 import torch
 
+from deepvol.api.schemas_eq_autocall import parse_murex_autocall_dag
+from deepvol.market.eq_curves import (
+    ClampedYieldCurve,
+    RepoCurve,
+    year_fraction,
+    year_fractions,
+)
 from deepvol.models.autocall.analytical_baseline import (
     AutocallBaselineOutput,
     compute_analytical_autocall_baseline,
@@ -36,79 +31,38 @@ from deepvol.models.autocall.analytical_baseline import (
 from deepvol.models.autocall.dupire_qmc_solver import RegularizedVolSurface
 from deepvol.models.autocall.escrowed_dividend import (
     EscrowedDividendOutput,
+    _infer_asset_currency,
     build_discount_rate_evaluator,
     compute_escrowed_dividend_forwards,
+)
+from deepvol.models.autocall.feature_layout import (
+    D_MAX_DEFAULT,
+    FEATURE_SCHEMA_VERSION,
+    M_MAX_DEFAULT,
+    PAIR_ORDER_DEPENDENT_INDICES,
+    AutocallEdgeCol,
+    AutocallGlobalCol,
+    AutocallNodeCol,
+    AutocallSchedCol,
+    MonitoringIndexCode,
+    monitoring_index_to_code,
 )
 from deepvol.models.autocall.seasoned_collapser import (
     CashFlowItem,
     SeasonedScheduleState,
     _to_utc_datetime,
-    _year_fraction,
     collapse_seasoned_schedule,
 )
 
-D_MAX_DEFAULT: int = 8
-M_MAX_DEFAULT: int = 48
-
-
-class AutocallNodeCol(IntEnum):
-    """14-column node feature layout for X_node in R^{B x D_max x 14} (§1.3.A.1)."""
-
-    LOG_MONEYNESS = 0
-    LOG_FWD_CARRY_1Y = 1
-    CASH_DIV_LEVERAGE = 2
-    REPO_SPREAD_AVG = 3
-    IV_SHORT_ATM = 4
-    IV_TERM_ATM = 5
-    IV_TERM_SLOPE = 6
-    SSVI_SKEW_RHO = 7
-    SSVI_CURV_ETA = 8
-    SMILE_RESIDUAL_PC1 = 9
-    SMILE_RESIDUAL_PC2 = 10
-    DIST_TO_PUT_STRIKE = 11
-    PROXY_DELTA_WEIGHT = 12
-    ASSET_ACTIVE_MASK = 13
-
-
-class AutocallEdgeCol(IntEnum):
-    """4-column edge feature layout for X_edge in R^{B x D_max x D_max x 4} (§1.3.A.2)."""
-
-    CORR_RHO = 0
-    COVARIANCE_TERM = 1
-    LOG_PERF_DIFF = 2
-    OFF_DIAG_MASK = 3
-
-
-class AutocallSchedCol(IntEnum):
-    """12-column schedule feature layout for X_sched in R^{B x M_max x 12} (§1.3.A.3)."""
-
-    TAU_OBS = 0
-    DELTA_TAU = 1
-    DF_PAY = 2
-    LOG_KO_BARRIER = 3
-    IS_CALLABLE_FLAG = 4
-    LOG_CPN_BARRIER = 5
-    IS_GUARANTEED_CPN = 6
-    COUPON_RATE = 7
-    STULZ_FWD_W = 8
-    STULZ_VOL_W = 9
-    PROXY_KO_PROB = 10
-    PROXY_CPN_PROB = 11
-
-
-class AutocallGlobalCol(IntEnum):
-    """10-column global context feature layout for X_global in R^{B x 10} (§1.3.A.4)."""
-
-    K_PUT = 0
-    B_KI = 1
-    HAS_KI_FLAG = 2
-    I_KI_PAST = 3
-    G_PUT = 4
-    C_MEM_0 = 5
-    IS_MEMORY_FLAG = 6
-    ABS_KO_SPREAD = 7
-    ABS_CPN_SPREAD = 8
-    L_PUT_PROXY = 9
+_BASELINE_SIG_PARAMS: frozenset[str] = frozenset(
+    inspect.signature(compute_analytical_autocall_baseline).parameters.keys()
+)
+_VOL_SURF_SIG_PARAMS: frozenset[str] = frozenset(
+    inspect.signature(RegularizedVolSurface.__init__).parameters.keys()
+)
+_HAS_IV_BATCH: bool = hasattr(RegularizedVolSurface, "iv_batch") and callable(
+    getattr(RegularizedVolSurface, "iv_batch")
+)
 
 
 class _LazySurfaceJacobianDict(dict[str, npt.NDArray[np.float64]]):
@@ -156,12 +110,18 @@ class _LazySurfaceJacobianDict(dict[str, npt.NDArray[np.float64]]):
         self._populate_all()
         return super().items()
 
+    def clone(self) -> _LazySurfaceJacobianDict:
+        cloned = _LazySurfaceJacobianDict(self._builder, self._keys)
+        for k, v in dict.items(self):
+            dict.__setitem__(cloned, k, v.copy())
+        return cloned
+
 
 @dataclass
 class AutocallPreprocState:
-    """Complete Tier 1 pre-processed state in IEEE-754 float64 (`torch.float64` / `np.float64`)."""
+    """Complete Tier 1 pre-processed state in IEEE-754 float64."""
 
-    # Padded feature tensors in torch.float64: shapes (B, D_max, 14), (B, D_max, D_max, 4), etc.
+    # Padded feature tensors in torch.float64: (B, D_max, 16), (B, D_max, D_max, 4), (B, M_max, 12), (B, 16)
     node_feats: torch.Tensor
     edge_feats: torch.Tensor
     asset_mask: torch.Tensor
@@ -240,14 +200,14 @@ class AutocallPreprocState:
     queries: list[str] = field(default_factory=lambda: ["ProductValue", "CashFlows"])
     coupon_barrier_type: str = "In"
     coupon_barrier_direction: str = "Up"
+    cash_to_settle_today: float = 0.0
+    quanto_meta: dict[str, Any] = field(default_factory=dict)
+    asset_financing_curves: dict[str, Any] = field(default_factory=dict)
+    discount_curve_id: str | None = None
+    feature_schema_version: str = FEATURE_SCHEMA_VERSION
 
     def to_tier2_float32_tensors(self) -> dict[str, torch.Tensor]:
-        """Precision boundary segregation (REM-S0-01 & Gate G4.4).
-
-        Casts ONLY the 6 fixed-padding feature/mask tensors to `torch.float32` for Tier 2
-        neural surrogate inference while maintaining autograd connectivity to upstream
-        `torch.float64` tensors.
-        """
+        """Precision boundary segregation casting only the 6 padded neural input tensors."""
         return {
             "node_feats": self.node_feats.to(dtype=torch.float32),
             "edge_feats": self.edge_feats.to(dtype=torch.float32),
@@ -285,7 +245,9 @@ class AutocallPreprocState:
     def global_context(self) -> torch.Tensor:
         return self.global_feats
 
-    def unpermute_assets(self, tensor_or_array: torch.Tensor | npt.NDArray[np.float64]) -> torch.Tensor | npt.NDArray[np.float64]:
+    def unpermute_assets(
+        self, tensor_or_array: torch.Tensor | npt.NDArray[np.float64]
+    ) -> torch.Tensor | npt.NDArray[np.float64]:
         """Applies the inverse lexicographical permutation pi_lex^{-1} along dim 0."""
         if isinstance(tensor_or_array, torch.Tensor):
             inv_idx = torch.as_tensor(self.inv_lex_perm, dtype=torch.long, device=tensor_or_array.device)
@@ -319,137 +281,284 @@ class AutocallPostprocOutput:
         return self.cashflows
 
 
-# ── Built-in Murex ConstantMessageMap DAG Fallback Parser ────────────────────
+# ── Thread-Safe Content-Addressed Caching ─────────────────────────────────────
 
 
-def _parse_murex_block_body(body_str: str) -> dict[str, Any]:
-    """Parses a Murex ConstantMessageMap block body into a Python dictionary."""
-    s = body_str.strip()
-    # Replace `<skipped>` with None
-    s = re.sub(r"<skipped>", "None", s)
-    # Replace `@<40-hex>` references with string literals `"@<40-hex>"`
-    s = re.sub(r"@([0-9a-f]{40})", r'"@\1"', s)
-    # Quote unquoted keys before colons (including keys with `&` like `MAGN_RUB&POSIRX_RUB:`)
-    s = re.sub(r"(?m)^(\s*)([A-Za-z0-9_&]+)\s*:", r'\1"\2":', s)
-    # Insert commas at the end of value lines inside lists or dicts
-    lines = s.splitlines()
-    out_lines: list[str] = []
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        # Look ahead for next non-empty line
-        next_stripped = ""
-        for j in range(i + 1, len(lines)):
-            if lines[j].strip():
-                next_stripped = lines[j].strip()
-                break
-        needs_comma = (
-            not stripped.endswith(("{", "[", ":", ","))
-            and next_stripped != ""
-            and not next_stripped.startswith(("}", "]"))
+@dataclass(frozen=True)
+class ContentDigestKey:
+    """Collision-resistant SHA-256 content-addressed cache key."""
+
+    namespace: str
+    digest_hex: str
+    payload_len: int
+
+
+_V = TypeVar("_V")
+
+
+class ThreadSafeLRUCache:
+    """Thread-safe bounded LRU cache with optional defensive value cloning."""
+
+    def __init__(
+        self,
+        maxsize: int = 512,
+        copy_fn: Callable[[Any], Any] | None = None,
+    ) -> None:
+        self._maxsize = max(int(maxsize), 1)
+        self._copy_fn = copy_fn
+        self._lock = threading.RLock()
+        self._data: OrderedDict[Any, Any] = OrderedDict()
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        with self._lock:
+            if key not in self._data:
+                return default
+            self._data.move_to_end(key)
+            val = self._data[key]
+            return self._copy_fn(val) if self._copy_fn is not None else val
+
+    def put(self, key: Any, value: Any) -> Any:
+        with self._lock:
+            stored = self._copy_fn(value) if self._copy_fn is not None else value
+            self._data[key] = stored
+            self._data.move_to_end(key)
+            while len(self._data) > self._maxsize:
+                self._data.popitem(last=False)
+            return self._copy_fn(stored) if self._copy_fn is not None else stored
+
+    def __contains__(self, key: object) -> bool:
+        with self._lock:
+            return key in self._data
+
+    def __getitem__(self, key: Any) -> Any:
+        res = self.get(key)
+        if res is None and key not in self._data:
+            raise KeyError(key)
+        return res
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self.put(key, value)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+
+def _feed_canonical_bytes(hasher: Any, obj: Any, counter: list[int]) -> bool:
+    """Feeds deterministic canonical byte representation into a SHA-256 hasher.
+
+    Returns False if `obj` contains an active autograd tensor or unhashable transient
+    that must bypass caching.
+    """
+    if obj is None:
+        hasher.update(b"N;")
+        counter[0] += 2
+        return True
+    if isinstance(obj, bool):
+        hasher.update(b"B1;" if obj else b"B0;")
+        counter[0] += 3
+        return True
+    if isinstance(obj, int):
+        b = str(obj).encode("ascii")
+        hasher.update(b"I" + struct.pack("!I", len(b)) + b)
+        counter[0] += 5 + len(b)
+        return True
+    if isinstance(obj, float):
+        # Canonicalize -0.0 to +0.0 while preserving NaN bit patterns explicitly.
+        val = 0.0 if obj == 0.0 else obj
+        packed = struct.pack("!d", val)
+        hasher.update(b"F" + packed)
+        counter[0] += 9
+        return True
+    if isinstance(obj, Enum):
+        return _feed_canonical_bytes(hasher, obj.value, counter)
+    if isinstance(obj, str):
+        b = obj.encode("utf-8")
+        hasher.update(b"S" + struct.pack("!I", len(b)) + b)
+        counter[0] += 5 + len(b)
+        return True
+    if isinstance(obj, (bytes, bytearray)):
+        hasher.update(b"Y" + struct.pack("!I", len(obj)) + bytes(obj))
+        counter[0] += 5 + len(obj)
+        return True
+    if isinstance(obj, datetime.datetime):
+        dt_utc = _to_utc_datetime(obj)
+        b = dt_utc.isoformat().encode("ascii")
+        hasher.update(b"DT" + struct.pack("!I", len(b)) + b)
+        counter[0] += 6 + len(b)
+        return True
+    if isinstance(obj, datetime.date):
+        b = obj.isoformat().encode("ascii")
+        hasher.update(b"DA" + struct.pack("!I", len(b)) + b)
+        counter[0] += 6 + len(b)
+        return True
+    if isinstance(obj, np.ndarray):
+        arr = np.ascontiguousarray(obj)
+        shape_b = repr(arr.shape).encode("ascii")
+        dtype_b = arr.dtype.str.encode("ascii")
+        raw = arr.tobytes()
+        hasher.update(
+            b"NP"
+            + struct.pack("!II", len(shape_b), len(dtype_b))
+            + shape_b
+            + dtype_b
+            + struct.pack("!Q", len(raw))
+            + raw
         )
-        if needs_comma:
-            out_lines.append(line + ",")
-        else:
-            out_lines.append(line)
+        counter[0] += 18 + len(shape_b) + len(dtype_b) + len(raw)
+        return True
+    if isinstance(obj, torch.Tensor):
+        if obj.requires_grad:
+            return False
+        arr = obj.detach().cpu().contiguous().numpy()
+        return _feed_canonical_bytes(hasher, arr, counter)
+    if hasattr(obj, "model_dump") and callable(obj.model_dump):
+        dumped = obj.model_dump(mode="python")
+        hasher.update(b"PM")
+        counter[0] += 2
+        return _feed_canonical_bytes(hasher, dumped, counter)
+    if isinstance(obj, Mapping):
+        hasher.update(b"M" + struct.pack("!I", len(obj)))
+        counter[0] += 5
+        for k in sorted(obj.keys(), key=lambda x: str(x)):
+            if not _feed_canonical_bytes(hasher, str(k), counter):
+                return False
+            if not _feed_canonical_bytes(hasher, obj[k], counter):
+                return False
+        return True
+    if isinstance(obj, (list, tuple)):
+        hasher.update(b"L" + struct.pack("!I", len(obj)))
+        counter[0] += 5
+        for item in obj:
+            if not _feed_canonical_bytes(hasher, item, counter):
+                return False
+        return True
+    if isinstance(obj, (set, frozenset)):
+        items = sorted(obj, key=lambda x: str(x))
+        hasher.update(b"T" + struct.pack("!I", len(items)))
+        counter[0] += 5
+        for item in items:
+            if not _feed_canonical_bytes(hasher, item, counter):
+                return False
+        return True
+    if isinstance(obj, (ClampedYieldCurve, RepoCurve, RegularizedVolSurface)):
+        return _feed_canonical_bytes(hasher, obj.__dict__, counter)
+    if hasattr(obj, "__dict__"):
+        hasher.update(b"O")
+        counter[0] += 1
+        return _feed_canonical_bytes(hasher, vars(obj), counter)
+    return False
 
-    py_expr = "\n".join(out_lines)
-    # Replace datetime.datetime(...) calls with ISO strings before literal_eval
-    def _dt_repl(match: re.Match[str]) -> str:
-        args = [int(x.strip()) for x in match.group(1).split(",") if x.strip().isdigit()]
-        y, mo, d = args[0], args[1], args[2]
-        hh = args[3] if len(args) > 3 else 0
-        mm = args[4] if len(args) > 4 else 0
-        ss = args[5] if len(args) > 5 else 0
-        return f'"{y:04d}-{mo:02d}-{d:02d}T{hh:02d}:{mm:02d}:{ss:02d}+00:00"'
 
-    py_expr = re.sub(r"datetime\.datetime\(([^)]+)\)", _dt_repl, py_expr)
-    parsed = ast.literal_eval(py_expr)
-    if not isinstance(parsed, dict):
-        raise ValueError("Parsed ConstantMessageMap block is not a dict.")
-    return parsed
+def digest_market_bytes(namespace: str, payload: Any) -> ContentDigestKey | None:
+    """Builds a SHA-256 ContentDigestKey covering 100% of interior values."""
+    h = hashlib.sha256()
+    counter = [0]
+    if not _feed_canonical_bytes(h, payload, counter):
+        return None
+    return ContentDigestKey(namespace=namespace, digest_hex=h.hexdigest(), payload_len=counter[0])
 
 
-def parse_murex_text_or_dict_fallback(
-    raw_input: str | Path | Mapping[str, Any],
-) -> tuple[Any, dict[str, Any] | None]:
-    """Parses a Murex ConstantMessageMap dump (or file path / dict) into resolved request & reference result."""
-    try:
-        from deepvol.api.schemas_eq_autocall import parse_murex_autocall_dag
+def _clone_dataclass_tensors(obj: Any) -> Any:
+    """Clones dataclass fields containing tensors, ndarrays, lists, or dicts."""
+    if obj is None:
+        return None
+    if isinstance(obj, torch.Tensor):
+        return obj.clone()
+    if isinstance(obj, np.ndarray):
+        return obj.copy()
+    if isinstance(obj, list):
+        return [_clone_dataclass_tensors(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_clone_dataclass_tensors(x) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _clone_dataclass_tensors(v) for k, v in obj.items()}
+    return obj
 
-        if isinstance(raw_input, Path):
-            raw_text = raw_input.read_text(encoding="utf-8")
-        else:
-            raw_text = raw_input  # type: ignore[assignment]
-        req_obj, ref_dict = parse_murex_autocall_dag(raw_text)
-        return req_obj, ref_dict
-    except Exception:
-        pass
 
-    if isinstance(raw_input, Mapping):
-        return dict(raw_input), None
+def _clone_dataclass_fields(obj: Any) -> Any:
+    updates = {
+        f.name: _clone_dataclass_tensors(getattr(obj, f.name))
+        for f in dc_fields(obj)
+    }
+    return dc_replace(obj, **updates)
 
-    if isinstance(raw_input, Path):
-        text = raw_input.read_text(encoding="utf-8")
-    elif isinstance(raw_input, str) and len(raw_input) < 512 and "\n" not in raw_input and Path(raw_input).is_file():
-        text = Path(raw_input).read_text(encoding="utf-8")
-    else:
-        text = str(raw_input)
 
-    # Split root reference `@<40-hex>` if present
-    root_match = re.search(r"(?m)^@([0-9a-f]{40})\s*$", text)
-    ref_result: dict[str, Any] | None = None
-    if root_match:
-        root_id = root_match.group(1)
-        prefix_text = text[: root_match.start()].strip()
-        if prefix_text.startswith("{"):
-            ref_result = _parse_murex_block_body(prefix_text)
-        dag_text = text[root_match.end() :].strip()
-    else:
-        root_id = ""
-        dag_text = text.strip()
-
-    block_matches = list(
-        re.finditer(
-            r"(?m)^([0-9a-f]{40})\s*\nclass:\s*ConstantMessageMap\s*\n(\{.*?\n\})",
-            dag_text,
-            re.DOTALL,
-        )
+def _clone_preproc_state(state: AutocallPreprocState) -> AutocallPreprocState:
+    """Deep-clones mutable containers and tensors so cached templates cannot be poisoned."""
+    surf_jacs: dict[str, npt.NDArray[np.float64]] = (
+        state.surface_feature_jacobians.clone()
+        if isinstance(state.surface_feature_jacobians, _LazySurfaceJacobianDict)
+        else {k: v.copy() for k, v in state.surface_feature_jacobians.items()}
     )
-    if not block_matches:
-        # Single dictionary payload
-        return _parse_murex_block_body(dag_text), ref_result
+    iv_jacs: dict[str, npt.NDArray[np.float64]] = (
+        state.iv_at_fwd_jacobians.clone()
+        if isinstance(state.iv_at_fwd_jacobians, _LazySurfaceJacobianDict)
+        else {k: v.copy() for k, v in state.iv_at_fwd_jacobians.items()}
+    )
+    funding_clone: dict[str, Any] | None = None
+    if state.funding_leg is not None:
+        funding_clone = {
+            k: (list(v) if isinstance(v, list) else v)
+            for k, v in state.funding_leg.items()
+        }
+    return dc_replace(
+        state,
+        node_feats=state.node_feats.clone(),
+        edge_feats=state.edge_feats.clone(),
+        asset_mask=state.asset_mask.clone(),
+        sched_feats=state.sched_feats.clone(),
+        sched_mask=state.sched_mask.clone(),
+        global_feats=state.global_feats.clone(),
+        original_identifiers=list(state.original_identifiers),
+        sorted_identifiers=list(state.sorted_identifiers),
+        lex_perm=state.lex_perm.copy(),
+        inv_lex_perm=state.inv_lex_perm.copy(),
+        spots_t0=state.spots_t0.clone(),
+        ref_spots=state.ref_spots.clone(),
+        moneyness_t0=state.moneyness_t0.clone(),
+        corr_matrix=state.corr_matrix.clone(),
+        tau_obs=state.tau_obs.clone(),
+        delta_tau=state.delta_tau.clone(),
+        tau_pay=state.tau_pay.clone(),
+        df_obs=state.df_obs.clone(),
+        df_pay=state.df_pay.clone(),
+        ko_barriers=state.ko_barriers.clone(),
+        is_callable=state.is_callable.clone(),
+        cpn_barriers=state.cpn_barriers.clone(),
+        is_guaranteed_cpn=state.is_guaranteed_cpn.clone(),
+        coupon_amounts=state.coupon_amounts.clone(),
+        forward_rel=state.forward_rel.clone(),
+        forward_perf=state.forward_perf.clone(),
+        cash_div_leverage=state.cash_div_leverage.clone(),
+        iv_at_fwd=state.iv_at_fwd.clone(),
+        v_perf=state.v_perf.clone(),
+        seasoned_state=_clone_dataclass_fields(state.seasoned_state),
+        dividend_schedule=_clone_dataclass_fields(state.dividend_schedule),
+        vol_surfaces=dict(state.vol_surfaces),
+        surface_feature_jacobians=surf_jacs,
+        iv_at_fwd_jacobians=iv_jacs,
+        baseline=_clone_dataclass_fields(state.baseline),
+        funding_leg=funding_clone,
+        queries=list(state.queries),
+        quanto_meta={k: dict(v) for k, v in state.quanto_meta.items()},
+        asset_financing_curves=dict(state.asset_financing_curves),
+    )
 
-    nodes: dict[str, dict[str, Any]] = {}
-    for bm in block_matches:
-        nid = bm.group(1)
-        nbody = bm.group(2)
-        nodes[nid] = _parse_murex_block_body(nbody)
-        if not root_id:
-            root_id = nid
 
-    def _resolve(obj: Any) -> Any:
-        if isinstance(obj, str) and obj.startswith("@") and len(obj) == 41:
-            ref_id = obj[1:]
-            if ref_id in nodes:
-                return _resolve(nodes[ref_id])
-            return obj
-        if isinstance(obj, dict):
-            return {k: _resolve(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_resolve(v) for v in obj]
-        return obj
-
-    resolved_root = _resolve(nodes[root_id])
-    return resolved_root, ref_result
+_MARKET_OBJECT_CACHE = ThreadSafeLRUCache(maxsize=512, copy_fn=None)
+_PREPROC_STATE_CACHE = ThreadSafeLRUCache(maxsize=512, copy_fn=_clone_preproc_state)
 
 
 def _extract_attr(obj: Any, *names: str, default: Any = None) -> Any:
     """Extracts the first matching key or attribute from a dict or Pydantic model."""
     if obj is None:
         return default
-    if isinstance(obj, (dict, Mapping)):
+    if isinstance(obj, Mapping):
         for name in names:
             if name in obj and obj[name] is not None:
                 return obj[name]
@@ -461,13 +570,165 @@ def _extract_attr(obj: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
+def _normalize_coupon_param(val: Any) -> float | list[float] | None:
+    if val is None:
+        return None
+    if isinstance(val, (str, bytes)):
+        return float(val)
+    if isinstance(val, np.ndarray):
+        return [float(x) for x in val.tolist()] if val.ndim > 0 else float(val.item())
+    if isinstance(val, Sequence):
+        return [float(x) for x in val]
+    return float(val)
+
+
+def _get_cached_yield_curve(spec: Any, as_of_dt: datetime.datetime) -> ClampedYieldCurve:
+    if isinstance(spec, ClampedYieldCurve):
+        return spec
+    key = digest_market_bytes("yield_curve", (spec, as_of_dt))
+    if key is not None:
+        cached = _MARKET_OBJECT_CACHE.get(key)
+        if cached is not None:
+            return cast(ClampedYieldCurve, cached)
+    curve = ClampedYieldCurve(spec, as_of_date=as_of_dt)
+    if key is not None:
+        return cast(ClampedYieldCurve, _MARKET_OBJECT_CACHE.put(key, curve))
+    return curve
+
+
+def _get_cached_vol_surface(
+    surf_spec: Any,
+    as_of_dt: datetime.datetime,
+) -> RegularizedVolSurface:
+    kwargs: dict[str, Any] = {"bc_type": "clamped"}
+    if "smile_interp" in _VOL_SURF_SIG_PARAMS:
+        s_interp = _extract_attr(surf_spec, "SmileInterpolationMethod", "smile_interpolation_method")
+        if s_interp is not None:
+            kwargs["smile_interp"] = str(getattr(s_interp, "value", s_interp))
+    if "smile_extrap" in _VOL_SURF_SIG_PARAMS:
+        s_extrap = _extract_attr(surf_spec, "SmileExtrapolationMethod", "smile_extrapolation_method")
+        if s_extrap is not None:
+            kwargs["smile_extrap"] = str(getattr(s_extrap, "value", s_extrap))
+
+    key = digest_market_bytes("vol_surface", (surf_spec, as_of_dt, kwargs))
+    if key is not None:
+        cached = _MARKET_OBJECT_CACHE.get(key)
+        if cached is not None:
+            return cast(RegularizedVolSurface, cached)
+    surf = RegularizedVolSurface(surf_spec, as_of_date=as_of_dt, **kwargs)
+    if key is not None:
+        return cast(RegularizedVolSurface, _MARKET_OBJECT_CACHE.put(key, surf))
+    return surf
+
+
+def _resolve_curves_and_financing(
+    mkt: Any,
+    model: Any,
+    sorted_ids: Sequence[str],
+    payment_ccy: str,
+    dividends_map: Mapping[str, Any],
+    predef_divs_map: Mapping[str, Any],
+    as_of_dt: datetime.datetime,
+) -> tuple[Any, str | None, dict[str, Any]]:
+    """Resolves the payment-currency discount curve and per-asset financing curves."""
+    rates_bundles = _extract_attr(mkt, "RatesCurvesBundles", "rates_curves_bundles")
+    fin_ids_raw = _extract_attr(model, "FinancingCurveIdentifiers", "financing_curve_identifiers")
+    fin_ids: list[str] = [str(x) for x in fin_ids_raw] if fin_ids_raw else []
+
+    disc_curve_spec = _extract_attr(mkt, "discount_curve")
+    disc_curve_id: str | None = None
+
+    if disc_curve_spec is not None:
+        disc_curve_id = str(_extract_attr(disc_curve_spec, "Identifier", "identifier", default="")) or None
+    elif isinstance(rates_bundles, Mapping) and len(rates_bundles) > 0:
+        pay_prefix = f"{payment_ccy.upper()}_"
+        # Prefer a curve in FinancingCurveIdentifiers matching payment_ccy.
+        for cid in fin_ids:
+            if cid in rates_bundles:
+                spec_c = rates_bundles[cid]
+                spec_ccy = str(_extract_attr(spec_c, "Currency", "currency", default="")).upper()
+                if spec_ccy == payment_ccy.upper() or cid.upper().startswith(pay_prefix):
+                    disc_curve_id = cid
+                    disc_curve_spec = spec_c
+                    break
+        if disc_curve_spec is None:
+            for cid in fin_ids:
+                if cid in rates_bundles:
+                    disc_curve_id = cid
+                    disc_curve_spec = rates_bundles[cid]
+                    break
+        if disc_curve_spec is None:
+            for cid, spec_c in rates_bundles.items():
+                spec_ccy = str(_extract_attr(spec_c, "Currency", "currency", default="")).upper()
+                if spec_ccy == payment_ccy.upper() or str(cid).upper().startswith(pay_prefix):
+                    disc_curve_id = str(cid)
+                    disc_curve_spec = spec_c
+                    break
+        if disc_curve_spec is None:
+            disc_curve_id = str(next(iter(rates_bundles.keys())))
+            disc_curve_spec = rates_bundles[disc_curve_id]
+
+    disc_curve_obj = _get_cached_yield_curve(disc_curve_spec, as_of_dt) if disc_curve_spec is not None else None
+
+    asset_fin_curves: dict[str, Any] = {}
+    if isinstance(rates_bundles, Mapping) and len(rates_bundles) > 0:
+        for ticker in sorted_ids:
+            # Infer asset currency from dividend sources when ticker has no currency suffix.
+            div_src = predef_divs_map.get(ticker) if isinstance(predef_divs_map, Mapping) else None
+            if div_src is None and isinstance(dividends_map, Mapping):
+                div_src = dividends_map.get(ticker)
+            div_ccy = _extract_attr(div_src, "Currency", "currency") if div_src is not None else None
+            inferred_ccy = _infer_asset_currency(
+                ticker,
+                str(div_ccy).upper() if div_ccy else payment_ccy,
+            )
+
+            matched_spec: Any = None
+            if ticker in rates_bundles:
+                matched_spec = rates_bundles[ticker]
+            else:
+                ccy_prefix = f"{inferred_ccy}_"
+                for cid in fin_ids:
+                    if cid in rates_bundles:
+                        spec_c = rates_bundles[cid]
+                        spec_ccy = str(_extract_attr(spec_c, "Currency", "currency", default="")).upper()
+                        if spec_ccy == inferred_ccy or cid.upper().startswith(ccy_prefix):
+                            matched_spec = spec_c
+                            break
+                if matched_spec is None:
+                    for cid, spec_c in rates_bundles.items():
+                        spec_ccy = str(_extract_attr(spec_c, "Currency", "currency", default="")).upper()
+                        if spec_ccy == inferred_ccy or str(cid).upper().startswith(ccy_prefix):
+                            matched_spec = spec_c
+                            break
+
+            if matched_spec is not None:
+                asset_fin_curves[ticker] = (
+                    disc_curve_obj
+                    if (disc_curve_spec is not None and matched_spec is disc_curve_spec)
+                    else _get_cached_yield_curve(matched_spec, as_of_dt)
+                )
+            elif inferred_ccy == payment_ccy.upper() and disc_curve_obj is not None:
+                asset_fin_curves[ticker] = disc_curve_obj
+    elif disc_curve_obj is not None:
+        for ticker in sorted_ids:
+            if _infer_asset_currency(ticker, payment_ccy) == payment_ccy.upper():
+                asset_fin_curves[ticker] = disc_curve_obj
+
+    return disc_curve_obj, disc_curve_id, asset_fin_curves
+
+
 def _build_correlation_matrix(
     sorted_ids: Sequence[str],
-    corr_input: Mapping[str, float] | Sequence[Sequence[float]] | torch.Tensor,
+    corr_input: Mapping[str, float] | Sequence[Sequence[float]] | torch.Tensor | None,
     device: torch.device,
 ) -> torch.Tensor:
     """Constructs the (D, D) correlation matrix in canonical sorted asset order in torch.float64."""
     d_assets = len(sorted_ids)
+    if corr_input is None:
+        if d_assets <= 1:
+            return torch.eye(d_assets, dtype=torch.float64, device=device)
+        raise KeyError("Missing Correlations map for multi-asset basket.")
     if isinstance(corr_input, torch.Tensor):
         return corr_input.to(dtype=torch.float64, device=device)
     if not isinstance(corr_input, Mapping):
@@ -491,188 +752,40 @@ def _build_correlation_matrix(
     return torch.as_tensor(mat, dtype=torch.float64, device=device)
 
 
-_PREPROC_STATE_CACHE: dict[Any, AutocallPreprocState] = {}
-
-
-def _try_make_preproc_cache_key(
-    *,
-    d_max: int,
-    m_max: int,
-    as_of_dt: datetime.datetime,
-    start_dt: datetime.datetime,
-    payment_ccy: str,
-    dcc: str,
-    underlying_ids: list[str],
-    ref_spots: list[float],
-    obs_dates: list[Any],
-    pay_dates: list[Any],
-    ko_levels: list[float],
-    cpn_levels: list[float],
-    cpn_amounts: list[float] | None,
-    fixed_cpn_amt: Any,
-    fixed_rate: Any,
-    is_memory: bool,
-    callability_index: str,
-    coupon_index: str | None,
-    option_index: str | None,
-    strike: float,
-    option_gearing: float,
-    lower_strike: float | None,
-    ki_barrier: float | None,
-    ko_spread: float,
-    cpn_spread: float,
-    ki_spread: float,
-    no_notional_repayment: bool,
-    autocall_coupon: float,
-    force_coupons_on_autocall: bool,
-    allow_autocall_on_expiry: bool,
-    is_long_basket: bool,
-    part_strike: float | None,
-    part_rate: float,
-    one_star_strike: float | None,
-    one_star_coupon: float,
-    cpn_barrier_type: str,
-    cpn_barrier_direction: str,
-    funding_leg_dict: dict[str, Any] | None,
-    disc_curve_spec: Any,
-    spots_map: Any,
+def _extract_funding_fixings(
     fixings_map: Any,
-    repo_curves_map: Any,
-    dividends_map: Any,
-    predef_divs_map: Any,
-    vol_surfaces_map: Any,
-    correlations_map: Any,
-) -> Any | None:
-    try:
-        if not isinstance(spots_map, (dict, Mapping)) or any(
-            isinstance(v, torch.Tensor) and v.requires_grad for v in spots_map.values()
-        ):
-            return None
-        spots_k = tuple((str(k), float(v)) for k, v in sorted(spots_map.items()))
-        corr_k = (
-            tuple((str(k), float(v)) for k, v in sorted(correlations_map.items()))
-            if isinstance(correlations_map, (dict, Mapping))
-            else str(correlations_map)
-        )
-        if isinstance(disc_curve_spec, (dict, Mapping)):
-            disc_k: Any = str(disc_curve_spec)
-        else:
-            rs = _extract_attr(disc_curve_spec, "RatesSchedule", "rates_schedule")
-            disc_k = (
-                str(_extract_attr(disc_curve_spec, "Identifier", "identifier")),
-                str(_extract_attr(disc_curve_spec, "InterpolationMethod", "interpolation_method")),
-                str(_extract_attr(disc_curve_spec, "InterpolationSpaceCoordinates", "space_coords")),
-                tuple(_extract_attr(rs, "Rates", "rates", default=()) or ())
-                if rs is not None
-                else (),
-                tuple(_extract_attr(rs, "Spreads", "spreads", default=()) or ())
-                if rs is not None and _extract_attr(rs, "Spreads", "spreads") is not None
-                else (),
-            )
-        divs_k = (
-            tuple(
-                (
-                    str(u),
-                    tuple(
-                        float(_extract_attr(it, "Amount", "amount", default=0.0))
-                        for it in (
-                            _extract_attr(
-                                dividends_map[u], "CashDividendList", "cash_dividend_list", default=()
-                            )
-                            or ()
-                        )
-                    ),
-                )
-                for u in sorted(dividends_map.keys())
-            )
-            if isinstance(dividends_map, (dict, Mapping))
-            else None
-        )
-        pdivs_k = str(predef_divs_map) if predef_divs_map else None
-        surf_list: list[Any] = []
-        if isinstance(vol_surfaces_map, (dict, Mapping)):
-            for u in sorted(vol_surfaces_map.keys()):
-                vq: Any = _extract_attr(vol_surfaces_map[u], "VolatilityQuotes", "volatility_quotes", default=()) or ()
-                if len(vq) > 0 and len(vq[0]) > 0:
-                    surf_list.append((str(u), len(vq), len(vq[0]), float(vq[0][0]), float(vq[-1][-1])))
-                else:
-                    surf_list.append((str(u), 0))
-        surf_k = tuple(surf_list)
-        repo_k = (
-            tuple(sorted(repo_curves_map.keys()))
-            if isinstance(repo_curves_map, (dict, Mapping))
-            else None
-        )
-        fix_k = (
-            tuple(
-                (
-                    str(u),
-                    len(_extract_attr(fixings_map[u], "FixingList", "fixing_list", default=()) or ()),
-                )
-                for u in sorted(fixings_map.keys())
-            )
-            if isinstance(fixings_map, (dict, Mapping))
-            else None
-        )
-        f_leg_k = (
-            (
-                funding_leg_dict.get("rate_identifier"),
-                funding_leg_dict.get("funding_spread"),
-                tuple(str(d) for d in funding_leg_dict.get("payment_dates", ())),
-            )
-            if funding_leg_dict is not None
-            else None
-        )
-        return (
-            d_max,
-            m_max,
-            as_of_dt,
-            start_dt,
-            payment_ccy,
-            dcc,
-            tuple(underlying_ids),
-            tuple(ref_spots),
-            tuple(str(d) for d in obs_dates),
-            tuple(str(d) for d in pay_dates),
-            tuple(ko_levels),
-            tuple(cpn_levels),
-            tuple(cpn_amounts) if cpn_amounts is not None else None,
-            fixed_cpn_amt,
-            fixed_rate,
-            is_memory,
-            callability_index,
-            coupon_index,
-            option_index,
-            strike,
-            option_gearing,
-            lower_strike,
-            ki_barrier,
-            ko_spread,
-            cpn_spread,
-            ki_spread,
-            no_notional_repayment,
-            autocall_coupon,
-            force_coupons_on_autocall,
-            allow_autocall_on_expiry,
-            is_long_basket,
-            part_strike,
-            part_rate,
-            one_star_strike,
-            one_star_coupon,
-            cpn_barrier_type,
-            cpn_barrier_direction,
-            f_leg_k,
-            disc_k,
-            spots_k,
-            corr_k,
-            divs_k,
-            pdivs_k,
-            surf_k,
-            repo_k,
-            fix_k,
-        )
-    except Exception:
+    rate_identifier: str | None,
+) -> tuple[tuple[datetime.datetime, float], ...]:
+    """Extracts sorted (date, rate) pairs for a floating funding rate identifier."""
+    if not rate_identifier or not isinstance(fixings_map, Mapping):
+        return ()
+    f_obj = fixings_map.get(rate_identifier)
+    if f_obj is None:
+        return ()
+    raw_dates = _extract_attr(f_obj, "Dates", "dates", default=())
+    raw_vals = _extract_attr(f_obj, "Values", "values", default=())
+    if not raw_dates or not raw_vals:
+        return ()
+    pairs = [(_to_utc_datetime(d), float(v)) for d, v in zip(raw_dates, raw_vals)]
+    pairs.sort(key=lambda item: item[0])
+    return tuple(pairs)
+
+
+def _lookup_funding_fixing(
+    fixings_pairs: Sequence[tuple[datetime.datetime, float]],
+    target_dt: datetime.datetime,
+) -> float | None:
+    """Finds an exact or same-calendar-day UTC fixing for a funding reset date."""
+    if not fixings_pairs:
         return None
+    target_date = target_dt.date()
+    exact: float | None = None
+    for f_dt, f_val in fixings_pairs:
+        if f_dt == target_dt:
+            return float(f_val)
+        if f_dt.date() == target_date:
+            exact = float(f_val)
+    return exact
 
 
 def preprocess_eq_autocall(
@@ -686,15 +799,9 @@ def preprocess_eq_autocall(
     d_max: int = D_MAX_DEFAULT,
     m_max: int = M_MAX_DEFAULT,
 ) -> AutocallPreprocState:
-    """Executes the Tier 1 deterministic `torch.float64` pre-processor on an Autocallable trade request.
-
-    Accepts:
-      - `EQAutocallableTradeRequest` or `EQAutocallableMLRequest` (Pydantic V2 models),
-      - Raw Murex `ConstantMessageMap` string or `Path` (`eq_autocallable_request.txt`),
-      - Structured Python `dict`.
-    """
+    """Executes the Tier 1 deterministic `torch.float64` pre-processor on an Autocallable trade."""
     if isinstance(req_or_raw, (str, Path)):
-        req_obj, _ = parse_murex_text_or_dict_fallback(req_or_raw)
+        req_obj, _ = parse_murex_autocall_dag(req_or_raw)
     else:
         req_obj = req_or_raw
 
@@ -730,7 +837,6 @@ def preprocess_eq_autocall(
         float(x) for x in _extract_attr(product, "UnderlyingReferenceSpots", "underlying_reference_spots")
     ]
 
-    # Extract observation & payment dates and barrier schedules
     periods_obj = _extract_attr(product, "periods")
     if periods_obj is not None:
         obs_dates = [_extract_attr(p, "observation_date") for p in periods_obj]
@@ -742,8 +848,8 @@ def preprocess_eq_autocall(
         cpn_amounts: list[float] | None = [
             float(_extract_attr(p, "coupon_amount", default=0.0)) for p in periods_obj
         ]
-        fixed_cpn_amt = None
-        fixed_rate = None
+        fixed_cpn_amt: float | list[float] | None = None
+        fixed_rate: float | list[float] | None = None
     else:
         obs_dates = list(_extract_attr(product, "ObservationDates", "observation_dates"))
         pay_dates = list(_extract_attr(product, "PaymentDates", "payment_dates"))
@@ -751,8 +857,12 @@ def preprocess_eq_autocall(
         raw_cpn_levels = _extract_attr(product, "CouponBarrierLevels", "coupon_barrier_levels")
         cpn_levels = [float(x) for x in raw_cpn_levels] if raw_cpn_levels is not None else [1e-5] * len(obs_dates)
         cpn_amounts = None
-        fixed_cpn_amt = _extract_attr(product, "FixedCouponAmount", "fixed_coupon_amount")
-        fixed_rate = _extract_attr(product, "FixedRate", "fixed_rate")
+        fixed_cpn_amt = _normalize_coupon_param(
+            _extract_attr(product, "FixedCouponAmount", "fixed_coupon_amount")
+        )
+        fixed_rate = _normalize_coupon_param(
+            _extract_attr(product, "FixedRate", "fixed_rate")
+        )
 
     is_memory = bool(_extract_attr(product, "IsMemory", "is_memory", default=False))
     call_idx_raw = _extract_attr(
@@ -766,7 +876,6 @@ def preprocess_eq_autocall(
     opt_idx_raw = _extract_attr(product, "OptionMonitoringIndex", "option_index")
     option_index = str(getattr(opt_idx_raw, "value", opt_idx_raw)) if opt_idx_raw is not None else None
 
-    # Downside put & modifiers
     downside_put = _extract_attr(product, "downside_put")
     modifiers = _extract_attr(product, "modifiers")
 
@@ -793,6 +902,20 @@ def preprocess_eq_autocall(
         else _extract_attr(product, "OptionDownAndInBarrierLevel", "knock_in_barrier")
     )
     ki_barrier = float(ki_barrier_raw) if ki_barrier_raw is not None else None
+
+    ki_obs_type_raw = _extract_attr(
+        product, "OptionDownAndInBarrierObservationType", "ki_observation_type"
+    )
+    ki_obs_type = str(getattr(ki_obs_type_raw, "value", ki_obs_type_raw)) if ki_obs_type_raw else None
+    ki_monitored_past_override = _extract_attr(product, "ki_monitored_past")
+    if ki_monitored_past_override is not None:
+        ki_monitored_past = bool(ki_monitored_past_override)
+    elif ki_barrier is None or ki_barrier <= 0.0:
+        ki_monitored_past = False
+    elif ki_obs_type == "European":
+        ki_monitored_past = False
+    else:
+        ki_monitored_past = True
 
     ko_spread = float(
         _extract_attr(
@@ -873,38 +996,6 @@ def preprocess_eq_autocall(
     )
     cpn_barrier_direction = str(getattr(cpn_barrier_dir_raw, "value", cpn_barrier_dir_raw) or "Up")
 
-    # Floating FundingLeg extraction (supports both floating RateIdentifier and fixed-spread FundingLeg)
-    funding_leg_obj = _extract_attr(product, "funding_leg")
-    rate_id = _extract_attr(product, "RateIdentifier", "rate_identifier")
-    funding_leg_dates = _extract_attr(product, "FundingLegPaymentDates", "funding_leg_payment_dates")
-    funding_spread = float(_extract_attr(product, "FundingSpread", "funding_spread", default=0.0))
-    funding_leg_dict: dict[str, Any] | None = None
-    if funding_leg_obj is not None:
-        raw_f_dates = _extract_attr(funding_leg_obj, "payment_dates", default=[])
-        if raw_f_dates:
-            raw_rid = _extract_attr(funding_leg_obj, "rate_identifier")
-            funding_leg_dict = {
-                "rate_identifier": str(raw_rid) if raw_rid is not None else None,
-                "funding_spread": float(_extract_attr(funding_leg_obj, "funding_spread", default=0.0)),
-                "payment_dates": [_to_utc_datetime(d) for d in raw_f_dates],
-            }
-    elif funding_leg_dates:
-        funding_leg_dict = {
-            "rate_identifier": str(rate_id) if rate_id is not None else None,
-            "funding_spread": funding_spread,
-            "payment_dates": [_to_utc_datetime(d) for d in funding_leg_dates],
-        }
-
-    # Resolve discount curve from MarketDataSet
-    rates_bundles = _extract_attr(mkt, "RatesCurvesBundles", "rates_curves_bundles")
-    disc_curve_spec = _extract_attr(mkt, "discount_curve")
-    if disc_curve_spec is None and rates_bundles:
-        fin_ids = _extract_attr(model, "FinancingCurveIdentifiers", "financing_curve_identifiers")
-        if fin_ids and len(fin_ids) > 0 and fin_ids[0] in rates_bundles:
-            disc_curve_spec = rates_bundles[fin_ids[0]]
-        else:
-            disc_curve_spec = next(iter(rates_bundles.values()))
-
     spots_map = _extract_attr(mkt, "Spots", "spots")
     fixings_map = _extract_attr(mkt, "Fixings", "fixings")
     repo_curves_map = _extract_attr(mkt, "RepoSpreadCurves", "repo_spread_curves", "repo_curves", default={})
@@ -917,8 +1008,45 @@ def preprocess_eq_autocall(
     )
     vol_surfaces_map = _extract_attr(mkt, "VolatilitySurfaces", "volatility_surfaces", default={})
     correlations_map = _extract_attr(mkt, "Correlations", "correlations")
+    rates_bundles = _extract_attr(mkt, "RatesCurvesBundles", "rates_curves_bundles")
+    fin_ids_raw = _extract_attr(model, "FinancingCurveIdentifiers", "financing_curve_identifiers")
 
-    cache_key: Any | None = None
+    # FundingLeg extraction supporting explicit FundingLeg dates or Warrant PaymentDates fallback
+    funding_leg_obj = _extract_attr(product, "funding_leg")
+    rate_id = _extract_attr(product, "RateIdentifier", "rate_identifier")
+    funding_leg_dates = _extract_attr(product, "FundingLegPaymentDates", "funding_leg_payment_dates")
+    funding_spread = float(_extract_attr(product, "FundingSpread", "funding_spread", default=0.0))
+    funding_leg_dict: dict[str, Any] | None = None
+    if funding_leg_obj is not None:
+        raw_f_dates = _extract_attr(funding_leg_obj, "payment_dates", default=[])
+        if raw_f_dates:
+            raw_rid = _extract_attr(funding_leg_obj, "rate_identifier")
+            f_rid_str = str(raw_rid) if raw_rid is not None else None
+            funding_leg_dict = {
+                "rate_identifier": f_rid_str,
+                "funding_spread": float(_extract_attr(funding_leg_obj, "funding_spread", default=0.0)),
+                "payment_dates": [_to_utc_datetime(d) for d in raw_f_dates],
+                "funding_fixings": _extract_funding_fixings(fixings_map, f_rid_str),
+            }
+    elif funding_leg_dates:
+        f_rid_str = str(rate_id) if rate_id is not None else None
+        funding_leg_dict = {
+            "rate_identifier": f_rid_str,
+            "funding_spread": funding_spread,
+            "payment_dates": [_to_utc_datetime(d) for d in funding_leg_dates],
+            "funding_fixings": _extract_funding_fixings(fixings_map, f_rid_str),
+        }
+    elif (rate_id is not None or funding_spread != 0.0) and pay_dates:
+        f_rid_str = str(rate_id) if rate_id is not None else None
+        funding_leg_dict = {
+            "rate_identifier": f_rid_str,
+            "funding_spread": funding_spread,
+            "payment_dates": [_to_utc_datetime(d) for d in pay_dates],
+            "funding_fixings": _extract_funding_fixings(fixings_map, f_rid_str),
+        }
+
+    # Content-addressed cache lookup hashing 100% of market and contract inputs
+    cache_key: ContentDigestKey | None = None
     if (
         spots_override is None
         and corr_override is None
@@ -926,86 +1054,98 @@ def preprocess_eq_autocall(
         and dividend_amount_overrides is None
         and as_of_date_override is None
     ):
-        cache_key = _try_make_preproc_cache_key(
-            d_max=d_max,
-            m_max=m_max,
-            as_of_dt=as_of_dt,
-            start_dt=start_dt,
-            payment_ccy=payment_ccy,
-            dcc=dcc,
-            underlying_ids=underlying_ids,
-            ref_spots=ref_spots,
-            obs_dates=obs_dates,
-            pay_dates=pay_dates,
-            ko_levels=ko_levels,
-            cpn_levels=cpn_levels,
-            cpn_amounts=cpn_amounts,
-            fixed_cpn_amt=fixed_cpn_amt,
-            fixed_rate=fixed_rate,
-            is_memory=is_memory,
-            callability_index=callability_index,
-            coupon_index=coupon_index,
-            option_index=option_index,
-            strike=strike,
-            option_gearing=option_gearing,
-            lower_strike=lower_strike,
-            ki_barrier=ki_barrier,
-            ko_spread=ko_spread,
-            cpn_spread=cpn_spread,
-            ki_spread=ki_spread,
-            no_notional_repayment=no_notional_repayment,
-            autocall_coupon=autocall_coupon,
-            force_coupons_on_autocall=force_coupons_on_autocall,
-            allow_autocall_on_expiry=allow_autocall_on_expiry,
-            is_long_basket=is_long_basket,
-            part_strike=part_strike,
-            part_rate=part_rate,
-            one_star_strike=one_star_strike,
-            one_star_coupon=one_star_coupon,
-            cpn_barrier_type=cpn_barrier_type,
-            cpn_barrier_direction=cpn_barrier_direction,
-            funding_leg_dict=funding_leg_dict,
-            disc_curve_spec=disc_curve_spec,
-            spots_map=spots_map,
-            fixings_map=fixings_map,
-            repo_curves_map=repo_curves_map,
-            dividends_map=dividends_map,
-            predef_divs_map=predef_divs_map,
-            vol_surfaces_map=vol_surfaces_map,
-            correlations_map=correlations_map,
-        )
-        if cache_key is not None and cache_key in _PREPROC_STATE_CACHE:
-            cached_template = _PREPROC_STATE_CACHE[cache_key]
-            cloned = copy.copy(cached_template)
-            cloned.queries = list(queries)
-            cloned.trade_info = str(trade_info) if trade_info is not None else None
-            return cloned
+        cache_payload = {
+            "schema_ver": FEATURE_SCHEMA_VERSION,
+            "d_max": int(d_max),
+            "m_max": int(m_max),
+            "as_of_dt": as_of_dt,
+            "start_dt": start_dt,
+            "payment_ccy": payment_ccy,
+            "dcc": dcc,
+            "underlying_ids": underlying_ids,
+            "ref_spots": ref_spots,
+            "obs_dates": [_to_utc_datetime(d) for d in obs_dates],
+            "pay_dates": [_to_utc_datetime(d) for d in pay_dates],
+            "ko_levels": ko_levels,
+            "cpn_levels": cpn_levels,
+            "cpn_amounts": cpn_amounts,
+            "fixed_cpn_amt": fixed_cpn_amt,
+            "fixed_rate": fixed_rate,
+            "is_memory": is_memory,
+            "callability_index": callability_index,
+            "coupon_index": coupon_index,
+            "option_index": option_index,
+            "strike": strike,
+            "option_gearing": option_gearing,
+            "lower_strike": lower_strike,
+            "ki_barrier": ki_barrier,
+            "ki_monitored_past": ki_monitored_past,
+            "ki_obs_type": ki_obs_type,
+            "ko_spread": ko_spread,
+            "cpn_spread": cpn_spread,
+            "ki_spread": ki_spread,
+            "no_notional_repayment": no_notional_repayment,
+            "autocall_coupon": autocall_coupon,
+            "force_coupons_on_autocall": force_coupons_on_autocall,
+            "allow_autocall_on_expiry": allow_autocall_on_expiry,
+            "is_long_basket": is_long_basket,
+            "part_strike": part_strike,
+            "part_rate": part_rate,
+            "one_star_strike": one_star_strike,
+            "one_star_coupon": one_star_coupon,
+            "cpn_barrier_type": cpn_barrier_type,
+            "cpn_barrier_direction": cpn_barrier_direction,
+            "funding_leg": funding_leg_dict,
+            "fin_ids": [str(x) for x in fin_ids_raw] if fin_ids_raw else None,
+            "disc_curve_spec": _extract_attr(mkt, "discount_curve"),
+            "rates_bundles": rates_bundles,
+            "spots_map": spots_map,
+            "fixings_map": fixings_map,
+            "repo_curves_map": repo_curves_map,
+            "dividends_map": dividends_map,
+            "predef_divs_map": predef_divs_map,
+            "vol_surfaces_map": vol_surfaces_map,
+            "correlations_map": correlations_map,
+        }
+        cache_key = digest_market_bytes("preproc_state", cache_payload)
+        if cache_key is not None:
+            cached_clone = cast("AutocallPreprocState | None", _PREPROC_STATE_CACHE.get(cache_key))
+            if cached_clone is not None:
+                cached_clone.queries = list(queries)
+                cached_clone.trade_info = str(trade_info) if trade_info is not None else None
+                return cached_clone
 
-    # Wrap in ClampedYieldCurve if available from Worker A's eq_curves.py
-    disc_curve_obj: Any = disc_curve_spec
-    try:
-        from deepvol.market.eq_curves import ClampedYieldCurve
-
-        if not isinstance(disc_curve_spec, ClampedYieldCurve):
-            disc_curve_obj = ClampedYieldCurve(disc_curve_spec)
-    except Exception:
-        disc_curve_obj = disc_curve_spec
+    # Canonical lexicographical sorting order needed to resolve asset financing curves
+    sorted_preview_ids = sorted(underlying_ids)
+    disc_curve_obj, disc_curve_id, asset_fin_curves = _resolve_curves_and_financing(
+        mkt=mkt,
+        model=model,
+        sorted_ids=sorted_preview_ids,
+        payment_ccy=payment_ccy,
+        dividends_map=dividends_map if isinstance(dividends_map, Mapping) else {},
+        predef_divs_map=predef_divs_map if isinstance(predef_divs_map, Mapping) else {},
+        as_of_dt=as_of_dt,
+    )
 
     if funding_leg_dict is not None:
         f_rid = funding_leg_dict.get("rate_identifier")
         f_curve_obj: Any = None
+        f_curve_id: str | None = disc_curve_id
         if f_rid is not None:
-            f_spec = rates_bundles.get(f_rid) if isinstance(rates_bundles, Mapping) else None
-            if f_spec is not None:
-                try:
-                    from deepvol.market.eq_curves import ClampedYieldCurve
-
-                    f_curve_obj = f_spec if isinstance(f_spec, ClampedYieldCurve) else ClampedYieldCurve(f_spec)
-                except Exception:
-                    f_curve_obj = f_spec
+            f_curve_id = str(f_rid)
+            if isinstance(rates_bundles, Mapping) and f_rid in rates_bundles:
+                f_curve_obj = (
+                    disc_curve_obj
+                    if (disc_curve_id is not None and f_rid == disc_curve_id)
+                    else _get_cached_yield_curve(rates_bundles[f_rid], as_of_dt)
+                )
             else:
                 f_curve_obj = disc_curve_obj
+                f_curve_id = disc_curve_id
+        else:
+            f_curve_obj = disc_curve_obj
         funding_leg_dict["funding_curve"] = f_curve_obj
+        funding_leg_dict["funding_curve_id"] = f_curve_id
 
     _, df_fin_fn = build_discount_rate_evaluator(disc_curve_obj, as_of_dt)
 
@@ -1020,8 +1160,8 @@ def preprocess_eq_autocall(
         spots_t0=spots_override if spots_override is not None else spots_map,
         ko_barriers=ko_levels,
         cpn_barriers=cpn_levels,
-        fixed_coupon_amount=float(fixed_cpn_amt) if fixed_cpn_amt is not None else None,
-        fixed_rate=float(fixed_rate) if fixed_rate is not None else None,
+        fixed_coupon_amount=fixed_cpn_amt,
+        fixed_rate=fixed_rate,
         coupon_amounts=cpn_amounts,
         day_count_convention=dcc,
         time_day_count_convention="Act365",
@@ -1031,13 +1171,24 @@ def preprocess_eq_autocall(
         option_index=option_index,
         fixings=fixings_map,
         ki_barrier=ki_barrier,
-        ki_monitored_past=False,
+        ki_monitored_past=ki_monitored_past,
         allow_autocall_on_expiry=allow_autocall_on_expiry,
         force_coupons_on_autocall=force_coupons_on_autocall,
         autocall_coupon=autocall_coupon,
         no_notional_repayment=no_notional_repayment,
         payment_currency=payment_ccy,
         df_pay_fn=df_fin_fn,
+        coupon_barrier_type=cpn_barrier_type,
+        coupon_barrier_direction=cpn_barrier_direction,
+        strike=strike,
+        option_gearing=option_gearing,
+        lower_strike=lower_strike,
+        is_long_basket=is_long_basket,
+        participation_call_strike=part_strike,
+        participation_call_rate=part_rate,
+        one_star_strike=one_star_strike,
+        one_star_coupon=one_star_coupon,
+        funding_leg=funding_leg_dict,
     )
 
     sorted_ids = seasoned.sorted_identifiers
@@ -1045,7 +1196,7 @@ def preprocess_eq_autocall(
     m_rem = len(seasoned.future_indices)
     device = seasoned.spots_t0.device
 
-    # 2. Buehler Escrowed/Affine Cash Dividend Forward & Leverage Engine
+    # 2. Escrowed/Affine Cash Dividend Forward & Quanto Engine
     div_out = compute_escrowed_dividend_forwards(
         identifiers=sorted_ids,
         as_of_date=as_of_dt,
@@ -1053,6 +1204,7 @@ def preprocess_eq_autocall(
         spots_t0=seasoned.spots_t0,
         ref_spots=seasoned.ref_spots,
         discount_curve=disc_curve_obj,
+        asset_financing_curves=asset_fin_curves,
         repo_curves=repo_curves_map,
         market_dividends=dividends_map,
         predefined_dividends=predef_divs_map,
@@ -1067,30 +1219,57 @@ def preprocess_eq_autocall(
     iv_at_fwd_np = np.zeros((d_assets, m_rem), dtype=np.float64)
     d_iv_dk_np = np.zeros((d_assets, m_rem), dtype=np.float64)
     node_surf_feats_np = np.zeros((d_assets, 7), dtype=np.float64)
+    surf_tau_obs_map: dict[str, npt.NDArray[np.float64]] = {}
     fwd_price_np = div_out.forward_price.detach().cpu().numpy().astype(np.float64)
     fwd_req_grad = bool(div_out.forward_price.requires_grad)
 
-    for i, ticker in enumerate(sorted_ids):
-        if ticker not in vol_surfaces_map:
-            raise KeyError(f"Missing EquityVolatilitySmileCollection for underlying {ticker!r}.")
-        surf_i = RegularizedVolSurface(vol_surfaces_map[ticker], as_of_date=as_of_dt, bc_type="clamped")
-        reg_surfaces[ticker] = surf_i
+    if m_rem > 0 and not seasoned.already_autocalled:
+        for i, ticker in enumerate(sorted_ids):
+            if ticker not in vol_surfaces_map:
+                raise KeyError(f"Missing EquityVolatilitySmileCollection for underlying {ticker!r}.")
+            surf_spec = vol_surfaces_map[ticker]
+            surf_i = _get_cached_vol_surface(surf_spec, as_of_dt)
+            reg_surfaces[ticker] = surf_i
 
-        if m_rem > 0:
-            for m in range(m_rem):
-                t_m = float(seasoned.tau_obs[m])
-                f_im = float(fwd_price_np[i, m])
-                iv_at_fwd_np[i, m] = float(surf_i.iv(t_m, f_im))
+            raw_surf_dcc = _extract_attr(surf_spec, "DayCountConvention", "day_count_convention", default="Act365")
+            surf_dcc = str(getattr(raw_surf_dcc, "value", raw_surf_dcc))
+            tau_surf_obs = (
+                np.asarray(seasoned.tau_obs, dtype=np.float64)
+                if surf_dcc == "Act365"
+                else year_fractions(as_of_dt, seasoned.future_obs_dates, surf_dcc)
+            )
+            surf_tau_obs_map[ticker] = tau_surf_obs
+
+            f_row = fwd_price_np[i, :]
+            if _HAS_IV_BATCH:
+                iv_batch_fn = getattr(surf_i, "iv_batch")
+                iv_at_fwd_np[i, :] = np.asarray(
+                    iv_batch_fn(tau_surf_obs, f_row), dtype=np.float64
+                )
                 if fwd_req_grad:
-                    eps_k = max(1e-5 * f_im, 1e-6)
-                    iv_hi = float(surf_i.iv(t_m, f_im + eps_k))
-                    iv_lo = float(surf_i.iv(t_m, max(f_im - eps_k, 1e-6)))
-                    d_iv_dk_np[i, m] = (iv_hi - iv_lo) / ((f_im + eps_k) - max(f_im - eps_k, 1e-6))
+                    eps_k = np.maximum(1e-5 * f_row, 1e-6)
+                    f_hi = f_row + eps_k
+                    f_lo = np.maximum(f_row - eps_k, 1e-6)
+                    iv_hi = np.asarray(iv_batch_fn(tau_surf_obs, f_hi), dtype=np.float64)
+                    iv_lo = np.asarray(iv_batch_fn(tau_surf_obs, f_lo), dtype=np.float64)
+                    d_iv_dk_np[i, :] = (iv_hi - iv_lo) / (f_hi - f_lo)
+            else:
+                for m in range(m_rem):
+                    t_m = float(tau_surf_obs[m])
+                    f_im = float(f_row[m])
+                    iv_at_fwd_np[i, m] = float(surf_i.iv(t_m, f_im))
+                    if fwd_req_grad:
+                        eps_k_s = max(1e-5 * f_im, 1e-6)
+                        f_hi_s = f_im + eps_k_s
+                        f_lo_s = max(f_im - eps_k_s, 1e-6)
+                        iv_hi_s = float(surf_i.iv(t_m, f_hi_s))
+                        iv_lo_s = float(surf_i.iv(t_m, f_lo_s))
+                        d_iv_dk_np[i, m] = (iv_hi_s - iv_lo_s) / (f_hi_s - f_lo_s)
 
-            t_short = float(seasoned.tau_obs[0])
-            f_short = float(fwd_price_np[i, 0])
-            t_term = float(seasoned.tau_obs[-1])
-            f_term = float(fwd_price_np[i, -1])
+            t_short = float(tau_surf_obs[0])
+            f_short = float(f_row[0])
+            t_term = float(tau_surf_obs[-1])
+            f_term = float(f_row[-1])
             node_surf_feats_np[i, :] = surf_i.extract_node_surface_features_values_only(
                 t_short,
                 f_short,
@@ -1103,40 +1282,48 @@ def preprocess_eq_autocall(
     id_to_idx = {ticker: idx for idx, ticker in enumerate(sorted_ids)}
 
     def _build_surf_feat_jac(ticker: str) -> npt.NDArray[np.float64]:
+        if ticker not in reg_surfaces or m_rem == 0:
+            return np.zeros((7, 1, 1), dtype=np.float64)
         surf_i = reg_surfaces[ticker]
-        if m_rem == 0:
-            return np.zeros((7, surf_i.n_exp, surf_i.n_raw_strikes), dtype=np.float64)
         idx = id_to_idx[ticker]
+        tau_s = surf_tau_obs_map[ticker]
         _, jac_7d = surf_i.extract_node_surface_features(
-            float(seasoned.tau_obs[0]),
+            float(tau_s[0]),
             float(fwd_price_np[idx, 0]),
-            float(seasoned.tau_obs[-1]),
+            float(tau_s[-1]),
             float(fwd_price_np[idx, -1]),
         )
         return jac_7d
 
     def _build_iv_fwd_jac(ticker: str) -> npt.NDArray[np.float64]:
+        if ticker not in reg_surfaces or m_rem == 0:
+            return np.zeros((0, 1, 1), dtype=np.float64)
         surf_i = reg_surfaces[ticker]
-        if m_rem == 0:
-            return np.zeros((0, surf_i.n_exp, surf_i.n_raw_strikes), dtype=np.float64)
         idx = id_to_idx[ticker]
+        tau_s = surf_tau_obs_map[ticker]
         return np.stack(
             [
-                surf_i.iv_and_d_iv_d_quotes(float(seasoned.tau_obs[m]), float(fwd_price_np[idx, m]))[1]
+                surf_i.iv_and_d_iv_d_quotes(float(tau_s[m]), float(fwd_price_np[idx, m]))[1]
                 for m in range(m_rem)
             ],
             axis=0,
         )
 
-    surf_feat_jacs: dict[str, npt.NDArray[np.float64]] = _LazySurfaceJacobianDict(_build_surf_feat_jac, sorted_ids)
-    iv_fwd_jacs: dict[str, npt.NDArray[np.float64]] = _LazySurfaceJacobianDict(_build_iv_fwd_jac, sorted_ids)
+    jac_keys = list(reg_surfaces.keys())
+    surf_feat_jacs: dict[str, npt.NDArray[np.float64]] = _LazySurfaceJacobianDict(
+        _build_surf_feat_jac, jac_keys
+    )
+    iv_fwd_jacs: dict[str, npt.NDArray[np.float64]] = _LazySurfaceJacobianDict(
+        _build_iv_fwd_jac, jac_keys
+    )
 
     iv_at_fwd_t = torch.as_tensor(iv_at_fwd_np, dtype=torch.float64, device=device)
-    if div_out.forward_price.requires_grad:
+    if div_out.forward_price.requires_grad and m_rem > 0 and not seasoned.already_autocalled:
         d_iv_dk_t = torch.as_tensor(d_iv_dk_np, dtype=torch.float64, device=device)
         iv_at_fwd_t = iv_at_fwd_t + d_iv_dk_t * (
             div_out.forward_price - div_out.forward_price.detach()
         )
+
     tau_obs_t = torch.as_tensor(seasoned.tau_obs, dtype=torch.float64, device=device)
     delta_tau_t = torch.as_tensor(seasoned.delta_tau, dtype=torch.float64, device=device)
     tau_pay_t = torch.as_tensor(seasoned.tau_pay, dtype=torch.float64, device=device)
@@ -1149,13 +1336,11 @@ def preprocess_eq_autocall(
 
     if df_pay_override is not None:
         df_pay_t = df_pay_override.to(dtype=torch.float64, device=device)
-    else:
-        df_batch_fn = getattr(df_fin_fn, "_eval_tau_batch", None)
-        if df_batch_fn is not None and getattr(disc_curve_obj, "dcc", "Act365") == "Act365":
-            df_pay_np = df_batch_fn(np.asarray(seasoned.tau_pay, dtype=np.float64))
-        else:
-            df_pay_np = np.array([df_fin_fn(d) for d in seasoned.future_pay_dates], dtype=np.float64)
+    elif m_rem > 0:
+        df_pay_np = np.array([df_fin_fn(d) for d in seasoned.future_pay_dates], dtype=np.float64)
         df_pay_t = torch.as_tensor(df_pay_np, dtype=torch.float64, device=device)
+    else:
+        df_pay_t = torch.empty(0, dtype=torch.float64, device=device)
 
     v_perf_t = iv_at_fwd_t * torch.sqrt(tau_obs_t.clamp(min=1e-12)).unsqueeze(0)
 
@@ -1173,7 +1358,7 @@ def preprocess_eq_autocall(
     coupon_amounts_t = torch.as_tensor(seasoned.future_coupon_rates, dtype=torch.float64, device=device)
 
     # 4. Analytical Stulz-Margrabe Moment-Matched Basket Proxy
-    proxy_inputs = {
+    proxy_inputs: dict[str, Any] = {
         "forward_perf": div_out.forward_perf,
         "v_perf": v_perf_t,
         "corr_matrix": corr_t,
@@ -1196,25 +1381,37 @@ def preprocess_eq_autocall(
         "no_notional_repayment": no_notional_repayment,
         "autocall_coupon": autocall_coupon,
         "force_coupons_on_autocall": force_coupons_on_autocall,
+        "allow_autocall_on_expiry": allow_autocall_on_expiry,
         "coupon_barrier_type": cpn_barrier_type,
         "coupon_barrier_direction": cpn_barrier_direction,
         "is_long_basket": is_long_basket,
         "pv_in_transit": seasoned.pv_in_transit,
         "already_autocalled": seasoned.already_autocalled,
         "callability_index": callability_index,
+        "coupon_index": coupon_index,
+        "option_index": option_index,
+        "inv_lex_perm": seasoned.inv_lex_perm,
+        "tau_obs": tau_obs_t,
         "participation_call_strike": part_strike,
         "participation_call_rate": part_rate,
         "one_star_strike": one_star_strike,
         "one_star_coupon": one_star_coupon,
     }
-    baseline = compute_analytical_autocall_baseline(proxy_inputs)
+    baseline_kwargs: dict[str, Any] = {}
+    if "use_fast_cpu" in _BASELINE_SIG_PARAMS:
+        baseline_kwargs["use_fast_cpu"] = None
+    baseline = compute_analytical_autocall_baseline(proxy_inputs, **baseline_kwargs)
 
-    # 5. Construct Fixed-Padding Feature Tensors in torch.float64 (preserving autograd graph!)
+    # 5. Fixed-Padding Feature Tensors in torch.float64 (preserving autograd graph)
     d_pad = max(d_max, d_assets)
     m_pad = max(m_max, m_rem)
+    n_node_cols = len(AutocallNodeCol)
+    n_edge_cols = len(AutocallEdgeCol)
+    n_sched_cols = len(AutocallSchedCol)
+    n_global_cols = len(AutocallGlobalCol)
 
-    # 5a. Node Features: (1, d_pad, 14)
-    log_m0 = torch.log(seasoned.moneyness_t0.clamp(min=1e-12))  # (D,)
+    # 5a. Node Features: (1, d_pad, 16)
+    log_m0 = torch.log(seasoned.moneyness_t0.clamp(min=1e-12))
     if m_rem > 0:
         tau_term = tau_obs_t[-1].clamp(min=1e-6)
         log_fwd_carry_1y = torch.log(div_out.forward_rel[:, -1].clamp(min=1e-12)) / tau_term
@@ -1228,31 +1425,42 @@ def preprocess_eq_autocall(
         log_div_lev = torch.zeros(d_assets, dtype=torch.float64, device=device)
         dist_to_put = torch.zeros(d_assets, dtype=torch.float64, device=device)
 
-    surf_feats_t = torch.as_tensor(node_surf_feats_np, dtype=torch.float64, device=device)  # (D, 7)
+    surf_feats_t = torch.as_tensor(node_surf_feats_np, dtype=torch.float64, device=device)
     active_ones = torch.ones(d_assets, dtype=torch.float64, device=device)
 
-    node_active = torch.stack(
-        [
-            log_m0,
-            log_fwd_carry_1y,
-            log_div_lev,
-            div_out.repo_spread_avg,
-            surf_feats_t[:, 0],
-            surf_feats_t[:, 1],
-            surf_feats_t[:, 2],
-            surf_feats_t[:, 3],
-            surf_feats_t[:, 4],
-            surf_feats_t[:, 5],
-            surf_feats_t[:, 6],
-            dist_to_put,
-            baseline.proxy_delta_weights,
-            active_ones,
-        ],
-        dim=1,
-    )  # (D, 14)
+    # Set pair role bits only when an active monitoring index depends on asset declaration order.
+    role_leg_a = torch.zeros(d_assets, dtype=torch.float64, device=device)
+    role_leg_b = torch.zeros(d_assets, dtype=torch.float64, device=device)
+    active_indices = (
+        callability_index,
+        coupon_index or callability_index,
+        option_index or callability_index,
+    )
+    if d_assets >= 2 and any(idx in PAIR_ORDER_DEPENDENT_INDICES for idx in active_indices):
+        role_leg_a[int(seasoned.inv_lex_perm[0])] = 1.0
+        role_leg_b[int(seasoned.inv_lex_perm[1])] = 1.0
+
+    node_cols: list[torch.Tensor] = [torch.zeros(d_assets, dtype=torch.float64, device=device)] * n_node_cols
+    node_cols[AutocallNodeCol.LOG_MONEYNESS] = log_m0
+    node_cols[AutocallNodeCol.LOG_FWD_CARRY_1Y] = log_fwd_carry_1y
+    node_cols[AutocallNodeCol.CASH_DIV_LEVERAGE] = log_div_lev
+    node_cols[AutocallNodeCol.REPO_SPREAD_AVG] = div_out.repo_spread_avg
+    node_cols[AutocallNodeCol.IV_SHORT_ATM] = surf_feats_t[:, 0]
+    node_cols[AutocallNodeCol.IV_TERM_ATM] = surf_feats_t[:, 1]
+    node_cols[AutocallNodeCol.IV_TERM_SLOPE] = surf_feats_t[:, 2]
+    node_cols[AutocallNodeCol.SSVI_SKEW_RHO] = surf_feats_t[:, 3]
+    node_cols[AutocallNodeCol.SSVI_CURV_ETA] = surf_feats_t[:, 4]
+    node_cols[AutocallNodeCol.SMILE_RESIDUAL_PC1] = surf_feats_t[:, 5]
+    node_cols[AutocallNodeCol.SMILE_RESIDUAL_PC2] = surf_feats_t[:, 6]
+    node_cols[AutocallNodeCol.DIST_TO_PUT_STRIKE] = dist_to_put
+    node_cols[AutocallNodeCol.PROXY_DELTA_WEIGHT] = baseline.proxy_delta_weights
+    node_cols[AutocallNodeCol.ASSET_ACTIVE_MASK] = active_ones
+    node_cols[AutocallNodeCol.ROLE_LEG_A] = role_leg_a
+    node_cols[AutocallNodeCol.ROLE_LEG_B] = role_leg_b
+    node_active = torch.stack(node_cols, dim=1)
 
     if d_pad > d_assets:
-        node_pad = torch.zeros((d_pad - d_assets, 14), dtype=torch.float64, device=device)
+        node_pad = torch.zeros((d_pad - d_assets, n_node_cols), dtype=torch.float64, device=device)
         node_feats = torch.cat([node_active, node_pad], dim=0).unsqueeze(0)
         asset_mask = torch.cat(
             [active_ones, torch.zeros(d_pad - d_assets, dtype=torch.float64, device=device)],
@@ -1274,13 +1482,17 @@ def preprocess_eq_autocall(
     log_perf_diff_active = torch.abs(log_fp_term.unsqueeze(1) - log_fp_term.unsqueeze(0))
     off_diag_active = 1.0 - torch.eye(d_assets, dtype=torch.float64, device=device)
 
-    edge_active = torch.stack(
-        [corr_t, cov_active, log_perf_diff_active, off_diag_active],
-        dim=-1,
-    )  # (D, D, 4)
+    edge_cols: list[torch.Tensor] = [
+        torch.zeros((d_assets, d_assets), dtype=torch.float64, device=device)
+    ] * n_edge_cols
+    edge_cols[AutocallEdgeCol.CORR_RHO] = corr_t
+    edge_cols[AutocallEdgeCol.COVARIANCE_TERM] = cov_active
+    edge_cols[AutocallEdgeCol.LOG_PERF_DIFF] = log_perf_diff_active
+    edge_cols[AutocallEdgeCol.OFF_DIAG_MASK] = off_diag_active
+    edge_active = torch.stack(edge_cols, dim=-1)
 
     if d_pad > d_assets:
-        edge_full = torch.zeros((d_pad, d_pad, 4), dtype=torch.float64, device=device)
+        edge_full = torch.zeros((d_pad, d_pad, n_edge_cols), dtype=torch.float64, device=device)
         edge_full[:d_assets, :d_assets, :] = edge_active
         edge_feats = edge_full.unsqueeze(0)
     else:
@@ -1291,26 +1503,25 @@ def preprocess_eq_autocall(
         log_ko_feat_t = torch.as_tensor(sb.log_ko_barrier_feat, dtype=torch.float64, device=device)
         log_cpn_feat_t = torch.as_tensor(sb.log_cpn_barrier_feat, dtype=torch.float64, device=device)
         log_fw_t = torch.log(baseline.f_w.clamp(min=1e-12))
-        sched_active = torch.stack(
-            [
-                tau_obs_t,
-                delta_tau_t,
-                df_pay_t,
-                log_ko_feat_t,
-                is_callable_t,
-                log_cpn_feat_t,
-                is_guaranteed_t,
-                coupon_amounts_t,
-                log_fw_t,
-                baseline.v_w,
-                baseline.p_proxy,
-                baseline.q_proxy,
-            ],
-            dim=1,
-        )  # (M_rem, 12)
+        sched_cols: list[torch.Tensor] = [
+            torch.zeros(m_rem, dtype=torch.float64, device=device)
+        ] * n_sched_cols
+        sched_cols[AutocallSchedCol.TAU_OBS] = tau_obs_t
+        sched_cols[AutocallSchedCol.DELTA_TAU] = delta_tau_t
+        sched_cols[AutocallSchedCol.DF_PAY] = df_pay_t
+        sched_cols[AutocallSchedCol.LOG_KO_BARRIER] = log_ko_feat_t
+        sched_cols[AutocallSchedCol.IS_CALLABLE_FLAG] = is_callable_t
+        sched_cols[AutocallSchedCol.LOG_CPN_BARRIER] = log_cpn_feat_t
+        sched_cols[AutocallSchedCol.IS_GUARANTEED_CPN] = is_guaranteed_t
+        sched_cols[AutocallSchedCol.COUPON_RATE] = coupon_amounts_t
+        sched_cols[AutocallSchedCol.STULZ_FWD_W] = log_fw_t
+        sched_cols[AutocallSchedCol.STULZ_VOL_W] = baseline.v_w
+        sched_cols[AutocallSchedCol.PROXY_KO_PROB] = baseline.p_proxy
+        sched_cols[AutocallSchedCol.PROXY_CPN_PROB] = baseline.q_proxy
+        sched_active = torch.stack(sched_cols, dim=1)
         sched_ones = torch.ones(m_rem, dtype=torch.float64, device=device)
         if m_pad > m_rem:
-            sched_pad = torch.zeros((m_pad - m_rem, 12), dtype=torch.float64, device=device)
+            sched_pad = torch.zeros((m_pad - m_rem, n_sched_cols), dtype=torch.float64, device=device)
             sched_feats = torch.cat([sched_active, sched_pad], dim=0).unsqueeze(0)
             sched_mask = torch.cat(
                 [sched_ones, torch.zeros(m_pad - m_rem, dtype=torch.float64, device=device)],
@@ -1320,27 +1531,35 @@ def preprocess_eq_autocall(
             sched_feats = sched_active.unsqueeze(0)
             sched_mask = sched_ones.unsqueeze(0)
     else:
-        sched_feats = torch.zeros((1, m_pad, 12), dtype=torch.float64, device=device)
+        sched_feats = torch.zeros((1, m_pad, n_sched_cols), dtype=torch.float64, device=device)
         sched_mask = torch.zeros((1, m_pad), dtype=torch.float64, device=device)
 
-    # 5d. Global Context Vector: (1, 10)
+    # 5d. Global Context Vector: (1, 16)
     has_ki = 1.0 if (ki_barrier is not None and ki_barrier > 0.0) else 0.0
     b_ki_val = float(ki_barrier) if (ki_barrier is not None and ki_barrier > 0.0) else float(strike)
-    global_vec = torch.stack(
-        [
-            torch.tensor(float(strike), dtype=torch.float64, device=device),
-            torch.tensor(b_ki_val, dtype=torch.float64, device=device),
-            torch.tensor(has_ki, dtype=torch.float64, device=device),
-            torch.tensor(float(seasoned.i_ki_past), dtype=torch.float64, device=device),
-            torch.tensor(float(option_gearing), dtype=torch.float64, device=device),
-            torch.tensor(float(seasoned.c_mem_0), dtype=torch.float64, device=device),
-            torch.tensor(1.0 if is_memory else 0.0, dtype=torch.float64, device=device),
-            torch.tensor(abs(float(ko_spread)), dtype=torch.float64, device=device),
-            torch.tensor(abs(float(cpn_spread)), dtype=torch.float64, device=device),
-            baseline.l_put_proxy,
-        ],
-        dim=0,
-    ).unsqueeze(0)
+    lower_k_val = float(lower_strike) if lower_strike is not None else 0.0
+    call_code = float(monitoring_index_to_code(callability_index))
+    cpn_code = float(monitoring_index_to_code(coupon_index or callability_index))
+    opt_code = float(monitoring_index_to_code(option_index or callability_index))
+
+    global_cols: list[torch.Tensor] = [torch.tensor(0.0, dtype=torch.float64, device=device)] * n_global_cols
+    global_cols[AutocallGlobalCol.K_PUT] = torch.tensor(float(strike), dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.B_KI] = torch.tensor(b_ki_val, dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.HAS_KI_FLAG] = torch.tensor(has_ki, dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.I_KI_PAST] = torch.tensor(float(seasoned.i_ki_past), dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.G_PUT] = torch.tensor(float(option_gearing), dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.C_MEM_0] = torch.tensor(float(seasoned.c_mem_0), dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.IS_MEMORY_FLAG] = torch.tensor(1.0 if is_memory else 0.0, dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.ABS_KO_SPREAD] = torch.tensor(abs(float(ko_spread)), dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.ABS_CPN_SPREAD] = torch.tensor(abs(float(cpn_spread)), dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.L_PUT_PROXY] = baseline.l_put_proxy
+    global_cols[AutocallGlobalCol.LOWER_STRIKE] = torch.tensor(lower_k_val, dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.CALL_INDEX_ID] = torch.tensor(call_code, dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.CPN_INDEX_ID] = torch.tensor(cpn_code, dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.OPT_INDEX_ID] = torch.tensor(opt_code, dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.IS_LONG_BASKET] = torch.tensor(1.0 if is_long_basket else 0.0, dtype=torch.float64, device=device)
+    global_cols[AutocallGlobalCol.ABS_KI_SPREAD] = torch.tensor(abs(float(ki_spread)), dtype=torch.float64, device=device)
+    global_vec = torch.stack(global_cols, dim=0).unsqueeze(0)
 
     state_out = AutocallPreprocState(
         node_feats=node_feats,
@@ -1413,13 +1632,14 @@ def preprocess_eq_autocall(
         queries=queries,
         coupon_barrier_type=cpn_barrier_type,
         coupon_barrier_direction=cpn_barrier_direction,
+        cash_to_settle_today=seasoned.cash_to_settle_today,
+        quanto_meta=div_out.quanto_meta,
+        asset_financing_curves=asset_fin_curves,
+        discount_curve_id=disc_curve_id,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
     )
     if cache_key is not None:
-        if len(_PREPROC_STATE_CACHE) > 256:
-            _PREPROC_STATE_CACHE.clear()
-        setattr(state_out, "_cache_origin", state_out)
-        _PREPROC_STATE_CACHE[cache_key] = state_out
-        return copy.copy(state_out)
+        return cast(AutocallPreprocState, _PREPROC_STATE_CACHE.put(cache_key, state_out))
     return state_out
 
 
@@ -1433,19 +1653,23 @@ def assemble_autocall_cashflows_and_pv(
     l_onestar: torch.Tensor | float | None = None,
     h_prob: torch.Tensor | None = None,
     q_prob: torch.Tensor | None = None,
+    coupon_cf_undisc: torch.Tensor | npt.NDArray[np.float64] | None = None,
     option_se: float = 0.0,
     total_se: float | None = None,
     df_fin_fn_override: Callable[[datetime.datetime], torch.Tensor | float] | None = None,
     build_cashflow_items: bool = True,
 ) -> AutocallPostprocOutput:
-    """Executes the W1 affine stopping-time cash-flow and ProductValue post-processor in torch.float64.
-
-    If `p_stop`, `q_cpn`, or `l_put` are omitted, defaults to the analytical Stulz-Margrabe baseline
-    predictions in `preproc_state.baseline`.
-    """
+    """Executes the W1 affine stopping-time cash-flow and ProductValue post-processor in float64."""
     m_rem = preproc_state.m_rem
     device = preproc_state.spots_t0.device
     ccy = preproc_state.payment_currency
+    cash_today = float(
+        getattr(
+            preproc_state,
+            "cash_to_settle_today",
+            getattr(preproc_state.seasoned_state, "cash_to_settle_today", 0.0),
+        )
+    )
 
     if p_stop is None and h_prob is not None:
         h_t = (
@@ -1488,7 +1712,6 @@ def assemble_autocall_cashflows_and_pv(
         else torch.as_tensor(l_onestar, dtype=torch.float64, device=device).reshape(())
     )
 
-    # Enforce callable mask on stopping probabilities
     p_t = p_t * preproc_state.is_callable
 
     cashflows: list[CashFlowItem] = (
@@ -1501,19 +1724,11 @@ def assemble_autocall_cashflows_and_pv(
         if build_cashflow_items:
             for m in range(m_rem):
                 pay_dt = preproc_state.seasoned_state.future_pay_dates[m]
-                cashflows.append(
-                    CashFlowItem("FundingLeg", pay_dt, 0.0, 0.0, ccy, 0, "Estimate")
-                )
-                cashflows.append(
-                    CashFlowItem("Coupon", pay_dt, 0.0, 0.0, ccy, 0, "Estimate")
-                )
+                cashflows.append(CashFlowItem("FundingLeg", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
+                cashflows.append(CashFlowItem("Coupon", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
                 if m == m_rem - 1:
-                    cashflows.append(
-                        CashFlowItem("Option", pay_dt, 0.0, 0.0, ccy, 0, "Estimate")
-                    )
-                cashflows.append(
-                    CashFlowItem("Notional", pay_dt, 0.0, 0.0, ccy, 0, "Estimate")
-                )
+                    cashflows.append(CashFlowItem("Option", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
+                cashflows.append(CashFlowItem("Notional", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
         return AutocallPostprocOutput(
             product_value=pv_in_transit_t,
             notional_pv=z_s,
@@ -1529,11 +1744,10 @@ def assemble_autocall_cashflows_and_pv(
             cashflows=cashflows,
             standard_error=0.0,
             reporting_currency=ccy,
-            cash_to_settle_today=0.0,
+            cash_to_settle_today=cash_today,
             l_onestar=l_onestar_t,
         )
 
-    # Survival probabilities S_m = 1 - sum_{k=1}^m p_k
     cum_p = torch.cumsum(p_t, dim=0)
     survival_probs = (1.0 - cum_p).clamp(min=0.0)
     surv_prev = torch.cat(
@@ -1544,7 +1758,7 @@ def assemble_autocall_cashflows_and_pv(
     df_pay = preproc_state.df_pay
     cpn_rates = preproc_state.coupon_amounts
 
-    # Floating / Fixed-Spread FundingLeg schedule per period if present
+    # Pure stateless FundingLeg evaluation without mutating preproc_state.funding_leg
     funding_cf_per_period: list[torch.Tensor] = [
         torch.tensor(0.0, dtype=torch.float64, device=device) for _ in range(m_rem)
     ]
@@ -1552,104 +1766,84 @@ def assemble_autocall_cashflows_and_pv(
         f_leg = preproc_state.funding_leg
         f_rid = f_leg.get("rate_identifier")
         f_curve = f_leg.get("funding_curve")
-        if df_fin_fn_override is None:
-            cache_key_w = (preproc_state.seasoned_state.as_of_date, m_rem)
-            cached_w_pair = f_leg.get("_cached_w_fund_per_period")
-            if cached_w_pair is not None and cached_w_pair[0] == cache_key_w:
-                w_fund_list: list[float] = cached_w_pair[1]
-            else:
-                cached_fin = f_leg.get("_cached_df_fin_fn")
-                if cached_fin is None:
-                    _, cached_fin = build_discount_rate_evaluator(
-                        preproc_state.discount_curve, preproc_state.seasoned_state.as_of_date
-                    )
-                    f_leg["_cached_df_fin_fn"] = cached_fin
-                df_fin_fn = cached_fin
-                if f_rid is not None and f_curve is not None and f_curve is not preproc_state.discount_curve:
-                    cached_fwd = f_leg.get("_cached_df_fwd_fn")
-                    if cached_fwd is None:
-                        _, cached_fwd = build_discount_rate_evaluator(
-                            f_curve, preproc_state.seasoned_state.as_of_date
-                        )
-                        f_leg["_cached_df_fwd_fn"] = cached_fwd
-                    df_fwd_fn = cached_fwd
-                else:
-                    df_fwd_fn = df_fin_fn
-                f_spread = float(f_leg.get("funding_spread", 0.0))
-                f_dates = f_leg.get("payment_dates", [])
-                w_fund_list = [0.0] * m_rem
-                prev_f_dt = preproc_state.seasoned_state.as_of_date
-                for f_dt in f_dates:
-                    if f_dt <= preproc_state.seasoned_state.as_of_date:
-                        prev_f_dt = f_dt
-                        continue
-                    alpha_j = _year_fraction(
-                        prev_f_dt, f_dt, preproc_state.seasoned_state.day_count_convention
-                    )
-                    df_curr: Any = float(df_fin_fn(f_dt))
-                    if f_rid is None:
-                        r_fwd_j_val = 0.0
-                    else:
-                        df_prev_fwd: Any = float(df_fwd_fn(prev_f_dt))
-                        df_curr_fwd: Any = float(df_fwd_fn(f_dt))
-                        r_fwd_j_val = (df_prev_fwd / max(df_curr_fwd, 1e-12) - 1.0) / max(alpha_j, 1e-8)
-                    m_idx = m_rem - 1
-                    for m in range(m_rem):
-                        if preproc_state.seasoned_state.future_pay_dates[m] >= f_dt:
-                            m_idx = m
-                            break
-                    w_fund_list[m_idx] += df_curr * (r_fwd_j_val + f_spread) * alpha_j
-                    prev_f_dt = f_dt
-                f_leg["_cached_w_fund_per_period"] = (cache_key_w, w_fund_list)
-            for m_idx, w_val in enumerate(w_fund_list):
-                if w_val != 0.0:
-                    funding_cf_per_period[m_idx] = surv_prev[m_idx] * w_val
-        else:
+        f_curve_id = f_leg.get("funding_curve_id")
+        disc_id = preproc_state.discount_curve_id
+        as_of_dt = preproc_state.seasoned_state.as_of_date
+        start_dt = preproc_state.seasoned_state.start_date
+        f_dcc = preproc_state.seasoned_state.day_count_convention
+
+        df_fin_fn: Callable[[datetime.datetime], torch.Tensor | float]
+        if df_fin_fn_override is not None:
             df_fin_fn = df_fin_fn_override
-            if f_rid is not None and f_curve is not None and f_curve is not preproc_state.discount_curve:
-                cached_fwd = f_leg.get("_cached_df_fwd_fn")
-                if cached_fwd is None:
-                    _, cached_fwd = build_discount_rate_evaluator(
-                        f_curve, preproc_state.seasoned_state.as_of_date
-                    )
-                    f_leg["_cached_df_fwd_fn"] = cached_fwd
-                df_fwd_fn = cached_fwd
+        else:
+            _, df_fin_fn = build_discount_rate_evaluator(preproc_state.discount_curve, as_of_dt)
+
+        same_curve = (
+            f_curve is None
+            or f_curve is preproc_state.discount_curve
+            or (f_curve_id is not None and disc_id is not None and f_curve_id == disc_id)
+        )
+        df_fwd_fn: Callable[[datetime.datetime], torch.Tensor | float]
+        if f_rid is not None and not same_curve:
+            _, df_fwd_fn = build_discount_rate_evaluator(f_curve, as_of_dt)
+        else:
+            df_fwd_fn = df_fin_fn
+
+        f_spread = float(f_leg.get("funding_spread", 0.0))
+        f_dates = f_leg.get("payment_dates", ())
+        f_fixings = f_leg.get("funding_fixings", ())
+
+        prev_f_dt = start_dt
+        for f_dt in f_dates:
+            if f_dt <= as_of_dt:
+                prev_f_dt = f_dt
+                continue
+            alpha_j = year_fraction(prev_f_dt, f_dt, f_dcc)
+            df_curr = df_fin_fn(f_dt)
+            if f_rid is None:
+                r_fwd_j: Any = 0.0
             else:
-                df_fwd_fn = df_fin_fn
-            f_spread = float(f_leg.get("funding_spread", 0.0))
-            f_dates = f_leg.get("payment_dates", [])
-            prev_f_dt = preproc_state.seasoned_state.as_of_date
-            for f_dt in f_dates:
-                if f_dt <= preproc_state.seasoned_state.as_of_date:
-                    prev_f_dt = f_dt
-                    continue
-                alpha_j = _year_fraction(prev_f_dt, f_dt, preproc_state.seasoned_state.day_count_convention)
-                df_curr = df_fin_fn(f_dt)
-                if f_rid is None:
-                    r_fwd_j: Any = 0.0
+                fixed_reset = _lookup_funding_fixing(f_fixings, prev_f_dt) if prev_f_dt < as_of_dt else None
+                if fixed_reset is not None:
+                    r_fwd_j = fixed_reset
+                elif prev_f_dt < as_of_dt:
+                    # Stub forward rate from valuation date when historical reset fixing is absent.
+                    alpha_rem = max(year_fraction(as_of_dt, f_dt, f_dcc), 1e-8)
+                    df_curr_fwd = df_fwd_fn(f_dt)
+                    if isinstance(df_curr_fwd, torch.Tensor):
+                        r_fwd_j = (1.0 / df_curr_fwd.clamp(min=1e-12) - 1.0) / alpha_rem
+                    else:
+                        r_fwd_j = (1.0 / max(float(df_curr_fwd), 1e-12) - 1.0) / alpha_rem
                 else:
                     df_prev_fwd = df_fwd_fn(prev_f_dt)
                     df_curr_fwd = df_fwd_fn(f_dt)
                     if isinstance(df_curr_fwd, torch.Tensor):
                         r_fwd_j = (df_prev_fwd / df_curr_fwd.clamp(min=1e-12) - 1.0) / max(alpha_j, 1e-8)
                     else:
-                        r_fwd_j = (df_prev_fwd / max(float(df_curr_fwd), 1e-12) - 1.0) / max(alpha_j, 1e-8)
-                # Map to nearest active period m
-                m_idx = m_rem - 1
-                for m in range(m_rem):
-                    if preproc_state.seasoned_state.future_pay_dates[m] >= f_dt:
-                        m_idx = m
-                        break
-                cf_fund_j = surv_prev[m_idx] * df_curr * (r_fwd_j + f_spread) * alpha_j
-                funding_cf_per_period[m_idx] = funding_cf_per_period[m_idx] + cf_fund_j
-                prev_f_dt = f_dt
+                        r_fwd_j = (
+                            float(df_prev_fwd) / max(float(df_curr_fwd), 1e-12) - 1.0
+                        ) / max(alpha_j, 1e-8)
+
+            m_idx = m_rem - 1
+            for m in range(m_rem):
+                if preproc_state.seasoned_state.future_pay_dates[m] >= f_dt:
+                    m_idx = m
+                    break
+            cf_fund_j = surv_prev[m_idx] * df_curr * (r_fwd_j + f_spread) * alpha_j
+            funding_cf_per_period[m_idx] = funding_cf_per_period[m_idx] + cf_fund_j
+            prev_f_dt = f_dt
+
+    coupon_cf_undisc_t = (
+        torch.as_tensor(coupon_cf_undisc, dtype=torch.float64, device=device).reshape(-1)[:m_rem]
+        if coupon_cf_undisc is not None
+        else None
+    )
 
     notional_cf_list: list[torch.Tensor] = []
     coupon_cf_list: list[torch.Tensor] = []
     mem_acc = torch.tensor(preproc_state.c_mem_0, dtype=torch.float64, device=device)
 
     for m in range(m_rem):
-        # Notional Redemption Row at T_m (§1.2.E.1)
         if preproc_state.no_notional_repayment:
             cf_notional_m = torch.tensor(0.0, dtype=torch.float64, device=device)
         elif m < m_rem - 1:
@@ -1658,22 +1852,22 @@ def assemble_autocall_cashflows_and_pv(
             cf_notional_m = df_pay[m] * (p_t[m] + survival_probs[m])
         notional_cf_list.append(cf_notional_m)
 
-        # Coupon Row at T_m (§1.2.E.1)
-        c_m = cpn_rates[m]
-        eff_c_m = (c_m + mem_acc) if preproc_state.is_memory else c_m
-        if preproc_state.force_coupons_on_autocall:
-            eff_q_m = torch.maximum(q_t[m], p_t[m] / surv_prev[m].clamp(min=1e-12))
+        if coupon_cf_undisc_t is not None:
+            cf_cpn_m = df_pay[m] * coupon_cf_undisc_t[m]
         else:
-            eff_q_m = q_t[m]
-        cf_cpn_m = df_pay[m] * (
-            surv_prev[m] * eff_q_m * eff_c_m + p_t[m] * float(preproc_state.autocall_coupon)
-        )
+            c_m = cpn_rates[m]
+            eff_c_m = (c_m + mem_acc) if preproc_state.is_memory else c_m
+            if preproc_state.force_coupons_on_autocall:
+                eff_q_m = torch.maximum(q_t[m], p_t[m] / surv_prev[m].clamp(min=1e-12))
+            else:
+                eff_q_m = q_t[m]
+            cf_cpn_m = df_pay[m] * (
+                surv_prev[m] * eff_q_m * eff_c_m + p_t[m] * float(preproc_state.autocall_coupon)
+            )
+            if preproc_state.is_memory:
+                mem_acc = eff_c_m * (1.0 - eff_q_m)
         coupon_cf_list.append(cf_cpn_m)
 
-        if preproc_state.is_memory:
-            mem_acc = eff_c_m * (1.0 - eff_q_m)
-
-    # Terminal Option Row at T_{M_rem} (§1.2.E.1)
     put_sign = 1.0 if preproc_state.is_long_basket else -1.0
     cf_option_term = df_pay[-1] * (
         put_sign * float(preproc_state.option_gearing) * l_put_t
@@ -1688,7 +1882,6 @@ def assemble_autocall_cashflows_and_pv(
 
     product_value = pv_in_transit_t + notional_pv + coupon_pv + option_pv - funding_pv
 
-    # Emit CashFlowItem rows for all future periods m = 0 .. M_rem - 1
     if build_cashflow_items:
         for m in range(m_rem):
             pay_dt = preproc_state.seasoned_state.future_pay_dates[m]
@@ -1759,21 +1952,27 @@ def assemble_autocall_cashflows_and_pv(
         cashflows=cashflows,
         standard_error=eff_total_se,
         reporting_currency=ccy,
-        cash_to_settle_today=0.0,
+        cash_to_settle_today=cash_today,
         l_onestar=l_onestar_t,
     )
 
 
 __all__ = [
+    "FEATURE_SCHEMA_VERSION",
     "D_MAX_DEFAULT",
     "M_MAX_DEFAULT",
+    "MonitoringIndexCode",
+    "monitoring_index_to_code",
+    "PAIR_ORDER_DEPENDENT_INDICES",
     "AutocallNodeCol",
     "AutocallEdgeCol",
     "AutocallSchedCol",
     "AutocallGlobalCol",
+    "ContentDigestKey",
+    "ThreadSafeLRUCache",
+    "digest_market_bytes",
     "AutocallPreprocState",
     "AutocallPostprocOutput",
-    "parse_murex_text_or_dict_fallback",
     "preprocess_eq_autocall",
     "assemble_autocall_cashflows_and_pv",
 ]

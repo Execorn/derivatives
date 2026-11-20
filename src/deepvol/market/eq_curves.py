@@ -1,21 +1,12 @@
-"""eq_curves.py — High-precision float64 multi-curve yield & repo interpolation engine.
-
-Implements Milestone M0 (Task 0.2) of SPEC-DEEPVOL-EQ-AUTOCALL-001:
-- Exact day-count fraction calculators (`Act365`, `Act360`, `ActAct`, `Thirty360`/`30360`, `Business252`).
-- `ClampedYieldCurve`: supports all 19 Murex curve interpolation methods (`CubicSpline` with clamped
-  boundary derivatives S'(tau_0) = S'(tau_{K-1}) = 0 on raw pillar tenors without prepending tau=0,
-  reproducing `RUB_RUONIA_OIS` DF(2027-02-09) = 0.9594909887002673 to 0 ULP in float64) and precomputes
-  the exact analytical spline basis weight matrix W_spline for single-MVP bucketed `Rho` sensitivities.
-- `RepoCurve`: parses `<n>D` pillar schedules under `Act360` convention and defaults omitted basket
-  constituents (such as `POSIRX_RUB` in `eq_autocallable_request.txt`) to a flat 0.0% repo spread curve.
-"""
+"""High-precision float64 multi-curve yield, repo interpolation, and day-count engine."""
 
 from __future__ import annotations
 
 import calendar
 import datetime
 from enum import Enum
-from typing import Any, Sequence
+import re
+from typing import Any, Mapping, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -31,13 +22,16 @@ from deepvol.api.schemas_eq_autocall import (
     DayCountConventionEnum,
     DiscountFactorCurveSpec,
     RepoSpreadCurveSpec,
+    _normalize_datetime,
 )
 
 
 # ── Day Count Conventions (IEEE-754 float64) ──────────────────────────────────
 
+_REPO_PERIOD_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([DWMYdwmy])\s*$")
 
-def _to_date_and_frac_days(d: datetime.date | datetime.datetime) -> tuple[datetime.date, float]:
+
+def _to_date_and_frac_days(d: datetime.date | datetime.datetime) -> Tuple[datetime.date, float]:
     """Extracts calendar date and any sub-day fractional seconds as days."""
     if isinstance(d, datetime.datetime):
         dt_utc = d.astimezone(datetime.timezone.utc) if d.tzinfo is not None else d
@@ -89,11 +83,28 @@ def _act_act_isda(
     return rem_y1 + full_years + elap_y2
 
 
-def _thirty_360_isda(
+def _thirty_360_us(
     d1: datetime.date | datetime.datetime,
     d2: datetime.date | datetime.datetime,
 ) -> float:
-    """Standard 30E/360 ISDA day-count fraction in float64."""
+    """US 30/360 Bond Basis day-count fraction in float64."""
+    date1, _ = _to_date_and_frac_days(d1)
+    date2, _ = _to_date_and_frac_days(d2)
+    day1 = min(date1.day, 30)
+    day2 = 30 if (date2.day == 31 and day1 == 30) else date2.day
+    days_360 = (
+        360.0 * (date2.year - date1.year)
+        + 30.0 * (date2.month - date1.month)
+        + float(day2 - day1)
+    )
+    return days_360 / 360.0
+
+
+def _thirty_e_360(
+    d1: datetime.date | datetime.datetime,
+    d2: datetime.date | datetime.datetime,
+) -> float:
+    """European 30E/360 ISDA day-count fraction in float64."""
     date1, _ = _to_date_and_frac_days(d1)
     date2, _ = _to_date_and_frac_days(d2)
     day1 = min(date1.day, 30)
@@ -106,35 +117,70 @@ def _thirty_360_isda(
     return days_360 / 360.0
 
 
+def _normalize_dcc_token(dcc: str | DayCountConventionEnum) -> str:
+    dcc_str = dcc.value if isinstance(dcc, Enum) else str(dcc)
+    return dcc_str.strip().upper().replace("/", "").replace("_", "").replace("-", "")
+
+
+_FIXED_DENOM_DCCS: dict[str, float] = {
+    "ACT365": 365.0,
+    "ACT365F": 365.0,
+    "ACTUAL365": 365.0,
+    "ACTUAL365FIXED": 365.0,
+    "ACT365FIXED": 365.0,
+    "ACT36525": 365.25,
+    "ACTUAL36525": 365.25,
+    "ACT360": 360.0,
+    "ACTUAL360": 360.0,
+    "ACT364": 364.0,
+    "ACTUAL364": 364.0,
+    "ACT366": 366.0,
+    "ACT3661": 366.0,
+    "ACT3662": 366.0,
+    "ACT3663": 366.0,
+    "ACTUAL366": 366.0,
+    "ACT252": 252.0,
+    "ACTUAL252": 252.0,
+}
+
+
+def dcc_denominator(dcc: str | DayCountConventionEnum) -> float:
+    """Returns the nominal annual day-count denominator for a DCC string."""
+    norm = _normalize_dcc_token(dcc)
+    if norm in _FIXED_DENOM_DCCS:
+        return _FIXED_DENOM_DCCS[norm]
+    if norm in ("BUSINESS252", "BUS252"):
+        return 252.0
+    if norm in ("THIRTY360", "30360", "30360US", "30U360", "30E360", "THIRTYE360", "EURO30360", "30360ISDA"):
+        return 360.0
+    if norm in ("ACTACT", "ACTUALACTUAL", "ACTACTISDA", "ACTUALACTUALISDA"):
+        return 365.0
+    raise ValueError(f"Unsupported day count convention: {dcc!r}")
+
+
 def year_fraction(
     d1: datetime.date | datetime.datetime,
     d2: datetime.date | datetime.datetime,
     dcc: str | DayCountConventionEnum = "Act365",
 ) -> float:
     """Computes the exact year fraction tau(d1, d2; dcc) in IEEE-754 float64."""
-    dcc_str = dcc.value if isinstance(dcc, Enum) else str(dcc)
-    dcc_norm = dcc_str.strip()
-
-    if dcc_norm in ("Act365", "Act365F", "ACT_365", "ACT_365F"):
-        return float(_exact_days(d1, d2) / 365.0)
-    if dcc_norm in ("Act360", "ACT_360"):
-        return float(_exact_days(d1, d2) / 360.0)
-    if dcc_norm in ("Act364", "ACT_364"):
-        return float(_exact_days(d1, d2) / 364.0)
-    if dcc_norm in ("Act366", "ACT_366"):
-        return float(_exact_days(d1, d2) / 366.0)
-    if dcc_norm in ("Act252", "ACT_252"):
-        return float(_exact_days(d1, d2) / 252.0)
-    if dcc_norm in ("ActAct", "ACT_ACT", "ActActISDA"):
+    norm = _normalize_dcc_token(dcc)
+    denom = _FIXED_DENOM_DCCS.get(norm)
+    if denom is not None:
+        return float(_exact_days(d1, d2) / denom)
+    if norm in ("ACTACT", "ACTUALACTUAL", "ACTACTISDA", "ACTUALACTUALISDA"):
         return float(_act_act_isda(d1, d2))
-    if dcc_norm in ("Thirty360", "30360", "30E360", "THIRTY_360", "THIRTY_E_360"):
-        return float(_thirty_360_isda(d1, d2))
-    if dcc_norm in ("Business252", "Bus252", "BUSINESS_252", "BUS_252"):
+    if norm in ("THIRTY360", "30360", "30360US", "30U360"):
+        return float(_thirty_360_us(d1, d2))
+    if norm in ("30E360", "THIRTYE360", "EURO30360", "30360ISDA"):
+        return float(_thirty_e_360(d1, d2))
+    if norm in ("BUSINESS252", "BUS252"):
         date1, _ = _to_date_and_frac_days(d1)
         date2, _ = _to_date_and_frac_days(d2)
         b_days = int(np.busday_count(date1.isoformat(), date2.isoformat()))
         return float(b_days / 252.0)
 
+    dcc_str = dcc.value if isinstance(dcc, Enum) else str(dcc)
     raise ValueError(f"Unsupported day count convention: {dcc_str!r}")
 
 
@@ -147,7 +193,40 @@ def year_fractions(
     return np.array([year_fraction(as_of, d, dcc) for d in dates], dtype=np.float64)
 
 
+def year_fraction_batch_epoch_sec(
+    as_of_sec: float,
+    target_secs: npt.NDArray[np.float64] | Sequence[float],
+    dcc: str | DayCountConventionEnum = "Act365",
+) -> npt.NDArray[np.float64]:
+    """Vectorized year fraction from UTC epoch seconds in IEEE-754 float64."""
+    targets = np.asarray(target_secs, dtype=np.float64)
+    if targets.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    norm = _normalize_dcc_token(dcc)
+    denom = _FIXED_DENOM_DCCS.get(norm)
+    if denom is not None:
+        return np.asarray((targets - float(as_of_sec)) / (86400.0 * denom), dtype=np.float64)
+    as_of_dt = datetime.datetime.fromtimestamp(float(as_of_sec), tz=datetime.timezone.utc)
+    target_dts = [
+        datetime.datetime.fromtimestamp(float(s), tz=datetime.timezone.utc)
+        for s in targets.tolist()
+    ]
+    return year_fractions(as_of_dt, target_dts, dcc)
+
+
 # ── Analytical Spline & Hermite Helpers ───────────────────────────────────────
+
+
+def _extrap_sides(extrapolation: str) -> Tuple[bool, bool]:
+    """Returns (left_is_flat, right_is_flat) for Flat/Linear/FlatLeft/FlatRight."""
+    ex = extrapolation.strip()
+    if ex == "Linear":
+        return False, False
+    if ex == "FlatLeft":
+        return True, False
+    if ex == "FlatRight":
+        return False, True
+    return True, True
 
 
 def _bessel_hermite_basis(
@@ -156,25 +235,17 @@ def _bessel_hermite_basis(
     *,
     extrapolation: str = "Flat",
 ) -> npt.NDArray[np.float64]:
-    """Computes the exact Bessel cubic Hermite basis weight matrix W in R^{M_eval x K}.
-
-    Bessel slopes at interior knots use the weighted parabolic secant average:
-        m_k = (dx_{k-1} s_k + dx_k s_{k-1}) / (dx_{k-1} + dx_k)
-    and endpoint slopes are clamped to 0.0 when `extrapolation == 'Flat'` (or secant if 'Linear').
-    Because every slope m_k is a linear combination of y, W @ y equals the Bessel Hermite
-    interpolant identically in float64.
-    """
+    """Computes the exact Bessel cubic Hermite basis weight matrix W in R^{M_eval x K}."""
     k_len = len(tenors)
     m_eval = len(tau_eval)
     eye_k = np.eye(k_len, dtype=np.float64)
     if k_len == 1:
         return np.ones((m_eval, 1), dtype=np.float64)
 
-    dx = np.diff(tenors)  # (K-1,)
-    # Secant matrix S_sec[j, :] = (e_{j+1} - e_j) / dx[j], shape (K-1, K)
+    left_flat, right_flat = _extrap_sides(extrapolation)
+    dx = np.diff(tenors)
     s_sec = (eye_k[1:, :] - eye_k[:-1, :]) / dx[:, None]
 
-    # Slope basis matrix M_slope[k, :] = dm_k / dy, shape (K, K)
     m_slope = np.zeros((k_len, k_len), dtype=np.float64)
     if k_len > 2:
         denom = dx[:-1] + dx[1:]
@@ -182,8 +253,9 @@ def _bessel_hermite_basis(
             dx[:-1, None] * s_sec[1:, :] + dx[1:, None] * s_sec[:-1, :]
         ) / denom[:, None]
 
-    if extrapolation != "Flat":
+    if not left_flat:
         m_slope[0, :] = s_sec[0, :]
+    if not right_flat:
         m_slope[-1, :] = s_sec[-1, :]
 
     w_out = np.zeros((m_eval, k_len), dtype=np.float64)
@@ -192,12 +264,12 @@ def _bessel_hermite_basis(
 
     for i, t_raw in enumerate(tau_eval):
         if t_raw <= t_min:
-            if extrapolation == "Flat":
+            if left_flat:
                 w_out[i, 0] = 1.0
             else:
                 w_out[i, :] = eye_k[0, :] + (t_raw - t_min) * m_slope[0, :]
         elif t_raw >= t_max:
-            if extrapolation == "Flat":
+            if right_flat:
                 w_out[i, -1] = 1.0
             else:
                 w_out[i, :] = eye_k[-1, :] + (t_raw - t_max) * m_slope[-1, :]
@@ -233,11 +305,12 @@ def _linear_basis(
         w_out[:, 0] = 1.0
         return w_out
 
+    left_flat, right_flat = _extrap_sides(extrapolation)
     t_min = tenors[0]
     t_max = tenors[-1]
     for i, t_raw in enumerate(tau_eval):
         if t_raw <= t_min:
-            if extrapolation == "Flat" or k_len < 2:
+            if left_flat or k_len < 2:
                 w_out[i, 0] = 1.0
             else:
                 dt = tenors[1] - tenors[0]
@@ -245,7 +318,7 @@ def _linear_basis(
                 w_out[i, 0] = 1.0 - alpha
                 w_out[i, 1] = alpha
         elif t_raw >= t_max:
-            if extrapolation == "Flat" or k_len < 2:
+            if right_flat or k_len < 2:
                 w_out[i, -1] = 1.0
             else:
                 dt = tenors[-1] - tenors[-2]
@@ -265,15 +338,10 @@ def _linear_basis(
 def _log_linear_rate_basis(
     tenors: npt.NDArray[np.float64],
     tau_eval: npt.NDArray[np.float64],
+    *,
+    extrapolation: str = "Flat",
 ) -> npt.NDArray[np.float64]:
-    """Computes the basis weight matrix W in R^{M_eval x K} for LogLinear / PiecewiseConstantForward.
-
-    Under LogLinear discount factor interpolation (piecewise constant forward rates):
-    - For tau <= tau_0: r(tau) = y_0 -> W[i, 0] = 1.0.
-    - For tau in (tau_{k-1}, tau_k]: r(tau)*tau = (1 - alpha)*y_{k-1}*tau_{k-1} + alpha*y_k*tau_k,
-      so r(tau) = [(1 - alpha)*(tau_{k-1}/tau)]*y_{k-1} + [alpha*(tau_k/tau)]*y_k.
-    - For tau > tau_{K-1}: flat zero-rate extrapolation r(tau) = y_{K-1} -> W[i, -1] = 1.0.
-    """
+    """Computes the basis weight matrix W in R^{M_eval x K} for LogLinear / PiecewiseConstantForward."""
     k_len = len(tenors)
     m_eval = len(tau_eval)
     w_out = np.zeros((m_eval, k_len), dtype=np.float64)
@@ -281,22 +349,233 @@ def _log_linear_rate_basis(
         w_out[:, 0] = 1.0
         return w_out
 
+    left_flat, right_flat = _extrap_sides(extrapolation)
     t_min = tenors[0]
     t_max = tenors[-1]
     for i, t_raw in enumerate(tau_eval):
         if t_raw <= t_min:
-            w_out[i, 0] = 1.0
+            if left_flat or k_len < 2:
+                w_out[i, 0] = 1.0
+            else:
+                dt = tenors[1] - tenors[0]
+                alpha = (t_raw - tenors[0]) / dt
+                w_out[i, 0] = 1.0 - alpha
+                w_out[i, 1] = alpha
         elif t_raw >= t_max:
-            w_out[i, -1] = 1.0
+            if right_flat or k_len < 2:
+                w_out[i, -1] = 1.0
+            else:
+                dt = tenors[-1] - tenors[-2]
+                alpha = (t_raw - tenors[-2]) / dt
+                w_out[i, -2] = 1.0 - alpha
+                w_out[i, -1] = alpha
         else:
             idx = int(np.searchsorted(tenors, t_raw, side="right")) - 1
             idx = max(0, min(idx, k_len - 2))
             t_l = tenors[idx]
             t_r = tenors[idx + 1]
             alpha = (t_raw - t_l) / (t_r - t_l)
-            w_out[i, idx] = (1.0 - alpha) * (t_l / t_raw)
-            w_out[i, idx + 1] = alpha * (t_r / t_raw)
+            if abs(t_raw) < 1e-12:
+                w_out[i, idx] = 1.0 - alpha
+                w_out[i, idx + 1] = alpha
+            else:
+                w_out[i, idx] = (1.0 - alpha) * (t_l / t_raw)
+                w_out[i, idx + 1] = alpha * (t_r / t_raw)
     return w_out
+
+
+def _fwd_fwd_linear_basis(
+    tenors: npt.NDArray[np.float64],
+    tau_eval: npt.NDArray[np.float64],
+    *,
+    extrapolation: str = "Flat",
+) -> npt.NDArray[np.float64]:
+    """Computes the exact basis weight matrix W for linear forward-rate interpolation preserving pillar DFs."""
+    k_len = len(tenors)
+    m_eval = len(tau_eval)
+    if k_len == 1:
+        return np.ones((m_eval, 1), dtype=np.float64)
+
+    # Map pillar zero rates r_k -> average interval forwards f_bar -> knot instantaneous forwards f_k
+    eye_k = np.eye(k_len, dtype=np.float64)
+    f_bar = np.zeros((k_len, k_len), dtype=np.float64)
+    if tenors[0] > 1e-12:
+        f_bar[0, 0] = 1.0
+    else:
+        f_bar[0, 1] = 1.0
+    for k in range(1, k_len):
+        dt_k = tenors[k] - tenors[k - 1]
+        f_bar[k, k] = tenors[k] / dt_k
+        f_bar[k, k - 1] = -tenors[k - 1] / dt_k
+
+    f_knot = np.zeros((k_len, k_len), dtype=np.float64)
+    f_knot[0, :] = f_bar[0, :]
+    for k in range(1, k_len):
+        f_knot[k, :] = 2.0 * f_bar[k, :] - f_knot[k - 1, :]
+
+    left_flat, right_flat = _extrap_sides(extrapolation)
+    w_out = np.zeros((m_eval, k_len), dtype=np.float64)
+    t_min = tenors[0]
+    t_max = tenors[-1]
+
+    def _eval_interior_weights(tau_val: float) -> npt.NDArray[np.float64]:
+        if tau_val <= t_min:
+            return eye_k[0, :]
+        idx = int(np.searchsorted(tenors, tau_val, side="right")) - 1
+        idx = max(0, min(idx, k_len - 2))
+        t_l = tenors[idx]
+        t_r = tenors[idx + 1]
+        h = t_r - t_l
+        dx = tau_val - t_l
+        # Integral of linear f(u) = f_l + (f_{l+1} - f_l) * (u - t_l)/h from t_l to tau_val:
+        slope_frac = 0.5 * (dx / h)
+        int_seg = dx * ((1.0 - slope_frac) * f_knot[idx, :] + slope_frac * f_knot[idx + 1, :])
+        total_int = t_l * eye_k[idx, :] + int_seg
+        if abs(tau_val) < 1e-12:
+            return np.asarray(f_knot[0, :], dtype=np.float64)
+        return np.asarray(total_int / tau_val, dtype=np.float64)
+
+    for i, t_raw in enumerate(tau_eval):
+        if t_raw <= t_min:
+            if left_flat:
+                w_out[i, :] = eye_k[0, :]
+            else:
+                slope_l = (eye_k[1, :] - eye_k[0, :]) / (tenors[1] - tenors[0])
+                w_out[i, :] = eye_k[0, :] + (t_raw - t_min) * slope_l
+        elif t_raw >= t_max:
+            if right_flat:
+                w_out[i, :] = eye_k[-1, :]
+            else:
+                slope_r = (eye_k[-1, :] - eye_k[-2, :]) / (tenors[-1] - tenors[-2])
+                w_out[i, :] = eye_k[-1, :] + (t_raw - t_max) * slope_r
+        else:
+            w_out[i, :] = _eval_interior_weights(float(t_raw))
+    return w_out
+
+
+def _monotone_convex_eval(
+    tenors: npt.NDArray[np.float64],
+    y_pillars: npt.NDArray[np.float64],
+    tau_eval: npt.NDArray[np.float64],
+    *,
+    space_coords: str = "Rates",
+    extrapolation: str = "Flat",
+) -> npt.NDArray[np.float64]:
+    """Hagan-West (2006) Monotone Convex forward-rate curve evaluation in float64."""
+    k_len = len(tenors)
+    m_eval = len(tau_eval)
+    if k_len == 1:
+        return np.full(m_eval, float(y_pillars[0]), dtype=np.float64)
+
+    # Convert pillars to zero rates r_k for forward-rate integration
+    if space_coords == "Rates":
+        r_pil = y_pillars
+    elif space_coords == "LogarithmOfDiscountFactors":
+        t_safe = np.maximum(np.abs(tenors), 1e-12)
+        r_pil = np.where(tenors > 1e-12, -y_pillars / t_safe, 0.0)
+    else:
+        t_safe = np.maximum(np.abs(tenors), 1e-12)
+        r_pil = np.where(tenors > 1e-12, -np.log(np.maximum(y_pillars, 1e-15)) / t_safe, 0.0)
+
+    if tenors[0] > 1e-12:
+        t_hw = np.concatenate([[0.0], tenors])
+        rt_hw = np.concatenate([[0.0], r_pil * tenors])
+    else:
+        t_hw = tenors
+        rt_hw = r_pil * tenors
+    n_seg = len(t_hw) - 1
+    dt_hw = np.diff(t_hw)
+    f_d = np.diff(rt_hw) / np.maximum(dt_hw, 1e-12)  # length n_seg, 0-based
+
+    # Estimate knot forwards f_knot[0..n_seg]
+    f_knot = np.zeros(n_seg + 1, dtype=np.float64)
+    for i in range(1, n_seg):
+        denom = dt_hw[i - 1] + dt_hw[i]
+        f_knot[i] = (dt_hw[i - 1] * f_d[i] + dt_hw[i] * f_d[i - 1]) / denom
+    if n_seg >= 2:
+        f_knot[0] = f_d[0] - 0.5 * (f_knot[1] - f_d[0])
+        f_knot[n_seg] = f_d[n_seg - 1] - 0.5 * (f_knot[n_seg - 1] - f_d[n_seg - 1])
+    else:
+        f_knot[0] = f_d[0]
+        f_knot[1] = f_d[0]
+
+    def _hw_segment_integral(i_seg: int, x: float) -> float:
+        """Evaluates int_0^x (f(u) - f_d[i_seg]) du on unit interval [0, 1] for Hagan-West §3.2."""
+        g0 = f_knot[i_seg] - f_d[i_seg]
+        g1 = f_knot[i_seg + 1] - f_d[i_seg]
+        if abs(g0) < 1e-15 and abs(g1) < 1e-15:
+            return 0.0
+        # Enforce Hagan-West monotonicity regions
+        if (g0 > 0.0 and -0.5 * g0 <= g1 <= -2.0 * g0) or (
+            g0 < 0.0 and -2.0 * g0 <= g1 <= -0.5 * g0
+        ):
+            pass
+        if (g0 >= 0.0 and g1 >= 0.0) or (g0 <= 0.0 and g1 <= 0.0):
+            # Case (i): flat midpoint clamp when both endpoints have same sign
+            eta = g0 + g1
+            if abs(eta) < 1e-15:
+                return 0.0
+            # Quadratic fit with zero integral on [0,1]: g(x) = g0*(1-4x+3x^2) + g1*(-2x+3x^2)
+            return float(g0 * (x - 2.0 * x * x + x * x * x) + g1 * (-x * x + x * x * x))
+        if abs(g1) > 2.0 * abs(g0) and abs(g0) > 1e-15:
+            # Case (ii): g(x) = g0 for x <= eta, quadratic on [eta, 1]
+            eta = 1.0 + g0 / (g1 - g0) if abs(g1 - g0) > 1e-15 else 1.0
+            eta = min(max(eta, 0.0), 1.0)
+            if x <= eta:
+                return float(g0 * x)
+            if eta >= 1.0 - 1e-15:
+                return float(g0 * x)
+            u = (x - eta) / (1.0 - eta)
+            return float(g0 * eta + (1.0 - eta) * (g0 * u + (g1 - g0) * (u * u * u) / 3.0))
+        if abs(g0) > 2.0 * abs(g1) and abs(g1) > 1e-15:
+            # Case (iii): quadratic on [0, eta], g(x) = g1 for x >= eta
+            eta = g1 / (g1 - g0) if abs(g1 - g0) > 1e-15 else 0.0
+            eta = min(max(eta, 0.0), 1.0)
+            if eta <= 1e-15:
+                return float(g1 * x)
+            if x <= eta:
+                return float(g1 * x + (g0 - g1) * eta * (1.0 - ((1.0 - x / eta) ** 3)) / 3.0)
+            return float(g1 * x + (g0 - g1) * eta / 3.0)
+        # Case (i) quadratic
+        return float(g0 * (x - 2.0 * x * x + x * x * x) + g1 * (-x * x + x * x * x))
+
+    def _eval_zero_rate_at(tau_val: float) -> float:
+        if tau_val <= t_hw[0] + 1e-12:
+            return float(f_knot[0])
+        if tau_val >= t_hw[-1]:
+            return float(rt_hw[-1] / t_hw[-1])
+        idx = int(np.searchsorted(t_hw, tau_val, side="right")) - 1
+        idx = max(0, min(idx, n_seg - 1))
+        h = dt_hw[idx]
+        x = (tau_val - t_hw[idx]) / max(h, 1e-12)
+        rt_val = rt_hw[idx] + h * (f_d[idx] * x + _hw_segment_integral(idx, x))
+        return float(rt_val / tau_val)
+
+    def _zero_to_space(tau_val: float, r_val: float) -> float:
+        if space_coords == "Rates":
+            return r_val
+        if space_coords == "LogarithmOfDiscountFactors":
+            return -r_val * tau_val
+        return float(np.exp(-r_val * tau_val))
+
+    left_flat, right_flat = _extrap_sides(extrapolation)
+    t_min = float(tenors[0])
+    t_max = float(tenors[-1])
+    y_min = float(y_pillars[0])
+    y_max = float(y_pillars[-1])
+    slope_l = float((y_pillars[1] - y_pillars[0]) / (tenors[1] - tenors[0]))
+    slope_r = float((y_pillars[-1] - y_pillars[-2]) / (tenors[-1] - tenors[-2]))
+
+    out = np.empty(m_eval, dtype=np.float64)
+    for i, t_raw in enumerate(tau_eval):
+        if t_raw <= t_min:
+            out[i] = y_min if left_flat else (y_min + slope_l * (t_raw - t_min))
+        elif t_raw >= t_max:
+            out[i] = y_max if right_flat else (y_max + slope_r * (t_raw - t_max))
+        else:
+            r_val = _eval_zero_rate_at(float(t_raw))
+            out[i] = _zero_to_space(float(t_raw), r_val)
+    return out
 
 
 def _nelson_siegel_basis(
@@ -304,10 +583,18 @@ def _nelson_siegel_basis(
     tau_eval: npt.NDArray[np.float64],
     *,
     svensson: bool = False,
+    extrapolation: str = "Flat",
 ) -> npt.NDArray[np.float64]:
     """Computes the exact linear least-squares Nelson-Siegel / Svensson projection basis W in R^{M_eval x K}."""
     k_len = len(tenors)
-    t_clip = np.clip(tau_eval, tenors[0], tenors[-1])
+    left_flat, right_flat = _extrap_sides(extrapolation)
+    t_min = float(tenors[0])
+    t_max = float(tenors[-1])
+    t_eval = tau_eval.copy()
+    if left_flat:
+        t_eval = np.maximum(t_eval, t_min)
+    if right_flat:
+        t_eval = np.minimum(t_eval, t_max)
 
     def _design(t: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         t_safe = np.maximum(t, 1e-8)
@@ -323,9 +610,9 @@ def _nelson_siegel_basis(
         f3 = (1.0 - np.exp(-u2)) / u2 - np.exp(-u2)
         return np.column_stack([f0, f1, f2, f3])[:, : min(4, k_len)]
 
-    x_pil = _design(tenors)  # (K, p)
-    x_eval = _design(t_clip)  # (M_eval, p)
-    pinv = np.linalg.pinv(x_pil)  # (p, K)
+    x_pil = _design(tenors)
+    x_eval = _design(t_eval)
+    pinv = np.linalg.pinv(x_pil)
     return np.asarray(x_eval @ pinv, dtype=np.float64)
 
 
@@ -333,24 +620,19 @@ def fast_clamped_cubic_coeffs(
     x: npt.NDArray[np.float64],
     y: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.float64]:
-    """Computes clamped cubic spline polynomial coefficients of shape `(4, K - 1, ...)` in pure NumPy.
-
-    Solves the tridiagonal Thomas system with clamped boundary derivatives $S'(x_0) = S'(x_{K-1}) = 0$,
-    reproducing `scipy.interpolate.CubicSpline(x, y, axis=0, bc_type="clamped").c` to 0 ULP on
-    `RUB_RUONIA_OIS` (`DF(2027-02-09) = 0.9594909887002673`) in ~14 us instead of ~123 us.
-    """
+    """Computes clamped cubic spline polynomial coefficients of shape `(4, K - 1, ...)` in pure NumPy."""
     k = len(x)
     if k < 2:
         raise ValueError("fast_clamped_cubic_coeffs requires at least 2 knots.")
-    h = np.diff(x)  # (K - 1,)
+    h = np.diff(x)
     h_shape = (k - 1,) + (1,) * (y.ndim - 1)
     h_b = h.reshape(h_shape)
-    s = (y[1:] - y[:-1]) / h_b  # (K - 1, ...)
+    s = (y[1:] - y[:-1]) / h_b
     d = np.zeros_like(y, dtype=np.float64)
     n_int = k - 2
     if n_int > 0:
-        h_prev = h[:-1]  # h[0 .. K-3]
-        h_next = h[1:]   # h[1 .. K-2]
+        h_prev = h[:-1]
+        h_next = h[1:]
         diag = 2.0 * (h_prev + h_next)
         int_shape = (n_int,) + (1,) * (y.ndim - 1)
         rhs = 3.0 * (h_next.reshape(int_shape) * s[:-1] + h_prev.reshape(int_shape) * s[1:])
@@ -394,19 +676,22 @@ def eval_clamped_cubic_coeffs(
     return np.asarray(((c0 * dx_b + c1) * dx_b + c2) * dx_b + c3, dtype=np.float64)
 
 
+def _extract_curve_field(obj: Mapping[str, Any], *names: str, default: Any = None) -> Any:
+    for name in names:
+        if name in obj and obj[name] is not None:
+            return obj[name]
+    return default
+
+
 # ── ClampedYieldCurve ─────────────────────────────────────────────────────────
 
 
 class ClampedYieldCurve:
-    """High-precision float64 yield/discount curve engine with precomputed analytical spline basis weights.
-
-    Matches the Murex Pricing Service `DiscountFactorCurve` implementation to 0 ULP (`1e-16`)
-    using clamped cubic splines (`bc_type="clamped"`) on the raw pillar tenors without prepending tau=0.
-    """
+    """High-precision float64 yield/discount curve engine with immutable state and spline basis weights."""
 
     def __init__(
         self,
-        spec: DiscountFactorCurveSpec | datetime.date | datetime.datetime | None = None,
+        spec: DiscountFactorCurveSpec | Mapping[str, Any] | datetime.date | datetime.datetime | None = None,
         pillar_dates: Sequence[datetime.date | datetime.datetime] | None = None,
         rates: Sequence[float] | npt.NDArray[np.float64] | None = None,
         *,
@@ -418,6 +703,7 @@ class ClampedYieldCurve:
         space_coords: str = "Rates",
         extrapolation_method: str = "Flat",
         quote_expression: str = "Percentage",
+        input_mode: str | None = None,
         identifier: str = "DEFAULT",
         currency: str = "RUB",
     ) -> None:
@@ -441,12 +727,77 @@ class ClampedYieldCurve:
             )
             if spec.RatesSchedule.Spreads is not None:
                 raw_rates = raw_rates + np.asarray(spec.RatesSchedule.Spreads, dtype=np.float64)
+        elif isinstance(spec, Mapping):
+            self.identifier = str(_extract_curve_field(spec, "Identifier", "identifier", default=identifier))
+            self.currency = str(_extract_curve_field(spec, "Currency", "currency", default=currency))
+            raw_as_of = _extract_curve_field(spec, "AsOfDate", "as_of_date", default=as_of_date)
+            self.as_of_date = _normalize_datetime(raw_as_of) if raw_as_of is not None else None
+            raw_dcc = _extract_curve_field(
+                spec, "InterpolationDayCountConvention", "DayCountConvention", "dcc", "day_count_convention", default=dcc
+            )
+            self.dcc = str(getattr(raw_dcc, "value", raw_dcc))
+            raw_interp = _extract_curve_field(
+                spec, "InterpolationMethod", "interpolation_method", default=interpolation_method
+            )
+            self.interpolation_method = str(getattr(raw_interp, "value", raw_interp))
+            raw_space = _extract_curve_field(
+                spec, "InterpolationSpaceCoordinates", "space_coords", default=space_coords
+            )
+            self.space_coords = str(getattr(raw_space, "value", raw_space))
+            raw_extrap = _extract_curve_field(
+                spec, "ExtrapolationMethod", "extrapolation_method", default=extrapolation_method
+            )
+            self.extrapolation_method = str(getattr(raw_extrap, "value", raw_extrap))
+            raw_qe = _extract_curve_field(
+                spec, "RateQuoteExpression", "rate_quote_expression", "quote_expression", default=quote_expression
+            )
+            self.quote_expression = str(getattr(raw_qe, "value", raw_qe))
+
+            sched = _extract_curve_field(spec, "RatesSchedule", "rates_schedule", default=spec)
+            if isinstance(sched, Mapping):
+                raw_dates = _extract_curve_field(sched, "Dates", "dates", default=pillar_dates or [])
+                raw_tenors = _extract_curve_field(sched, "Tenors", "tenors", "pillar_tenors", default=pillar_tenors)
+                raw_r = _extract_curve_field(sched, "Rates", "rates", "rates_pct", default=rates)
+                raw_sp = _extract_curve_field(sched, "Spreads", "spreads", default=spreads)
+                raw_dfs = _extract_curve_field(sched, "DiscountFactors", "discount_factors", default=None)
+            else:
+                raw_dates = getattr(sched, "Dates", getattr(sched, "dates", pillar_dates or []))
+                raw_tenors = getattr(sched, "Tenors", getattr(sched, "tenors", pillar_tenors))
+                raw_r = getattr(sched, "Rates", getattr(sched, "rates", rates))
+                raw_sp = getattr(sched, "Spreads", getattr(sched, "spreads", spreads))
+                raw_dfs = getattr(sched, "DiscountFactors", getattr(sched, "discount_factors", None))
+
+            self.pillar_dates = [_normalize_datetime(d) for d in raw_dates] if raw_dates else []
+            if raw_tenors is not None:
+                tenors_arr = np.asarray(raw_tenors, dtype=np.float64)
+            elif self.pillar_dates and self.as_of_date is not None:
+                tenors_arr = year_fractions(self.as_of_date, self.pillar_dates, self.dcc)
+            else:
+                raise ValueError(
+                    "ClampedYieldCurve dict spec requires Dates + AsOfDate or pillar_tenors."
+                )
+            if raw_r is None and raw_sp is None and raw_dfs is None:
+                raise ValueError("ClampedYieldCurve dict spec requires Rates, Spreads, or DiscountFactors.")
+            if raw_r is None and raw_dfs is not None:
+                raw_rates = np.asarray(raw_dfs, dtype=np.float64)
+                if input_mode is None:
+                    input_mode = "df"
+                if self.quote_expression == "Percentage":
+                    self.quote_expression = "Standard"
+            else:
+                raw_rates = (
+                    np.asarray(raw_r, dtype=np.float64)
+                    if raw_r is not None
+                    else np.zeros(len(tenors_arr), dtype=np.float64)
+                )
+            if raw_sp is not None:
+                raw_rates = raw_rates + np.asarray(raw_sp, dtype=np.float64)
         else:
             if isinstance(spec, (datetime.date, datetime.datetime)) and as_of_date is None:
                 as_of_date = spec
             self.identifier = identifier
             self.currency = currency
-            self.as_of_date = as_of_date
+            self.as_of_date = _normalize_datetime(as_of_date) if as_of_date is not None else None
             self.dcc = dcc.value if isinstance(dcc, Enum) else str(dcc)
             self.interpolation_method = (
                 interpolation_method.value
@@ -494,62 +845,98 @@ class ClampedYieldCurve:
         if len(tenors_arr) > 1 and np.any(np.diff(tenors_arr) <= 0.0):
             raise ValueError("ClampedYieldCurve pillar tenors must be strictly increasing.")
 
-        self._tenors: npt.NDArray[np.float64] = np.asarray(tenors_arr, dtype=np.float64)
-        self._raw_quotes: npt.NDArray[np.float64] = np.asarray(raw_rates, dtype=np.float64)
+        self._tenors: npt.NDArray[np.float64] = np.array(tenors_arr, dtype=np.float64, copy=True)
+        self._raw_quotes: npt.NDArray[np.float64] = np.array(raw_rates, dtype=np.float64, copy=True)
         self._quote_scale: float = 0.01 if self.quote_expression == "Percentage" else 1.0
-        self._input_mode: str = "rates"
 
-        # Convert pillar quotes to continuously compounded decimal zero rates r_k (AUD-P1-05):
-        if self.space_coords == "Rates":
-            self._rates_decimal: npt.NDArray[np.float64] = self._raw_quotes * self._quote_scale
+        # Resolve quote semantics cleanly without value-range heuristics
+        if input_mode is not None:
+            mode_norm = input_mode.strip().lower()
+            if mode_norm not in ("rates", "log_df", "df"):
+                raise ValueError(f"Unsupported input_mode: {input_mode!r}")
+            self._input_mode: str = mode_norm
+        elif self.space_coords == "Rates":
+            self._input_mode = "rates"
         elif self.space_coords == "LogarithmOfDiscountFactors":
-            if self.quote_expression != "Percentage" and np.all(self._raw_quotes <= 0.0):
-                self._input_mode = "log_df"
-                t_safe = np.maximum(np.abs(self._tenors), 1e-12)
-                self._rates_decimal = np.where(
-                    self._tenors > 1e-12, -self._raw_quotes / t_safe, 0.0
-                )
-            else:
-                self._rates_decimal = self._raw_quotes * self._quote_scale
+            self._input_mode = "rates" if self.quote_expression == "Percentage" else "log_df"
         elif self.space_coords in ("DiscountFactors", "Factors"):
-            # Distinguish actual discount factors DF_k in (0.35, 1.05] (non-increasing) from decimal/pct zero rates:
-            is_df_quotes = (
-                self.quote_expression != "Percentage"
-                and np.all((self._raw_quotes > 0.35) & (self._raw_quotes <= 1.05))
-                and (
-                    len(self._raw_quotes) == 1
-                    or float(self._raw_quotes[-1]) <= float(self._raw_quotes[0]) + 1e-6
-                )
-            )
-            if is_df_quotes:
-                self._input_mode = "df"
-                t_safe = np.maximum(np.abs(self._tenors), 1e-12)
-                df_safe = np.maximum(self._raw_quotes, 1e-15)
-                self._rates_decimal = np.where(
-                    self._tenors > 1e-12, -np.log(df_safe) / t_safe, 0.0
-                )
-            else:
-                self._rates_decimal = self._raw_quotes * self._quote_scale
+            self._input_mode = "rates" if self.quote_expression == "Percentage" else "df"
         else:
             raise ValueError(f"Unsupported InterpolationSpaceCoordinates: {self.space_coords!r}")
 
-        # Fit spline directly in continuous zero-rate space to prevent short-end 1/tau singularities
-        self._y_pillars: npt.NDArray[np.float64] = self._rates_decimal.copy()
+        t_safe = np.maximum(np.abs(self._tenors), 1e-12)
+        if self._input_mode == "rates":
+            rates_dec = self._raw_quotes * self._quote_scale
+        elif self._input_mode == "log_df":
+            rates_dec = np.where(
+                self._tenors > 1e-12, -(self._raw_quotes * self._quote_scale) / t_safe, 0.0
+            )
+        else:
+            df_pil = np.maximum(self._raw_quotes * self._quote_scale, 1e-15)
+            rates_dec = np.where(
+                self._tenors > 1e-12, -np.log(df_pil) / t_safe, 0.0
+            )
+        self._rates_decimal: npt.NDArray[np.float64] = np.asarray(rates_dec, dtype=np.float64)
 
-        # Precompute fast spline coefficients; build basis matrix lazily on first Rho/spline_weights call
+        # Interpolate natively in the requested InterpolationSpaceCoordinates
+        if self.space_coords == "Rates":
+            y_pil = self._rates_decimal.copy()
+        elif self.space_coords == "LogarithmOfDiscountFactors":
+            if self._input_mode == "log_df":
+                y_pil = self._raw_quotes * self._quote_scale
+            elif self._input_mode == "df":
+                y_pil = np.log(np.maximum(self._raw_quotes * self._quote_scale, 1e-15))
+            else:
+                y_pil = -self._rates_decimal * self._tenors
+        elif self.space_coords in ("DiscountFactors", "Factors"):
+            if self._input_mode == "df":
+                y_pil = self._raw_quotes * self._quote_scale
+            elif self._input_mode == "log_df":
+                y_pil = np.exp(self._raw_quotes * self._quote_scale)
+            else:
+                y_pil = np.exp(-self._rates_decimal * self._tenors)
+        else:
+            raise ValueError(f"Unsupported InterpolationSpaceCoordinates: {self.space_coords!r}")
+
+        self._y_pillars: npt.NDArray[np.float64] = np.asarray(y_pil, dtype=np.float64)
+
         self._fast_coeffs: npt.NDArray[np.float64] | None = None
         self._fast_basis_coeffs: npt.NDArray[np.float64] | None = None
         self._cs_val: Any = None
         self._cs_basis: Any = None
         self._nonlin_interp: Any = None
+        self.interpolation_metadata: dict[str, Any] = {}
         self._build_interpolator()
+
+        # Freeze immutable backing arrays
+        self._tenors.setflags(write=False)
+        self._raw_quotes.setflags(write=False)
+        self._rates_decimal.setflags(write=False)
+        self._y_pillars.setflags(write=False)
+        if self._fast_coeffs is not None:
+            self._fast_coeffs.setflags(write=False)
 
     def _build_interpolator(self) -> None:
         k_len = len(self._tenors)
+        method = self.interpolation_method
+        approx_aliases = {
+            "LME": "NotAKnotCubicSpline",
+            "Polynomial": "NotAKnotCubicSpline",
+            "Rational": "NotAKnotCubicSpline",
+            "FwdFwdQuartic": "NotAKnotCubicSpline",
+            "ExpSpline": "ClampedCubicSpline",
+            "ConstrainedCubicSpline": "ClampedCubicSpline",
+            "AdaptiveSpline": "ClampedCubicSpline",
+            "Kruger": "PCHIP",
+            "Harmonic": "PCHIP",
+        }
+        if method in approx_aliases:
+            self.interpolation_metadata = {"exact": False, "surrogate_method": approx_aliases[method]}
+        else:
+            self.interpolation_metadata = {"exact": True, "surrogate_method": method}
+
         if k_len == 1:
             return
-
-        method = self.interpolation_method
 
         if method in (
             "CubicSpline",
@@ -576,13 +963,7 @@ class ClampedYieldCurve:
         elif method in ("QuadraticSpline", "Quadratic"):
             deg = min(2, k_len - 1)
             self._cs_val = make_interp_spline(self._tenors, self._y_pillars, k=deg)
-        elif method in (
-            "MonotoneCubic",
-            "PCHIP",
-            "MonotoneConvex",
-            "Kruger",
-            "Harmonic",
-        ):
+        elif method in ("MonotoneCubic", "PCHIP", "Kruger", "Harmonic"):
             self._nonlin_interp = PchipInterpolator(self._tenors, self._y_pillars)
         elif method == "Akima":
             if k_len >= 5:
@@ -590,6 +971,7 @@ class ClampedYieldCurve:
             else:
                 self._nonlin_interp = PchipInterpolator(self._tenors, self._y_pillars)
         elif method in (
+            "MonotoneConvex",
             "Linear",
             "FwdFwdLinear",
             "LogLinear",
@@ -619,6 +1001,7 @@ class ClampedYieldCurve:
         eye_k = np.eye(k_len, dtype=np.float64)
         if self._fast_coeffs is not None:
             self._fast_basis_coeffs = fast_clamped_cubic_coeffs(self._tenors, eye_k)
+            self._fast_basis_coeffs.setflags(write=False)
         elif method == "NaturalCubicSpline":
             self._cs_basis = CubicSpline(self._tenors, eye_k, axis=0, bc_type="natural")
         elif method in (
@@ -656,7 +1039,7 @@ class ClampedYieldCurve:
 
     def _to_tenors_and_scalar_flag(
         self, dates_or_tenors: Any
-    ) -> tuple[npt.NDArray[np.float64], bool]:
+    ) -> Tuple[npt.NDArray[np.float64], bool]:
         if isinstance(dates_or_tenors, np.ndarray):
             if dates_or_tenors.ndim == 0:
                 return self._to_tenors_and_scalar_flag(dates_or_tenors.item())
@@ -679,62 +1062,96 @@ class ClampedYieldCurve:
             return year_fractions(self.as_of_date, seq, self.dcc), False
         return np.asarray(seq, dtype=np.float64), False
 
-    def spline_weights(self, dates_or_tenors: Any) -> npt.NDArray[np.float64]:
-        """Returns the $M_{\\text{eval}} \\times K$ basis weight matrix $\\mathbf{W}_{\\text{spline}}(\\boldsymbol{\\tau}_{\\text{eval}})$.
-
-        Satisfies $S(\\boldsymbol{\\tau}_{\\text{eval}}) = \\mathbf{W}_{\\text{spline}}(\\boldsymbol{\\tau}_{\\text{eval}}) \\mathbf{y}$
-        for all linear interpolation operators, and the exact Jacobian $\\partial S / \\partial \\mathbf{y}$
-        for non-linear monotone interpolators (`PCHIP`, `Akima`).
-        """
-        tau_arr, _ = self._to_tenors_and_scalar_flag(dates_or_tenors)
+    def _spline_weights_interior_and_extrap(self, tau_arr: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         m_eval = len(tau_arr)
         k_len = len(self._tenors)
-        if m_eval == 0:
-            return np.zeros((0, k_len), dtype=np.float64)
-        if k_len == 1:
-            return np.ones((m_eval, 1), dtype=np.float64)
-
-        method = self.interpolation_method
         t_min = self._tenors[0]
         t_max = self._tenors[-1]
+        left_flat, right_flat = _extrap_sides(self.extrapolation_method)
         t_clip = np.clip(tau_arr, t_min, t_max)
 
         self._ensure_basis_interpolator()
         if self._fast_basis_coeffs is not None:
-            return eval_clamped_cubic_coeffs(self._tenors, self._fast_basis_coeffs, t_clip)
+            w = eval_clamped_cubic_coeffs(self._tenors, self._fast_basis_coeffs, t_clip)
+            if not left_flat:
+                mask_l = tau_arr < t_min
+                if np.any(mask_l):
+                    dt0 = self._tenors[1] - t_min
+                    alpha_l = (tau_arr[mask_l] - t_min)[:, None] / dt0
+                    w[mask_l] = 0.0
+                    w[mask_l, 0] = 1.0 - alpha_l[:, 0]
+                    w[mask_l, 1] = alpha_l[:, 0]
+            if not right_flat:
+                mask_r = tau_arr > t_max
+                if np.any(mask_r):
+                    dtn = t_max - self._tenors[-2]
+                    alpha_r = (tau_arr[mask_r] - t_max)[:, None] / dtn
+                    w[mask_r] = 0.0
+                    w[mask_r, -2] = -alpha_r[:, 0]
+                    w[mask_r, -1] = 1.0 + alpha_r[:, 0]
+            return w
+
         if self._cs_basis is not None:
-            return np.asarray(self._cs_basis(t_clip), dtype=np.float64)
+            w = np.asarray(self._cs_basis(t_clip), dtype=np.float64)
+            if not left_flat:
+                mask_l = tau_arr < t_min
+                if np.any(mask_l):
+                    w0 = np.asarray(self._cs_basis(t_min), dtype=np.float64)
+                    dw0 = np.asarray(self._cs_basis.derivative()(t_min), dtype=np.float64)
+                    w[mask_l] = w0[None, :] + (tau_arr[mask_l] - t_min)[:, None] * dw0[None, :]
+            if not right_flat:
+                mask_r = tau_arr > t_max
+                if np.any(mask_r):
+                    wn = np.asarray(self._cs_basis(t_max), dtype=np.float64)
+                    dwn = np.asarray(self._cs_basis.derivative()(t_max), dtype=np.float64)
+                    w[mask_r] = wn[None, :] + (tau_arr[mask_r] - t_max)[:, None] * dwn[None, :]
+            return w
 
-        if method in ("Linear", "FwdFwdLinear"):
-            return _linear_basis(self._tenors, t_clip, extrapolation="Flat")
-
+        method = self.interpolation_method
+        if method == "Linear":
+            return _linear_basis(self._tenors, tau_arr, extrapolation=self.extrapolation_method)
+        if method == "FwdFwdLinear":
+            return _fwd_fwd_linear_basis(
+                self._tenors, tau_arr, extrapolation=self.extrapolation_method
+            )
         if method in ("LogLinear", "LogDiscountLinear", "PiecewiseConstantForward"):
-            return _log_linear_rate_basis(self._tenors, tau_arr)
-
-        if method in ("FlatLeft", "PiecewiseConstantToTheLeft"):
+            return _log_linear_rate_basis(
+                self._tenors, tau_arr, extrapolation=self.extrapolation_method
+            )
+        if method == "FlatLeft":
             w = np.zeros((m_eval, k_len), dtype=np.float64)
             idx = np.clip(np.searchsorted(self._tenors, tau_arr, side="right") - 1, 0, k_len - 1)
             w[np.arange(m_eval), idx] = 1.0
             return w
-
-        if method in ("FlatRight", "PiecewiseConstantToTheRight"):
+        if method == "FlatRight":
             w = np.zeros((m_eval, k_len), dtype=np.float64)
             idx = np.clip(np.searchsorted(self._tenors, tau_arr, side="left"), 0, k_len - 1)
             w[np.arange(m_eval), idx] = 1.0
             return w
-
+        if method == "PiecewiseConstantToTheLeft":
+            w = np.zeros((m_eval, k_len), dtype=np.float64)
+            idx = np.clip(np.searchsorted(self._tenors, tau_arr, side="left"), 0, k_len - 1)
+            w[np.arange(m_eval), idx] = 1.0
+            return w
+        if method == "PiecewiseConstantToTheRight":
+            w = np.zeros((m_eval, k_len), dtype=np.float64)
+            idx = np.clip(np.searchsorted(self._tenors, tau_arr, side="right") - 1, 0, k_len - 1)
+            w[np.arange(m_eval), idx] = 1.0
+            return w
         if method == "Bessel":
             return _bessel_hermite_basis(
-                self._tenors, t_clip, extrapolation="Flat"
+                self._tenors, tau_arr, extrapolation=self.extrapolation_method
+            )
+        if method in ("NelsonSiegel", "NelsonSiegelContinuous", "NelsonSiegelDiscrete"):
+            return _nelson_siegel_basis(
+                self._tenors, tau_arr, svensson=False, extrapolation=self.extrapolation_method
+            )
+        if method == "Svensson":
+            return _nelson_siegel_basis(
+                self._tenors, tau_arr, svensson=True, extrapolation=self.extrapolation_method
             )
 
-        if method in ("NelsonSiegel", "NelsonSiegelContinuous", "NelsonSiegelDiscrete"):
-            return _nelson_siegel_basis(self._tenors, t_clip, svensson=False)
-
-        if method == "Svensson":
-            return _nelson_siegel_basis(self._tenors, t_clip, svensson=True)
-
-        # Non-linear monotone interpolators (PCHIP / Akima): compute exact central-difference Jacobian dS/dy
+        # Non-linear interpolators (PCHIP / Akima / MonotoneConvex): exact central-difference dS/dy
         eps = 1e-7
         jac = np.zeros((m_eval, k_len), dtype=np.float64)
         for k in range(k_len):
@@ -742,49 +1159,149 @@ class ClampedYieldCurve:
             y_dn = self._y_pillars.copy()
             y_up[k] += eps
             y_dn[k] -= eps
-            if method == "Akima" and k_len >= 5:
-                i_up = Akima1DInterpolator(self._tenors, y_up)
-                i_dn = Akima1DInterpolator(self._tenors, y_dn)
-            else:
-                i_up = PchipInterpolator(self._tenors, y_up)
-                i_dn = PchipInterpolator(self._tenors, y_dn)
-            jac[:, k] = (np.asarray(i_up(t_clip), dtype=np.float64) - np.asarray(i_dn(t_clip), dtype=np.float64)) / (
-                2.0 * eps
-            )
+            s_up = self._eval_nonlin_with_y(tau_arr, y_up)
+            s_dn = self._eval_nonlin_with_y(tau_arr, y_dn)
+            jac[:, k] = (s_up - s_dn) / (2.0 * eps)
         return jac
 
+    def _eval_nonlin_with_y(
+        self,
+        tau_arr: npt.NDArray[np.float64],
+        y_pil: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        method = self.interpolation_method
+        if method == "MonotoneConvex":
+            return _monotone_convex_eval(
+                self._tenors,
+                y_pil,
+                tau_arr,
+                space_coords=self.space_coords,
+                extrapolation=self.extrapolation_method,
+            )
+        k_len = len(self._tenors)
+        if method == "Akima" and k_len >= 5:
+            interp = Akima1DInterpolator(self._tenors, y_pil)
+        else:
+            interp = PchipInterpolator(self._tenors, y_pil)
+        return self._eval_scipy_with_extrap(interp, tau_arr)
+
+    def _eval_scipy_with_extrap(
+        self,
+        interp: Any,
+        tau_arr: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        t_min = self._tenors[0]
+        t_max = self._tenors[-1]
+        left_flat, right_flat = _extrap_sides(self.extrapolation_method)
+        t_clip = np.clip(tau_arr, t_min, t_max)
+        vals = np.asarray(interp(t_clip), dtype=np.float64)
+        if not left_flat:
+            mask_l = tau_arr < t_min
+            if np.any(mask_l):
+                s0 = float(interp(t_min))
+                ds0 = float(interp.derivative()(t_min))
+                vals[mask_l] = s0 + ds0 * (tau_arr[mask_l] - t_min)
+        if not right_flat:
+            mask_r = tau_arr > t_max
+            if np.any(mask_r):
+                sn = float(interp(t_max))
+                dsn = float(interp.derivative()(t_max))
+                vals[mask_r] = sn + dsn * (tau_arr[mask_r] - t_max)
+        return vals
+
+    def spline_weights(self, dates_or_tenors: Any) -> npt.NDArray[np.float64]:
+        """Returns the M_eval x K basis weight matrix dS / dy_pillars in float64."""
+        tau_arr, _ = self._to_tenors_and_scalar_flag(dates_or_tenors)
+        m_eval = len(tau_arr)
+        k_len = len(self._tenors)
+        if m_eval == 0:
+            return np.zeros((0, k_len), dtype=np.float64)
+        if k_len == 1:
+            return np.ones((m_eval, 1), dtype=np.float64)
+        return self._spline_weights_interior_and_extrap(tau_arr)
+
     def _eval_space_coord(self, tau_arr: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-        """Evaluates the interpolated curve coordinate S(tau) in float64 with clamped tau in [tau_0, tau_{K-1}]."""
+        """Evaluates the interpolated curve coordinate S(tau) in float64 honoring ExtrapolationMethod."""
         if len(tau_arr) == 0:
             return np.zeros(0, dtype=np.float64)
         if len(self._tenors) == 1:
             return np.full(len(tau_arr), self._y_pillars[0], dtype=np.float64)
 
-        t_clip = np.clip(tau_arr, self._tenors[0], self._tenors[-1])
+        t_min = self._tenors[0]
+        t_max = self._tenors[-1]
+        left_flat, right_flat = _extrap_sides(self.extrapolation_method)
 
         if self._fast_coeffs is not None:
-            return eval_clamped_cubic_coeffs(self._tenors, self._fast_coeffs, t_clip)
-        if self._cs_val is not None:
-            return np.asarray(self._cs_val(t_clip), dtype=np.float64)
-        if self._nonlin_interp is not None:
-            return np.asarray(self._nonlin_interp(t_clip), dtype=np.float64)
+            t_clip = np.clip(tau_arr, t_min, t_max)
+            vals = eval_clamped_cubic_coeffs(self._tenors, self._fast_coeffs, t_clip)
+            if not left_flat:
+                mask_l = tau_arr < t_min
+                if np.any(mask_l):
+                    slope_l = (self._y_pillars[1] - self._y_pillars[0]) / (self._tenors[1] - t_min)
+                    vals[mask_l] = self._y_pillars[0] + slope_l * (tau_arr[mask_l] - t_min)
+            if not right_flat:
+                mask_r = tau_arr > t_max
+                if np.any(mask_r):
+                    slope_r = (self._y_pillars[-1] - self._y_pillars[-2]) / (t_max - self._tenors[-2])
+                    vals[mask_r] = self._y_pillars[-1] + slope_r * (tau_arr[mask_r] - t_max)
+            return vals
 
-        w = self.spline_weights(tau_arr)
+        if self._cs_val is not None:
+            return self._eval_scipy_with_extrap(self._cs_val, tau_arr)
+
+        if self._nonlin_interp is not None:
+            return self._eval_scipy_with_extrap(self._nonlin_interp, tau_arr)
+
+        if self.interpolation_method == "MonotoneConvex":
+            return _monotone_convex_eval(
+                self._tenors,
+                self._y_pillars,
+                tau_arr,
+                space_coords=self.space_coords,
+                extrapolation=self.extrapolation_method,
+            )
+
+        w = self._spline_weights_interior_and_extrap(tau_arr)
         return np.asarray(w @ self._y_pillars, dtype=np.float64)
 
     def zero_rate(self, dates_or_tenors: Any) -> npt.NDArray[np.float64]:
         """Evaluates continuously compounded decimal zero rate r(tau) in float64."""
         tau_arr, is_scalar = self._to_tenors_and_scalar_flag(dates_or_tenors)
-        r_arr = self._eval_space_coord(tau_arr)
+        y_arr = self._eval_space_coord(tau_arr)
+        if self.space_coords == "Rates":
+            r_arr = y_arr
+        elif self.space_coords == "LogarithmOfDiscountFactors":
+            t_safe = np.maximum(np.abs(tau_arr), 1e-12)
+            r0_fallback = (
+                float(self._rates_decimal[1])
+                if self._tenors[0] <= 1e-12 and len(self._tenors) > 1
+                else float(self._rates_decimal[0])
+            )
+            r_arr = np.where(tau_arr > 1e-12, -y_arr / t_safe, r0_fallback)
+        else:
+            t_safe = np.maximum(np.abs(tau_arr), 1e-12)
+            df_safe = np.maximum(y_arr, 1e-15)
+            r0_fallback = (
+                float(self._rates_decimal[1])
+                if self._tenors[0] <= 1e-12 and len(self._tenors) > 1
+                else float(self._rates_decimal[0])
+            )
+            r_arr = np.where(tau_arr > 1e-12, -np.log(df_safe) / t_safe, r0_fallback)
+
         if is_scalar:
             return np.float64(r_arr[0])  # type: ignore[return-value]
         return np.asarray(r_arr, dtype=np.float64)
 
     def df(self, dates_or_tenors: Any) -> npt.NDArray[np.float64]:
-        """Evaluates the discount factor DF(tau) = exp(-r(tau) * tau) in float64."""
+        """Evaluates the discount factor DF(tau) in float64."""
         tau_arr, is_scalar = self._to_tenors_and_scalar_flag(dates_or_tenors)
-        r_val = self._eval_space_coord(tau_arr)
-        df_arr = np.where(tau_arr <= 0.0, 1.0, np.exp(-r_val * tau_arr))
+        y_val = self._eval_space_coord(tau_arr)
+        if self.space_coords == "Rates":
+            df_arr = np.where(tau_arr <= 0.0, 1.0, np.exp(-y_val * tau_arr))
+        elif self.space_coords == "LogarithmOfDiscountFactors":
+            df_arr = np.where(tau_arr <= 0.0, 1.0, np.exp(y_val))
+        else:
+            df_arr = np.where(tau_arr <= 0.0, 1.0, np.maximum(y_val, 1e-15))
 
         if is_scalar:
             return np.float64(df_arr[0])  # type: ignore[return-value]
@@ -795,41 +1312,84 @@ class ClampedYieldCurve:
         dates_or_tenors: Any,
         *,
         in_quote_units: bool = True,
-    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-        """Computes `(df, d_df_d_pillar_quote)` in float64 using the precomputed spline basis matrix.
-
-        For zero-rate quotes:
-            d DF(tau_m) / d r_k^{quote} = -tau_m * DF(tau_m) * W_spline(tau_m, k) * scale_quote
-        where `scale_quote = 0.01` for `Percentage` and `1.0` for `Decimal` (when `in_quote_units=True`).
-        """
+    ) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """Computes `(df, d_df_d_pillar_quote)` in float64 using the spline basis matrix."""
         tau_arr, _ = self._to_tenors_and_scalar_flag(dates_or_tenors)
         df_arr = np.asarray(self.df(tau_arr), dtype=np.float64)
-        w_mat = self.spline_weights(tau_arr)  # (M_eval, K)
+        w_mat = self.spline_weights(tau_arr)
         scale = self._quote_scale if in_quote_units else 1.0
+        pos_eval = (tau_arr > 0.0).astype(np.float64)[:, None]
 
-        d_df_d_r = -(np.maximum(tau_arr, 0.0)[:, None] * df_arr[:, None]) * w_mat
-        if self._input_mode == "log_df":
-            t_safe = np.maximum(np.abs(self._tenors), 1e-12)
-            d_df = d_df_d_r * (-1.0 / t_safe[None, :]) * scale
-        elif self._input_mode == "df":
-            t_safe = np.maximum(np.abs(self._tenors), 1e-12)
-            df_pil = np.maximum(self._raw_quotes, 1e-15)
-            d_df = d_df_d_r * (-1.0 / (t_safe * df_pil)[None, :]) * scale
+        # 1. d DF(tau_m) / d y_pil
+        if self.space_coords == "Rates":
+            d_df_d_y = -(np.maximum(tau_arr, 0.0)[:, None] * df_arr[:, None]) * w_mat
+        elif self.space_coords == "LogarithmOfDiscountFactors":
+            d_df_d_y = (pos_eval * df_arr[:, None]) * w_mat
         else:
-            d_df = d_df_d_r * scale
+            d_df_d_y = pos_eval * w_mat
 
+        # 2. d y_pil / d quote_k (masked to 0 at tau_k <= 1e-12 whenever 1/tau_k appears)
+        pos_pil = self._tenors > 1e-12
+        t_safe = np.maximum(np.abs(self._tenors), 1e-12)
+        if self.space_coords == "Rates":
+            if self._input_mode == "log_df":
+                dy_dq = np.where(pos_pil, -1.0 / t_safe, 0.0) * scale
+            elif self._input_mode == "df":
+                df_pil = np.maximum(self._raw_quotes * self._quote_scale, 1e-15)
+                dy_dq = np.where(pos_pil, -1.0 / (t_safe * df_pil), 0.0) * scale
+            else:
+                dy_dq = np.full(len(self._tenors), scale, dtype=np.float64)
+        elif self.space_coords == "LogarithmOfDiscountFactors":
+            if self._input_mode == "log_df":
+                dy_dq = np.full(len(self._tenors), scale, dtype=np.float64)
+            elif self._input_mode == "df":
+                df_pil = np.maximum(self._raw_quotes * self._quote_scale, 1e-15)
+                dy_dq = (1.0 / df_pil) * scale
+            else:
+                dy_dq = (-self._tenors) * scale
+        else:
+            if self._input_mode == "df":
+                dy_dq = np.full(len(self._tenors), scale, dtype=np.float64)
+            elif self._input_mode == "log_df":
+                dy_dq = self._y_pillars * scale
+            else:
+                dy_dq = (-self._tenors * self._y_pillars) * scale
+
+        d_df = d_df_d_y * dy_dq[None, :]
         return df_arr, np.asarray(d_df, dtype=np.float64)
 
 
 # ── RepoCurve ─────────────────────────────────────────────────────────────────
 
 
+def _parse_repo_periods_days(periods: Sequence[Any]) -> npt.NDArray[np.float64]:
+    days: list[float] = []
+    for p in periods:
+        if isinstance(p, (int, float)):
+            days.append(float(p))
+            continue
+        m = _REPO_PERIOD_RE.match(str(p))
+        if m is None:
+            raise ValueError(f"Invalid repo period format {p!r}; expected '<n>[DWMY]'")
+        val = float(m.group(1))
+        unit = m.group(2).upper()
+        if unit == "D":
+            days.append(val)
+        elif unit == "W":
+            days.append(val * 7.0)
+        elif unit == "M":
+            days.append(val * 30.0)
+        elif unit == "Y":
+            days.append(val * 365.0)
+    return np.asarray(days, dtype=np.float64)
+
+
 class RepoCurve:
-    """Equity repo spread curve (`Act360`, `<n>D` periods) with automatic flat-0.0% fallback when omitted."""
+    """Equity repo spread curve with automatic flat-0.0% fallback when omitted."""
 
     def __init__(
         self,
-        spec: RepoSpreadCurveSpec | None = None,
+        spec: RepoSpreadCurveSpec | Mapping[str, Any] | None = None,
         *,
         as_of_date: datetime.date | datetime.datetime | None = None,
         periods_days: Sequence[float] | npt.NDArray[np.float64] | None = None,
@@ -840,22 +1400,22 @@ class RepoCurve:
         quote_expression: str = "Percentage",
         identifier: str = "DEFAULT",
     ) -> None:
-        self.as_of_date = as_of_date
-        if spec is not None:
+        self.as_of_date = _normalize_datetime(as_of_date) if as_of_date is not None else None
+        if isinstance(spec, RepoSpreadCurveSpec):
             self.identifier = spec.Identifier
             self.dcc = spec.InterpolationDayCountConvention.value
             self.interpolation_method = spec.InterpolationMethod.value
             self.extrapolation_method = spec.ExtrapolationMethod.value
             self.quote_expression = spec.RateQuoteExpression.value
             days_arr = np.asarray(spec.RatesSchedule.period_days(), dtype=np.float64)
-            denom = 365.0 if "365" in self.dcc else 360.0
+            denom = dcc_denominator(self.dcc)
             tenors_arr = days_arr / denom
             rates_arr = np.asarray(spec.RatesSchedule.Rates, dtype=np.float64)
             self._is_flat_zero = False
             self._inner_curve: ClampedYieldCurve | None = ClampedYieldCurve(
                 pillar_tenors=tenors_arr,
                 rates=rates_arr,
-                as_of_date=as_of_date,
+                as_of_date=self.as_of_date,
                 dcc=self.dcc,
                 interpolation_method=self.interpolation_method,
                 space_coords=spec.InterpolationSpaceCoordinates.value,
@@ -863,6 +1423,64 @@ class RepoCurve:
                 quote_expression=self.quote_expression,
                 identifier=self.identifier,
             )
+        elif isinstance(spec, Mapping):
+            self.identifier = str(_extract_curve_field(spec, "Identifier", "identifier", default=identifier))
+            raw_dcc = _extract_curve_field(
+                spec, "InterpolationDayCountConvention", "DayCountConvention", "day_count_convention", "dcc", default=dcc
+            )
+            self.dcc = str(getattr(raw_dcc, "value", raw_dcc))
+            raw_interp = _extract_curve_field(
+                spec, "InterpolationMethod", "interpolation_method", default=interpolation_method
+            )
+            self.interpolation_method = str(getattr(raw_interp, "value", raw_interp))
+            raw_extrap = _extract_curve_field(
+                spec, "ExtrapolationMethod", "extrapolation_method", default=extrapolation_method
+            )
+            self.extrapolation_method = str(getattr(raw_extrap, "value", raw_extrap))
+            raw_space = _extract_curve_field(
+                spec, "InterpolationSpaceCoordinates", "space_coords", default="Rates"
+            )
+            space_coords = str(getattr(raw_space, "value", raw_space))
+            raw_qe = _extract_curve_field(
+                spec, "RateQuoteExpression", "rate_quote_expression", "quote_expression", default=quote_expression
+            )
+            self.quote_expression = str(getattr(raw_qe, "value", raw_qe))
+            sched = _extract_curve_field(spec, "RatesSchedule", "rates_schedule", default=spec)
+            if isinstance(sched, Mapping):
+                raw_periods = _extract_curve_field(sched, "Periods", "periods_days", "Dates", "dates", default=[])
+                raw_rates = _extract_curve_field(sched, "Rates", "rates_pct", "rates", default=[])
+            else:
+                raw_periods = getattr(sched, "Periods", getattr(sched, "periods_days", getattr(sched, "Dates", [])))
+                raw_rates = getattr(sched, "Rates", getattr(sched, "rates_pct", getattr(sched, "rates", [])))
+            if len(raw_rates) == 0:
+                self._is_flat_zero = True
+                self._inner_curve = None
+            else:
+                if raw_periods and isinstance(raw_periods[0], (datetime.date, datetime.datetime, str)) and (
+                    isinstance(raw_periods[0], (datetime.date, datetime.datetime))
+                    or ("-" in str(raw_periods[0]) or ":" in str(raw_periods[0]))
+                ):
+                    if self.as_of_date is None:
+                        raise ValueError("RepoCurve requires `as_of_date` when Dates are provided.")
+                    tenors_arr = year_fractions(
+                        self.as_of_date, [_normalize_datetime(d) for d in raw_periods], self.dcc
+                    )
+                else:
+                    days_arr = _parse_repo_periods_days(raw_periods)
+                    tenors_arr = days_arr / dcc_denominator(self.dcc)
+                rates_arr = np.asarray(raw_rates, dtype=np.float64)
+                self._is_flat_zero = False
+                self._inner_curve = ClampedYieldCurve(
+                    pillar_tenors=tenors_arr,
+                    rates=rates_arr,
+                    as_of_date=self.as_of_date,
+                    dcc=self.dcc,
+                    interpolation_method=self.interpolation_method,
+                    space_coords=space_coords,
+                    extrapolation_method=self.extrapolation_method,
+                    quote_expression=self.quote_expression,
+                    identifier=self.identifier,
+                )
         elif periods_days is not None and rates is not None:
             self.identifier = identifier
             self.dcc = dcc.value if isinstance(dcc, Enum) else str(dcc)
@@ -882,13 +1500,12 @@ class RepoCurve:
                 else str(quote_expression)
             )
             days_arr = np.asarray(periods_days, dtype=np.float64)
-            denom = 365.0 if "365" in self.dcc else 360.0
-            tenors_arr = days_arr / denom
+            tenors_arr = days_arr / dcc_denominator(self.dcc)
             self._is_flat_zero = False
             self._inner_curve = ClampedYieldCurve(
                 pillar_tenors=tenors_arr,
                 rates=rates,
-                as_of_date=as_of_date,
+                as_of_date=self.as_of_date,
                 dcc=self.dcc,
                 interpolation_method=self.interpolation_method,
                 space_coords="Rates",
@@ -897,7 +1514,6 @@ class RepoCurve:
                 identifier=self.identifier,
             )
         else:
-            # Default flat 0.0% repo curve (e.g., for omitted POSIRX_RUB)
             self.identifier = identifier
             self.dcc = dcc.value if isinstance(dcc, Enum) else str(dcc)
             self.interpolation_method = "CubicSpline"
@@ -911,12 +1527,12 @@ class RepoCurve:
         """True when constructed with `spec=None` (flat 0.0% repo curve)."""
         return self._is_flat_zero
 
-    def _to_act360_tenors_and_scalar_flag(
+    def _to_repo_tenors_and_scalar_flag(
         self, dates_or_tenors: Any
-    ) -> tuple[npt.NDArray[np.float64], bool]:
+    ) -> Tuple[npt.NDArray[np.float64], bool]:
         if isinstance(dates_or_tenors, np.ndarray):
             if dates_or_tenors.ndim == 0:
-                return self._to_act360_tenors_and_scalar_flag(dates_or_tenors.item())
+                return self._to_repo_tenors_and_scalar_flag(dates_or_tenors.item())
             if dates_or_tenors.ndim == 1 and np.issubdtype(dates_or_tenors.dtype, np.number):
                 return dates_or_tenors.astype(np.float64, copy=False), False
         if isinstance(dates_or_tenors, (datetime.date, datetime.datetime)):
@@ -942,7 +1558,7 @@ class RepoCurve:
 
     def repo_rate(self, dates_or_tenors: Any) -> npt.NDArray[np.float64]:
         """Evaluates decimal repo spread rate q_repo(t) in float64."""
-        tau_arr, is_scalar = self._to_act360_tenors_and_scalar_flag(dates_or_tenors)
+        tau_arr, is_scalar = self._to_repo_tenors_and_scalar_flag(dates_or_tenors)
         if self._is_flat_zero or self._inner_curve is None:
             res = np.zeros_like(tau_arr, dtype=np.float64)
         else:
@@ -952,22 +1568,22 @@ class RepoCurve:
         return res
 
     def integrated_repo(self, dates_or_tenors: Any) -> npt.NDArray[np.float64]:
-        """Evaluates integrated repo spread int_{t_0}^t q_repo(u) du = q_repo(t) * (days / 360.0) in float64."""
-        tau_arr, is_scalar = self._to_act360_tenors_and_scalar_flag(dates_or_tenors)
+        """Evaluates integrated repo spread int_{t_0}^t q_repo(u) du in float64 (0 for tau <= 0)."""
+        tau_arr, is_scalar = self._to_repo_tenors_and_scalar_flag(dates_or_tenors)
         if self._is_flat_zero or self._inner_curve is None:
             res = np.zeros_like(tau_arr, dtype=np.float64)
         else:
             r_arr = np.asarray(self._inner_curve.zero_rate(tau_arr), dtype=np.float64)
-            res = r_arr * tau_arr
+            res = np.where(tau_arr <= 0.0, 0.0, r_arr * tau_arr)
         if is_scalar:
             return np.float64(res[0])  # type: ignore[return-value]
         return res
 
     def repo_df(self, dates_or_tenors: Any) -> npt.NDArray[np.float64]:
-        """Evaluates repo discount factor exp(-int_{t_0}^t q_repo(u) du) in float64."""
-        tau_arr, is_scalar = self._to_act360_tenors_and_scalar_flag(dates_or_tenors)
+        """Evaluates repo discount factor exp(-int_{t_0}^t q_repo(u) du) in float64 (1.0 for tau <= 0)."""
+        tau_arr, is_scalar = self._to_repo_tenors_and_scalar_flag(dates_or_tenors)
         int_repo = np.asarray(self.integrated_repo(tau_arr), dtype=np.float64)
-        df_arr = np.exp(-int_repo)
+        df_arr = np.where(tau_arr <= 0.0, 1.0, np.exp(-int_repo))
         if is_scalar:
             return np.float64(df_arr[0])  # type: ignore[return-value]
         return df_arr

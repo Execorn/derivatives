@@ -3,76 +3,22 @@ autocall — Multi-Asset & Vanilla Equity Autocallable Pricing Package.
 
 Preserves backward-compatible exports from legacy `deepvol.models.autocall`
 (`make_obs_indices`, `autocall_upper_bound`, `_price_autocall_kernel`, `price_autocall_mc`)
-while exposing the `SPEC-DEEPVOL-EQ-AUTOCALL-001` multi-asset submodules.
+while lazily exposing multi-asset autocall submodules via PEP 562.
 """
 
 from __future__ import annotations
 
+import importlib
 import math
-from typing import List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-
-from deepvol.models.autocall.analytical_baseline import (
-    AutocallBaselineOutput,
-    compute_analytical_autocall_baseline,
-    fast_stulz_margrabe_cpu,
-    stulz_margrabe_moments_with_weights,
-    stulz_margrabe_worst_of_moments,
-)
-from deepvol.models.autocall.dupire_qmc_solver import (
-    DupireQMCResult,
-    RegularizedVolSurface,
-    enforce_no_arbitrage_projection,
-    price_eq_autocall_dupire_qmc,
-    price_eq_autocall_qmc_fallback,
-)
-from deepvol.models.autocall.escrowed_dividend import (
-    EscrowedDividendOutput,
-    ParsedDividendEvent,
-    build_discount_rate_evaluator,
-    build_repo_rate_evaluator,
-    compute_escrowed_dividend_forwards,
-    merge_dividend_schedules,
-)
-from deepvol.models.autocall.pre_post_processor import (
-    D_MAX_DEFAULT,
-    M_MAX_DEFAULT,
-    AutocallEdgeCol,
-    AutocallGlobalCol,
-    AutocallNodeCol,
-    AutocallPostprocOutput,
-    AutocallPreprocState,
-    AutocallSchedCol,
-    assemble_autocall_cashflows_and_pv,
-    parse_murex_text_or_dict_fallback,
-    preprocess_eq_autocall,
-)
-from deepvol.models.autocall.seasoned_collapser import (
-    CashFlowItem,
-    HistoricalPeriodRecord,
-    SeasonedScheduleState,
-    SentinelBarrierResult,
-    canonicalize_asset_order,
-    collapse_seasoned_schedule,
-    evaluate_monitoring_index_np,
-    evaluate_monitoring_index_torch,
-    normalize_sentinel_barriers,
-)
 
 
 def make_obs_indices(n_obs: int, T: float, N_steps: int) -> List[int]:
     """
     Returns a sorted list of step indices (ints) where observation dates fall,
     uniformly spaced over (0, T].
-
-    Parameters:
-        n_obs: Number of observation dates.
-        T: Maturity in years.
-        N_steps: Total simulation steps across (0, T].
-
-    Returns:
-        Sorted list of integer step indices in [1, N_steps].
     """
     dt = T / N_steps
     indices: List[int] = []
@@ -152,20 +98,6 @@ def price_autocall_mc(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Vectorized Monte Carlo pricing for 1-leg vanilla autocallable notes.
-
-    Parameters:
-        S: Spot paths tensor of shape (B, N_paths, N_steps + 1) in float64.
-        obs_indices: Step indices of observation dates.
-        B: Barrier tensor of shape (B,) as fraction of S0.
-        coupon: Annual coupon rate tensor of shape (B,).
-        r: Risk-free rate tensor of shape (B,).
-        T: Total maturity.
-        dt: Time step size.
-
-    Returns:
-        npv: Expected discounted payoff of shape (B,).
-        call_prob: Autocall early redemption probability of shape (B,).
-        exp_life: Expected time to redemption in years of shape (B,).
     """
     if isinstance(obs_indices, list):
         obs_tensor = torch.tensor(obs_indices, dtype=torch.long, device=S.device)
@@ -182,45 +114,111 @@ def price_autocall_mc(
     )
 
 
+_LAZY_SUBMODULE_EXPORTS: Dict[str, Tuple[str, Optional[str]]] = {
+    "FEATURE_SCHEMA_VERSION": ("deepvol.models.autocall.feature_layout", "FEATURE_SCHEMA_VERSION"),
+    "D_MAX_DEFAULT": ("deepvol.models.autocall.feature_layout", "D_MAX_DEFAULT"),
+    "M_MAX_DEFAULT": ("deepvol.models.autocall.feature_layout", "M_MAX_DEFAULT"),
+    "MonitoringIndexCode": ("deepvol.models.autocall.feature_layout", "MonitoringIndexCode"),
+    "AutocallNodeCol": ("deepvol.models.autocall.feature_layout", "AutocallNodeCol"),
+    "AutocallEdgeCol": ("deepvol.models.autocall.feature_layout", "AutocallEdgeCol"),
+    "AutocallSchedCol": ("deepvol.models.autocall.feature_layout", "AutocallSchedCol"),
+    "AutocallGlobalCol": ("deepvol.models.autocall.feature_layout", "AutocallGlobalCol"),
+    "AutocallBaselineOutput": ("deepvol.models.autocall.analytical_baseline", "AutocallBaselineOutput"),
+    "compute_analytical_autocall_baseline": (
+        "deepvol.models.autocall.analytical_baseline",
+        "compute_analytical_autocall_baseline",
+    ),
+    "fast_stulz_margrabe_cpu": ("deepvol.models.autocall.analytical_baseline", "fast_stulz_margrabe_cpu"),
+    "stulz_margrabe_moments_with_weights": (
+        "deepvol.models.autocall.analytical_baseline",
+        "stulz_margrabe_moments_with_weights",
+    ),
+    "stulz_margrabe_worst_of_moments": (
+        "deepvol.models.autocall.analytical_baseline",
+        "stulz_margrabe_worst_of_moments",
+    ),
+    "DupireQMCResult": ("deepvol.models.autocall.dupire_qmc_solver", "DupireQMCResult"),
+    "RegularizedVolSurface": ("deepvol.models.autocall.dupire_qmc_solver", "RegularizedVolSurface"),
+    "enforce_no_arbitrage_projection": (
+        "deepvol.models.autocall.dupire_qmc_solver",
+        "enforce_no_arbitrage_projection",
+    ),
+    "price_eq_autocall_dupire_qmc": (
+        "deepvol.models.autocall.dupire_qmc_solver",
+        "price_eq_autocall_dupire_qmc",
+    ),
+    "price_eq_autocall_qmc_fallback": (
+        "deepvol.models.autocall.dupire_qmc_solver",
+        "price_eq_autocall_qmc_fallback",
+    ),
+    "EscrowedDividendOutput": ("deepvol.models.autocall.escrowed_dividend", "EscrowedDividendOutput"),
+    "ParsedDividendEvent": ("deepvol.models.autocall.escrowed_dividend", "ParsedDividendEvent"),
+    "build_discount_rate_evaluator": (
+        "deepvol.models.autocall.escrowed_dividend",
+        "build_discount_rate_evaluator",
+    ),
+    "build_repo_rate_evaluator": ("deepvol.models.autocall.escrowed_dividend", "build_repo_rate_evaluator"),
+    "compute_escrowed_dividend_forwards": (
+        "deepvol.models.autocall.escrowed_dividend",
+        "compute_escrowed_dividend_forwards",
+    ),
+    "merge_dividend_schedules": ("deepvol.models.autocall.escrowed_dividend", "merge_dividend_schedules"),
+    "AutocallPostprocOutput": ("deepvol.models.autocall.pre_post_processor", "AutocallPostprocOutput"),
+    "AutocallPreprocState": ("deepvol.models.autocall.pre_post_processor", "AutocallPreprocState"),
+    "assemble_autocall_cashflows_and_pv": (
+        "deepvol.models.autocall.pre_post_processor",
+        "assemble_autocall_cashflows_and_pv",
+    ),
+    "preprocess_eq_autocall": ("deepvol.models.autocall.pre_post_processor", "preprocess_eq_autocall"),
+    "CashFlowItem": ("deepvol.models.autocall.seasoned_collapser", "CashFlowItem"),
+    "HistoricalPeriodRecord": ("deepvol.models.autocall.seasoned_collapser", "HistoricalPeriodRecord"),
+    "SeasonedScheduleState": ("deepvol.models.autocall.seasoned_collapser", "SeasonedScheduleState"),
+    "SentinelBarrierResult": ("deepvol.models.autocall.seasoned_collapser", "SentinelBarrierResult"),
+    "canonicalize_asset_order": ("deepvol.models.autocall.seasoned_collapser", "canonicalize_asset_order"),
+    "collapse_seasoned_schedule": (
+        "deepvol.models.autocall.seasoned_collapser",
+        "collapse_seasoned_schedule",
+    ),
+    "evaluate_monitoring_index_np": (
+        "deepvol.models.autocall.seasoned_collapser",
+        "evaluate_monitoring_index_np",
+    ),
+    "evaluate_monitoring_index_torch": (
+        "deepvol.models.autocall.seasoned_collapser",
+        "evaluate_monitoring_index_torch",
+    ),
+    "normalize_sentinel_barriers": (
+        "deepvol.models.autocall.seasoned_collapser",
+        "normalize_sentinel_barriers",
+    ),
+    "greeks_engine": ("deepvol.models.autocall.greeks_engine", None),
+    "AutocallGreeksResult": ("deepvol.models.autocall.greeks_engine", "AutocallGreeksResult"),
+    "compute_eq_autocall_greeks": ("deepvol.models.autocall.greeks_engine", "compute_eq_autocall_greeks"),
+    "compute_batched_surrogate_greeks": (
+        "deepvol.models.autocall.greeks_engine",
+        "compute_batched_surrogate_greeks",
+    ),
+}
+
 __all__ = [
     "make_obs_indices",
     "autocall_upper_bound",
     "_price_autocall_kernel",
     "price_autocall_mc",
-    "D_MAX_DEFAULT",
-    "M_MAX_DEFAULT",
-    "AutocallNodeCol",
-    "AutocallEdgeCol",
-    "AutocallSchedCol",
-    "AutocallGlobalCol",
-    "AutocallPreprocState",
-    "AutocallPostprocOutput",
-    "AutocallBaselineOutput",
-    "CashFlowItem",
-    "HistoricalPeriodRecord",
-    "SeasonedScheduleState",
-    "SentinelBarrierResult",
-    "ParsedDividendEvent",
-    "EscrowedDividendOutput",
-    "RegularizedVolSurface",
-    "DupireQMCResult",
-    "canonicalize_asset_order",
-    "evaluate_monitoring_index_np",
-    "evaluate_monitoring_index_torch",
-    "normalize_sentinel_barriers",
-    "collapse_seasoned_schedule",
-    "build_repo_rate_evaluator",
-    "build_discount_rate_evaluator",
-    "merge_dividend_schedules",
-    "compute_escrowed_dividend_forwards",
-    "fast_stulz_margrabe_cpu",
-    "stulz_margrabe_moments_with_weights",
-    "stulz_margrabe_worst_of_moments",
-    "compute_analytical_autocall_baseline",
-    "enforce_no_arbitrage_projection",
-    "price_eq_autocall_dupire_qmc",
-    "price_eq_autocall_qmc_fallback",
-    "parse_murex_text_or_dict_fallback",
-    "preprocess_eq_autocall",
-    "assemble_autocall_cashflows_and_pv",
+    *_LAZY_SUBMODULE_EXPORTS.keys(),
 ]
+
+
+def __getattr__(name: str) -> Any:
+    target = _LAZY_SUBMODULE_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    mod_name, attr_name = target
+    module = importlib.import_module(mod_name)
+    value = module if attr_name is None else getattr(module, attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> List[str]:
+    return sorted(set(globals().keys()) | set(__all__))

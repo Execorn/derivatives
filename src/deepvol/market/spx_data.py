@@ -2,22 +2,21 @@
 §1.1 SPX market data acquisition and cleaning pipeline.
 """
 from __future__ import annotations
-import os
-os.environ["NUMBA_DISABLE_JIT"] = "1"
+
+from datetime import date, datetime, timedelta
+import json
+from pathlib import Path
+import threading
+import time
+from typing import Any, Dict
 
 import numpy as np
-import pandas as pd
-from pathlib import Path
-from datetime import date, datetime, timedelta
-from typing import Optional
-from scipy.interpolate import interp1d, RectBivariateSpline
+import numpy.typing as npt
+import pandas as pd  # type: ignore[import-untyped]
+import py_vollib_vectorized
+from scipy.interpolate import RectBivariateSpline, interp1d
 from scipy.stats import linregress
 import torch
-import json
-import time
-import threading
-
-import py_vollib_vectorized
 
 _LOCK = threading.Lock()
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -66,7 +65,7 @@ def download_spx_chain(snapshot_date: date, cache: bool = True) -> pd.DataFrame:
     today = date.today()
     if snapshot_date >= today:
         try:
-            import yfinance as yf
+            import yfinance as yf  # type: ignore[import-untyped]
             ticker = yf.Ticker("^SPX")
             expirations = ticker.options
             
@@ -372,7 +371,7 @@ def clean_chain(df: pd.DataFrame,
 def to_iv_surface(df: pd.DataFrame,
                   S: float,
                   r: float,
-                  q: float) -> np.ndarray:
+                  q: float) -> npt.NDArray[np.float64]:
     """
     Interpolate cleaned chain onto the FNO (T_GRID, K_GRID) regular grid.
     """
@@ -418,7 +417,9 @@ def to_iv_surface(df: pd.DataFrame,
 
                 with torch.no_grad():
                     iv_surface_t = calibrate._fno_predict_real_iv(model, theta_raw, spatial)
-                iv_surface = iv_surface_t.squeeze().cpu().numpy()
+                iv_surface: npt.NDArray[np.float64] = np.asarray(
+                    iv_surface_t.squeeze().cpu().numpy(), dtype=np.float64
+                )
             finally:
                 calibrate._NORM_VERSIONS["v1"] = orig_v1
                 calibrate._param_norm = None
@@ -458,14 +459,14 @@ def to_iv_surface(df: pd.DataFrame,
             grid_iv[idx_T] = np.full(11, 0.20)
             
     spline = RectBivariateSpline(unique_T, K_GRID, grid_iv, kx=min(3, max(1, M - 1)), ky=3)
-    surface = spline(T_GRID, K_GRID)
+    surface = np.asarray(spline(T_GRID, K_GRID), dtype=np.float64)
     surface = np.clip(surface, 1e-4, None)
     return surface
 
 
 def calibrate_to_market(snapshot_date: date,
                         fix_H: bool = True,
-                        H_fixed: float = 0.1) -> dict:
+                        H_fixed: float = 0.1) -> Dict[str, Any]:
     """
     Full pipeline: download → clean → grid → Newton calibration.
     """

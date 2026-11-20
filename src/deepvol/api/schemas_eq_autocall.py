@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import datetime
 from enum import Enum
-import os
+import math
 from pathlib import Path
 import re
 from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union, cast
@@ -119,6 +119,10 @@ class DayCountConventionEnum(str, Enum):
     Act364 = "Act364"
     Act366 = "Act366"
     Act365F = "Act365F"
+    Act365_25 = "Act365_25"
+    Act366_1 = "Act366_1"
+    Act366_2 = "Act366_2"
+    Act366_3 = "Act366_3"
 
     # Uppercase aliases
     ACT_365 = "Act365"
@@ -132,6 +136,10 @@ class DayCountConventionEnum(str, Enum):
     ACT_364 = "Act364"
     ACT_366 = "Act366"
     ACT_365F = "Act365F"
+    ACT_365_25 = "Act365_25"
+    ACT_366_1 = "Act366_1"
+    ACT_366_2 = "Act366_2"
+    ACT_366_3 = "Act366_3"
 
 
 class CurveInterpolationMethodEnum(str, Enum):
@@ -139,6 +147,7 @@ class CurveInterpolationMethodEnum(str, Enum):
 
     CubicSpline = "CubicSpline"
     Linear = "Linear"
+    Smooth = "Smooth"
     LogLinear = "LogLinear"
     FlatLeft = "FlatLeft"
     FlatRight = "FlatRight"
@@ -177,6 +186,7 @@ class CurveInterpolationMethodEnum(str, Enum):
     # Uppercase aliases
     CUBIC_SPLINE = "CubicSpline"
     LINEAR = "Linear"
+    SMOOTH = "Smooth"
     LOG_LINEAR = "LogLinear"
     FLAT_LEFT = "FlatLeft"
     FLAT_RIGHT = "FlatRight"
@@ -273,7 +283,7 @@ def _normalize_datetime(val: Any) -> datetime.datetime:
     if isinstance(val, datetime.datetime):
         if val.tzinfo is None:
             return val.replace(tzinfo=datetime.timezone.utc)
-        return val
+        return val.astimezone(datetime.timezone.utc)
     if isinstance(val, datetime.date):
         return datetime.datetime(val.year, val.month, val.day, 0, 0, tzinfo=datetime.timezone.utc)
     if isinstance(val, str):
@@ -282,8 +292,8 @@ def _normalize_datetime(val: Any) -> datetime.datetime:
             s = s[:-1] + "+00:00"
         dt = datetime.datetime.fromisoformat(s)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return dt
+            return dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
     raise TypeError(f"Cannot convert {type(val).__name__} to datetime.datetime")
 
 
@@ -475,6 +485,11 @@ class PredefinedDividendsSpec(BaseModel):
             raise ValueError(
                 f"PredefinedDividends ExDates length ({len(self.ExDates)}) != Amounts length ({len(self.Amounts)})"
             )
+        if any((not math.isfinite(a)) or a < 0.0 for a in self.Amounts):
+            raise ValueError("PredefinedDividends.Amounts must be finite and non-negative")
+        for idx in range(1, len(self.ExDates)):
+            if self.ExDates[idx] < self.ExDates[idx - 1]:
+                raise ValueError("PredefinedDividends.ExDates must be sorted in ascending order")
         return self
 
 
@@ -630,6 +645,37 @@ class MarketDataSetSpec(BaseModel):
     def _parse_as_of(cls, v: Any) -> datetime.datetime:
         return _normalize_datetime(v)
 
+    @field_validator("RatesCurvesBundles")
+    @classmethod
+    def _validate_rates_bundles(
+        cls, v: Dict[str, DiscountFactorCurveSpec]
+    ) -> Dict[str, DiscountFactorCurveSpec]:
+        if len(v) == 0:
+            raise ValueError("MarketDataSet.RatesCurvesBundles must not be empty")
+        return v
+
+    @field_validator("VolatilitySurfaces")
+    @classmethod
+    def _validate_vol_surfaces(
+        cls, v: Dict[str, VolatilitySurfaceSpec]
+    ) -> Dict[str, VolatilitySurfaceSpec]:
+        if len(v) == 0:
+            raise ValueError("MarketDataSet.VolatilitySurfaces must not be empty")
+        return v
+
+    @field_validator("Spots")
+    @classmethod
+    def _validate_spots(cls, v: Dict[str, float]) -> Dict[str, float]:
+        if len(v) == 0:
+            raise ValueError("MarketDataSet.Spots must not be empty")
+        for ticker, spot in v.items():
+            s_val = float(spot)
+            if not math.isfinite(s_val) or s_val <= 0.0:
+                raise ValueError(
+                    f"MarketDataSet.Spots[{ticker!r}] must be strictly positive and finite, got {spot!r}"
+                )
+        return v
+
     @field_validator("Correlations")
     @classmethod
     def _validate_correlations(cls, v: Dict[str, float]) -> Dict[str, float]:
@@ -730,11 +776,14 @@ class AutoCallableProductSpec(BaseModel):
     FixedRate: Optional[Union[float, List[float]]] = None
     FixedCouponAmount: Optional[Union[float, List[float]]] = None
     CouponBarrierLevels: Optional[List[float]] = None
-    CouponBarrierType: Optional[str] = "In"
-    CouponBarrierDirection: Optional[str] = "Up"
+    CouponBarrierType: Optional[Literal["In", "Out"]] = "In"
+    CouponBarrierDirection: Optional[Literal["Up", "Down"]] = "Up"
     CouponBarrierAbsoluteDigitalSpread: Optional[float] = None
     OptionDownAndInBarrierLevel: Optional[float] = None
     OptionDownAndInBarrierAbsoluteDigitalSpread: Optional[float] = None
+    OptionDownAndInBarrierObservationType: Optional[
+        Literal["European", "Discrete", "American", "Continuous"]
+    ] = None
     CouponBarrierMonitoringIndex: Optional[MonitoringIndexEnum] = None
     OptionMonitoringIndex: Optional[MonitoringIndexEnum] = None
     RateIdentifier: Optional[str] = None
@@ -785,19 +834,60 @@ class AutoCallableProductSpec(BaseModel):
             )
         if len(self.UnderlyingIdentifiers) == 0:
             raise ValueError("UnderlyingIdentifiers must not be empty")
+        if len(set(self.UnderlyingIdentifiers)) != len(self.UnderlyingIdentifiers):
+            raise ValueError("UnderlyingIdentifiers must not contain duplicates")
         if len(self.UnderlyingIdentifiers) != len(self.UnderlyingReferenceSpots):
             raise ValueError(
                 f"UnderlyingIdentifiers length ({len(self.UnderlyingIdentifiers)}) != "
                 f"UnderlyingReferenceSpots length ({len(self.UnderlyingReferenceSpots)})"
             )
-        if any(s <= 0.0 for s in self.UnderlyingReferenceSpots):
-            raise ValueError("UnderlyingReferenceSpots must all be strictly positive")
-        if self.LowerStrike is not None and self.LowerStrike > self.Strike:
-            raise ValueError(f"LowerStrike ({self.LowerStrike}) must be <= Strike ({self.Strike})")
+        if any((not math.isfinite(s)) or s <= 0.0 for s in self.UnderlyingReferenceSpots):
+            raise ValueError("UnderlyingReferenceSpots must all be strictly positive and finite")
+        pair_indices = {"RatioAB", "RatioBA", "DiffAB", "DiffBA", "Outperformance", "Spread"}
+        for idx_val in (
+            self.CallabilityMonitoringIndex,
+            self.CouponBarrierMonitoringIndex,
+            self.OptionMonitoringIndex,
+        ):
+            if idx_val is not None and idx_val.value in pair_indices and len(self.UnderlyingIdentifiers) != 2:
+                raise ValueError(
+                    f"MonitoringIndex {idx_val.value!r} requires exactly 2 underlyings, got {len(self.UnderlyingIdentifiers)}"
+                )
+        if any((not math.isfinite(lvl)) or lvl <= 0.0 for lvl in self.AutoCallTriggerLevels):
+            raise ValueError("AutoCallTriggerLevels must all be strictly positive and finite")
+        if not math.isfinite(self.Strike) or self.Strike < 0.0:
+            raise ValueError(f"Strike must be finite and non-negative, got {self.Strike!r}")
+        if self.LowerStrike is not None:
+            if not math.isfinite(self.LowerStrike) or self.LowerStrike < 0.0:
+                raise ValueError(f"LowerStrike must be finite and non-negative, got {self.LowerStrike!r}")
+            if self.LowerStrike > self.Strike:
+                raise ValueError(f"LowerStrike ({self.LowerStrike}) must be <= Strike ({self.Strike})")
+        if not math.isfinite(self.OptionGearing) or self.OptionGearing < 0.0:
+            raise ValueError(f"OptionGearing must be finite and non-negative, got {self.OptionGearing!r}")
+        for name_opt, val_opt in (
+            ("AutoCallCoupon", self.AutoCallCoupon),
+            ("OneStarStrike", self.OneStarStrike),
+            ("OneStarCoupon", self.OneStarCoupon),
+            ("ParticipationCallStrike", self.ParticipationCallStrike),
+            ("ParticipationCallRate", self.ParticipationCallRate),
+        ):
+            if val_opt is not None and (not math.isfinite(val_opt) or val_opt < 0.0):
+                raise ValueError(f"{name_opt} must be finite and non-negative, got {val_opt!r}")
+        for name_cpn, val_cpn in (
+            ("FixedCouponAmount", self.FixedCouponAmount),
+            ("FixedRate", self.FixedRate),
+        ):
+            if isinstance(val_cpn, list):
+                if len(val_cpn) != m_obs:
+                    raise ValueError(f"{name_cpn} length ({len(val_cpn)}) != ObservationDates length ({m_obs})")
+                if any((not math.isfinite(x)) or x < 0.0 for x in val_cpn):
+                    raise ValueError(f"{name_cpn} elements must be finite and non-negative")
+            elif val_cpn is not None and (not math.isfinite(val_cpn) or val_cpn < 0.0):
+                raise ValueError(f"{name_cpn} must be finite and non-negative, got {val_cpn!r}")
         return self
 
-    def get_coupon_rates(self) -> List[float]:
-        """Returns the per-period coupon vector of length $M$ (broadcasting scalar if needed)."""
+    def get_coupon_rates(self, *, apply_dcc: bool = False) -> List[float]:
+        """Returns the per-period coupon vector of length M (applying DCC when apply_dcc=True and FixedRate is used)."""
         m = len(self.ObservationDates)
         source = self.FixedCouponAmount if self.FixedCouponAmount is not None else self.FixedRate
         if source is None:
@@ -805,8 +895,20 @@ class AutoCallableProductSpec(BaseModel):
         if isinstance(source, list):
             if len(source) != m:
                 raise ValueError(f"Coupon vector length ({len(source)}) != number of periods ({m})")
-            return [float(x) for x in source]
-        return [float(source)] * m
+            rates = [float(x) for x in source]
+        else:
+            rates = [float(source)] * m
+        if apply_dcc and self.FixedRate is not None:
+            from deepvol.market.eq_curves import year_fraction
+
+            dcc = self.DayCountConvention.value
+            prev_dt = self.StartDate
+            scaled: List[float] = []
+            for r_m, pay_dt in zip(rates, self.PaymentDates):
+                scaled.append(r_m * year_fraction(prev_dt, pay_dt, dcc))
+                prev_dt = pay_dt
+            return scaled
+        return rates
 
 
 class CashFlowRow(BaseModel):
@@ -906,6 +1008,13 @@ class EQAutocallableTradeRequest(BaseModel):
 
     @model_validator(mode="after")
     def _collect_nested_stripped_fields(self) -> EQAutocallableTradeRequest:
+        if len(self.Queries) == 0:
+            raise ValueError("Queries must not be empty")
+        if (
+            len(self.Product.UnderlyingIdentifiers) >= 2
+            and len(self.Model.MarketDataSet.Correlations) == 0
+        ):
+            raise ValueError("MarketDataSet.Correlations must not be empty for multi-asset baskets")
         _append_unique(self.stripped_legacy_fields, self.Model.stripped_legacy_fields)
         return self
 
@@ -941,11 +1050,21 @@ class EQAutocallableTradeResponse(BaseModel):
 
 # ── Murex `ConstantMessageMap` DAG Tokenizer & Parser ─────────────────────────
 
+_FAST_TOK_RE = re.compile(
+    r"datetime\.(?:datetime|date)\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)"
+    r"|<skipped>"
+    r"|'[^']*'"
+    r'|"[^"]*"'
+    r"|[\{\}\[\]:]"
+    r"|[^\s,\{\}\[\]:'\"]+"
+    r"|['\"]"
+)
+
 _TOKEN_RE = re.compile(
     r"""
-    (?P<WS>\s+|,+)
+    (?:\s+|,+)
   | (?P<SKIPPED><skipped>)
-  | (?P<DATETIME>datetime\.(?:datetime|date)\([^)]*\))
+  | (?P<DATETIME>datetime\.(?:datetime|date)\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))
   | (?P<LBRACE>\{)
   | (?P<RBRACE>\})
   | (?P<LBRACKET>\[)
@@ -955,65 +1074,176 @@ _TOKEN_RE = re.compile(
   | (?P<DQUOTE>"[^"]*")
   | (?P<REF>[@&!][0-9a-fA-F]{40})
   | (?P<WORD>[^\s,\{\}\[\]:'"]+)
+  | (?P<ERR>.)
     """,
     re.VERBOSE,
 )
 
+_TOK_SKIPPED = 1
+_TOK_DATETIME = 2
+_TOK_LBRACE = 3
+_TOK_RBRACE = 4
+_TOK_LBRACKET = 5
+_TOK_RBRACKET = 6
+_TOK_COLON = 7
+_TOK_SQUOTE = 8
+_TOK_DQUOTE = 9
+_TOK_REF = 10
+_TOK_WORD = 11
+_TOK_ERR = 12
+
+_KIND_TO_NAME: Tuple[str, ...] = (
+    "",
+    "SKIPPED",
+    "DATETIME",
+    "LBRACE",
+    "RBRACE",
+    "LBRACKET",
+    "RBRACKET",
+    "COLON",
+    "SQUOTE",
+    "DQUOTE",
+    "REF",
+    "WORD",
+    "ERR",
+)
+
+_FAST_UTC_DT_RE = re.compile(
+    r"^datetime\.datetime\((\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?,\s*tzinfo=datetime\.timezone\.utc\)$"
+)
 _SHA1_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _REF_STR_RE = re.compile(r"^[@&!]([0-9a-fA-F]{40})$")
 _DT_ARGS_RE = re.compile(r"^datetime\.(datetime|date)\((.*)\)$")
+_TD_ARGS_RE = re.compile(r"(?:datetime\.)?timedelta\((.*)\)$")
+_EXTERNAL_OR_TIER0_ID_KEYS: frozenset[str] = frozenset(
+    {"StaticDataSet", "BaseCurve", "ForwardObject", "FinancingCurve"}
+)
+
+
+def _split_top_level_args(inner: str) -> List[str]:
+    parts: List[str] = []
+    depth = 0
+    start = 0
+    for idx, ch in enumerate(inner):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            seg = inner[start:idx].strip()
+            if seg:
+                parts.append(seg)
+            start = idx + 1
+    tail = inner[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _parse_tzinfo_expr(expr: str) -> datetime.timezone:
+    s = expr.strip()
+    if "utc" in s.lower():
+        return datetime.timezone.utc
+    if s.startswith(("datetime.timezone(", "timezone(")) and s.endswith(")"):
+        inner = s[s.index("(") + 1 : -1].strip()
+        td_match = _TD_ARGS_RE.match(inner)
+        if td_match is not None:
+            td_parts = _split_top_level_args(td_match.group(1))
+            pos_vals: List[float] = []
+            kw_vals: Dict[str, float] = {}
+            for tp in td_parts:
+                if "=" in tp:
+                    tk, tv = [x.strip() for x in tp.split("=", 1)]
+                    kw_vals[tk] = float(tv)
+                else:
+                    pos_vals.append(float(tp))
+            td = datetime.timedelta(*pos_vals, **kw_vals)
+            return datetime.timezone(td)
+    raise ValueError(f"Unsupported tzinfo literal in datetime expression: {expr!r}")
 
 
 def _parse_datetime_literal(text: str) -> datetime.datetime:
     """Safely parses a `datetime.datetime(...)` or `datetime.date(...)` literal without `eval()`."""
+    if text.startswith("datetime.datetime(") and text.endswith(", tzinfo=datetime.timezone.utc)"):
+        nums = text[18:-31].split(",")
+        n_nums = len(nums)
+        if 3 <= n_nums <= 6:
+            try:
+                vals = [int(x) for x in nums]
+                return datetime.datetime(
+                    vals[0],
+                    vals[1],
+                    vals[2],
+                    vals[3] if n_nums > 3 else 0,
+                    vals[4] if n_nums > 4 else 0,
+                    vals[5] if n_nums > 5 else 0,
+                    tzinfo=datetime.timezone.utc,
+                )
+            except ValueError:
+                pass
+    fast_m = _FAST_UTC_DT_RE.match(text)
+    if fast_m is not None:
+        g1, g2, g3, g4, g5, g6 = fast_m.groups()
+        return datetime.datetime(
+            int(g1),
+            int(g2),
+            int(g3),
+            int(g4),
+            int(g5),
+            int(g6) if g6 is not None else 0,
+            tzinfo=datetime.timezone.utc,
+        )
     m = _DT_ARGS_RE.match(text.strip())
     if m is None:
         raise ValueError(f"Malformed datetime literal: {text!r}")
     kind = m.group(1)
     inner = m.group(2)
-    parts = [p.strip() for p in inner.split(",") if p.strip()]
+    parts = _split_top_level_args(inner)
     int_args: List[int] = []
+    kw_int: Dict[str, int] = {}
     tz = datetime.timezone.utc
     for p in parts:
         if "=" in p:
             k, v = [x.strip() for x in p.split("=", 1)]
-            if k == "tzinfo" and "utc" in v.lower():
-                tz = datetime.timezone.utc
+            if k == "tzinfo":
+                tz = _parse_tzinfo_expr(v)
+            elif k in ("year", "month", "day", "hour", "minute", "second", "microsecond"):
+                kw_int[k] = int(v)
         else:
             int_args.append(int(p))
     if kind == "date":
-        return datetime.datetime(int_args[0], int_args[1], int_args[2], 0, 0, tzinfo=tz)
-    while len(int_args) < 6:
+        return datetime.datetime(int_args[0], int_args[1], int_args[2], 0, 0, tzinfo=tz).astimezone(
+            datetime.timezone.utc
+        )
+    while len(int_args) < 7:
         int_args.append(0)
-    return datetime.datetime(
-        int_args[0],
-        int_args[1],
-        int_args[2],
-        int_args[3],
-        int_args[4],
-        int_args[5],
+    dt = datetime.datetime(
+        kw_int.get("year", int_args[0]),
+        kw_int.get("month", int_args[1]),
+        kw_int.get("day", int_args[2]),
+        kw_int.get("hour", int_args[3]),
+        kw_int.get("minute", int_args[4]),
+        kw_int.get("second", int_args[5]),
+        kw_int.get("microsecond", int_args[6]),
         tzinfo=tz,
     )
+    return dt.astimezone(datetime.timezone.utc)
 
 
 class _DAGTokenStream:
     """Lexer stream over Murex `ConstantMessageMap` text dumps."""
 
     def __init__(self, text: str) -> None:
-        self.tokens: List[Tuple[str, str]] = []
-        pos = 0
-        n = len(text)
-        while pos < n:
-            m = _TOKEN_RE.match(text, pos)
-            if m is None:
-                raise ValueError(
-                    f"Unexpected character in DAG input at position {pos}: {text[pos:pos+32]!r}"
-                )
-            pos = m.end()
-            kind = m.lastgroup
-            if kind is None or kind == "WS":
-                continue
-            self.tokens.append((kind, m.group(kind)))
+        raw_tokens: List[Tuple[int, str]] = [
+            (m.lastindex, m.group())
+            for m in _TOKEN_RE.finditer(text)
+            if m.lastindex is not None
+        ]
+        for k_id, val in raw_tokens:
+            if k_id == _TOK_ERR:
+                raise ValueError(f"Unexpected character in DAG input: {val!r}")
+        self._raw_tokens = raw_tokens
+        self.tokens: List[Tuple[str, str]] = [(_KIND_TO_NAME[k_id], val) for k_id, val in raw_tokens]
         self.idx = 0
 
     def peek(self, offset: int = 0) -> Optional[Tuple[str, str]]:
@@ -1036,70 +1266,255 @@ class _DAGTokenStream:
         return val
 
 
-def _parse_dag_value(stream: _DAGTokenStream) -> Any:
-    kind, val = stream.next()
-    if kind == "LBRACE":
-        obj: Dict[str, Any] = {}
-        while True:
-            pk = stream.peek()
-            if pk is None:
-                raise ValueError("Unclosed '{' in Murex DAG")
-            if pk[0] == "RBRACE":
-                stream.next()
-                return obj
-            k_kind, k_val = stream.next()
-            if k_kind in ("SQUOTE", "DQUOTE"):
-                key_str = k_val[1:-1]
-            elif k_kind == "WORD":
-                key_str = k_val
-            else:
-                raise ValueError(f"Invalid map key token ({k_kind}, {k_val!r})")
-            stream.expect("COLON")
-            obj[key_str] = _parse_dag_value(stream)
-    if kind == "LBRACKET":
-        arr: List[Any] = []
-        while True:
-            pk = stream.peek()
-            if pk is None:
-                raise ValueError("Unclosed '[' in Murex DAG")
-            if pk[0] == "RBRACKET":
-                stream.next()
-                return arr
-            arr.append(_parse_dag_value(stream))
-    if kind == "SKIPPED":
-        return None
-    if kind == "DATETIME":
-        return _parse_datetime_literal(val)
-    if kind in ("SQUOTE", "DQUOTE"):
+def _tokenize_dag_fast(text: str) -> List[Tuple[int, str]]:
+    tokens: List[Tuple[int, str]] = [
+        (m.lastindex, m.group())
+        for m in _TOKEN_RE.finditer(text)
+        if m.lastindex is not None
+    ]
+    for k_id, val in tokens:
+        if k_id == _TOK_ERR:
+            raise ValueError(f"Unexpected character in DAG input: {val!r}")
+    return tokens
+
+
+_NUM_START = frozenset("0123456789-+")
+
+
+def _parse_scalar_token(val: str) -> Any:
+    ch = val[0]
+    if ch == "'" or ch == '"':
+        if len(val) < 2 or val[-1] != ch:
+            raise ValueError(f"Unclosed string literal {val!r}")
         return val[1:-1]
-    if kind == "REF":
-        return val
-    if kind == "WORD":
-        if val in ("True", "true"):
-            return True
-        if val in ("False", "false"):
-            return False
-        if val in ("None", "null"):
-            return None
+    if ch in _NUM_START:
+        if len(val) == 40 and _SHA1_RE.fullmatch(val) is not None:
+            return val
         try:
-            if "." not in val and "e" not in val.lower():
+            if "." not in val and "e" not in val and "E" not in val:
                 return int(val)
             return float(val)
         except ValueError:
             return val
-    raise ValueError(f"Unexpected token ({kind}, {val!r}) while parsing value")
+    if val == "<skipped>":
+        return None
+    if ch == "d" and (val.startswith("datetime.datetime(") or val.startswith("datetime.date(")):
+        return _parse_datetime_literal(val)
+    if (ch == "@" or ch == "&" or ch == "!") and len(val) == 41 and _SHA1_RE.fullmatch(val[1:]) is not None:
+        return val
+    if val in ("}", "]", ":"):
+        raise ValueError(f"Unexpected delimiter {val!r} while parsing value")
+    if val == "True" or val == "true":
+        return True
+    if val == "False" or val == "false":
+        return False
+    if val == "None" or val == "null":
+        return None
+    if len(val) == 40 and _SHA1_RE.fullmatch(val) is not None:
+        return val
+    return val
+
+
+def _parse_str_dag_at(tokens: List[str], idx: int, n_toks: int) -> Tuple[Any, int]:
+    """Iterative Murex DAG block parser avoiding per-scalar Python call overhead."""
+    if idx >= n_toks:
+        raise ValueError("Unexpected end of token stream while parsing Murex DAG")
+
+    # Fast local aliases
+    num_start = _NUM_START
+    sha1_full = _SHA1_RE.fullmatch
+    dt_cls = datetime.datetime
+    utc_tz = datetime.timezone.utc
+
+    stack: List[Any] = []
+    # Stack entries are either (dict_obj, pending_key_or_None) or list_obj
+    root_assigned = False
+    root_val: Any = None
+
+    while idx < n_toks:
+        val = tokens[idx]
+        idx += 1
+        ch = val[0]
+
+        if ch == "}":
+            if not stack or type(stack[-1]) is not tuple:
+                raise ValueError("Unexpected '}' in Murex DAG")
+            completed_dict, pending_k = stack.pop()
+            if pending_k is not None:
+                raise ValueError(f"Missing value for key {pending_k!r} before '}}'")
+            parsed = completed_dict
+        elif ch == "]":
+            if not stack or type(stack[-1]) is not list:
+                raise ValueError("Unexpected ']' in Murex DAG")
+            parsed = stack.pop()
+        elif ch == "{":
+            stack.append(({}, None))
+            continue
+        elif ch == "[":
+            stack.append([])
+            continue
+        elif stack and type(stack[-1]) is tuple and stack[-1][1] is None:
+            # Expect map key followed by ':'
+            if ch == "'" or ch == '"':
+                if len(val) < 2 or val[-1] != ch:
+                    raise ValueError(f"Unclosed string key token {val!r}")
+                key_str = val[1:-1]
+            elif val == ":":
+                raise ValueError("Unexpected ':' as map key")
+            else:
+                key_str = val
+            if idx >= n_toks or tokens[idx] != ":":
+                raise ValueError("Expected token COLON after map key")
+            idx += 1
+            stack[-1] = (stack[-1][0], key_str)
+            continue
+        else:
+            # Scalar token
+            if ch in num_start:
+                if len(val) == 40 and sha1_full(val) is not None:
+                    parsed = val
+                elif "." in val or "e" in val or "E" in val:
+                    try:
+                        parsed = float(val)
+                    except ValueError:
+                        parsed = val
+                else:
+                    try:
+                        parsed = int(val)
+                    except ValueError:
+                        parsed = val
+            elif ch == "'" or ch == '"':
+                if len(val) < 2 or val[-1] != ch:
+                    raise ValueError(f"Unclosed string literal {val!r}")
+                parsed = val[1:-1]
+            elif ch == "d" and (
+                val.startswith("datetime.datetime(") or val.startswith("datetime.date(")
+            ):
+                if val.startswith("datetime.datetime(") and val.endswith(", tzinfo=datetime.timezone.utc)"):
+                    nums = val[18:-31].split(",")
+                    n_nums = len(nums)
+                    if n_nums == 5:
+                        parsed = dt_cls(
+                            int(nums[0]), int(nums[1]), int(nums[2]),
+                            int(nums[3]), int(nums[4]), tzinfo=utc_tz,
+                        )
+                    elif n_nums == 6:
+                        parsed = dt_cls(
+                            int(nums[0]), int(nums[1]), int(nums[2]),
+                            int(nums[3]), int(nums[4]), int(nums[5]), tzinfo=utc_tz,
+                        )
+                    else:
+                        parsed = _parse_datetime_literal(val)
+                else:
+                    parsed = _parse_datetime_literal(val)
+            elif val == "<skipped>":
+                parsed = None
+            elif (ch == "@" or ch == "&" or ch == "!") and len(val) == 41 and sha1_full(val[1:]) is not None:
+                parsed = val
+            elif val == ":":
+                raise ValueError("Unexpected ':' while parsing value")
+            elif val == "True" or val == "true":
+                parsed = True
+            elif val == "False" or val == "false":
+                parsed = False
+            elif val == "None" or val == "null":
+                parsed = None
+            elif len(val) == 40 and sha1_full(val) is not None:
+                parsed = val
+            else:
+                parsed = val
+
+        if not stack:
+            root_val = parsed
+            root_assigned = True
+            break
+        top = stack[-1]
+        if type(top) is list:
+            top.append(parsed)
+        else:
+            d_obj, p_key = top
+            d_obj[p_key] = parsed
+            stack[-1] = (d_obj, None)
+
+    if not root_assigned:
+        raise ValueError("Unclosed '{' or '[' in Murex DAG")
+    return root_val, idx
+
+
+def _parse_dag_at(tokens: List[Tuple[int, str]], idx: int, n_toks: int) -> Tuple[Any, int]:
+    if idx >= n_toks:
+        raise ValueError("Unexpected end of token stream while parsing Murex DAG")
+    kind, val = tokens[idx]
+    idx += 1
+    if kind == _TOK_LBRACE:
+        obj: Dict[str, Any] = {}
+        while idx < n_toks:
+            k_kind, k_val = tokens[idx]
+            if k_kind == _TOK_RBRACE:
+                return obj, idx + 1
+            if k_kind == _TOK_SQUOTE or k_kind == _TOK_DQUOTE:
+                key_str = k_val[1:-1]
+            elif k_kind == _TOK_WORD:
+                key_str = k_val
+            else:
+                raise ValueError(f"Invalid map key token ({_KIND_TO_NAME[k_kind]}, {k_val!r})")
+            idx += 1
+            if idx >= n_toks or tokens[idx][0] != _TOK_COLON:
+                raise ValueError("Expected token COLON after map key")
+            idx += 1
+            parsed_val, idx = _parse_dag_at(tokens, idx, n_toks)
+            obj[key_str] = parsed_val
+        raise ValueError("Unclosed '{' in Murex DAG")
+    if kind == _TOK_LBRACKET:
+        arr: List[Any] = []
+        while idx < n_toks:
+            if tokens[idx][0] == _TOK_RBRACKET:
+                return arr, idx + 1
+            item_val, idx = _parse_dag_at(tokens, idx, n_toks)
+            arr.append(item_val)
+        raise ValueError("Unclosed '[' in Murex DAG")
+    if kind == _TOK_SKIPPED:
+        return None, idx
+    if kind == _TOK_DATETIME:
+        return _parse_datetime_literal(val), idx
+    if kind == _TOK_SQUOTE or kind == _TOK_DQUOTE:
+        return val[1:-1], idx
+    if kind == _TOK_REF:
+        return val, idx
+    if kind == _TOK_WORD:
+        if val == "True" or val == "true":
+            return True, idx
+        if val == "False" or val == "false":
+            return False, idx
+        if val == "None" or val == "null":
+            return None, idx
+        if len(val) == 40 and _SHA1_RE.fullmatch(val) is not None:
+            return val, idx
+        try:
+            if "." not in val and "e" not in val and "E" not in val:
+                return int(val), idx
+            return float(val), idx
+        except ValueError:
+            return val, idx
+    raise ValueError(f"Unexpected token ({_KIND_TO_NAME[kind]}, {val!r}) while parsing value")
+
+
+def _parse_dag_value(stream: _DAGTokenStream) -> Any:
+    val, new_idx = _parse_dag_at(stream._raw_tokens, stream.idx, len(stream._raw_tokens))
+    stream.idx = new_idx
+    return val
 
 
 def _extract_reference_hash(val: Any, nodes: Mapping[str, Any]) -> Optional[str]:
-    if not isinstance(val, str):
+    if type(val) is not str and not isinstance(val, str):
         return None
-    m = _REF_STR_RE.match(val.strip())
-    if m is not None:
-        h = m.group(1).lower()
-        return h
-    s = val.strip().lower()
-    if _SHA1_RE.match(s) and s in nodes:
-        return s
+    s = val.strip()
+    if len(s) == 41 and s[0] in ("@", "&", "!") and _SHA1_RE.fullmatch(s[1:]) is not None:
+        return s[1:].lower()
+    if len(s) == 40 and _SHA1_RE.fullmatch(s) is not None:
+        s_low = s.lower()
+        if s_low in nodes:
+            return s_low
     return None
 
 
@@ -1107,21 +1522,55 @@ def _resolve_dag_node(
     obj: Any,
     nodes: Mapping[str, Dict[str, Any]],
     visiting: set[str],
+    memo: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    ref_hash = _extract_reference_hash(obj, nodes)
-    if ref_hash is not None:
-        if ref_hash in visiting:
-            raise ValueError(f"Circular dependency cycle detected in Murex DAG at {ref_hash}")
-        if ref_hash not in nodes:
-            raise KeyError(f"Dangling Murex DAG reference to missing hash {ref_hash!r}")
-        visiting.add(ref_hash)
-        resolved = _resolve_dag_node(nodes[ref_hash], nodes, visiting)
-        visiting.remove(ref_hash)
-        return resolved
+    if memo is None:
+        memo = {}
+    obj_type = type(obj)
+    if obj_type is float or obj_type is int or obj_type is bool or obj is None:
+        return obj
+    if obj_type is dict:
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            if k in _EXTERNAL_OR_TIER0_ID_KEYS:
+                ext_ref = _extract_reference_hash(v, nodes)
+                if ext_ref is not None and ext_ref not in nodes:
+                    out[k] = v
+                    continue
+            out[k] = _resolve_dag_node(v, nodes, visiting, memo)
+        return out
+    if obj_type is list:
+        return [
+            item
+            if (type(item) is float or type(item) is int or type(item) is bool or item is None)
+            else _resolve_dag_node(item, nodes, visiting, memo)
+            for item in obj
+        ]
+    if obj_type is str:
+        ref_hash = _extract_reference_hash(obj, nodes)
+        if ref_hash is not None:
+            if ref_hash in visiting:
+                raise ValueError(f"Circular dependency cycle detected in Murex DAG at {ref_hash}")
+            if ref_hash in memo:
+                return memo[ref_hash]
+            if ref_hash not in nodes:
+                raise KeyError(f"Dangling Murex DAG reference to missing hash {ref_hash!r}")
+            visiting.add(ref_hash)
+            resolved = _resolve_dag_node(nodes[ref_hash], nodes, visiting, memo)
+            visiting.remove(ref_hash)
+            memo[ref_hash] = resolved
+            return resolved
+        return obj
     if isinstance(obj, Mapping):
-        return {k: _resolve_dag_node(v, nodes, visiting) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_resolve_dag_node(item, nodes, visiting) for item in obj]
+        out_m: Dict[str, Any] = {}
+        for k, v in obj.items():
+            if k in _EXTERNAL_OR_TIER0_ID_KEYS:
+                ext_ref = _extract_reference_hash(v, nodes)
+                if ext_ref is not None and ext_ref not in nodes:
+                    out_m[k] = v
+                    continue
+            out_m[k] = _resolve_dag_node(v, nodes, visiting, memo)
+        return out_m
     return obj
 
 
@@ -1209,49 +1658,50 @@ def parse_murex_autocall_dag(
             f"Unsupported input type for parse_murex_autocall_dag: {type(raw_text_or_dict).__name__}"
         )
 
-    stream = _DAGTokenStream(text)
+    tokens = _FAST_TOK_RE.findall(text)
+    n_toks = len(tokens)
+    idx = 0
     nodes: Dict[str, Dict[str, Any]] = {}
     result_dict: Dict[str, Any] = {}
     anonymous_dicts: List[Dict[str, Any]] = []
     root_hash: Optional[str] = None
 
-    while stream.peek() is not None:
-        pk0 = stream.peek(0)
-        assert pk0 is not None
-        kind, val = pk0
+    while idx < n_toks:
+        val = tokens[idx]
+        ch = val[0]
 
-        if kind == "LBRACE":
-            parsed_map = cast(Dict[str, Any], _parse_dag_value(stream))
+        if ch == "{":
+            parsed_map, idx = _parse_str_dag_at(tokens, idx, n_toks)
             if "ProductValue" in parsed_map or "CashFlows" in parsed_map:
                 result_dict = parsed_map
             else:
                 anonymous_dicts.append(parsed_map)
-        elif kind == "REF":
-            stream.next()
+        elif ch in ("@", "&", "!") and len(val) == 41 and _SHA1_RE.fullmatch(val[1:]) is not None:
+            idx += 1
             root_hash = val[1:].lower()
-        elif kind == "WORD" and val == "Result" and stream.peek(1) is not None and stream.peek(1)[0] == "COLON":  # type: ignore[index]
-            stream.next()  # Result
-            stream.next()  # :
-            res_val = _parse_dag_value(stream)
+        elif val == "Result" and idx + 1 < n_toks and tokens[idx + 1] == ":":
+            idx += 2
+            res_val, idx = _parse_str_dag_at(tokens, idx, n_toks)
             if isinstance(res_val, Mapping):
                 result_dict = dict(res_val)
-        elif kind == "WORD" and _SHA1_RE.match(val):
+        elif len(val) == 40 and _SHA1_RE.fullmatch(val) is not None:
             node_hash = val.lower()
-            stream.next()
-            # Optional `class : ConstantMessageMap` or `:` header
-            pk_next = stream.peek(0)
-            if pk_next is not None and pk_next[0] == "WORD" and pk_next[1] == "class":
-                stream.next()  # class
-                stream.expect("COLON")
-                stream.next()  # ConstantMessageMap
-            elif pk_next is not None and pk_next[0] == "COLON":
-                stream.next()
-            node_body = _parse_dag_value(stream)
+            idx += 1
+            if idx < n_toks:
+                nv = tokens[idx]
+                if nv == "class":
+                    idx += 1
+                    if idx >= n_toks or tokens[idx] != ":":
+                        raise ValueError("Expected COLON after 'class' in Murex DAG header")
+                    idx += 2
+                elif nv == ":":
+                    idx += 1
+            node_body, idx = _parse_str_dag_at(tokens, idx, n_toks)
             if not isinstance(node_body, Mapping):
                 raise ValueError(f"Expected map body for DAG node {node_hash}")
             nodes[node_hash] = dict(node_body)
         else:
-            raise ValueError(f"Unexpected top-level token in Murex DAG: ({kind}, {val!r})")
+            raise ValueError(f"Unexpected top-level token in Murex DAG: {val!r}")
 
     if root_hash is None:
         for h, body in nodes.items():
