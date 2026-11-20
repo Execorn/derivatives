@@ -153,20 +153,20 @@ def fast_stulz_margrabe_cpu(
 
 def _truncated_upper_std_moments_torch(alpha: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Exact C^inf posterior (mu_u, var_u) of U ~ N(0,1) | U <= alpha via erfcx IMR + CF."""
-    use_cf = alpha <= -6.0
+    use_cf = alpha <= -4.0
     use_zero = alpha >= 26.0
     # CF branch (safe clamp keeps inactive branch finite)
-    x_cf = -torch.where(use_cf, alpha, torch.full_like(alpha, -6.0))
+    x_cf = -torch.where(use_cf, alpha, torch.full_like(alpha, -4.0))
     v = torch.zeros_like(x_cf)
-    for k in range(36, 2, -1):
+    for k in range(80, 2, -1):
         v = float(k) / (x_cf + v)
     r2_cf = 2.0 / (x_cf + v)
     psi_cf = 1.0 / (x_cf + r2_cf)
     mu_cf = -x_cf - psi_cf
     var_cf = (psi_cf * (r2_cf - psi_cf)).clamp(min=1e-12)
 
-    # erfcx IMR branch for -6.0 < alpha < 26.0
-    a_mid = alpha.clamp(min=-6.0, max=25.999)
+    # erfcx IMR branch for -4.0 < alpha < 26.0
+    a_mid = alpha.clamp(min=-4.0, max=25.999)
     lam_mid = _SQRT_TWO_OVER_PI / torch.special.erfcx(-a_mid * _INV_SQRT2)
     mu_mid = -lam_mid
     var_mid = (1.0 - a_mid * lam_mid - lam_mid * lam_mid).clamp(min=1e-12)
@@ -1686,17 +1686,22 @@ def _compute_cross_index_corr_torch(
     code_b: int,
     w_b: torch.Tensor,
 ) -> torch.Tensor:
-    """Cross-index correlation for 1D (D,) or 2D (B, D) inputs."""
+    """Cross-index correlation for 1D (D,), 2D (B, D), or 3D (B, M, D) inputs."""
     if code_a == code_b:
         return torch.ones(f_in.shape[:-1], dtype=torch.float64, device=f_in.device)
     if (code_a == 0 and code_b == 1) or (code_a == 1 and code_b == 0):
         if f_in.ndim == 1:
             return _clark_corr_min_max_torch(f_in, v_in, corr)
-        b_sz = f_in.shape[0]
-        return torch.stack(
-            [_clark_corr_min_max_torch(f_in[b], v_in[b], corr if corr.ndim == 2 else corr[b]) for b in range(b_sz)],
+        lead_shape = f_in.shape[:-1]
+        d_assets = int(f_in.shape[-1])
+        f_flat = f_in.reshape(-1, d_assets)
+        v_flat = v_in.reshape(-1, d_assets)
+        c_bc = corr.expand(*lead_shape, d_assets, d_assets).reshape(-1, d_assets, d_assets)
+        vals = torch.stack(
+            [_clark_corr_min_max_torch(f_flat[k], v_flat[k], c_bc[k]) for k in range(int(f_flat.shape[0]))],
             dim=0,
         )
+        return vals.view(lead_shape)
     da_diff = 9 <= code_a <= 13
     db_diff = 9 <= code_b <= 13
     wa = w_a * f_in if da_diff else w_a

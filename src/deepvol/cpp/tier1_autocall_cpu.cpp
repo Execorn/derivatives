@@ -96,12 +96,12 @@ inline double cody_erfcx(double x) noexcept {
     return result;
 }
 
-// Continued fraction tail avoids catastrophic subtraction (alpha + lambda(alpha)) for alpha <= -6.
+// Continued fraction tail avoids catastrophic subtraction (alpha + lambda(alpha)) for alpha <= -4.
 inline void truncated_upper_std_moments(double alpha, double& mu_out, double& var_out) noexcept {
-    if (alpha <= -6.0) {
+    if (alpha <= -4.0) {
         const double x = -alpha;
         double v = 0.0;
-        for (int k = 36; k >= 3; --k) {
+        for (int k = 80; k >= 3; --k) {
             v = static_cast<double>(k) / (x + v);
         }
         const double r2 = 2.0 / (x + v);

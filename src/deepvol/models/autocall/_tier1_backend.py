@@ -282,10 +282,10 @@ def _cody_erfcx(x: float) -> float:
 
 
 def _truncated_upper_std_moments(alpha: float) -> Tuple[float, float]:
-    if alpha <= -6.0:
+    if alpha <= -4.0:
         x = -alpha
         v = 0.0
-        for k in range(36, 2, -1):
+        for k in range(80, 2, -1):
             v = float(k) / (x + v)
         r2 = 2.0 / (x + v)
         psi = 1.0 / (x + r2)
