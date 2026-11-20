@@ -11,11 +11,16 @@ Architecture:
   - Tier 3: Operational Fallback Routing & SR 26-2 Audit Logger
 """
 
-import time
-import json
+from __future__ import annotations
+
+from collections import deque
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Union
+import threading
+import time
+from typing import Any, Deque, Dict, List, Optional
+
 import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn as nn
 
@@ -41,8 +46,10 @@ class AutocallModelGuardian:
         psi_alert_threshold: float = 0.25,
         tau_ood: float = 2.0,
         device: str = "cpu",
+        psi_window_size: int = 200,
+        psi_min_samples: int = 20,
     ) -> None:
-        self.model = model
+        self.model: Any = model
         self.norm_in = norm_in
         self.norm_out = norm_out
         self.feller_threshold = feller_threshold
@@ -52,20 +59,23 @@ class AutocallModelGuardian:
         self.psi_alert_threshold = psi_alert_threshold
         self.tau_ood = tau_ood
         self.device = torch.device(device)
+        self.psi_window_size = max(int(psi_window_size), 1)
+        self.psi_min_samples = max(int(psi_min_samples), 2)
 
         # Baseline reference distribution for Population Stability Index (PSI)
-        self.reference_distribution: Optional[np.ndarray] = None
-        self.audit_log: List[Dict[str, Any]] = []
+        self.reference_distribution: Optional[npt.NDArray[Any]] = None
+        self.feature_history: Deque[npt.NDArray[Any]] = deque(maxlen=self.psi_window_size)
+        self.audit_log: Deque[Dict[str, Any]] = deque(maxlen=10_000)
+        self._lock = threading.RLock()
 
-    def set_reference_distribution(self, X_train: np.ndarray) -> None:
+    def set_reference_distribution(self, X_train: npt.NDArray[Any]) -> None:
         """Store reference training feature distribution and precompute per-dimension quantile bins for PSI."""
         X = np.asarray(X_train, dtype=np.float32)
         if X.ndim == 1:
             X = X.reshape(-1, 1)
-        self.reference_distribution = X.copy()
         N, D = X.shape
-        self.psi_bin_edges = np.zeros((D, 11), dtype=np.float32)
-        self.psi_ref_pcts = np.zeros((D, 10), dtype=np.float32)
+        bin_edges = np.zeros((D, 11), dtype=np.float32)
+        ref_pcts = np.zeros((D, 10), dtype=np.float32)
         percentiles = np.linspace(0, 100, 11)
         for d in range(D):
             edges = np.percentile(X[:, d], percentiles)
@@ -73,9 +83,13 @@ class AutocallModelGuardian:
             edges[-1] += 1e-5
             if len(np.unique(edges)) < len(edges):
                 edges = np.linspace(edges[0], edges[-1], 11)
-            self.psi_bin_edges[d] = edges
+            bin_edges[d] = edges
             counts, _ = np.histogram(X[:, d], bins=edges)
-            self.psi_ref_pcts[d] = (counts + 1e-4) / (N + 10 * 1e-4)
+            ref_pcts[d] = (counts + 1e-4) / (N + 10 * 1e-4)
+        with self._lock:
+            self.reference_distribution = X.copy()
+            self.psi_bin_edges = bin_edges
+            self.psi_ref_pcts = ref_pcts
 
     def check_input_ood(self, raw_params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -203,31 +217,42 @@ class AutocallModelGuardian:
             "df_dB": df_dB,
         }
 
-    def compute_psi(self, current_batch: np.ndarray) -> float:
+    def compute_psi(self, current_batch: npt.NDArray[Any]) -> float:
         """
         Computes Population Stability Index (PSI) per Federal Reserve SR 26-2.
         Evaluates PSI independently for each feature dimension and returns maximum drift.
-        PSI < 0.10: Insignificant drift (Model stable).
-        0.10 <= PSI < 0.25: Moderate drift (Monitor closely).
-        PSI >= 0.25: Significant drift (Mandates model recalibration / fallback).
+        For single-sample inputs (N == 1), accumulates into a bounded rolling window until
+        `psi_min_samples` are observed so single observations do not trigger spurious spikes.
         """
-        if getattr(self, "psi_bin_edges", None) is None:
-            if self.reference_distribution is None:
-                return 0.0
-            self.set_reference_distribution(self.reference_distribution)
+        with self._lock:
+            if getattr(self, "psi_bin_edges", None) is None:
+                if self.reference_distribution is None:
+                    return 0.0
+                self.set_reference_distribution(self.reference_distribution)
 
-        curr = np.asarray(current_batch, dtype=np.float32)
-        if curr.ndim == 1:
-            curr = curr.reshape(1, -1)
+            curr = np.asarray(current_batch, dtype=np.float32)
+            if curr.ndim == 1:
+                curr = curr.reshape(1, -1)
+            if curr.shape[0] == 0:
+                return 0.0
+            if curr.shape[0] == 1:
+                self.feature_history.append(curr[0].copy())
+                if len(self.feature_history) < self.psi_min_samples:
+                    return 0.0
+                curr = np.stack(list(self.feature_history), axis=0)
+
+            bin_edges = self.psi_bin_edges.copy()
+            ref_pcts = self.psi_ref_pcts.copy()
+
         N, D = curr.shape
-        D_ref = self.psi_bin_edges.shape[0]
+        D_ref = bin_edges.shape[0]
         D_eval = min(D, D_ref)
 
         psi_per_dim = np.zeros(D_eval, dtype=np.float32)
         for d in range(D_eval):
-            counts, _ = np.histogram(curr[:, d], bins=self.psi_bin_edges[d])
+            counts, _ = np.histogram(curr[:, d], bins=bin_edges[d])
             curr_pct = (counts + 1e-4) / (N + 10 * 1e-4)
-            psi_per_dim[d] = np.sum((curr_pct - self.psi_ref_pcts[d]) * np.log(curr_pct / self.psi_ref_pcts[d]))
+            psi_per_dim[d] = np.sum((curr_pct - ref_pcts[d]) * np.log(curr_pct / ref_pcts[d]))
         return float(np.max(psi_per_dim))
 
     def predict_with_guardian(
@@ -364,7 +389,7 @@ class AutocallModelGuardian:
             coupon_val = float(raw_params.get("coupon", 0.08))
             n_obs = max(1, int(round(float(raw_params.get("n_obs_per_year", 4)) * T_val)))
 
-            def effective_sigma_func(t: float, s: np.ndarray) -> np.ndarray:
+            def effective_sigma_func(t: float, s: npt.NDArray[Any]) -> npt.NDArray[Any]:
                 t_pos = max(float(t), 1e-10)
                 kt = kappa_val * t_pos
                 if abs(kt) < 1e-4:
@@ -405,7 +430,8 @@ class AutocallModelGuardian:
             "fallback_latency_ms": fb_latency_ms,
             "total_latency_ms": total_latency_ms,
         }
-        self.audit_log.append(audit_entry)
+        with self._lock:
+            self.audit_log.append(audit_entry)
 
         return {
             "npv": fallback_npv,
