@@ -40,7 +40,27 @@ _INV_SQRT2PI: float = 0.39894228040143267793994605993438
 _SQRT_HALF_PI: float = 1.2533141373155002512078826424055
 _SQRT_TWO_OVER_PI: float = 0.79788456080286535587989211986876
 _TIE_TAU: float = 0.008
-_VOL_TIE_TAU: float = 0.004
+
+_BALANCED_TREES_D4: Tuple[Tuple[int, int, int, int], ...] = (
+    (0, 1, 2, 3),
+    (2, 3, 0, 1),
+    (0, 2, 1, 3),
+    (1, 3, 0, 2),
+    (0, 3, 1, 2),
+    (1, 2, 0, 3),
+)
+
+
+def _build_balanced_trees_d5() -> Tuple[Tuple[int, int, int, int, int], ...]:
+    trees: List[Tuple[int, int, int, int, int]] = []
+    for e in range(5):
+        r = [x for x in range(5) if x != e]
+        for a, b, c, d in _BALANCED_TREES_D4:
+            trees.append((r[a], r[b], r[c], r[d], e))
+    return tuple(trees)
+
+
+_BALANCED_TREES_D5: Tuple[Tuple[int, int, int, int, int], ...] = _build_balanced_trees_d5()
 
 
 def _ndtr_scalar(x: float) -> float:
@@ -412,14 +432,75 @@ def _clark_symmetrized_torch(
     if w_tie_max < 1e-12:
         return _eval_masked_clark_order(ord_f)
 
-    def _symmetrized_vol_clark_batch(
+    def _clark_pair_merge(
+        f1: torch.Tensor,
+        v1: torch.Tensor,
+        f2: torch.Tensor,
+        v2: torch.Tensor,
+        rho_12: torch.Tensor,
+        v_rem: Optional[torch.Tensor],
+        rho_1_rem: Optional[torch.Tensor],
+        rho_2_rem: Optional[torch.Tensor],
+        best_of: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        rho_c = rho_12.clamp(-0.999999, 0.999999)
+        var_m = (v1 * v1 + v2 * v2 - 2.0 * rho_c * v1 * v2).clamp(min=1e-16)
+        sig_m = torch.sqrt(var_m)
+        log_f_ratio = torch.log(f1 / f2)
+        d1 = (log_f_ratio + 0.5 * var_m) / sig_m
+        d2 = d1 - sig_m
+        if best_of:
+            w1 = torch.special.ndtr(d1)
+            w2 = torch.special.ndtr(-d2)
+        else:
+            w1 = torch.special.ndtr(-d1)
+            w2 = torch.special.ndtr(d2)
+        e_m1 = (f1 * w1 + f2 * w2).clamp(min=1e-16)
+
+        f1_sq = (f1 * f1) * torch.exp(v1 * v1)
+        f2_sq = (f2 * f2) * torch.exp(v2 * v2)
+        sig_m2 = 2.0 * sig_m
+        var_m2 = sig_m2 * sig_m2
+        d1_sq = (torch.log(f1_sq.clamp(min=1e-30) / f2_sq.clamp(min=1e-30)) + 0.5 * var_m2) / sig_m2
+        d2_sq = d1_sq - sig_m2
+        if best_of:
+            e_m2 = f1_sq * torch.special.ndtr(d1_sq) + f2_sq * torch.special.ndtr(-d2_sq)
+        else:
+            e_m2 = f1_sq * torch.special.ndtr(-d1_sq) + f2_sq * torch.special.ndtr(d2_sq)
+
+        v_new = torch.sqrt(
+            torch.clamp(torch.log(torch.clamp(e_m2 / (e_m1 * e_m1).clamp(min=1e-30), min=1.0)), min=1e-16)
+        )
+
+        rho_m_rem: Optional[torch.Tensor] = None
+        if v_rem is not None and rho_1_rem is not None and rho_2_rem is not None:
+            exp_arg_1 = rho_1_rem * v1.unsqueeze(1) * v_rem
+            exp_arg_2 = rho_2_rem * v2.unsqueeze(1) * v_rem
+            f1_k = f1.unsqueeze(1) * torch.exp(exp_arg_1)
+            f2_k = f2.unsqueeze(1) * torch.exp(exp_arg_2)
+            var_m_col = var_m.unsqueeze(1)
+            sig_m_col = sig_m.unsqueeze(1)
+            d1_k = (log_f_ratio.unsqueeze(1) + (exp_arg_1 - exp_arg_2) + 0.5 * var_m_col) / sig_m_col
+            d2_k = d1_k - sig_m_col
+            if best_of:
+                e_m_pk = f1_k * torch.special.ndtr(d1_k) + f2_k * torch.special.ndtr(-d2_k)
+            else:
+                e_m_pk = f1_k * torch.special.ndtr(-d1_k) + f2_k * torch.special.ndtr(d2_k)
+            cov_log = torch.log(torch.clamp(e_m_pk / e_m1.unsqueeze(1), min=1e-16))
+            rho_m_rem = torch.clamp(
+                cov_log / (v_new.unsqueeze(1) * v_rem).clamp(min=1e-16),
+                -0.999999,
+                0.999999,
+            )
+        return e_m1, v_new, w1, w2, rho_m_rem
+
+    def _symmetrized_balanced_clark_batch(
         f_b: torch.Tensor,
         v_b: torch.Tensor,
         c_b: torch.Tensor,
-        ord_v_b: torch.Tensor,
         best_of: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pure-PyTorch C^inf vol-tie-blended Clark moments (f_sym, m2_sym, w_sym)."""
+        """S_D-symmetric, C^inf balanced Clark tree reduction without argsort(v)."""
         b_sub, d_sub = f_b.shape
         if d_sub == 0:
             z1 = torch.zeros(b_sub, dtype=torch.float64, device=device)
@@ -428,95 +509,125 @@ def _clark_symmetrized_torch(
             f1 = f_b[:, 0]
             v1 = v_b[:, 0]
             return f1, f1 * f1 * torch.exp(v1 * v1), torch.ones((b_sub, 1), dtype=torch.float64, device=device)
-
-        def _avg_rev_pair(perm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            f1, v1, w1 = _clark_one_order_torch(f_b, v_b, c_b, perm, best_of)
-            f2, v2, w2 = _clark_one_order_torch(f_b, v_b, c_b, torch.flip(perm, dims=[1]), best_of)
-            return (
-                0.5 * (f1 + f2),
-                0.5 * (f1 * f1 * torch.exp(v1 * v1) + f2 * f2 * torch.exp(v2 * v2)),
-                0.5 * (w1 + w2),
-            )
-
         if d_sub == 2:
-            return _avg_rev_pair(ord_v_b)
+            f_m, v_m, w1, w2, _ = _clark_pair_merge(
+                f_b[:, 0], v_b[:, 0], f_b[:, 1], v_b[:, 1], c_b[:, 0, 1], None, None, None, best_of
+            )
+            return f_m, f_m * f_m * torch.exp(v_m * v_m), torch.stack([w1, w2], dim=1)
+        if d_sub == 3:
+            perms_3 = torch.tensor([[0, 1, 2], [0, 2, 1], [1, 2, 0]], dtype=torch.long, device=device)
+            n_t = 3
+            f_rep = f_b.unsqueeze(0).expand(n_t, b_sub, 3).reshape(n_t * b_sub, 3)
+            v_rep = v_b.unsqueeze(0).expand(n_t, b_sub, 3).reshape(n_t * b_sub, 3)
+            c_rep = c_b.unsqueeze(0).expand(n_t, b_sub, 3, 3).reshape(n_t * b_sub, 3, 3)
+            p_rep = perms_3.unsqueeze(1).expand(n_t, b_sub, 3).reshape(n_t * b_sub, 3)
+            ft, vt, wt = _clark_one_order_torch(f_rep, v_rep, c_rep, p_rep, best_of)
+            ft_v = ft.view(n_t, b_sub)
+            vt_v = vt.view(n_t, b_sub)
+            wt_v = wt.view(n_t, b_sub, 3)
+            return ft_v.mean(dim=0), (ft_v * ft_v * torch.exp(vt_v * vt_v)).mean(dim=0), wt_v.mean(dim=0)
+        if d_sub == 4:
+            trees_4 = torch.tensor(_BALANCED_TREES_D4, dtype=torch.long, device=device)
+            n_t = 6
+            f_rep = f_b.unsqueeze(0).expand(n_t, b_sub, 4).reshape(n_t * b_sub, 4)
+            v_rep = v_b.unsqueeze(0).expand(n_t, b_sub, 4).reshape(n_t * b_sub, 4)
+            c_rep = c_b.unsqueeze(0).expand(n_t, b_sub, 4, 4).reshape(n_t * b_sub, 4, 4)
+            p_rep = trees_4.unsqueeze(1).expand(n_t, b_sub, 4).reshape(n_t * b_sub, 4)
+            fo = torch.gather(f_rep, 1, p_rep)
+            vo = torch.gather(v_rep, 1, p_rep)
+            co = torch.gather(
+                torch.gather(c_rep, 1, p_rep.unsqueeze(2).expand(n_t * b_sub, 4, 4)),
+                2,
+                p_rep.unsqueeze(1).expand(n_t * b_sub, 4, 4),
+            )
+            f_ab, v_ab, w_a, w_b, rho_ab_cd = _clark_pair_merge(
+                fo[:, 0], vo[:, 0], fo[:, 1], vo[:, 1], co[:, 0, 1],
+                vo[:, 2:4], co[:, 0, 2:4], co[:, 1, 2:4], best_of,
+            )
+            assert rho_ab_cd is not None
+            f_cd, v_cd, w_c, w_d, rho_cd_ab = _clark_pair_merge(
+                fo[:, 2], vo[:, 2], fo[:, 3], vo[:, 3], co[:, 2, 3],
+                v_ab.unsqueeze(1), rho_ab_cd[:, 0:1], rho_ab_cd[:, 1:2], best_of,
+            )
+            assert rho_cd_ab is not None
+            f_root, v_root, w_ab, w_cd, _ = _clark_pair_merge(
+                f_ab, v_ab, f_cd, v_cd, rho_cd_ab[:, 0], None, None, None, best_of
+            )
+            w_leaves = torch.stack([w_ab * w_a, w_ab * w_b, w_cd * w_c, w_cd * w_d], dim=1)
+            w_unsorted = torch.zeros_like(w_leaves).scatter(1, p_rep, w_leaves)
+            fr_v = f_root.view(n_t, b_sub)
+            vr_v = v_root.view(n_t, b_sub)
+            return fr_v.mean(dim=0), (fr_v * fr_v * torch.exp(vr_v * vr_v)).mean(dim=0), w_unsorted.view(n_t, b_sub, 4).mean(dim=0)
+        if d_sub == 5:
+            trees_5 = torch.tensor(_BALANCED_TREES_D5, dtype=torch.long, device=device)
+            n_t = 30
+            f_rep = f_b.unsqueeze(0).expand(n_t, b_sub, 5).reshape(n_t * b_sub, 5)
+            v_rep = v_b.unsqueeze(0).expand(n_t, b_sub, 5).reshape(n_t * b_sub, 5)
+            c_rep = c_b.unsqueeze(0).expand(n_t, b_sub, 5, 5).reshape(n_t * b_sub, 5, 5)
+            p_rep = trees_5.unsqueeze(1).expand(n_t, b_sub, 5).reshape(n_t * b_sub, 5)
+            fo = torch.gather(f_rep, 1, p_rep)
+            vo = torch.gather(v_rep, 1, p_rep)
+            co = torch.gather(
+                torch.gather(c_rep, 1, p_rep.unsqueeze(2).expand(n_t * b_sub, 5, 5)),
+                2,
+                p_rep.unsqueeze(1).expand(n_t * b_sub, 5, 5),
+            )
+            f_ab, v_ab, w_a, w_b, rho_ab_cde = _clark_pair_merge(
+                fo[:, 0], vo[:, 0], fo[:, 1], vo[:, 1], co[:, 0, 1],
+                vo[:, 2:5], co[:, 0, 2:5], co[:, 1, 2:5], best_of,
+            )
+            assert rho_ab_cde is not None
+            v_rem2 = torch.stack([v_ab, vo[:, 4]], dim=1)
+            r1_rem2 = torch.stack([rho_ab_cde[:, 0], co[:, 2, 4]], dim=1)
+            r2_rem2 = torch.stack([rho_ab_cde[:, 1], co[:, 3, 4]], dim=1)
+            f_cd, v_cd, w_c, w_d, rho_cd_abe = _clark_pair_merge(
+                fo[:, 2], vo[:, 2], fo[:, 3], vo[:, 3], co[:, 2, 3],
+                v_rem2, r1_rem2, r2_rem2, best_of,
+            )
+            assert rho_cd_abe is not None
+            f_abcd, v_abcd, w_ab, w_cd, rho_abcd_e = _clark_pair_merge(
+                f_ab, v_ab, f_cd, v_cd, rho_cd_abe[:, 0],
+                vo[:, 4:5], rho_ab_cde[:, 2:3], rho_cd_abe[:, 1:2], best_of,
+            )
+            assert rho_abcd_e is not None
+            f_root, v_root, w_abcd, w_e, _ = _clark_pair_merge(
+                f_abcd, v_abcd, fo[:, 4], vo[:, 4], rho_abcd_e[:, 0], None, None, None, best_of
+            )
+            w_leaves = torch.stack(
+                [w_abcd * w_ab * w_a, w_abcd * w_ab * w_b, w_abcd * w_cd * w_c, w_abcd * w_cd * w_d, w_e],
+                dim=1,
+            )
+            w_unsorted = torch.zeros_like(w_leaves).scatter(1, p_rep, w_leaves)
+            fr_v = f_root.view(n_t, b_sub)
+            vr_v = v_root.view(n_t, b_sub)
+            return fr_v.mean(dim=0), (fr_v * fr_v * torch.exp(vr_v * vr_v)).mean(dim=0), w_unsorted.view(n_t, b_sub, 5).mean(dim=0)
 
-        dv_mat = v_b.unsqueeze(2) - v_b.unsqueeze(1)
-        u_all = (0.5 * (dv_mat * dv_mat).sum(dim=(1, 2))) / (_VOL_TIE_TAU * _VOL_TIE_TAU)
-        w_v_all = torch.exp(-(u_all * u_all).clamp(max=80.0))
-        w_v_min = float(w_v_all.detach().min().item())
-        w_v_max = float(w_v_all.detach().max().item())
-
-        if w_v_min > 1.0 - 1e-15:
-            f_cyc, m2_cyc, w_cyc = _avg_rev_pair(ord_v_b)
-            for s in range(1, d_sub):
-                fs, m2s, ws = _avg_rev_pair(torch.roll(ord_v_b, shifts=-s, dims=1))
-                f_cyc = f_cyc + fs
-                m2_cyc = m2_cyc + m2s
-                w_cyc = w_cyc + ws
-            inv_d = 1.0 / float(d_sub)
-            return f_cyc * inv_d, m2_cyc * inv_d, w_cyc * inv_d
-
-        f_0, m2_0, w_0 = _avg_rev_pair(ord_v_b)
-        v_sorted = torch.gather(v_b, 1, ord_v_b)
-        f_pair_num = f_0
-        m2_pair_num = m2_0
-        w_pair_num = w_0
-        denom = torch.ones_like(f_0)
-        for k in range(d_sub - 1):
-            z_k = (v_sorted[:, k + 1] - v_sorted[:, k]) / _VOL_TIE_TAU
-            alpha_k = torch.exp(-(z_k * z_k * z_k * z_k).clamp(max=80.0))
-            if float(alpha_k.detach().max().item()) > 1e-15:
-                sw_k = ord_v_b.clone()
-                sw_k[:, k] = ord_v_b[:, k + 1]
-                sw_k[:, k + 1] = ord_v_b[:, k]
-                fk, m2k, wk = _avg_rev_pair(sw_k)
-                f_pair_num = f_pair_num + alpha_k * fk
-                m2_pair_num = m2_pair_num + alpha_k * m2k
-                w_pair_num = w_pair_num + alpha_k.unsqueeze(1) * wk
-                denom = denom + alpha_k
-        inv_den = 1.0 / denom
-        f_pair = f_pair_num * inv_den
-        m2_pair = m2_pair_num * inv_den
-        w_pair = w_pair_num * inv_den.unsqueeze(1)
-
-        if w_v_max < 1e-15:
-            return f_pair, m2_pair, w_pair
-
-        f_cyc = f_0
-        m2_cyc = m2_0
-        w_cyc = w_0
-        for s in range(1, d_sub):
-            fs, m2s, ws = _avg_rev_pair(torch.roll(ord_v_b, shifts=-s, dims=1))
-            f_cyc = f_cyc + fs
-            m2_cyc = m2_cyc + m2s
-            w_cyc = w_cyc + ws
-        inv_d = 1.0 / float(d_sub)
-        f_cyc = f_cyc * inv_d
-        m2_cyc = m2_cyc * inv_d
-        w_cyc = w_cyc * inv_d
-        one_m_w = 1.0 - w_v_all
-        return (
-            one_m_w * f_pair + w_v_all * f_cyc,
-            one_m_w * m2_pair + w_v_all * m2_cyc,
-            one_m_w.unsqueeze(1) * w_pair + w_v_all.unsqueeze(1) * w_cyc,
-        )
-
-    # Pure-PyTorch symmetrized vol-ordered / cyclic reductions (functorch-safe)
-    v_key = torch.where(active_b, v_safe.detach(), torch.full_like(v_safe, 1e12))
-    ord_v = torch.argsort(v_key, dim=1, stable=True)
+        # D >= 6: canonical cyclic + reverse shifts without data-dependent argsort(v)
+        base_ord = torch.arange(d_sub, dtype=torch.long, device=device).unsqueeze(0).expand(b_sub, d_sub)
+        perms_cyc = [torch.roll(base_ord, shifts=-s, dims=1) for s in range(d_sub)]
+        perms_cyc = perms_cyc + [torch.flip(p, dims=[1]) for p in perms_cyc]
+        n_p = len(perms_cyc)
+        p_cat = torch.cat(perms_cyc, dim=0)
+        f_rep = f_b.repeat(n_p, 1)
+        v_rep = v_b.repeat(n_p, 1)
+        c_rep = c_b.repeat(n_p, 1, 1)
+        ft, vt, wt = _clark_one_order_torch(f_rep, v_rep, c_rep, p_cat, best_of)
+        ft_v = ft.view(n_p, b_sub)
+        vt_v = vt.view(n_p, b_sub)
+        return ft_v.mean(dim=0), (ft_v * ft_v * torch.exp(vt_v * vt_v)).mean(dim=0), wt.view(n_p, b_sub, d_sub).mean(dim=0)
 
     if mask_in is None:
-        f_sym, m2_sym, w_sym = _symmetrized_vol_clark_batch(f_safe, v_safe, c_safe, ord_v, is_best_of)
+        f_sym, m2_sym, w_sym = _symmetrized_balanced_clark_batch(f_safe, v_safe, c_safe, is_best_of)
         v_sym = torch.sqrt(
             torch.clamp(torch.log(torch.clamp(m2_sym / (f_sym * f_sym).clamp(min=1e-30), min=1.0)), min=1e-16)
         )
     else:
+        ord_act = torch.argsort((~active_b).to(dtype=torch.int64), dim=1, stable=True)
         active_cnt = active_b.sum(dim=1).to(dtype=torch.long)
         min_act = int(active_cnt.min().item())
         max_act = int(active_cnt.max().item())
         if min_act == max_act:
-            act_idx = ord_v[:, :min_act]
+            act_idx = ord_act[:, :min_act]
             f_act = torch.gather(f_safe, 1, act_idx)
             v_act = torch.gather(v_safe, 1, act_idx)
             c_act = torch.gather(
@@ -524,8 +635,7 @@ def _clark_symmetrized_torch(
                 2,
                 act_idx.unsqueeze(1).expand(b_size, min_act, min_act),
             )
-            id_ord = torch.arange(min_act, dtype=torch.long, device=device).unsqueeze(0).expand(b_size, min_act)
-            f_sym, m2_sym, w_act = _symmetrized_vol_clark_batch(f_act, v_act, c_act, id_ord, is_best_of)
+            f_sym, m2_sym, w_act = _symmetrized_balanced_clark_batch(f_act, v_act, c_act, is_best_of)
             w_sym = torch.zeros((b_size, d_max), dtype=torch.float64, device=device).scatter(1, act_idx, w_act)
         else:
             f_rows: List[torch.Tensor] = []
@@ -533,7 +643,7 @@ def _clark_symmetrized_torch(
             w_rows: List[torch.Tensor] = []
             for r in range(b_size):
                 d_act = int(active_cnt[r].item())
-                act_idx_r = ord_v[r : r + 1, :d_act]
+                act_idx_r = ord_act[r : r + 1, :d_act]
                 f_act_r = torch.gather(f_safe[r : r + 1], 1, act_idx_r)
                 v_act_r = torch.gather(v_safe[r : r + 1], 1, act_idx_r)
                 c_act_r = torch.gather(
@@ -541,8 +651,7 @@ def _clark_symmetrized_torch(
                     2,
                     act_idx_r.unsqueeze(1).expand(1, d_act, d_act),
                 )
-                id_ord_r = torch.arange(d_act, dtype=torch.long, device=device).unsqueeze(0)
-                f_r, m2_r, w_act_r = _symmetrized_vol_clark_batch(f_act_r, v_act_r, c_act_r, id_ord_r, is_best_of)
+                f_r, m2_r, w_act_r = _symmetrized_balanced_clark_batch(f_act_r, v_act_r, c_act_r, is_best_of)
                 w_r = torch.zeros((1, d_max), dtype=torch.float64, device=device).scatter(1, act_idx_r, w_act_r)
                 f_rows.append(f_r)
                 m2_rows.append(m2_r)
@@ -1983,6 +2092,20 @@ def _is_ad_active(*tensors: torch.Tensor) -> bool:
     return False
 
 
+def _has_near_tied_forwards(fp_t: torch.Tensor) -> bool:
+    if fp_t.ndim != 2 or fp_t.device.type != "cpu" or _is_ad_active(fp_t):
+        return False
+    d_assets, m_rem = int(fp_t.shape[0]), int(fp_t.shape[1])
+    if d_assets < 2 or m_rem == 0:
+        return False
+    arr = _tensor_to_np_ro(fp_t)
+    if m_rem == 1:
+        col = sorted(max(float(x), 1e-16) for x in arr[:, 0].tolist())
+        return any(col[i + 1] < col[i] * 1.0618365465453596 for i in range(d_assets - 1))
+    s_arr = np.sort(np.maximum(arr, 1e-16), axis=0)
+    return bool(np.any(s_arr[1:] < s_arr[:-1] * 1.0618365465453596))
+
+
 def compute_analytical_autocall_baseline(
     preproc_state: Any,
     *,
@@ -2021,6 +2144,7 @@ def compute_analytical_autocall_baseline(
                 use_fast_cpu is True
                 or not _is_ad_active(fp_t, vp_t, cm_t, df_t, ko_t, cb_t, cr_t)
             )
+            and not _has_near_tied_forwards(fp_t)
         )
         if can_cpu:
             is_preproc = hasattr(preproc_state, "baseline")
@@ -2314,6 +2438,7 @@ def compute_analytical_autocall_baseline(
         fp_t.ndim == 2
         and device.type == "cpu"
         and (use_fast_cpu is True or (use_fast_cpu is None and not any_grad))
+        and not _has_near_tied_forwards(fp_t)
     )
 
     if can_fast_cpu:
