@@ -365,3 +365,422 @@ def test_predefined_dividends_and_correlation_pair_spec() -> None:
 
     with pytest.raises(ValueError, match="Invalid correlation key"):
         CorrelationPairSpec.from_key("INVALID_KEY_WITHOUT_AMPERSAND", 0.5)
+
+
+def test_sch011_sch018_sch019_ext003_schema_and_dag_edge_cases(tmp_path: Path) -> None:
+    from deepvol.api.schemas_eq_autocall import (
+        FXVolatilitySmileCollectionSpec,
+        _DAGTokenStream,
+        _parse_dag_value,
+        _parse_datetime_literal,
+        _parse_scalar_token,
+        _tokenize_dag_fast,
+    )
+
+    # SCH-018: nested-paren tzinfo, microseconds, date literal, Z suffix, naive datetime
+    dt_nested = _parse_datetime_literal(
+        "datetime.datetime(2026, 10, 23, 12, 30, 45, 123456, tzinfo=datetime.timezone(datetime.timedelta(hours=3)))"
+    )
+    assert dt_nested == datetime.datetime(2026, 10, 23, 9, 30, 45, 123456, tzinfo=datetime.timezone.utc)
+    dt_kw = _parse_datetime_literal(
+        "datetime.datetime(year=2026, month=10, day=23, hour=5, minute=0, second=0, tzinfo=timezone(timedelta(seconds=-3600)))"
+    )
+    assert dt_kw == datetime.datetime(2026, 10, 23, 6, 0, tzinfo=datetime.timezone.utc)
+    dt_date = _parse_datetime_literal("datetime.date(2026, 10, 23)")
+    assert dt_date == datetime.datetime(2026, 10, 23, 0, 0, tzinfo=datetime.timezone.utc)
+    dt_utc_fast = _parse_datetime_literal("datetime.datetime(2026, 10, 23, 1, 2, 3, tzinfo=datetime.timezone.utc)")
+    assert dt_utc_fast == datetime.datetime(2026, 10, 23, 1, 2, 3, tzinfo=datetime.timezone.utc)
+    with pytest.raises(ValueError, match="Malformed datetime literal"):
+        _parse_datetime_literal("not_a_date")
+    with pytest.raises(ValueError, match="Unsupported tzinfo literal"):
+        _parse_datetime_literal("datetime.datetime(2026, 1, 1, tzinfo=FixedOffset(180))")
+
+    # SCH-013: FX Smooth & extended DCCs
+    fx_spec = FXVolatilitySmileCollectionSpec(
+        Identifier="USD/RUB",
+        AsOfDate=datetime.datetime(2026, 10, 23, 0, 0, tzinfo=datetime.timezone.utc),
+        SmileInterpolationMethod="Smooth",
+        Deltas=["-25D", "ATM", "25D"],
+        Tenors=["O/N", "1Y"],
+        VolatilityQuotes=[[0.15, 0.14, 0.16], [0.18, 0.17, 0.19]],
+    )
+    assert fx_spec.SmileInterpolationMethod == CurveInterpolationMethodEnum.Smooth
+    for dcc_tok in ("Act365_25", "Act366_1", "Act366_2", "Act366_3", "30E360"):
+        assert dcc_tok in {m.value for m in DayCountConventionEnum}
+
+    # Token stream & scalar token branches
+    sample_dag_text = (
+        "{ 'a': 123, 'b': -1.5e-2, 'c': <skipped>, 'd': True, 'e': false, "
+        "'f': None, 'g': datetime.date(2026, 5, 1), 'h': ['x', 0123456789abcdef0123456789abcdef01234567] }"
+    )
+    stream = _DAGTokenStream(sample_dag_text)
+    assert stream.peek() is not None
+    parsed_stream = _parse_dag_value(stream)
+    assert parsed_stream["a"] == 123
+    assert parsed_stream["b"] == pytest.approx(-0.015)
+    assert parsed_stream["c"] is None
+    assert parsed_stream["d"] is True
+    assert parsed_stream["e"] is False
+    assert parsed_stream["f"] is None
+    assert parsed_stream["g"].year == 2026
+    assert len(_tokenize_dag_fast("{ 'k': 1 }")) == 5
+    assert _parse_scalar_token("0123456789abcdef0123456789abcdef01234567") == "0123456789abcdef0123456789abcdef01234567"
+    assert _parse_scalar_token("9" * 40) == "9" * 40
+    assert _parse_scalar_token("123456") == 123456
+    assert _parse_scalar_token("true") is True and _parse_scalar_token("null") is None
+    assert _parse_scalar_token("@" + "a" * 40) == "@" + "a" * 40
+    with pytest.raises(ValueError):
+        _parse_scalar_token("'unclosed")
+    with pytest.raises(ValueError):
+        _parse_scalar_token("}")
+    with pytest.raises(ValueError, match="COLON"):
+        _parse_dag_value(_DAGTokenStream("{ 'k' 1 }"))
+
+    # SCH-011: Circular DAG & dangling Tier-0 vs missing non-Tier-0 reference
+    req, res_ref = parse_murex_autocall_dag(REQUEST_TXT_PATH)
+    base_d = req.model_dump()
+    base_d.pop("stripped_legacy_fields", None)
+    h_root = "1" * 40
+    h_cyc = "2" * 40
+    with pytest.raises(ValueError, match="Circular dependency"):
+        parse_murex_autocall_dag(
+            {
+                h_root: {"Product": f"&{h_cyc}", "Model": base_d["Model"]},
+                h_cyc: {"Product": f"&{h_root}"},
+            }
+        )
+    with pytest.raises(KeyError, match="Dangling Murex DAG reference"):
+        parse_murex_autocall_dag(
+            {
+                h_root: {"Product": "&" + "f" * 40, "Model": base_d["Model"]},
+            }
+        )
+
+    # Dangling Tier-0 / external ID keys should pass without KeyError
+    tier0_d = req.model_dump(mode="json")
+    tier0_d.pop("stripped_legacy_fields", None)
+    tier0_d["StaticDataSet"] = "@" + "e" * 40
+    tier0_d["Model"]["MarketDataSet"]["RatesCurvesBundles"]["RUB_RUONIA_OIS"]["BaseCurve"] = "@" + "d" * 40
+    dag_file = tmp_path / "dag_sample.txt"
+    h_prod = "3" * 40
+    h_mds = "4" * 40
+    h_mod = "5" * 40
+    dag_file.write_text(
+        f"@{h_root}\n"
+        f"{h_root} class: ConstantMessageMap\n"
+        f"{{ Product: &{h_prod}, Model: !{h_mod}, Queries: ['ProductValue'], StaticDataSet: '@{'e' * 40}' }}\n"
+        f"{h_prod} : {repr(tier0_d['Product'])}\n"
+        f"{h_mod} : {{ TypeName: 'DupireLocalVolatilityModel', MarketDataSet: &{h_mds}, FinancingCurveIdentifiers: ['RUB_RUONIA_OIS'] }}\n"
+        f"{h_mds} : {repr(tier0_d['Model']['MarketDataSet'])}\n"
+        f"Result : {{ ProductValue: 0.25, CashFlows: [{{ Description: 'Option', Date: '2027-02-09T00:00:00Z', Amount: -0.1 }}] }}\n",
+        encoding="utf-8",
+    )
+    parsed_file_req, parsed_file_res = parse_murex_autocall_dag(dag_file)
+    assert parsed_file_req.Queries == [AutocallQueryMetric.ProductValue]
+    assert parsed_file_res["Option"] == pytest.approx(-0.1)
+
+    # SCH-008: get_coupon_rates(apply_dcc=True) with FixedRate
+    prod_rate = copy.deepcopy(base_d["Product"])
+    prod_rate["FixedCouponAmount"] = None
+    prod_rate["FixedRate"] = 0.16
+    prod_rate["DayCountConvention"] = "Act360"
+    spec_rate = AutoCallableProductSpec.model_validate(prod_rate)
+    scaled_rates = spec_rate.get_coupon_rates(apply_dcc=True)
+    assert len(scaled_rates) == 12
+    assert all(0.0 < x < 0.16 for x in scaled_rates)
+
+    # SCH-019 & EXT-003: strict Murex validators
+    with pytest.raises(ValidationError):
+        RatesScheduleSpec(Dates=[], Rates=[])
+    with pytest.raises(ValidationError):
+        RatesScheduleSpec(Dates=[datetime.date(2027, 1, 1)], Rates=[0.1, 0.2])
+    with pytest.raises(ValidationError):
+        RatesScheduleSpec(Dates=[datetime.date(2027, 1, 1)], Rates=[], Spreads=[0.1, 0.2])
+    with pytest.raises(ValidationError):
+        RatesScheduleSpec(Dates=[datetime.date(2027, 1, 1)], Rates=[], Spreads=None)
+    with pytest.raises(ValidationError):
+        RepoScheduleSpec(Periods=["1Y"], Rates=[0.1, 0.2])
+    with pytest.raises(ValidationError):
+        RepoScheduleSpec(Periods=[], Rates=[])
+    with pytest.raises(ValidationError):
+        RepoScheduleSpec(Periods=["BAD_PERIOD"], Rates=[0.1])
+
+    # MarketDataSetSpec validators: empty Spots / <=0 Spots / empty Vol / empty Curves
+    bad_mds = copy.deepcopy(base_d["Model"]["MarketDataSet"])
+    bad_mds["Spots"]["MAGN_RUB"] = 0.0
+    with pytest.raises(ValidationError, match="strictly positive"):
+        MarketDataSetSpec.model_validate(bad_mds)
+    bad_mds["Spots"]["MAGN_RUB"] = -5.0
+    with pytest.raises(ValidationError, match="strictly positive"):
+        MarketDataSetSpec.model_validate(bad_mds)
+    bad_mds["Spots"] = {}
+    with pytest.raises(ValidationError):
+        MarketDataSetSpec.model_validate(bad_mds)
+    bad_mds2 = copy.deepcopy(base_d["Model"]["MarketDataSet"])
+    bad_mds2["RatesCurvesBundles"] = {}
+    with pytest.raises(ValidationError):
+        MarketDataSetSpec.model_validate(bad_mds2)
+    bad_mds3 = copy.deepcopy(base_d["Model"]["MarketDataSet"])
+    bad_mds3["VolatilitySurfaces"] = {}
+    with pytest.raises(ValidationError):
+        MarketDataSetSpec.model_validate(bad_mds3)
+
+    # AutoCallableProductSpec validators: duplicate IDs, pair index != 2, negative strike/gearing/KO, LowerStrike > Strike
+    bad_p = copy.deepcopy(base_d["Product"])
+    bad_p["UnderlyingIdentifiers"][1] = bad_p["UnderlyingIdentifiers"][0]
+    with pytest.raises(ValidationError, match="duplicates"):
+        AutoCallableProductSpec.model_validate(bad_p)
+
+    bad_pair = copy.deepcopy(base_d["Product"])
+    bad_pair["CallabilityMonitoringIndex"] = "RatioAB"
+    with pytest.raises(ValidationError, match="requires exactly 2 underlyings"):
+        AutoCallableProductSpec.model_validate(bad_pair)
+
+    for field, val in (
+        ("Strike", -0.1),
+        ("LowerStrike", 1.2),
+        ("OptionGearing", -1.0),
+        ("AutoCallTriggerLevels", [-1.0] * 12),
+        ("UnderlyingReferenceSpots", [0.0] * 5),
+        ("FixedCouponAmount", [-0.01] * 12),
+        ("CouponBarrierType", "InvalidType"),
+        ("CouponBarrierDirection", "Sideways"),
+    ):
+        bp = copy.deepcopy(base_d["Product"])
+        bp[field] = val
+        with pytest.raises(ValidationError):
+            AutoCallableProductSpec.model_validate(bp)
+
+    # CashFlowRow aliases (PaymentDate, ExpectedValue, PaymentValue)
+    cf_a = CashFlowRow.model_validate(
+        {"Description": "Coupon", "PaymentDate": "2027-02-09T00:00:00Z", "ExpectedValue": 0.05}
+    )
+    cf_b = CashFlowRow.model_validate(
+        {"Description": "Notional", "Date": datetime.date(2027, 2, 9), "PaymentValue": 1.0}
+    )
+    assert cf_a.Amount == pytest.approx(0.05)
+    assert cf_b.PaymentValue == pytest.approx(1.0)
+
+
+def test_sch_additional_dag_datetime_and_smile_validation_branches(tmp_path: Path) -> None:
+    from deepvol.api.schemas_eq_autocall import (
+        EquityVolSmileCollectionSpec,
+        FXVolatilitySmileCollectionSpec,
+        _parse_datetime_literal,
+    )
+
+    req, _ = parse_murex_autocall_dag(REQUEST_TXT_PATH)
+    base_d = req.model_dump()
+    base_d.pop("stripped_legacy_fields", None)
+
+    # _parse_datetime_literal Murex Python literal forms, tzinfo, microsecond, and error paths
+    dt_z = _parse_datetime_literal("datetime.datetime(2027, 2, 9, 12, 30, 45, tzinfo=datetime.timezone.utc)")
+    assert dt_z.tzinfo == datetime.timezone.utc and dt_z.hour == 12
+    dt_us = _parse_datetime_literal(
+        "datetime.datetime(2027, 2, 9, 12, 30, 45, microsecond=123456, tzinfo=datetime.timezone(datetime.timedelta(hours=3)))"
+    )
+    assert dt_us.microsecond == 123456
+    dt_date = _parse_datetime_literal("datetime.date(2027, 2, 9)")
+    assert dt_date.year == 2027
+    with pytest.raises(ValueError):
+        _parse_datetime_literal("None")
+    with pytest.raises(ValueError):
+        _parse_datetime_literal("datetime.datetime(bad)")
+
+    # parse_murex_autocall_dag direct request dict + {sha1: node_dict} with "Root" key + errors
+    direct_d = copy.deepcopy(base_d)
+    direct_d["Result"] = {"ProductValue": 0.88}
+    r_direct, res_direct = parse_murex_autocall_dag(direct_d)
+    assert r_direct.TradeInfo == req.TradeInfo and res_direct["ProductValue"] == pytest.approx(0.88)
+
+    h_root = "f" * 40
+    h_prod = "e" * 40
+    h_mod = "d" * 40
+    dag_with_root = {
+        "Root": f"@{h_root}",
+        h_root: {
+            "Product": f"&{h_prod}",
+            "Model": f"!{h_mod}",
+            "Queries": ["ProductValue"],
+        },
+        h_prod: copy.deepcopy(base_d["Product"]),
+        h_mod: copy.deepcopy(base_d["Model"]),
+    }
+    r_root, _ = parse_murex_autocall_dag(dag_with_root)
+    assert len(r_root.Product.ObservationDates) == 12
+
+    with pytest.raises(ValueError, match="root trade request node"):
+        parse_murex_autocall_dag({"Root": "@" + "0" * 40, "a" * 40: {"Foo": 1}})
+    with pytest.raises(TypeError):
+        parse_murex_autocall_dag(42)  # type: ignore[arg-type]
+
+    # AutoCallableProductSpec additional length & field validators
+    bp_dates = copy.deepcopy(base_d["Product"])
+    bp_dates["PaymentDates"] = bp_dates["PaymentDates"][:-1]
+    with pytest.raises(ValidationError):
+        AutoCallableProductSpec.model_validate(bp_dates)
+
+    bp_ref = copy.deepcopy(base_d["Product"])
+    bp_ref["UnderlyingReferenceSpots"] = bp_ref["UnderlyingReferenceSpots"][:-1]
+    with pytest.raises(ValidationError):
+        AutoCallableProductSpec.model_validate(bp_ref)
+
+    bp_list = copy.deepcopy(base_d["Product"])
+    bp_list["FixedCouponAmount"] = [0.05] * 3
+    with pytest.raises(ValidationError):
+        AutoCallableProductSpec.model_validate(bp_list)
+
+    spec_list_rate = copy.deepcopy(base_d["Product"])
+    spec_list_rate["FixedCouponAmount"] = None
+    spec_list_rate["FixedRate"] = [0.12] * 12
+    assert len(AutoCallableProductSpec.model_validate(spec_list_rate).get_coupon_rates(apply_dcc=True)) == 12
+
+    # Smile validation errors
+    vkco_d = copy.deepcopy(base_d["Model"]["MarketDataSet"]["VolatilitySurfaces"]["VKCO_RUB"])
+    vkco_d["VolatilityQuotes"][0] = vkco_d["VolatilityQuotes"][0][:-1]
+    with pytest.raises(ValidationError):
+        EquityVolSmileCollectionSpec.model_validate(vkco_d)
+
+    fx_bad = {
+        "Identifier": "USD/RUB",
+        "TypeName": "FXVolatilitySmileCollection",
+        "DayCountConvention": "Act365",
+        "Deltas": ["-25D", "ATM"],
+        "Tenors": ["1M", "6M"],
+        "VolatilityQuotes": [[0.20, 0.21]],
+    }
+    with pytest.raises(ValidationError):
+        FXVolatilitySmileCollectionSpec.model_validate(fx_bad)
+
+    # Dividend validators + cyclical DAG & missing filename path resolution
+    from deepvol.api.schemas_eq_autocall import DividendItemSpec, PredefinedDividendsSpec
+
+    with pytest.raises(ValidationError):
+        DividendItemSpec(ExDate=datetime.date(2026, 6, 1), Amount=-1.0)
+    with pytest.raises(ValidationError):
+        PredefinedDividendsSpec(ExDates=[datetime.date(2026, 6, 1)], Amounts=[-1.0])
+    with pytest.raises(ValidationError):
+        PredefinedDividendsSpec(ExDates=[datetime.date(2026, 6, 1)], Amounts=[1.0, 2.0])
+
+    h_cyc_a = "1" * 40
+    h_cyc_b = "2" * 40
+    cyc_file = tmp_path / "cyclic_dag.txt"
+    cyc_file.write_text(
+        f"@{h_cyc_a}\n"
+        f"{h_cyc_a} : {{ Product: &{h_cyc_b}, Model: &{h_cyc_b} }}\n"
+        f"{h_cyc_b} : {{ Product: &{h_cyc_a}, Model: &{h_cyc_a} }}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="cycle"):
+        parse_murex_autocall_dag(cyc_file)
+
+    r_rel, _ = parse_murex_autocall_dag("eq_autocallable_request.txt")
+    assert r_rel.TradeInfo == req.TradeInfo
+
+    # DAG tokenizer/scalar/stream helpers & anonymous dict + root errors
+    from deepvol.api.schemas_eq_autocall import _DAGTokenStream, _parse_scalar_token, _tokenize_dag_fast
+
+    ts = _DAGTokenStream("{ a: 'x' }")
+    assert ts.peek() == ("LBRACE", "{")
+    assert ts.expect("LBRACE") == "{"
+    with pytest.raises(ValueError):
+        ts.expect("RBRACE")
+    assert len(_tokenize_dag_fast("{ a: 1 }")) >= 4
+    assert _parse_scalar_token("<skipped>") is None
+    assert _parse_scalar_token("true") is True
+    assert _parse_scalar_token("false") is False
+    assert _parse_scalar_token("null") is None
+    assert _parse_scalar_token("1e-4") == pytest.approx(1e-4)
+    assert _parse_scalar_token("a" * 40) == "a" * 40
+    with pytest.raises(ValueError):
+        _parse_scalar_token("}")
+
+    json_d = req.model_dump(mode="json")
+    json_d.pop("stripped_legacy_fields", None)
+    anon_text = f"{{ Product: {repr(json_d['Product'])}, Model: {repr(json_d['Model'])}, Queries: ['ProductValue'] }}"
+    r_anon, _ = parse_murex_autocall_dag(anon_text)
+    assert len(r_anon.Product.ObservationDates) == 12
+    with pytest.raises(KeyError):
+        parse_murex_autocall_dag(f"@{'a' * 40}\n{'b' * 40} : {{ Foo: 1 }}")
+    with pytest.raises(ValueError):
+        parse_murex_autocall_dag("   ")
+    with pytest.raises(ValueError):
+        parse_murex_autocall_dag("BOGUS_TOKEN")
+
+    # _parse_str_dag_at & error paths for unclosed literals, unexpected delimiters, missing colon
+    from deepvol.api.schemas_eq_autocall import _FAST_TOK_RE, _parse_str_dag_at
+
+    toks_dt = _FAST_TOK_RE.findall(
+        "{ a: datetime.datetime(2027, 2, 9, 0, 0, 15, tzinfo=datetime.timezone.utc), "
+        "b: datetime.date(2027, 2, 9), c: <skipped>, d: True, e: False, f: None, "
+        f"g: {'a' * 40}, h: 123abc }}"
+    )
+    res_map, _ = _parse_str_dag_at(toks_dt, 0, len(toks_dt))
+    assert res_map["c"] is None and res_map["d"] is True and res_map["e"] is False and res_map["f"] is None
+
+    for bad_dag_str in (
+        "{ a: }",
+        "}",
+        "]",
+        "{ : 1 }",
+        "{ a 1 }",
+        "{ a: : }",
+        "{ 'unclosed: 1 }",
+        "{ a: 'unclosed }",
+        "{ a: ",
+    ):
+        bad_toks = _FAST_TOK_RE.findall(bad_dag_str)
+        with pytest.raises(ValueError):
+            _parse_str_dag_at(bad_toks, 0, len(bad_toks))
+
+    # Additional tokenizer/parser branches (_DAGTokenStream, _parse_dag_at, _extract_reference_hash)
+    from deepvol.api.schemas_eq_autocall import (
+        _extract_reference_hash,
+        _parse_dag_at,
+        _parse_dag_value,
+    )
+
+    with pytest.raises(ValueError, match="Unclosed string literal"):
+        _parse_scalar_token("'")
+    ts_empty = _DAGTokenStream("")
+    assert ts_empty.peek() is None
+    with pytest.raises(ValueError):
+        ts_empty.next()
+
+    assert _parse_scalar_token("'single'") == "single"
+    assert _parse_scalar_token("123abc") == "123abc"
+    assert _parse_scalar_token("datetime.date(2026, 6, 1)") == datetime.datetime(
+        2026, 6, 1, tzinfo=datetime.timezone.utc
+    )
+    assert _parse_scalar_token("@" + "a" * 40) == "@" + "a" * 40
+    assert _parse_scalar_token("custom_ident") == "custom_ident"
+
+    tok_ok = _tokenize_dag_fast(
+        "{ 'quoted_k': [true, false, null, "
+        + "a" * 40
+        + ", &"
+        + "b" * 40
+        + ", datetime.date(2026, 6, 1), 'sq', bad123] }"
+    )
+    ts_ok = _DAGTokenStream.__new__(_DAGTokenStream)
+    ts_ok._raw_tokens = tok_ok
+    ts_ok.tokens = []
+    ts_ok.idx = 0
+    parsed_ok = _parse_dag_value(ts_ok)
+    assert parsed_ok["quoted_k"][0] is True and parsed_ok["quoted_k"][1] is False and parsed_ok["quoted_k"][2] is None
+
+    for bad_fast in ("", "{ [1]: 2 }", "{ a 2 }", "{ a: 1", "[ 1 2", "{ a: ] }"):
+        bad_ftoks = _tokenize_dag_fast(bad_fast)
+        with pytest.raises(ValueError):
+            _parse_dag_at(bad_ftoks, 0, len(bad_ftoks))
+
+    h_node = "c" * 40
+    assert _extract_reference_hash(123, {h_node: {}}) is None
+    assert _extract_reference_hash(h_node.upper(), {h_node: {}}) == h_node
+    assert _extract_reference_hash("d" * 40, {h_node: {}}) is None
+
+
+
+
+
+

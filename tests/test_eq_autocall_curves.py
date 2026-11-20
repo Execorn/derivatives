@@ -258,3 +258,226 @@ def test_repo_curve_and_omitted_posirx_rub_fallback() -> None:
     q_vec = vkco_repo.integrated_repo(req.Product.ObservationDates)
     assert q_vec.shape == (12,)
     assert q_vec.dtype == np.float64
+
+
+def test_t1m004_t1m007_t1m015_t1m019_t1m023_ext014_curves_and_dcc() -> None:
+    from deepvol.market.eq_curves import year_fraction_batch_epoch_sec
+
+    # T1M-015 & SCH-013: canonical DCCs & slash aliases & epoch-sec vectorized helper
+    d0 = datetime.datetime(2024, 1, 31, 0, 0, tzinfo=datetime.timezone.utc)
+    d1 = datetime.datetime(2025, 4, 30, 0, 0, tzinfo=datetime.timezone.utc)
+    assert year_fraction(d0, d1, "Act365_25") == pytest.approx((d1 - d0).days / 365.25, abs=1e-15)
+    assert year_fraction(d0, d1, "Act366_1") == pytest.approx((d1 - d0).days / 366.0, abs=1e-15)
+    assert year_fraction(d0, d1, "Act/365") == year_fraction(d0, d1, "Act365")
+    assert year_fraction(d0, d1, "Act/Act") == year_fraction(d0, d1, "ActAct")
+    assert year_fraction(d0, d1, "30/360") == year_fraction(d0, d1, "Thirty360")
+    assert year_fraction(d0, d1, "30E360") == pytest.approx(450.0 / 360.0, abs=1e-15)
+    assert year_fraction(d1, d0, "Act365") == pytest.approx(-year_fraction(d0, d1, "Act365"), abs=1e-15)
+
+    t0_s = int(d0.timestamp())
+    t1_s = np.array([int(d0.timestamp()), int(d1.timestamp())], dtype=np.int64)
+    for dcc_name in ("Act365", "Act360", "ActAct", "Thirty360"):
+        vec = year_fraction_batch_epoch_sec(t0_s, t1_s, dcc_name)
+        assert vec.shape == (2,)
+        assert vec[0] == pytest.approx(0.0, abs=1e-15)
+        assert vec[1] == pytest.approx(year_fraction(d0, d1, dcc_name), abs=1e-12)
+
+    # T1M-004: InterpolationSpaceCoordinates without quote heuristics + tau=0 mask
+    as_of = datetime.datetime(2026, 10, 23, 0, 0, tzinfo=datetime.timezone.utc)
+    tenors = np.array([0.0, 0.25, 1.0, 2.0, 5.0], dtype=np.float64)
+    rates_dec = np.array([0.08, 0.085, 0.09, 0.095, 0.10], dtype=np.float64)
+    dfs_pil = np.exp(-rates_dec * tenors)
+    log_dfs_pil = -rates_dec * tenors
+
+    for space_coord, mode, quotes in (
+        ("Rates", "rates", rates_dec),
+        ("Rates", "df", dfs_pil),
+        ("Rates", "log_df", log_dfs_pil),
+        ("LogarithmOfDiscountFactors", "log_df", log_dfs_pil),
+        ("LogarithmOfDiscountFactors", "df", dfs_pil),
+        ("LogarithmOfDiscountFactors", "rates", rates_dec),
+        ("DiscountFactors", "df", dfs_pil),
+        ("DiscountFactors", "log_df", log_dfs_pil),
+        ("DiscountFactors", "rates", rates_dec),
+    ):
+        c_sp = ClampedYieldCurve(
+            as_of_date=as_of,
+            pillar_tenors=tenors,
+            rates=quotes,
+            space_coords=space_coord,
+            quote_expression="Standard",
+            input_mode=mode,
+            interpolation_method="Linear",
+        )
+        # tau <= 1e-12 sensitivity at pillar 0 must be masked to 0.0 (no 1/0 NaN!)
+        df_q, d_df_q = c_sp.df_and_d_df_d_pillar(np.array([0.0, 0.5, 1.5], dtype=np.float64))
+        assert np.all(np.isfinite(df_q)) and np.all(np.isfinite(d_df_q))
+        assert df_q[0] == pytest.approx(1.0, abs=1e-15)
+        assert np.all(np.isfinite(c_sp.zero_rate(np.array([0.0, 0.5], dtype=np.float64))))
+        # Immutability check (CHR-010)
+        assert c_sp.tenors.flags.writeable is False
+        assert c_sp.rates.flags.writeable is False
+
+    # T1M-007 & T1M-019: Linear/FlatLeft/FlatRight extrapolation + MonotoneConvex + FwdFwdLinear + PiecewiseConstantToTheLeft/Right + Bessel + approx aliases
+    eval_t = np.array([0.02, 0.10, 0.40, 1.25, 3.0, 7.0], dtype=np.float64)
+    for method in (
+        "CubicSpline",
+        "NaturalCubicSpline",
+        "NotAKnotCubicSpline",
+        "QuadraticSpline",
+        "Linear",
+        "LogLinear",
+        "FwdFwdLinear",
+        "MonotoneConvex",
+        "Bessel",
+        "PCHIP",
+        "Akima",
+        "PiecewiseConstantToTheLeft",
+        "PiecewiseConstantToTheRight",
+        "LME",
+        "ExpSpline",
+        "Kruger",
+    ):
+        for extrap in ("Flat", "Linear", "FlatLeft", "FlatRight"):
+            c_m = ClampedYieldCurve(
+                as_of_date=as_of,
+                pillar_tenors=np.array([0.1, 0.5, 1.0, 2.0, 5.0], dtype=np.float64),
+                rates=np.array([12.0, 13.5, 11.0, 14.0, 13.0], dtype=np.float64),
+                interpolation_method=method,
+                extrapolation_method=extrap,
+            )
+            r_eval = c_m.zero_rate(eval_t)
+            w_eval = c_m.spline_weights(eval_t)
+            assert np.all(np.isfinite(r_eval))
+            assert np.all(np.isfinite(w_eval))
+            if method in ("CubicSpline", "Linear", "Bessel", "FwdFwdLinear", "NaturalCubicSpline", "NotAKnotCubicSpline"):
+                np.testing.assert_allclose(w_eval @ c_m.rates, r_eval, atol=1e-12)
+
+    # Single-pillar curve & empty eval
+    c_single = ClampedYieldCurve(as_of_date=as_of, pillar_tenors=[1.0], rates=[10.0])
+    assert float(c_single.zero_rate(0.5)) == pytest.approx(0.10)
+    assert c_single.spline_weights([0.2, 2.0]).shape == (2, 1)
+    assert c_single.spline_weights([]).shape == (0, 1)
+    assert c_single.df(np.array([], dtype=np.float64)).shape == (0,)
+
+    # EXT-014: Mapping dict construction for ClampedYieldCurve & RepoCurve + T1M-023 RepoCurve tau <= 0 clamp
+    dict_curve = ClampedYieldCurve(
+        {
+            "Identifier": "DICT_RUB",
+            "Currency": "RUB",
+            "AsOfDate": as_of.isoformat(),
+            "InterpolationDayCountConvention": "Act365",
+            "InterpolationMethod": "MonotoneConvex",
+            "InterpolationSpaceCoordinates": "DiscountFactors",
+            "ExtrapolationMethod": "Linear",
+            "RatesSchedule": {
+                "Dates": [
+                    (as_of + datetime.timedelta(days=90)).isoformat(),
+                    (as_of + datetime.timedelta(days=365)).isoformat(),
+                    (as_of + datetime.timedelta(days=730)).isoformat(),
+                ],
+                "DiscountFactors": [0.97, 0.90, 0.81],
+            },
+        }
+    )
+    assert float(dict_curve.df(as_of + datetime.timedelta(days=365))) == pytest.approx(0.90, abs=1e-12)
+
+    repo_dict = RepoCurve(
+        {
+            "Identifier": "DICT_REPO",
+            "InterpolationDayCountConvention": "Act365_25",
+            "RatesSchedule": {"Periods": ["1W", "3M", "1Y"], "Rates": [0.5, 1.0, 1.5]},
+        },
+        as_of_date=as_of,
+    )
+    assert float(repo_dict.repo_df(0.0)) == pytest.approx(1.0, abs=1e-15)
+    assert float(repo_dict.repo_df(-0.1)) == pytest.approx(1.0, abs=1e-15)
+    assert float(repo_dict.integrated_repo(-0.1)) == pytest.approx(0.0, abs=1e-15)
+    assert float(repo_dict.repo_df(np.float64(0.5))) < 1.0
+
+    # Validation error checks
+    with pytest.raises(ValueError):
+        ClampedYieldCurve(as_of_date=as_of, pillar_tenors=[1.0, 0.5], rates=[10.0, 11.0])
+    with pytest.raises(ValueError):
+        ClampedYieldCurve(as_of_date=as_of, pillar_tenors=[1.0, 2.0], rates=[10.0, 11.0], interpolation_method="BogusMethod")
+
+    # Additional branch-coverage edge cases for eq_curves.py
+    from deepvol.market.eq_curves import dcc_denominator
+
+    assert dcc_denominator("Business252") == pytest.approx(252.0)
+    assert dcc_denominator("30E360") == pytest.approx(360.0)
+    assert dcc_denominator("ActActISDA") == pytest.approx(365.0)
+    with pytest.raises(ValueError):
+        dcc_denominator("BogusDCC")
+
+    # 3-pillar NotAKnotCubicSpline & Akima fallback + tau=0 handling in spline/basis
+    for m_small in ("NotAKnotCubicSpline", "Akima"):
+        c3 = ClampedYieldCurve(
+            as_of_date=as_of,
+            pillar_tenors=[0.5, 1.0, 2.0],
+            rates=[10.0, 12.0, 11.0],
+            interpolation_method=m_small,
+        )
+        assert np.all(np.isfinite(c3.zero_rate([0.0, 0.75, 3.0])))
+        assert c3.spline_weights([0.0, 0.75, 3.0]).shape == (3, 3)
+
+    # input_mode="log_df" and space_coords="LogarithmOfDiscountFactors" / "Rates" with input_mode="df"
+    c_logdf = ClampedYieldCurve(
+        as_of_date=as_of,
+        pillar_tenors=[0.5, 1.0, 2.0],
+        rates=[-0.05, -0.10, -0.22],
+        space_coords="LogarithmOfDiscountFactors",
+        quote_expression="Standard",
+        interpolation_method="Linear",
+    )
+    assert float(c_logdf.df(1.0)) == pytest.approx(np.exp(-0.10), abs=1e-12)
+
+    c_df_in = ClampedYieldCurve(
+        as_of_date=as_of,
+        pillar_tenors=[0.5, 1.0, 2.0],
+        rates=[0.95, 0.90, 0.80],
+        space_coords="DiscountFactors",
+        quote_expression="Standard",
+        interpolation_method="MonotoneConvex",
+    )
+    assert np.all(np.isfinite(c_df_in.df([0.0, 0.25, 1.0, 3.0])))
+    assert np.all(np.isfinite(c_df_in.spline_weights([0.0, 0.25, 1.5])))
+
+    c_fwd_tau0 = ClampedYieldCurve(
+        as_of_date=as_of,
+        pillar_tenors=[0.5, 1.0, 2.0],
+        rates=[10.0, 12.0, 11.0],
+        interpolation_method="FwdFwdLinear",
+    )
+    assert np.all(np.isfinite(c_fwd_tau0.spline_weights([0.0, 0.25, 0.75, 3.0])))
+    c_log_tau0 = ClampedYieldCurve(
+        as_of_date=as_of,
+        pillar_tenors=[0.5, 1.0, 2.0],
+        rates=[10.0, 12.0, 11.0],
+        interpolation_method="LogLinear",
+    )
+    assert np.all(np.isfinite(c_log_tau0.spline_weights([0.0, 0.25, 0.75, 3.0])))
+
+    repo_dates = RepoCurve(
+        {
+            "Identifier": "REPO_DATES",
+            "RatesSchedule": {
+                "Dates": [(as_of + datetime.timedelta(days=90)).isoformat(), (as_of + datetime.timedelta(days=365)).isoformat()],
+                "Rates": [0.5, 1.0],
+            },
+        },
+        as_of_date=as_of,
+    )
+    assert float(repo_dates.repo_rate(as_of + datetime.timedelta(days=90))) == pytest.approx(0.005)
+    repo_num = RepoCurve(as_of_date=as_of, periods_days=[90.0, 365.0], rates=[0.5, 1.0])
+    assert repo_num.is_flat_zero is False
+    assert repo_num.repo_df([]).shape == (0,)
+    repo_empty = RepoCurve(spec=None, as_of_date=as_of)
+    assert repo_empty.is_flat_zero is True
+    assert float(repo_empty.repo_rate(0.5)) == 0.0
+    assert float(repo_empty.integrated_repo(0.5)) == 0.0
+
+    with pytest.raises(ValueError):
+        ClampedYieldCurve(as_of_date=as_of, pillar_tenors=[1.0, 2.0], rates=[10.0], input_mode="bad_mode")
+
+

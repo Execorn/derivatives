@@ -573,3 +573,95 @@ def test_G4_5_cudnn_rnn_backward_freedom_and_eval_second_order_autograd() -> Non
         assert torch.allclose(
             hvp_node[1, 0, :], hvp_node[1, 1, :], atol=1e-5, rtol=1e-4
         )
+
+
+def test_egno_v2_modifiers_second_order_sdpa_and_empty_schedule() -> None:
+    from deepvol.surrogates.eq_autocall_egno import assemble_surrogate_product_value
+
+    model = MaskedEQAutocallSurrogate(d_max=8, m_max=48, d_model=64, n_egno_layers=2, n_sched_layers=1)
+    model.zero_init_residual_heads(std=0.0)
+    model.eval()
+    model.freeze_eval_buffers()
+
+    b_sz, d_m, m_m = 2, 8, 12
+    node_f = torch.randn(b_sz, d_m, 16, dtype=torch.float32, requires_grad=True)
+    edge_f = torch.randn(b_sz, d_m, d_m, 4, dtype=torch.float32)
+    amask = torch.zeros(b_sz, d_m, dtype=torch.float32)
+    amask[:, :3] = 1.0
+    sched_f = torch.rand(b_sz, m_m, 12, dtype=torch.float32)
+    sched_f[:, :, int(AutocallSchedCol.DF_PAY)] = 0.95
+    sched_f[:, :, int(AutocallSchedCol.COUPON_RATE)] = 0.04
+    smask = torch.zeros(b_sz, m_m, dtype=torch.float32)
+    smask[:, :4] = 1.0
+    glob_f = torch.zeros(b_sz, 16, dtype=torch.float32)
+    glob_f[:, int(AutocallGlobalCol.K_PUT)] = 0.90
+    glob_f[:, int(AutocallGlobalCol.G_PUT)] = 1.0
+    glob_f[:, int(AutocallGlobalCol.LOWER_STRIKE)] = 0.50
+    glob_f[:, int(AutocallGlobalCol.IS_MEMORY_FLAG)] = 1.0
+
+    # Test forward_residuals with require_second_order_sdpa=True and full double backward
+    dh, dc, dp = model.forward_residuals(
+        node_f, edge_f, amask, sched_f, smask, glob_f, require_second_order_sdpa=True
+    )
+    g = torch.autograd.grad(dh.sum() + dc.sum() + dp.sum(), node_f, create_graph=True)[0]
+    hv = torch.autograd.grad((g * node_f.detach()).sum(), node_f)[0]
+    assert torch.isfinite(hv).all()
+
+    out = model(node_f, edge_f, amask, sched_f, smask, glob_f)
+    pv_mod = assemble_surrogate_product_value(
+        out,
+        sched_f,
+        smask,
+        glob_f,
+        no_notional_repayment=True,
+        autocall_coupon=0.05,
+        force_coupons_on_autocall=True,
+        is_long_basket=True,
+        pv_in_transit=0.02,
+        funding_pv=0.01,
+        already_autocalled=False,
+        w_fund_per_period=torch.full((b_sz, 4), 0.005, dtype=torch.float32),
+        lower_strike=0.45,
+        one_star_pv=0.03,
+        part_call_pv=0.02,
+    )
+    assert pv_mod.shape == (b_sz,) and torch.isfinite(pv_mod).all()
+
+    # Empty schedule early exit & already_autocalled override
+    pv_empty = assemble_surrogate_product_value(
+        out,
+        torch.zeros(b_sz, 0, 12, dtype=torch.float32),
+        torch.zeros(b_sz, 0, dtype=torch.float32),
+        glob_f,
+        pv_in_transit=0.123,
+    )
+    torch.testing.assert_close(pv_empty, torch.full((b_sz,), 0.123, dtype=torch.float32))
+
+    pv_ko = assemble_surrogate_product_value(
+        out, sched_f, smask, glob_f, pv_in_transit=0.456, already_autocalled=True
+    )
+    torch.testing.assert_close(pv_ko, torch.full((b_sz,), 0.456, dtype=torch.float32))
+
+    # Exercise direct MaskedEGNOLayer.forward (with pair_weight) and is_zero_residual cache
+    assert model.is_zero_residual() is True
+    assert model.is_zero_residual() is True
+    model.zero_init_residual_heads(std=0.01)
+    assert model.is_zero_residual() is False
+
+    h_layer = torch.randn(b_m := 2, d_m, model.d_model, dtype=torch.float32)
+    pw = torch.full((b_m, d_m, d_m), 0.5, dtype=torch.float32)
+    out_layer = model.egno_layers[0](h_layer, edge_f, amask, pair_weight=pw)
+    assert out_layer.shape == h_layer.shape and torch.isfinite(out_layer).all()
+    torch.testing.assert_close(out_layer[:, 3:, :], torch.zeros_like(out_layer[:, 3:, :]))
+
+    out_all_active = model(
+        node_f.detach(),
+        edge_f,
+        torch.ones_like(amask),
+        sched_f,
+        torch.ones_like(smask),
+        glob_f,
+    )
+    assert torch.isfinite(out_all_active.stopping_probs).all()
+
+

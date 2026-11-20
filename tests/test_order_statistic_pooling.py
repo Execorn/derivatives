@@ -177,3 +177,41 @@ def test_w5_softmin_partition_of_unity_and_negative_semidefinite_hessian() -> No
     eigvals = torch.linalg.eigvalsh(hess_min)
     assert eigvals.max().item() <= 1e-13
     assert abs(eigvals.max().item()) <= 1e-13
+
+
+def test_order_statistic_pooling_validation_all_active_weights_and_all_func_codes() -> None:
+    for kwargs in (
+        {"hidden_dim": 0},
+        {"init_tau": 0.0},
+        {"sharp_tau": 0.0},
+        {"n_func_codes": 0},
+        {"func_emb_dim": 0},
+    ):
+        with pytest.raises(ValueError):
+            OrderStatisticPooling(**kwargs)
+
+    pool = OrderStatisticPooling(hidden_dim=16, out_dim=32, n_func_codes=15, func_emb_dim=8)
+    h = torch.randn(3, 5, 16, dtype=torch.float64)
+    mask = torch.ones(3, 5, dtype=torch.float64)
+    weights = torch.tensor(
+        [[0.2, 0.3, 0.5, 0.0, 0.0], [0.5, 0.2, 0.1, 0.1, 0.1], [0.25, 0.25, 0.25, 0.25, 0.0]],
+        dtype=torch.float64,
+    )
+    pool_f64 = pool.to(dtype=torch.float64)
+    pool_f64.freeze_eval_buffers()
+    summaries = pool_f64.compute_seven_statistics(h, mask, asset_weights=weights, all_active=True)
+    assert len(summaries) == 7
+    assert all(s.shape == (3, 16) and torch.isfinite(s).all() for s in summaries)
+    summaries5 = pool_f64.compute_five_statistics(h, mask, asset_weights=weights, all_active=True)
+    assert len(summaries5) == 5
+
+    for code in range(15):
+        out = pool_f64(
+            h,
+            mask,
+            asset_weights=weights,
+            func_codes=torch.full((3, 3), code, dtype=torch.long),
+            all_active=True,
+        )
+        assert out.shape == (3, 32) and torch.isfinite(out).all()
+
