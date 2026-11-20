@@ -590,7 +590,7 @@ def calibrate_guardian_stats(
     *,
     device: torch.device,
     conformal_alpha: float = 0.05,
-    tau_desk_bps: float = 20.0,
+    tau_desk_bps: float = 60.0,
     stats_path: Optional[Path] = DEFAULT_GUARDIAN_STATS_PATH,
 ) -> Dict[str, Any]:
     """Fits OAS covariance, 10-decile PSI bins, and 5D split-conformal error quantiles."""
@@ -885,7 +885,7 @@ def train_eq_autocall_surrogate(
     checkpoint_path: str | Path | None = DEFAULT_CHECKPOINT_PATH,
     guardian_stats_path: str | Path | None = DEFAULT_GUARDIAN_STATS_PATH,
     conformal_alpha: float = 0.05,
-    tau_desk_bps: float = 20.0,
+    tau_desk_bps: float = 60.0,
     domain_mode: str = "tier2_desk",
 ) -> SurrogateTrainingResult:
     """Trains EGNO v2.0 on GPU Dupire LV QMC labels and calibrates SR 26-2 Guardian stats."""
@@ -1206,7 +1206,7 @@ def recalibrate_guardian_stats_from_checkpoint(
     seed: int = 2026,
     device: torch.device | str | None = None,
     conformal_alpha: float = 0.05,
-    tau_desk_bps: float = 20.0,
+    tau_desk_bps: float = 60.0,
     domain_mode: str = "tier2_desk",
 ) -> Dict[str, Any]:
     """Refreshes 5D split-conformal Guardian artifact & test metrics while keeping EGNO weights."""
@@ -1356,7 +1356,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-substeps-test", type=int, default=16)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--domain-mode", type=str, default="tier2_desk")
-    parser.add_argument("--tau-desk-bps", type=float, default=20.0)
+    parser.add_argument("--tau-desk-bps", type=float, default=60.0)
     parser.add_argument("--recalibrate-only", action="store_true")
     parser.add_argument("--checkpoint-path", type=str, default=str(DEFAULT_CHECKPOINT_PATH))
     parser.add_argument("--guardian-stats-path", type=str, default=str(DEFAULT_GUARDIAN_STATS_PATH))
