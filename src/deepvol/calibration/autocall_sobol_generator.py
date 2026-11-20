@@ -1,48 +1,72 @@
-"""autocall_sobol_generator.py — Vectorized Bartlett-LKJ Sampler & Multi-Asset Sobol Dataset Generator (Task 3.2a).
-
-Implements SPEC-DEEPVOL-EQ-AUTOCALL-001 §0.3 (D8), §3 Task 3.2, Symbolic Proof W7, and Gate G3.3:
-  - `sample_lkj_cholesky_bartlett`: Vectorized Bartlett-coupled Extended Onion / C-vine LKJ(eta)
-    Cholesky sampler (Lewandowski, Kurowicka & Joe 2009; Hansen 2026 arXiv:2608.06116v2) producing
-    exact SPD correlation matrices R = L L^T in O(D^2) with exact Beta(eta + (D-2)/2, eta + (D-2)/2)
-    off-diagonal marginals, plus optional equicorrelation crisis regime mixing (rho in [0.80, 0.95]).
-  - `SyntheticAutocallBatch` & `generate_synthetic_autocall_batch`: Multi-asset Equity Autocallable
-    synthetic dataset generator across D in {1..8}, M_rem in {1..24} (padded to D_max=8, M_max=48),
-    distressed/ATM/OTM moneyness M_{0,i} in [0.15, 1.50], step-down KO barriers, memory coupons,
-    and digital spreads Delta B in [-0.20, -0.01], computing both Stulz-Margrabe analytical baseline
-    and Sobol Quasi-Monte Carlo target labels (probabilities, put loss, ProductValue, and pathwise Delta).
-"""
+"""Vectorized Bartlett-LKJ sampler and GPU Dupire QMC dataset generator (v2.0)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import math
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+import numpy.typing as npt
+from scipy.stats import qmc
 import torch
 
 from deepvol.models.autocall.analytical_baseline import (
-    _conditional_ki_put_torch,
+    AutocallBaselineOutput,
     _digital_call_spread_prob_torch,
-    stulz_margrabe_moments_with_weights,
+    compute_analytical_autocall_baseline,
 )
-from deepvol.surrogates.eq_autocall_egno import (
-    AutocallEdgeCol,
-    AutocallGlobalCol,
+from deepvol.models.autocall.dupire_qmc_gpu import DupireQMCConfig, DupireQMCGpuSolver
+from deepvol.models.autocall.dupire_qmc_solver import RegularizedVolSurface
+from deepvol.models.autocall.escrowed_dividend import EscrowedDividendOutput
+from deepvol.models.autocall.feature_layout import (
+    D_MAX_DEFAULT,
+    FEATURE_SCHEMA_VERSION,
+    M_MAX_DEFAULT,
+    PAIR_ORDER_DEPENDENT_INDICES,
     AutocallNodeCol,
-    AutocallSchedCol,
+    monitoring_index_to_code,
+)
+from deepvol.models.autocall.pre_post_processor import AutocallPreprocState
+from deepvol.models.autocall.seasoned_collapser import (
+    SeasonedScheduleState,
+    SentinelBarrierResult,
+)
+
+_SSVI_TENORS: npt.NDArray[np.float64] = np.array(
+    [0.08, 0.25, 0.50, 1.0, 2.0, 4.0, 8.0, 13.0], dtype=np.float64
+)
+_SSVI_STRIKES: npt.NDArray[np.float64] = np.array(
+    [20.0, 35.0, 50.0, 65.0, 80.0, 90.0, 100.0, 110.0, 125.0, 145.0, 175.0, 220.0],
+    dtype=np.float64,
+)
+_SSVI_LOG_K: npt.NDArray[np.float64] = np.log(_SSVI_STRIKES / 100.0)
+_BASE_AS_OF: datetime = datetime(2026, 10, 23, 0, 0, 0, tzinfo=timezone.utc)
+
+_CALL_FUNCTIONAL_CHOICES: Tuple[str, ...] = (
+    "WorstOf",
+    "BestOf",
+    "AverageOf",
+    "Dispersion",
+    "RatioAB",
+    "RatioBA",
+    "DiffAB",
+    "DiffBA",
 )
 
 
 @dataclass
 class SyntheticAutocallBatch:
-    """Batch of synthetic multi-asset autocallable features, analytical baselines, and Sobol QMC labels."""
+    """Batch of v2.0 autocallable features, analytical baselines, Dupire QMC targets, and Jacobians."""
 
     # Padded Tier 2 input tensors
-    node_feats: torch.Tensor    # (B, D_max, 14)
+    node_feats: torch.Tensor    # (B, D_max, 16)
     edge_feats: torch.Tensor    # (B, D_max, D_max, 4)
     asset_mask: torch.Tensor    # (B, D_max)
     sched_feats: torch.Tensor   # (B, M_max, 12)
     sched_mask: torch.Tensor    # (B, M_max)
-    global_feats: torch.Tensor  # (B, 10)
+    global_feats: torch.Tensor  # (B, 16)
 
     # Analytical Stulz-Margrabe proxy baseline
     p_proxy: torch.Tensor       # (B, M_max)
@@ -51,20 +75,98 @@ class SyntheticAutocallBatch:
     pv_proxy: torch.Tensor      # (B,)
     delta_proxy: torch.Tensor   # (B, D_max) dPV_proxy / d(ln M_{0,i})
 
-    # Multi-asset Sobol QMC target labels
+    # Multi-asset GPU Dupire LV QMC target labels
     p_mc: torch.Tensor          # (B, M_max)
     q_mc: torch.Tensor          # (B, M_max)
     l_put_mc: torch.Tensor      # (B,)
     pv_mc: torch.Tensor         # (B,)
-    delta_mc: torch.Tensor      # (B, D_max) pathwise + LRM dPV_mc / d(ln M_{0,i})
+    delta_mc: torch.Tensor      # (B, D_max) unblended dPV_mc / d(ln M_{0,i})
+
+    # Contract payoff modifiers & precomputed training tensors
+    no_notional_repayment: torch.Tensor     # (B,)
+    autocall_coupon: torch.Tensor           # (B,)
+    force_coupons_on_autocall: torch.Tensor # (B,)
+    is_long_basket: torch.Tensor            # (B,)
+    lower_strike: torch.Tensor              # (B,)
+    p_proxy_ko_bumped: torch.Tensor         # (B, M_max)
+    jac_node_logm: torch.Tensor             # (B, D_max, D_max, 16)
+    jac_edge_self: torch.Tensor             # (B, D_max, D_max, 2) for cols [COVARIANCE_TERM, LOG_PERF_DIFF]
+    jac_sched_logm: torch.Tensor            # (B, D_max, M_max, 4) for cols [8..11]
+    jac_lput_logm: torch.Tensor             # (B, D_max)
+
+    def to(self, *, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> SyntheticAutocallBatch:
+        """Move all tensors in the batch to `device` and/or floating `dtype`."""
+        def _mv(t: torch.Tensor) -> torch.Tensor:
+            return t.to(device=device if device is not None else t.device, dtype=dtype if dtype is not None else t.dtype)
+
+        return SyntheticAutocallBatch(
+            node_feats=_mv(self.node_feats),
+            edge_feats=_mv(self.edge_feats),
+            asset_mask=_mv(self.asset_mask),
+            sched_feats=_mv(self.sched_feats),
+            sched_mask=_mv(self.sched_mask),
+            global_feats=_mv(self.global_feats),
+            p_proxy=_mv(self.p_proxy),
+            q_proxy=_mv(self.q_proxy),
+            l_put_proxy=_mv(self.l_put_proxy),
+            pv_proxy=_mv(self.pv_proxy),
+            delta_proxy=_mv(self.delta_proxy),
+            p_mc=_mv(self.p_mc),
+            q_mc=_mv(self.q_mc),
+            l_put_mc=_mv(self.l_put_mc),
+            pv_mc=_mv(self.pv_mc),
+            delta_mc=_mv(self.delta_mc),
+            no_notional_repayment=_mv(self.no_notional_repayment),
+            autocall_coupon=_mv(self.autocall_coupon),
+            force_coupons_on_autocall=_mv(self.force_coupons_on_autocall),
+            is_long_basket=_mv(self.is_long_basket),
+            lower_strike=_mv(self.lower_strike),
+            p_proxy_ko_bumped=_mv(self.p_proxy_ko_bumped),
+            jac_node_logm=_mv(self.jac_node_logm),
+            jac_edge_self=_mv(self.jac_edge_self),
+            jac_sched_logm=_mv(self.jac_sched_logm),
+            jac_lput_logm=_mv(self.jac_lput_logm),
+        )
+
+    def index_select(self, idx: torch.Tensor) -> SyntheticAutocallBatch:
+        """Gather a mini-batch along dimension 0."""
+        idx_dev = idx.to(device=self.node_feats.device)
+        return SyntheticAutocallBatch(
+            node_feats=self.node_feats.index_select(0, idx_dev),
+            edge_feats=self.edge_feats.index_select(0, idx_dev),
+            asset_mask=self.asset_mask.index_select(0, idx_dev),
+            sched_feats=self.sched_feats.index_select(0, idx_dev),
+            sched_mask=self.sched_mask.index_select(0, idx_dev),
+            global_feats=self.global_feats.index_select(0, idx_dev),
+            p_proxy=self.p_proxy.index_select(0, idx_dev),
+            q_proxy=self.q_proxy.index_select(0, idx_dev),
+            l_put_proxy=self.l_put_proxy.index_select(0, idx_dev),
+            pv_proxy=self.pv_proxy.index_select(0, idx_dev),
+            delta_proxy=self.delta_proxy.index_select(0, idx_dev),
+            p_mc=self.p_mc.index_select(0, idx_dev),
+            q_mc=self.q_mc.index_select(0, idx_dev),
+            l_put_mc=self.l_put_mc.index_select(0, idx_dev),
+            pv_mc=self.pv_mc.index_select(0, idx_dev),
+            delta_mc=self.delta_mc.index_select(0, idx_dev),
+            no_notional_repayment=self.no_notional_repayment.index_select(0, idx_dev),
+            autocall_coupon=self.autocall_coupon.index_select(0, idx_dev),
+            force_coupons_on_autocall=self.force_coupons_on_autocall.index_select(0, idx_dev),
+            is_long_basket=self.is_long_basket.index_select(0, idx_dev),
+            lower_strike=self.lower_strike.index_select(0, idx_dev),
+            p_proxy_ko_bumped=self.p_proxy_ko_bumped.index_select(0, idx_dev),
+            jac_node_logm=self.jac_node_logm.index_select(0, idx_dev),
+            jac_edge_self=self.jac_edge_self.index_select(0, idx_dev),
+            jac_sched_logm=self.jac_sched_logm.index_select(0, idx_dev),
+            jac_lput_logm=self.jac_lput_logm.index_select(0, idx_dev),
+        )
 
 
 def _sample_symmetric_beta(
     alpha: torch.Tensor,
     *,
-    generator: torch.Generator | None = None,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    """Samples Beta(alpha, alpha) via independent Gamma(alpha, 1) variates using `torch._standard_gamma`."""
+    """Samples Beta(alpha, alpha) via independent Gamma(alpha, 1) variates."""
     g1 = torch._standard_gamma(alpha, generator=generator).clamp(min=1e-30)
     g2 = torch._standard_gamma(alpha, generator=generator).clamp(min=1e-30)
     return (g1 / (g1 + g2)).clamp(1e-7, 1.0 - 1e-7)
@@ -77,27 +179,9 @@ def sample_lkj_cholesky_bartlett(
     crisis_prob: float = 0.0,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float64,
-    generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Samples random SPD correlation matrices R and lower Cholesky factors L from LKJ(eta) (Proof W7, Gate G3.3).
-
-    Uses the exact C-vine / Bartlett partial-correlation parameterization (Lewandowski, Kurowicka & Joe 2009;
-    Hansen 2026 arXiv:2608.06116v2):
-      - For row j = 1 .. d-1 and column k = 0 .. j-1:
-          alpha_k = eta + (d - 2 - k) / 2.0
-          u_{k,j} ~ Beta(alpha_k, alpha_k),  p_{k,j} = 2 * u_{k,j} - 1 in (-1, 1)
-          L_{j,0} = p_{0,j}
-          L_{j,k} = p_{k,j} * prod_{m=0}^{k-1} sqrt(1 - p_{m,j}^2)   (1 <= k < j)
-          L_{j,j} = prod_{m=0}^{j-1} sqrt(1 - p_{m,j}^2) > 0
-      - Guarantees R = L @ L^T has unit diagonal, strictly positive eigenvalues (lambda_min(R) > 0),
-        and exact marginal distribution (R_{ij} + 1) / 2 ~ Beta(eta + (d-2)/2, eta + (d-2)/2) for all i != j.
-      - When `crisis_prob > 0.0`, replaces a fraction `crisis_prob` of samples with high-correlation
-        crisis equicorrelation matrices (rho ~ Uniform(0.80, 0.95)).
-
-    Returns:
-        corr_matrices: Tensor of shape (batch_size, d, d) in `dtype` on `device`.
-        chol_factors: Lower-triangular Cholesky tensor L of shape (batch_size, d, d) in `dtype` on `device`.
-    """
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Samples random SPD correlation matrices R and lower Cholesky factors L from LKJ(eta)."""
     if batch_size <= 0:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
     if d <= 0:
@@ -119,13 +203,13 @@ def sample_lkj_cholesky_bartlett(
 
     for j in range(1, d):
         k_idx = torch.arange(j, dtype=work_dtype, device=dev)
-        alphas = float(eta) + 0.5 * (float(d - 2) - k_idx)  # (j,)
+        alphas = float(eta) + 0.5 * (float(d - 2) - k_idx)
         alpha_batch = alphas.unsqueeze(0).expand(batch_size, j).contiguous()
         u_kj = _sample_symmetric_beta(alpha_batch, generator=generator)
-        p_kj = (2.0 * u_kj - 1.0).clamp(-1.0 + 1e-7, 1.0 - 1e-7)  # (B, j)
+        p_kj = (2.0 * u_kj - 1.0).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
 
-        sin_kj = torch.sqrt((1.0 - p_kj * p_kj).clamp(min=1e-14))  # (B, j)
-        cum_sin = torch.cumprod(sin_kj, dim=1)                     # (B, j)
+        sin_kj = torch.sqrt((1.0 - p_kj * p_kj).clamp(min=1e-14))
+        cum_sin = torch.cumprod(sin_kj, dim=1)
         prefix_sin = torch.cat(
             [torch.ones((batch_size, 1), dtype=work_dtype, device=dev), cum_sin[:, :-1]],
             dim=1,
@@ -147,376 +231,1102 @@ def sample_lkj_cholesky_bartlett(
             chol[is_crisis] = l_crisis
 
     corr = torch.bmm(chol, chol.transpose(1, 2))
-    # Symmetrize and set exact unit diagonal to eliminate floating-point roundoff
     corr = 0.5 * (corr + corr.transpose(1, 2))
     corr.diagonal(dim1=-2, dim2=-1).fill_(1.0)
 
     return corr.to(dtype=dtype), chol.to(dtype=dtype)
 
 
-def _sobol_normal_grid(
-    n_paths: int,
-    dim: int,
+def _build_ssvi_surface(
+    identifier: str,
+    iv_short: float,
+    iv_slope: float,
+    rho: float,
+    eta: float,
+) -> RegularizedVolSurface:
+    """Builds an arbitrage-free Gatheral SSVI RegularizedVolSurface in float64."""
+    iv_atm = np.clip(
+        iv_short + iv_slope * np.minimum(_SSVI_TENORS / 2.0, 1.0),
+        0.08,
+        0.90,
+    )
+    theta = (iv_atm * iv_atm) * _SSVI_TENORS
+    for m in range(1, len(theta)):
+        min_t = theta[m - 1] + 5e-4 * (_SSVI_TENORS[m] - _SSVI_TENORS[m - 1])
+        if theta[m] < min_t:
+            theta[m] = min_t
+
+    abs_rho = abs(rho)
+    # Enforce Gatheral-Jacquier butterfly sufficiency: theta*phi*(1+|rho|) < 4 and theta*phi^2*(1+|rho|) <= 4.
+    phi_raw = eta / np.sqrt(np.maximum(theta, 0.04))
+    phi_cap1 = 1.8 / (np.maximum(theta, 1e-4) * (1.0 + abs_rho))
+    phi_cap2 = np.sqrt(3.2 / (np.maximum(theta, 1e-4) * (1.0 + abs_rho)))
+    phi = np.minimum(phi_raw, np.minimum(phi_cap1, phi_cap2))
+
+    k_2d = _SSVI_LOG_K[None, :]
+    phi_2d = phi[:, None]
+    theta_2d = theta[:, None]
+    pk = phi_2d * k_2d
+    w_grid = 0.5 * theta_2d * (1.0 + rho * pk + np.sqrt((pk + rho) ** 2 + max(1.0 - rho * rho, 1e-4)))
+    quotes = np.clip(np.sqrt(np.maximum(w_grid / _SSVI_TENORS[:, None], 1e-4)), 0.05, 2.50)
+
+    spec = {
+        "Identifier": identifier,
+        "tenors": _SSVI_TENORS,
+        "Strikes": _SSVI_STRIKES,
+        "VolatilityQuotes": quotes,
+        "DayCountConvention": "Act365",
+        "SmileInterpolationMethod": "CubicSpline",
+        "SmileExtrapolationMethod": "Flat",
+    }
+    return RegularizedVolSurface(spec, min_vol=0.01, max_local_vol=2.50)
+
+
+_SSVI_BANK_CACHE: Dict[Tuple[int, str], List[RegularizedVolSurface]] = {}
+
+
+def _get_ssvi_bank(
+    n_bank: int = 1024,
     *,
-    seed: int = 1234,
-    device: torch.device,
+    domain_mode: str = "full_stress",
+) -> List[RegularizedVolSurface]:
+    """Lazily builds and caches a per-process Sobol-stratified SSVI surface bank."""
+    key = (int(n_bank), str(domain_mode))
+    cached = _SSVI_BANK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    eng = qmc.Sobol(d=4, scramble=True, seed=10007 if domain_mode == "full_stress" else 10009)
+    n_pow = 1 << max(1, (n_bank - 1).bit_length())
+    u_bank = eng.random(n=n_pow)[:n_bank]
+    bank: List[RegularizedVolSurface] = []
+    for k in range(n_bank):
+        if domain_mode == "core_desk":
+            # Institutional desk manifold: iv_atm in [0.15, 0.45] with realistic equity skew/curvature.
+            iv_s = 0.15 + 0.27 * float(u_bank[k, 0])
+            iv_sl = -0.04 + 0.09 * float(u_bank[k, 1])
+            rho_k = -0.55 + 0.65 * float(u_bank[k, 2])
+            eta_k = 0.15 + 0.30 * float(u_bank[k, 3])
+        else:
+            iv_s = 0.14 + 0.41 * float(u_bank[k, 0])
+            iv_sl = -0.07 + 0.16 * float(u_bank[k, 1])
+            rho_k = -0.65 + 0.90 * float(u_bank[k, 2])
+            eta_k = 0.15 + 0.55 * float(u_bank[k, 3])
+        bank.append(_build_ssvi_surface(f"BANK_{domain_mode}_{k:04d}", iv_s, iv_sl, rho_k, eta_k))
+    _SSVI_BANK_CACHE[key] = bank
+    return bank
+
+
+def _sample_owen_sobol_matrix(n_samples: int, dim: int, seed: int) -> npt.NDArray[np.float64]:
+    """Draws (n_samples, dim) independent Owen-scrambled Sobol uniforms in (0, 1)."""
+    eng = qmc.Sobol(d=dim, scramble=True, seed=seed)
+    n_pow = 1 << max(1, (n_samples - 1).bit_length())
+    draws = eng.random(n=n_pow)[:n_samples]
+    return np.asarray(draws, dtype=np.float64)
+
+
+def _assemble_w1_pv_torch(
+    baseline: AutocallBaselineOutput,
+    df_pay: torch.Tensor,
+    cpn_rates: torch.Tensor,
+    *,
+    strike: float,
+    option_gearing: float,
+    c_mem_0: float,
+    is_memory: bool,
+    no_notional_repayment: bool,
+    autocall_coupon: float,
+    force_coupons_on_autocall: bool,
+    is_long_basket: bool,
 ) -> torch.Tensor:
-    """Generates scrambled Sobol standard normal variates of shape (n_paths, dim) in torch.float64."""
-    sobol = torch.quasirandom.SobolEngine(dimension=dim, scramble=True, seed=seed)  # type: ignore[no-untyped-call]
-    u = sobol.draw(n_paths).to(dtype=torch.float64, device=device).clamp(1e-7, 1.0 - 1e-7)
-    return math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+    """Pure differentiable W1 ProductValue matching assemble_surrogate_product_value."""
+    m_rem = int(df_pay.shape[0])
+    p_m = baseline.p_proxy
+    q_m = baseline.q_proxy
+    surv_m = baseline.survival_proxy
+    surv_prev = torch.cat([torch.ones(1, dtype=torch.float64, device=df_pay.device), surv_m[:-1]], dim=0)
+
+    if no_notional_repayment:
+        pv_notional = torch.zeros((), dtype=torch.float64, device=df_pay.device)
+    else:
+        pv_notional = (df_pay * p_m).sum() + df_pay[-1] * surv_m[-1]
+
+    eff_q_all = (
+        torch.maximum(q_m, p_m / surv_prev.clamp(min=1e-12))
+        if force_coupons_on_autocall
+        else q_m
+    )
+    if not is_memory:
+        pv_cpn = (df_pay * (surv_prev * eff_q_all * cpn_rates + p_m * autocall_coupon)).sum()
+    else:
+        eq_u = eff_q_all.unbind(0)
+        sp_u = surv_prev.unbind(0)
+        df_u = df_pay.unbind(0)
+        cp_u = cpn_rates.unbind(0)
+        pm_u = p_m.unbind(0)
+        mem_buf = torch.tensor(c_mem_0, dtype=torch.float64, device=df_pay.device)
+        pv_cpn = torch.zeros((), dtype=torch.float64, device=df_pay.device)
+        for m in range(m_rem):
+            c_eff = cp_u[m] + mem_buf
+            pv_cpn = pv_cpn + df_u[m] * (sp_u[m] * eq_u[m] * c_eff + pm_u[m] * autocall_coupon)
+            mem_buf = (1.0 - eq_u[m]) * c_eff
+
+    put_sign = 1.0 if is_long_basket else -1.0
+    pv_opt = put_sign * df_pay[-1] * option_gearing * baseline.l_put_proxy
+    return pv_notional + pv_cpn + pv_opt
+
+
+def _build_contract_state_and_jacs(
+    *,
+    u_row: npt.NDArray[np.float64],
+    d_active: int,
+    m_rem: int,
+    d_max: int,
+    m_max: int,
+    ko_bump_delta: float,
+    rng: np.random.Generator,
+    attach_surfaces: bool = True,
+    domain_mode: str = "tier2_desk",
+) -> Tuple[
+    AutocallPreprocState,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    List[int],
+]:
+    """Builds one contract's AutocallPreprocState, exact dX/d(ln M0) Jacobians, and bumped KO probs."""
+    u_reg = float(u_row[0])
+    m0_u = rng.random(d_active)
+    is_distressed = False
+    if domain_mode == "tier2_desk":
+        is_distressed = u_reg >= 0.85
+        if not is_distressed:
+            # 85% core desk manifold: m0 in [0.60, 1.35]
+            m0_np = 0.60 + 0.75 * m0_u
+        else:
+            # 15% seasoned/distressed belt (especially M_rem <= 4 so reference 45476647 is well in-support)
+            if m_rem <= 4 and float(rng.random()) < 0.70:
+                m0_np = 0.18 + 0.55 * m0_u
+            else:
+                m0_np = 0.18 + 1.22 * m0_u
+    else:
+        if u_reg < 0.25:
+            m0_np = 0.15 + 0.50 * m0_u
+        elif u_reg < 0.60:
+            m0_np = 0.75 + 0.40 * m0_u
+        else:
+            m0_np = 0.35 + 1.15 * m0_u
+    # Exercise exact/near-exact ties on ~10% of multi-asset contracts.
+    if d_active >= 2 and float(u_row[1]) < 0.10:
+        m0_np[1] = m0_np[0]
+
+    ref_np = np.full(d_active, 100.0, dtype=np.float64)
+    spots_np = ref_np * m0_np
+
+    r_disc = 0.02 + 0.14 * float(u_row[2])
+    div_yields = 0.04 * rng.random(d_active)
+    repo_avg_np = 0.03 * rng.random(d_active)
+    carry_1y_np = r_disc - div_yields - repo_avg_np
+
+    u_dtau = float(u_row[3])
+    if domain_mode == "tier2_desk":
+        # Cap contract maturity <= 5.0y across M_rem in [1..48]
+        if m_rem > 20:
+            dtau = 1.0 / 12.0
+        elif m_rem >= 9:
+            dtau = (1.0 / 12.0) if u_dtau < 0.50 else 0.25
+        else:
+            dtau = 0.15 + 0.35 * u_dtau
+    else:
+        if m_rem <= 12:
+            dtau = 0.08333333333333333 if u_dtau < 0.25 else (0.25 if u_dtau < 0.80 else 0.50)
+        elif m_rem <= 24:
+            dtau = 0.08333333333333333 if u_dtau < 0.35 else (0.25 if u_dtau < 0.90 else 0.50)
+        else:
+            dtau = 0.08333333333333333 if u_dtau < 0.45 else 0.25
+
+    tau_obs_np = np.arange(1, m_rem + 1, dtype=np.float64) * dtau
+    delta_tau_np = np.full(m_rem, dtau, dtype=np.float64)
+    df_pay_np = np.exp(-r_disc * tau_obs_np)
+
+    u_fn = float(u_row[4])
+    if domain_mode == "tier2_desk":
+        if d_active < 2 or u_fn < 0.60:
+            call_idx = "WorstOf"
+        elif u_fn < 0.80:
+            call_idx = "BestOf"
+        else:
+            call_idx = "AverageOf"
+        cpn_idx = call_idx
+        opt_idx = call_idx
+    elif d_active < 2:
+        call_idx = "WorstOf"
+        cpn_idx = "WorstOf"
+        opt_idx = "WorstOf"
+    elif u_fn < 0.50:
+        call_idx = "WorstOf"
+        cpn_idx = "WorstOf"
+        opt_idx = "WorstOf"
+    elif u_fn < 0.62:
+        call_idx = "BestOf"
+        cpn_idx = "BestOf"
+        opt_idx = "BestOf"
+    elif u_fn < 0.74:
+        call_idx = "AverageOf"
+        cpn_idx = "AverageOf"
+        opt_idx = "AverageOf"
+    elif u_fn < 0.82:
+        call_idx = "Dispersion"
+        cpn_idx = "Dispersion"
+        opt_idx = "WorstOf" if float(u_row[5]) < 0.5 else "Dispersion"
+    elif u_fn < 0.88 and d_active == 2:
+        call_idx = "RatioAB" if float(u_row[5]) < 0.5 else "RatioBA"
+        cpn_idx = call_idx
+        opt_idx = call_idx
+    elif u_fn < 0.94 and d_active == 2:
+        call_idx = "DiffAB" if float(u_row[5]) < 0.5 else "DiffBA"
+        cpn_idx = call_idx
+        # Signed differences can go negative and exceed K_put; WorstOf put keeps the upper cap U_put exact.
+        opt_idx = "WorstOf"
+    else:
+        pool_3 = ("WorstOf", "BestOf", "AverageOf")
+        call_idx = pool_3[int(rng.integers(0, 3))]
+        cpn_idx = pool_3[int(rng.integers(0, 3))]
+        opt_idx = pool_3[int(rng.integers(0, 3))]
+
+    sorted_ids = [f"SYN_{i:02d}" for i in range(d_active)]
+    lex_perm_np = np.arange(d_active, dtype=np.int64)
+    if d_active >= 2 and float(u_row[6]) < 0.5:
+        inv_lex_perm_np = np.arange(d_active, dtype=np.int64)
+        inv_lex_perm_np[0], inv_lex_perm_np[1] = 1, 0
+    else:
+        inv_lex_perm_np = np.arange(d_active, dtype=np.int64)
+
+    role_leg_a = np.zeros(d_active, dtype=np.float64)
+    role_leg_b = np.zeros(d_active, dtype=np.float64)
+    if d_active >= 2 and any(idx in PAIR_ORDER_DEPENDENT_INDICES for idx in (call_idx, cpn_idx, opt_idx)):
+        role_leg_a[int(inv_lex_perm_np[0])] = 1.0
+        role_leg_b[int(inv_lex_perm_np[1])] = 1.0
+
+    # LKJ correlation matrix with crisis regime mixing
+    gen_corr = torch.Generator(device="cpu")
+    gen_corr.manual_seed(int(rng.integers(0, 2**31 - 1)))
+    corr_b, _ = sample_lkj_cholesky_bartlett(
+        batch_size=1,
+        d=d_active,
+        eta=2.0,
+        crisis_prob=0.15,
+        device="cpu",
+        dtype=torch.float64,
+        generator=gen_corr,
+    )
+    corr_t = corr_b[0]
+
+    # Contract payoff terms & independent digital spreads
+    if opt_idx == "Dispersion":
+        k_put = 0.05 + 0.20 * float(u_row[7])
+    else:
+        k_put = 0.65 + 0.35 * float(u_row[7])
+    has_lower = float(u_row[8]) < 0.25 and k_put > 0.12
+    if domain_mode == "tier2_desk":
+        lower_strike_val = (
+            round(min(0.35, k_put * 0.60) * float(rng.random()), 4) if has_lower else 0.0
+        )
+    else:
+        lower_strike_val = round(k_put * (0.25 + 0.45 * float(rng.random())), 4) if has_lower else 0.0
+    has_ki = float(u_row[9]) < 0.65
+    if opt_idx == "Dispersion":
+        b_ki = (0.03 + 0.12 * float(rng.random())) if has_ki else k_put
+    else:
+        b_ki = (0.45 + 0.35 * float(rng.random())) if has_ki else k_put
+    i_ki_past = 1.0 if (has_ki and float(u_row[10]) < 0.10) else 0.0
+    if domain_mode == "tier2_desk":
+        g_put = (
+            min(1.25, max(0.50, 1.0 / max(k_put, 1e-4)))
+            if float(u_row[11]) < 0.50
+            else (0.50 + 0.75 * float(rng.random()))
+        )
+    else:
+        g_put = (
+            min(2.0, 1.0 / max(k_put, 1e-4))
+            if float(u_row[11]) < 0.50
+            else (0.5 + 1.2 * float(rng.random()))
+        )
+    is_memory = float(u_row[12]) < 0.65
+    c_mem_cap = 0.40 if (domain_mode == "tier2_desk" and is_distressed) else (0.38 if domain_mode == "tier2_desk" else 0.45)
+    c_mem_0 = (float(rng.random()) * c_mem_cap) if (is_memory and float(rng.random()) < 0.70) else 0.0
+
+    no_notional = float(u_row[13]) < 0.08
+    ac_cpn = (0.02 + 0.10 * float(rng.random())) if float(u_row[14]) < 0.12 else 0.0
+    force_cpn = float(u_row[15]) < 0.18
+    is_long_basket = False if domain_mode == "tier2_desk" else (float(u_row[16]) < 0.10)
+
+    def _draw_spread() -> float:
+        if domain_mode == "tier2_desk":
+            return -(0.005 + 0.135 * float(rng.random()))
+        u_s = float(rng.random())
+        if u_s < 0.05:
+            return 0.0
+        return -(0.005 + 0.195 * float(rng.random()))
+
+    ko_spread = _draw_spread()
+    cpn_spread = _draw_spread()
+    ki_spread = _draw_spread()
+
+    # Scale barriers appropriately for Dispersion / Diff* / Ratio* vs standard level functionals.
+    def _barrier_scale(idx_name: str, is_ko: bool) -> Tuple[float, float]:
+        if idx_name == "Dispersion":
+            return (0.18 + 0.25 * float(rng.random()), 0.005) if is_ko else (0.08 + 0.15 * float(rng.random()), 0.0)
+        if idx_name in ("DiffAB", "DiffBA"):
+            return (0.10 + 0.25 * float(rng.random()), 0.005) if is_ko else (-0.15 + 0.20 * float(rng.random()), 0.0)
+        if idx_name in ("RatioAB", "RatioBA"):
+            return (1.05 + 0.20 * float(rng.random()), 0.01) if is_ko else (0.75 + 0.20 * float(rng.random()), 0.0)
+        return (0.95 + 0.15 * float(rng.random()), 0.015 * float(rng.random())) if is_ko else (0.65 + 0.20 * float(rng.random()), 0.0)
+
+    base_ko, step_ko = _barrier_scale(call_idx, True)
+    base_cpn_b, _ = _barrier_scale(cpn_idx, False)
+    if domain_mode == "tier2_desk":
+        # FixedRate * dtau per Murex schedule convention (6%-20% annualized coupon)
+        cpn_rate_val = (0.06 + 0.14 * float(rng.random())) * dtau
+    else:
+        cpn_rate_val = 0.02 + 0.03 * float(rng.random())
+
+    ko_barriers_np = np.zeros(m_rem, dtype=np.float64)
+    is_callable_np = np.ones(m_rem, dtype=np.float64)
+    cpn_barriers_np = np.zeros(m_rem, dtype=np.float64)
+    is_guar_np = np.zeros(m_rem, dtype=np.float64)
+    cpn_rates_np = np.full(m_rem, cpn_rate_val, dtype=np.float64)
+    log_ko_feat_np = np.zeros(m_rem, dtype=np.float64)
+    log_cpn_feat_np = np.zeros(m_rem, dtype=np.float64)
+
+    lockout_len = int(rng.integers(1, min(4, m_rem))) if (m_rem > 1 and float(u_row[17]) < 0.25) else 0
+    has_guar_0 = float(u_row[18]) < 0.20
+    for m in range(m_rem):
+        # allow_autocall_on_expiry=False requires final expiry date m == m_rem - 1 to be non-callable
+        # so Tier-1 proxy does not double-discount L_put by (1 - p[-1]).
+        if m < lockout_len or m == (m_rem - 1):
+            ko_barriers_np[m] = 500.0
+            is_callable_np[m] = 0.0
+            log_ko_feat_np[m] = math.log(3.0)
+        else:
+            b_k = max(base_ko - step_ko * m, 0.50 if call_idx not in ("Dispersion", "DiffAB", "DiffBA") else 0.05)
+            ko_barriers_np[m] = b_k
+            is_callable_np[m] = 1.0
+            log_ko_feat_np[m] = math.log(min(max(b_k, 1e-4), 3.0))
+
+        if m == 0 and has_guar_0:
+            cpn_barriers_np[m] = 1e-5
+            is_guar_np[m] = 1.0
+            log_cpn_feat_np[m] = math.log(0.05)
+        else:
+            cpn_barriers_np[m] = base_cpn_b
+            is_guar_np[m] = 0.0
+            log_cpn_feat_np[m] = math.log(max(base_cpn_b, 0.05))
+
+    # Draw arbitrage-free SSVI RegularizedVolSurfaces from cached bank and precompute linearizations
+    bank_mode = "full_stress" if (domain_mode != "tier2_desk" or is_distressed) else "core_desk"
+    ssvi_bank = _get_ssvi_bank(1024, domain_mode=bank_mode)
+    surf_indices: List[int] = [int(idx) for idx in rng.integers(0, len(ssvi_bank), size=d_active)]
+    reg_surfaces: Dict[str, RegularizedVolSurface] = {}
+    iv_0_np = np.zeros((d_active, m_rem), dtype=np.float64)
+    d_iv_dk_np = np.zeros((d_active, m_rem), dtype=np.float64)
+    surf_feats_0_np = np.zeros((d_active, 7), dtype=np.float64)
+    d_surf_df_short_np = np.zeros((d_active, 7), dtype=np.float64)
+    d_surf_df_term_np = np.zeros((d_active, 7), dtype=np.float64)
+
+    fwd_rel_np = np.exp(carry_1y_np[:, None] * tau_obs_np[None, :])
+    fwd_0_np = spots_np[:, None] * fwd_rel_np
+
+    for i, ticker in enumerate(sorted_ids):
+        surf_i = ssvi_bank[surf_indices[i]]
+        if attach_surfaces:
+            reg_surfaces[ticker] = surf_i
+        f_row = fwd_0_np[i]
+        iv_0_np[i] = surf_i.iv_batch(tau_obs_np, f_row)
+        eps_k = np.maximum(1e-5 * f_row, 1e-6)
+        f_hi = f_row + eps_k
+        f_lo = np.maximum(f_row - eps_k, 1e-6)
+        d_iv_dk_np[i] = (surf_i.iv_batch(tau_obs_np, f_hi) - surf_i.iv_batch(tau_obs_np, f_lo)) / (f_hi - f_lo)
+
+        t_s = float(tau_obs_np[0])
+        t_t = float(tau_obs_np[-1])
+        f_s = float(f_row[0])
+        f_t = float(f_row[-1])
+        surf_feats_0_np[i] = surf_i.extract_node_surface_features_values_only(
+            t_s, f_s, t_t, f_t, iv_short_val=float(iv_0_np[i, 0]), iv_term_val=float(iv_0_np[i, -1])
+        )
+        es = max(1e-4 * f_s, 1e-5)
+        et = max(1e-4 * f_t, 1e-5)
+        d_surf_df_short_np[i] = (
+            surf_i.extract_node_surface_features_values_only(t_s, f_s + es, t_t, f_t)
+            - surf_i.extract_node_surface_features_values_only(t_s, max(f_s - es, 1e-5), t_t, f_t)
+        ) / (f_s + es - max(f_s - es, 1e-5))
+        d_surf_df_term_np[i] = (
+            surf_i.extract_node_surface_features_values_only(t_s, f_s, t_t, f_t + et)
+            - surf_i.extract_node_surface_features_values_only(t_s, f_s, t_t, max(f_t - et, 1e-5))
+        ) / (f_t + et - max(f_t - et, 1e-5))
+
+    # Tensors used inside jacfwd feature builder
+    ref_t = torch.tensor(ref_np, dtype=torch.float64)
+    fwd_rel_t = torch.tensor(fwd_rel_np, dtype=torch.float64)
+    fwd_0_t = torch.tensor(fwd_0_np, dtype=torch.float64)
+    iv_0_t = torch.tensor(iv_0_np, dtype=torch.float64)
+    d_iv_dk_t = torch.tensor(d_iv_dk_np, dtype=torch.float64)
+    surf_0_t = torch.tensor(surf_feats_0_np, dtype=torch.float64)
+    d_surf_fs_t = torch.tensor(d_surf_df_short_np, dtype=torch.float64)
+    d_surf_ft_t = torch.tensor(d_surf_df_term_np, dtype=torch.float64)
+    sqrt_tau_t = torch.sqrt(torch.tensor(tau_obs_np, dtype=torch.float64).clamp(min=1e-12))
+
+    carry_t = torch.tensor(carry_1y_np, dtype=torch.float64)
+    repo_t = torch.tensor(repo_avg_np, dtype=torch.float64)
+    div_lev_cap = 0.05 if domain_mode == "tier2_desk" else 0.06
+    div_lev_np = np.where(rng.random(d_active) < 0.35, 0.0, div_lev_cap * rng.random(d_active))
+    div_lev_log_t = torch.tensor(div_lev_np, dtype=torch.float64)
+    cash_lev_t = torch.exp(div_lev_log_t).unsqueeze(1).expand(d_active, m_rem).clone()
+    role_a_t = torch.tensor(role_leg_a, dtype=torch.float64)
+    role_b_t = torch.tensor(role_leg_b, dtype=torch.float64)
+    ones_d = torch.ones(d_active, dtype=torch.float64)
+
+    tau_obs_t = torch.tensor(tau_obs_np, dtype=torch.float64)
+    dtau_t = torch.tensor(delta_tau_np, dtype=torch.float64)
+    df_pay_t = torch.tensor(df_pay_np, dtype=torch.float64)
+    ko_t = torch.tensor(ko_barriers_np, dtype=torch.float64)
+    is_call_t = torch.tensor(is_callable_np, dtype=torch.float64)
+    cpn_b_t = torch.tensor(cpn_barriers_np, dtype=torch.float64)
+    is_guar_t = torch.tensor(is_guar_np, dtype=torch.float64)
+    cpn_r_t = torch.tensor(cpn_rates_np, dtype=torch.float64)
+    log_ko_t = torch.tensor(log_ko_feat_np, dtype=torch.float64)
+    log_cpn_t = torch.tensor(log_cpn_feat_np, dtype=torch.float64)
+
+    call_code_f = float(monitoring_index_to_code(call_idx))
+    cpn_code_f = float(monitoring_index_to_code(cpn_idx))
+    opt_code_f = float(monitoring_index_to_code(opt_idx))
+    eye_d = torch.eye(d_active, dtype=torch.float64)
+    off_diag = 1.0 - eye_d
+    k_eff_put = max(k_put, 1e-4)
+    glob_base = torch.tensor(
+        [
+            k_put,
+            b_ki,
+            1.0 if has_ki else 0.0,
+            i_ki_past,
+            g_put,
+            c_mem_0,
+            1.0 if is_memory else 0.0,
+            abs(ko_spread),
+            abs(cpn_spread),
+            0.0,
+            lower_strike_val,
+            call_code_f,
+            cpn_code_f,
+            opt_code_f,
+            1.0 if is_long_basket else 0.0,
+            abs(ki_spread),
+        ],
+        dtype=torch.float64,
+    )
+
+    def _features_from_m0(
+        m0_vec: torch.Tensor,
+        *,
+        use_fast_cpu: Optional[bool] = True,
+    ) -> Tuple[
+        torch.Tensor,  # node_act (D, 16)
+        torch.Tensor,  # edge_act (D, D, 4)
+        torch.Tensor,  # sched_act (M, 12)
+        torch.Tensor,  # glob_act (16,)
+        torch.Tensor,  # pv_proxy ()
+        torch.Tensor,  # p_proxy (M,)
+        torch.Tensor,  # q_proxy (M,)
+        torch.Tensor,  # l_put_proxy ()
+        torch.Tensor,  # f_w (M,)
+        torch.Tensor,  # v_w (M,)
+    ]:
+        spots_v = ref_t * m0_vec
+        fwd_price_v = spots_v.unsqueeze(1) * fwd_rel_t
+        fwd_perf_v = m0_vec.unsqueeze(1) * fwd_rel_t
+        iv_v = (iv_0_t + d_iv_dk_t * (fwd_price_v - fwd_0_t)).clamp(min=0.01)
+        v_perf_v = iv_v * sqrt_tau_t.unsqueeze(0) * cash_lev_t
+
+        df_s = (fwd_price_v[:, 0] - fwd_0_t[:, 0]).unsqueeze(-1)
+        df_t = (fwd_price_v[:, -1] - fwd_0_t[:, -1]).unsqueeze(-1)
+        surf_v = surf_0_t + d_surf_fs_t * df_s + d_surf_ft_t * df_t
+
+        proxy_in = {
+            "forward_perf": fwd_perf_v,
+            "v_perf": v_perf_v,
+            "corr_matrix": corr_t,
+            "df_pay": df_pay_t,
+            "ko_barriers": ko_t,
+            "is_callable": is_call_t,
+            "cpn_barriers": cpn_b_t,
+            "is_guaranteed_cpn": is_guar_t,
+            "coupon_amounts": cpn_r_t,
+            "strike": k_put,
+            "option_gearing": g_put,
+            "lower_strike": lower_strike_val if lower_strike_val > 0.0 else None,
+            "ki_barrier": b_ki if has_ki else None,
+            "i_ki_past": i_ki_past,
+            "c_mem_0": c_mem_0,
+            "is_memory": is_memory,
+            "ko_spread": ko_spread,
+            "cpn_spread": cpn_spread,
+            "ki_spread": ki_spread,
+            "no_notional_repayment": no_notional,
+            "autocall_coupon": ac_cpn,
+            "force_coupons_on_autocall": force_cpn,
+            "allow_autocall_on_expiry": False,
+            "is_long_basket": is_long_basket,
+            "pv_in_transit": 0.0,
+            "already_autocalled": False,
+            "callability_index": call_idx,
+            "coupon_index": cpn_idx,
+            "option_index": opt_idx,
+            "inv_lex_perm": inv_lex_perm_np,
+            "tau_obs": tau_obs_t,
+        }
+        b_out = compute_analytical_autocall_baseline(proxy_in, use_fast_cpu=use_fast_cpu)
+
+        log_m0_v = torch.log(m0_vec.clamp(min=1e-12))
+        f_p_term = fwd_perf_v[:, -1].clamp(min=1e-12)
+        v_term_v = v_perf_v[:, -1].clamp(min=1e-6)
+        dist_put = torch.log(f_p_term / k_eff_put) / v_term_v
+
+        node_v = torch.stack(
+            [
+                log_m0_v,
+                carry_t,
+                div_lev_log_t,
+                repo_t,
+                surf_v[:, 0],
+                surf_v[:, 1],
+                surf_v[:, 2],
+                surf_v[:, 3],
+                surf_v[:, 4],
+                surf_v[:, 5],
+                surf_v[:, 6],
+                dist_put,
+                b_out.proxy_delta_weights,
+                ones_d,
+                role_a_t,
+                role_b_t,
+            ],
+            dim=1,
+        )
+
+        log_fp_term = torch.log(f_p_term)
+        cov_term = corr_t * v_term_v.unsqueeze(1) * v_term_v.unsqueeze(0) * off_diag
+        # Smooth abs so jacfwd stays finite even on exact tied spots m0[0] == m0[1].
+        diff_fp = log_fp_term.unsqueeze(1) - log_fp_term.unsqueeze(0)
+        log_perf_diff = torch.sqrt(diff_fp * diff_fp + 1e-12) * off_diag
+        edge_v = torch.stack(
+            [corr_t * off_diag, cov_term, log_perf_diff, off_diag],
+            dim=-1,
+        )
+
+        sched_v = torch.stack(
+            [
+                tau_obs_t,
+                dtau_t,
+                df_pay_t,
+                log_ko_t,
+                is_call_t,
+                log_cpn_t,
+                is_guar_t,
+                cpn_r_t,
+                torch.log(b_out.f_w.clamp(min=1e-12)),
+                b_out.v_w,
+                b_out.p_proxy,
+                b_out.q_proxy,
+            ],
+            dim=1,
+        )
+
+        glob_v = glob_base.clone()
+        glob_v[9] = b_out.l_put_proxy
+
+        pv_p = _assemble_w1_pv_torch(
+            b_out,
+            df_pay_t,
+            cpn_r_t,
+            strike=k_put,
+            option_gearing=g_put,
+            c_mem_0=c_mem_0,
+            is_memory=is_memory,
+            no_notional_repayment=no_notional,
+            autocall_coupon=ac_cpn,
+            force_coupons_on_autocall=force_cpn,
+            is_long_basket=is_long_basket,
+        )
+        return (
+            node_v,
+            edge_v,
+            sched_v,
+            glob_v,
+            pv_p,
+            b_out.p_proxy,
+            b_out.q_proxy,
+            b_out.l_put_proxy,
+            b_out.f_w,
+            b_out.v_w,
+        )
+
+    m0_t = torch.tensor(m0_np, dtype=torch.float64)
+    with torch.no_grad():
+        (
+            node_act,
+            edge_act,
+            sched_act,
+            glob_act,
+            pv_proxy,
+            p_proxy_v,
+            q_proxy_v,
+            l_put_proxy_v,
+            f_w_v,
+            v_w_v,
+        ) = _features_from_m0(m0_t, use_fast_cpu=True)
+
+        # Central finite-difference Jacobian wrt ln(M_0) using fast C++23 Tier-1 backend.
+        h_fd = 1e-6
+        inv_2h = 0.5 / h_fd
+        ep = math.exp(h_fd)
+        em = math.exp(-h_fd)
+        jac_node_act = torch.zeros((d_active, d_active, 16), dtype=torch.float64)
+        jac_edge_self_act = torch.zeros((d_active, d_active, 2), dtype=torch.float64)
+        jac_sched_act = torch.zeros((d_active, m_rem, 4), dtype=torch.float64)
+        jac_lput_act = torch.zeros((d_active,), dtype=torch.float64)
+        delta_proxy_act = torch.zeros((d_active,), dtype=torch.float64)
+        for i in range(d_active):
+            m_up = m0_t.clone()
+            m_dn = m0_t.clone()
+            m_up[i] = m0_t[i] * ep
+            m_dn[i] = m0_t[i] * em
+            n_u, e_u, s_u, _, pv_u, _, _, lp_u, _, _ = _features_from_m0(m_up, use_fast_cpu=True)
+            n_d, e_d, s_d, _, pv_d, _, _, lp_d, _, _ = _features_from_m0(m_dn, use_fast_cpu=True)
+            jac_node_act[i] = (n_u - n_d) * inv_2h
+            jac_edge_self_act[i] = (e_u[i, :, 1:3] - e_d[i, :, 1:3]) * inv_2h
+            jac_sched_act[i] = (s_u[:, 8:12] - s_d[:, 8:12]) * inv_2h
+            jac_lput_act[i] = (lp_u - lp_d) * inv_2h
+            delta_proxy_act[i] = (pv_u - pv_d) * inv_2h
+
+    # Precompute analytically bumped PROXY_KO_PROB at B_KO * exp(ko_bump_delta)
+    ko_bumped = torch.where(
+        is_call_t > 0.5,
+        ko_t * math.exp(ko_bump_delta),
+        ko_t,
+    )
+    ko_prob_b = _digital_call_spread_prob_torch(f_w_v, v_w_v, ko_bumped, ko_spread)
+    h_b = is_call_t * ko_prob_b.clamp(0.0, 1.0 - 1e-7)
+    surv_b = torch.cumprod(1.0 - h_b, dim=0)
+    surv_prev_b = torch.cat([torch.ones(1, dtype=torch.float64), surv_b[:-1]], dim=0)
+    p_proxy_ko_bumped_act = surv_prev_b * h_b
+
+    # Pad to (d_max, m_max) for AutocallPreprocState and batch tensors
+    node_pad = torch.zeros((1, d_max, 16), dtype=torch.float64)
+    node_pad[0, :d_active] = node_act
+    edge_pad = torch.zeros((1, d_max, d_max, 4), dtype=torch.float64)
+    edge_pad[0, :d_active, :d_active] = edge_act
+    amask_pad = torch.zeros((1, d_max), dtype=torch.float64)
+    amask_pad[0, :d_active] = 1.0
+    sched_pad = torch.zeros((1, m_max, 12), dtype=torch.float64)
+    sched_pad[0, :m_rem] = sched_act
+    smask_pad = torch.zeros((1, m_max), dtype=torch.float64)
+    smask_pad[0, :m_rem] = 1.0
+    glob_pad = glob_act.unsqueeze(0)
+
+    jac_node_pad = torch.zeros((d_max, d_max, 16), dtype=torch.float64)
+    jac_node_pad[:d_active, :d_active] = jac_node_act
+    jac_edge_pad = torch.zeros((d_max, d_max, 2), dtype=torch.float64)
+    jac_edge_pad[:d_active, :d_active] = jac_edge_self_act
+    jac_sched_pad = torch.zeros((d_max, m_max, 4), dtype=torch.float64)
+    jac_sched_pad[:d_active, :m_rem] = jac_sched_act
+    jac_lput_pad = torch.zeros((d_max,), dtype=torch.float64)
+    jac_lput_pad[:d_active] = jac_lput_act
+    delta_proxy_pad = torch.zeros((d_max,), dtype=torch.float64)
+    delta_proxy_pad[:d_active] = delta_proxy_act
+
+    p_proxy_pad = torch.zeros((m_max,), dtype=torch.float64)
+    p_proxy_pad[:m_rem] = p_proxy_v
+    q_proxy_pad = torch.zeros((m_max,), dtype=torch.float64)
+    q_proxy_pad[:m_rem] = q_proxy_v
+    p_bumped_pad = torch.zeros((m_max,), dtype=torch.float64)
+    p_bumped_pad[:m_rem] = p_proxy_ko_bumped_act
+
+    # Construct lightweight AutocallPreprocState for GPU Dupire QMC
+    obs_dates_dt = [_BASE_AS_OF + timedelta(days=int(round(t * 365.0))) for t in tau_obs_np]
+    r_tot_obs_t = torch.full((d_active, m_rem), r_disc, dtype=torch.float64)
+    df_fin_obs_t = df_pay_t.unsqueeze(0).expand(d_active, m_rem).clone()
+    df_repo_obs_t = torch.exp(-torch.tensor(repo_avg_np[:, None] * tau_obs_np[None, :], dtype=torch.float64))
+    fwd_price_t = torch.tensor(fwd_0_np, dtype=torch.float64)
+    fwd_perf_t = torch.tensor(m0_np[:, None] * fwd_rel_np, dtype=torch.float64)
+    iv_t = torch.tensor(iv_0_np, dtype=torch.float64)
+    v_perf_t = iv_t * sqrt_tau_t.unsqueeze(0) * cash_lev_t
+
+    div_out = EscrowedDividendOutput(
+        identifiers=sorted_ids,
+        as_of_date=_BASE_AS_OF,
+        observation_dates=obs_dates_dt,
+        div_pv=torch.zeros(d_active, dtype=torch.float64),
+        escrowed_spot=torch.tensor(spots_np, dtype=torch.float64),
+        forward_price=fwd_price_t,
+        forward_rel=fwd_rel_t,
+        forward_perf=fwd_perf_t,
+        cash_div_leverage=cash_lev_t,
+        escrowed_div_fraction=torch.zeros(d_active, dtype=torch.float64),
+        df_fin_obs=df_fin_obs_t,
+        df_repo_obs=df_repo_obs_t,
+        r_tot_obs=r_tot_obs_t,
+        repo_spread_avg=repo_t,
+        dividend_events={tid: [] for tid in sorted_ids},
+    )
+
+    sentinel_res = SentinelBarrierResult(
+        ko_barriers_raw=ko_barriers_np,
+        cpn_barriers_raw=cpn_barriers_np,
+        is_callable=is_callable_np,
+        log_ko_barrier_feat=log_ko_feat_np,
+        is_guaranteed_cpn=is_guar_np,
+        log_cpn_barrier_feat=log_cpn_feat_np,
+    )
+    seasoned = SeasonedScheduleState(
+        as_of_date=_BASE_AS_OF,
+        start_date=_BASE_AS_OF - timedelta(days=30),
+        payment_currency="RUB",
+        day_count_convention="Act365",
+        original_identifiers=sorted_ids,
+        sorted_identifiers=sorted_ids,
+        lex_perm=lex_perm_np,
+        inv_lex_perm=inv_lex_perm_np,
+        spots_t0=torch.tensor(spots_np, dtype=torch.float64),
+        ref_spots=ref_t,
+        moneyness_t0=m0_t,
+        settled_indices=[],
+        in_transit_indices=[],
+        future_indices=list(range(m_rem)),
+        c_mem_0=c_mem_0,
+        i_ki_past=i_ki_past,
+        already_autocalled=False,
+        autocalled_period_index=None,
+        pv_in_transit=0.0,
+        future_obs_dates=obs_dates_dt,
+        future_pay_dates=obs_dates_dt,
+        tau_obs=tau_obs_np,
+        delta_tau=delta_tau_np,
+        tau_pay=tau_obs_np,
+        future_coupon_rates=cpn_rates_np,
+        sentinel_barriers=sentinel_res,
+    )
+
+    baseline_out = AutocallBaselineOutput(
+        f_w=f_w_v,
+        v_w=v_w_v,
+        h_proxy=(p_proxy_v / torch.cat([torch.ones(1, dtype=torch.float64), (1.0 - torch.cumsum(p_proxy_v, 0))[:-1]]).clamp(min=1e-6)).clamp(0.0, 1.0),
+        p_proxy=p_proxy_v,
+        survival_proxy=(1.0 - torch.cumsum(p_proxy_v, dim=0)).clamp(min=0.0),
+        q_proxy=q_proxy_v,
+        l_put_proxy=l_put_proxy_v,
+        proxy_delta_weights=node_act[:, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)],
+        option_pv_proxy=torch.tensor(0.0, dtype=torch.float64),
+        notional_pv_proxy=torch.tensor(0.0, dtype=torch.float64),
+        coupon_pv_proxy=torch.tensor(0.0, dtype=torch.float64),
+        product_value_proxy=pv_proxy,
+    )
+
+    state = AutocallPreprocState(
+        node_feats=node_pad,
+        edge_feats=edge_pad,
+        asset_mask=amask_pad,
+        sched_feats=sched_pad,
+        sched_mask=smask_pad,
+        global_feats=glob_pad,
+        d_assets=d_active,
+        m_rem=m_rem,
+        d_max=d_max,
+        m_max=m_max,
+        original_identifiers=sorted_ids,
+        sorted_identifiers=sorted_ids,
+        lex_perm=lex_perm_np,
+        inv_lex_perm=inv_lex_perm_np,
+        spots_t0=torch.tensor(spots_np, dtype=torch.float64),
+        ref_spots=ref_t,
+        moneyness_t0=m0_t,
+        corr_matrix=corr_t,
+        tau_obs=tau_obs_t,
+        delta_tau=dtau_t,
+        tau_pay=tau_obs_t,
+        df_obs=df_pay_t,
+        df_pay=df_pay_t,
+        ko_barriers=ko_t,
+        is_callable=is_call_t,
+        cpn_barriers=cpn_b_t,
+        is_guaranteed_cpn=is_guar_t,
+        coupon_amounts=cpn_r_t,
+        forward_rel=fwd_rel_t,
+        forward_perf=fwd_perf_t,
+        cash_div_leverage=cash_lev_t,
+        iv_at_fwd=iv_t,
+        v_perf=v_perf_t,
+        seasoned_state=seasoned,
+        dividend_schedule=div_out,
+        vol_surfaces=reg_surfaces,
+        surface_feature_jacobians={},
+        iv_at_fwd_jacobians={},
+        discount_curve=None,
+        baseline=baseline_out,
+        strike=k_put,
+        option_gearing=g_put,
+        lower_strike=lower_strike_val if lower_strike_val > 0.0 else None,
+        ki_barrier=b_ki if has_ki else None,
+        i_ki_past=i_ki_past,
+        c_mem_0=c_mem_0,
+        is_memory=is_memory,
+        ko_spread=ko_spread,
+        cpn_spread=cpn_spread,
+        ki_spread=ki_spread,
+        no_notional_repayment=no_notional,
+        autocall_coupon=ac_cpn,
+        force_coupons_on_autocall=force_cpn,
+        allow_autocall_on_expiry=False,
+        is_long_basket=is_long_basket,
+        payment_currency="RUB",
+        callability_index=call_idx,
+        coupon_index=cpn_idx,
+        option_index=opt_idx,
+        funding_leg=None,
+        pv_in_transit=0.0,
+        already_autocalled=False,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+    )
+
+    mod_vec = torch.tensor(
+        [
+            1.0 if no_notional else 0.0,
+            float(ac_cpn),
+            1.0 if force_cpn else 0.0,
+            1.0 if is_long_basket else 0.0,
+            float(lower_strike_val),
+        ],
+        dtype=torch.float64,
+    )
+
+    return (
+        state,
+        p_proxy_pad,
+        q_proxy_pad,
+        l_put_proxy_v,
+        pv_proxy,
+        delta_proxy_pad,
+        p_bumped_pad,
+        jac_node_pad,
+        jac_edge_pad,
+        jac_sched_pad,
+        jac_lput_pad,
+        mod_vec,
+        surf_indices,
+    )
 
 
 def generate_synthetic_autocall_batch(
     batch_size: int,
     *,
-    d_max: int = 8,
-    m_max: int = 48,
-    m_rem_max: int = 16,
-    n_mc_paths: int = 1024,
+    d_max: int = D_MAX_DEFAULT,
+    m_max: int = M_MAX_DEFAULT,
+    m_rem_max: int = M_MAX_DEFAULT,
+    n_mc_paths: int = 8192,
+    n_substeps: int = 8,
     eta_lkj: float = 2.0,
     crisis_prob: float = 0.15,
+    ko_bump_delta: float = 0.02,
     seed: int = 42,
     dtype: torch.dtype = torch.float32,
     device: torch.device | str = "cpu",
-    fixed_d: int | None = None,
+    qmc_device: torch.device | str | None = None,
+    fixed_d: Optional[int] = None,
+    cv_mode: str = "none",
+    compute_pathwise_delta: bool = True,
+    domain_mode: str = "tier2_desk",
 ) -> SyntheticAutocallBatch:
-    """Generates a diverse batch of multi-asset Equity Autocallable contracts with analytical & QMC labels.
-
-    Covers:
-      - Active basket cardinality D in {1, ..., d_max} (cycling evenly across the batch).
-      - Active remaining schedule length M_rem in {1, ..., m_rem_max}.
-      - Seasoned spot moneyness M_{0,i} in [0.15, 1.50] (distressed, ATM, and OTM).
-      - Bartlett-LKJ(eta) + crisis correlation matrices.
-      - Step-down KO barriers, lock-out periods, guaranteed coupon periods, memory coupons,
-        and digital spreads Delta B in [-0.20, -0.01].
-      - Computes both the exact Stulz-Margrabe proxy baseline and multi-asset Sobol QMC target labels
-        (including pathwise + LRM differential Delta labels dPV / d(ln M_{0,i})).
-    """
+    """Generates stratified Owen-Sobol v2.0 autocallable contracts labeled by GPU Dupire LV QMC."""
+    _ = eta_lkj, crisis_prob
+    if domain_mode not in ("tier2_desk", "full_stress"):
+        raise ValueError(f"domain_mode must be 'tier2_desk' or 'full_stress', got {domain_mode!r}.")
     dev = torch.device(device)
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
+    eff_qmc_dev = (
+        torch.device(qmc_device)
+        if qmc_device is not None
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    eff_m_rem_max = min(max(int(m_rem_max), 1), m_max)
 
-    node_feats = torch.zeros((batch_size, d_max, 14), dtype=torch.float64, device=dev)
-    edge_feats = torch.zeros((batch_size, d_max, d_max, 4), dtype=torch.float64, device=dev)
-    asset_mask = torch.zeros((batch_size, d_max), dtype=torch.float64, device=dev)
-    sched_feats = torch.zeros((batch_size, m_max, 12), dtype=torch.float64, device=dev)
-    sched_mask = torch.zeros((batch_size, m_max), dtype=torch.float64, device=dev)
-    global_feats = torch.zeros((batch_size, 10), dtype=torch.float64, device=dev)
+    # Independent stratified Owen-Sobol draws per contract (eliminates modulo-index coupling).
+    u_mat = _sample_owen_sobol_matrix(batch_size, 21, seed=seed)
+    rng = np.random.default_rng(seed + 1337)
 
-    p_proxy_out = torch.zeros((batch_size, m_max), dtype=torch.float64, device=dev)
-    q_proxy_out = torch.zeros((batch_size, m_max), dtype=torch.float64, device=dev)
-    l_put_proxy_out = torch.zeros((batch_size,), dtype=torch.float64, device=dev)
-    pv_proxy_out = torch.zeros((batch_size,), dtype=torch.float64, device=dev)
-    delta_proxy_out = torch.zeros((batch_size, d_max), dtype=torch.float64, device=dev)
+    # Stratify (d_active, m_rem) cleanly across buckets so GPU Dupire batching coalesces densely.
+    if fixed_d is not None:
+        d_choices = np.full(batch_size, max(1, min(int(fixed_d), d_max)), dtype=np.int64)
+    else:
+        d_choices = 1 + (np.arange(batch_size, dtype=np.int64) % d_max)
+        rng.shuffle(d_choices)
+        if domain_mode == "full_stress":
+            pair_mask = (u_mat[:, 4] >= 0.82) & (u_mat[:, 4] < 0.94)
+            d_choices = np.where(pair_mask & (d_max >= 2), 2, d_choices)
 
-    p_mc_out = torch.zeros((batch_size, m_max), dtype=torch.float64, device=dev)
-    q_mc_out = torch.zeros((batch_size, m_max), dtype=torch.float64, device=dev)
-    l_put_mc_out = torch.zeros((batch_size,), dtype=torch.float64, device=dev)
-    pv_mc_out = torch.zeros((batch_size,), dtype=torch.float64, device=dev)
-    delta_mc_out = torch.zeros((batch_size, d_max), dtype=torch.float64, device=dev)
+    m_grid = np.clip(
+        1 + np.floor(u_mat[:, 19] * eff_m_rem_max).astype(np.int64),
+        1,
+        eff_m_rem_max,
+    )
+    # Quantize M_rem for large batches into rich bucket coverage [1..48] for high GPU occupancy.
+    if batch_size >= 64 and eff_m_rem_max >= 12:
+        m_palette = np.array([1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48], dtype=np.int64)
+        m_palette = m_palette[m_palette <= eff_m_rem_max]
+        use_pal = u_mat[:, 20] < 0.85
+        pal_idx = np.clip(np.floor(u_mat[:, 19] * len(m_palette)).astype(np.int64), 0, len(m_palette) - 1)
+        m_choices = np.where(use_pal, m_palette[pal_idx], m_grid)
+    else:
+        m_choices = m_grid
 
-    eff_m_rem_max = min(max(int(m_rem_max), 2), m_max)
-    z_sobol = _sobol_normal_grid(n_mc_paths, eff_m_rem_max * d_max, seed=seed + 999, device=dev)
+    states: list[AutocallPreprocState] = []
+    node_list: list[torch.Tensor] = []
+    edge_list: list[torch.Tensor] = []
+    amask_list: list[torch.Tensor] = []
+    sched_list: list[torch.Tensor] = []
+    smask_list: list[torch.Tensor] = []
+    glob_list: list[torch.Tensor] = []
+
+    p_px_list: list[torch.Tensor] = []
+    q_px_list: list[torch.Tensor] = []
+    lp_px_list: list[torch.Tensor] = []
+    pv_px_list: list[torch.Tensor] = []
+    dp_px_list: list[torch.Tensor] = []
+    pb_px_list: list[torch.Tensor] = []
+    jn_list: list[torch.Tensor] = []
+    je_list: list[torch.Tensor] = []
+    js_list: list[torch.Tensor] = []
+    jl_list: list[torch.Tensor] = []
+    mod_list: list[torch.Tensor] = []
 
     for b in range(batch_size):
-      with torch.enable_grad():  # type: ignore[no-untyped-call]
-        d_active = max(1, min(int(fixed_d), d_max)) if fixed_d is not None else ((b % d_max) + 1)
-        m_rem = 1 + ((b * 5 + seed) % eff_m_rem_max)
-
-        asset_mask[b, :d_active] = 1.0
-        sched_mask[b, :m_rem] = 1.0
-
-        # Sample moneyness M_{0,i} in [0.15, 1.50]
-        u_m0 = torch.rand(d_active, generator=gen, dtype=torch.float64)
-        if b % 4 == 0:
-            # Distressed regime [0.15, 0.65]
-            m0 = 0.15 + 0.50 * u_m0
-        elif b % 4 == 1:
-            # Near-barrier ATM regime [0.75, 1.15]
-            m0 = 0.75 + 0.40 * u_m0
-        else:
-            # Broad regime [0.35, 1.50]
-            m0 = 0.35 + 1.15 * u_m0
-        m0_dev = m0.to(device=dev).detach().requires_grad_(True)
-        log_m0 = torch.log(m0_dev)
-
-        carry_1y = (0.02 + 0.12 * torch.rand(d_active, generator=gen, dtype=torch.float64)).to(dev)
-        div_lev_log = (0.08 * torch.rand(d_active, generator=gen, dtype=torch.float64)).to(dev)
-        repo_avg = (0.03 * torch.rand(d_active, generator=gen, dtype=torch.float64)).to(dev)
-        iv_short = (0.18 + 0.45 * torch.rand(d_active, generator=gen, dtype=torch.float64)).to(dev)
-        iv_slope = (-0.08 + 0.12 * torch.rand(d_active, generator=gen, dtype=torch.float64)).to(dev)
-        iv_term = (iv_short + iv_slope).clamp(min=0.08)
-        ssvi_rho = (-0.65 + 0.50 * torch.rand(d_active, generator=gen, dtype=torch.float64)).to(dev)
-        ssvi_eta = (0.20 + 0.55 * torch.rand(d_active, generator=gen, dtype=torch.float64)).to(dev)
-        pc1 = (0.02 * torch.randn(d_active, generator=gen, dtype=torch.float64)).to(dev)
-        pc2 = (0.015 * torch.randn(d_active, generator=gen, dtype=torch.float64)).to(dev)
-
-        corr_b, chol_b = sample_lkj_cholesky_bartlett(
-            batch_size=1,
-            d=d_active,
-            eta=eta_lkj,
-            crisis_prob=crisis_prob,
-            device="cpu",
-            dtype=torch.float64,
-            generator=gen,
+        out_b = _build_contract_state_and_jacs(
+            u_row=u_mat[b],
+            d_active=int(d_choices[b]),
+            m_rem=int(m_choices[b]),
+            d_max=d_max,
+            m_max=m_max,
+            ko_bump_delta=ko_bump_delta,
+            rng=rng,
+            attach_surfaces=True,
+            domain_mode=domain_mode,
         )
-        corr_mat = corr_b[0].to(device=dev)
-        chol_l = chol_b[0].to(device=dev)
+        st_b = out_b[0]
+        states.append(st_b)
+        node_list.append(st_b.node_feats[0])
+        edge_list.append(st_b.edge_feats[0])
+        amask_list.append(st_b.asset_mask[0])
+        sched_list.append(st_b.sched_feats[0])
+        smask_list.append(st_b.sched_mask[0])
+        glob_list.append(st_b.global_feats[0])
+        p_px_list.append(out_b[1])
+        q_px_list.append(out_b[2])
+        lp_px_list.append(out_b[3])
+        pv_px_list.append(out_b[4])
+        dp_px_list.append(out_b[5])
+        pb_px_list.append(out_b[6])
+        jn_list.append(out_b[7])
+        je_list.append(out_b[8])
+        js_list.append(out_b[9])
+        jl_list.append(out_b[10])
+        mod_list.append(out_b[11])
 
-        dtau = 0.25
-        tau_obs = torch.arange(1, m_rem + 1, dtype=torch.float64, device=dev) * dtau
-        tau_term = tau_obs[-1]
-        r_disc = 0.08 + 0.10 * float(torch.rand(1, generator=gen, dtype=torch.float64).item())
-        df_pay = torch.exp(-r_disc * tau_obs)
+    solver = DupireQMCGpuSolver(device=eff_qmc_dev)
+    qmc_cfg = DupireQMCConfig(
+        n_paths=int(n_mc_paths),
+        n_replicates=8 if int(n_mc_paths) >= 64 else 1,
+        n_substeps=int(n_substeps),
+        mode="dupire_lv",
+        precision="mixed_fp32_fp64",
+        cv_mode=cv_mode,  # type: ignore[arg-type]
+        seed=int(seed) + 999,
+    )
+    pv_mc_t, p_mc_t, q_mc_t, l_put_mc_t, delta_mc_opt = solver.simulate_batch_for_training(
+        states,
+        config=qmc_cfg,
+        compute_pathwise_delta=compute_pathwise_delta,
+    )
+    delta_mc_t = (
+        delta_mc_opt
+        if delta_mc_opt is not None
+        else torch.zeros((batch_size, d_max), dtype=torch.float64)
+    )
 
-        k_put = 0.65 + 0.35 * float(torch.rand(1, generator=gen, dtype=torch.float64).item())
-        has_ki = 1.0 if (b % 3 != 0) else 0.0
-        b_ki = (0.50 + 0.25 * float(torch.rand(1, generator=gen, dtype=torch.float64).item())) if has_ki > 0.5 else k_put
-        i_ki_past = 1.0 if (b % 9 == 0 and has_ki > 0.5) else 0.0
-        g_put = 1.0 / k_put if (b % 2 == 0) else 1.0
-        is_memory = 1.0 if (b % 3 != 2) else 0.0
-        c_mem_0 = (0.04 * float((b % 4))) if is_memory > 0.5 else 0.0
+    mods = torch.stack(mod_list, dim=0)
 
-        # Digital spread Delta B in [-0.20, -0.01]
-        ko_spread = -(0.01 + 0.19 * float(torch.rand(1, generator=gen, dtype=torch.float64).item()))
-        cpn_spread = ko_spread
+    batch = SyntheticAutocallBatch(
+        node_feats=torch.stack(node_list, dim=0),
+        edge_feats=torch.stack(edge_list, dim=0),
+        asset_mask=torch.stack(amask_list, dim=0),
+        sched_feats=torch.stack(sched_list, dim=0),
+        sched_mask=torch.stack(smask_list, dim=0),
+        global_feats=torch.stack(glob_list, dim=0),
+        p_proxy=torch.stack(p_px_list, dim=0),
+        q_proxy=torch.stack(q_px_list, dim=0),
+        l_put_proxy=torch.stack(lp_px_list, dim=0),
+        pv_proxy=torch.stack(pv_px_list, dim=0),
+        delta_proxy=torch.stack(dp_px_list, dim=0),
+        p_mc=p_mc_t,
+        q_mc=q_mc_t,
+        l_put_mc=l_put_mc_t,
+        pv_mc=pv_mc_t,
+        delta_mc=delta_mc_t,
+        no_notional_repayment=mods[:, 0],
+        autocall_coupon=mods[:, 1],
+        force_coupons_on_autocall=mods[:, 2],
+        is_long_basket=mods[:, 3],
+        lower_strike=mods[:, 4],
+        p_proxy_ko_bumped=torch.stack(pb_px_list, dim=0),
+        jac_node_logm=torch.stack(jn_list, dim=0),
+        jac_edge_self=torch.stack(je_list, dim=0),
+        jac_sched_logm=torch.stack(js_list, dim=0),
+        jac_lput_logm=torch.stack(jl_list, dim=0),
+    )
+    return batch.to(device=dev, dtype=dtype)
 
-        # Step-down KO barriers and coupon barriers across m = 0 .. M_rem - 1
-        ko_barriers = torch.zeros(m_rem, dtype=torch.float64, device=dev)
-        is_callable = torch.ones(m_rem, dtype=torch.float64, device=dev)
-        cpn_barriers = torch.zeros(m_rem, dtype=torch.float64, device=dev)
-        is_guar = torch.zeros(m_rem, dtype=torch.float64, device=dev)
-        cpn_rates = torch.full((m_rem,), 0.025 + 0.025 * ((b % 3) / 2.0), dtype=torch.float64, device=dev)
 
-        base_ko = 0.95 + 0.10 * float(torch.rand(1, generator=gen, dtype=torch.float64).item())
-        step_ko = 0.015 * float(torch.rand(1, generator=gen, dtype=torch.float64).item())
-        base_cpn_b = 0.65 + 0.20 * float(torch.rand(1, generator=gen, dtype=torch.float64).item())
-
-        for m in range(m_rem):
-            if m == 0 and (b % 4 == 0) and m_rem > 1:
-                ko_barriers[m] = 500.0
-                is_callable[m] = 0.0
-            else:
-                ko_barriers[m] = max(base_ko - step_ko * m, 0.70)
-                is_callable[m] = 1.0
-
-            if m == 0 and (b % 5 == 0):
-                cpn_barriers[m] = 1e-5
-                is_guar[m] = 1.0
-            else:
-                cpn_barriers[m] = base_cpn_b
-                is_guar[m] = 0.0
-
-        # Forward performances F_{P,i}(t_m) and log-volatilities v_{i,m}
-        fwd_rel = torch.exp(carry_1y.unsqueeze(1) * tau_obs.unsqueeze(0))  # (D, M_rem)
-        fwd_perf = m0_dev.unsqueeze(1) * fwd_rel                           # (D, M_rem)
-        frac_t = (tau_obs / tau_term.clamp(min=1e-6)).unsqueeze(0)
-        iv_m = (iv_short.unsqueeze(1) + iv_slope.unsqueeze(1) * frac_t).clamp(min=0.08)
-        v_perf = iv_m * torch.sqrt(tau_obs).unsqueeze(0)                   # (D, M_rem)
-
-        # Evaluate Stulz-Margrabe analytical baseline across all M_rem periods
-        f_batch = fwd_perf.transpose(0, 1).contiguous()
-        v_batch = v_perf.transpose(0, 1).contiguous()
-        c_batch = corr_mat.unsqueeze(0).expand(m_rem, d_active, d_active)
-        f_w, v_w, w_all = stulz_margrabe_moments_with_weights(f_batch, v_batch, c_batch)
-        proxy_delta_w = w_all[-1].detach()
-
-        ko_prob_raw = _digital_call_spread_prob_torch(f_w, v_w, ko_barriers, ko_spread)
-        h_proxy = is_callable * ko_prob_raw.clamp(0.0, 1.0 - 1e-7)
-        surv_proxy = torch.cumprod(1.0 - h_proxy, dim=0)
-        surv_prev_proxy = torch.cat(
-            [torch.ones(1, dtype=torch.float64, device=dev), surv_proxy[:-1]], dim=0
-        )
-        p_proxy = surv_prev_proxy * h_proxy
-
-        cpn_prob_raw = _digital_call_spread_prob_torch(f_w, v_w, cpn_barriers, cpn_spread)
-        q_proxy = torch.where(is_guar > 0.5, torch.ones_like(cpn_prob_raw), cpn_prob_raw)
-
-        put_base = _conditional_ki_put_torch(
-            f_cond=f_w[-1],
-            v_cond=v_w[-1],
-            strike=k_put,
-            lower_strike=None,
-            ki_barrier=b_ki if has_ki > 0.5 else None,
-            i_ki_past=i_ki_past,
-            ki_spread=ko_spread,
-        )
-        l_put_proxy = (surv_proxy[-1] * put_base).clamp(min=0.0)
-
-        # Assemble proxy PV and compute exact autograd dPV_proxy / d(ln M_{0,i})
-        pv_notional_p = (df_pay * p_proxy).sum() + df_pay[-1] * surv_proxy[-1]
-        mem_acc = torch.tensor(c_mem_0 * is_memory, dtype=torch.float64, device=dev)
-        pv_cpn_p = torch.tensor(0.0, dtype=torch.float64, device=dev)
-        for m in range(m_rem):
-            c_eff = cpn_rates[m] + mem_acc
-            pv_cpn_p = pv_cpn_p + df_pay[m] * surv_prev_proxy[m] * q_proxy[m] * c_eff
-            mem_acc = is_memory * (1.0 - q_proxy[m]) * c_eff
-        pv_opt_p = -df_pay[-1] * g_put * l_put_proxy
-        pv_proxy = pv_notional_p + pv_cpn_p + pv_opt_p
-
-        (grad_m0_proxy,) = torch.autograd.grad(pv_proxy, m0_dev, retain_graph=False)
-        d_pv_d_log_m0_proxy = (grad_m0_proxy.detach() * m0_dev.detach())
-
-        # Populate padded Tier 2 tensors
-        v_term = v_perf[:, -1].detach()
-        log_fp_term = torch.log(fwd_perf[:, -1].detach().clamp(min=1e-12))
-        dist_put = (log_fp_term - math.log(k_put)) / v_term.clamp(min=1e-6)
-
-        node_feats[b, :d_active, AutocallNodeCol.LOG_MONEYNESS] = log_m0.detach()
-        node_feats[b, :d_active, AutocallNodeCol.LOG_FWD_CARRY_1Y] = carry_1y
-        node_feats[b, :d_active, AutocallNodeCol.CASH_DIV_LEVERAGE] = div_lev_log
-        node_feats[b, :d_active, AutocallNodeCol.REPO_SPREAD_AVG] = repo_avg
-        node_feats[b, :d_active, AutocallNodeCol.IV_SHORT_ATM] = iv_short
-        node_feats[b, :d_active, AutocallNodeCol.IV_TERM_ATM] = iv_term
-        node_feats[b, :d_active, AutocallNodeCol.IV_TERM_SLOPE] = iv_slope
-        node_feats[b, :d_active, AutocallNodeCol.SSVI_SKEW_RHO] = ssvi_rho
-        node_feats[b, :d_active, AutocallNodeCol.SSVI_CURV_ETA] = ssvi_eta
-        node_feats[b, :d_active, AutocallNodeCol.SMILE_RESIDUAL_PC1] = pc1
-        node_feats[b, :d_active, AutocallNodeCol.SMILE_RESIDUAL_PC2] = pc2
-        node_feats[b, :d_active, AutocallNodeCol.DIST_TO_PUT_STRIKE] = dist_put
-        node_feats[b, :d_active, AutocallNodeCol.PROXY_DELTA_WEIGHT] = proxy_delta_w
-        node_feats[b, :d_active, AutocallNodeCol.ASSET_ACTIVE_MASK] = 1.0
-
-        eye_d = torch.eye(d_active, dtype=torch.float64, device=dev)
-        off_diag = 1.0 - eye_d
-        edge_feats[b, :d_active, :d_active, AutocallEdgeCol.CORR_RHO] = corr_mat * off_diag
-        edge_feats[b, :d_active, :d_active, AutocallEdgeCol.COVARIANCE_TERM] = (
-            corr_mat * v_term.unsqueeze(1) * v_term.unsqueeze(0) * off_diag
-        )
-        edge_feats[b, :d_active, :d_active, AutocallEdgeCol.LOG_PERF_DIFF] = (
-            torch.abs(log_fp_term.unsqueeze(1) - log_fp_term.unsqueeze(0)) * off_diag
-        )
-        edge_feats[b, :d_active, :d_active, AutocallEdgeCol.OFF_DIAG_MASK] = off_diag
-
-        log_ko_feat = torch.log(torch.clamp(ko_barriers, min=1e-4, max=3.0))
-        log_cpn_feat = torch.log(torch.clamp(cpn_barriers, min=0.05))
-        sched_feats[b, :m_rem, AutocallSchedCol.TAU_OBS] = tau_obs
-        sched_feats[b, :m_rem, AutocallSchedCol.DELTA_TAU] = dtau
-        sched_feats[b, :m_rem, AutocallSchedCol.DF_PAY] = df_pay
-        sched_feats[b, :m_rem, AutocallSchedCol.LOG_KO_BARRIER] = log_ko_feat
-        sched_feats[b, :m_rem, AutocallSchedCol.IS_CALLABLE_FLAG] = is_callable
-        sched_feats[b, :m_rem, AutocallSchedCol.LOG_CPN_BARRIER] = log_cpn_feat
-        sched_feats[b, :m_rem, AutocallSchedCol.IS_GUARANTEED_CPN] = is_guar
-        sched_feats[b, :m_rem, AutocallSchedCol.COUPON_RATE] = cpn_rates
-        sched_feats[b, :m_rem, AutocallSchedCol.STULZ_FWD_W] = torch.log(f_w.detach().clamp(min=1e-12))
-        sched_feats[b, :m_rem, AutocallSchedCol.STULZ_VOL_W] = v_w.detach()
-        sched_feats[b, :m_rem, AutocallSchedCol.PROXY_KO_PROB] = p_proxy.detach()
-        sched_feats[b, :m_rem, AutocallSchedCol.PROXY_CPN_PROB] = q_proxy.detach()
-
-        global_feats[b, AutocallGlobalCol.K_PUT] = k_put
-        global_feats[b, AutocallGlobalCol.B_KI] = b_ki
-        global_feats[b, AutocallGlobalCol.HAS_KI_FLAG] = has_ki
-        global_feats[b, AutocallGlobalCol.I_KI_PAST] = i_ki_past
-        global_feats[b, AutocallGlobalCol.G_PUT] = g_put
-        global_feats[b, AutocallGlobalCol.C_MEM_0] = c_mem_0
-        global_feats[b, AutocallGlobalCol.IS_MEMORY_FLAG] = is_memory
-        global_feats[b, AutocallGlobalCol.ABS_KO_SPREAD] = abs(ko_spread)
-        global_feats[b, AutocallGlobalCol.ABS_CPN_SPREAD] = abs(cpn_spread)
-        global_feats[b, AutocallGlobalCol.L_PUT_PROXY] = l_put_proxy.detach()
-
-        p_proxy_out[b, :m_rem] = p_proxy.detach()
-        q_proxy_out[b, :m_rem] = q_proxy.detach()
-        l_put_proxy_out[b] = l_put_proxy.detach()
-        pv_proxy_out[b] = pv_proxy.detach()
-        delta_proxy_out[b, :d_active] = d_pv_d_log_m0_proxy
-
-        # Multi-asset Sobol QMC local-vol skew, dividend-leverage & correlation-dispersion target
-        m0_mc = m0.to(device=dev).detach().clone().requires_grad_(True)
-        fwd_perf_mc = m0_mc.unsqueeze(1) * fwd_rel
-        f_batch_mc = fwd_perf_mc.transpose(0, 1).contiguous()
-        f_w_base, v_w_base, w_all_mc = stulz_margrabe_moments_with_weights(
-            f_batch_mc, v_batch, c_batch
-        )
-
-        # Correlated Sobol QMC standardized draws across active assets to estimate multi-asset dispersion
-        z_corr = z_sobol[:, :d_active] @ chol_l.T
-        qmc_skew_factor = ((z_corr * z_corr - 1.0) * ssvi_rho.unsqueeze(0)).mean(dim=0)
-        if d_active > 1:
-            mean_rho = float((corr_mat * off_diag).sum().item() / (d_active * (d_active - 1)))
-        else:
-            mean_rho = 1.0
-        disp_factor = max(0.0, float(d_active - 2) / float(d_max)) * (1.0 - mean_rho)
-
-        w_term_mc = w_all_mc[-1].detach().clamp(min=0.0)
-        w_term_norm = w_term_mc / w_term_mc.sum().clamp(min=1e-12)
-        h_disp_mc = float((1.0 - (w_term_norm * w_term_norm).sum()).clamp(0.0, 1.0).item())
-        path_or_disp_scale = max(h_disp_mc, 0.25 if m_rem > 1 else 0.0)
-
-        # Basket-weighted SSVI skew, curvature, cash-dividend leverage, and correlation shift
-        skew_asset = -0.008 * ssvi_rho - 0.006 * div_lev_log + 0.004 * qmc_skew_factor
-        vol_asset = 0.015 * div_lev_log + 0.008 * ssvi_eta - 0.010 * ssvi_rho * torch.tanh(dist_put)
-
-        delta_log_fw = h_disp_mc * (
-            (w_all_mc * skew_asset.unsqueeze(0)).sum(dim=1) * v_w_base - 0.004 * disp_factor * v_w_base
-        )
-        delta_vw = path_or_disp_scale * (
-            (w_all_mc * vol_asset.unsqueeze(0)).sum(dim=1) * v_w_base + 0.003 * disp_factor * v_w_base
-        )
-
-        f_w_mc = f_w_base * torch.exp(delta_log_fw)
-        v_w_mc = (v_w_base + delta_vw).clamp(min=1e-4)
-
-        ko_prob_mc = _digital_call_spread_prob_torch(f_w_mc, v_w_mc, ko_barriers, ko_spread)
-        h_mc = is_callable * ko_prob_mc.clamp(0.0, 1.0 - 1e-7)
-        surv_mc = torch.cumprod(1.0 - h_mc, dim=0)
-        surv_prev_mc = torch.cat(
-            [torch.ones(1, dtype=torch.float64, device=dev), surv_mc[:-1]], dim=0
-        )
-        p_mc_vec = surv_prev_mc * h_mc
-
-        cpn_prob_mc = _digital_call_spread_prob_torch(f_w_mc, v_w_mc, cpn_barriers, cpn_spread)
-        q_mc_vec = torch.where(is_guar > 0.5, torch.ones_like(cpn_prob_mc), cpn_prob_mc)
-
-        put_base_mc = _conditional_ki_put_torch(
-            f_cond=f_w_mc[-1],
-            v_cond=v_w_mc[-1],
-            strike=k_put,
-            lower_strike=None,
-            ki_barrier=b_ki if has_ki > 0.5 else None,
-            i_ki_past=i_ki_past,
-            ki_spread=ko_spread,
-        )
-        l_put_mc = (surv_mc[-1] * put_base_mc).clamp(min=0.0)
-
-        pv_notional_mc = (df_pay * p_mc_vec).sum() + df_pay[-1] * surv_mc[-1]
-        mem_mc = torch.tensor(c_mem_0 * is_memory, dtype=torch.float64, device=dev)
-        pv_cpn_mc = torch.tensor(0.0, dtype=torch.float64, device=dev)
-        for m in range(m_rem):
-            c_eff_m = cpn_rates[m] + mem_mc
-            pv_cpn_mc = pv_cpn_mc + df_pay[m] * surv_prev_mc[m] * q_mc_vec[m] * c_eff_m
-            mem_mc = is_memory * (1.0 - q_mc_vec[m]) * c_eff_m
-        pv_opt_mc = -df_pay[-1] * g_put * l_put_mc
-        pv_mc_total = pv_notional_mc + pv_cpn_mc + pv_opt_mc
-
-        (grad_m0_mc,) = torch.autograd.grad(pv_mc_total, m0_mc, retain_graph=False)
-        d_pv_d_log_m0_mc = grad_m0_mc.detach() * m0_mc.detach()
-        w_spread = abs(ko_spread) / (abs(ko_spread) + 0.05)
-        delta_blend = w_spread * d_pv_d_log_m0_mc + (1.0 - w_spread) * d_pv_d_log_m0_proxy
-
-        p_mc_out[b, :m_rem] = p_mc_vec.detach()
-        q_mc_out[b, :m_rem] = q_mc_vec.detach()
-        l_put_mc_out[b] = l_put_mc.detach()
-        pv_mc_out[b] = pv_mc_total.detach()
-        delta_mc_out[b, :d_active] = delta_blend
-
-    return SyntheticAutocallBatch(
-        node_feats=node_feats.to(dtype=dtype),
-        edge_feats=edge_feats.to(dtype=dtype),
-        asset_mask=asset_mask.to(dtype=dtype),
-        sched_feats=sched_feats.to(dtype=dtype),
-        sched_mask=sched_mask.to(dtype=dtype),
-        global_feats=global_feats.to(dtype=dtype),
-        p_proxy=p_proxy_out.to(dtype=dtype),
-        q_proxy=q_proxy_out.to(dtype=dtype),
-        l_put_proxy=l_put_proxy_out.to(dtype=dtype),
-        pv_proxy=pv_proxy_out.to(dtype=dtype),
-        delta_proxy=delta_proxy_out.to(dtype=dtype),
-        p_mc=p_mc_out.to(dtype=dtype),
-        q_mc=q_mc_out.to(dtype=dtype),
-        l_put_mc=l_put_mc_out.to(dtype=dtype),
-        pv_mc=pv_mc_out.to(dtype=dtype),
-        delta_mc=delta_mc_out.to(dtype=dtype),
+def generate_dupire_autocall_dataset(
+    n_contracts: int,
+    *,
+    d_max: int = D_MAX_DEFAULT,
+    m_max: int = M_MAX_DEFAULT,
+    n_mc_paths: int = 8192,
+    n_substeps: int = 8,
+    seed: int = 42,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cpu",
+    qmc_device: torch.device | str | None = None,
+    cv_mode: str = "none",
+) -> SyntheticAutocallBatch:
+    """Convenience wrapper generating a v2.0 GPU Dupire QMC dataset of size `n_contracts`."""
+    return generate_synthetic_autocall_batch(
+        batch_size=n_contracts,
+        d_max=d_max,
+        m_max=m_max,
+        m_rem_max=m_max,
+        n_mc_paths=n_mc_paths,
+        n_substeps=n_substeps,
+        seed=seed,
+        dtype=dtype,
+        device=device,
+        qmc_device=qmc_device,
+        cv_mode=cv_mode,
+        compute_pathwise_delta=True,
     )
 
 
@@ -524,4 +1334,5 @@ __all__ = [
     "SyntheticAutocallBatch",
     "sample_lkj_cholesky_bartlett",
     "generate_synthetic_autocall_batch",
+    "generate_dupire_autocall_dataset",
 ]
