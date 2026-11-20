@@ -390,20 +390,29 @@ def enforce_no_arbitrage_projection_with_jacobian(
                             cal_scale[m, u] = 0.0
                     was_projected = True
 
-        # Re-enforce calendar monotonicity if wing projection lowered any variance below m-1
+        # Re-enforce calendar monotonicity only when variance falls meaningfully below m-1
+        # (ignore ~1e-16 round-trip noise from sqrt(w/t)**2 * t)
         w_re = (projected_quotes * projected_quotes) * t_arr[:, None]
         for m in range(1, n_exp):
             dt_m = t_arr[m] - t_arr[m - 1]
             min_w_m = w_re[m - 1] + min_calendar_dvar_dt * dt_m
-            viol = w_re[m] < min_w_m
+            tol_m = 1e-14 * np.maximum(1.0, np.abs(min_w_m))
+            viol = w_re[m] < (min_w_m - tol_m)
             if np.any(viol):
                 w_re[m, viol] = min_w_m[viol]
-                projected_quotes[m, viol] = np.sqrt(
-                    np.maximum(w_re[m, viol] / t_arr[m], min_vol * min_vol)
-                )
-                cal_ancestor[m, viol] = -1
-                cal_scale[m, viol] = 0.0
                 was_projected = True
+                for u in np.flatnonzero(viol):
+                    sig_prev_u = float(projected_quotes[m - 1, u])
+                    sig_new = math.sqrt(max(w_re[m, u] / t_arr[m], min_vol * min_vol))
+                    projected_quotes[m, u] = sig_new
+                    if w_re[m, u] / t_arr[m] <= min_vol * min_vol or cal_ancestor[m - 1, u] < 0:
+                        cal_ancestor[m, u] = -1
+                        cal_scale[m, u] = 0.0
+                    else:
+                        cal_ancestor[m, u] = cal_ancestor[m - 1, u]
+                        cal_scale[m, u] = cal_scale[m - 1, u] * (
+                            (t_arr[m - 1] * sig_prev_u) / max(t_arr[m] * sig_new, 1e-12)
+                        )
 
     cal_jacobian = np.zeros((n_exp, n_exp, n_u), dtype=np.float64)
     for m in range(n_exp):
@@ -696,7 +705,7 @@ class RegularizedVolSurface:
             self._slice_cs = scipy.interpolate.CubicSpline(
                 self.strikes, self.quotes, bc_type=eff_bc, axis=1
             )
-            self._fast_slice_coeffs = np.transpose(self._slice_cs.c, (0, 2, 1)).copy()
+            self._fast_slice_coeffs = np.asarray(self._slice_cs.c, dtype=np.float64).copy()
             if use_linear_extrap:
                 self._slopes_left = np.asarray(self._slice_cs(self.strikes[0], 1), dtype=np.float64)
                 self._slopes_right = np.asarray(self._slice_cs(self.strikes[-1], 1), dtype=np.float64)
