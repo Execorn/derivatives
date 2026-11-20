@@ -23,9 +23,12 @@ import math
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
+
+import anyio
 
 from cachetools import TTLCache
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
@@ -46,13 +49,6 @@ from deepvol.api.metrics import (
 logger = logging.getLogger(__name__)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-# Limit intra-op threads to prevent CPU core thrashing when executing in thread pools
-try:
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-except RuntimeError:
-    pass
 
 # ── path setup ────────────────────────────────────────────────────────────────
 _src = str(Path(__file__).parents[2])
@@ -88,9 +84,17 @@ async def lifespan(app: FastAPI):
         import logging
 
         logging.getLogger(__name__).warning("FX Cross executor startup failed: %s", exc)
+    try:
+        await anyio.to_thread.run_sync(_init_eq_autocall_state)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("EQ Autocall runtime preload skipped: %s", exc)
 
     yield
 
+    try:
+        _shutdown_eq_autocall_state()
+    except Exception as exc:
+        logging.getLogger(__name__).warning("EQ Autocall runtime shutdown failed: %s", exc)
     try:
         _shutdown_fx_cross_state()
     except Exception as exc:
@@ -127,19 +131,16 @@ setup_metrics(app)
 
 
 class AsyncReadWriteLock:
-    """Non-blocking, asyncio-compatible Read-Write Lock."""
+    """Non-blocking, cancellation-safe, loop-aware asyncio Read-Write Lock."""
 
-    def __init__(self):
-        self._readers = 0
-        self._write_lock = None
-        self._read_ready = None
-        self._loop = None
+    def __init__(self) -> None:
+        self._readers: int = 0
+        self._write_lock: Optional[asyncio.Lock] = None
+        self._read_ready: Optional[asyncio.Condition] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-    def _get_locks(self):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
+    def _get_locks(self) -> Tuple[asyncio.Lock, asyncio.Condition]:
+        loop = asyncio.get_running_loop()
         if self._loop is not loop or self._write_lock is None or self._read_ready is None:
             self._loop = loop
             self._write_lock = asyncio.Lock()
@@ -147,41 +148,54 @@ class AsyncReadWriteLock:
             self._readers = 0
         return self._write_lock, self._read_ready
 
-    async def acquire_read(self):
+    async def acquire_read(self) -> None:
         write_lock, read_ready = self._get_locks()
         async with read_ready:
             while write_lock.locked():
                 await read_ready.wait()
             self._readers += 1
 
-    async def release_read(self):
-        write_lock, read_ready = self._get_locks()
+    async def release_read(self) -> None:
+        _write_lock, read_ready = self._get_locks()
         async with read_ready:
-            self._readers -= 1
+            self._readers = max(0, self._readers - 1)
             if self._readers == 0:
                 read_ready.notify_all()
 
-    async def acquire_write(self):
+    async def acquire_write(self) -> None:
         write_lock, read_ready = self._get_locks()
         await write_lock.acquire()
-        t0 = asyncio.get_event_loop().time()
-        _WRITE_STARVATION_WARN_S = 30.0
-        async with read_ready:
-            while self._readers > 0:
-                await read_ready.wait()
-                elapsed = asyncio.get_event_loop().time() - t0
-                if elapsed > _WRITE_STARVATION_WARN_S:
-                    import logging as _logging
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        warn_interval_s = 30.0
+        try:
+            async with read_ready:
+                while self._readers > 0:
+                    await read_ready.wait()
+                    elapsed = loop.time() - t0
+                    if elapsed > warn_interval_s:
+                        logger.warning(
+                            "AsyncReadWriteLock: writer waiting >%.0fs for readers to drain "
+                            "(%d active reader(s)). Consider reducing concurrent read load.",
+                            elapsed,
+                            self._readers,
+                        )
+                        t0 = loop.time()
+        except BaseException:
+            if write_lock.locked():
+                write_lock.release()
 
-                    _logging.getLogger(__name__).warning(
-                        "AsyncReadWriteLock: writer waiting >%.0fs for readers to drain "
-                        "(%d active reader(s)). Consider reducing concurrent read load.",
-                        elapsed,
-                        self._readers,
-                    )
-                    t0 = asyncio.get_event_loop().time()  # reset to avoid log spam
+            async def _wake_waiters() -> None:
+                async with read_ready:
+                    read_ready.notify_all()
 
-    async def release_write(self):
+            try:
+                loop.create_task(_wake_waiters())
+            except RuntimeError:
+                pass
+            raise
+
+    async def release_write(self) -> None:
         write_lock, read_ready = self._get_locks()
         if write_lock.locked():
             write_lock.release()
@@ -189,29 +203,29 @@ class AsyncReadWriteLock:
             read_ready.notify_all()
 
     class ReaderContext:
-        def __init__(self, rwlock):
+        def __init__(self, rwlock: AsyncReadWriteLock) -> None:
             self.rwlock = rwlock
 
-        async def __aenter__(self):
+        async def __aenter__(self) -> None:
             await self.rwlock.acquire_read()
 
-        async def __aexit__(self, exc_type, exc, tb):
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
             await self.rwlock.release_read()
 
     class WriterContext:
-        def __init__(self, rwlock):
+        def __init__(self, rwlock: AsyncReadWriteLock) -> None:
             self.rwlock = rwlock
 
-        async def __aenter__(self):
+        async def __aenter__(self) -> None:
             await self.rwlock.acquire_write()
 
-        async def __aexit__(self, exc_type, exc, tb):
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
             await self.rwlock.release_write()
 
-    def reader(self):
+    def reader(self) -> ReaderContext:
         return self.ReaderContext(self)
 
-    def writer(self):
+    def writer(self) -> WriterContext:
         return self.WriterContext(self)
 
 
@@ -2762,27 +2776,118 @@ from deepvol.api.eq_autocall_arrow import (  # noqa: E402
     ARROW_MIME as EQ_AUTOCALL_ARROW_MIME,
 )
 from deepvol.api.eq_autocall_runtime import (  # noqa: E402
+    MAX_BATCH_TRADES as EQ_AUTOCALL_MAX_BATCH_TRADES,
+    EngineMode as EQAutocallEngineMode,
     EQAutocallRuntime,
     EQAutocallRuntimeResponse,
 )
 
-_EQ_AUTOCALL_STATE: Dict[str, Any] = {
+_EQ_AUTOCALL_STATE: Dict[str, Optional[EQAutocallRuntime]] = {
     "runtime": None,
 }
+_RUNTIME_INIT_LOCK = threading.Lock()
 _EQ_AUTOCALL_RW_LOCK = AsyncReadWriteLock()
 
 
 def _init_eq_autocall_state() -> EQAutocallRuntime:
-    runtime = EQAutocallRuntime()
-    _EQ_AUTOCALL_STATE["runtime"] = runtime
-    return runtime
+    with _RUNTIME_INIT_LOCK:
+        existing = _EQ_AUTOCALL_STATE.get("runtime")
+        if existing is not None:
+            return existing
+        runtime = EQAutocallRuntime()
+        _EQ_AUTOCALL_STATE["runtime"] = runtime
+        return runtime
+
+
+def _shutdown_eq_autocall_state() -> None:
+    with _RUNTIME_INIT_LOCK:
+        rt = _EQ_AUTOCALL_STATE.pop("runtime", None)
+        if rt is not None and getattr(rt, "_compiled_runner", None) is not None:
+            rt._compiled_runner.invalidate_graphs()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
 
 def _get_eq_autocall_runtime() -> EQAutocallRuntime:
     rt = _EQ_AUTOCALL_STATE.get("runtime")
-    if rt is None:
-        rt = _init_eq_autocall_state()
-    return rt
+    if rt is not None:
+        return rt
+    return _init_eq_autocall_state()
+
+
+def _parse_json_tensor_batch_payload(payload: Dict[str, Any]) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    float,
+    bool,
+]:
+    """Validates and converts a JSON tensor batch dict into strict finite `float64` CPU tensors."""
+    required = ("node_feats", "edge_feats", "asset_mask", "sched_feats", "sched_mask", "global_feats")
+    for key in required:
+        if key not in payload or payload[key] is None:
+            raise ValueError(f"Missing required tensor batch key {key!r}.")
+
+    try:
+        node_t = torch.as_tensor(payload["node_feats"], dtype=torch.float64)
+        edge_t = torch.as_tensor(payload["edge_feats"], dtype=torch.float64)
+        amask_t = torch.as_tensor(payload["asset_mask"], dtype=torch.float64)
+        sched_t = torch.as_tensor(payload["sched_feats"], dtype=torch.float64)
+        smask_t = torch.as_tensor(payload["sched_mask"], dtype=torch.float64)
+        glob_t = torch.as_tensor(payload["global_feats"], dtype=torch.float64)
+        spots_t = (
+            torch.as_tensor(payload["spots_t0"], dtype=torch.float64)
+            if payload.get("spots_t0") is not None
+            else None
+        )
+        refs_t = (
+            torch.as_tensor(payload["ref_spots"], dtype=torch.float64)
+            if payload.get("ref_spots") is not None
+            else None
+        )
+    except (ValueError, TypeError, RuntimeError) as exc:
+        raise ValueError(f"Malformed tensor batch payload: {exc}") from exc
+
+    if node_t.ndim != 3 or edge_t.ndim != 4 or amask_t.ndim != 2:
+        raise ValueError("Invalid tensor ranks for node_feats/edge_feats/asset_mask.")
+    if sched_t.ndim != 3 or smask_t.ndim != 2 or glob_t.ndim != 2:
+        raise ValueError("Invalid tensor ranks for sched_feats/sched_mask/global_feats.")
+
+    b_sz = int(node_t.shape[0])
+    if b_sz < 1 or b_sz > EQ_AUTOCALL_MAX_BATCH_TRADES:
+        raise ValueError(f"Tensor batch size {b_sz} out of bounds [1, {EQ_AUTOCALL_MAX_BATCH_TRADES}].")
+    for name, tens in (
+        ("node_feats", node_t),
+        ("edge_feats", edge_t),
+        ("asset_mask", amask_t),
+        ("sched_feats", sched_t),
+        ("sched_mask", smask_t),
+        ("global_feats", glob_t),
+    ):
+        if int(tens.shape[0]) != b_sz or not bool(torch.isfinite(tens).all()):
+            raise ValueError(f"Tensor {name} has mismatched batch dimension or non-finite entries.")
+
+    pvit = float(payload.get("pv_in_transit", 0.0))
+    if not math.isfinite(pvit):
+        raise ValueError("Non-finite pv_in_transit in tensor batch payload.")
+    return (
+        node_t,
+        edge_t,
+        amask_t,
+        sched_t,
+        smask_t,
+        glob_t,
+        spots_t,
+        refs_t,
+        pvit,
+        bool(payload.get("compute_greeks", True)),
+    )
 
 
 eq_autocall_router = APIRouter(prefix="/eq_autocall", tags=["EQ Autocallable"])
@@ -2791,16 +2896,16 @@ eq_autocall_router = APIRouter(prefix="/eq_autocall", tags=["EQ Autocallable"])
 @eq_autocall_router.get("/health")
 async def eq_autocall_health() -> Dict[str, Any]:
     """Liveness and model readiness endpoint for the Multi-Asset Equity Autocallable runtime."""
-    rt = _get_eq_autocall_runtime()
+    rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
     return {
         "status": "ok",
         "device": str(rt.device),
         "model_version": rt.model_version,
         "d_max": rt.d_max,
         "m_max": rt.m_max,
-        "checkpoint_loaded": bool(
-            rt.checkpoint_path is not None and rt.checkpoint_path.is_file()
-        ),
+        "checkpoint_loaded": bool(rt.checkpoint_loaded),
+        "checkpoint_error": rt.checkpoint_error,
+        "guardian_stats_loaded": bool(rt.guardian_stats_loaded),
         "checkpoint_metrics": rt.checkpoint_metrics,
     }
 
@@ -2808,39 +2913,47 @@ async def eq_autocall_health() -> Dict[str, Any]:
 @eq_autocall_router.post("/price", response_model=EQAutocallRuntimeResponse)
 async def eq_autocall_price(
     request: Request,
-    engine: str = Query(default="auto", description="Pricing engine: auto, surrogate, proxy, or qmc"),
+    engine: EQAutocallEngineMode = Query(
+        default="auto",
+        description="Pricing engine: auto, surrogate, proxy, or qmc",
+    ),
     include_all_greeks: Optional[bool] = Query(default=None),
 ) -> EQAutocallRuntimeResponse:
     """Prices a single Multi-Asset Equity Autocallable trade from a JSON `EQAutocallableTradeRequest` payload."""
     async with _EQ_AUTOCALL_RW_LOCK.reader():
-        rt = _get_eq_autocall_runtime()
+        rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
+        body_bytes = await request.body()
+        if not body_bytes:
+            raise HTTPException(status_code=422, detail="Empty request body")
         try:
-            body_bytes = await request.body()
-            if not body_bytes:
-                raise ValueError("Empty request body")
             payload = orjson.loads(body_bytes)
-        except Exception as exc:
+        except (orjson.JSONDecodeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=f"Invalid JSON payload: {exc}") from exc
 
         try:
-            return rt.price_trade(
-                payload,
-                engine,
-                include_all_greeks=include_all_greeks,
+            return await anyio.to_thread.run_sync(
+                lambda: rt.price_trade(
+                    payload,
+                    engine,
+                    include_all_greeks=include_all_greeks,
+                )
             )
-        except (ValidationError, ValueError, KeyError, TypeError) as exc:
+        except (ValidationError, ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @eq_autocall_router.post("/price_murex_dag", response_model=EQAutocallRuntimeResponse)
 async def eq_autocall_price_murex_dag(
     request: Request,
-    engine: str = Query(default="auto", description="Pricing engine: auto, surrogate, proxy, or qmc"),
+    engine: EQAutocallEngineMode = Query(
+        default="auto",
+        description="Pricing engine: auto, surrogate, proxy, or qmc",
+    ),
     include_all_greeks: bool = Query(default=True),
 ) -> EQAutocallRuntimeResponse:
     """Ingests and prices a raw Murex `ConstantMessageMap` DAG payload (text/plain or JSON `{\"dag_text\": ...}`)."""
     async with _EQ_AUTOCALL_RW_LOCK.reader():
-        rt = _get_eq_autocall_runtime()
+        rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
         body_bytes = await request.body()
         if not body_bytes:
             raise HTTPException(status_code=422, detail="Empty Murex DAG request body")
@@ -2850,8 +2963,11 @@ async def eq_autocall_price_murex_dag(
         if "application/json" in content_type:
             try:
                 parsed_json = orjson.loads(body_bytes)
-            except Exception as exc:
-                raise HTTPException(status_code=422, detail=f"Invalid JSON in Murex DAG request: {exc}") from exc
+            except (orjson.JSONDecodeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid JSON in Murex DAG request: {exc}",
+                ) from exc
             if isinstance(parsed_json, dict) and "dag_text" in parsed_json:
                 dag_input = str(parsed_json["dag_text"])
             elif isinstance(parsed_json, dict):
@@ -2864,15 +2980,20 @@ async def eq_autocall_price_murex_dag(
             try:
                 dag_input = body_bytes.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise HTTPException(status_code=422, detail=f"Invalid UTF-8 text in Murex DAG request: {exc}") from exc
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid UTF-8 text in Murex DAG request: {exc}",
+                ) from exc
 
         try:
-            return rt.price_murex_dag(
-                dag_input,
-                engine,
-                include_all_greeks=include_all_greeks,
+            return await anyio.to_thread.run_sync(
+                lambda: rt.price_murex_dag(
+                    dag_input,
+                    engine,
+                    include_all_greeks=include_all_greeks,
+                )
             )
-        except (ValidationError, ValueError, KeyError, TypeError) as exc:
+        except (ValidationError, ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
@@ -2883,17 +3004,19 @@ async def eq_autocall_price_arrow(
 ) -> Response:
     """Vectorized Apache Arrow IPC stream endpoint (`application/vnd.apache.arrow.stream`)."""
     async with _EQ_AUTOCALL_RW_LOCK.reader():
-        rt = _get_eq_autocall_runtime()
+        rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
         body_bytes = await request.body()
         if not body_bytes:
             raise HTTPException(status_code=422, detail="Empty Arrow IPC payload")
 
         try:
-            out_bytes = rt.price_arrow_ipc(
-                body_bytes,
-                compute_greeks,
+            out_bytes = await anyio.to_thread.run_sync(
+                lambda: rt.price_arrow_ipc(
+                    body_bytes,
+                    compute_greeks,
+                )
             )
-        except (ValidationError, ValueError, KeyError, TypeError) as exc:
+        except (ValidationError, ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         return Response(content=out_bytes, media_type=EQ_AUTOCALL_ARROW_MIME)
@@ -2903,11 +3026,11 @@ async def eq_autocall_price_arrow(
 async def eq_autocall_price_batch(
     request: Request,
     compute_greeks: bool = Query(default=True),
-    engine: str = Query(default="auto"),
+    engine: EQAutocallEngineMode = Query(default="auto"),
 ) -> Response:
     """Batched valuation and Greek evaluation supporting JSON trade lists, JSON tensor batches, and Apache Arrow IPC."""
     async with _EQ_AUTOCALL_RW_LOCK.reader():
-        rt = _get_eq_autocall_runtime()
+        rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
         content_type = request.headers.get("content-type", "application/json").lower()
         body_bytes = await request.body()
         if not body_bytes:
@@ -2915,48 +3038,58 @@ async def eq_autocall_price_batch(
 
         if EQ_AUTOCALL_ARROW_MIME in content_type or "application/octet-stream" in content_type:
             try:
-                arrow_resp = rt.price_arrow_ipc(
-                    body_bytes,
-                    compute_greeks,
+                arrow_resp = await anyio.to_thread.run_sync(
+                    lambda: rt.price_arrow_ipc(
+                        body_bytes,
+                        compute_greeks,
+                    )
                 )
-            except (ValidationError, ValueError, KeyError, TypeError) as exc:
+            except (ValidationError, ValueError, TypeError) as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             return Response(content=arrow_resp, media_type=EQ_AUTOCALL_ARROW_MIME)
 
         try:
             payload = orjson.loads(body_bytes)
-        except Exception as exc:
+        except (orjson.JSONDecodeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=f"Invalid JSON batch payload: {exc}") from exc
 
         def _eval_json_batch() -> bytes:
             t0 = time.perf_counter()
             if isinstance(payload, list):
+                if len(payload) == 0 or len(payload) > EQ_AUTOCALL_MAX_BATCH_TRADES:
+                    raise ValueError(
+                        f"Batch trades count {len(payload)} out of bounds [1, {EQ_AUTOCALL_MAX_BATCH_TRADES}]."
+                    )
                 res_list = rt.price_batch_json(payload, compute_greeks=compute_greeks, engine=engine)
                 dumped = [r.model_dump(mode="json") for r in res_list]
                 return orjson.dumps(dumped)
 
             if isinstance(payload, dict):
                 if "node_feats" in payload and "sched_feats" in payload:
+                    (
+                        node_t,
+                        edge_t,
+                        amask_t,
+                        sched_t,
+                        smask_t,
+                        glob_t,
+                        spots_t,
+                        refs_t,
+                        pvit,
+                        eff_cg,
+                    ) = _parse_json_tensor_batch_payload(payload)
                     batch_out = rt.price_tensor_batch(
-                        torch.as_tensor(payload["node_feats"], dtype=torch.float64),
-                        torch.as_tensor(payload["edge_feats"], dtype=torch.float64),
-                        torch.as_tensor(payload["asset_mask"], dtype=torch.float64),
-                        torch.as_tensor(payload["sched_feats"], dtype=torch.float64),
-                        torch.as_tensor(payload["sched_mask"], dtype=torch.float64),
-                        torch.as_tensor(payload["global_feats"], dtype=torch.float64),
-                        spots_t0=(
-                            torch.as_tensor(payload["spots_t0"], dtype=torch.float64)
-                            if "spots_t0" in payload and payload["spots_t0"] is not None
-                            else None
-                        ),
-                        ref_spots=(
-                            torch.as_tensor(payload["ref_spots"], dtype=torch.float64)
-                            if "ref_spots" in payload and payload["ref_spots"] is not None
-                            else None
-                        ),
-                        pv_in_transit=payload.get("pv_in_transit", 0.0),
-                        compute_greeks=bool(payload.get("compute_greeks", compute_greeks)),
-                        compute_cash_gamma=bool(payload.get("compute_greeks", compute_greeks)),
+                        node_t,
+                        edge_t,
+                        amask_t,
+                        sched_t,
+                        smask_t,
+                        glob_t,
+                        spots_t0=spots_t,
+                        ref_spots=refs_t,
+                        pv_in_transit=pvit,
+                        compute_greeks=eff_cg,
+                        compute_cash_gamma=eff_cg,
                     )
                     lat_ms = (time.perf_counter() - t0) * 1e3
                     return orjson.dumps(
@@ -2985,6 +3118,10 @@ async def eq_autocall_price_batch(
 
                 trades_seq = payload.get("requests", payload.get("trades"))
                 if isinstance(trades_seq, list):
+                    if len(trades_seq) == 0 or len(trades_seq) > EQ_AUTOCALL_MAX_BATCH_TRADES:
+                        raise ValueError(
+                            f"Batch trades count {len(trades_seq)} out of bounds [1, {EQ_AUTOCALL_MAX_BATCH_TRADES}]."
+                        )
                     eff_cg = bool(payload.get("compute_greeks", compute_greeks))
                     eff_eng = str(payload.get("engine", engine))
                     res_list = rt.price_batch_json(
@@ -3009,8 +3146,8 @@ async def eq_autocall_price_batch(
             )
 
         try:
-            json_bytes = _eval_json_batch()
-        except (ValidationError, ValueError, KeyError, TypeError) as exc:
+            json_bytes = await anyio.to_thread.run_sync(_eval_json_batch)
+        except (ValidationError, ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         return Response(content=json_bytes, media_type="application/json")
@@ -3032,9 +3169,16 @@ app.add_api_route(
 )
 
 
-def main():
-    import uvicorn
+def main() -> None:
     import argparse
+    import uvicorn
+
+    n_threads = int(os.environ.get("DEEPVOL_TORCH_THREADS", "1"))
+    try:
+        torch.set_num_threads(n_threads)
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
 
     parser = argparse.ArgumentParser(description="DeepVol FastAPI Server CLI")
     parser.add_argument(

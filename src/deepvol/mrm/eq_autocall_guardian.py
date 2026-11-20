@@ -17,11 +17,13 @@ in strict IEEE-754 double precision (`np.float64` / `torch.float64`):
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
+import hashlib
 import logging
 import math
+from pathlib import Path
 import threading
 from typing import Any, Literal, Sequence
 
@@ -34,22 +36,28 @@ from deepvol.models.autocall.analytical_baseline import (
     AutocallBaselineOutput,
     compute_analytical_autocall_baseline,
 )
-from deepvol.models.autocall.dupire_qmc_solver import (
-    DupireQMCResult,
-    price_eq_autocall_dupire_qmc,
-)
-from deepvol.models.autocall.pre_post_processor import (
+from deepvol.models.autocall.dupire_qmc_solver import price_eq_autocall_dupire_qmc
+from deepvol.models.autocall.dupire_qmc_solver import DupireQMCResult
+from deepvol.models.autocall.feature_layout import (
     D_MAX_DEFAULT,
     M_MAX_DEFAULT,
     AutocallEdgeCol,
+    AutocallGlobalCol,
     AutocallNodeCol,
+    AutocallSchedCol,
+    MonitoringIndexCode,
+    monitoring_index_to_code,
+)
+from deepvol.models.autocall.pre_post_processor import (
     AutocallPostprocOutput,
     AutocallPreprocState,
-    AutocallSchedCol,
     assemble_autocall_cashflows_and_pv,
     preprocess_eq_autocall,
 )
-from deepvol.models.autocall.seasoned_collapser import CashFlowItem
+from deepvol.models.autocall.seasoned_collapser import (
+    CashFlowItem,
+    evaluate_monitoring_index_np,
+)
 from deepvol.surrogates.eq_autocall_egno import (
     AutocallSurrogateOutput,
     MaskedEQAutocallSurrogate,
@@ -57,11 +65,19 @@ from deepvol.surrogates.eq_autocall_egno import (
 
 logger = logging.getLogger("deepvol.mrm.eq_autocall_guardian")
 
+DEFAULT_GUARDIAN_STATS_PATH: Path = (
+    Path(__file__).resolve().parents[3]
+    / "artifacts"
+    / "checkpoints"
+    / "eq_autocall_guardian_stats.pt"
+)
+
 SUPPORTED_TIER2_INDICES: frozenset[str] = frozenset(
     {"WorstOf", "BestOf", "Average", "AverageOf"}
 )
 
 CHI2_16_0999: float = 39.25
+DEFAULT_TAU_DESK_BPS: float = 60.0
 
 
 class AutocallFallbackReason(str, Enum):
@@ -75,6 +91,7 @@ class AutocallFallbackReason(str, Enum):
     CORRELATION_NOT_PSD = "CORRELATION_NOT_PSD"
     IMMINENT_BARRIER_PIN_RISK = "IMMINENT_BARRIER_PIN_RISK"
     MAHALANOBIS_OOD = "MAHALANOBIS_OOD"
+    CONFORMAL_UNCERTAINTY_BREACH = "CONFORMAL_UNCERTAINTY_BREACH"
     PSI_DRIFT_BREACH = "PSI_DRIFT_BREACH"
     POST_INFERENCE_SIMPLEX_VIOLATION = "POST_INFERENCE_SIMPLEX_VIOLATION"
     POST_INFERENCE_PUT_BOUND_VIOLATION = "POST_INFERENCE_PUT_BOUND_VIOLATION"
@@ -187,10 +204,29 @@ class SR262AuditRecord:
     max_psi_score: float
     min_pin_risk_z: float
     engine_selected: str
+    conformal_half_width_bps: float = 0.0
+    greeks_engine_used: str = "None"
 
     def to_dict(self) -> dict[str, Any]:
         """Serializes the audit record to a JSON-compatible dictionary."""
-        return asdict(self)
+        return {
+            "trade_id": self.trade_id,
+            "timestamp_utc": self.timestamp_utc,
+            "pre_gate_passed": self.pre_gate_passed,
+            "post_gate_passed": self.post_gate_passed,
+            "fallback_triggered": self.fallback_triggered,
+            "fallback_reasons": list(self.fallback_reasons),
+            "warnings": list(self.warnings),
+            "min_corr_eigenvalue_raw": self.min_corr_eigenvalue_raw,
+            "min_corr_eigenvalue_shrunk": self.min_corr_eigenvalue_shrunk,
+            "correlation_shrunk_applied": self.correlation_shrunk_applied,
+            "mahalanobis_d2": self.mahalanobis_d2,
+            "max_psi_score": self.max_psi_score,
+            "min_pin_risk_z": self.min_pin_risk_z,
+            "engine_selected": self.engine_selected,
+            "conformal_half_width_bps": self.conformal_half_width_bps,
+            "greeks_engine_used": self.greeks_engine_used,
+        }
 
 
 @dataclass
@@ -274,23 +310,13 @@ def project_correlation_to_psd(
     *,
     eps_psd: float = 1e-4,
 ) -> tuple[npt.NDArray[np.float64], float, float, bool]:
-    """Projects a symmetric correlation matrix R to the SPD cone with lambda_min >= eps_psd.
-
-    Applies optimal Ledoit-Wolf / convex shrinkage toward the identity matrix:
-        R(alpha) = (1 - alpha) * R_sym + alpha * I_D,
-        alpha = clip((eps_psd - lambda_min) / (1 - lambda_min), 0.0, 1.0),
-    followed by spectral eigenvalue flooring + diagonal renormalization if needed so that
-    lambda_min(R_PSD) >= eps_psd and diag(R_PSD) == 1 in IEEE-754 float64.
-
-    Args:
-        corr: Correlation matrix of shape (D, D) as numpy array, torch.Tensor, or nested list.
-        eps_psd: Minimum allowable eigenvalue threshold (default 1e-4).
+    """Projects a correlation matrix R onto {S >= eps_psd I} \\cap {diag(S) = 1} via Dykstra-Higham (2002).
 
     Returns:
         r_psd: (D, D) float64 PSD correlation matrix with unit diagonal and lambda_min >= eps_psd.
         min_eig_raw: Minimum eigenvalue of the raw symmetrized input matrix.
         min_eig_shrunk: Minimum eigenvalue of the returned R_PSD matrix.
-        shrunk_applied: True if shrinkage or projection was applied, else False.
+        shrunk_applied: True if asymmetry, diagonal deviation, or non-PSD projection occurred.
     """
     if isinstance(corr, torch.Tensor):
         r_in = corr.detach().cpu().numpy().astype(np.float64, copy=True)
@@ -312,9 +338,11 @@ def project_correlation_to_psd(
     if has_non_finite:
         r_clean = np.where(np.isfinite(r_in), r_in, 0.0)
         np.fill_diagonal(r_clean, 1.0)
+        has_asymmetry = float(np.max(np.abs(r_clean - r_clean.T))) > 1e-10
         r_sym = 0.5 * (r_clean + r_clean.T)
         min_eig_raw = -1.0
     else:
+        has_asymmetry = float(np.max(np.abs(r_in - r_in.T))) > 1e-10
         r_sym = 0.5 * (r_in + r_in.T)
         eigvals_raw = np.linalg.eigvalsh(r_sym)
         min_eig_raw = float(np.min(eigvals_raw))
@@ -325,6 +353,7 @@ def project_correlation_to_psd(
 
     if (
         not has_non_finite
+        and not has_asymmetry
         and min_eig_raw >= eps_psd
         and diag_dev <= 1e-10
         and max_off <= 1.0 - 1e-12
@@ -332,47 +361,39 @@ def project_correlation_to_psd(
         np.fill_diagonal(r_sym, 1.0)
         return r_sym, min_eig_raw, min_eig_raw, False
 
-    # Ensure unit diagonal and bounded off-diagonal entries before convex shrinkage
-    r_work = r_sym.copy()
-    np.fill_diagonal(r_work, 1.0)
-    max_allowed_off = 1.0 - eps_psd
-    if max_off > max_allowed_off:
-        r_work[off_mask] = np.clip(r_work[off_mask], -max_allowed_off, max_allowed_off)
+    # Dykstra-Higham (2002) alternating projections onto {S >= eps_psd * I} \cap {diag(S) = 1}
+    y = r_sym.copy()
+    np.fill_diagonal(y, 1.0)
+    d_s = np.zeros_like(y)
+    for _ in range(50):
+        r_k = y - d_s
+        eigvals, eigvecs = np.linalg.eigh(0.5 * (r_k + r_k.T))
+        eigvals_clipped = np.maximum(eigvals, eps_psd)
+        x_k = (eigvecs * eigvals_clipped[None, :]) @ eigvecs.T
+        x_k = 0.5 * (x_k + x_k.T)
+        d_s = x_k - r_k
+        y_next = x_k.copy()
+        np.fill_diagonal(y_next, 1.0)
+        step_diff = float(np.max(np.abs(y_next - y)))
+        y = y_next
+        if step_diff <= 1e-12:
+            if float(np.min(np.linalg.eigvalsh(y))) >= eps_psd - 1e-12:
+                break
 
-    eigvals_work = np.linalg.eigvalsh(r_work)
-    lam_min = float(np.min(eigvals_work))
+    y = 0.5 * (y + y.T)
+    np.fill_diagonal(y, 1.0)
+    min_eig_shrunk = float(np.min(np.linalg.eigvalsh(y)))
+    if min_eig_shrunk < eps_psd:
+        alpha_fix = min(
+            max((eps_psd - min_eig_shrunk + 1e-12) / max(1.0 - min_eig_shrunk, 1e-12), 0.0),
+            1.0,
+        )
+        y = (1.0 - alpha_fix) * y + alpha_fix * np.eye(d, dtype=np.float64)
+        y = 0.5 * (y + y.T)
+        np.fill_diagonal(y, 1.0)
+        min_eig_shrunk = float(np.min(np.linalg.eigvalsh(y)))
 
-    if lam_min < eps_psd:
-        denom = max(1.0 - lam_min, 1e-12)
-        alpha = min(max((eps_psd - lam_min) / denom, 0.0), 1.0)
-        # Cap global convex shrinkage at 0.05 so spectral projection handles localized negative modes
-        # without shrinking valid off-diagonal correlations by up to 46.4% (AUD-P1-06)
-        alpha_eff = min(alpha, 0.05) if not has_non_finite else alpha
-        eye_d = np.eye(d, dtype=np.float64)
-        r_psd = (1.0 - alpha_eff) * r_work + alpha_eff * eye_d
-        np.fill_diagonal(r_psd, 1.0)
-    else:
-        r_psd = r_work
-
-    # Verify minimum eigenvalue after convex shrinkage; apply spectral floor + renormalization if needed
-    eigvals_post, eigvecs_post = np.linalg.eigh(r_psd)
-    min_eig_shrunk = float(np.min(eigvals_post))
-    if min_eig_shrunk < eps_psd - 1e-14:
-        eigvals_floored = np.maximum(eigvals_post, eps_psd)
-        r_spec = (eigvecs_post * eigvals_floored[None, :]) @ eigvecs_post.T
-        d_inv = 1.0 / np.sqrt(np.maximum(np.diag(r_spec), 1e-12))
-        r_psd = r_spec * np.outer(d_inv, d_inv)
-        r_psd = 0.5 * (r_psd + r_psd.T)
-        np.fill_diagonal(r_psd, 1.0)
-        eigvals_final = np.linalg.eigvalsh(r_psd)
-        lam_final = float(np.min(eigvals_final))
-        if lam_final < eps_psd:
-            alpha_fix = min(max((eps_psd - lam_final + 1e-12) / max(1.0 - lam_final, 1e-12), 0.0), 1.0)
-            r_psd = (1.0 - alpha_fix) * r_psd + alpha_fix * np.eye(d, dtype=np.float64)
-            np.fill_diagonal(r_psd, 1.0)
-        min_eig_shrunk = float(np.min(np.linalg.eigvalsh(r_psd)))
-
-    return r_psd, min_eig_raw, min_eig_shrunk, True
+    return y, min_eig_raw, min_eig_shrunk, True
 
 
 def extract_16d_basket_summary(
@@ -529,8 +550,9 @@ class EQAutocallModelGuardian:
     """Tier 3 SR 11-7 / SR 26-2 Model Risk Management Guardian & Failover Router.
 
     Enforces a 3-stage circuit breaker:
-      1. Pre-Inference Structural, PSD Correlation, Imminent Pin-Risk, Mahalanobis OOD & PSI Gate.
-      2. Post-Inference Probability Simplex, Put Loss Bound & Residual Outlier Gate.
+      1. Pre-Inference Structural, PSD Correlation, Imminent Pin-Risk, Mahalanobis OOD,
+         Conformal Uncertainty & PSI Gate.
+      2. Post-Inference Probability Simplex, Put-Spread Bound & Funded Residual Gate.
       3. Deterministic Failover Router to `price_eq_autocall_dupire_qmc` with SR 26-2 Audit Logging.
     """
 
@@ -548,10 +570,14 @@ class EQAutocallModelGuardian:
         psi_fallback_threshold: float = 0.25,
         psi_window_size: int = 200,
         psi_min_samples: int = 20,
-        residual_threshold: float = 0.15,
+        residual_threshold: float | None = None,
         ref_mean_16d: npt.NDArray[np.float64] | None = None,
         ref_cov_inv_16d: npt.NDArray[np.float64] | None = None,
-        record_drift_by_default: bool = False,
+        record_drift_by_default: bool = True,
+        tau_desk_bps: float = DEFAULT_TAU_DESK_BPS,
+        conformal_alpha: float = 0.05,
+        stats_path: str | Path | None = None,
+        use_gpu_qmc: bool | None = None,
     ) -> None:
         self.d_max = int(d_max)
         self.m_max = int(m_max)
@@ -564,8 +590,13 @@ class EQAutocallModelGuardian:
         self.psi_fallback_threshold = float(psi_fallback_threshold)
         self.psi_window_size = int(psi_window_size)
         self.psi_min_samples = int(psi_min_samples)
-        self.residual_threshold = float(residual_threshold)
+        self.residual_threshold: float | None = (
+            float(residual_threshold) if residual_threshold is not None else None
+        )
         self.record_drift_by_default = bool(record_drift_by_default)
+        self.tau_desk_bps = float(tau_desk_bps)
+        self.conformal_alpha = float(conformal_alpha)
+        self.use_gpu_qmc = use_gpu_qmc
 
         self.ref_mean_16d: npt.NDArray[np.float64] = (
             np.asarray(ref_mean_16d, dtype=np.float64).copy()
@@ -576,12 +607,12 @@ class EQAutocallModelGuardian:
             self.ref_cov_inv_16d: npt.NDArray[np.float64] = np.asarray(
                 ref_cov_inv_16d, dtype=np.float64
             ).copy()
-            ref_std = np.sqrt(
-                1.0 / np.maximum(np.diag(self.ref_cov_inv_16d), 1e-12)
-            )
+            cov_mat = np.linalg.pinv(self.ref_cov_inv_16d)
+            ref_std = np.sqrt(np.maximum(np.diag(cov_mat), 1e-12))
         else:
             ref_std = _DEFAULT_REF_STD_16D.copy()
             self.ref_cov_inv_16d = np.diag(1.0 / (ref_std * ref_std))
+        self.ref_marginal_std_16d: npt.NDArray[np.float64] = ref_std.copy()
 
         # Initialize 10-decile bin edges from the calibrated Gaussian reference distribution
         self.psi_bin_edges = np.zeros((16, 11), dtype=np.float64)
@@ -592,11 +623,92 @@ class EQAutocallModelGuardian:
             self.psi_bin_edges[j, 1:10] = self.ref_mean_16d[j] + ref_std[j] * inner_z
             self.psi_bin_edges[j, 10] = np.inf
 
+        self.q_ood_conformal: float = self.mahalanobis_chi2_threshold
+        self.q_err_conformal: float = 0.0
+        self.scale_eps0: float = 0.0
+        self.scale_c1: float = 0.0
+        self.scale_weights_5d: npt.NDArray[np.float64] = np.zeros(5, dtype=np.float64)
+        self._conformal_calibrated: bool = False
+        self.stats_loaded: bool = False
+        self.stats_path: Path | None = Path(stats_path) if stats_path is not None else None
+
         self.feature_history: deque[npt.NDArray[np.float64]] = deque(
             maxlen=self.psi_window_size
         )
+        self._recent_psi_trade_ids: deque[str] = deque(maxlen=self.psi_window_size)
+        self._recent_psi_batch_hashes: deque[bytes] = deque(maxlen=self.psi_window_size)
         self.audit_log: deque[SR262AuditRecord] = deque(maxlen=10_000)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+
+        if self.stats_path is not None and self.stats_path.is_file():
+            self.load_calibrated_stats(self.stats_path)
+
+    def load_calibrated_stats(self, stats_path: str | Path) -> dict[str, Any]:
+        """Loads OAS covariance, 10-decile PSI bins, and split-conformal quantiles safely."""
+        p = Path(stats_path)
+        raw = torch.load(p, map_location="cpu", weights_only=True)
+        if not isinstance(raw, dict):
+            raise ValueError(f"Expected dict payload in Guardian stats artifact {p}.")
+
+        def _to_f64(val: Any) -> npt.NDArray[np.float64]:
+            if isinstance(val, torch.Tensor):
+                return val.detach().cpu().numpy().astype(np.float64, copy=True)
+            return np.asarray(val, dtype=np.float64).copy()
+
+        ref_mean = _to_f64(raw["ref_mean_16d"]).reshape(16)
+        ref_cov_inv = _to_f64(raw["ref_cov_inv_16d"]).reshape(16, 16)
+        if "ref_marginal_std_16d" in raw:
+            marg_std = _to_f64(raw["ref_marginal_std_16d"]).reshape(16)
+        elif "ref_cov_oas_16d" in raw:
+            cov_oas = _to_f64(raw["ref_cov_oas_16d"]).reshape(16, 16)
+            marg_std = np.sqrt(np.maximum(np.diag(cov_oas), 1e-12))
+        else:
+            cov_pinv = np.linalg.pinv(ref_cov_inv)
+            marg_std = np.sqrt(np.maximum(np.diag(cov_pinv), 1e-12))
+        bin_edges = _to_f64(raw["psi_bin_edges"]).reshape(16, 11)
+        ref_probs = _to_f64(raw["psi_ref_probs"]).reshape(16, 10)
+
+        q_ood = float(raw.get("q_ood_conformal", self.mahalanobis_chi2_threshold))
+        q_err = float(raw.get("q_err_conformal", 0.0))
+        eps0 = float(raw.get("scale_eps0", 0.0))
+        c1 = float(raw.get("scale_c1", 0.0))
+        if "scale_weights_5d" in raw:
+            w5 = _to_f64(raw["scale_weights_5d"]).reshape(5)
+            eps0 = float(w5[0])
+            c1 = float(w5[1])
+        else:
+            w5 = np.array([eps0, c1, 0.0, 0.0, 0.0], dtype=np.float64)
+        tau_file = float(raw.get("tau_desk_bps", self.tau_desk_bps))
+        alpha_file = float(raw.get("conformal_alpha", self.conformal_alpha))
+
+        with self._lock:
+            self.ref_mean_16d = ref_mean
+            self.ref_cov_inv_16d = ref_cov_inv
+            self.ref_marginal_std_16d = marg_std
+            self.psi_bin_edges = bin_edges
+            self.psi_ref_probs = ref_probs
+            self.q_ood_conformal = q_ood
+            self.q_err_conformal = q_err
+            self.scale_eps0 = eps0
+            self.scale_c1 = c1
+            self.scale_weights_5d = w5.copy()
+            self.conformal_alpha = alpha_file
+            if self.tau_desk_bps == DEFAULT_TAU_DESK_BPS:
+                self.tau_desk_bps = tau_file
+            self._conformal_calibrated = True
+            self.stats_loaded = True
+            self.stats_path = p
+
+        return {
+            "schema_version": str(raw.get("schema_version", "2.0")),
+            "q_ood_conformal": q_ood,
+            "q_err_conformal": q_err,
+            "scale_eps0": eps0,
+            "scale_c1": c1,
+            "scale_weights_5d": w5.tolist(),
+            "tau_desk_bps": self.tau_desk_bps,
+            "n_cal": int(raw.get("n_cal", 0)),
+        }
 
     def fit_reference_distribution(
         self,
@@ -613,8 +725,8 @@ class EQAutocallModelGuardian:
             raise ValueError(f"Expected reference_features of shape (N, 16), got {x_ref.shape}.")
 
         n_samples = x_ref.shape[0]
-        self.ref_mean_16d = np.mean(x_ref, axis=0)
-        diff = x_ref - self.ref_mean_16d[None, :]
+        ref_mean = np.mean(x_ref, axis=0)
+        diff = x_ref - ref_mean[None, :]
         cov_sample = (diff.T @ diff) / float(max(n_samples - 1, 1))
         diag_target = np.diag(np.maximum(np.diag(cov_sample), 1e-4))
         cov_shrunk = (
@@ -622,26 +734,36 @@ class EQAutocallModelGuardian:
             + shrinkage * diag_target
             + 1e-4 * np.eye(16, dtype=np.float64)
         )
-        self.ref_cov_inv_16d = np.linalg.inv(cov_shrunk)
+        cov_inv = np.linalg.inv(cov_shrunk)
+        marg_std = np.sqrt(np.maximum(np.diag(cov_shrunk), 1e-12))
 
+        bin_edges = np.zeros((16, 11), dtype=np.float64)
+        ref_probs = np.full((16, 10), 0.10, dtype=np.float64)
         percentiles = np.linspace(0.0, 100.0, 11)
         for j in range(16):
             edges = np.percentile(x_ref[:, j], percentiles).astype(np.float64)
             if len(np.unique(edges[1:-1])) < 9:
                 col_std = max(float(np.std(x_ref[:, j])), 1e-3)
-                inner = self.ref_mean_16d[j] + col_std * np.asarray(
+                inner = ref_mean[j] + col_std * np.asarray(
                     norm.ppf(np.linspace(0.1, 0.9, 9)), dtype=np.float64
                 )
             else:
                 inner = edges[1:-1]
-            self.psi_bin_edges[j, 0] = -np.inf
-            self.psi_bin_edges[j, 1:10] = inner
-            self.psi_bin_edges[j, 10] = np.inf
-            counts, _ = np.histogram(x_ref[:, j], bins=self.psi_bin_edges[j])
-            self.psi_ref_probs[j] = np.maximum(
+            bin_edges[j, 0] = -np.inf
+            bin_edges[j, 1:10] = inner
+            bin_edges[j, 10] = np.inf
+            counts, _ = np.histogram(x_ref[:, j], bins=bin_edges[j])
+            probs_j = np.maximum(
                 counts.astype(np.float64) / float(max(n_samples, 1)), 1e-6
             )
-            self.psi_ref_probs[j] /= np.sum(self.psi_ref_probs[j])
+            ref_probs[j] = probs_j / np.sum(probs_j)
+
+        with self._lock:
+            self.ref_mean_16d = ref_mean
+            self.ref_cov_inv_16d = cov_inv
+            self.ref_marginal_std_16d = marg_std
+            self.psi_bin_edges = bin_edges
+            self.psi_ref_probs = ref_probs
 
     def reset_drift_history(self) -> None:
         """Clears the rolling feature history window."""
@@ -674,8 +796,11 @@ class EQAutocallModelGuardian:
         x = np.asarray(feat_16d, dtype=np.float64).reshape(16)
         if not np.all(np.isfinite(x)):
             return 1e6
-        diff = x - self.ref_mean_16d
-        d2 = float(diff @ self.ref_cov_inv_16d @ diff)
+        with self._lock:
+            ref_mean = self.ref_mean_16d
+            cov_inv = self.ref_cov_inv_16d
+        diff = x - ref_mean
+        d2 = float(diff @ cov_inv @ diff)
         return max(d2, 0.0)
 
     def compute_psi(
@@ -683,29 +808,100 @@ class EQAutocallModelGuardian:
         observed_batch: npt.NDArray[np.float64] | None = None,
     ) -> tuple[float, dict[str, float]]:
         """Computes the 10-decile PSI on `observed_batch` or the rolling `self.feature_history` window."""
-        if observed_batch is not None:
-            obs = np.asarray(observed_batch, dtype=np.float64)
-            return compute_psi_10_decile(obs, self.psi_bin_edges, self.psi_ref_probs)
         with self._lock:
-            if len(self.feature_history) < self.psi_min_samples:
-                return 0.0, {name: 0.0 for name in FEATURE_NAMES_16D}
-            obs = np.stack(list(self.feature_history), axis=0)
-        return compute_psi_10_decile(obs, self.psi_bin_edges, self.psi_ref_probs)
+            bin_edges = self.psi_bin_edges.copy()
+            ref_probs = self.psi_ref_probs.copy()
+            if observed_batch is not None:
+                obs = np.asarray(observed_batch, dtype=np.float64)
+            else:
+                if len(self.feature_history) < self.psi_min_samples:
+                    return 0.0, {name: 0.0 for name in FEATURE_NAMES_16D}
+                obs = np.stack(list(self.feature_history), axis=0)
+        return compute_psi_10_decile(obs, bin_edges, ref_probs)
+
+    def compute_conformal_half_width_bps(
+        self,
+        preproc_state: AutocallPreprocState,
+        baseline_out: AutocallBaselineOutput | None = None,
+    ) -> float:
+        """Computes 5D locally-weighted split-conformal error half-width in bps."""
+        with self._lock:
+            if not self._conformal_calibrated:
+                return 0.0
+            q_err = self.q_err_conformal
+            w5 = self.scale_weights_5d.copy()
+
+        b_out = baseline_out if baseline_out is not None else preproc_state.baseline
+        w_np = b_out.proxy_delta_weights.detach().cpu().numpy().astype(np.float64)
+        w_abs = np.abs(w_np)
+        w_sum = float(np.sum(w_abs))
+        if w_sum > 1e-6:
+            w_norm = w_abs / w_sum
+            h_disp = float(np.clip(1.0 - np.sum(w_norm * w_norm), 0.0, 1.0))
+        else:
+            h_disp = 0.0
+
+        m_rem = int(preproc_state.m_rem)
+        vw_np = (
+            b_out.v_w.detach().cpu().numpy().astype(np.float64)
+            if m_rem > 0 and b_out.v_w.numel() > 0
+            else np.zeros(0, dtype=np.float64)
+        )
+        v_bar = float(np.mean(vw_np[:m_rem])) if (m_rem > 0 and vw_np.size >= m_rem) else 0.0
+        v_last = float(vw_np[m_rem - 1]) if (m_rem > 0 and vw_np.size >= m_rem) else 0.0
+
+        call_code = monitoring_index_to_code(preproc_state.callability_index)
+        opt_code = monitoring_index_to_code(
+            preproc_state.option_index
+            if preproc_state.option_index is not None
+            else preproc_state.callability_index
+        )
+        is_wof = (
+            1.0
+            if (
+                call_code == int(MonitoringIndexCode.WORST_OF)
+                or opt_code == int(MonitoringIndexCode.WORST_OF)
+            )
+            else 0.0
+        )
+        has_ki_untriggered = (
+            1.0
+            if (preproc_state.ki_barrier is not None and float(preproc_state.i_ki_past) < 0.5)
+            else 0.0
+        )
+
+        phi = np.array(
+            [
+                1.0,
+                math.sqrt(max(h_disp * max(v_bar, 0.0), 0.0)),
+                (float(max(m_rem - 1, 0)) / 47.0) * max(v_bar, 0.0),
+                is_wof * h_disp,
+                has_ki_untriggered * max(float(preproc_state.option_gearing), 0.0) * max(v_last, 0.0),
+            ],
+            dtype=np.float64,
+        )
+        scale = float(np.dot(w5, phi))
+        return float(max(q_err * scale * 1e4, 0.0))
+
+    @staticmethod
+    def _eval_spot_basket_perf(
+        m0_np: npt.NDArray[np.float64],
+        index_name: str,
+        inv_lex_perm: npt.NDArray[np.int64] | None,
+    ) -> float:
+        """Evaluates monitoring index on current spot performance m0 in original order."""
+        idx = str(index_name).strip()
+        is_asym = idx in ("RatioAB", "RatioBA", "DiffAB", "DiffBA", "Outperformance", "Spread")
+        arr = m0_np[inv_lex_perm] if (is_asym and inv_lex_perm is not None) else m0_np
+        res_arr = np.asarray(evaluate_monitoring_index_np(arr[None, :], idx), dtype=np.float64).reshape(-1)
+        return float(res_arr[0])
 
     def compute_min_pin_risk_z(
         self,
         preproc_state: AutocallPreprocState,
         baseline_out: AutocallBaselineOutput | None = None,
     ) -> tuple[float, bool]:
-        """Computes imminent barrier pin-risk z-score across short-dated active periods (tau_m <= 0.08).
-
-        Screens all active barriers (AutoCall B_KO, non-guaranteed Coupon B_cpn, and terminal KnockIn B_KI)
-        when tau_m <= self.pin_risk_tau_max (§1.5.1 & AUD-P1-06).
-
-        Returns:
-            min_z: Finite float64 pin-risk z-score in [0.0, 100.0].
-            pin_risk_breached: True if min_z < self.pin_risk_z_min (0.15) on an imminent barrier period.
-        """
+        """Computes imminent log-space barrier pin-risk z-score across short-dated active periods."""
         m_rem = int(preproc_state.m_rem)
         if m_rem == 0 or preproc_state.already_autocalled:
             return 100.0, False
@@ -719,18 +915,31 @@ class EQAutocallModelGuardian:
         fw_np = b_out.f_w.detach().cpu().numpy().astype(np.float64)
         vw_np = b_out.v_w.detach().cpu().numpy().astype(np.float64)
 
+        m0_np = preproc_state.moneyness_t0.detach().cpu().numpy().astype(np.float64)
+        inv_perm_raw = getattr(preproc_state, "inv_lex_perm", None)
+        inv_perm = np.asarray(inv_perm_raw, dtype=np.int64) if inv_perm_raw is not None else None
+        w0_call = max(
+            self._eval_spot_basket_perf(m0_np, preproc_state.callability_index, inv_perm),
+            1e-12,
+        )
+        eff_cpn_idx = preproc_state.coupon_index or preproc_state.callability_index
+        eff_opt_idx = preproc_state.option_index or preproc_state.callability_index
+        w0_cpn = max(self._eval_spot_basket_perf(m0_np, eff_cpn_idx, inv_perm), 1e-12)
+        w0_opt = max(self._eval_spot_basket_perf(m0_np, eff_opt_idx, inv_perm), 1e-12)
+
         min_imminent_z = 100.0
         has_imminent = False
         for m in range(m_rem):
             if tau_np[m] > self.pin_risk_tau_max:
                 continue
             denom = max(float(vw_np[m]), 1e-12)
-            fw_m = float(fw_np[m])
+            fw_m = max(float(fw_np[m]), 1e-12)
 
-            # 1. Active AutoCall barrier
-            if (call_np[m] > 0.5) or (ko_np[m] < 10.0):
+            # 1. Active AutoCall barrier (AND guard prevents false positives on non-callable periods)
+            if (call_np[m] > 0.5) and (1e-4 < float(ko_np[m]) < 10.0):
                 has_imminent = True
-                z_ko = abs(fw_m - float(ko_np[m])) / denom
+                b_ko = float(ko_np[m])
+                z_ko = min(abs(math.log(fw_m / b_ko)), abs(math.log(w0_call / b_ko))) / denom
                 if not np.isfinite(z_ko):
                     z_ko = 0.0
                 if z_ko < min_imminent_z:
@@ -739,25 +948,49 @@ class EQAutocallModelGuardian:
             # 2. Active non-guaranteed Coupon barrier
             if guar_np[m] < 0.5 and 1e-4 < float(cpn_np[m]) < 10.0:
                 has_imminent = True
-                z_cpn = abs(fw_m - float(cpn_np[m])) / denom
+                b_cpn = float(cpn_np[m])
+                z_cpn = min(abs(math.log(fw_m / b_cpn)), abs(math.log(w0_cpn / b_cpn))) / denom
                 if not np.isfinite(z_cpn):
                     z_cpn = 0.0
                 if z_cpn < min_imminent_z:
                     min_imminent_z = z_cpn
 
-            # 3. Active terminal KnockIn barrier on final observation period
-            if (
-                m == m_rem - 1
-                and preproc_state.ki_barrier is not None
-                and float(preproc_state.ki_barrier) > 1e-4
-                and float(preproc_state.i_ki_past) < 0.5
-            ):
-                has_imminent = True
-                z_ki = abs(fw_m - float(preproc_state.ki_barrier)) / denom
-                if not np.isfinite(z_ki):
-                    z_ki = 0.0
-                if z_ki < min_imminent_z:
-                    min_imminent_z = z_ki
+            # 3. Active terminal barriers (KnockIn, Put Strike, LowerStrike) on final observation
+            if m == m_rem - 1:
+                if (
+                    preproc_state.ki_barrier is not None
+                    and float(preproc_state.ki_barrier) > 1e-4
+                    and float(preproc_state.i_ki_past) < 0.5
+                ):
+                    has_imminent = True
+                    b_ki = float(preproc_state.ki_barrier)
+                    z_ki = min(abs(math.log(fw_m / b_ki)), abs(math.log(w0_opt / b_ki))) / denom
+                    if not np.isfinite(z_ki):
+                        z_ki = 0.0
+                    if z_ki < min_imminent_z:
+                        min_imminent_z = z_ki
+
+                if float(preproc_state.strike) > 1e-4 and float(preproc_state.option_gearing) > 0.0:
+                    has_imminent = True
+                    k_put = float(preproc_state.strike)
+                    z_k = min(abs(math.log(fw_m / k_put)), abs(math.log(w0_opt / k_put))) / denom
+                    if not np.isfinite(z_k):
+                        z_k = 0.0
+                    if z_k < min_imminent_z:
+                        min_imminent_z = z_k
+
+                if (
+                    preproc_state.lower_strike is not None
+                    and float(preproc_state.lower_strike) > 1e-4
+                    and float(preproc_state.option_gearing) > 0.0
+                ):
+                    has_imminent = True
+                    k_low = float(preproc_state.lower_strike)
+                    z_low = min(abs(math.log(fw_m / k_low)), abs(math.log(w0_opt / k_low))) / denom
+                    if not np.isfinite(z_low):
+                        z_low = 0.0
+                    if z_low < min_imminent_z:
+                        min_imminent_z = z_low
 
         if has_imminent:
             min_z_clamped = float(min(max(min_imminent_z, 0.0), 100.0))
@@ -777,19 +1010,7 @@ class EQAutocallModelGuardian:
         npt.NDArray[np.float64],
         dict[str, Any],
     ]:
-        """Executes the Tier 3 Pre-Inference Structural, PSD, Pin-Risk, OOD & PSI Gate in float64.
-
-        Args:
-            preproc_state: Tier 1 `AutocallPreprocState` in `torch.float64`.
-            baseline_out: Optional `AutocallBaselineOutput` (defaults to `preproc_state.baseline`).
-            record_drift: Whether to append this trade's 16D feature summary to `self.feature_history`.
-
-        Returns:
-            passed: True if the trade is safe for Tier 2 neural surrogate inference.
-            reasons: List of `AutocallFallbackReason` codes that tripped.
-            r_psd: (D, D) PSD-shrunk correlation matrix in `np.float64` with lambda_min >= 1e-4.
-            diagnostics: Dictionary of SR 26-2 diagnostic metrics and warnings.
-        """
+        """Executes the Tier 3 Pre-Inference Structural, PSD, Pin-Risk, OOD, Conformal & PSI Gate."""
         b_out = baseline_out if baseline_out is not None else preproc_state.baseline
         reasons: list[AutocallFallbackReason] = []
         warnings: list[str] = []
@@ -824,34 +1045,59 @@ class EQAutocallModelGuardian:
         if m_rem == 0 or preproc_state.already_autocalled:
             reasons.append(AutocallFallbackReason.ZERO_FUTURE_PERIODS)
 
-        # 3. Exotic monitoring index & exotic terminal modifier gates
-        indices_to_check = [preproc_state.callability_index]
-        if preproc_state.coupon_index is not None:
-            indices_to_check.append(preproc_state.coupon_index)
-        if preproc_state.option_index is not None:
-            indices_to_check.append(preproc_state.option_index)
+        # 3. Exotic monitoring index (incl. mixed-leg indices) & exotic terminal modifier gates
+        call_idx_str = str(preproc_state.callability_index).strip()
+        cpn_idx_str = (
+            str(preproc_state.coupon_index).strip()
+            if preproc_state.coupon_index is not None
+            else call_idx_str
+        )
+        opt_idx_str = (
+            str(preproc_state.option_index).strip()
+            if preproc_state.option_index is not None
+            else call_idx_str
+        )
+        indices_to_check = (call_idx_str, cpn_idx_str, opt_idx_str)
+        call_code = monitoring_index_to_code(call_idx_str)
+        mixed_index = (
+            monitoring_index_to_code(cpn_idx_str) != call_code
+            or monitoring_index_to_code(opt_idx_str) != call_code
+        )
+        if mixed_index or any(idx_name not in SUPPORTED_TIER2_INDICES for idx_name in indices_to_check):
+            reasons.append(AutocallFallbackReason.EXOTIC_MONITORING_INDEX)
 
-        for idx_name in indices_to_check:
-            if str(idx_name).strip() not in SUPPORTED_TIER2_INDICES:
-                reasons.append(AutocallFallbackReason.EXOTIC_MONITORING_INDEX)
-                break
-
+        has_lower_strike = (
+            preproc_state.lower_strike is not None and float(preproc_state.lower_strike) > 0.0
+        )
+        allow_ac_expiry_active = (
+            bool(preproc_state.allow_autocall_on_expiry)
+            and m_rem > 0
+            and preproc_state.is_callable.numel() > 0
+            and float(preproc_state.is_callable[-1].item()) > 0.5
+        )
         if (
             float(preproc_state.participation_call_rate) > 0.0
             or float(preproc_state.one_star_coupon) > 0.0
             or (preproc_state.one_star_strike is not None and float(preproc_state.one_star_strike) > 0.0)
             or str(preproc_state.coupon_barrier_type).strip() != "In"
             or str(preproc_state.coupon_barrier_direction).strip() != "Up"
+            or has_lower_strike
+            or bool(preproc_state.is_long_basket)
+            or allow_ac_expiry_active
         ):
             reasons.append(AutocallFallbackReason.EXOTIC_TERMINAL_MODIFIER_ROUTED)
 
-        # 4. Correlation PSD & Ledoit-Wolf shrinkage gate
+        # 4. Correlation PSD & Dykstra-Higham projection gate
         r_psd, min_eig_raw, min_eig_shrunk, shrunk_applied = project_correlation_to_psd(
             preproc_state.corr_matrix,
             eps_psd=self.eps_psd,
         )
         raw_corr_np = preproc_state.corr_matrix.detach().cpu().numpy().astype(np.float64)
-        off_mask = ~np.eye(d_assets, dtype=bool) if d_assets >= 2 else np.zeros((d_assets, d_assets), dtype=bool)
+        off_mask = (
+            ~np.eye(d_assets, dtype=bool)
+            if d_assets >= 2
+            else np.zeros((d_assets, d_assets), dtype=bool)
+        )
         has_invalid_corr_entry = (
             not bool(np.all(np.isfinite(raw_corr_np)))
             or (bool(np.any(off_mask)) and float(np.max(np.abs(raw_corr_np[off_mask]))) > 1.0 + 1e-6)
@@ -867,40 +1113,136 @@ class EQAutocallModelGuardian:
                 f"CORRELATION_SHRUNK_TO_PSD: min_eig_raw={min_eig_raw:.6e} -> min_eig_shrunk={min_eig_shrunk:.6e}."
             )
 
-        # 5. Imminent barrier pin-risk gate
+        # 5. Imminent log-space barrier pin-risk gate
         min_pin_z, pin_breached = self.compute_min_pin_risk_z(preproc_state, b_out)
         if pin_breached:
             reasons.append(AutocallFallbackReason.IMMINENT_BARRIER_PIN_RISK)
 
-        # 6. 16D Basket Summary Feature Extraction, Mahalanobis OOD & 10-Decile PSI Drift Gate
+        # 6. 16D Basket Summary Feature Extraction, Mahalanobis OOD, Active Smile/Domain Box & Conformal Gate
         summary_16d = extract_16d_basket_summary(preproc_state, b_out)
+        conformal_hw_bps = self.compute_conformal_half_width_bps(preproc_state, b_out)
+        with self._lock:
+            eff_ood_thresh = (
+                float(self.q_ood_conformal)
+                if self._conformal_calibrated
+                else float(self.mahalanobis_chi2_threshold)
+            )
+            conformal_active = bool(self._conformal_calibrated)
+            tau_desk_bps = float(self.tau_desk_bps)
+
         if not bool(np.all(np.isfinite(summary_16d))):
             if AutocallFallbackReason.NON_FINITE_OUTPUT not in reasons:
                 reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
             mahalanobis_d2 = 1e6
         else:
             mahalanobis_d2 = self.compute_mahalanobis_d2(summary_16d)
-            # Enforce explicit Sobol training-domain box bounds (AUD-P0-09)
             max_vol_val = float(summary_16d[AutocallSummaryCol.MAX_ATM_VOL])
             max_div_lev = float(summary_16d[AutocallSummaryCol.MAX_CASH_DIV_LEVERAGE])
             min_log_m = float(summary_16d[AutocallSummaryCol.MIN_LOG_MONEYNESS])
             max_log_m = float(summary_16d[AutocallSummaryCol.MAX_LOG_MONEYNESS])
-            if (
+
+            domain_box_ood = (
                 max_vol_val > 1.00
                 or max_div_lev > math.log(1.0 / (1.0 - 0.25))
                 or min_log_m < math.log(0.15)
                 or max_log_m > math.log(2.50)
-            ):
-                mahalanobis_d2 = max(mahalanobis_d2, self.mahalanobis_chi2_threshold + 10.0)
+                or float(preproc_state.option_gearing) > 2.0
+            )
 
-        if mahalanobis_d2 > self.mahalanobis_chi2_threshold:
+            # Check active-asset smile box bounds (scoped to |w_proxy_i| > 1e-3 & K in [0.4 F_i, 2.0 F_i])
+            if not domain_box_ood and d_assets > 0:
+                w_proxy_np = b_out.proxy_delta_weights.detach().cpu().numpy().astype(np.float64)
+                node_np = preproc_state.node_feats[0, :d_assets, :].detach().cpu().numpy().astype(np.float64)
+                if float(np.max(np.abs(node_np[:, int(AutocallNodeCol.REPO_SPREAD_AVG)]))) > 0.15:
+                    domain_box_ood = True
+
+                fwd_np = (
+                    preproc_state.dividend_schedule.forward_price.detach().cpu().numpy().astype(np.float64)
+                    if preproc_state.dividend_schedule.forward_price.numel() > 0
+                    else None
+                )
+                for i in range(d_assets):
+                    if abs(float(w_proxy_np[i])) <= 1e-3:
+                        continue
+                    skew_rho = abs(float(node_np[i, int(AutocallNodeCol.SSVI_SKEW_RHO)]))
+                    curv_eta = float(node_np[i, int(AutocallNodeCol.SSVI_CURV_ETA)])
+                    pc1 = abs(float(node_np[i, int(AutocallNodeCol.SMILE_RESIDUAL_PC1)]))
+                    pc2 = abs(float(node_np[i, int(AutocallNodeCol.SMILE_RESIDUAL_PC2)]))
+                    if skew_rho > 0.75 or curv_eta > 3.5 or pc1 > 0.25 or pc2 > 0.25:
+                        domain_box_ood = True
+                        break
+                    ticker_i = preproc_state.sorted_identifiers[i]
+                    surf_i = preproc_state.vol_surfaces.get(ticker_i)
+                    if (
+                        surf_i is not None
+                        and fwd_np is not None
+                        and fwd_np.shape[0] > i
+                        and fwd_np.shape[1] > 0
+                    ):
+                        f_i = float(fwd_np[i, -1])
+                        k_mask = (surf_i.strikes >= 0.4 * f_i) & (surf_i.strikes <= 2.0 * f_i)
+                        if np.any(k_mask):
+                            q_act = surf_i.quotes[:, k_mask]
+                            q_ratio = float(np.max(q_act)) / max(float(np.min(q_act)), 1e-12)
+                            if q_ratio > 5.0:
+                                domain_box_ood = True
+                                break
+
+            # Check zero-rate bounds and quanto drift bounds
+            if not domain_box_ood and m_rem > 0:
+                df_pay_np = preproc_state.df_pay.detach().cpu().numpy().astype(np.float64)
+                tau_pay_np = preproc_state.tau_pay.detach().cpu().numpy().astype(np.float64)
+                for m_idx in range(m_rem):
+                    t_p = float(tau_pay_np[m_idx])
+                    if t_p >= 0.02:
+                        r_zero_m = -math.log(max(float(df_pay_np[m_idx]), 1e-12)) / t_p
+                        if r_zero_m < -0.01 or r_zero_m > 0.30:
+                            domain_box_ood = True
+                            break
+
+            if not domain_box_ood and preproc_state.quanto_meta:
+                for q_ticker, q_meta in preproc_state.quanto_meta.items():
+                    if q_ticker not in preproc_state.sorted_identifiers:
+                        continue
+                    idx_q = preproc_state.sorted_identifiers.index(q_ticker)
+                    rho_fx = abs(float(q_meta.get("rho_s_fx", 0.0)))
+                    sig_fx_vals = q_meta.get("sig_fx_obs", ())
+                    sig_fx_max = max((abs(float(v)) for v in sig_fx_vals), default=0.0)
+                    sig_eq_max = (
+                        float(torch.max(preproc_state.iv_at_fwd[idx_q]).item())
+                        if preproc_state.iv_at_fwd.numel() > 0
+                        else 0.0
+                    )
+                    if rho_fx * sig_fx_max * sig_eq_max > 0.10:
+                        domain_box_ood = True
+                        break
+
+            if domain_box_ood:
+                mahalanobis_d2 = max(mahalanobis_d2, eff_ood_thresh + 10.0)
+
+        if mahalanobis_d2 > eff_ood_thresh:
             reasons.append(AutocallFallbackReason.MAHALANOBIS_OOD)
+
+        if conformal_active and conformal_hw_bps > tau_desk_bps:
+            reasons.append(AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH)
+            warnings.append(
+                f"CONFORMAL_UNCERTAINTY_BREACH: conformal_half_width_bps={conformal_hw_bps:.2f} > {tau_desk_bps:.2f}."
+            )
 
         do_record = (
             self.record_drift_by_default if record_drift is None else bool(record_drift)
         )
         if do_record and bool(np.all(np.isfinite(summary_16d))):
-            self.record_feature_vector(summary_16d)
+            t_id = str(preproc_state.trade_info) if preproc_state.trade_info is not None else ""
+            should_push = True
+            if t_id:
+                with self._lock:
+                    if t_id in self._recent_psi_trade_ids:
+                        should_push = False
+                    else:
+                        self._recent_psi_trade_ids.append(t_id)
+            if should_push:
+                self.record_feature_vector(summary_16d)
 
         max_psi, psi_per_feature = self.compute_psi()
         if max_psi >= self.psi_fallback_threshold:
@@ -922,6 +1264,7 @@ class EQAutocallModelGuardian:
             "max_psi_score": float(max_psi),
             "psi_per_feature": psi_per_feature,
             "min_pin_risk_z": float(min_pin_z),
+            "conformal_half_width_bps": float(conformal_hw_bps),
             "summary_features_16d": summary_16d,
             "warnings": warnings,
         }
@@ -934,22 +1277,11 @@ class EQAutocallModelGuardian:
         preproc_state: AutocallPreprocState,
         baseline_out: AutocallBaselineOutput | None = None,
     ) -> tuple[bool, list[AutocallFallbackReason]]:
-        """Executes the Tier 3 Post-Inference Probability Simplex, Put Bound & Residual Gate in float64.
-
-        Checks (§1.5.2):
-          1. `NON_FINITE_OUTPUT`: No NaN or Inf in p_m, q_m, L_put, or ProductValue.
-          2. `POST_INFERENCE_SIMPLEX_VIOLATION`:
-             sum_{m=1}^{M_rem} p_m <= 1 + 1e-6, p_m in [-1e-7, 1 + 1e-7], q_m in [-1e-7, 1 + 1e-7].
-          3. `POST_INFERENCE_PUT_BOUND_VIOLATION`:
-             L_put in [-1e-7, K_put * S_{M_rem} + 1e-6].
-          4. `POST_INFERENCE_RESIDUAL_OUTLIER`:
-             |PV_surrogate - PV_proxy| <= tau_res (dispersion- and variance-scaled residual bound, AUD-P0-10).
-        """
+        """Executes the Tier 3 Post-Inference Probability Simplex, Put-Spread Bound & Funded Residual Gate."""
         reasons: list[AutocallFallbackReason] = []
         m_rem = int(preproc_state.m_rem)
         b_out = baseline_out if baseline_out is not None else preproc_state.baseline
 
-        # Extract p_m, q_m, l_put in float64
         p_arr: npt.NDArray[np.float64] | None = None
         q_arr: npt.NDArray[np.float64] | None = None
         l_put_val: float | None = None
@@ -1052,7 +1384,6 @@ class EQAutocallModelGuardian:
         if l_put_val is None:
             l_put_val = 0.0
 
-        # If postproc_out was not supplied, assemble it to evaluate PV_surrogate
         if pv_surrogate is None:
             if np.all(np.isfinite(p_arr)) and np.all(np.isfinite(q_arr)) and np.isfinite(l_put_val):
                 asm = assemble_autocall_cashflows_and_pv(
@@ -1060,6 +1391,7 @@ class EQAutocallModelGuardian:
                     p_stop=torch.as_tensor(p_arr, dtype=torch.float64),
                     q_cpn=torch.as_tensor(q_arr, dtype=torch.float64),
                     l_put=torch.tensor(l_put_val, dtype=torch.float64),
+                    build_cashflow_items=False,
                 )
                 pv_surrogate = float(asm.product_value.detach().cpu().item())
             else:
@@ -1086,7 +1418,7 @@ class EQAutocallModelGuardian:
         if sum_p > 1.0 + 1e-6 or p_out_of_bounds or q_out_of_bounds:
             reasons.append(AutocallFallbackReason.POST_INFERENCE_SIMPLEX_VIOLATION)
 
-        # 3. Terminal unit put loss bound check: 0 <= L_put <= K_put * S_{M_rem}
+        # 3. Terminal put-spread bound check: 0 <= L_put <= max(K_put - K_low, 0) * S_{M_rem}
         surv_term = max(1.0 - sum_p, 0.0)
         if isinstance(surrogate_out, AutocallSurrogateOutput) and m_rem > 0:
             surv_from_out = float(
@@ -1100,16 +1432,32 @@ class EQAutocallModelGuardian:
                 surv_term = max(min(surv_term, surv_from_out), 0.0)
 
         k_put = max(float(preproc_state.strike), 0.0)
-        max_put_bound = k_put * surv_term + 1e-6
+        k_low = (
+            max(float(preproc_state.lower_strike), 0.0)
+            if preproc_state.lower_strike is not None
+            else 0.0
+        )
+        k_eff = max(k_put - k_low, 0.0)
+        max_put_bound = k_eff * surv_term + 1e-6
         if l_put_val < -1e-7 or l_put_val > max_put_bound:
             reasons.append(AutocallFallbackReason.POST_INFERENCE_PUT_BOUND_VIOLATION)
 
-        # 4. Residual outlier check: |PV_surrogate - PV_proxy| <= tau_res (AUD-P0-10)
-        pv_proxy = float(b_out.product_value_proxy.detach().cpu().item())
-        if abs(self.residual_threshold - 0.15) < 1e-9:
+        # 4. Funded-vs-funded proxy residual outlier check (EXT-012)
+        pv_proxy_unfunded = float(b_out.product_value_proxy.detach().cpu().item())
+        if preproc_state.funding_leg is not None:
+            asm_proxy = assemble_autocall_cashflows_and_pv(
+                preproc_state,
+                build_cashflow_items=False,
+            )
+            pv_proxy = float(asm_proxy.product_value.detach().cpu().item())
+        else:
+            pv_proxy = pv_proxy_unfunded
+
+        if self.residual_threshold is None:
             w_np = b_out.proxy_delta_weights.detach().cpu().numpy().astype(np.float64)
-            w_sum = max(float(np.sum(np.maximum(w_np, 0.0))), 1e-6)
-            w_norm = np.maximum(w_np, 0.0) / w_sum
+            w_abs = np.abs(w_np)
+            w_sum = max(float(np.sum(w_abs)), 1e-6)
+            w_norm = w_abs / w_sum
             h_disp = float(np.clip(1.0 - np.sum(w_norm * w_norm), 0.0, 1.0))
             v_bar = (
                 float(np.mean(b_out.v_w.detach().cpu().numpy().astype(np.float64)))
@@ -1118,7 +1466,7 @@ class EQAutocallModelGuardian:
             )
             tau_res = min(0.0050 + 0.0350 * h_disp * math.sqrt(max(v_bar, 1e-4)), 0.0200)
         else:
-            tau_res = self.residual_threshold
+            tau_res = float(self.residual_threshold)
         if abs(pv_surrogate - pv_proxy) > tau_res:
             reasons.append(AutocallFallbackReason.POST_INFERENCE_RESIDUAL_OUTLIER)
 
@@ -1148,6 +1496,355 @@ class EQAutocallModelGuardian:
         preproc_state.baseline = new_baseline
         return new_baseline
 
+    def _extract_batch_16d_summary(
+        self,
+        node_feats: torch.Tensor,
+        edge_feats: torch.Tensor,
+        asset_mask: torch.Tensor,
+        sched_feats: torch.Tensor,
+        sched_mask: torch.Tensor,
+        global_feats: torch.Tensor,
+    ) -> npt.NDArray[np.float64]:
+        """Vectorized 16D summary feature extraction for tensor/Arrow batches."""
+        node_np = node_feats.detach().cpu().numpy().astype(np.float64)
+        edge_np = edge_feats.detach().cpu().numpy().astype(np.float64)
+        amask_np = asset_mask.detach().cpu().numpy().astype(np.float64) > 0.5
+        sched_np = sched_feats.detach().cpu().numpy().astype(np.float64)
+        smask_np = sched_mask.detach().cpu().numpy().astype(np.float64) > 0.5
+        glob_np = global_feats.detach().cpu().numpy().astype(np.float64)
+
+        b_sz = node_np.shape[0]
+        out = np.zeros((b_sz, 16), dtype=np.float64)
+        a_cnt = np.maximum(np.sum(amask_np, axis=1), 1).astype(np.float64)
+        log_m = node_np[:, :, int(AutocallNodeCol.LOG_MONEYNESS)]
+        log_m_masked_min = np.where(amask_np, log_m, np.inf)
+        log_m_masked_max = np.where(amask_np, log_m, -np.inf)
+        has_a = np.any(amask_np, axis=1)
+        out[:, 0] = np.where(has_a, np.sum(np.where(amask_np, log_m, 0.0), axis=1) / a_cnt, 0.0)
+        out[:, 1] = np.where(has_a, np.min(log_m_masked_min, axis=1), 0.0)
+        out[:, 2] = np.where(has_a, np.max(log_m_masked_max, axis=1), 0.0)
+
+        iv_s = node_np[:, :, int(AutocallNodeCol.IV_SHORT_ATM)]
+        iv_t = node_np[:, :, int(AutocallNodeCol.IV_TERM_ATM)]
+        out[:, 3] = np.where(has_a, np.sum(np.where(amask_np, iv_t, 0.0), axis=1) / a_cnt, 0.0)
+        out[:, 4] = np.where(
+            has_a,
+            np.max(np.where(amask_np, np.maximum(iv_s, iv_t), -np.inf), axis=1),
+            0.0,
+        )
+        div_l = node_np[:, :, int(AutocallNodeCol.CASH_DIV_LEVERAGE)]
+        out[:, 7] = np.where(has_a, np.max(np.where(amask_np, div_l, -np.inf), axis=1), 0.0)
+
+        d_max = node_np.shape[1]
+        eye_d = np.eye(d_max, dtype=bool)[None, :, :]
+        pair_mask = amask_np[:, :, None] & amask_np[:, None, :] & (~eye_d)
+        pair_cnt = np.sum(pair_mask, axis=(1, 2))
+        has_pair = pair_cnt > 0
+        corr_mat = edge_np[:, :, :, int(AutocallEdgeCol.CORR_RHO)]
+        out[:, 5] = np.where(
+            has_pair,
+            np.sum(np.where(pair_mask, corr_mat, 0.0), axis=(1, 2)) / np.maximum(pair_cnt, 1),
+            0.45,
+        )
+        out[:, 6] = np.where(
+            has_pair,
+            np.min(np.where(pair_mask, corr_mat, np.inf), axis=(1, 2)),
+            0.25,
+        )
+
+        m_cnt = np.sum(smask_np, axis=1)
+        has_m = m_cnt > 0
+        last_m_idx = np.clip(m_cnt - 1, 0, max(sched_np.shape[1] - 1, 0))
+        rows_idx = np.arange(b_sz)
+        if sched_np.shape[1] > 0:
+            tau_last = sched_np[rows_idx, last_m_idx, int(AutocallSchedCol.TAU_OBS)]
+            fw_last = sched_np[rows_idx, last_m_idx, int(AutocallSchedCol.STULZ_FWD_W)]
+            vw_last = sched_np[rows_idx, last_m_idx, int(AutocallSchedCol.STULZ_VOL_W)]
+        else:
+            tau_last = np.zeros(b_sz, dtype=np.float64)
+            fw_last = np.zeros(b_sz, dtype=np.float64)
+            vw_last = np.full(b_sz, 0.25, dtype=np.float64)
+        out[:, 8] = np.where(has_m, tau_last, 0.0)
+
+        is_call = (sched_np[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)] > 0.5) & smask_np
+        call_cnt = np.sum(is_call, axis=1)
+        log_ko = sched_np[:, :, int(AutocallSchedCol.LOG_KO_BARRIER)]
+        out[:, 9] = np.where(
+            call_cnt > 0,
+            np.sum(np.where(is_call, log_ko, 0.0), axis=1) / np.maximum(call_cnt, 1),
+            0.05,
+        )
+        log_cpn = sched_np[:, :, int(AutocallSchedCol.LOG_CPN_BARRIER)]
+        guar = sched_np[:, :, int(AutocallSchedCol.IS_GUARANTEED_CPN)]
+        cpn_act = smask_np & (guar < 0.5) & (log_cpn > math.log(1e-4) + 1e-4)
+        cpn_cnt = np.sum(cpn_act, axis=1)
+        out[:, 10] = np.where(
+            cpn_cnt > 0,
+            np.sum(np.where(cpn_act, log_cpn, 0.0), axis=1) / np.maximum(cpn_cnt, 1),
+            -0.50,
+        )
+        out[:, 11] = glob_np[:, int(AutocallGlobalCol.K_PUT)]
+        out[:, 12] = np.where(has_m, fw_last, out[:, 1])
+        out[:, 13] = np.where(has_m, vw_last, 0.25)
+        out[:, 14] = glob_np[:, int(AutocallGlobalCol.C_MEM_0)]
+        out[:, 15] = np.abs(glob_np[:, int(AutocallGlobalCol.ABS_KO_SPREAD)])
+        return out
+
+    def evaluate_tensor_batch_pre(
+        self,
+        node_feats: torch.Tensor,
+        edge_feats: torch.Tensor,
+        asset_mask: torch.Tensor,
+        sched_feats: torch.Tensor,
+        sched_mask: torch.Tensor,
+        global_feats: torch.Tensor,
+        *,
+        record_drift: bool | None = None,
+    ) -> dict[str, Any]:
+        """Vectorized SR 26-2 pre-inference batch screening for Arrow/tensor batch endpoints."""
+        node_np = node_feats.detach().cpu().numpy().astype(np.float64, copy=False)
+        edge_np = edge_feats.detach().cpu().numpy().astype(np.float64, copy=False)
+        amask_np = asset_mask.detach().cpu().numpy().astype(np.float64, copy=False) > 0.5
+        sched_np = sched_feats.detach().cpu().numpy().astype(np.float64, copy=False)
+        smask_np = sched_mask.detach().cpu().numpy().astype(np.float64, copy=False) > 0.5
+        glob_np = global_feats.detach().cpu().numpy().astype(np.float64, copy=False)
+
+        b_sz = node_np.shape[0]
+        summary_batch = np.zeros((b_sz, 16), dtype=np.float64)
+        a_cnt = np.maximum(np.sum(amask_np, axis=1), 1).astype(np.float64)
+        log_m = node_np[:, :, int(AutocallNodeCol.LOG_MONEYNESS)]
+        has_a = np.any(amask_np, axis=1)
+        summary_batch[:, 0] = np.where(has_a, np.sum(np.where(amask_np, log_m, 0.0), axis=1) / a_cnt, 0.0)
+        summary_batch[:, 1] = np.where(has_a, np.min(np.where(amask_np, log_m, np.inf), axis=1), 0.0)
+        summary_batch[:, 2] = np.where(has_a, np.max(np.where(amask_np, log_m, -np.inf), axis=1), 0.0)
+
+        iv_s = node_np[:, :, int(AutocallNodeCol.IV_SHORT_ATM)]
+        iv_t = node_np[:, :, int(AutocallNodeCol.IV_TERM_ATM)]
+        iv_p = 0.5 * (iv_s + iv_t)
+        summary_batch[:, 3] = np.where(has_a, np.sum(np.where(amask_np, iv_p, 0.0), axis=1) / a_cnt, 0.35)
+        summary_batch[:, 4] = np.where(has_a, np.max(np.where(amask_np, iv_p, -np.inf), axis=1), 0.35)
+
+        corr_np = edge_np[:, :, :, int(AutocallEdgeCol.CORR_RHO)]
+        off_mask = edge_np[:, :, :, int(AutocallEdgeCol.OFF_DIAG_MASK)] > 0.5
+        off_cnt = np.sum(off_mask, axis=(1, 2))
+        has_off = off_cnt > 0
+        summary_batch[:, 5] = np.where(has_off, np.sum(np.where(off_mask, corr_np, 0.0), axis=(1, 2)) / np.maximum(off_cnt, 1), 1.0)
+        summary_batch[:, 6] = np.where(has_off, np.min(np.where(off_mask, corr_np, np.inf), axis=(1, 2)), 1.0)
+
+        div_l = node_np[:, :, int(AutocallNodeCol.CASH_DIV_LEVERAGE)]
+        summary_batch[:, 7] = np.where(has_a, np.max(np.where(amask_np, div_l, 0.0), axis=1), 0.0)
+
+        tau_np = sched_np[:, :, int(AutocallSchedCol.TAU_OBS)]
+        fw_np = sched_np[:, :, int(AutocallSchedCol.STULZ_FWD_W)]
+        vw_all = sched_np[:, :, int(AutocallSchedCol.STULZ_VOL_W)]
+        has_m = np.any(smask_np, axis=1)
+        m_last_idx = np.maximum(np.sum(smask_np, axis=1) - 1, 0)
+        b_idx = np.arange(b_sz)
+        summary_batch[:, 8] = np.where(has_m, tau_np[b_idx, m_last_idx], 0.0) if tau_np.shape[1] > 0 else 0.0
+
+        log_ko = sched_np[:, :, int(AutocallSchedCol.LOG_KO_BARRIER)]
+        is_call = smask_np & (sched_np[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)] > 0.5) & (log_ko < math.log(100.0))
+        call_cnt = np.sum(is_call, axis=1)
+        summary_batch[:, 9] = np.where(call_cnt > 0, np.sum(np.where(is_call, log_ko, 0.0), axis=1) / np.maximum(call_cnt, 1), 0.05)
+
+        log_cpn = sched_np[:, :, int(AutocallSchedCol.LOG_CPN_BARRIER)]
+        guar = sched_np[:, :, int(AutocallSchedCol.IS_GUARANTEED_CPN)]
+        cpn_act = smask_np & (guar < 0.5) & (log_cpn > math.log(1e-4) + 1e-4)
+        cpn_cnt = np.sum(cpn_act, axis=1)
+        summary_batch[:, 10] = np.where(cpn_cnt > 0, np.sum(np.where(cpn_act, log_cpn, 0.0), axis=1) / np.maximum(cpn_cnt, 1), -0.50)
+
+        summary_batch[:, 11] = glob_np[:, int(AutocallGlobalCol.K_PUT)]
+        summary_batch[:, 12] = np.where(has_m, fw_np[b_idx, m_last_idx], summary_batch[:, 1]) if fw_np.shape[1] > 0 else summary_batch[:, 1]
+        summary_batch[:, 13] = np.where(has_m, vw_all[b_idx, m_last_idx], 0.25) if vw_all.shape[1] > 0 else 0.25
+        summary_batch[:, 14] = glob_np[:, int(AutocallGlobalCol.C_MEM_0)]
+        summary_batch[:, 15] = np.abs(glob_np[:, int(AutocallGlobalCol.ABS_KO_SPREAD)])
+
+        finite_mask = np.all(np.isfinite(summary_batch), axis=1)
+        with self._lock:
+            ref_mean = self.ref_mean_16d
+            cov_inv = self.ref_cov_inv_16d
+            eff_ood = (
+                float(self.q_ood_conformal)
+                if self._conformal_calibrated
+                else float(self.mahalanobis_chi2_threshold)
+            )
+            conformal_active = bool(self._conformal_calibrated)
+            q_err = float(self.q_err_conformal)
+            w5 = self.scale_weights_5d.copy()
+            tau_desk = float(self.tau_desk_bps)
+
+        diff = summary_batch - ref_mean[None, :]
+        d2_vec = np.maximum(np.sum((diff @ cov_inv) * diff, axis=1), 0.0)
+        d2_vec = np.where(finite_mask, d2_vec, 1e6)
+
+        if conformal_active:
+            w_np = node_np[:, :, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)]
+            w_abs = np.where(amask_np, np.abs(w_np), 0.0)
+            w_sum = np.sum(w_abs, axis=1, keepdims=True)
+            has_w = w_sum.squeeze(1) > 1e-6
+            w_norm = w_abs / np.maximum(w_sum, 1e-6)
+            h_disp = np.where(has_w, np.clip(1.0 - np.sum(w_norm * w_norm, axis=1), 0.0, 1.0), 0.0)
+            raw_m_cnt = np.sum(smask_np, axis=1)
+            m_cnt = np.maximum(raw_m_cnt, 1)
+            v_bar = np.sum(np.where(smask_np, vw_all, 0.0), axis=1) / m_cnt
+            call_id = np.round(glob_np[:, int(AutocallGlobalCol.CALL_INDEX_ID)])
+            opt_id = np.round(glob_np[:, int(AutocallGlobalCol.OPT_INDEX_ID)])
+            is_wof = (
+                (call_id == int(MonitoringIndexCode.WORST_OF))
+                | (opt_id == int(MonitoringIndexCode.WORST_OF))
+            ).astype(np.float64)
+            has_ki_b = glob_np[:, int(AutocallGlobalCol.HAS_KI_FLAG)] > 0.5
+            i_kip_b = glob_np[:, int(AutocallGlobalCol.I_KI_PAST)] < 0.5
+            g_put_b = np.maximum(glob_np[:, int(AutocallGlobalCol.G_PUT)], 0.0)
+            v_last_b = summary_batch[:, 13] * np.where(raw_m_cnt > 0, 1.0, 0.0)
+            phi_mat = np.stack(
+                [
+                    np.ones(b_sz, dtype=np.float64),
+                    np.sqrt(np.maximum(h_disp * np.maximum(v_bar, 0.0), 0.0)),
+                    (np.maximum(raw_m_cnt.astype(np.float64) - 1.0, 0.0) / 47.0)
+                    * np.maximum(v_bar, 0.0),
+                    is_wof * h_disp,
+                    np.where(has_ki_b & i_kip_b, 1.0, 0.0)
+                    * g_put_b
+                    * np.maximum(v_last_b, 0.0),
+                ],
+                axis=1,
+            )
+            conf_hw_vec = np.maximum(q_err * (phi_mat @ w5) * 1e4, 0.0)
+        else:
+            conf_hw_vec = np.zeros(b_sz, dtype=np.float64)
+
+        do_record = self.record_drift_by_default if record_drift is None else bool(record_drift)
+        if do_record and b_sz > 0:
+            finite_rows = summary_batch[finite_mask]
+            if len(finite_rows) > 0:
+                if len(finite_rows) > 1 and bool(np.all(finite_rows == finite_rows[0])):
+                    uniq_vals = np.round(finite_rows[:1], 6)
+                    distinct_rows = finite_rows[:1]
+                else:
+                    rounded = np.round(finite_rows, 6)
+                    uniq_vals, uniq_idx = np.unique(rounded, axis=0, return_index=True)
+                    distinct_rows = finite_rows[np.sort(uniq_idx)]
+                batch_sig = hashlib.blake2b(uniq_vals.tobytes(), digest_size=16).digest()
+                should_record_batch = True
+                with self._lock:
+                    if batch_sig in self._recent_psi_batch_hashes:
+                        should_record_batch = False
+                    else:
+                        self._recent_psi_batch_hashes.append(batch_sig)
+                if should_record_batch:
+                    stride = max(
+                        1, len(distinct_rows) // min(len(distinct_rows), self.psi_window_size)
+                    )
+                    self.record_feature_vector(distinct_rows[::stride])
+
+        max_psi, _ = self.compute_psi()
+        ood_flags = d2_vec > eff_ood
+        conf_flags = conf_hw_vec > tau_desk if conformal_active else np.zeros(b_sz, dtype=bool)
+        return {
+            "batch_size": b_sz,
+            "max_mahalanobis_d2": float(np.max(d2_vec)) if b_sz > 0 else 0.0,
+            "mean_mahalanobis_d2": float(np.mean(d2_vec)) if b_sz > 0 else 0.0,
+            "ood_count": int(np.sum(ood_flags)),
+            "max_conformal_half_width_bps": float(np.max(conf_hw_vec)) if b_sz > 0 else 0.0,
+            "conformal_breach_count": int(np.sum(conf_flags)),
+            "max_psi_score": float(max_psi),
+            "psi_breached": bool(max_psi >= self.psi_fallback_threshold),
+            "non_finite_count": int(np.sum(~finite_mask)),
+        }
+
+    def evaluate_tensor_batch_post(
+        self,
+        stopping_probs: torch.Tensor,
+        coupon_probs: torch.Tensor,
+        put_loss: torch.Tensor,
+        product_value: torch.Tensor,
+        sched_mask: torch.Tensor,
+        global_feats: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Vectorized SR 26-2 post-inference simplex, put-spread & finiteness audit for batches."""
+        with torch.no_grad():
+            finite_ok = (
+                torch.isfinite(stopping_probs).all(dim=1)
+                & torch.isfinite(coupon_probs).all(dim=1)
+                & torch.isfinite(put_loss)
+                & torch.isfinite(product_value)
+            )
+            sm_b = sched_mask > 0.5
+            p_act = torch.where(sm_b, stopping_probs, torch.zeros_like(stopping_probs))
+            q_act = torch.where(sm_b, coupon_probs, torch.zeros_like(coupon_probs))
+            sum_p = p_act.sum(dim=1)
+            simplex_ok = (
+                (sum_p <= 1.0 + 1e-6)
+                & ((p_act >= -1e-7) & (p_act <= 1.0 + 1e-7)).all(dim=1)
+                & ((q_act >= -1e-7) & (q_act <= 1.0 + 1e-7)).all(dim=1)
+            )
+            k_put = global_feats[:, int(AutocallGlobalCol.K_PUT)].clamp(min=0.0)
+            if global_feats.shape[1] > int(AutocallGlobalCol.LOWER_STRIKE):
+                k_low = global_feats[:, int(AutocallGlobalCol.LOWER_STRIKE)].clamp(min=0.0)
+            else:
+                k_low = torch.zeros_like(k_put)
+            k_eff = (k_put - k_low).clamp(min=0.0)
+            surv_term = (1.0 - sum_p).clamp(min=0.0)
+            put_ok = (put_loss >= -1e-7) & (put_loss <= k_eff * surv_term + 1e-6)
+            counts = torch.stack(
+                [(~finite_ok).sum(), (~simplex_ok).sum(), (~put_ok).sum()]
+            ).tolist()
+        nf_cnt, sim_cnt, put_cnt = int(counts[0]), int(counts[1]), int(counts[2])
+        return {
+            "all_passed": (nf_cnt == 0 and sim_cnt == 0 and put_cnt == 0),
+            "non_finite_count": nf_cnt,
+            "simplex_violation_count": sim_cnt,
+            "put_bound_violation_count": put_cnt,
+        }
+
+    def record_batch_audit(
+        self,
+        *,
+        trade_id: str,
+        pre_diag: dict[str, Any],
+        post_diag: dict[str, Any],
+        engine_selected: str,
+        greeks_engine_used: str,
+    ) -> SR262AuditRecord:
+        """Records a batch SR 26-2 compliance telemetry entry into `self.audit_log`."""
+        fb_reasons: list[str] = []
+        warnings: list[str] = []
+        if pre_diag.get("non_finite_count", 0) > 0 or post_diag.get("non_finite_count", 0) > 0:
+            fb_reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT.value)
+        if pre_diag.get("ood_count", 0) > 0:
+            warnings.append(f"BATCH_OOD_COUNT={pre_diag['ood_count']}")
+        if pre_diag.get("conformal_breach_count", 0) > 0:
+            warnings.append(f"BATCH_CONFORMAL_BREACH_COUNT={pre_diag['conformal_breach_count']}")
+        if pre_diag.get("psi_breached", False):
+            fb_reasons.append(AutocallFallbackReason.PSI_DRIFT_BREACH.value)
+        if post_diag.get("simplex_violation_count", 0) > 0:
+            fb_reasons.append(AutocallFallbackReason.POST_INFERENCE_SIMPLEX_VIOLATION.value)
+        if post_diag.get("put_bound_violation_count", 0) > 0:
+            fb_reasons.append(AutocallFallbackReason.POST_INFERENCE_PUT_BOUND_VIOLATION.value)
+
+        rec = SR262AuditRecord(
+            trade_id=trade_id,
+            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+            pre_gate_passed=(pre_diag.get("non_finite_count", 0) == 0 and not pre_diag.get("psi_breached", False)),
+            post_gate_passed=bool(post_diag.get("all_passed", True)),
+            fallback_triggered=bool(len(fb_reasons) > 0),
+            fallback_reasons=fb_reasons,
+            warnings=warnings,
+            min_corr_eigenvalue_raw=1.0,
+            min_corr_eigenvalue_shrunk=1.0,
+            correlation_shrunk_applied=False,
+            mahalanobis_d2=float(pre_diag.get("max_mahalanobis_d2", 0.0)),
+            max_psi_score=float(pre_diag.get("max_psi_score", 0.0)),
+            min_pin_risk_z=100.0,
+            engine_selected=engine_selected,
+            conformal_half_width_bps=float(pre_diag.get("max_conformal_half_width_bps", 0.0)),
+            greeks_engine_used=greeks_engine_used,
+        )
+        with self._lock:
+            self.audit_log.append(rec)
+        return rec
+
     def price_with_guardian(
         self,
         req_or_state: Any,
@@ -1160,19 +1857,9 @@ class EQAutocallModelGuardian:
         record_drift: bool | None = None,
         seed: int | None = None,
         greeks_fn: Any = None,
+        greeks_engine_used: str | None = None,
     ) -> GuardianPricingResult:
-        """Executes the guarded 4-Tier pricing pipeline with deterministic failover to Dupire QMC.
-
-        Flow:
-          1. Runs Tier 1 `preprocess_eq_autocall` (if not already `AutocallPreprocState`) + Stulz-Margrabe baseline.
-          2. Evaluates Tier 3 Pre-Inference Gate (`evaluate_pre_inference`) and applies PSD correlation shrinkage.
-          3. If `m_rem == 0` (`ZERO_FUTURE_PERIODS`): assembles deterministic cashflows and PV in Tier 1 (0 ms).
-          4. If Pre-Inference Gate passes and `surrogate is not None` and not `force_qmc`:
-             runs Tier 2 `MaskedEQAutocallSurrogate` + Tier 1 W1 cash-flow assembly + Post-Inference Gate.
-          5. If either gate trips (or `force_qmc=True` / `surrogate is None`):
-             routes seamlessly to `price_eq_autocall_dupire_qmc` using the PSD-shrunk correlation matrix
-             and logs a complete `SR262AuditRecord` in `self.audit_log`.
-        """
+        """Executes the guarded 4-Tier pricing pipeline with deterministic failover to Dupire QMC."""
         if isinstance(req_or_state, AutocallPreprocState):
             state = req_or_state
         else:
@@ -1180,6 +1867,13 @@ class EQAutocallModelGuardian:
 
         trade_id = state.trade_info if state.trade_info is not None else "UNSPECIFIED_TRADE"
         ts_utc = datetime.now(timezone.utc).isoformat()
+        cash_today = float(
+            getattr(
+                state,
+                "cash_to_settle_today",
+                getattr(state.seasoned_state, "cash_to_settle_today", 0.0),
+            )
+        )
 
         pre_passed, pre_reasons, r_psd, diag = self.evaluate_pre_inference(
             state,
@@ -1187,7 +1881,6 @@ class EQAutocallModelGuardian:
             record_drift=record_drift,
         )
 
-        # Always ensure downstream state carries the valid PSD correlation matrix
         if diag["correlation_shrunk_applied"] or (
             AutocallFallbackReason.CORRELATION_NOT_PSD in pre_reasons
         ):
@@ -1195,6 +1888,7 @@ class EQAutocallModelGuardian:
 
         all_reasons: list[AutocallFallbackReason] = list(pre_reasons)
         warnings: list[str] = list(diag["warnings"])
+        conformal_hw_bps = float(diag.get("conformal_half_width_bps", 0.0))
 
         if force_qmc and AutocallFallbackReason.ENGINE_REQUESTED_QMC not in all_reasons:
             all_reasons.append(AutocallFallbackReason.ENGINE_REQUESTED_QMC)
@@ -1209,6 +1903,9 @@ class EQAutocallModelGuardian:
                 q_cpn=z_t,
                 l_put=torch.tensor(0.0, dtype=torch.float64, device=state.spots_t0.device),
                 option_se=0.0,
+            )
+            eff_greeks_eng = greeks_engine_used or (
+                "Tier1_AnalyticalProxy" if greeks_fn is not None else "None"
             )
             audit_det = SR262AuditRecord(
                 trade_id=trade_id,
@@ -1225,6 +1922,8 @@ class EQAutocallModelGuardian:
                 max_psi_score=diag["max_psi_score"],
                 min_pin_risk_z=diag["min_pin_risk_z"],
                 engine_selected="Tier1_Deterministic",
+                conformal_half_width_bps=conformal_hw_bps,
+                greeks_engine_used=eff_greeks_eng,
             )
             with self._lock:
                 self.audit_log.append(audit_det)
@@ -1310,6 +2009,9 @@ class EQAutocallModelGuardian:
                 state.baseline,
             )
             if post_passed:
+                eff_greeks_t2 = greeks_engine_used or (
+                    "Tier2_SingleVJP_AD" if greeks_res is not None else "None"
+                )
                 audit_t2 = SR262AuditRecord(
                     trade_id=trade_id,
                     timestamp_utc=ts_utc,
@@ -1325,6 +2027,8 @@ class EQAutocallModelGuardian:
                     max_psi_score=diag["max_psi_score"],
                     min_pin_risk_z=diag["min_pin_risk_z"],
                     engine_selected="Tier2_MaskedEGNO",
+                    conformal_half_width_bps=conformal_hw_bps,
+                    greeks_engine_used=eff_greeks_t2,
                 )
                 with self._lock:
                     self.audit_log.append(audit_t2)
@@ -1359,9 +2063,23 @@ class EQAutocallModelGuardian:
                 if r not in all_reasons:
                     all_reasons.append(r)
 
-        # Case 3: Route to Tier 3 Deterministic Dupire Local Volatility Sobol QMC Fallback
+        # Case 3: Route to Tier 3/4 Deterministic Dupire Local Volatility RQMC Fallback
         if surrogate is None and len(all_reasons) == 0:
             all_reasons.append(AutocallFallbackReason.ENGINE_REQUESTED_QMC)
+
+        idx_set = {
+            str(state.callability_index).strip(),
+            str(state.coupon_index or state.callability_index).strip(),
+            str(state.option_index or state.callability_index).strip(),
+        }
+        if self.use_gpu_qmc is not None:
+            eff_use_gpu = bool(self.use_gpu_qmc) and torch.cuda.is_available()
+        else:
+            eff_use_gpu = (
+                torch.cuda.is_available()
+                and int(n_fallback_paths) >= 1024
+                and ("TwinWin" not in idx_set)
+            )
 
         qmc_res = price_eq_autocall_dupire_qmc(
             state,
@@ -1369,8 +2087,10 @@ class EQAutocallModelGuardian:
             mode=qmc_mode,
             n_substeps_per_period=n_substeps_per_period,
             seed=seed,
+            use_gpu=eff_use_gpu,
         )
 
+        eff_greeks_qmc = greeks_engine_used or "None"
         audit_fb = SR262AuditRecord(
             trade_id=trade_id,
             timestamp_utc=ts_utc,
@@ -1386,6 +2106,8 @@ class EQAutocallModelGuardian:
             max_psi_score=diag["max_psi_score"],
             min_pin_risk_z=diag["min_pin_risk_z"],
             engine_selected="Tier3_DupireQMC",
+            conformal_half_width_bps=conformal_hw_bps,
+            greeks_engine_used=eff_greeks_qmc,
         )
         with self._lock:
             self.audit_log.append(audit_fb)
@@ -1404,7 +2126,7 @@ class EQAutocallModelGuardian:
             l_call=float(qmc_res.l_call),
             cashflows=qmc_res.cashflows,
             reporting_currency=state.payment_currency,
-            cash_to_settle_today=0.0,
+            cash_to_settle_today=cash_today,
             engine_selected="Tier3_DupireQMC",
             fallback_triggered=True,
             fallback_reasons=all_reasons,
@@ -1418,6 +2140,8 @@ class EQAutocallModelGuardian:
 
 
 __all__ = [
+    "DEFAULT_GUARDIAN_STATS_PATH",
+    "DEFAULT_TAU_DESK_BPS",
     "SUPPORTED_TIER2_INDICES",
     "CHI2_16_0999",
     "AutocallFallbackReason",
