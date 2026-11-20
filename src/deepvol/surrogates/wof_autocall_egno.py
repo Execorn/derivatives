@@ -7,12 +7,12 @@ Implements:
   - WoFAutocallEGNO: Permutation-equivariant graph neural operator.
 """
 
-import sys
-sys.path.insert(0, "src")
+from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional, Tuple, cast
 import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn as nn
 from deepvol.surrogates.egno import EGNOLayer
@@ -26,24 +26,24 @@ class WoFInputNormalizer:
     ]
 
     def __init__(self) -> None:
-        self.mean: Optional[np.ndarray] = None
-        self.std: Optional[np.ndarray] = None
+        self.mean: Optional[npt.NDArray[np.float32]] = None
+        self.std: Optional[npt.NDArray[np.float32]] = None
 
-    def fit(self, X: np.ndarray) -> "WoFInputNormalizer":
+    def fit(self, X: npt.NDArray[np.float32]) -> "WoFInputNormalizer":
         self.mean = np.mean(X, axis=0, dtype=np.float64).astype(np.float32)
         self.std = np.std(X, axis=0, dtype=np.float64).astype(np.float32)
-        self.std = np.where(self.std < 1e-8, 1.0, self.std)
+        self.std = np.where(self.std < 1e-8, 1.0, self.std).astype(np.float32)
         return self
 
-    def transform(self, X: np.ndarray) -> np.ndarray:
+    def transform(self, X: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
         if self.mean is None or self.std is None:
             raise RuntimeError("Normalizer has not been fitted yet.")
-        return ((X - self.mean) / self.std).astype(np.float32)
+        return cast(npt.NDArray[np.float32], ((X - self.mean) / self.std).astype(np.float32))
 
-    def inverse_transform(self, X_norm: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, X_norm: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
         if self.mean is None or self.std is None:
             raise RuntimeError("Normalizer has not been fitted yet.")
-        return (X_norm * self.std + self.mean).astype(np.float32)
+        return cast(npt.NDArray[np.float32], (X_norm * self.std + self.mean).astype(np.float32))
 
     def transform_tensor(self, X: torch.Tensor) -> torch.Tensor:
         mean_t = torch.tensor(self.mean, dtype=X.dtype, device=X.device)
@@ -55,11 +55,13 @@ class WoFInputNormalizer:
         std_t = torch.tensor(self.std, dtype=X_norm.dtype, device=X_norm.device)
         return X_norm * std_t + mean_t
 
-    def to_tensor(self, X: np.ndarray, device: torch.device) -> torch.Tensor:
+    def to_tensor(self, X: npt.NDArray[np.float32], device: torch.device) -> torch.Tensor:
         X_norm = self.transform(X)
         return torch.tensor(X_norm, dtype=torch.float32, device=device)
 
     def save(self, path: str) -> None:
+        if self.mean is None or self.std is None:
+            raise RuntimeError("Normalizer has not been fitted yet.")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, mean=self.mean, std=self.std)
 
@@ -76,28 +78,28 @@ class WoFOutputNormalizer:
     TARGET_NAMES = ["npv", "call_prob", "exp_life"]
 
     def __init__(self) -> None:
-        self.min_val: Optional[np.ndarray] = None
-        self.max_val: Optional[np.ndarray] = None
+        self.min_val: Optional[npt.NDArray[np.float32]] = None
+        self.max_val: Optional[npt.NDArray[np.float32]] = None
 
-    def fit(self, Y: np.ndarray) -> "WoFOutputNormalizer":
+    def fit(self, Y: npt.NDArray[np.float32]) -> "WoFOutputNormalizer":
         self.min_val = np.min(Y, axis=0).astype(np.float32)
         self.max_val = np.max(Y, axis=0).astype(np.float32)
         diff = self.max_val - self.min_val
-        diff = np.where(diff < 1e-8, 1.0, diff)
-        self.max_val = self.min_val + diff
+        diff = np.where(diff < 1e-8, 1.0, diff).astype(np.float32)
+        self.max_val = (self.min_val + diff).astype(np.float32)
         return self
 
-    def transform(self, Y: np.ndarray) -> np.ndarray:
+    def transform(self, Y: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
         if self.min_val is None or self.max_val is None:
             raise RuntimeError("Normalizer has not been fitted yet.")
         diff = self.max_val - self.min_val
-        return ((Y - self.min_val) / diff).astype(np.float32)
+        return cast(npt.NDArray[np.float32], ((Y - self.min_val) / diff).astype(np.float32))
 
-    def inverse_transform(self, Y_norm: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, Y_norm: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
         if self.min_val is None or self.max_val is None:
             raise RuntimeError("Normalizer has not been fitted yet.")
         diff = self.max_val - self.min_val
-        return (Y_norm * diff + self.min_val).astype(np.float32)
+        return cast(npt.NDArray[np.float32], (Y_norm * diff + self.min_val).astype(np.float32))
 
     def transform_tensor(self, Y: torch.Tensor) -> torch.Tensor:
         min_t = torch.tensor(self.min_val, dtype=Y.dtype, device=Y.device)
@@ -110,6 +112,8 @@ class WoFOutputNormalizer:
         return Y_norm * (max_t - min_t) + min_t
 
     def save(self, path: str) -> None:
+        if self.min_val is None or self.max_val is None:
+            raise RuntimeError("Normalizer has not been fitted yet.")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, min_val=self.min_val, max_val=self.max_val)
 
@@ -216,7 +220,7 @@ class WoFAutocallEGNO(nn.Module):
         # Global mean pool across the 2 nodes
         h_pool = h.mean(dim=1)  # (B, hidden_dim)
         combined = torch.cat([h_pool, g_feat], dim=-1)  # (B, 2*hidden_dim)
-        return self.out_mlp(combined)
+        return cast(torch.Tensor, self.out_mlp(combined))
 
     def forward(
         self,
