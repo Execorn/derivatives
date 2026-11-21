@@ -73,7 +73,7 @@ uv sync
 uv run python setup.py build_ext --inplace
 ```
 
-See [`docs/fx_cross_cpu_laptop_guide.md`](docs/fx_cross_cpu_laptop_guide.md) for standalone CPU-only installation and `XAU/RUB` pricing examples.
+See [`docs/eq_autocall_cpu_laptop_guide.md`](docs/eq_autocall_cpu_laptop_guide.md) for Linux Python 3.13 CPU-only setup (`venv` + `pip`) and `EQAutocallable` execution, and [`docs/fx_cross_cpu_laptop_guide.md`](docs/fx_cross_cpu_laptop_guide.md) for `XAU/RUB` FX Cross CPU setup.
 
 ---
 
