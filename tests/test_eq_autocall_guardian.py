@@ -205,7 +205,7 @@ def _build_synthetic_autocall_dict(
             "AutoCallTriggerAbsoluteDigitalSpread": -0.10,
             "CouponBarrierAbsoluteDigitalSpread": -0.10,
             "OptionDownAndInBarrierAbsoluteDigitalSpread": -0.10,
-            "AllowAutocallOnExpiry": True,
+            "AllowAutocallOnExpiry": False,
             "CallabilityMonitoringIndex": callability_index,
             "CouponBarrierMonitoringIndex": coupon_index,
             "OptionMonitoringIndex": option_index,
@@ -777,4 +777,256 @@ def test_G3_4_guardian_tripwires_and_audit_log(
             "max_psi_score",
             "min_pin_risk_z",
             "engine_selected",
+            "conformal_half_width_bps",
+            "greeks_engine_used",
         }
+
+
+def test_guardian_v2_calibrated_5d_conformal_exotic_routing_and_batch_audit(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+    zero_head_surrogate: MaskedEQAutocallSurrogate,
+) -> None:
+    """Covers v2.0 5D conformal calibration, tau_desk_bps=60.0, 45476647 acceptance, exotic modifiers, smile OOD, and batch audit."""
+    from deepvol.mrm.eq_autocall_guardian import (
+        DEFAULT_GUARDIAN_STATS_PATH,
+        DEFAULT_TAU_DESK_BPS,
+    )
+    from deepvol.training.train_eq_autocall import (
+        DEFAULT_CHECKPOINT_PATH,
+        load_eq_autocall_surrogate,
+    )
+
+    assert DEFAULT_TAU_DESK_BPS == pytest.approx(60.0)
+    assert DEFAULT_CHECKPOINT_PATH.is_file() and DEFAULT_GUARDIAN_STATS_PATH.is_file()
+
+    req_model, _ = parsed_dag
+    surr, _ = load_eq_autocall_surrogate(DEFAULT_CHECKPOINT_PATH, device="cpu")
+    guardian = EQAutocallModelGuardian(
+        stats_path=DEFAULT_GUARDIAN_STATS_PATH,
+        tau_desk_bps=DEFAULT_TAU_DESK_BPS,
+        record_drift_by_default=False,
+    )
+
+    # 1. Production reference 45476647/EMTN_CIB_SEC must pass Tier-2 pre-gate & conformal gate cleanly
+    res_ref = guardian.price_with_guardian(req_model, surrogate=surr)
+    assert res_ref.fallback_triggered is False
+    assert res_ref.engine_selected == "Tier2_MaskedEGNO"
+    assert res_ref.audit_record.conformal_half_width_bps <= 60.0
+    assert res_ref.ProductValue == pytest.approx(res_ref.product_value)
+    assert res_ref.StandardError == pytest.approx(res_ref.standard_error)
+    assert res_ref.Option == pytest.approx(res_ref.option_pv)
+    assert res_ref.Notional == pytest.approx(res_ref.notional_pv)
+    assert res_ref.Coupon == pytest.approx(res_ref.coupon_pv)
+    assert res_ref.CashFlows is res_ref.cashflows
+    assert res_ref.cash_flows is res_ref.cashflows
+
+    # 2. Legacy conformal stats without scale_weights_5d falls back cleanly
+    guardian_legacy = EQAutocallModelGuardian(record_drift_by_default=False)
+    stats_no_5d = copy.deepcopy(dict(torch.load(DEFAULT_GUARDIAN_STATS_PATH, map_location="cpu", weights_only=True)))
+    stats_no_5d.pop("scale_weights_5d", None)
+    assert guardian_legacy.compute_conformal_half_width_bps(preprocess_eq_autocall(req_model)) == 0.0
+    guardian_legacy.q_err_conformal = float(stats_no_5d["q_err_conformal"])
+    guardian_legacy.q_ood_conformal = float(stats_no_5d["q_ood_conformal"])
+    guardian_legacy._conformal_calibrated = True
+    assert guardian_legacy.compute_conformal_half_width_bps(preprocess_eq_autocall(req_model)) >= 0.0
+
+    # 3. Exotic terminal modifiers -> EXOTIC_TERMINAL_MODIFIER_ROUTED
+    for mod_field, mod_val in (
+        ("AllowAutocallOnExpiry", True),
+        ("LowerStrike", 0.50),
+        ("OneStarStrike", 1.15),
+        ("ParticipationCallRate", 0.25),
+        ("CouponBarrierType", "Out"),
+        ("IsLongBasket", True),
+    ):
+        req_m, _ = _build_synthetic_autocall_dict(d_assets=2, m_periods=3)
+        req_m["Product"][mod_field] = mod_val
+        res_m = guardian.price_with_guardian(req_m, surrogate=zero_head_surrogate, n_fallback_paths=128)
+        assert res_m.fallback_triggered is True
+        assert AutocallFallbackReason.EXOTIC_TERMINAL_MODIFIER_ROUTED in res_m.fallback_reasons
+
+    # 4. Smile box OOD branches (SSVI skew/curv/PC1, repo spread) & pin-risk on LowerStrike / KI
+    st_smile = preprocess_eq_autocall(req_model)
+    st_smile.node_feats = st_smile.node_feats.clone()
+    st_smile.node_feats[0, :, 10] = 0.90  # SSVI_SKEW_RHO > 0.75 across active assets
+    pre_ok_s, pre_reasons_s, _, _ = guardian.evaluate_pre_inference(st_smile)
+    assert pre_ok_s is False and AutocallFallbackReason.MAHALANOBIS_OOD in pre_reasons_s
+
+    req_low_pin, _ = _build_synthetic_autocall_dict(d_assets=2, m_periods=2, tau_first=0.01)
+    req_low_pin["Product"]["LowerStrike"] = 0.99
+    req_low_pin["Product"]["OptionDownAndInBarrierLevel"] = 0.99
+    st_low_pin = preprocess_eq_autocall(req_low_pin)
+    st_low_pin.tau_obs = torch.tensor([0.01, 0.02], dtype=torch.float64)
+    z_pin, breached = guardian.compute_min_pin_risk_z(st_low_pin)
+    assert z_pin >= 0.0 and isinstance(breached, bool)
+
+    # 5. Dict-typed evaluate_post_inference and vector batch pre/post/audit gates
+    st_ref = preprocess_eq_autocall(req_model)
+    ok_dict, reasons_dict = guardian.evaluate_post_inference(
+        {"p_stop": np.zeros(st_ref.m_rem), "q_cpn": np.zeros(st_ref.m_rem), "l_put": 0.0},
+        {"ProductValue": float(st_ref.baseline.product_value_proxy.item())},
+        st_ref,
+    )
+    assert ok_dict is True and reasons_dict == []
+
+    t2 = st_ref.to_tier2_float32_tensors()
+    pre_batch_diag = guardian.evaluate_tensor_batch_pre(
+        t2["node_feats"], t2["edge_feats"], t2["asset_mask"], t2["sched_feats"], t2["sched_mask"], t2["global_feats"]
+    )
+    with torch.no_grad():
+        s_out = surr(
+            t2["node_feats"], t2["edge_feats"], t2["asset_mask"], t2["sched_feats"], t2["sched_mask"], t2["global_feats"]
+        )
+    post_batch_diag = guardian.evaluate_tensor_batch_post(
+        s_out.stopping_probs,
+        s_out.coupon_probs,
+        s_out.put_loss,
+        torch.tensor([float(st_ref.baseline.product_value_proxy.item())], dtype=torch.float64),
+        t2["sched_mask"],
+        t2["global_feats"],
+    )
+    batch_rec = guardian.record_batch_audit(
+        trade_id="BATCH_GUARD_TEST",
+        pre_diag=pre_batch_diag,
+        post_diag=post_batch_diag,
+        engine_selected="Tier2_MaskedEGNO",
+        greeks_engine_used="Tier2_BatchedAD",
+    )
+    assert batch_rec.trade_id == "BATCH_GUARD_TEST"
+
+    bad_post = guardian.evaluate_tensor_batch_post(
+        torch.full((1, st_ref.sched_mask.shape[1]), 0.9, dtype=torch.float64),
+        torch.zeros_like(t2["sched_mask"], dtype=torch.float64),
+        torch.tensor([5.0], dtype=torch.float64),
+        torch.tensor([float("nan")], dtype=torch.float64),
+        t2["sched_mask"],
+        t2["global_feats"],
+    )
+    assert bad_post["all_passed"] is False and bad_post["non_finite_count"] == 1
+    bad_rec = guardian.record_batch_audit(
+        trade_id="BATCH_BAD_TEST",
+        pre_diag={**pre_batch_diag, "ood_count": 1, "conformal_breach_count": 1, "psi_breached": True},
+        post_diag=bad_post,
+        engine_selected="Tier2_MaskedEGNO",
+        greeks_engine_used="None",
+    )
+    assert bad_rec.fallback_triggered is True and len(bad_rec.warnings) >= 2
+
+    # Additional guardian coverage: reset_drift_history, residual_threshold, conformal breach, non-finite inputs, stopping_probs dict
+    guardian.reset_drift_history()
+    guardian_res_th = EQAutocallModelGuardian(residual_threshold=0.05, record_drift_by_default=False)
+    ok_th, _ = guardian_res_th.evaluate_post_inference(
+        {"stopping_probs": np.zeros(st_ref.m_rem), "coupon_probs": np.zeros(st_ref.m_rem), "put_loss": 0.0},
+        {"product_value": float(st_ref.baseline.product_value_proxy.item())},
+        st_ref,
+    )
+    assert ok_th is True
+    g_conf = EQAutocallModelGuardian(
+        stats_path=DEFAULT_GUARDIAN_STATS_PATH,
+        tau_desk_bps=0.01,
+        record_drift_by_default=False,
+    )
+    ok_cf, reasons_cf, _, _ = g_conf.evaluate_pre_inference(st_ref)
+    assert ok_cf is False and AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH in reasons_cf
+
+    st_nan_in = copy.copy(st_ref)
+    st_nan_in.spots_t0 = torch.full_like(st_ref.spots_t0, float("nan"))
+    ok_ni, reasons_ni, _, _ = guardian.evaluate_pre_inference(st_nan_in)
+    assert ok_ni is False and AutocallFallbackReason.NON_FINITE_OUTPUT in reasons_ni
+
+    # Edge-case PSD shapes & domain_box_ood triggers (zero rate, quanto drift, repo spread) + funded post gate
+    r0, _, _, _ = project_correlation_to_psd(np.zeros((0, 0), dtype=np.float64))
+    assert r0.shape == (0, 0)
+    r1, _, _, s1 = project_correlation_to_psd(np.array([[1.2]], dtype=np.float64))
+    assert r1.shape == (1, 1) and s1 is True
+    r_nf, _, _, s_nf = project_correlation_to_psd(np.array([[1.0, float("nan")], [0.2, 1.0]], dtype=np.float64))
+    assert np.all(np.isfinite(r_nf)) and s_nf is True
+    with pytest.raises(ValueError, match="square"):
+        project_correlation_to_psd(np.ones((2, 3), dtype=np.float64))
+
+    st_zr = copy.copy(st_ref)
+    st_zr.df_pay = torch.full_like(st_ref.df_pay, 0.20)
+    ok_zr, r_zr, _, _ = guardian.evaluate_pre_inference(st_zr)
+    assert ok_zr is False and AutocallFallbackReason.MAHALANOBIS_OOD in r_zr
+
+    st_qnt = copy.copy(st_ref)
+    st_qnt.quanto_meta = {st_ref.sorted_identifiers[0]: {"rho_s_fx": 0.9, "sig_fx_obs": [0.8]}}
+    ok_qnt, r_qnt, _, _ = guardian.evaluate_pre_inference(st_qnt)
+    assert ok_qnt is False and AutocallFallbackReason.MAHALANOBIS_OOD in r_qnt
+
+    st_repo = copy.copy(st_ref)
+    from deepvol.models.autocall.feature_layout import AutocallNodeCol
+
+    st_repo.node_feats = st_ref.node_feats.clone()
+    st_repo.node_feats[0, 0, int(AutocallNodeCol.REPO_SPREAD_AVG)] = 0.25
+    ok_rp, r_rp, _, _ = guardian.evaluate_pre_inference(st_repo)
+    assert ok_rp is False and AutocallFallbackReason.MAHALANOBIS_OOD in r_rp
+
+    req_f = copy.deepcopy(req_model)
+    req_f.Product.RateIdentifier = "RUB_RUONIA_OIS"
+    req_f.Product.FundingSpread = 0.015
+    req_f.Product.FundingLegPaymentDates = list(req_f.Product.PaymentDates)
+    st_f = preprocess_eq_autocall(req_f)
+    ok_f, _ = guardian.evaluate_post_inference(None, None, st_f)
+    assert isinstance(ok_f, bool)
+
+    # Wide vol smile (ratio > 5.0 -> OOD), dict postproc_out format, pin risk (non-guar cpn + KI), and batch helpers
+    from types import SimpleNamespace
+
+    st_wide = copy.copy(st_ref)
+    wide_map = dict(st_ref.vol_surfaces)
+    for idx_i, tid_i in enumerate(st_ref.sorted_identifiers):
+        f_ref_i = float(st_ref.dividend_schedule.forward_price[idx_i, -1])
+        wide_map[tid_i] = SimpleNamespace(
+            strikes=np.array([0.5 * f_ref_i, 1.0 * f_ref_i, 1.5 * f_ref_i], dtype=np.float64),
+            quotes=np.array([[0.05, 0.20, 0.35]], dtype=np.float64),
+        )
+    st_wide.vol_surfaces = wide_map
+    ok_w, r_w, _, _ = guardian.evaluate_pre_inference(st_wide)
+    assert ok_w is False and AutocallFallbackReason.MAHALANOBIS_OOD in r_w
+
+    st_pin = copy.copy(st_ref)
+    st_pin.sched_feats = st_ref.sched_feats.clone()
+    st_pin.tau_obs = torch.full_like(st_ref.tau_obs, 0.01)
+    st_pin.sched_feats[0, 0, 1] = 0.01  # t_rem <= 14/365
+    st_pin.sched_feats[0, 0, 5] = 0.0   # non-callable
+    st_pin.sched_feats[0, 0, 7] = 0.0   # non-guaranteed coupon barrier
+    st_pin.sched_feats[0, 0, 4] = 0.0   # log_cpn_barrier ~= 0
+    z_pin, _ = guardian.compute_min_pin_risk_z(st_pin)
+    assert z_pin >= 0.0
+
+    m_s = st_ref.sched_feats.shape[1]
+    ok_dp, r_dp = guardian.evaluate_post_inference(
+        {
+            "stopping_probs": torch.full((1, m_s), 1.0 / max(m_s, 1)),
+            "coupon_probs": torch.full((1, m_s), 0.2),
+            "put_loss": torch.tensor([0.05]),
+        },
+        None,
+        st_ref,
+    )
+    assert isinstance(ok_dp, bool) and isinstance(r_dp, list)
+
+    sum16 = guardian._extract_batch_16d_summary(
+        st_ref.node_feats,
+        st_ref.edge_feats,
+        st_ref.asset_mask,
+        st_ref.sched_feats,
+        st_ref.sched_mask,
+        st_ref.global_feats,
+    )
+    assert sum16.shape == (1, 16)
+    g_nocal = EQAutocallModelGuardian(d_max=8, m_max=48, stats_path=None)
+    res_nc = g_nocal.evaluate_tensor_batch_pre(
+        st_ref.node_feats,
+        st_ref.edge_feats,
+        st_ref.asset_mask,
+        st_ref.sched_feats,
+        st_ref.sched_mask,
+        st_ref.global_feats,
+    )
+    assert isinstance(res_nc, dict) and res_nc["conformal_breach_count"] == 0
+
+
+
+

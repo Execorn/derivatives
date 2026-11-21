@@ -1,0 +1,276 @@
+"""Concurrency, thread-safety, cache immutability, and lock verification suite."""
+
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import copy
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+import torch
+
+from deepvol.api.schemas_eq_autocall import EQAutocallableTradeRequest, parse_murex_autocall_dag
+from deepvol.models.autocall import (
+    compute_analytical_autocall_baseline,
+    preprocess_eq_autocall,
+)
+from deepvol.models.autocall.pre_post_processor import ThreadSafeLRUCache
+
+_LOCAL_DATA_REQUEST = Path(__file__).resolve().parents[1] / "data" / "autocall" / "eq_autocallable_request.txt"
+_MAIN_REPO_REQUEST = Path("/home/execorn/programming/derivatives/data/autocall/eq_autocallable_request.txt")
+REQUEST_TXT_PATH = _LOCAL_DATA_REQUEST if _LOCAL_DATA_REQUEST.exists() else _MAIN_REPO_REQUEST
+
+
+@pytest.fixture(scope="module")
+def base_request() -> EQAutocallableTradeRequest:
+    req, _ = parse_murex_autocall_dag(REQUEST_TXT_PATH)
+    return req
+
+
+def test_thread_safe_lru_cache_16_thread_stress_and_copy_isolation() -> None:
+    cache = ThreadSafeLRUCache(maxsize=16, copy_fn=lambda arr: arr.copy())
+
+    def _worker(tid: int) -> bool:
+        for i in range(64):
+            key = f"k_{(tid + i) % 24}"
+            val = np.full(4, float(tid * 100 + i), dtype=np.float64)
+            out = cache.put(key, val)
+            out.fill(-999.0)
+            fetched = cache.get(key)
+            if fetched is not None:
+                if float(fetched[0]) == -999.0:
+                    return False
+                fetched.fill(-888.0)
+            _ = key in cache
+            if i % 17 == 0:
+                try:
+                    _ = cache[key]
+                except KeyError:
+                    pass
+        return True
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(_worker, range(16)))
+    assert all(results)
+    assert len(cache) <= 16
+    cache.clear()
+    assert len(cache) == 0
+
+
+def test_preprocess_eq_autocall_16_thread_concurrency_and_immutability(
+    base_request: EQAutocallableTradeRequest,
+) -> None:
+    variants: list[EQAutocallableTradeRequest] = []
+    expected_pvs: list[float] = []
+    expected_spots: list[float] = []
+    for k in range(8):
+        req_k = copy.deepcopy(base_request)
+        first_uid = req_k.Product.UnderlyingIdentifiers[0]
+        req_k.Model.MarketDataSet.Spots[first_uid] = float(req_k.Model.MarketDataSet.Spots[first_uid]) * (
+            0.90 + 0.03 * k
+        )
+        st_ref = preprocess_eq_autocall(req_k)
+        variants.append(req_k)
+        expected_pvs.append(float(st_ref.baseline.product_value_proxy.item()))
+        expected_spots.append(float(st_ref.spots_t0[0].item()))
+
+    def _run_worker(tid: int) -> None:
+        for step in range(4):
+            idx = (tid + step) % len(variants)
+            st = preprocess_eq_autocall(variants[idx])
+            assert abs(float(st.baseline.product_value_proxy.item()) - expected_pvs[idx]) < 1e-12
+            assert abs(float(st.spots_t0[0].item()) - expected_spots[idx]) < 1e-12
+            for surf in st.vol_surfaces.values():
+                assert surf.quotes.flags.writeable is False
+                assert surf.strikes.flags.writeable is False
+                assert surf.tenors.flags.writeable is False
+            assert st.discount_curve.tenors.flags.writeable is False
+            assert st.discount_curve.rates.flags.writeable is False
+            # Mutating returned mutable tensors must not poison cached artifacts for other threads
+            st.spots_t0.fill_(1.0)
+            st.node_feats.zero_()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = [pool.submit(_run_worker, tid) for tid in range(16)]
+        for fut in futures:
+            fut.result()
+
+    # Post-stress integrity re-check
+    for idx, req_k in enumerate(variants):
+        st_after = preprocess_eq_autocall(req_k)
+        assert float(st_after.baseline.product_value_proxy.item()) == pytest.approx(expected_pvs[idx], abs=1e-12)
+        assert float(st_after.spots_t0[0].item()) == pytest.approx(expected_spots[idx], abs=1e-12)
+
+
+def test_analytical_baseline_16_thread_no_buffer_aliasing(
+    base_request: EQAutocallableTradeRequest,
+) -> None:
+    st_list = []
+    ref_outputs = []
+    for k in range(4):
+        req_k = copy.deepcopy(base_request)
+        for uid in req_k.Product.UnderlyingIdentifiers:
+            req_k.Model.MarketDataSet.Spots[uid] = float(req_k.Model.MarketDataSet.Spots[uid]) * (0.88 + 0.08 * k)
+        st_k = preprocess_eq_autocall(req_k)
+        st_list.append(st_k)
+        ref_outputs.append(float(compute_analytical_autocall_baseline(st_k, use_fast_cpu=True).product_value_proxy.item()))
+
+    def _run_baseline(tid: int) -> None:
+        for j in range(12):
+            idx = (tid + j) % len(st_list)
+            out = compute_analytical_autocall_baseline(st_list[idx], use_fast_cpu=True)
+            assert float(out.product_value_proxy.item()) == pytest.approx(ref_outputs[idx], abs=1e-12)
+            assert torch.isfinite(out.p_proxy).all()
+            assert torch.isfinite(out.q_proxy).all()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for fut in [pool.submit(_run_baseline, t) for t in range(16)]:
+            fut.result()
+
+
+def test_compiled_runner_output_clone_and_concurrency(
+    base_request: EQAutocallableTradeRequest,
+) -> None:
+    from deepvol.surrogates.compiled_runner import CompiledSurrogateRunner
+    from deepvol.surrogates.eq_autocall_egno import MaskedEQAutocallSurrogate
+
+    st = preprocess_eq_autocall(base_request)
+    model = MaskedEQAutocallSurrogate(d_node=16, d_global=16, d_model=64, n_egno_layers=2, n_sched_layers=1)
+    model.eval()
+    runner = CompiledSurrogateRunner(model, enable_cudagraphs=False, enable_inductor=False)
+    t2 = st.to_tier2_float32_tensors()
+    args = (
+        t2["node_feats"],
+        t2["edge_feats"],
+        t2["asset_mask"],
+        t2["sched_feats"],
+        t2["sched_mask"],
+        t2["global_feats"],
+    )
+
+    ref = runner.predict_residuals(*args)
+    ref_p = ref[0].clone()
+    # Mutating caller copy must not alter subsequent runner outputs
+    ref[0].fill_(99.0)
+    ref2 = runner.predict_residuals(*args)
+    torch.testing.assert_close(ref2[0], ref_p, atol=1e-6, rtol=1e-6)
+
+    def _run_pred(_: int) -> None:
+        out = runner.predict_residuals(*args)
+        torch.testing.assert_close(out[0], ref_p, atol=1e-6, rtol=1e-6)
+        out[0].zero_()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for fut in [pool.submit(_run_pred, i) for i in range(16)]:
+            fut.result()
+
+    runner.invalidate_graphs()
+    out_after = runner.predict_residuals(*args)
+    torch.testing.assert_close(out_after[0], ref_p, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.gpu
+def test_compiled_runner_cuda_graphs_clone_and_concurrency(
+    base_request: EQAutocallableTradeRequest,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    from deepvol.surrogates.compiled_runner import CompiledSurrogateRunner
+    from deepvol.surrogates.eq_autocall_egno import MaskedEQAutocallSurrogate
+
+    dev = torch.device("cuda")
+    st = preprocess_eq_autocall(base_request)
+    model = MaskedEQAutocallSurrogate(
+        d_node=16, d_global=16, d_model=64, n_egno_layers=2, n_sched_layers=1
+    ).to(dev)
+    model.eval()
+    model.freeze_eval_buffers()
+    runner = CompiledSurrogateRunner(model, enable_cudagraphs=True, enable_inductor=False)
+
+    t2 = {k: v.to(dev) for k, v in st.to_tier2_float32_tensors().items()}
+    args = (
+        t2["node_feats"],
+        t2["edge_feats"],
+        t2["asset_mask"],
+        t2["sched_feats"],
+        t2["sched_mask"],
+        t2["global_feats"],
+    )
+
+    with torch.no_grad():
+        eager = model.forward_residuals(*args)
+        out1 = runner.predict_residuals(*args)
+        torch.testing.assert_close(out1[0], eager[0], atol=1e-4, rtol=1e-4)
+        ref_dh = out1[0].clone()
+        out1[0].fill_(77.0)
+        out2 = runner.predict_residuals(*args)
+        torch.testing.assert_close(out2[0], ref_dh, atol=1e-6, rtol=1e-6)
+
+    def _cuda_worker(_: int) -> None:
+        with torch.no_grad():
+            out_w = runner.predict_residuals(*args)
+            torch.testing.assert_close(out_w[0], ref_dh, atol=1e-6, rtol=1e-6)
+            out_w[0].zero_()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for fut in [pool.submit(_cuda_worker, i) for i in range(16)]:
+            fut.result()
+
+    # Exercise grad-enabled fallback and out-of-bucket geometry fallback
+    with torch.enable_grad():  # type: ignore[no-untyped-call]
+        node_grad = args[0].detach().clone().requires_grad_(True)
+        out_grad = runner.predict_residuals(node_grad, *args[1:])
+        assert out_grad[0].requires_grad
+
+    big_args = (
+        torch.randn(1, 20, 16, device=dev, dtype=torch.float32),
+        torch.randn(1, 20, 20, 4, device=dev, dtype=torch.float32),
+        torch.ones(1, 20, device=dev, dtype=torch.float32),
+        torch.randn(1, 60, 12, device=dev, dtype=torch.float32),
+        torch.ones(1, 60, device=dev, dtype=torch.float32),
+        torch.randn(1, 16, device=dev, dtype=torch.float32),
+    )
+    with torch.no_grad():
+        out_big = runner.predict_residuals(*big_args)
+        assert out_big[0].shape == (1, 60)
+
+        runner.invalidate_graphs()
+        out3 = runner.predict_residuals(*args)
+        torch.testing.assert_close(out3[0], ref_dh, atol=1e-6, rtol=1e-6)
+
+
+def test_async_rwlock_cross_loop_and_cancellation_wakeup() -> None:
+    from deepvol.api.server import AsyncReadWriteLock
+
+    async def _scenario() -> None:
+        lock = AsyncReadWriteLock()
+        events: list[str] = []
+
+        async with lock.reader():
+            events.append("r1_in")
+            w_task = asyncio.create_task(_acquire_write(lock, events))
+            await asyncio.sleep(0.02)
+            r_queued = asyncio.create_task(_acquire_read(lock, events))
+            await asyncio.sleep(0.02)
+            w_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await w_task
+        await r_queued
+        assert "w_acquired" not in events
+        assert "r2_acquired" in events
+
+    async def _acquire_write(lock: Any, events: list[str]) -> None:
+        async with lock.writer():
+            events.append("w_acquired")
+
+    async def _acquire_read(lock: Any, events: list[str]) -> None:
+        async with lock.reader():
+            events.append("r2_acquired")
+
+    asyncio.run(_scenario())
+    # Reusing the same AsyncReadWriteLock across a brand new event loop must succeed
+    asyncio.run(_scenario())
