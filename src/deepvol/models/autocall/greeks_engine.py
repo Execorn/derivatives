@@ -15257,7 +15257,11 @@ def _compute_e2e_d5_cg_core(
         use_clark32=no_ties,
     )
     t1_d_log_s = (g_fp_bm * fp_bm_eff * cdl_bm_u).sum(dim=2)
-    d_pv_d_sig_m = g_v_bm * sqrt_tau_m_2.unsqueeze(1) * amask_2.unsqueeze(2) * smask_2.unsqueeze(1)
+    d_pv_d_sig_m = torch.where(
+        (amask_2 > 0.5).unsqueeze(2) & (smask_2 > 0.5).unsqueeze(1),
+        g_v_bm * sqrt_tau_m_2.unsqueeze(1),
+        0.0,
+    )
     vega_tier1_short = ((1.0 - alpha_m_2).unsqueeze(1) * d_pv_d_sig_m).sum(dim=2)
     vega_tier1_term = (alpha_m_2.unsqueeze(1) * d_pv_d_sig_m).sum(dim=2)
     w_v_term_ij = g_corr_bm + g_corr_bm.transpose(1, 2)
@@ -15956,7 +15960,7 @@ def compute_batched_surrogate_greeks(
         log_fp_eff = log_fp_term_2
         w_lev_eff = torch.cat([w_lev, w_lev], dim=0)
         log_fw_eff = sched_2[:, :, int(AutocallSchedCol.STULZ_FWD_W)]
-        v_w_eff = sched_2[:, :, int(AutocallSchedCol.STULZ_VOL_W)]
+        v_w_eff = sched_2[:, :, int(AutocallSchedCol.STULZ_VOL_W)].clamp(min=1e-6)
 
         def _double_opt(val: Any) -> Any:
             if isinstance(val, torch.Tensor) and val.ndim >= 1 and int(val.shape[0]) == batch_size:
@@ -16235,7 +16239,11 @@ def compute_batched_surrogate_greeks(
                 else torch.zeros((b_eff, d_act), dtype=torch.float64, device=device)
             )
             if g_v_bm is not None:
-                d_pv_d_sig_m = g_v_bm.detach() * sqrt_tau_m_eff.unsqueeze(1) * amask_eff_64.unsqueeze(2) * smask_eff_64.unsqueeze(1)
+                d_pv_d_sig_m = torch.where(
+                    (amask_eff_64 > 0.5).unsqueeze(2) & (smask_eff_64 > 0.5).unsqueeze(1),
+                    g_v_bm.detach() * sqrt_tau_m_eff.unsqueeze(1),
+                    0.0,
+                )
                 vega_tier1_short = ((1.0 - alpha_m_eff).unsqueeze(1) * d_pv_d_sig_m).sum(dim=2)
                 vega_tier1_term = (alpha_m_eff.unsqueeze(1) * d_pv_d_sig_m).sum(dim=2)
             else:
@@ -16324,10 +16332,15 @@ def compute_batched_surrogate_greeks(
             d_vw_d_sig_m = (
                 w_proxy_eff.unsqueeze(2) * sqrt_tau_m_eff.unsqueeze(1) * v_w_scale_m.unsqueeze(1) * cov_w_v_sum
             ) / v_w_eff.unsqueeze(1)
-            d_pv_d_sig_m = d_pv_d_vw_m.unsqueeze(1) * d_vw_d_sig_m * smask_eff_64.unsqueeze(1)
+            smask_eff_bool = smask_eff_64 > 0.5
+            d_pv_d_sig_m = torch.where(
+                smask_eff_bool.unsqueeze(1),
+                d_pv_d_vw_m.unsqueeze(1) * d_vw_d_sig_m,
+                0.0,
+            )
             vega_tier1_short = ((1.0 - alpha_m_eff).unsqueeze(1) * d_pv_d_sig_m).sum(dim=2)
             vega_tier1_term = (alpha_m_eff.unsqueeze(1) * d_pv_d_sig_m).sum(dim=2)
-            w_bm_term = ((d_pv_d_vw_m * smask_eff_64) / v_w_eff).unsqueeze(1) * 2.0
+            w_bm_term = torch.where(smask_eff_bool, d_pv_d_vw_m / v_w_eff, 0.0).unsqueeze(1) * 2.0
             w_v_term_ij = torch.bmm(w_v_m * w_bm_term, w_v_m.transpose(1, 2))
 
         # Edge LOG_PERF_DIFF and DIST_TO_PUT / LOG_FWD_CARRY / CASH_DIV_LEVERAGE spot chain rules
