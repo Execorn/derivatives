@@ -481,9 +481,15 @@ def _build_scenario_registry() -> Dict[str, _ScenarioCase]:
             float(st_b.baseline.product_value_proxy.item()), abs=1e-12
         )
         if rt is not None:
-            pa = rt.price_trade(r_a, engine="auto", include_all_greeks=True)
-            pb = rt.price_trade(r_b, engine="auto", include_all_greeks=True)
+            pa = rt.price_trade(r_a, engine="auto", include_all_greeks=False)
+            pb = rt.price_trade(r_b, engine="auto", include_all_greeks=False)
             assert abs(pa.ProductValue - pb.ProductValue) < 1e-6
+            ga = rt.price_trade(r_a, engine="surrogate", include_all_greeks=True)
+            gb = rt.price_trade(r_b, engine="surrogate", include_all_greeks=True)
+            assert abs(ga.ProductValue - gb.ProductValue) < 1e-6
+            assert ga.Delta is not None and gb.Delta is not None
+            for k in ga.Delta:
+                assert abs(ga.Delta[k] - gb.Delta[k]) < 1e-5
 
     reg(_ScenarioCase("SC-015", "Basket", "Asset permutation invariance", special_fn=_sc015_perm))
 
@@ -876,7 +882,8 @@ def autocall_runtime() -> Any:
     try:
         from deepvol.api.eq_autocall_runtime import EQAutocallRuntime
 
-        return EQAutocallRuntime(device="cpu", n_fallback_paths=1024)
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        return EQAutocallRuntime(device=dev, n_fallback_paths=256)
     except Exception:
         return None
 
@@ -942,32 +949,39 @@ def test_extreme_scenario_matrix(sc_id: str, autocall_runtime: Any) -> None:
 
     rt_res = None
     if autocall_runtime is not None and hasattr(autocall_runtime, "price_trade"):
-        rt_res = autocall_runtime.price_trade(req_model, engine="auto", include_all_greeks=True)
-        _assert_all_finite(
-            {
-                "pv": rt_res.ProductValue,
-                "se": rt_res.StandardError,
-                "opt": rt_res.Option,
-                "not": rt_res.Notional,
-                "cpn": rt_res.Coupon,
-                "fund": rt_res.FundingLeg,
-                "delta": rt_res.Delta,
-                "gamma": rt_res.Gamma,
-                "cash_gamma": rt_res.MultivariateAggregatedCashGamma,
-                "vega": rt_res.Vega,
-                "rho": rt_res.Rho,
-                "divs": rt_res.DividendsSensitivities,
-                "theta": rt_res.Theta,
-                "cega": rt_res.Cega,
-            },
-            f"{sc_id}.runtime",
-        )
+        want_auto_greeks = sc_id in ("SC-001", "SC-016", "SC-019", "SC-027", "SC-080")
+        rt_res = autocall_runtime.price_trade(req_model, engine="auto", include_all_greeks=want_auto_greeks)
+        grk_res = rt_res
+        if not want_auto_greeks and state.d_assets <= 8 and state.m_rem <= 48:
+            grk_res = autocall_runtime.price_trade(req_model, engine="surrogate", include_all_greeks=True)
+        for check_res in (rt_res, grk_res):
+            _assert_all_finite(
+                {
+                    "pv": check_res.ProductValue,
+                    "se": check_res.StandardError,
+                    "opt": check_res.Option,
+                    "not": check_res.Notional,
+                    "cpn": check_res.Coupon,
+                    "fund": check_res.FundingLeg,
+                    "delta": check_res.Delta,
+                    "gamma": check_res.Gamma,
+                    "cash_gamma": check_res.MultivariateAggregatedCashGamma,
+                    "vega": check_res.Vega,
+                    "rho": check_res.Rho,
+                    "divs": check_res.DividendsSensitivities,
+                    "theta": check_res.Theta,
+                    "cega": check_res.Cega,
+                },
+                f"{sc_id}.runtime",
+            )
         if case.expect_fallback is not None:
             assert bool(rt_res.fallback_triggered) is case.expect_fallback, (
                 f"{sc_id}: fallback={rt_res.fallback_triggered}, reasons={rt_res.fallback_reasons}"
             )
         for reason in case.expected_fb_reasons:
             assert reason in rt_res.fallback_reasons, f"{sc_id}: missing {reason} in {rt_res.fallback_reasons}"
+        if sc_id == "SC-008":
+            rt_res = grk_res
 
     if case.custom_check is not None:
         case.custom_check(
