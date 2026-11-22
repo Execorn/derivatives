@@ -238,6 +238,8 @@ _ROOT_TIER0_FIELDS: frozenset[str] = frozenset(
         "CalculationMethod",
         "NumberOfPaths",
         "BatchSizeForMCPath",
+        "RandomNumberGenerator",
+        "TimeSteps",
         "StaticDataSet",
         "GreekMetricsSettings",
     }
@@ -464,6 +466,7 @@ class DividendsSpec(BaseModel):
     TypeName: Literal["Dividends"] = "Dividends"
     Identifier: str
     CashDividendList: List[DividendItemSpec] = Field(default_factory=list)
+    Currency: Optional[str] = Field(default=None, exclude=True)
 
 
 class PredefinedDividendsSpec(BaseModel):
@@ -473,6 +476,7 @@ class PredefinedDividendsSpec(BaseModel):
 
     ExDates: List[datetime.datetime]
     Amounts: List[float]
+    Currency: Optional[str] = Field(default=None, exclude=True)
 
     @field_validator("ExDates", mode="before")
     @classmethod
@@ -506,6 +510,7 @@ class EquityVolSmileCollectionSpec(BaseModel):
     ExpirationDates: List[datetime.datetime]
     Strikes: List[float]
     VolatilityQuotes: List[List[float]]
+    Currency: Optional[str] = Field(default=None, exclude=True)
 
     @field_validator("ExpirationDates", mode="before")
     @classmethod
@@ -911,18 +916,34 @@ class AutoCallableProductSpec(BaseModel):
         return rates
 
 
+_DESCRIPTION_TO_SHORT_CODE: Dict[str, str] = {
+    "FundingLeg": "F",
+    "Coupon": "C",
+    "Notional": "N",
+    "Option": "O",
+    "OneStarCoupon": "S",
+    "IsLongBasket": "L",
+}
+
+
 class CashFlowRow(BaseModel):
     """Single cash-flow table entry in `EQAutocallableTradeResponse`."""
 
     model_config = ConfigDict(extra="forbid")
 
-    Description: Union[Literal["FundingLeg", "Coupon", "Notional", "Option"], str]
+    Description: Union[
+        Literal["FundingLeg", "Coupon", "Notional", "Option", "OneStarCoupon", "IsLongBasket"],
+        str,
+    ]
     Date: datetime.datetime
     Amount: float
     StandardError: float = 0.0
     Currency: str = "RUB"
     Leg: int = 0
-    StatusText: Union[Literal["Settled", "Estimate"], str] = "Estimate"
+    StatusText: Union[Literal["Settled", "InTransit", "Estimate"], str] = "Estimate"
+    ShortCode: Optional[
+        Union[Literal["F", "C", "N", "O", "S", "B", "L"], str]
+    ] = Field(default=None, exclude=True)
 
     @model_validator(mode="before")
     @classmethod
@@ -942,6 +963,10 @@ class CashFlowRow(BaseModel):
             pay_val = out.pop("PaymentValue")
             if "Amount" not in out:
                 out["Amount"] = float(pay_val)
+        if out.get("ShortCode") is None and "Description" in out:
+            sc = _DESCRIPTION_TO_SHORT_CODE.get(str(out["Description"]))
+            if sc is not None:
+                out["ShortCode"] = sc
         return out
 
     @field_validator("Date", mode="before")
@@ -967,6 +992,7 @@ class EQAutocallableTradeRequest(BaseModel):
     )
     TradeInfo: Optional[str] = None
     stripped_legacy_fields: List[str] = Field(default_factory=list)
+    legacy_solver_config: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
     @model_validator(mode="before")
     @classmethod
@@ -975,17 +1001,32 @@ class EQAutocallableTradeRequest(BaseModel):
             return data
         out = dict(data)
         stripped: List[str] = list(out.get("stripped_legacy_fields", []))
+        existing_solver_cfg = out.get("legacy_solver_config")
+        solver_cfg: Dict[str, Any] = (
+            dict(existing_solver_cfg) if isinstance(existing_solver_cfg, Mapping) else {}
+        )
 
         for field_name in (
             "CalculationMethod",
             "NumberOfPaths",
             "BatchSizeForMCPath",
+            "RandomNumberGenerator",
+            "TimeSteps",
             "StaticDataSet",
             "GreekMetricsSettings",
         ):
             if field_name in out:
                 val = out.pop(field_name)
                 _append_unique(stripped, [field_name])
+                if field_name in (
+                    "CalculationMethod",
+                    "NumberOfPaths",
+                    "BatchSizeForMCPath",
+                    "RandomNumberGenerator",
+                    "TimeSteps",
+                    "GreekMetricsSettings",
+                ):
+                    solver_cfg[field_name] = val
                 if field_name == "GreekMetricsSettings" and isinstance(val, Mapping):
                     for gk_key, gk_val in val.items():
                         if gk_key not in _GREEK_SETTINGS_TIER0_FIELDS:
@@ -1004,6 +1045,8 @@ class EQAutocallableTradeRequest(BaseModel):
                                         _append_unique(stripped, [b_key])
 
         out["stripped_legacy_fields"] = stripped
+        if solver_cfg:
+            out["legacy_solver_config"] = solver_cfg
         return out
 
     @model_validator(mode="after")

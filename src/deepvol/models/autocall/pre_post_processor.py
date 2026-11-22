@@ -204,6 +204,8 @@ class AutocallPreprocState:
     quanto_meta: dict[str, Any] = field(default_factory=dict)
     asset_financing_curves: dict[str, Any] = field(default_factory=dict)
     discount_curve_id: str | None = None
+    r_native_obs: torch.Tensor | None = None
+    warnings: list[str] = field(default_factory=list)
     feature_schema_version: str = FEATURE_SCHEMA_VERSION
 
     def to_tier2_float32_tensors(self) -> dict[str, torch.Tensor]:
@@ -275,6 +277,7 @@ class AutocallPostprocOutput:
     reporting_currency: str = "RUB"
     cash_to_settle_today: float = 0.0
     l_onestar: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0, dtype=torch.float64))
+    p_onestar: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0, dtype=torch.float64))
 
     @property
     def cash_flows(self) -> list[CashFlowItem]:
@@ -481,11 +484,17 @@ def _clone_dataclass_tensors(obj: Any) -> Any:
 
 
 def _clone_dataclass_fields(obj: Any) -> Any:
+    field_names = {f.name for f in dc_fields(obj)}
     updates = {
-        f.name: _clone_dataclass_tensors(getattr(obj, f.name))
-        for f in dc_fields(obj)
+        name: _clone_dataclass_tensors(getattr(obj, name))
+        for name in field_names
     }
-    return dc_replace(obj, **updates)
+    cloned = dc_replace(obj, **updates)
+    if hasattr(obj, "__dict__"):
+        for k, v in obj.__dict__.items():
+            if k not in field_names:
+                setattr(cloned, k, _clone_dataclass_tensors(v))
+    return cloned
 
 
 def _clone_preproc_state(state: AutocallPreprocState) -> AutocallPreprocState:
@@ -547,6 +556,8 @@ def _clone_preproc_state(state: AutocallPreprocState) -> AutocallPreprocState:
         queries=list(state.queries),
         quanto_meta={k: dict(v) for k, v in state.quanto_meta.items()},
         asset_financing_curves=dict(state.asset_financing_curves),
+        r_native_obs=state.r_native_obs.clone() if state.r_native_obs is not None else None,
+        warnings=list(state.warnings),
     )
 
 
@@ -596,19 +607,223 @@ def _get_cached_yield_curve(spec: Any, as_of_dt: datetime.datetime) -> ClampedYi
     return curve
 
 
+_VERSION_STATUS_TAGS: frozenset[str] = frozenset(
+    {
+        "OLD",
+        "NEW",
+        "REG",
+        "PREF",
+        "P",
+        "DR",
+        "ADR",
+        "GDR",
+        "CLS",
+        "LOCAL",
+        "SHS",
+        "ORD",
+        "A",
+        "B",
+        "C",
+        "1",
+        "2",
+    }
+)
+_KNOWN_ISO_CURRENCIES: frozenset[str] = frozenset(
+    {
+        "RUB",
+        "USD",
+        "CNH",
+        "CNY",
+        "EUR",
+        "GBP",
+        "HKD",
+        "CHF",
+        "JPY",
+        "AED",
+        "KZT",
+        "BYN",
+        "TRY",
+        "INR",
+        "BRL",
+        "ZAR",
+        "CAD",
+        "AUD",
+        "SGD",
+        "NZD",
+        "SEK",
+        "NOK",
+        "DKK",
+        "PLN",
+        "MXN",
+        "KRW",
+        "TWD",
+    }
+)
+_COUNTRY_SUFFIX_TO_CCY: dict[str, str] = {
+    "US": "USD",
+    "HK": "HKD",
+    "CN": "CNH",
+    "EU": "EUR",
+    "LN": "GBP",
+    "GR": "EUR",
+    "FP": "EUR",
+    "GY": "EUR",
+    "SW": "CHF",
+    "JP": "JPY",
+    "KZ": "KZT",
+}
+_OIS_CURVE_TOKENS: tuple[str, ...] = (
+    "OIS",
+    "SOFR",
+    "RUONIA",
+    "ESTR",
+    "SONIA",
+    "TONAR",
+    "SARON",
+    "SHIBOR",
+)
+_FUNDING_CURVE_TOKENS: tuple[str, ...] = ("FUNDING", "FUND", "SECD")
+
+
+def _curve_ois_priority_rank(cid: str, fin_ids: Sequence[str] = ()) -> tuple[int, str]:
+    """Ranks candidate same-currency curves for equity forward growth (F-12).
+
+    Rank 0: OIS curves ('OIS', 'SOFR', 'RUONIA', 'ESTR', 'SONIA') without 'XCCY', 'FUNDING', 'SECD'.
+    Rank 1: Standard yield / FX curves not in fin_ids and without 'XCCY', 'FUNDING', 'SECD'.
+    Rank 2: 'XCCY' cross-currency basis curves.
+    Rank 3: Curves in fin_ids or containing 'FUNDING' / 'SECD'.
+    """
+    cid_u = str(cid).strip().upper()
+    fin_set = {str(f).strip().upper() for f in fin_ids}
+    has_xccy = "XCCY" in cid_u
+    has_funding = any(tok in cid_u for tok in _FUNDING_CURVE_TOKENS)
+    has_ois = any(tok in cid_u for tok in _OIS_CURVE_TOKENS)
+    if has_ois and not has_xccy and not has_funding:
+        return (0, cid_u)
+    if not has_xccy and not has_funding and cid_u not in fin_set:
+        return (1, cid_u)
+    if has_xccy:
+        return (2, cid_u)
+    return (3, cid_u)
+
+
+def _infer_asset_currency_5tier(
+    ticker: str,
+    payment_ccy: str,
+    *,
+    div_src: Any = None,
+    vol_surfaces_map: Mapping[str, Any] | None = None,
+    correlations_map: Mapping[str, float] | None = None,
+    rates_bundles: Mapping[str, Any] | None = None,
+) -> str:
+    """5-tier deterministic asset currency inference (I-5a)."""
+    pay_ccy_upper = str(payment_ccy).strip().upper()
+
+    # Tier 1: Explicit Currency metadata on div_src or vol_surfaces_map[ticker]
+    for src in (
+        div_src,
+        vol_surfaces_map.get(ticker) if isinstance(vol_surfaces_map, Mapping) else None,
+    ):
+        raw_ccy = _extract_attr(src, "Currency", "currency") if src is not None else None
+        if isinstance(raw_ccy, str):
+            c_up = raw_ccy.strip().upper()
+            if len(c_up) == 3 and c_up.isalpha() and c_up not in _VERSION_STATUS_TAGS:
+                return c_up
+
+    # Tier 2: Tokenized '_' scan after stripping version/status tags
+    tokens = [tok.strip().upper() for tok in str(ticker).split("_") if tok.strip()]
+    while len(tokens) > 1 and tokens[-1] in _VERSION_STATUS_TAGS:
+        tokens.pop()
+    if len(tokens) > 2 and tokens[-1] == "RX" and len(tokens[-2]) == 3 and tokens[-2].isalpha():
+        tokens.pop()
+    for tok in reversed(tokens[1:]):
+        if tok in _KNOWN_ISO_CURRENCIES:
+            return tok
+    if len(tokens) >= 2 and len(tokens[-1]) == 3 and tokens[-1].isalpha() and tokens[-1] not in _VERSION_STATUS_TAGS:
+        return tokens[-1]
+
+    # Tier 3: Correlations & FXVolatilitySmileCollection pair graph ('AAPLUS&USDRUB', 'MSFT&USDRUB' -> 'USD')
+    if isinstance(correlations_map, Mapping):
+        fx_candidates: list[str] = []
+        if isinstance(vol_surfaces_map, Mapping):
+            for sid, s_obj in vol_surfaces_map.items():
+                t_name = _extract_attr(s_obj, "TypeName", "type_name")
+                sid_clean = str(sid).strip().upper().replace("_", "").replace("/", "").replace("-", "")
+                if t_name == "FXVolatilitySmileCollection" or (
+                    len(sid_clean) == 6
+                    and sid_clean[:3] in _KNOWN_ISO_CURRENCIES
+                    and sid_clean[3:] in _KNOWN_ISO_CURRENCIES
+                ):
+                    fx_candidates.append(str(sid))
+        # Also scan correlation keys directly for 6-letter FX pairs paired with ticker
+        for corr_key in correlations_map:
+            if "&" in str(corr_key):
+                lhs, rhs = str(corr_key).split("&", 1)
+                other = rhs if lhs == ticker else (lhs if rhs == ticker else None)
+                if other is not None and other not in fx_candidates:
+                    other_clean = other.strip().upper().replace("_", "").replace("/", "").replace("-", "")
+                    if (
+                        len(other_clean) == 6
+                        and other_clean[:3] in _KNOWN_ISO_CURRENCIES
+                        and other_clean[3:] in _KNOWN_ISO_CURRENCIES
+                    ):
+                        fx_candidates.append(other)
+
+        for fx_id in fx_candidates:
+            if f"{ticker}&{fx_id}" in correlations_map or f"{fx_id}&{ticker}" in correlations_map:
+                fx_clean = fx_id.strip().upper().replace("_", "").replace("/", "").replace("-", "")
+                if len(fx_clean) == 6 and fx_clean[:3].isalpha() and fx_clean[3:].isalpha():
+                    c1, c2 = fx_clean[:3], fx_clean[3:]
+                    if c1 == pay_ccy_upper and c2 != pay_ccy_upper:
+                        return c2
+                    if c2 == pay_ccy_upper and c1 != pay_ccy_upper:
+                        return c1
+
+    # Tier 4: 2-letter country suffix ('AAPLUS', 'GOOGLUS' -> 'USD' when foreign curve/FX exists)
+    base_tok = tokens[0] if tokens else str(ticker).strip().upper()
+    if len(base_tok) >= 5 and base_tok[-2:] in _COUNTRY_SUFFIX_TO_CCY:
+        cand_ccy = _COUNTRY_SUFFIX_TO_CCY[base_tok[-2:]]
+        has_ccy_curve = isinstance(rates_bundles, Mapping) and any(
+            str(cid).strip().upper().startswith(cand_ccy)
+            or str(_extract_attr(spec_c, "Currency", "currency", default="")).strip().upper() == cand_ccy
+            for cid, spec_c in rates_bundles.items()
+        )
+        has_ccy_fx = isinstance(vol_surfaces_map, Mapping) and any(
+            cand_ccy in str(sid).strip().upper() for sid in vol_surfaces_map
+        )
+        if has_ccy_curve or has_ccy_fx or (not rates_bundles and not vol_surfaces_map):
+            return cand_ccy
+
+    # Tier 5: Default to payment_currency
+    return pay_ccy_upper
+
+
 def _get_cached_vol_surface(
     surf_spec: Any,
     as_of_dt: datetime.datetime,
+    surface_id: str | None = None,
 ) -> RegularizedVolSurface:
+    if (
+        isinstance(surf_spec, Mapping)
+        and surface_id is not None
+        and "Identifier" not in surf_spec
+        and "identifier" not in surf_spec
+    ):
+        surf_spec = {**surf_spec, "Identifier": str(surface_id)}
     kwargs: dict[str, Any] = {"bc_type": "clamped"}
     if "smile_interp" in _VOL_SURF_SIG_PARAMS:
         s_interp = _extract_attr(surf_spec, "SmileInterpolationMethod", "smile_interpolation_method")
         if s_interp is not None:
             kwargs["smile_interp"] = str(getattr(s_interp, "value", s_interp))
     if "smile_extrap" in _VOL_SURF_SIG_PARAMS:
+        s_extrap = _extract_attr(surf_spec, "SmileExtrapolationMethod", "smile_interpolation_method")
         s_extrap = _extract_attr(surf_spec, "SmileExtrapolationMethod", "smile_extrapolation_method")
         if s_extrap is not None:
             kwargs["smile_extrap"] = str(getattr(s_extrap, "value", s_extrap))
+    if "surface_id" in _VOL_SURF_SIG_PARAMS:
+        eff_id = surface_id or _extract_attr(surf_spec, "Identifier", "identifier")
+        if eff_id is not None:
+            kwargs["surface_id"] = str(eff_id)
 
     key = digest_market_bytes("vol_surface", (surf_spec, as_of_dt, kwargs))
     if key is not None:
@@ -630,8 +845,10 @@ def _resolve_curves_and_financing(
     predef_divs_map: Mapping[str, Any],
     as_of_dt: datetime.datetime,
 ) -> tuple[Any, str | None, dict[str, Any]]:
-    """Resolves the payment-currency discount curve and per-asset financing curves."""
+    """Resolves the payment-currency discount curve and per-asset OIS forward growth curves."""
     rates_bundles = _extract_attr(mkt, "RatesCurvesBundles", "rates_curves_bundles")
+    vol_surfaces_map = _extract_attr(mkt, "VolatilitySurfaces", "volatility_surfaces", default={})
+    correlations_map = _extract_attr(mkt, "Correlations", "correlations", default={})
     fin_ids_raw = _extract_attr(model, "FinancingCurveIdentifiers", "financing_curve_identifiers")
     fin_ids: list[str] = [str(x) for x in fin_ids_raw] if fin_ids_raw else []
 
@@ -642,7 +859,7 @@ def _resolve_curves_and_financing(
         disc_curve_id = str(_extract_attr(disc_curve_spec, "Identifier", "identifier", default="")) or None
     elif isinstance(rates_bundles, Mapping) and len(rates_bundles) > 0:
         pay_prefix = f"{payment_ccy.upper()}_"
-        # Prefer a curve in FinancingCurveIdentifiers matching payment_ccy.
+        # Prefer a curve in FinancingCurveIdentifiers matching payment_ccy for note discounting.
         for cid in fin_ids:
             if cid in rates_bundles:
                 spec_c = rates_bundles[cid]
@@ -673,14 +890,16 @@ def _resolve_curves_and_financing(
     asset_fin_curves: dict[str, Any] = {}
     if isinstance(rates_bundles, Mapping) and len(rates_bundles) > 0:
         for ticker in sorted_ids:
-            # Infer asset currency from dividend sources when ticker has no currency suffix.
             div_src = predef_divs_map.get(ticker) if isinstance(predef_divs_map, Mapping) else None
             if div_src is None and isinstance(dividends_map, Mapping):
                 div_src = dividends_map.get(ticker)
-            div_ccy = _extract_attr(div_src, "Currency", "currency") if div_src is not None else None
-            inferred_ccy = _infer_asset_currency(
+            inferred_ccy = _infer_asset_currency_5tier(
                 ticker,
-                str(div_ccy).upper() if div_ccy else payment_ccy,
+                payment_ccy,
+                div_src=div_src,
+                vol_surfaces_map=vol_surfaces_map if isinstance(vol_surfaces_map, Mapping) else None,
+                correlations_map=correlations_map if isinstance(correlations_map, Mapping) else None,
+                rates_bundles=rates_bundles,
             )
 
             matched_spec: Any = None
@@ -688,19 +907,17 @@ def _resolve_curves_and_financing(
                 matched_spec = rates_bundles[ticker]
             else:
                 ccy_prefix = f"{inferred_ccy}_"
-                for cid in fin_ids:
-                    if cid in rates_bundles:
-                        spec_c = rates_bundles[cid]
-                        spec_ccy = str(_extract_attr(spec_c, "Currency", "currency", default="")).upper()
-                        if spec_ccy == inferred_ccy or cid.upper().startswith(ccy_prefix):
-                            matched_spec = spec_c
-                            break
-                if matched_spec is None:
-                    for cid, spec_c in rates_bundles.items():
-                        spec_ccy = str(_extract_attr(spec_c, "Currency", "currency", default="")).upper()
-                        if spec_ccy == inferred_ccy or str(cid).upper().startswith(ccy_prefix):
-                            matched_spec = spec_c
-                            break
+                candidates: list[tuple[int, int, Any]] = []
+                for idx, (cid, spec_c) in enumerate(rates_bundles.items()):
+                    cid_str = str(cid)
+                    cid_u = cid_str.strip().upper()
+                    spec_ccy = str(_extract_attr(spec_c, "Currency", "currency", default="")).strip().upper()
+                    if spec_ccy == inferred_ccy or cid_u.startswith(ccy_prefix) or cid_u == inferred_ccy:
+                        rank, _ = _curve_ois_priority_rank(cid_str, fin_ids)
+                        candidates.append((rank, idx, spec_c))
+                if candidates:
+                    candidates.sort(key=lambda item: (item[0], item[1]))
+                    matched_spec = candidates[0][2]
 
             if matched_spec is not None:
                 asset_fin_curves[ticker] = (
@@ -712,7 +929,13 @@ def _resolve_curves_and_financing(
                 asset_fin_curves[ticker] = disc_curve_obj
     elif disc_curve_obj is not None:
         for ticker in sorted_ids:
-            if _infer_asset_currency(ticker, payment_ccy) == payment_ccy.upper():
+            inferred_ccy = _infer_asset_currency_5tier(
+                ticker,
+                payment_ccy,
+                vol_surfaces_map=vol_surfaces_map if isinstance(vol_surfaces_map, Mapping) else None,
+                correlations_map=correlations_map if isinstance(correlations_map, Mapping) else None,
+            )
+            if inferred_ccy == payment_ccy.upper():
                 asset_fin_curves[ticker] = disc_curve_obj
 
     return disc_curve_obj, disc_curve_id, asset_fin_curves
@@ -912,7 +1135,7 @@ def preprocess_eq_autocall(
         ki_monitored_past = bool(ki_monitored_past_override)
     elif ki_barrier is None or ki_barrier <= 0.0:
         ki_monitored_past = False
-    elif ki_obs_type == "European":
+    elif ki_obs_type is None or ki_obs_type == "European":
         ki_monitored_past = False
     else:
         ki_monitored_past = True
@@ -1190,6 +1413,17 @@ def preprocess_eq_autocall(
         one_star_coupon=one_star_coupon,
         funding_leg=funding_leg_dict,
     )
+    if not hasattr(seasoned, "warnings") or getattr(seasoned, "warnings", None) is None:
+        setattr(seasoned, "warnings", [])
+    seasoned_warnings: list[str] = getattr(seasoned, "warnings")
+    if (
+        ki_obs_type_raw is None
+        and ki_monitored_past_override is None
+        and ki_barrier is not None
+        and float(ki_barrier) > 0.0
+    ):
+        if "KI_OBS_TYPE_DEFAULTED_EUROPEAN" not in seasoned_warnings:
+            seasoned_warnings.append("KI_OBS_TYPE_DEFAULTED_EUROPEAN")
 
     sorted_ids = seasoned.sorted_identifiers
     d_assets = len(sorted_ids)
@@ -1228,8 +1462,13 @@ def preprocess_eq_autocall(
             if ticker not in vol_surfaces_map:
                 raise KeyError(f"Missing EquityVolatilitySmileCollection for underlying {ticker!r}.")
             surf_spec = vol_surfaces_map[ticker]
-            surf_i = _get_cached_vol_surface(surf_spec, as_of_dt)
+            surf_i = _get_cached_vol_surface(surf_spec, as_of_dt, surface_id=ticker)
             reg_surfaces[ticker] = surf_i
+            surf_warns = getattr(surf_i, "warnings", None)
+            if isinstance(surf_warns, Sequence) and not isinstance(surf_warns, (str, bytes)):
+                for w_msg in surf_warns:
+                    if str(w_msg) not in seasoned_warnings:
+                        seasoned_warnings.append(str(w_msg))
 
             raw_surf_dcc = _extract_attr(surf_spec, "DayCountConvention", "day_count_convention", default="Act365")
             surf_dcc = str(getattr(raw_surf_dcc, "value", raw_surf_dcc))
@@ -1639,6 +1878,16 @@ def preprocess_eq_autocall(
         quanto_meta=div_out.quanto_meta,
         asset_financing_curves=asset_fin_curves,
         discount_curve_id=disc_curve_id,
+        r_native_obs=(
+            getattr(div_out, "r_native_obs").to(dtype=torch.float64, device=device)
+            if isinstance(getattr(div_out, "r_native_obs", None), torch.Tensor)
+            else (
+                torch.as_tensor(getattr(div_out, "r_native_obs"), dtype=torch.float64, device=device)
+                if getattr(div_out, "r_native_obs", None) is not None
+                else None
+            )
+        ),
+        warnings=list(seasoned_warnings),
         feature_schema_version=FEATURE_SCHEMA_VERSION,
     )
     if cache_key is not None:
@@ -1654,6 +1903,7 @@ def assemble_autocall_cashflows_and_pv(
     l_put: torch.Tensor | None = None,
     l_call: torch.Tensor | None = None,
     l_onestar: torch.Tensor | float | None = None,
+    p_onestar: torch.Tensor | float | None = None,
     h_prob: torch.Tensor | None = None,
     q_prob: torch.Tensor | None = None,
     coupon_cf_undisc: torch.Tensor | npt.NDArray[np.float64] | None = None,
@@ -1716,6 +1966,17 @@ def assemble_autocall_cashflows_and_pv(
         else torch.as_tensor(l_onestar, dtype=torch.float64, device=device).reshape(())
     )
 
+    if p_onestar is not None:
+        p_onestar_raw = torch.as_tensor(p_onestar, dtype=torch.float64, device=device).reshape(())
+    elif hasattr(preproc_state.baseline, "p_onestar_proxy") and getattr(preproc_state.baseline, "p_onestar_proxy") is not None:
+        p_onestar_raw = torch.as_tensor(
+            getattr(preproc_state.baseline, "p_onestar_proxy"), dtype=torch.float64, device=device
+        ).reshape(())
+    elif float(preproc_state.one_star_coupon) > 0.0:
+        p_onestar_raw = l_onestar_t / float(preproc_state.one_star_coupon)
+    else:
+        p_onestar_raw = torch.tensor(0.0, dtype=torch.float64, device=device)
+
     p_t = p_t * preproc_state.is_callable
 
     cashflows: list[CashFlowItem] = (
@@ -1750,6 +2011,7 @@ def assemble_autocall_cashflows_and_pv(
             reporting_currency=ccy,
             cash_to_settle_today=cash_today,
             l_onestar=l_onestar_t,
+            p_onestar=z_s,
         )
 
     cum_p = torch.cumsum(p_t, dim=0)
@@ -1758,6 +2020,7 @@ def assemble_autocall_cashflows_and_pv(
         [torch.ones(1, dtype=torch.float64, device=device), survival_probs[:-1]],
         dim=0,
     )
+    p_onestar_t = torch.minimum(p_onestar_raw.clamp(min=0.0), survival_probs[-1])
 
     df_pay = preproc_state.df_pay
     cpn_rates = preproc_state.coupon_amounts
@@ -1884,7 +2147,7 @@ def assemble_autocall_cashflows_and_pv(
                 mem_acc = eff_c_m * (1.0 - eff_q_m)
         coupon_cf_list.append(cf_cpn_m)
 
-    put_sign = 1.0 if preproc_state.is_long_basket else -1.0
+    put_sign = -1.0
     cf_option_term = df_pay[-1] * (
         put_sign * float(preproc_state.option_gearing) * l_put_t
         + float(preproc_state.participation_call_rate) * l_call_t
@@ -1929,6 +2192,109 @@ def assemble_autocall_cashflows_and_pv(
             )
             if m == m_rem - 1:
                 opt_amt = float(cf_option_term.detach().cpu().item())
+                if preproc_state.is_long_basket:
+                    stop_notional_amt = (
+                        0.0
+                        if preproc_state.no_notional_repayment
+                        else float((df_pay[-1] * p_t[-1]).detach().cpu().item())
+                    )
+                    surv_notional_amt = (
+                        0.0
+                        if preproc_state.no_notional_repayment
+                        else float((df_pay[-1] * survival_probs[-1]).detach().cpu().item())
+                    )
+                    cashflows.append(
+                        CashFlowItem(
+                            Description="IsLongBasket",  # type: ignore[arg-type]
+                            Date=pay_dt,
+                            Amount=surv_notional_amt + opt_amt,
+                            StandardError=float(option_se),
+                            Currency=ccy,
+                            Leg=0,
+                            StatusText="Estimate",
+                        )
+                    )
+                    cashflows.append(
+                        CashFlowItem(
+                            Description="Option",
+                            Date=pay_dt,
+                            Amount=0.0,
+                            StandardError=0.0,
+                            Currency=ccy,
+                            Leg=0,
+                            StatusText="Estimate",
+                        )
+                    )
+                    cashflows.append(
+                        CashFlowItem(
+                            Description="Notional",
+                            Date=pay_dt,
+                            Amount=stop_notional_amt,
+                            StandardError=0.0,
+                            Currency=ccy,
+                            Leg=0,
+                            StatusText="Estimate",
+                        )
+                    )
+                    continue
+
+                if preproc_state.one_star_strike is not None and float(preproc_state.one_star_strike) > 0.0:
+                    p_star_val = float(p_onestar_t.detach().cpu().item())
+                    if p_star_val > 0.0 or float(preproc_state.one_star_strike) > 0.0:
+                        df_last = float(df_pay[-1].detach().cpu().item())
+                        onestar_principal_amt = (
+                            0.0 if preproc_state.no_notional_repayment else df_last * p_star_val
+                        )
+                        onestar_bonus_amt = df_last * float(l_onestar_t.detach().cpu().item())
+                        onestar_total_amt = onestar_principal_amt + onestar_bonus_amt
+                        notional_rem_amt = max(notional_amt - onestar_principal_amt, 0.0)
+                        opt_only_amt = float(
+                            (
+                                df_pay[-1]
+                                * (
+                                    put_sign * float(preproc_state.option_gearing) * l_put_t
+                                    + float(preproc_state.participation_call_rate) * l_call_t
+                                )
+                            )
+                            .detach()
+                            .cpu()
+                            .item()
+                        )
+                        cashflows.append(
+                            CashFlowItem(
+                                Description="OneStarCoupon",  # type: ignore[arg-type]
+                                Date=pay_dt,
+                                Amount=onestar_total_amt,
+                                StandardError=0.0,
+                                Currency=ccy,
+                                Leg=0,
+                                StatusText="Estimate",
+                            )
+                        )
+                        cashflows.append(
+                            CashFlowItem(
+                                Description="Option",
+                                Date=pay_dt,
+                                Amount=opt_only_amt,
+                                StandardError=float(option_se),
+                                Currency=ccy,
+                                Leg=0,
+                                StatusText="Estimate",
+                            )
+                        )
+                        cashflows.append(
+                            CashFlowItem(
+                                Description="Notional",
+                                Date=pay_dt,
+                                Amount=notional_rem_amt,
+                                StandardError=0.0,
+                                Currency=ccy,
+                                Leg=0,
+                                StatusText="Estimate",
+                            )
+                        )
+                        continue
+
                 cashflows.append(
                     CashFlowItem(
                         Description="Option",
@@ -1970,6 +2336,7 @@ def assemble_autocall_cashflows_and_pv(
         reporting_currency=ccy,
         cash_to_settle_today=cash_today,
         l_onestar=l_onestar_t,
+        p_onestar=p_onestar_t,
     )
 
 
