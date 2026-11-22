@@ -214,6 +214,8 @@ def enforce_no_arbitrage_projection_with_jacobian(
     min_vol: float = 0.01,
     max_vol: float = 5.00,
     min_calendar_dvar_dt: float = 1e-5,
+    surface_id: str = "UNKNOWN",
+    warnings_out: Optional[List[str]] = None,
 ) -> Tuple[
     npt.NDArray[np.float64],
     npt.NDArray[np.float64],
@@ -239,24 +241,60 @@ def enforce_no_arbitrage_projection_with_jacobian(
     q_arr = np.asarray(quotes, dtype=np.float64)
 
     if t_arr.ndim != 1 or k_arr.ndim != 1 or q_arr.ndim != 2:
-        raise ValueError("SMILE_ARBITRAGE: Invalid surface dimensions.")
+        raise ValueError(f"SMILE_ARBITRAGE: Invalid surface dimensions on surface={surface_id}.")
     if len(t_arr) == 0 or len(k_arr) < 2:
-        raise ValueError("SMILE_ARBITRAGE: Surface must have at least 1 expiry and 2 strikes.")
+        raise ValueError(
+            f"SMILE_ARBITRAGE: Surface must have at least 1 expiry and 2 strikes on surface={surface_id}."
+        )
     if q_arr.shape != (len(t_arr), len(k_arr)):
         raise ValueError(
-            f"SMILE_ARBITRAGE: Quotes shape {q_arr.shape} does not match ({len(t_arr)}, {len(k_arr)})."
+            f"SMILE_ARBITRAGE: Quotes shape {q_arr.shape} does not match ({len(t_arr)}, {len(k_arr)}) on surface={surface_id}."
         )
     if not (np.all(np.isfinite(t_arr)) and np.all(np.isfinite(k_arr)) and np.all(np.isfinite(q_arr))):
-        raise ValueError("SMILE_ARBITRAGE: Non-finite (NaN/Inf) values in volatility surface.")
-    if np.any(t_arr <= 0.0) or np.any(np.diff(t_arr) <= 0.0):
-        raise ValueError("SMILE_ARBITRAGE: Expiration tenors must be strictly positive and increasing.")
-    if np.any(k_arr <= 0.0):
-        raise ValueError("SMILE_ARBITRAGE: Strikes must be strictly positive.")
-    if np.any(q_arr < 0.0):
-        raise ValueError("SMILE_ARBITRAGE: Negative implied volatility quote.")
-    if np.any(q_arr > max_vol):
+        bad_q = np.argwhere(~np.isfinite(q_arr))
+        if len(bad_q) > 0:
+            m_b, j_b = int(bad_q[0, 0]), int(bad_q[0, 1])
+            j_p = max(j_b - 1, 0)
+            t_b = float(t_arr[m_b]) if np.isfinite(t_arr[m_b]) else -1.0
+            k_b = float(k_arr[j_b]) if np.isfinite(k_arr[j_b]) else -1.0
+            k_p = float(k_arr[j_p]) if np.isfinite(k_arr[j_p]) else -1.0
+            v_p = float(q_arr[m_b, j_p])
+            v_b = float(q_arr[m_b, j_b])
+            raise ValueError(
+                f"SMILE_ARBITRAGE: Non-finite (NaN/Inf) values in volatility surface={surface_id}, "
+                f"slice={m_b} (T={t_b:.4f}Y), K={k_b:.4f} (prev_K={k_p:.4f} -> K={k_b:.4f}, "
+                f"vol_jump={v_p:.5f}->{v_b:.5f}), min_d2c=nan, min_g=nan."
+            )
         raise ValueError(
-            f"SMILE_ARBITRAGE: Implied volatility quotes exceed max_vol ({max_vol})."
+            f"SMILE_ARBITRAGE: Non-finite (NaN/Inf) values in volatility surface={surface_id}."
+        )
+    if np.any(t_arr <= 0.0) or np.any(np.diff(t_arr) <= 0.0):
+        raise ValueError(
+            f"SMILE_ARBITRAGE: Expiration tenors must be strictly positive and increasing on surface={surface_id}."
+        )
+    if np.any(k_arr <= 0.0):
+        raise ValueError(f"SMILE_ARBITRAGE: Strikes must be strictly positive on surface={surface_id}.")
+    if np.any(q_arr < 1e-4):
+        bad_low = np.argwhere(q_arr < 1e-4)
+        m_b, j_b = int(bad_low[0, 0]), int(bad_low[0, 1])
+        j_p = max(j_b - 1, 0)
+        raise ValueError(
+            f"SMILE_ARBITRAGE: Negative or sub-1e-4 implied volatility quote on surface={surface_id}, "
+            f"slice={m_b} (T={float(t_arr[m_b]):.4f}Y), K={float(k_arr[j_b]):.4f} "
+            f"(prev_K={float(k_arr[j_p]):.4f} -> K={float(k_arr[j_b]):.4f}, "
+            f"vol_jump={float(q_arr[m_b, j_p]):.5f}->{float(q_arr[m_b, j_b]):.5f}), "
+            f"min_d2c=0.000000, min_g=0.0000."
+        )
+    if np.any(q_arr > max_vol):
+        bad_hi = np.argwhere(q_arr > max_vol)
+        m_b, j_b = int(bad_hi[0, 0]), int(bad_hi[0, 1])
+        j_p = max(j_b - 1, 0)
+        raise ValueError(
+            f"SMILE_ARBITRAGE: Implied volatility quotes exceed max_vol ({max_vol}) on surface={surface_id}, "
+            f"slice={m_b} (T={float(t_arr[m_b]):.4f}Y), K={float(k_arr[j_b]):.4f} "
+            f"(prev_K={float(k_arr[j_p]):.4f} -> K={float(k_arr[j_b]):.4f}, "
+            f"vol_jump={float(q_arr[m_b, j_p]):.5f}->{float(q_arr[m_b, j_b]):.5f}), "
+            f"min_d2c=0.000000, min_g=0.0000."
         )
 
     was_projected = False
@@ -341,43 +379,126 @@ def enforce_no_arbitrage_projection_with_jacobian(
         y_u = np.log(unique_strikes / k_ref)
         core_strike_mask = (unique_strikes >= 0.5 * k_ref) & (unique_strikes <= 1.5 * k_ref)
 
+        def _compute_surface_worst_metrics() -> Tuple[float, float]:
+            surf_min_d2c = float("inf")
+            surf_min_g = float("inf")
+            for m_chk in range(n_exp):
+                t_chk = float(t_arr[m_chk])
+                w_chk = (projected_quotes[m_chk] * projected_quotes[m_chk]) * t_chk
+                y_ev_chk, g_ev_chk = _eval_durrleman_slice(y_u, w_chk)
+                c_ev_mask = (y_ev_chk >= math.log(0.5)) & (y_ev_chk <= math.log(1.5))
+                if np.any(c_ev_mask):
+                    surf_min_g = min(surf_min_g, float(np.min(g_ev_chk[c_ev_mask])))
+                else:
+                    surf_min_g = min(surf_min_g, float(np.min(g_ev_chk)))
+                c_chk = _b76_norm_call(y_u, w_chk)
+                sl_chk = np.diff(c_chk) / np.maximum(np.diff(unique_strikes), 1e-12)
+                d2_chk = np.diff(sl_chk)
+                for j_chk in range(1, n_u - 1):
+                    if core_strike_mask[j_chk]:
+                        surf_min_d2c = min(surf_min_d2c, float(d2_chk[j_chk - 1]))
+            if not math.isfinite(surf_min_d2c):
+                surf_min_d2c = 0.0
+            if not math.isfinite(surf_min_g):
+                surf_min_g = 0.0
+            return surf_min_d2c, surf_min_g
+
         for m in range(n_exp):
             t_m = float(t_arr[m])
             w_m = (projected_quotes[m] * projected_quotes[m]) * t_m
             y_eval, g_eval = _eval_durrleman_slice(y_u, w_m)
             core_eval_mask = (y_eval >= math.log(0.5)) & (y_eval <= math.log(1.5))
 
-            if np.any(core_eval_mask):
-                min_g_core = float(np.min(g_eval[core_eval_mask]))
-                if min_g_core < -10.0:
-                    raise ValueError(
-                        f"SMILE_ARBITRAGE: Severe Durrleman butterfly convexity violation "
-                        f"(min g={min_g_core:.2f} < -10.0) in core strikes at slice {m}."
-                    )
-
+            min_g_core = (
+                float(np.min(g_eval[core_eval_mask]))
+                if np.any(core_eval_mask)
+                else float(np.min(g_eval))
+            )
             min_g_all = float(np.min(g_eval))
-            if min_g_all < -25.0:
-                raise ValueError(
-                    f"SMILE_ARBITRAGE: Uncertifiable Durrleman butterfly arbitrage "
-                    f"(min g={min_g_all:.2f} < -25.0) at slice {m}."
-                )
 
             # Check discrete Black-76 normalized call convexity C''(K) >= 0 at F = K_ref
             calls_m = _b76_norm_call(y_u, w_m)
             slopes_m = np.diff(calls_m) / np.maximum(np.diff(unique_strikes), 1e-12)
             d2c_m = np.diff(slopes_m)
-            if np.min(d2c_m) < -1e-9 or np.max(slopes_m) > 1e-9:
-                # If core call convexity itself fails badly, reject; otherwise project offending wings
-                core_interior_viol = False
-                for j in range(1, n_u - 1):
-                    if core_strike_mask[j] and d2c_m[j - 1] < -1e-4:
-                        core_interior_viol = True
-                        break
-                if core_interior_viol:
-                    raise ValueError(
-                        f"SMILE_ARBITRAGE: Core call-price convexity violation at slice {m}."
-                    )
 
+            min_d2c_core = float("inf")
+            j_first_severe: Optional[int] = None
+            j_first_mild: Optional[int] = None
+            j_worst_core: int = 1
+            for j in range(1, n_u - 1):
+                if core_strike_mask[j]:
+                    val_d2c = float(d2c_m[j - 1])
+                    if val_d2c < min_d2c_core:
+                        min_d2c_core = val_d2c
+                        j_worst_core = j
+                    if val_d2c < -1e-3 and j_first_severe is None:
+                        j_first_severe = j
+                    elif val_d2c < -1e-4 and j_first_mild is None:
+                        j_first_mild = j
+            if not math.isfinite(min_d2c_core):
+                min_d2c_core = float(np.min(d2c_m)) if len(d2c_m) > 0 else 0.0
+                j_worst_core = int(np.argmin(d2c_m)) + 1 if len(d2c_m) > 0 else 1
+
+            j_off = (
+                j_first_severe
+                if j_first_severe is not None
+                else (j_first_mild if j_first_mild is not None else j_worst_core)
+            )
+            j_prev = max(j_off - 1, 0)
+            strike_val = float(unique_strikes[j_off])
+            prev_strike_val = float(unique_strikes[j_prev])
+            v_prev = float(projected_quotes[m, j_prev])
+            v_curr = float(projected_quotes[m, j_off])
+
+            if min_d2c_core < -1e-3 or min_g_core < -10.0 or min_g_all < -25.0:
+                surf_min_d2c, surf_min_g = _compute_surface_worst_metrics()
+                min_d2c_val = min(min_d2c_core, surf_min_d2c)
+                min_g_val = min(min_g_core, surf_min_g)
+                raise ValueError(
+                    f"SMILE_ARBITRAGE: Core call-price convexity violation at slice {m}: "
+                    f"surface={surface_id}, slice={m} (T={t_m:.4f}Y), "
+                    f"K={strike_val:.4f} (prev_K={prev_strike_val:.4f} -> K={strike_val:.4f}, "
+                    f"vol_jump={v_prev:.5f}->{v_curr:.5f}), "
+                    f"min_d2c={min_d2c_val:.6f}, min_g={min_g_val:.4f}."
+                )
+
+            if min_d2c_core < -1e-4:
+                # Two-tier C2 ruling: mild numerical quote noise (-1e-3 <= min_d2c_core < -1e-4
+                # and min_g_core >= -10.0) is projected onto convex call prices with warning.
+                all_wing_mask = np.zeros_like(core_strike_mask)
+                calls_proj = _project_wing_calls_convex(unique_strikes, calls_m, k_ref, all_wing_mask)
+                for u in range(n_u):
+                    if abs(calls_proj[u] - calls_m[u]) > 1e-11:
+                        sig_u = _invert_b76_norm_call_to_vol(
+                            float(y_u[u]), float(calls_proj[u]), t_m, min_vol, max_vol
+                        )
+                        projected_quotes[m, u] = sig_u
+                        cal_ancestor[m, u] = -1
+                        cal_scale[m, u] = 0.0
+                # If a downward quote dip left any residual d2c < -1e-4 after lower-hull projection,
+                # smooth offending interior vol wiggle iteratively until d2c >= -1e-4.
+                for _ in range(16):
+                    w_chk = (projected_quotes[m] * projected_quotes[m]) * t_m
+                    c_chk = _b76_norm_call(y_u, w_chk)
+                    sl_chk = np.diff(c_chk) / np.maximum(np.diff(unique_strikes), 1e-12)
+                    d2_chk = np.diff(sl_chk)
+                    fixed_any = False
+                    for j_c in range(1, n_u - 1):
+                        if core_strike_mask[j_c] and float(d2_chk[j_c - 1]) < -1e-4:
+                            w_interp = (unique_strikes[j_c] - unique_strikes[j_c - 1]) / max(
+                                unique_strikes[j_c + 1] - unique_strikes[j_c - 1], 1e-12
+                            )
+                            v_sec = (1.0 - w_interp) * projected_quotes[m, j_c - 1] + w_interp * projected_quotes[m, j_c + 1]
+                            projected_quotes[m, j_c] = 0.5 * (projected_quotes[m, j_c] + v_sec)
+                            cal_ancestor[m, j_c] = -1
+                            cal_scale[m, j_c] = 0.0
+                            fixed_any = True
+                    if not fixed_any:
+                        break
+                was_projected = True
+                if warnings_out is not None and "SMILE_ARBITRAGE_PROJECTED" not in warnings_out:
+                    warnings_out.append("SMILE_ARBITRAGE_PROJECTED")
+            elif np.min(d2c_m) < -1e-9 or np.max(slopes_m) > 1e-9:
                 calls_proj = _project_wing_calls_convex(unique_strikes, calls_m, k_ref, core_strike_mask)
                 if np.max(np.abs(calls_proj - calls_m)) > 1e-10:
                     for u in range(n_u):
@@ -440,6 +561,8 @@ def enforce_no_arbitrage_projection(
     min_vol: float = 0.01,
     max_vol: float = 5.00,
     min_calendar_dvar_dt: float = 1e-5,
+    surface_id: str = "UNKNOWN",
+    warnings_out: Optional[List[str]] = None,
 ) -> Tuple[
     npt.NDArray[np.float64],
     npt.NDArray[np.float64],
@@ -454,6 +577,8 @@ def enforce_no_arbitrage_projection(
         min_vol=min_vol,
         max_vol=max_vol,
         min_calendar_dvar_dt=min_calendar_dvar_dt,
+        surface_id=surface_id,
+        warnings_out=warnings_out,
     )
     return u_k, proj_q, dedup_m, was_proj
 
@@ -490,11 +615,13 @@ class RegularizedVolSurface:
         dcc: Optional[str] = None,
         smile_interp: Optional[str] = None,
         smile_extrap: Optional[str] = None,
+        surface_id: Optional[str] = None,
     ) -> None:
         self.min_vol = float(min_vol)
         self.max_local_vol = float(max_local_vol)
         self.bc_type = str(bc_type)
         self._basis_lock = threading.RLock()
+        self.warnings: List[str] = []
 
         if isinstance(surf_spec, Mapping):
             self.identifier = str(surf_spec.get("Identifier", surf_spec.get("identifier", "ASSET")))
@@ -619,6 +746,11 @@ class RegularizedVolSurface:
                     dtype=np.float64,
                 )
 
+        if surface_id is not None and str(surface_id).strip() and (
+            not self.identifier or self.identifier in ("ASSET", "UNKNOWN")
+        ):
+            self.identifier = str(surface_id).strip()
+
         self.dcc: str = eff_dcc
         self.as_of_date: Optional[datetime] = _to_utc_datetime(raw_as_of) if raw_as_of is not None else None
         self.smile_interp: str = eff_interp
@@ -644,6 +776,8 @@ class RegularizedVolSurface:
             self.raw_strikes,
             self.raw_quotes,
             min_vol=self.min_vol,
+            surface_id=self.identifier,
+            warnings_out=self.warnings,
         )
 
         self.calendar_proj_digest: str = hashlib.blake2b(
@@ -1338,6 +1472,25 @@ class DupireQMCResult:
     n_paths: int = 32768
     mode: str = "dupire_lv"
     l_onestar: float = 0.0
+    p_onestar: float = 0.0
+
+
+DupireQMCOutput = DupireQMCResult
+
+
+def _resolve_r_native_obs_tensor(state: Any) -> torch.Tensor:
+    """Resolves native-currency cumulative forward carry integral (excluding quanto drift)."""
+    r_nat = getattr(state, "r_native_obs", None)
+    if r_nat is None:
+        r_nat = getattr(state.dividend_schedule, "r_native_obs", None)
+    if r_nat is not None:
+        return r_nat
+    q_meta = getattr(state.dividend_schedule, "quanto_meta", None)
+    df_fin = getattr(state.dividend_schedule, "df_fin_obs", None)
+    df_repo = getattr(state.dividend_schedule, "df_repo_obs", None)
+    if q_meta and df_fin is not None and df_repo is not None:
+        return -torch.log(torch.clamp(df_fin, min=1e-15)) + torch.log(torch.clamp(df_repo, min=1e-15))
+    return state.dividend_schedule.r_tot_obs
 
 
 def _digital_ramp_np(
@@ -1509,6 +1662,7 @@ def _assemble_qmc_postproc(
     l_put_val: float,
     l_call_val: float,
     l_onestar_val: float,
+    p_onestar_val: float = 0.0,
     option_se: float,
     total_se: float,
     assemble_fn: Callable[..., Any],
@@ -1519,9 +1673,13 @@ def _assemble_qmc_postproc(
     l_put_t = torch.tensor(l_put_val, dtype=torch.float64)
     l_call_t = torch.tensor(l_call_val, dtype=torch.float64)
     l_onestar_t = torch.tensor(l_onestar_val, dtype=torch.float64)
+    sig_params = inspect.signature(assemble_fn).parameters
+    extra_kwargs: dict[str, Any] = {}
+    if "p_onestar" in sig_params:
+        extra_kwargs["p_onestar"] = torch.tensor(float(p_onestar_val), dtype=torch.float64)
 
     if _asm_supports_coupon_cf(assemble_fn):
-        return assemble_fn(
+        asm = assemble_fn(
             state,
             p_stop=p_t,
             q_cpn=q_t,
@@ -1531,7 +1689,13 @@ def _assemble_qmc_postproc(
             option_se=option_se,
             total_se=total_se,
             coupon_cf_undisc=torch.as_tensor(cpn_cf_expected, dtype=torch.float64),
+            **extra_kwargs,
         )
+        if "p_onestar" not in sig_params and bool(getattr(state, "is_long_basket", False)) and len(df_pay) > 0:
+            put_fix_delta = -2.0 * float(df_pay[-1]) * float(state.option_gearing) * float(l_put_val)
+            asm.option_pv = asm.option_pv + put_fix_delta
+            asm.product_value = asm.product_value + put_fix_delta
+        return asm
 
     asm = assemble_fn(
         state,
@@ -1542,6 +1706,7 @@ def _assemble_qmc_postproc(
         l_onestar=l_onestar_t,
         option_se=option_se,
         total_se=total_se,
+        **extra_kwargs,
     )
     # Pre-merge compatibility patch: overwrite marginal-independence coupon rows with pathwise expectations
     disc_cpn_cfs = df_pay * cpn_cf_expected
@@ -1705,6 +1870,14 @@ def price_eq_autocall_dupire_qmc(
     div_events_ordered = [div_events_map.get(ticker, []) for ticker in state.sorted_identifiers]
     df_fin_obs_np = state.dividend_schedule.df_fin_obs.detach().cpu().numpy()
     r_tot_obs_np = state.dividend_schedule.r_tot_obs.detach().cpu().numpy()
+    r_native_obs_np = _resolve_r_native_obs_tensor(state).detach().cpu().numpy().astype(np.float64)
+    has_quanto_diff = not bool(np.allclose(r_native_obs_np, r_tot_obs_np, rtol=1e-14, atol=1e-14))
+    escrowed_spot_t = getattr(state.dividend_schedule, "escrowed_spot", None)
+    escrowed_spot_np = (
+        escrowed_spot_t.detach().cpu().numpy().astype(np.float64)
+        if escrowed_spot_t is not None
+        else None
+    )
     future_obs_dates = getattr(state.seasoned_state, "future_obs_dates", [])
 
     # Precompute surface DCC tenors and Act365-to-DCC variance-time scale factors (T1M-012)
@@ -1762,11 +1935,23 @@ def price_eq_autocall_dupire_qmc(
                     np.zeros(d_assets, dtype=np.float64) if m == 0 else r_tot_obs_np[:, m - 1]
                 )
                 r_tot_curr = r_tot_obs_np[:, m]
+                r_nat_prev = (
+                    np.zeros(d_assets, dtype=np.float64) if m == 0 else r_native_obs_np[:, m - 1]
+                )
+                r_nat_curr = r_native_obs_np[:, m]
+                esc_prev = (
+                    spots_t0 if (m == 0 or escrowed_spot_np is None) else escrowed_spot_np[:, m - 1]
+                )
+                esc_curr = spots_t0 if escrowed_spot_np is None else escrowed_spot_np[:, m]
+                q_div_m = (
+                    -np.log(np.maximum(esc_curr / np.maximum(esc_prev, 1e-12), 1e-12))
+                    / dt_period
+                )
                 r_zero_m = (
                     -np.log(np.maximum(df_fin_curr / np.maximum(df_fin_prev, 1e-15), 1e-15))
                     / dt_period
                 )
-                drift_net_m = (r_tot_curr - r_tot_prev) / dt_period
+                drift_net_m = (r_nat_curr - r_nat_prev) / dt_period - q_div_m
                 q_repo_m = r_zero_m - drift_net_m
 
                 z_coarse = z_sobol_rep[:, m * d_assets : (m + 1) * d_assets] @ chol_l.T
@@ -1780,29 +1965,35 @@ def price_eq_autocall_dupire_qmc(
                 f_curr = fwd_prices[:, m]
 
                 for s_idx in range(n_sub):
-                    t_step = t_prev + (s_idx + 0.5) * dt_sub
+                    alpha_s = (s_idx + 0.5) / float(n_sub)
+                    t_step = t_prev + alpha_s * dt_period
                     if len(div_events_ordered) == d_assets and any(len(ev) > 0 for ev in div_events_ordered):
                         f_step = _compute_forward_at_time_np(
                             spots_t0, r_tot_obs_np, tau_obs, div_events_ordered, t_step, m
                         )
                     else:
                         f_prev = spots_t0 if m == 0 else fwd_prices[:, m - 1]
-                        alpha_s = (s_idx + 0.5) / float(n_sub)
                         f_step = f_prev + alpha_s * (f_curr - f_prev)
                     s_curr_est = np.exp(log_x) * f_step[None, :]
+                    if has_quanto_diff:
+                        r_tot_step = r_tot_prev + alpha_s * (r_tot_curr - r_tot_prev)
+                        r_nat_step = r_nat_prev + alpha_s * (r_nat_curr - r_nat_prev)
+                        f_step_native = f_step * np.exp(r_nat_step - r_tot_step)
+                    else:
+                        f_step_native = f_step
 
                     for i in range(d_assets):
                         t_surf_prev = 0.0 if m == 0 else float(tau_surf_obs[i, m - 1])
                         t_surf_curr = float(tau_surf_obs[i, m])
                         dt_surf_ratio = (t_surf_curr - t_surf_prev) / dt_period
-                        t_surf_step = t_surf_prev + ((s_idx + 0.5) / float(n_sub)) * (
+                        t_surf_step = t_surf_prev + alpha_s * (
                             t_surf_curr - t_surf_prev
                         )
                         lv_dcc = np.asarray(
                             surfs_ordered[i].local_vol(
                                 t_surf_step,
                                 s_curr_est[:, i],
-                                forward_at_t=float(f_step[i]),
+                                forward_at_t=float(f_step_native[i]),
                                 r_zero=float(r_zero_m[i]),
                                 q_repo=float(q_repo_m[i]),
                                 cash_div_leverage=1.0,  # T1M-001: never double-count dividend leverage
@@ -1833,7 +2024,11 @@ def price_eq_autocall_dupire_qmc(
     cpn_cf_expected = np.zeros(m_rem, dtype=np.float64)
 
     eff_cpn_idx = state.coupon_index if state.coupon_index else state.callability_index
-    eff_opt_idx = state.option_index if state.option_index else state.callability_index
+    eff_opt_idx = (
+        "AverageOf"
+        if bool(getattr(state, "is_long_basket", False))
+        else (state.option_index if state.option_index else state.callability_index)
+    )
     cpn_dir = str(getattr(state, "coupon_barrier_direction", "Up") or "Up").strip().lower()
     cpn_type = str(getattr(state, "coupon_barrier_type", "In") or "In").strip().lower()
     inv_lex_perm_raw = getattr(state, "inv_lex_perm", None)
@@ -1915,7 +2110,7 @@ def price_eq_autocall_dupire_qmc(
             and float(state.ki_barrier) > 0.0
             and state.seasoned_state.i_ki_past < 0.5
         ):
-            ki_up = _digital_ramp_np(w_opt, float(state.ki_barrier), -float(state.ki_spread))
+            ki_up = _digital_ramp_np(w_opt, float(state.ki_barrier), float(state.ki_spread))
             ki_ind = 1.0 - ki_up
             put_intrinsic = put_intrinsic * ki_ind
 
@@ -1935,8 +2130,9 @@ def price_eq_autocall_dupire_qmc(
     l_put_val = float(np.mean(unit_put_paths))
     l_call_val = float(np.mean(unit_call_paths))
     l_onestar_val = 0.0
+    p_onestar_val = float(np.mean(alive * star_ind)) if star_ind is not None else 0.0
 
-    put_sign = 1.0 if state.is_long_basket else -1.0
+    put_sign = -1.0
     opt_payoff_paths = df_pay[-1] * (
         put_sign * float(state.option_gearing) * unit_put_paths
         + float(state.participation_call_rate) * unit_call_paths
@@ -1966,6 +2162,7 @@ def price_eq_autocall_dupire_qmc(
         l_put_val=l_put_val,
         l_call_val=l_call_val,
         l_onestar_val=l_onestar_val,
+        p_onestar_val=p_onestar_val,
         option_se=option_se,
         total_se=total_se,
         assemble_fn=assemble_autocall_cashflows_and_pv,
@@ -1987,6 +2184,7 @@ def price_eq_autocall_dupire_qmc(
         n_paths=n_total_paths,
         mode=eff_mode,
         l_onestar=l_onestar_val,
+        p_onestar=p_onestar_val,
     )
 
 
@@ -1997,6 +2195,7 @@ price_autocall_dupire_qmc = price_eq_autocall_dupire_qmc
 __all__ = [
     "RegularizedVolSurface",
     "DupireQMCResult",
+    "DupireQMCOutput",
     "enforce_no_arbitrage_projection",
     "enforce_no_arbitrage_projection_with_jacobian",
     "price_eq_autocall_dupire_qmc",

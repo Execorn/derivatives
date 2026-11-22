@@ -31,6 +31,7 @@ from deepvol.models.autocall.dupire_qmc_solver import (
     _assemble_qmc_postproc,
     _compute_funding_weights_np,
     _next_power_of_two,
+    _resolve_r_native_obs_tensor,
     price_eq_autocall_dupire_qmc,
 )
 from deepvol.models.autocall.pre_post_processor import (
@@ -857,6 +858,14 @@ def _build_lv_tables_batch(
         ex_pvs = torch.tensor(ex_pvs_np, dtype=torch.float64, device=device)
         mask_ex = (ex_taus[:, None, :] > 0.0) & (ex_taus[:, None, :] <= t_eff[:, :, None] + 1e-12)
         d_pv_grid = (mask_ex.to(torch.float64) * ex_pvs[:, None, :]).sum(dim=2)
+        mask_ex0 = (ex_taus[:, None, :] > 0.0) & (ex_taus[:, None, :] <= tau0[:, :, None] + 1e-12)
+        d_pv0 = (mask_ex0.to(torch.float64) * ex_pvs[:, None, :]).sum(dim=2)
+        esc0 = torch.clamp(spots_t0[:, None] - d_pv0, min=0.01 * spots_t0[:, None])
+        mask_ex1 = (ex_taus[:, None, :] > 0.0) & (ex_taus[:, None, :] <= tau1[:, :, None] + 1e-12)
+        d_pv1 = (mask_ex1.to(torch.float64) * ex_pvs[:, None, :]).sum(dim=2)
+        esc1 = torch.clamp(spots_t0[:, None] - d_pv1, min=0.01 * spots_t0[:, None])
+        q_div_grid = -torch.log(torch.clamp(esc1 / torch.clamp(esc0, min=1e-12), min=1e-12)) / dt_k
+        q_repo_grid = q_repo_grid + q_div_grid
     else:
         d_pv_grid = torch.zeros((a_cnt, n_t), dtype=torch.float64, device=device)
 
@@ -1002,6 +1011,16 @@ def _eval_gpu_surface_local_vol_table(
         )
         mask_ex = (ex_taus[None, :] > 0.0) & (ex_taus[None, :] <= t_eff_365[:, None] + 1e-12)
         d_pv_grid = (mask_ex.to(torch.float64) * ex_pvs[None, :]).sum(dim=1)
+        tau0_g = tau_knots[k_idx]
+        tau1_g = tau_knots[k_idx + 1]
+        mask_ex0 = (ex_taus[None, :] > 0.0) & (ex_taus[None, :] <= tau0_g[:, None] + 1e-12)
+        d_pv0 = (mask_ex0.to(torch.float64) * ex_pvs[None, :]).sum(dim=1)
+        esc0 = torch.clamp(spots_t0_i - d_pv0, min=0.01 * spots_t0_i)
+        mask_ex1 = (ex_taus[None, :] > 0.0) & (ex_taus[None, :] <= tau1_g[:, None] + 1e-12)
+        d_pv1 = (mask_ex1.to(torch.float64) * ex_pvs[None, :]).sum(dim=1)
+        esc1 = torch.clamp(spots_t0_i - d_pv1, min=0.01 * spots_t0_i)
+        q_div_grid = -torch.log(torch.clamp(esc1 / torch.clamp(esc0, min=1e-12), min=1e-12)) / dt_k
+        q_repo_grid = q_repo_grid + q_div_grid
     else:
         d_pv_grid = torch.zeros(n_t, dtype=torch.float64, device=device)
 
@@ -1424,7 +1443,7 @@ class GpuTorchDupireQMC:
             lv_table, y_min_gpu, inv_dy_gpu = _build_lv_tables_batch(
                 surfs_ordered,
                 state.spots_t0.to(device=dev, dtype=torch.float64),
-                state.dividend_schedule.r_tot_obs.to(device=dev, dtype=torch.float64),
+                _resolve_r_native_obs_tensor(state).to(device=dev, dtype=torch.float64),
                 state.dividend_schedule.df_fin_obs.to(device=dev, dtype=torch.float64),
                 state.tau_obs.to(device=dev, dtype=torch.float64),
                 [div_events_map.get(ticker, []) for ticker in state.sorted_identifiers],
@@ -1472,7 +1491,11 @@ class GpuTorchDupireQMC:
         cpn_cf_gpu = torch.zeros(m_rem, dtype=torch.float64, device=dev)
 
         eff_cpn_idx = state.coupon_index if state.coupon_index else state.callability_index
-        eff_opt_idx = state.option_index if state.option_index else state.callability_index
+        eff_opt_idx = (
+            "AverageOf"
+            if bool(getattr(state, "is_long_basket", False))
+            else (state.option_index if state.option_index else state.callability_index)
+        )
         cpn_dir = str(getattr(state, "coupon_barrier_direction", "Up") or "Up").strip().lower()
         cpn_type = str(getattr(state, "coupon_barrier_type", "In") or "In").strip().lower()
 
@@ -1698,7 +1721,7 @@ class GpuTorchDupireQMC:
             if state.lower_strike is not None and float(state.lower_strike) > 0.0:
                 put_int = torch.clamp(put_int, max=max(float(state.strike) - float(state.lower_strike), 0.0))
             if state.ki_barrier is not None and float(state.ki_barrier) > 0.0 and state.seasoned_state.i_ki_past < 0.5:
-                ki_ind = 1.0 - _digital_ramp_torch(w_opt, float(state.ki_barrier), -float(state.ki_spread))
+                ki_ind = 1.0 - _digital_ramp_torch(w_opt, float(state.ki_barrier), float(state.ki_spread))
                 put_int = put_int * ki_ind
             if star_ind is not None:
                 put_int = put_int * (1.0 - star_ind)
@@ -1714,8 +1737,9 @@ class GpuTorchDupireQMC:
         l_put_val = float(unit_put_paths.mean().item())
         l_call_val = float(unit_call_paths.mean().item())
         l_onestar_val = 0.0
+        p_onestar_val = float((alive * star_ind).mean().item()) if star_ind is not None else 0.0
 
-        put_sign = 1.0 if state.is_long_basket else -1.0
+        put_sign = -1.0
         opt_payoff_paths = float(df_pay_np[-1]) * (
             put_sign * float(state.option_gearing) * unit_put_paths
             + float(state.participation_call_rate) * unit_call_paths
@@ -1751,7 +1775,7 @@ class GpuTorchDupireQMC:
                 if state.lower_strike is not None and float(state.lower_strike) > 0.0:
                     pi_g = torch.clamp(pi_g, max=max(float(state.strike) - float(state.lower_strike), 0.0))
                 if state.ki_barrier is not None and float(state.ki_barrier) > 0.0 and state.seasoned_state.i_ki_past < 0.5:
-                    pi_g = pi_g * (1.0 - _digital_ramp_torch(w_og, float(state.ki_barrier), -float(state.ki_spread)))
+                    pi_g = pi_g * (1.0 - _digital_ramp_torch(w_og, float(state.ki_barrier), float(state.ki_spread)))
                 if st_g_term is not None:
                     pi_g = pi_g * (1.0 - st_g_term)
                 up_g = alive_gbm * pi_g
@@ -1809,6 +1833,7 @@ class GpuTorchDupireQMC:
             l_put_val=l_put_val,
             l_call_val=l_call_val,
             l_onestar_val=l_onestar_val,
+            p_onestar_val=p_onestar_val,
             option_se=option_se,
             total_se=total_se,
             assemble_fn=assemble_autocall_cashflows_and_pv,
@@ -1819,8 +1844,20 @@ class GpuTorchDupireQMC:
         adj_prod = float(asm.product_value.item()) + cv_shift
         adj_opt = float(asm.option_pv.item()) + cv_shift
         if cv_shift != 0.0 and asm.cashflows:
-            for idx_cf, cf in enumerate(asm.cashflows):
-                if cf.Description == "Option" and cf.StatusText == "Estimate":
+            target_desc = (
+                "IsLongBasket"
+                if (
+                    bool(getattr(state, "is_long_basket", False))
+                    and any(
+                        cf.Description == "IsLongBasket" and cf.StatusText == "Estimate"
+                        for cf in asm.cashflows
+                    )
+                )
+                else "Option"
+            )
+            for idx_cf in range(len(asm.cashflows) - 1, -1, -1):
+                cf = asm.cashflows[idx_cf]
+                if cf.Description == target_desc and cf.StatusText == "Estimate":
                     asm.cashflows[idx_cf] = type(cf)(
                         Description=cf.Description,
                         Date=cf.Date,
@@ -1848,6 +1885,7 @@ class GpuTorchDupireQMC:
             n_paths=n_total_paths,
             mode=cfg.mode,
             l_onestar=l_onestar_val,
+            p_onestar=p_onestar_val,
         )
 
     def _eval_cheap_gbm_expectation(
@@ -1977,7 +2015,8 @@ class GpuTorchDupireQMC:
                 if not state.no_notional_repayment:
                     pv = pv + float(df_pay_np[m]) * (st_m if m < m_rem - 1 else (st_m + alive))
             del ko_all_t, cp_all_t
-            w_opt = _evaluate_monitoring_index_gpu(perf_term, eff_opt_idx, inv_perm_gpu)
+            opt_idx_eff = "AverageOf" if bool(getattr(state, "is_long_basket", False)) else eff_opt_idx
+            w_opt = _evaluate_monitoring_index_gpu(perf_term, opt_idx_eff, inv_perm_gpu)
             st_term: Optional[torch.Tensor] = None
             if state.one_star_strike is not None and float(state.one_star_strike) > 0.0:
                 st_term = (
@@ -1989,7 +2028,7 @@ class GpuTorchDupireQMC:
                 if state.lower_strike is not None and float(state.lower_strike) > 0.0:
                     pi = torch.clamp(pi, max=max(float(state.strike) - float(state.lower_strike), 0.0))
                 if state.ki_barrier is not None and float(state.ki_barrier) > 0.0 and state.seasoned_state.i_ki_past < 0.5:
-                    pi = pi * (1.0 - _digital_ramp_torch(w_opt, float(state.ki_barrier), -float(state.ki_spread)))
+                    pi = pi * (1.0 - _digital_ramp_torch(w_opt, float(state.ki_barrier), float(state.ki_spread)))
                 if st_term is not None:
                     pi = pi * (1.0 - st_term)
                 up = alive * pi
@@ -2000,7 +2039,7 @@ class GpuTorchDupireQMC:
                 if (state.participation_call_strike is not None and float(state.participation_call_rate) > 0.0)
                 else torch.zeros_like(alive)
             )
-            put_sign = 1.0 if state.is_long_basket else -1.0
+            put_sign = -1.0
             pv = pv + float(df_pay_np[-1]) * (
                 put_sign * float(state.option_gearing) * up + float(state.participation_call_rate) * uc
             )
@@ -2172,7 +2211,7 @@ class GpuTorchDupireQMC:
             [
                 torch.stack([st.dividend_schedule.forward_price.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
                 torch.stack([st.cash_div_leverage.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
-                torch.stack([st.dividend_schedule.r_tot_obs.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
+                torch.stack([_resolve_r_native_obs_tensor(st).detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
                 torch.stack([st.dividend_schedule.df_fin_obs.detach().to(device="cpu", dtype=torch.float64) for st in st_chunk], dim=0),
             ],
             dim=0,
@@ -2207,7 +2246,7 @@ class GpuTorchDupireQMC:
             scal_np[10, bi] = float(lk) if (lk is not None and float(lk) > 0.0) else -1.0
             kb = st.ki_barrier
             scal_np[11, bi] = float(kb) if (kb is not None and float(kb) > 0.0 and st.seasoned_state.i_ki_past < 0.5) else -1.0
-            scal_np[12, bi] = -float(st.ki_spread)
+            scal_np[12, bi] = float(st.ki_spread)
             sk = st.one_star_strike
             scal_np[13, bi] = float(sk) if (sk is not None and float(sk) > 0.0) else -1.0
             scal_np[14, bi] = float(st.one_star_coupon)
@@ -2215,7 +2254,7 @@ class GpuTorchDupireQMC:
             pr = st.participation_call_rate
             scal_np[15, bi] = float(pk) if (pk is not None and float(pr) > 0.0) else -1.0
             scal_np[16, bi] = float(pr)
-            scal_np[17, bi] = 1.0 if st.is_long_basket else -1.0
+            scal_np[17, bi] = -1.0
             div_ev_map = getattr(st.dividend_schedule, "dividend_events", {})
             for ticker in st.sorted_identifiers:
                 surfs_flat.append(st.vol_surfaces[ticker])
@@ -2274,7 +2313,11 @@ class GpuTorchDupireQMC:
             if e_cpn != c_idx:
                 cpn_diff_list.append(bi)
                 cpn_groups.setdefault((e_cpn, p_key), []).append(bi)
-            e_opt = str(st.option_index if st.option_index else st.callability_index)
+            e_opt = (
+                "AverageOf"
+                if bool(getattr(st, "is_long_basket", False))
+                else str(st.option_index if st.option_index else st.callability_index)
+            )
             opt_groups.setdefault((e_opt, p_key), []).append(bi)
             cpn_down_flags.append(str(getattr(st, "coupon_barrier_direction", "Up") or "Up").strip().lower() == "down")
             cpn_out_flags.append(str(getattr(st, "coupon_barrier_type", "In") or "In").strip().lower() == "out")
