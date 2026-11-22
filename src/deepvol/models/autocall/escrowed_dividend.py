@@ -737,11 +737,30 @@ def _eval_fx_atm_vol(fx_spec: Any, tau_eval: float) -> float:
     return float(vals[0])
 
 
-def _eval_eq_atm_vol(eq_spec: Any, as_of_dt: datetime, obs_dt: datetime, spot_val: float) -> float:
+def _eval_eq_atm_vol_batch(
+    eq_spec: Any,
+    as_of_dt: datetime,
+    eval_dts: Sequence[datetime],
+    spot_val: float,
+) -> npt.NDArray[np.float64]:
+    """Vectorized ATM implied volatility evaluation across all target dates for a single equity."""
+    n_eval = len(eval_dts)
+    if n_eval == 0 or eq_spec is None:
+        return np.zeros(n_eval, dtype=np.float64)
+    if hasattr(eq_spec, "iv_batch") and callable(eq_spec.iv_batch):
+        surf_dcc = str(getattr(eq_spec, "dcc", "Act365"))
+        taus = np.asarray(
+            [year_fraction(as_of_dt, _to_utc_datetime(d), surf_dcc) for d in eval_dts],
+            dtype=np.float64,
+        )
+        spots = np.full(n_eval, float(spot_val), dtype=np.float64)
+        return np.asarray(eq_spec.iv_batch(taus, spots), dtype=np.float64)
     if hasattr(eq_spec, "iv") and callable(eq_spec.iv):
         surf_dcc = str(getattr(eq_spec, "dcc", "Act365"))
-        tau = year_fraction(as_of_dt, obs_dt, surf_dcc)
-        return float(eq_spec.iv(tau, spot_val))
+        return np.asarray(
+            [float(eq_spec.iv(year_fraction(as_of_dt, _to_utc_datetime(d), surf_dcc), spot_val)) for d in eval_dts],
+            dtype=np.float64,
+        )
     if isinstance(eq_spec, Mapping):
         strikes_raw = eq_spec.get("Strikes", eq_spec.get("strikes", []))
         quotes_raw = eq_spec.get("VolatilityQuotes", eq_spec.get("volatility_quotes", []))
@@ -753,26 +772,44 @@ def _eval_eq_atm_vol(eq_spec: Any, as_of_dt: datetime, obs_dt: datetime, spot_va
         exp_dates = getattr(eq_spec, "ExpirationDates", getattr(eq_spec, "expiration_dates", []))
         raw_dcc = getattr(eq_spec, "DayCountConvention", getattr(eq_spec, "day_count_convention", "Act365"))
     if not strikes_raw or not quotes_raw or not exp_dates:
-        return 0.0
+        return np.zeros(n_eval, dtype=np.float64)
     dcc = str(getattr(raw_dcc, "value", raw_dcc))
-    t_eval = year_fraction(as_of_dt, _to_utc_datetime(obs_dt), dcc)
-    tenors = np.asarray([year_fraction(as_of_dt, _to_utc_datetime(d), dcc) for d in exp_dates], dtype=np.float64)
+    t_eval = np.asarray(
+        [year_fraction(as_of_dt, _to_utc_datetime(d), dcc) for d in eval_dts],
+        dtype=np.float64,
+    )
+    tenors = np.asarray(
+        [year_fraction(as_of_dt, _to_utc_datetime(d), dcc) for d in exp_dates],
+        dtype=np.float64,
+    )
     strikes = np.asarray(strikes_raw, dtype=np.float64)
     quotes = np.asarray(quotes_raw, dtype=np.float64)
-    slice_vols = np.array([float(np.interp(spot_val, strikes, row)) for row in quotes], dtype=np.float64)
+    if len(strikes) <= 1:
+        slice_vols = quotes[:, 0].astype(np.float64)
+    elif bool(np.all(np.diff(strikes) > 0.0)):
+        s_clip = float(np.clip(spot_val, strikes[0], strikes[-1]))
+        k_idx = int(np.clip(np.searchsorted(strikes, s_clip, side="right") - 1, 0, len(strikes) - 2))
+        k0 = float(strikes[k_idx])
+        k1 = float(strikes[k_idx + 1])
+        w_k = (s_clip - k0) / max(k1 - k0, 1e-12) if k1 > k0 else 0.0
+        slice_vols = np.asarray((1.0 - w_k) * quotes[:, k_idx] + w_k * quotes[:, k_idx + 1], dtype=np.float64)
+    else:
+        slice_vols = np.array([float(np.interp(spot_val, strikes, row)) for row in quotes], dtype=np.float64)
     if len(tenors) == 1:
-        return float(slice_vols[0])
+        return np.full(n_eval, float(slice_vols[0]), dtype=np.float64)
     order = np.argsort(tenors)
     tenors = tenors[order]
     slice_vols = slice_vols[order]
-    if t_eval <= float(tenors[0]):
-        return float(slice_vols[0])
-    if t_eval >= float(tenors[-1]):
-        return float(slice_vols[-1])
-    # Interpolate linearly in total variance (sigma^2 * T) to match RegularizedVolSurface.iv
     slice_vars = (slice_vols * slice_vols) * np.maximum(tenors, 0.0)
-    w_eval = float(np.interp(t_eval, tenors, slice_vars))
-    return float(np.sqrt(max(w_eval / max(t_eval, 1e-12), 0.0)))
+    w_eval = np.interp(t_eval, tenors, slice_vars)
+    out = np.sqrt(np.maximum(w_eval / np.maximum(t_eval, 1e-12), 0.0))
+    out = np.where(t_eval <= float(tenors[0]), float(slice_vols[0]), out)
+    out = np.where(t_eval >= float(tenors[-1]), float(slice_vols[-1]), out)
+    return np.asarray(out, dtype=np.float64)
+
+
+def _eval_eq_atm_vol(eq_spec: Any, as_of_dt: datetime, obs_dt: datetime, spot_val: float) -> float:
+    return float(_eval_eq_atm_vol_batch(eq_spec, as_of_dt, (obs_dt,), spot_val)[0])
 
 
 class QuantoFXSpec(tuple[str, Any, float]):
@@ -1173,16 +1210,25 @@ def compute_escrowed_dividend_forwards(
         )
         if quanto_resolved is not None:
             fx_id, fx_spec, rho_s_fx = quanto_resolved
-            sig_fx_obs, fx_dcc = _eval_fx_atm_vol_batch(fx_spec, tau_365_obs)
             assert vol_surfaces is not None
             eq_spec = vol_surfaces.get(ticker)
-            sig_eq_obs = np.array(
-                [
-                    _eval_eq_atm_vol(eq_spec, t0_dt, obs_dt, spot_i_val) if eq_spec is not None else 0.0
-                    for obs_dt in obs_dts
-                ],
-                dtype=np.float64,
-            )
+            if fut_ex_dates:
+                tau_365_all = np.concatenate(
+                    [tau_365_obs, np.asarray(fut_ex_taus_365, dtype=np.float64)]
+                )
+                sig_fx_all, fx_dcc = _eval_fx_atm_vol_batch(fx_spec, tau_365_all)
+                sig_fx_obs = sig_fx_all[:m_rem]
+                sig_fx_ex = sig_fx_all[m_rem:]
+                sig_eq_all = _eval_eq_atm_vol_batch(
+                    eq_spec, t0_dt, [*obs_dts, *fut_ex_dates], spot_i_val
+                )
+                sig_eq_obs = sig_eq_all[:m_rem]
+                sig_eq_ex = sig_eq_all[m_rem:]
+                quanto_fut_arr = -rho_s_fx * sig_eq_ex * sig_fx_ex
+            else:
+                sig_fx_obs, fx_dcc = _eval_fx_atm_vol_batch(fx_spec, tau_365_obs)
+                sig_eq_obs = _eval_eq_atm_vol_batch(eq_spec, t0_dt, obs_dts, spot_i_val)
+                quanto_fut_arr = np.zeros(0, dtype=np.float64)
             quanto_obs_arr = -rho_s_fx * sig_eq_obs * sig_fx_obs
             r_tot_np[i, :] = r_native_i + quanto_obs_arr * tau_365_obs
             quanto_meta_map[ticker] = {
@@ -1194,18 +1240,6 @@ def compute_escrowed_dividend_forwards(
                 "fx_dcc": fx_dcc,
                 "asset_ccy": asset_ccy_i,
             }
-            if fut_ex_dates:
-                sig_fx_ex, _ = _eval_fx_atm_vol_batch(fx_spec, np.asarray(fut_ex_taus_365, dtype=np.float64))
-                sig_eq_ex = np.array(
-                    [
-                        _eval_eq_atm_vol(eq_spec, t0_dt, ex_dt, spot_i_val) if eq_spec is not None else 0.0
-                        for ex_dt in fut_ex_dates
-                    ],
-                    dtype=np.float64,
-                )
-                quanto_fut_arr = -rho_s_fx * sig_eq_ex * sig_fx_ex
-            else:
-                quanto_fut_arr = np.zeros(0, dtype=np.float64)
         else:
             r_tot_np[i, :] = r_native_i
             quanto_fut_arr = np.zeros(0, dtype=np.float64)

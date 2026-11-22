@@ -26,11 +26,12 @@ import hashlib
 import inspect
 import math
 import threading
-from typing import Any, Callable, List, Literal, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, List, Literal, Mapping, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 import numpy.typing as npt
 import scipy.interpolate
+from scipy.special import ndtr
 from scipy.stats import norm, qmc
 import torch
 
@@ -104,7 +105,7 @@ def _b76_norm_call(y: npt.NDArray[np.float64], w: npt.NDArray[np.float64]) -> np
     sqrt_w = np.sqrt(np.maximum(w, 1e-14))
     d1 = (-y + 0.5 * w) / sqrt_w
     d2 = d1 - sqrt_w
-    return np.asarray(norm.cdf(d1) - np.exp(y) * norm.cdf(d2), dtype=np.float64)
+    return np.asarray(ndtr(d1) - np.exp(y) * ndtr(d2), dtype=np.float64)
 
 
 def _invert_b76_norm_call_to_vol(
@@ -130,7 +131,7 @@ def _invert_b76_norm_call_to_vol(
         sw = sig * sqrt_t
         d1 = (-y + 0.5 * sw * sw) / max(sw, 1e-12)
         d2 = d1 - sw
-        return float(norm.cdf(d1) - k_over_f * norm.cdf(d2))
+        return float(ndtr(d1) - k_over_f * ndtr(d2))
 
     if _call(lo) >= c_target:
         return lo
@@ -189,21 +190,51 @@ def _project_wing_calls_convex(
     return out
 
 
+def _eval_durrleman_batch(
+    y: npt.NDArray[np.float64],
+    w_mat: npt.NDArray[np.float64],
+) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Vectorized Durrleman butterfly density g(y) across all slices using fast_clamped_cubic_coeffs."""
+    coeffs = fast_clamped_cubic_coeffs(y, w_mat.T)
+    c0 = coeffs[0].T
+    c1 = coeffs[1].T
+    c2 = coeffs[2].T
+    c3 = coeffs[3].T
+
+    y_mid = 0.5 * (y[:-1] + y[1:])
+    dx_mid = (y_mid - y[:-1])[None, :]
+    dx_end = float(y[-1] - y[-2])
+    y_eval = np.concatenate([y, y_mid])
+
+    c0_e = c0[:, -1:]
+    c1_e = c1[:, -1:]
+    c2_e = c2[:, -1:]
+    c3_e = c3[:, -1:]
+    w_end = ((c0_e * dx_end + c1_e) * dx_end + c2_e) * dx_end + c3_e
+    wp_end = (3.0 * c0_e * dx_end + 2.0 * c1_e) * dx_end + c2_e
+    wpp_end = 6.0 * c0_e * dx_end + 2.0 * c1_e
+
+    w_mid = ((c0 * dx_mid + c1) * dx_mid + c2) * dx_mid + c3
+    wp_mid = (3.0 * c0 * dx_mid + 2.0 * c1) * dx_mid + c2
+    wpp_mid = 6.0 * c0 * dx_mid + 2.0 * c1
+
+    w_e = np.maximum(np.concatenate([c3, w_end, w_mid], axis=1), 1e-12)
+    wp_e = np.concatenate([c2, wp_end, wp_mid], axis=1)
+    wpp_e = np.concatenate([2.0 * c1, wpp_end, wpp_mid], axis=1)
+
+    term1 = (1.0 - (y_eval[None, :] * wp_e) / (2.0 * w_e)) ** 2
+    term2 = 0.25 * (wp_e * wp_e) * (1.0 / w_e + 0.25)
+    g_mat = term1 - term2 + 0.5 * wpp_e
+    return y_eval, g_mat
+
+
 def _eval_durrleman_slice(
     y: npt.NDArray[np.float64],
     w_slice: npt.NDArray[np.float64],
 ) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """Evaluates Durrleman butterfly density g(y) at knots and midpoints using spot-independent log-strikes."""
-    cs = scipy.interpolate.CubicSpline(y, w_slice, bc_type="clamped")
-    y_mid = 0.5 * (y[:-1] + y[1:])
-    y_eval = np.concatenate([y, y_mid])
-    w_e = np.maximum(np.asarray(cs(y_eval), dtype=np.float64), 1e-12)
-    wp_e = np.asarray(cs(y_eval, 1), dtype=np.float64)
-    wpp_e = np.asarray(cs(y_eval, 2), dtype=np.float64)
-    term1 = (1.0 - (y_eval * wp_e) / (2.0 * w_e)) ** 2
-    term2 = 0.25 * (wp_e * wp_e) * (1.0 / w_e + 0.25)
-    g_e = term1 - term2 + 0.5 * wpp_e
-    return y_eval, g_e
+    y_eval, g_mat = _eval_durrleman_batch(y, np.asarray(w_slice, dtype=np.float64)[None, :])
+    return y_eval, g_mat[0]
 
 
 def enforce_no_arbitrage_projection_with_jacobian(
@@ -379,24 +410,28 @@ def enforce_no_arbitrage_projection_with_jacobian(
         y_u = np.log(unique_strikes / k_ref)
         core_strike_mask = (unique_strikes >= 0.5 * k_ref) & (unique_strikes <= 1.5 * k_ref)
 
+        w_all_init = (projected_quotes * projected_quotes) * t_arr[:, None]
+        y_eval, g_mat_all = _eval_durrleman_batch(y_u, w_all_init)
+        calls_mat_all = _b76_norm_call(y_u[None, :], w_all_init)
+        core_eval_mask = (y_eval >= math.log(0.5)) & (y_eval <= math.log(1.5))
+        has_core_eval = bool(np.any(core_eval_mask))
+        dk_step = np.maximum(np.diff(unique_strikes), 1e-12)
+
         def _compute_surface_worst_metrics() -> Tuple[float, float]:
-            surf_min_d2c = float("inf")
-            surf_min_g = float("inf")
-            for m_chk in range(n_exp):
-                t_chk = float(t_arr[m_chk])
-                w_chk = (projected_quotes[m_chk] * projected_quotes[m_chk]) * t_chk
-                y_ev_chk, g_ev_chk = _eval_durrleman_slice(y_u, w_chk)
-                c_ev_mask = (y_ev_chk >= math.log(0.5)) & (y_ev_chk <= math.log(1.5))
-                if np.any(c_ev_mask):
-                    surf_min_g = min(surf_min_g, float(np.min(g_ev_chk[c_ev_mask])))
-                else:
-                    surf_min_g = min(surf_min_g, float(np.min(g_ev_chk)))
-                c_chk = _b76_norm_call(y_u, w_chk)
-                sl_chk = np.diff(c_chk) / np.maximum(np.diff(unique_strikes), 1e-12)
-                d2_chk = np.diff(sl_chk)
-                for j_chk in range(1, n_u - 1):
-                    if core_strike_mask[j_chk]:
-                        surf_min_d2c = min(surf_min_d2c, float(d2_chk[j_chk - 1]))
+            w_chk_all = (projected_quotes * projected_quotes) * t_arr[:, None]
+            _, g_chk_all = _eval_durrleman_batch(y_u, w_chk_all)
+            if has_core_eval:
+                surf_min_g = float(np.min(g_chk_all[:, core_eval_mask]))
+            else:
+                surf_min_g = float(np.min(g_chk_all))
+            c_chk_all = _b76_norm_call(y_u[None, :], w_chk_all)
+            sl_chk_all = np.diff(c_chk_all, axis=1) / dk_step[None, :]
+            d2_chk_all = np.diff(sl_chk_all, axis=1)
+            core_int_mask = core_strike_mask[1:-1]
+            if np.any(core_int_mask):
+                surf_min_d2c = float(np.min(d2_chk_all[:, core_int_mask]))
+            else:
+                surf_min_d2c = 0.0
             if not math.isfinite(surf_min_d2c):
                 surf_min_d2c = 0.0
             if not math.isfinite(surf_min_g):
@@ -405,20 +440,18 @@ def enforce_no_arbitrage_projection_with_jacobian(
 
         for m in range(n_exp):
             t_m = float(t_arr[m])
-            w_m = (projected_quotes[m] * projected_quotes[m]) * t_m
-            y_eval, g_eval = _eval_durrleman_slice(y_u, w_m)
-            core_eval_mask = (y_eval >= math.log(0.5)) & (y_eval <= math.log(1.5))
+            g_eval = g_mat_all[m]
 
             min_g_core = (
                 float(np.min(g_eval[core_eval_mask]))
-                if np.any(core_eval_mask)
+                if has_core_eval
                 else float(np.min(g_eval))
             )
             min_g_all = float(np.min(g_eval))
 
             # Check discrete Black-76 normalized call convexity C''(K) >= 0 at F = K_ref
-            calls_m = _b76_norm_call(y_u, w_m)
-            slopes_m = np.diff(calls_m) / np.maximum(np.diff(unique_strikes), 1e-12)
+            calls_m = calls_mat_all[m]
+            slopes_m = np.diff(calls_m) / dk_step
             d2c_m = np.diff(slopes_m)
 
             min_d2c_core = float("inf")
@@ -873,6 +906,10 @@ class RegularizedVolSurface:
         for arr in arrays:
             if arr is not None:
                 arr.setflags(write=False)
+
+    def __deepcopy__(self, memo: Any) -> RegularizedVolSurface:
+        _ = memo
+        return self
 
     def _ensure_basis_spline(self) -> None:
         """Initializes and freezes the strike basis spline weights thread-safely."""
@@ -1484,13 +1521,13 @@ def _resolve_r_native_obs_tensor(state: Any) -> torch.Tensor:
     if r_nat is None:
         r_nat = getattr(state.dividend_schedule, "r_native_obs", None)
     if r_nat is not None:
-        return r_nat
+        return cast(torch.Tensor, r_nat)
     q_meta = getattr(state.dividend_schedule, "quanto_meta", None)
     df_fin = getattr(state.dividend_schedule, "df_fin_obs", None)
     df_repo = getattr(state.dividend_schedule, "df_repo_obs", None)
     if q_meta and df_fin is not None and df_repo is not None:
         return -torch.log(torch.clamp(df_fin, min=1e-15)) + torch.log(torch.clamp(df_repo, min=1e-15))
-    return state.dividend_schedule.r_tot_obs
+    return cast(torch.Tensor, state.dividend_schedule.r_tot_obs)
 
 
 def _digital_ramp_np(
@@ -1888,137 +1925,146 @@ def price_eq_autocall_dupire_qmc(
         else:
             tau_surf_obs[i, :] = [surf_i.map_act365_to_surface_tenor(float(t_m)) for t_m in tau_obs]
 
-    # Simulate each replicate r independently with Owen-scrambled Sobol net
+    # Generate Owen-scrambled Sobol nets for all replicates and diffuse vectorized across (eff_r, n_rep)
+    z_sobol_all = np.empty((eff_r, n_rep, total_dim), dtype=np.float64)
     for rep_idx in range(eff_r):
-        p_start = rep_idx * n_rep
-        p_end = p_start + n_rep
         rep_seed = base_seed + rep_idx * 1009
-        z_sobol_rep = _generate_sobol_normals(
+        z_sobol_all[rep_idx] = _generate_sobol_normals(
             n_rep, total_dim, scramble=scramble, seed=rep_seed
         )
 
-        if eff_mode == "terminal_iv":
-            log_x_prev = np.zeros((n_rep, d_assets), dtype=np.float64)
-            var_prev = np.zeros(d_assets, dtype=np.float64)
-            for m in range(m_rem):
-                z_m = z_sobol_rep[:, m * d_assets : (m + 1) * d_assets] @ chol_l.T
-                var_curr = np.empty(d_assets, dtype=np.float64)
-                for i, surf_i in enumerate(surfs_ordered):
-                    if surf_i.dcc.strip().lower() not in ("act365", "act365f", "act_365", "act_365f"):
-                        iv_i_m = float(surf_i.iv(float(tau_surf_obs[i, m]), float(fwd_prices[i, m])))
-                        var_curr[i] = (iv_i_m * iv_i_m) * float(tau_surf_obs[i, m])
-                    else:
-                        var_curr[i] = (iv_at_fwd[i, m] ** 2) * tau_obs[m]
-                d_var = np.maximum(var_curr - var_prev, 1e-12)
-                std_step = np.sqrt(d_var)
-                log_x_curr = log_x_prev - 0.5 * d_var[None, :] + std_step[None, :] * z_m
-                s_m = fwd_prices[:, m][None, :] * np.exp(log_x_curr)
-                perf_paths[p_start:p_end, m, :] = s_m / ref_spots[None, :]
-                log_x_prev = log_x_curr
-                var_prev = var_prev + d_var  # T1M-011: monotone running max cumulative variance
-        else:
-            rng_bridge = np.random.default_rng(rep_seed + 777)
-            log_x = np.zeros((n_rep, d_assets), dtype=np.float64)
-            t_prev = 0.0
-
-            for m in range(m_rem):
-                t_curr = float(tau_obs[m])
-                dt_period = max(t_curr - t_prev, 1e-8)
-                dt_sub = dt_period / float(n_sub)
-                sqrt_dt_sub = math.sqrt(dt_sub)
-
-                df_fin_prev = (
-                    np.ones(d_assets, dtype=np.float64) if m == 0 else df_fin_obs_np[:, m - 1]
-                )
-                df_fin_curr = df_fin_obs_np[:, m]
-                r_tot_prev = (
-                    np.zeros(d_assets, dtype=np.float64) if m == 0 else r_tot_obs_np[:, m - 1]
-                )
-                r_tot_curr = r_tot_obs_np[:, m]
-                r_nat_prev = (
-                    np.zeros(d_assets, dtype=np.float64) if m == 0 else r_native_obs_np[:, m - 1]
-                )
-                r_nat_curr = r_native_obs_np[:, m]
-                esc_prev = (
-                    spots_t0
-                    if (m == 0 or escrowed_spot_np is None or escrowed_spot_np.ndim < 2)
-                    else escrowed_spot_np[:, m - 1]
-                )
-                esc_curr = (
-                    spots_t0
-                    if (escrowed_spot_np is None or escrowed_spot_np.ndim < 2)
-                    else escrowed_spot_np[:, m]
-                )
-                q_div_m = (
-                    -np.log(np.maximum(esc_curr / np.maximum(esc_prev, 1e-12), 1e-12))
-                    / dt_period
-                )
-                r_zero_m = (
-                    -np.log(np.maximum(df_fin_curr / np.maximum(df_fin_prev, 1e-15), 1e-15))
-                    / dt_period
-                )
-                drift_net_m = (r_nat_curr - r_nat_prev) / dt_period - q_div_m
-                q_repo_m = r_zero_m - drift_net_m
-
-                z_coarse = z_sobol_rep[:, m * d_assets : (m + 1) * d_assets] @ chol_l.T
-                if n_sub == 1:
-                    z_steps = z_coarse[None, :, :]
+    if eff_mode == "terminal_iv":
+        log_x_prev = np.zeros((eff_r, n_rep, d_assets), dtype=np.float64)
+        var_prev = np.zeros(d_assets, dtype=np.float64)
+        for m in range(m_rem):
+            z_m = z_sobol_all[:, :, m * d_assets : (m + 1) * d_assets] @ chol_l.T
+            var_curr = np.empty(d_assets, dtype=np.float64)
+            for i, surf_i in enumerate(surfs_ordered):
+                if surf_i.dcc.strip().lower() not in ("act365", "act365f", "act_365", "act_365f"):
+                    iv_i_m = float(surf_i.iv(float(tau_surf_obs[i, m]), float(fwd_prices[i, m])))
+                    var_curr[i] = (iv_i_m * iv_i_m) * float(tau_surf_obs[i, m])
                 else:
-                    raw_sub = rng_bridge.standard_normal((n_sub, n_rep, d_assets)) @ chol_l.T
+                    var_curr[i] = (iv_at_fwd[i, m] ** 2) * tau_obs[m]
+            d_var = np.maximum(var_curr - var_prev, 1e-12)
+            std_step = np.sqrt(d_var)
+            log_x_curr = log_x_prev - 0.5 * d_var[None, None, :] + std_step[None, None, :] * z_m
+            s_m = fwd_prices[:, m][None, None, :] * np.exp(log_x_curr)
+            perf_paths[:, m, :] = (s_m / ref_spots[None, None, :]).reshape(n_total_paths, d_assets)
+            log_x_prev = log_x_curr
+            var_prev = var_prev + d_var  # T1M-011: monotone running max cumulative variance
+    else:
+        rng_bridges = [
+            np.random.default_rng(base_seed + rep_idx * 1009 + 777) for rep_idx in range(eff_r)
+        ]
+        log_x = np.zeros((eff_r, n_rep, d_assets), dtype=np.float64)
+        t_prev = 0.0
+        has_div_events = len(div_events_ordered) == d_assets and any(
+            len(ev) > 0 for ev in div_events_ordered
+        )
+
+        for m in range(m_rem):
+            t_curr = float(tau_obs[m])
+            dt_period = max(t_curr - t_prev, 1e-8)
+            dt_sub = dt_period / float(n_sub)
+            sqrt_dt_sub = math.sqrt(dt_sub)
+
+            df_fin_prev = (
+                np.ones(d_assets, dtype=np.float64) if m == 0 else df_fin_obs_np[:, m - 1]
+            )
+            df_fin_curr = df_fin_obs_np[:, m]
+            r_tot_prev = (
+                np.zeros(d_assets, dtype=np.float64) if m == 0 else r_tot_obs_np[:, m - 1]
+            )
+            r_tot_curr = r_tot_obs_np[:, m]
+            r_nat_prev = (
+                np.zeros(d_assets, dtype=np.float64) if m == 0 else r_native_obs_np[:, m - 1]
+            )
+            r_nat_curr = r_native_obs_np[:, m]
+            esc_prev = (
+                spots_t0
+                if (m == 0 or escrowed_spot_np is None or escrowed_spot_np.ndim < 2)
+                else escrowed_spot_np[:, m - 1]
+            )
+            esc_curr = (
+                spots_t0
+                if (escrowed_spot_np is None or escrowed_spot_np.ndim < 2)
+                else escrowed_spot_np[:, m]
+            )
+            q_div_m = (
+                -np.log(np.maximum(esc_curr / np.maximum(esc_prev, 1e-12), 1e-12))
+                / dt_period
+            )
+            r_zero_m = (
+                -np.log(np.maximum(df_fin_curr / np.maximum(df_fin_prev, 1e-15), 1e-15))
+                / dt_period
+            )
+            drift_net_m = (r_nat_curr - r_nat_prev) / dt_period - q_div_m
+            q_repo_m = r_zero_m - drift_net_m
+
+            z_coarse = z_sobol_all[:, :, m * d_assets : (m + 1) * d_assets] @ chol_l.T
+            if n_sub == 1:
+                z_steps = z_coarse[None, :, :, :]
+            else:
+                z_steps = np.empty((n_sub, eff_r, n_rep, d_assets), dtype=np.float64)
+                inv_sqrt_sub = 1.0 / math.sqrt(float(n_sub))
+                for rep_idx in range(eff_r):
+                    raw_sub = rng_bridges[rep_idx].standard_normal((n_sub, n_rep, d_assets)) @ chol_l.T
                     mean_sub = np.mean(raw_sub, axis=0, keepdims=True)
-                    z_steps = raw_sub - mean_sub + z_coarse[None, :, :] / math.sqrt(float(n_sub))
+                    z_steps[:, rep_idx, :, :] = (
+                        raw_sub - mean_sub + z_coarse[rep_idx][None, :, :] * inv_sqrt_sub
+                    )
 
-                f_curr = fwd_prices[:, m]
+            f_curr = fwd_prices[:, m]
+            f_prev = spots_t0 if m == 0 else fwd_prices[:, m - 1]
 
-                for s_idx in range(n_sub):
-                    alpha_s = (s_idx + 0.5) / float(n_sub)
-                    t_step = t_prev + alpha_s * dt_period
-                    if len(div_events_ordered) == d_assets and any(len(ev) > 0 for ev in div_events_ordered):
-                        f_step = _compute_forward_at_time_np(
-                            spots_t0, r_tot_obs_np, tau_obs, div_events_ordered, t_step, m
-                        )
-                    else:
-                        f_prev = spots_t0 if m == 0 else fwd_prices[:, m - 1]
-                        f_step = f_prev + alpha_s * (f_curr - f_prev)
-                    s_curr_est = np.exp(log_x) * f_step[None, :]
-                    if has_quanto_diff:
-                        r_tot_step = r_tot_prev + alpha_s * (r_tot_curr - r_tot_prev)
-                        r_nat_step = r_nat_prev + alpha_s * (r_nat_curr - r_nat_prev)
-                        f_step_native = f_step * np.exp(r_nat_step - r_tot_step)
-                    else:
-                        f_step_native = f_step
+            for s_idx in range(n_sub):
+                alpha_s = (s_idx + 0.5) / float(n_sub)
+                t_step = t_prev + alpha_s * dt_period
+                if has_div_events:
+                    f_step = _compute_forward_at_time_np(
+                        spots_t0, r_tot_obs_np, tau_obs, div_events_ordered, t_step, m
+                    )
+                else:
+                    f_step = f_prev + alpha_s * (f_curr - f_prev)
+                s_curr_est = np.exp(log_x) * f_step[None, None, :]
+                if has_quanto_diff:
+                    r_tot_step = r_tot_prev + alpha_s * (r_tot_curr - r_tot_prev)
+                    r_nat_step = r_nat_prev + alpha_s * (r_nat_curr - r_nat_prev)
+                    f_step_native = f_step * np.exp(r_nat_step - r_tot_step)
+                else:
+                    f_step_native = f_step
 
-                    for i in range(d_assets):
-                        t_surf_prev = 0.0 if m == 0 else float(tau_surf_obs[i, m - 1])
-                        t_surf_curr = float(tau_surf_obs[i, m])
-                        dt_surf_ratio = (t_surf_curr - t_surf_prev) / dt_period
-                        t_surf_step = t_surf_prev + alpha_s * (
-                            t_surf_curr - t_surf_prev
-                        )
-                        lv_dcc = np.asarray(
-                            surfs_ordered[i].local_vol(
-                                t_surf_step,
-                                s_curr_est[:, i],
-                                forward_at_t=float(f_step_native[i]),
-                                r_zero=float(r_zero_m[i]),
-                                q_repo=float(q_repo_m[i]),
-                                cash_div_leverage=1.0,  # T1M-001: never double-count dividend leverage
-                            ),
-                            dtype=np.float64,
-                        )
-                        lv_i = lv_dcc * math.sqrt(max(dt_surf_ratio, 1e-12))
-                        log_x[:, i] += (
-                            -0.5 * (lv_i * lv_i) * dt_sub
-                            + lv_i * sqrt_dt_sub * z_steps[s_idx, :, i]
-                        )
+                for i in range(d_assets):
+                    t_surf_prev = 0.0 if m == 0 else float(tau_surf_obs[i, m - 1])
+                    t_surf_curr = float(tau_surf_obs[i, m])
+                    dt_surf_ratio = (t_surf_curr - t_surf_prev) / dt_period
+                    t_surf_step = t_surf_prev + alpha_s * (
+                        t_surf_curr - t_surf_prev
+                    )
+                    lv_dcc = np.asarray(
+                        surfs_ordered[i].local_vol(
+                            t_surf_step,
+                            s_curr_est[:, :, i].reshape(-1),
+                            forward_at_t=float(f_step_native[i]),
+                            r_zero=float(r_zero_m[i]),
+                            q_repo=float(q_repo_m[i]),
+                            cash_div_leverage=1.0,  # T1M-001: never double-count dividend leverage
+                        ),
+                        dtype=np.float64,
+                    ).reshape(eff_r, n_rep)
+                    lv_i = lv_dcc * math.sqrt(max(dt_surf_ratio, 1e-12))
+                    log_x[:, :, i] += (
+                        -0.5 * (lv_i * lv_i) * dt_sub
+                        + lv_i * sqrt_dt_sub * z_steps[s_idx, :, :, i]
+                    )
 
-                # Martingale drift enforcement per replicate
-                mean_x = np.mean(np.exp(log_x), axis=0, keepdims=True)
-                log_x = log_x - np.log(np.maximum(mean_x, 1e-12))
+            # Martingale drift enforcement per replicate
+            mean_x = np.mean(np.exp(log_x), axis=1, keepdims=True)
+            log_x = log_x - np.log(np.maximum(mean_x, 1e-12))
 
-                s_m = f_curr[None, :] * np.exp(log_x)
-                perf_paths[p_start:p_end, m, :] = s_m / ref_spots[None, :]
-                t_prev = t_curr
+            s_m = f_curr[None, None, :] * np.exp(log_x)
+            perf_paths[:, m, :] = (s_m / ref_spots[None, None, :]).reshape(n_total_paths, d_assets)
+            t_prev = t_curr
 
     # Pathwise payoff & cashflow evaluation
     alive = np.ones(n_total_paths, dtype=np.float64)

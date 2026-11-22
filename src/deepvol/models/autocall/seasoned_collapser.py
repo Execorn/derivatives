@@ -432,7 +432,7 @@ def _eval_terminal_option_payoff(
             eff_w_opt - float(participation_call_strike), 0.0
         )
 
-    if one_star_strike is not None and float(one_star_coupon) > 0.0:
+    if one_star_strike is not None and float(one_star_strike) > 0.0 and float(one_star_coupon) != 0.0:
         w_best = float(evaluate_monitoring_index_np(perf_m, "BestOf"))
         if w_best >= float(one_star_strike):
             opt_paid += float(one_star_coupon)
@@ -554,7 +554,11 @@ def collapse_seasoned_schedule(
 
     eff_cpn_index = coupon_index if coupon_index else callability_index
     raw_opt_index = option_index if option_index else callability_index
-    eff_opt_index = "AverageOf" if (is_long_basket and raw_opt_index == "WorstOf") else raw_opt_index
+    eff_opt_index = (
+        "AverageOf"
+        if (is_long_basket and (option_index is None or raw_opt_index == "WorstOf"))
+        else raw_opt_index
+    )
     type_out = coupon_barrier_type.strip().lower() == "out"
     dir_down = coupon_barrier_direction.strip().lower() == "down"
 
@@ -655,6 +659,7 @@ def collapse_seasoned_schedule(
         fund_amt_m = float(past_funding_by_period.get(m, 0.0))
 
         opt_paid = 0.0
+        stopped_before_m = already_autocalled
         if already_autocalled:
             cpn_trig = False
             ko_trig = False
@@ -760,6 +765,96 @@ def collapse_seasoned_schedule(
             )
         )
         if m == m_total - 1:
+            if is_long_basket:
+                if not stopped_before_m and not ko_trig:
+                    islong_amt = float(cf_notional_amt + cf_opt_amt)
+                    notional_rem_amt = 0.0
+                else:
+                    islong_amt = 0.0
+                    notional_rem_amt = float(cf_notional_amt)
+                past_cashflows.append(
+                    CashFlowItem(
+                        Description="IsLongBasket",
+                        Date=T_m,
+                        Amount=islong_amt,
+                        StandardError=0.0,
+                        Currency=payment_currency,
+                        Leg=0,
+                        StatusText=cf_status,
+                    )
+                )
+                past_cashflows.append(
+                    CashFlowItem(
+                        Description="Option",
+                        Date=T_m,
+                        Amount=0.0,
+                        StandardError=0.0,
+                        Currency=payment_currency,
+                        Leg=0,
+                        StatusText=cf_status,
+                    )
+                )
+                past_cashflows.append(
+                    CashFlowItem(
+                        Description="Notional",
+                        Date=T_m,
+                        Amount=notional_rem_amt,
+                        StandardError=0.0,
+                        Currency=payment_currency,
+                        Leg=0,
+                        StatusText=cf_status,
+                    )
+                )
+                continue
+
+            if one_star_strike is not None and float(one_star_strike) > 0.0:
+                w_best_m = float(
+                    evaluate_monitoring_index_np(perf_m, "BestOf", inv_lex_perm=inv_lex_perm)
+                )
+                if not stopped_before_m and not ko_trig and w_best_m >= float(one_star_strike):
+                    onestar_bonus_cf = float(df_m * float(one_star_coupon))
+                    onestar_amt = float(cf_notional_amt + onestar_bonus_cf)
+                    opt_only_amt = float(cf_opt_amt - onestar_bonus_cf)
+                    notional_rem_amt = 0.0
+                else:
+                    onestar_amt = 0.0
+                    opt_only_amt = float(cf_opt_amt)
+                    notional_rem_amt = float(cf_notional_amt)
+                past_cashflows.append(
+                    CashFlowItem(
+                        Description="OneStarCoupon",
+                        Date=T_m,
+                        Amount=onestar_amt,
+                        StandardError=0.0,
+                        Currency=payment_currency,
+                        Leg=0,
+                        StatusText=cf_status,
+                    )
+                )
+                past_cashflows.append(
+                    CashFlowItem(
+                        Description="Option",
+                        Date=T_m,
+                        Amount=opt_only_amt,
+                        StandardError=0.0,
+                        Currency=payment_currency,
+                        Leg=0,
+                        StatusText=cf_status,
+                    )
+                )
+                past_cashflows.append(
+                    CashFlowItem(
+                        Description="Notional",
+                        Date=T_m,
+                        Amount=notional_rem_amt,
+                        StandardError=0.0,
+                        Currency=payment_currency,
+                        Leg=0,
+                        StatusText=cf_status,
+                    )
+                )
+                continue
+
             past_cashflows.append(
                 CashFlowItem(
                     Description="Option",

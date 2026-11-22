@@ -1193,7 +1193,7 @@ def _evaluate_monitoring_index_gpu(
         return p.max(dim=asset_dim).values - p.mean(dim=asset_dim)
     if idx == "DiffAverageWorst":
         return p.mean(dim=asset_dim) - p.min(dim=asset_dim).values
-    if idx in ("RatioAB", "Outperformance"):
+    if idx == "RatioAB":
         p0 = p.select(asset_dim, 0)
         if d_len < 2:
             return p0
@@ -1203,7 +1203,7 @@ def _evaluate_monitoring_index_gpu(
         if d_len < 2:
             return p0
         return p.select(asset_dim, 1) / p0.clamp(min=1e-12)
-    if idx in ("DiffAB", "Spread"):
+    if idx in ("DiffAB", "Outperformance", "Spread"):
         p0 = p.select(asset_dim, 0)
         if d_len < 2:
             return p0
@@ -1213,6 +1213,9 @@ def _evaluate_monitoring_index_gpu(
         if d_len < 2:
             return p0
         return p.select(asset_dim, 1) - p0
+    if idx == "TwinWin":
+        w_min = p.min(dim=asset_dim).values
+        return torch.abs(w_min - 1.0) + 1.0
     return p.min(dim=asset_dim).values
 
 
@@ -1734,10 +1737,11 @@ class GpuTorchDupireQMC:
         else:
             unit_call_paths = torch.zeros((eff_r, n_rep), dtype=torch.float64, device=dev)
 
-        l_put_val = float(unit_put_paths.mean().item())
-        l_call_val = float(unit_call_paths.mean().item())
-        l_onestar_val = 0.0
-        p_onestar_val = float((alive * star_ind).mean().item()) if star_ind is not None else 0.0
+        p_onestar_t = (
+            (alive * star_ind).mean()
+            if star_ind is not None
+            else torch.zeros((), dtype=torch.float64, device=dev)
+        )
 
         put_sign = -1.0
         opt_payoff_paths = float(df_pay_np[-1]) * (
@@ -1747,12 +1751,34 @@ class GpuTorchDupireQMC:
         if star_ind is not None and float(state.one_star_coupon) > 0.0:
             onestar_paths = alive * star_ind * float(state.one_star_coupon)
             opt_payoff_paths = opt_payoff_paths + float(df_pay_np[-1]) * onestar_paths
-            l_onestar_val = float(onestar_paths.mean().item())
+            l_onestar_t = onestar_paths.mean()
+        else:
+            l_onestar_t = torch.zeros((), dtype=torch.float64, device=dev)
 
         total_pv_paths = total_pv_paths + opt_payoff_paths
 
-        # Apply strictly unbiased Control Variate (CHM-001)
-        raw_pv_mean = float(total_pv_paths.mean().item())
+        if eff_r > 1:
+            rep_opt = opt_payoff_paths.mean(dim=1)
+            opt_se_t = rep_opt.std(unbiased=True) / math.sqrt(float(eff_r))
+        else:
+            opt_se_t = opt_payoff_paths.reshape(-1).std(unbiased=True) / math.sqrt(float(n_total_paths))
+
+        scalars_cpu = torch.stack(
+            [
+                unit_put_paths.mean(),
+                unit_call_paths.mean(),
+                l_onestar_t,
+                p_onestar_t,
+                total_pv_paths.mean(),
+                opt_se_t,
+            ]
+        ).cpu().tolist()
+        l_put_val = float(scalars_cpu[0])
+        l_call_val = float(scalars_cpu[1])
+        l_onestar_val = float(scalars_cpu[2])
+        p_onestar_val = float(scalars_cpu[3])
+        raw_pv_mean = float(scalars_cpu[4])
+        option_se = float(scalars_cpu[5])
         if cfg.cv_mode == "bs1d_exact":
             f_dom = float(fwd_prices_np[dom_idx, -1]) / float(ref_np[dom_idx])
             k_cv = float(state.strike) if state.strike > 1e-6 else 1.0
@@ -1817,12 +1843,6 @@ class GpuTorchDupireQMC:
                 total_se = float(rep_pv.std(unbiased=True).item() / math.sqrt(float(eff_r)))
             else:
                 total_se = float(total_pv_paths.reshape(-1).std(unbiased=True).item() / math.sqrt(float(n_total_paths)))
-
-        if eff_r > 1:
-            rep_opt = opt_payoff_paths.mean(dim=1)
-            option_se = float(rep_opt.std(unbiased=True).item() / math.sqrt(float(eff_r)))
-        else:
-            option_se = float(opt_payoff_paths.reshape(-1).std(unbiased=True).item() / math.sqrt(float(n_total_paths)))
 
         asm = _assemble_qmc_postproc(
             state,
@@ -2873,7 +2893,7 @@ def _eval_index_and_grad_gpu(
         t_min = (p == w_min).to(p.dtype)
         t_min = t_min / t_min.sum(dim=asset_dim, keepdim=True).clamp(min=1.0)
         grad = 1.0 / float(max(d, 1)) - t_min
-    elif idx in ("RatioAB", "Outperformance"):
+    elif idx == "RatioAB":
         if d >= 2:
             b_safe = p.select(asset_dim, 1).clamp(min=1e-12)
             grad.select(asset_dim, 0).copy_(1.0 / b_safe)
@@ -2887,7 +2907,7 @@ def _eval_index_and_grad_gpu(
             grad.select(asset_dim, 0).copy_(-p.select(asset_dim, 1) / (a_safe * a_safe))
         else:
             grad.select(asset_dim, 0).fill_(1.0)
-    elif idx in ("DiffAB", "Spread"):
+    elif idx in ("DiffAB", "Outperformance", "Spread"):
         if d >= 2:
             grad.select(asset_dim, 0).fill_(1.0)
             grad.select(asset_dim, 1).fill_(-1.0)
@@ -2899,6 +2919,12 @@ def _eval_index_and_grad_gpu(
             grad.select(asset_dim, 0).fill_(-1.0)
         else:
             grad.select(asset_dim, 0).fill_(1.0)
+    elif idx == "TwinWin":
+        w_min = p.min(dim=asset_dim, keepdim=True).values
+        t_min = (p == w_min).to(p.dtype)
+        t_min = t_min / t_min.sum(dim=asset_dim, keepdim=True).clamp(min=1.0)
+        sign_tw = torch.where(w_min < 1.0, -1.0, 1.0).to(p.dtype)
+        grad = sign_tw * t_min
 
     if is_asym and inv_lex_perm_t is not None:
         grad_sorted = torch.zeros_like(grad)

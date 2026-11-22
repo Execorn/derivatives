@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Sequence, TypeVar, cast
 
 import numpy as np
 import numpy.typing as npt
+import orjson
 import torch
 
 from deepvol.api.schemas_eq_autocall import parse_murex_autocall_dag
@@ -31,7 +32,6 @@ from deepvol.models.autocall.analytical_baseline import (
 from deepvol.models.autocall.dupire_qmc_solver import RegularizedVolSurface
 from deepvol.models.autocall.escrowed_dividend import (
     EscrowedDividendOutput,
-    _infer_asset_currency,
     build_discount_rate_evaluator,
     compute_escrowed_dividend_forwards,
 )
@@ -68,19 +68,40 @@ _HAS_IV_BATCH: bool = hasattr(RegularizedVolSurface, "iv_batch") and callable(
 class _LazySurfaceJacobianDict(dict[str, npt.NDArray[np.float64]]):
     """Lazily computes and caches surface quote Jacobians only if accessed."""
 
-    def __init__(self, builder: Callable[[str], npt.NDArray[np.float64]], keys: Sequence[str]) -> None:
+    def __init__(
+        self,
+        builder: Callable[[str], npt.NDArray[np.float64]],
+        keys: Sequence[str],
+        *,
+        _shared_cache: dict[str, npt.NDArray[np.float64]] | None = None,
+        _lock: threading.RLock | None = None,
+    ) -> None:
         super().__init__()
         self._builder = builder
         self._keys = list(keys)
+        self._shared_cache: dict[str, npt.NDArray[np.float64]] = (
+            _shared_cache if _shared_cache is not None else {}
+        )
+        self._lock: threading.RLock = _lock if _lock is not None else threading.RLock()
+
+    def _get_or_build(self, key: str) -> npt.NDArray[np.float64]:
+        with self._lock:
+            cached = self._shared_cache.get(key)
+            if cached is None:
+                built = np.asarray(self._builder(key), dtype=np.float64).copy()
+                built.setflags(write=False)
+                self._shared_cache[key] = built
+                cached = built
+            return cached.copy()
 
     def _populate_all(self) -> None:
         for k in self._keys:
             if not super().__contains__(k):
-                super().__setitem__(k, self._builder(k))
+                super().__setitem__(k, self._get_or_build(k))
 
     def __getitem__(self, key: str) -> npt.NDArray[np.float64]:
         if not super().__contains__(key) and key in self._keys:
-            super().__setitem__(key, self._builder(key))
+            super().__setitem__(key, self._get_or_build(key))
         return super().__getitem__(key)
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -111,10 +132,19 @@ class _LazySurfaceJacobianDict(dict[str, npt.NDArray[np.float64]]):
         return super().items()
 
     def clone(self) -> _LazySurfaceJacobianDict:
-        cloned = _LazySurfaceJacobianDict(self._builder, self._keys)
+        cloned = _LazySurfaceJacobianDict(
+            self._builder,
+            self._keys,
+            _shared_cache=self._shared_cache,
+            _lock=self._lock,
+        )
         for k, v in dict.items(self):
             dict.__setitem__(cloned, k, v.copy())
         return cloned
+
+    def __deepcopy__(self, memo: Any) -> _LazySurfaceJacobianDict:
+        _ = memo
+        return self.clone()
 
 
 @dataclass
@@ -457,13 +487,72 @@ def _feed_canonical_bytes(hasher: Any, obj: Any, counter: list[int]) -> bool:
     return False
 
 
+class _UncacheablePayloadError(Exception):
+    """Raised when a payload contains an autograd-tracked tensor or unhashable object."""
+
+
+_ORJSON_CANONICAL_OPTS: int = (
+    orjson.OPT_SORT_KEYS
+    | orjson.OPT_SERIALIZE_NUMPY
+    | orjson.OPT_NON_STR_KEYS
+)
+
+
+def _orjson_canonical_default(obj: Any) -> Any:
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, torch.Tensor):
+        if obj.requires_grad:
+            raise _UncacheablePayloadError()
+        arr = obj.detach().cpu().contiguous().numpy()
+        return ("__tensor__", arr.shape, arr.dtype.str, arr)
+    if isinstance(obj, np.ndarray):
+        arr = np.ascontiguousarray(obj)
+        return ("__ndarray__", arr.shape, arr.dtype.str, arr)
+    if hasattr(obj, "model_dump") and callable(obj.model_dump):
+        d = getattr(obj, "__dict__", None)
+        if isinstance(d, dict):
+            extra = getattr(obj, "__pydantic_extra__", None)
+            if extra:
+                return (obj.__class__.__name__, d, extra)
+            return (obj.__class__.__name__, d)
+        return obj.model_dump(mode="python")
+    if isinstance(obj, datetime.datetime):
+        return _to_utc_datetime(obj).isoformat()
+    if isinstance(obj, datetime.date):
+        return obj.isoformat()
+    if isinstance(obj, (set, frozenset)):
+        return ("__set__", sorted(obj, key=lambda x: str(x)))
+    if isinstance(obj, (bytes, bytearray)):
+        return ("__bytes__", bytes(obj).hex())
+    if isinstance(obj, Mapping):
+        return dict(obj)
+    if hasattr(obj, "__dict__"):
+        return (obj.__class__.__name__, vars(obj))
+    raise _UncacheablePayloadError()
+
+
 def digest_market_bytes(namespace: str, payload: Any) -> ContentDigestKey | None:
     """Builds a SHA-256 ContentDigestKey covering 100% of interior values."""
-    h = hashlib.sha256()
-    counter = [0]
-    if not _feed_canonical_bytes(h, payload, counter):
+    try:
+        raw = orjson.dumps(
+            payload,
+            option=_ORJSON_CANONICAL_OPTS,
+            default=_orjson_canonical_default,
+        )
+        return ContentDigestKey(
+            namespace=namespace,
+            digest_hex=hashlib.sha256(raw).hexdigest(),
+            payload_len=len(raw),
+        )
+    except _UncacheablePayloadError:
         return None
-    return ContentDigestKey(namespace=namespace, digest_hex=h.hexdigest(), payload_len=counter[0])
+    except Exception:
+        h = hashlib.sha256()
+        counter = [0]
+        if not _feed_canonical_bytes(h, payload, counter):
+            return None
+        return ContentDigestKey(namespace=namespace, digest_hex=h.hexdigest(), payload_len=counter[0])
 
 
 def _clone_dataclass_tensors(obj: Any) -> Any:
@@ -569,15 +658,20 @@ def _extract_attr(obj: Any, *names: str, default: Any = None) -> Any:
     """Extracts the first matching key or attribute from a dict or Pydantic model."""
     if obj is None:
         return default
-    if isinstance(obj, Mapping):
+    if isinstance(obj, dict):
         for name in names:
-            if name in obj and obj[name] is not None:
-                return obj[name]
+            val = obj.get(name)
+            if val is not None:
+                return val
         return default
     for name in names:
         val = getattr(obj, name, None)
         if val is not None:
             return val
+    if isinstance(obj, Mapping):
+        for name in names:
+            if name in obj and obj[name] is not None:
+                return obj[name]
     return default
 
 
@@ -1187,6 +1281,8 @@ def preprocess_eq_autocall(
         if modifiers is not None
         else _extract_attr(product, "IsLongBasket", "is_long_basket", default=False)
     )
+    if is_long_basket and option_index is None:
+        option_index = "AverageOf"
     part_strike_raw = (
         _extract_attr(modifiers, "participation_call_strike")
         if modifiers is not None
@@ -1992,6 +2088,13 @@ def assemble_autocall_cashflows_and_pv(
                 cashflows.append(CashFlowItem("FundingLeg", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
                 cashflows.append(CashFlowItem("Coupon", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
                 if m == m_rem - 1:
+                    if preproc_state.is_long_basket:
+                        cashflows.append(CashFlowItem("IsLongBasket", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
+                    elif (
+                        preproc_state.one_star_strike is not None
+                        and float(preproc_state.one_star_strike) > 0.0
+                    ):
+                        cashflows.append(CashFlowItem("OneStarCoupon", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
                     cashflows.append(CashFlowItem("Option", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
                 cashflows.append(CashFlowItem("Notional", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
         return AutocallPostprocOutput(
@@ -2205,7 +2308,7 @@ def assemble_autocall_cashflows_and_pv(
                     )
                     cashflows.append(
                         CashFlowItem(
-                            Description="IsLongBasket",  # type: ignore[arg-type]
+                            Description="IsLongBasket",
                             Date=pay_dt,
                             Amount=surv_notional_amt + opt_amt,
                             StandardError=float(option_se),
@@ -2262,7 +2365,7 @@ def assemble_autocall_cashflows_and_pv(
                         )
                         cashflows.append(
                             CashFlowItem(
-                                Description="OneStarCoupon",  # type: ignore[arg-type]
+                                Description="OneStarCoupon",
                                 Date=pay_dt,
                                 Amount=onestar_total_amt,
                                 StandardError=0.0,
