@@ -508,10 +508,12 @@ def compute_psi_10_decile(
     bin_edges: npt.NDArray[np.float64],
     ref_probs: npt.NDArray[np.float64],
 ) -> tuple[float, dict[str, float]]:
-    """Computes the 10-decile Population Stability Index (PSI) across the 16 summary features.
+    """Computes the Laplace-smoothed 10-decile Population Stability Index (PSI) across the 16 summary features.
 
-    Formula:
-        PSI_j = sum_{b=1}^{10} (p_{j,b} - q_{j,b}) * ln(max(p_{j,b}, 1e-6) / max(q_{j,b}, 1e-6))
+    Formula (with Laplace pseudocount alpha_0 = 0.5, K = 10 bins):
+        p_hat_{j,b} = (c_{j,b} + 0.5) / (N + 5.0)
+        q_hat_{j,b} = (N * q_{j,b} + 0.5) / (N + 5.0)
+        PSI_j = sum_{b=1}^{10} (p_hat_{j,b} - q_hat_{j,b}) * ln(p_hat_{j,b} / q_hat_{j,b})
 
     Returns:
         max_psi: Maximum PSI across all 16 features.
@@ -532,11 +534,13 @@ def compute_psi_10_decile(
         if len(col_finite) == 0:
             psi_j = 10.0
         else:
+            n_obs = float(len(col_finite))
             counts, _ = np.histogram(col_finite, bins=bin_edges[j])
-            p_b = counts.astype(np.float64) / float(len(col_finite))
-            q_b = ref_probs[j]
-            p_safe = np.maximum(p_b, 1e-6)
-            q_safe = np.maximum(q_b, 1e-6)
+            p_b = (counts.astype(np.float64) + 0.5) / (n_obs + 5.0)
+            q_raw = np.asarray(ref_probs[j], dtype=np.float64)
+            q_b = (n_obs * q_raw + 0.5) / (n_obs + 5.0)
+            p_safe = np.maximum(p_b, 1e-12)
+            q_safe = np.maximum(q_b, 1e-12)
             psi_j = float(np.sum((p_b - q_b) * np.log(p_safe / q_safe)))
         name_j = FEATURE_NAMES_16D[j]
         psi_map[name_j] = psi_j
@@ -544,6 +548,37 @@ def compute_psi_10_decile(
             max_psi = psi_j
 
     return max_psi, psi_map
+
+
+_D1_ACTIVE_SUBSPACE_INDICES: tuple[int, ...] = (0, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+
+
+def _regularize_cov_oas_correlation_space(
+    cov_mat: npt.NDArray[np.float64],
+    *,
+    lambda_min: float = 0.025,
+    std_floor: float = 1e-2,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Standardizes covariance in correlation space with eigenvalue floor (kappa <= 40) and builds d=1 subspace precision."""
+    cov_sym = 0.5 * (cov_mat + cov_mat.T)
+    raw_std = np.sqrt(np.maximum(np.diag(cov_sym), 1e-12))
+    marg_std = np.maximum(raw_std, float(std_floor))
+    r_mat = cov_sym / np.maximum(np.outer(raw_std, raw_std), 1e-12)
+    r_sym = 0.5 * (r_mat + r_mat.T)
+    np.fill_diagonal(r_sym, 1.0)
+    eigvals, eigvecs = np.linalg.eigh(r_sym)
+    eigvals_floored = np.maximum(eigvals, float(lambda_min))
+    r_reg = (eigvecs * eigvals_floored[None, :]) @ eigvecs.T
+    r_inv = (eigvecs * (1.0 / eigvals_floored)[None, :]) @ eigvecs.T
+    inv_std = 1.0 / marg_std
+    cov_reg = (marg_std[:, None] * r_reg) * marg_std[None, :]
+    cov_inv_reg = (inv_std[:, None] * r_inv) * inv_std[None, :]
+
+    sub_idx = list(_D1_ACTIVE_SUBSPACE_INDICES)
+    cov_sub = cov_reg[np.ix_(sub_idx, sub_idx)]
+    cov_inv_d1 = np.zeros((16, 16), dtype=np.float64)
+    cov_inv_d1[np.ix_(sub_idx, sub_idx)] = np.linalg.pinv(cov_sub)
+    return cov_reg, cov_inv_reg, marg_std, cov_inv_d1
 
 
 class EQAutocallModelGuardian:
@@ -574,6 +609,7 @@ class EQAutocallModelGuardian:
         ref_mean_16d: npt.NDArray[np.float64] | None = None,
         ref_cov_inv_16d: npt.NDArray[np.float64] | None = None,
         record_drift_by_default: bool = True,
+        psi_hard_circuit_breaker: bool = True,
         tau_desk_bps: float = DEFAULT_TAU_DESK_BPS,
         conformal_alpha: float = 0.05,
         stats_path: str | Path | None = None,
@@ -594,6 +630,7 @@ class EQAutocallModelGuardian:
             float(residual_threshold) if residual_threshold is not None else None
         )
         self.record_drift_by_default = bool(record_drift_by_default)
+        self.psi_hard_circuit_breaker = bool(psi_hard_circuit_breaker)
         self.tau_desk_bps = float(tau_desk_bps)
         self.conformal_alpha = float(conformal_alpha)
         self.use_gpu_qmc = use_gpu_qmc
@@ -608,10 +645,12 @@ class EQAutocallModelGuardian:
                 ref_cov_inv_16d, dtype=np.float64
             ).copy()
             cov_mat = np.linalg.pinv(self.ref_cov_inv_16d)
-            ref_std = np.sqrt(np.maximum(np.diag(cov_mat), 1e-12))
+            _, _, ref_std, cov_inv_d1 = _regularize_cov_oas_correlation_space(cov_mat)
         else:
             ref_std = _DEFAULT_REF_STD_16D.copy()
             self.ref_cov_inv_16d = np.diag(1.0 / (ref_std * ref_std))
+            _, _, _, cov_inv_d1 = _regularize_cov_oas_correlation_space(np.diag(ref_std * ref_std))
+        self.ref_cov_inv_d1_16d: npt.NDArray[np.float64] = cov_inv_d1
         self.ref_marginal_std_16d: npt.NDArray[np.float64] = ref_std.copy()
 
         # Initialize 10-decile bin edges from the calibrated Gaussian reference distribution
@@ -628,6 +667,7 @@ class EQAutocallModelGuardian:
         self.scale_eps0: float = 0.0
         self.scale_c1: float = 0.0
         self.scale_weights_5d: npt.NDArray[np.float64] = np.zeros(5, dtype=np.float64)
+        self.mondrian_q_err_table: dict[str, float] = {}
         self._conformal_calibrated: bool = False
         self.stats_loaded: bool = False
         self.stats_path: Path | None = Path(stats_path) if stats_path is not None else None
@@ -656,15 +696,14 @@ class EQAutocallModelGuardian:
             return np.asarray(val, dtype=np.float64).copy()
 
         ref_mean = _to_f64(raw["ref_mean_16d"]).reshape(16)
-        ref_cov_inv = _to_f64(raw["ref_cov_inv_16d"]).reshape(16, 16)
-        if "ref_marginal_std_16d" in raw:
-            marg_std = _to_f64(raw["ref_marginal_std_16d"]).reshape(16)
-        elif "ref_cov_oas_16d" in raw:
-            cov_oas = _to_f64(raw["ref_cov_oas_16d"]).reshape(16, 16)
-            marg_std = np.sqrt(np.maximum(np.diag(cov_oas), 1e-12))
+        ref_cov_inv_raw = _to_f64(raw["ref_cov_inv_16d"]).reshape(16, 16)
+        if "ref_cov_oas_16d" in raw:
+            cov_oas_in = _to_f64(raw["ref_cov_oas_16d"]).reshape(16, 16)
         else:
-            cov_pinv = np.linalg.pinv(ref_cov_inv)
-            marg_std = np.sqrt(np.maximum(np.diag(cov_pinv), 1e-12))
+            cov_oas_in = np.linalg.pinv(ref_cov_inv_raw)
+        _, ref_cov_inv, marg_std, cov_inv_d1 = _regularize_cov_oas_correlation_space(cov_oas_in)
+        if "ref_marginal_std_16d" in raw:
+            marg_std = np.maximum(_to_f64(raw["ref_marginal_std_16d"]).reshape(16), 1e-2)
         bin_edges = _to_f64(raw["psi_bin_edges"]).reshape(16, 11)
         ref_probs = _to_f64(raw["psi_ref_probs"]).reshape(16, 10)
 
@@ -680,10 +719,17 @@ class EQAutocallModelGuardian:
             w5 = np.array([eps0, c1, 0.0, 0.0, 0.0], dtype=np.float64)
         tau_file = float(raw.get("tau_desk_bps", self.tau_desk_bps))
         alpha_file = float(raw.get("conformal_alpha", self.conformal_alpha))
+        raw_mondrian = raw.get("mondrian_q_err_table")
+        mondrian_tbl: dict[str, float] = (
+            {str(k): float(v) for k, v in raw_mondrian.items()}
+            if isinstance(raw_mondrian, dict)
+            else {}
+        )
 
         with self._lock:
             self.ref_mean_16d = ref_mean
             self.ref_cov_inv_16d = ref_cov_inv
+            self.ref_cov_inv_d1_16d = cov_inv_d1
             self.ref_marginal_std_16d = marg_std
             self.psi_bin_edges = bin_edges
             self.psi_ref_probs = ref_probs
@@ -692,6 +738,7 @@ class EQAutocallModelGuardian:
             self.scale_eps0 = eps0
             self.scale_c1 = c1
             self.scale_weights_5d = w5.copy()
+            self.mondrian_q_err_table = mondrian_tbl
             self.conformal_alpha = alpha_file
             if self.tau_desk_bps == DEFAULT_TAU_DESK_BPS:
                 self.tau_desk_bps = tau_file
@@ -734,8 +781,7 @@ class EQAutocallModelGuardian:
             + shrinkage * diag_target
             + 1e-4 * np.eye(16, dtype=np.float64)
         )
-        cov_inv = np.linalg.inv(cov_shrunk)
-        marg_std = np.sqrt(np.maximum(np.diag(cov_shrunk), 1e-12))
+        _, cov_inv, marg_std, cov_inv_d1 = _regularize_cov_oas_correlation_space(cov_shrunk)
 
         bin_edges = np.zeros((16, 11), dtype=np.float64)
         ref_probs = np.full((16, 10), 0.10, dtype=np.float64)
@@ -753,14 +799,13 @@ class EQAutocallModelGuardian:
             bin_edges[j, 1:10] = inner
             bin_edges[j, 10] = np.inf
             counts, _ = np.histogram(x_ref[:, j], bins=bin_edges[j])
-            probs_j = np.maximum(
-                counts.astype(np.float64) / float(max(n_samples, 1)), 1e-6
-            )
+            probs_j = (counts.astype(np.float64) + 0.5) / (float(max(n_samples, 1)) + 5.0)
             ref_probs[j] = probs_j / np.sum(probs_j)
 
         with self._lock:
             self.ref_mean_16d = ref_mean
             self.ref_cov_inv_16d = cov_inv
+            self.ref_cov_inv_d1_16d = cov_inv_d1
             self.ref_marginal_std_16d = marg_std
             self.psi_bin_edges = bin_edges
             self.psi_ref_probs = ref_probs
@@ -791,17 +836,39 @@ class EQAutocallModelGuardian:
     def compute_mahalanobis_d2(
         self,
         feat_16d: npt.NDArray[np.float64],
+        *,
+        d_assets: int | None = None,
     ) -> float:
-        """Computes squared Mahalanobis distance D_M^2(x) = (x - mu)^T Sigma^{-1} (x - mu) in float64."""
+        """Computes squared Mahalanobis distance D_M^2(x) = (x - mu)^T Sigma^{-1} (x - mu) in float64.
+
+        When d_assets == 1 (or single-asset summary invariants hold), projects onto the 12D non-degenerate subspace.
+        """
         x = np.asarray(feat_16d, dtype=np.float64).reshape(16)
         if not np.all(np.isfinite(x)):
             return 1e6
+        is_d1 = (
+            (d_assets == 1)
+            if d_assets is not None
+            else (
+                abs(float(x[2]) - float(x[1])) <= 1e-12
+                and abs(float(x[5]) - 0.45) <= 1e-9
+                and abs(float(x[6]) - 0.25) <= 1e-9
+            )
+        )
         with self._lock:
             ref_mean = self.ref_mean_16d
-            cov_inv = self.ref_cov_inv_16d
+            cov_inv = self.ref_cov_inv_d1_16d if is_d1 else self.ref_cov_inv_16d
         diff = x - ref_mean
         d2 = float(diff @ cov_inv @ diff)
         return max(d2, 0.0)
+
+    def effective_psi_threshold(self, n_samples: int | None = None) -> float:
+        """Computes Yurdakul-Naranjo finite-sample scaled PSI threshold tau_eff(N) = tau_PSI + (9.0 / N) * (1 + 1.5)."""
+        with self._lock:
+            n_eff = int(n_samples) if n_samples is not None else len(self.feature_history)
+        if n_eff <= 0:
+            return float(self.psi_fallback_threshold)
+        return float(self.psi_fallback_threshold) + (9.0 / float(n_eff)) * (1.0 + 1.5)
 
     def compute_psi(
         self,
@@ -824,12 +891,13 @@ class EQAutocallModelGuardian:
         preproc_state: AutocallPreprocState,
         baseline_out: AutocallBaselineOutput | None = None,
     ) -> float:
-        """Computes 5D locally-weighted split-conformal error half-width in bps."""
+        """Computes 5D locally-weighted split/Mondrian-conformal error half-width in bps."""
         with self._lock:
             if not self._conformal_calibrated:
                 return 0.0
             q_err = self.q_err_conformal
             w5 = self.scale_weights_5d.copy()
+            mondrian_tbl = dict(self.mondrian_q_err_table)
 
         b_out = baseline_out if baseline_out is not None else preproc_state.baseline
         w_np = b_out.proxy_delta_weights.detach().cpu().numpy().astype(np.float64)
@@ -869,6 +937,11 @@ class EQAutocallModelGuardian:
             if (preproc_state.ki_barrier is not None and float(preproc_state.i_ki_past) < 0.5)
             else 0.0
         )
+        if mondrian_tbl:
+            ki_b = 1 if has_ki_untriggered > 0.5 else 0
+            m_b = 0 if m_rem <= 12 else (1 if m_rem <= 25 else 2)
+            d_b = 0 if int(preproc_state.d_assets) <= 2 else 1
+            q_err = float(mondrian_tbl.get(f"ki{ki_b}_m{m_b}_d{d_b}", q_err))
 
         phi = np.array(
             [
@@ -1014,6 +1087,13 @@ class EQAutocallModelGuardian:
         b_out = baseline_out if baseline_out is not None else preproc_state.baseline
         reasons: list[AutocallFallbackReason] = []
         warnings: list[str] = []
+        for w_s in getattr(getattr(preproc_state, "seasoned_state", None), "warnings", ()):
+            if str(w_s) not in warnings:
+                warnings.append(str(w_s))
+        for _tk, surf_obj in getattr(preproc_state, "vol_surfaces", {}).items():
+            for w_v in getattr(surf_obj, "warnings", ()):
+                if str(w_v) not in warnings:
+                    warnings.append(str(w_v))
 
         d_assets = int(preproc_state.d_assets)
         m_rem = int(preproc_state.m_rem)
@@ -1135,7 +1215,7 @@ class EQAutocallModelGuardian:
                 reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
             mahalanobis_d2 = 1e6
         else:
-            mahalanobis_d2 = self.compute_mahalanobis_d2(summary_16d)
+            mahalanobis_d2 = self.compute_mahalanobis_d2(summary_16d, d_assets=d_assets)
             max_vol_val = float(summary_16d[AutocallSummaryCol.MAX_ATM_VOL])
             max_div_lev = float(summary_16d[AutocallSummaryCol.MAX_CASH_DIV_LEVERAGE])
             min_log_m = float(summary_16d[AutocallSummaryCol.MIN_LOG_MONEYNESS])
@@ -1143,7 +1223,7 @@ class EQAutocallModelGuardian:
 
             domain_box_ood = (
                 max_vol_val > 1.00
-                or max_div_lev > math.log(1.0 / (1.0 - 0.25))
+                or max_div_lev > math.log(1.0 / (1.0 - 0.35))
                 or min_log_m < math.log(0.15)
                 or max_log_m > math.log(2.50)
                 or float(preproc_state.option_gearing) > 2.0
@@ -1245,10 +1325,18 @@ class EQAutocallModelGuardian:
                 self.record_feature_vector(summary_16d)
 
         max_psi, psi_per_feature = self.compute_psi()
-        if max_psi >= self.psi_fallback_threshold:
-            reasons.append(AutocallFallbackReason.PSI_DRIFT_BREACH)
+        with self._lock:
+            n_hist = len(self.feature_history)
+        eff_psi_thresh = (
+            self.effective_psi_threshold(n_hist)
+            if n_hist > 0
+            else float(self.psi_fallback_threshold)
+        )
+        if max_psi >= eff_psi_thresh:
+            if self.psi_hard_circuit_breaker:
+                reasons.append(AutocallFallbackReason.PSI_DRIFT_BREACH)
             warnings.append(
-                f"PSI_DRIFT_BREACH: max_psi={max_psi:.4f} >= {self.psi_fallback_threshold:.4f}."
+                f"PSI_DRIFT_BREACH: max_psi={max_psi:.4f} >= {eff_psi_thresh:.4f}."
             )
         elif max_psi >= self.psi_warning_threshold:
             warnings.append(

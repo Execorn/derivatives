@@ -480,11 +480,28 @@ def _compute_local_scale_factor(batch: SyntheticAutocallBatch) -> npt.NDArray[np
     return _compute_difficulty_basis_5d(batch)[:, 1]
 
 
+def _extract_mondrian_cell_keys_from_batch(batch: SyntheticAutocallBatch) -> List[str]:
+    """Maps each trade in `batch` to its 12-cell Mondrian taxonomy key `ki{0,1}_m{0,1,2}_d{0,1}`."""
+    has_ki = (
+        (batch.global_feats[:, int(AutocallGlobalCol.HAS_KI_FLAG)] > 0.5)
+        & (batch.global_feats[:, int(AutocallGlobalCol.I_KI_PAST)] < 0.5)
+    ).detach().cpu().numpy()
+    m_cnt = (batch.sched_mask > 0.5).sum(dim=1).detach().cpu().numpy()
+    d_cnt = (batch.asset_mask > 0.5).sum(dim=1).detach().cpu().numpy()
+    keys: List[str] = []
+    for hk, m_c, d_c in zip(has_ki, m_cnt, d_cnt):
+        ki_b = 1 if bool(hk) else 0
+        m_b = 0 if int(m_c) <= 12 else (1 if int(m_c) <= 25 else 2)
+        d_b = 0 if int(d_c) <= 2 else 1
+        keys.append(f"ki{ki_b}_m{m_b}_d{d_b}")
+    return keys
+
+
 def compute_conformal_half_width_bps(
     batch: SyntheticAutocallBatch,
     stats_payload: Dict[str, Any],
 ) -> npt.NDArray[np.float64]:
-    """Computes split-conformal half-width in bps using 5D difficulty weights (or 2-term fallback)."""
+    """Computes split-conformal half-width in bps using 5D difficulty weights (and optional Mondrian table)."""
     q_err = float(stats_payload["q_err_conformal"])
     if "scale_weights_5d" in stats_payload and stats_payload["scale_weights_5d"] is not None:
         w5 = np.asarray(
@@ -499,6 +516,11 @@ def compute_conformal_half_width_bps(
         eps0 = float(stats_payload["scale_eps0"])
         c1 = float(stats_payload["scale_c1"])
         scale = np.maximum(eps0 + c1 * _compute_local_scale_factor(batch), 1e-4)
+    mondrian_tbl = stats_payload.get("mondrian_q_err_table")
+    if isinstance(mondrian_tbl, dict) and len(mondrian_tbl) > 0:
+        cell_keys = _extract_mondrian_cell_keys_from_batch(batch)
+        q_vec = np.array([float(mondrian_tbl.get(k, q_err)) for k in cell_keys], dtype=np.float64)
+        return q_vec * scale * 1e4
     return q_err * scale * 1e4
 
 
@@ -593,21 +615,28 @@ def calibrate_guardian_stats(
     tau_desk_bps: float = 60.0,
     stats_path: Optional[Path] = DEFAULT_GUARDIAN_STATS_PATH,
 ) -> Dict[str, Any]:
-    """Fits OAS covariance, 10-decile PSI bins, and 5D split-conformal error quantiles."""
+    """Fits correlation-space standardized OAS covariance, Laplace-smoothed 10-decile PSI bins, and Mondrian 5D-CQR quantiles."""
     x_fit = extract_16d_features_from_batch(train_batch)
     n_fit, p = x_fit.shape
     ref_mean = np.mean(x_fit, axis=0)
-    diff = x_fit - ref_mean[None, :]
-    s_cov = (diff.T @ diff) / float(max(n_fit, 1))
-    tr_s = float(np.trace(s_cov))
-    tr_s2 = float(np.sum(s_cov * s_cov))
-    denom = float(n_fit + 1 - 2.0 / p) * max(tr_s2 - (tr_s * tr_s) / p, 1e-12)
-    numer = (1.0 - 2.0 / p) * tr_s2 + tr_s * tr_s
-    rho_oas = min(1.0, max(0.0, numer / max(denom, 1e-12)))
-    f_target = (tr_s / p) * np.eye(p, dtype=np.float64)
-    cov_oas = (1.0 - rho_oas) * s_cov + rho_oas * f_target + 1e-6 * np.eye(p, dtype=np.float64)
-    cov_inv = np.linalg.inv(cov_oas)
-    marginal_std = np.sqrt(np.maximum(np.diag(cov_oas), 1e-12))
+    raw_std = np.sqrt(np.maximum(np.var(x_fit, axis=0), 1e-12))
+    marginal_std = np.maximum(raw_std, 1e-2)
+    z_fit = (x_fit - ref_mean[None, :]) / marginal_std[None, :]
+    r_sample = (z_fit.T @ z_fit) / float(max(n_fit, 1))
+    tr_r = float(np.trace(r_sample))
+    tr_r2 = float(np.sum(r_sample * r_sample))
+    denom = float(n_fit + 1 - 2.0 / p) * max(tr_r2 - (tr_r * tr_r) / p, 1e-12)
+    numer = (1.0 - 2.0 / p) * tr_r2 + tr_r * tr_r
+    rho_oas = min(1.0, max(0.05, numer / max(denom, 1e-12)))
+    f_target = (tr_r / p) * np.eye(p, dtype=np.float64)
+    r_oas = (1.0 - rho_oas) * r_sample + rho_oas * f_target
+    eigvals, eigvecs = np.linalg.eigh(0.5 * (r_oas + r_oas.T))
+    eigvals_floored = np.maximum(eigvals, 0.025)
+    r_oas_reg = (eigvecs * eigvals_floored[None, :]) @ eigvecs.T
+    r_oas_inv = (eigvecs * (1.0 / eigvals_floored)[None, :]) @ eigvecs.T
+    inv_std = 1.0 / marginal_std
+    cov_oas = (marginal_std[:, None] * r_oas_reg) * marginal_std[None, :]
+    cov_inv = (inv_std[:, None] * r_oas_inv) * inv_std[None, :]
 
     psi_bin_edges = np.zeros((p, 11), dtype=np.float64)
     psi_ref_probs = np.full((p, 10), 0.10, dtype=np.float64)
@@ -625,7 +654,7 @@ def calibrate_guardian_stats(
         psi_bin_edges[j, 1:10] = inner
         psi_bin_edges[j, 10] = np.inf
         counts, _ = np.histogram(x_fit[:, j], bins=psi_bin_edges[j])
-        probs = np.maximum(counts.astype(np.float64) / float(max(n_fit, 1)), 1e-6)
+        probs = (counts.astype(np.float64) + 0.5) / (float(max(n_fit, 1)) + 5.0)
         psi_ref_probs[j] = probs / np.sum(probs)
 
     # Split-conformal calibration strictly on held-out Cal split (Cal-1 quantile fit, disjoint Cal-2 conformal quantile)
@@ -640,16 +669,19 @@ def calibrate_guardian_stats(
     pv_mc_cal = cal_batch.pv_mc.detach().cpu().numpy().astype(np.float64)
     abs_err_cal = np.abs(pv_pred_cal - pv_mc_cal)
     phi_cal = _compute_difficulty_basis_5d(cal_batch)
+    all_cell_keys = _extract_mondrian_cell_keys_from_batch(cal_batch)
 
     if n_cal >= 64:
         split_idx = n_cal // 2
         w5 = _fit_quantile_scale_weights_5d(phi_cal[:split_idx], abs_err_cal[:split_idx], tau=0.90)
         phi_score = phi_cal[split_idx:]
         err_score = abs_err_cal[split_idx:]
+        score_cell_keys = all_cell_keys[split_idx:]
     else:
         w5 = _fit_quantile_scale_weights_5d(phi_cal, abs_err_cal, tau=0.90)
         phi_score = phi_cal
         err_score = abs_err_cal
+        score_cell_keys = all_cell_keys
 
     n_score = int(err_score.shape[0])
     denom_score = np.maximum(phi_score @ w5, 1.5e-4)
@@ -658,6 +690,25 @@ def calibrate_guardian_stats(
     q_err_conformal = float(np.quantile(scores_cal, q_err_level))
     scale_eps0 = float(w5[0])
     scale_c1 = float(w5[1])
+
+    # 12-Cell Hierarchical Mondrian Conformal Quantiles with Empirical Bayes shrinkage (m0 = 50)
+    m0_eb = 50.0
+    mondrian_q_err_table: Dict[str, float] = {}
+    score_keys_arr = np.asarray(score_cell_keys)
+    for ki_b in (0, 1):
+        for m_b in (0, 1, 2):
+            for d_b in (0, 1):
+                ck = f"ki{ki_b}_m{m_b}_d{d_b}"
+                c_mask = score_keys_arr == ck
+                n_c = int(np.sum(c_mask))
+                if n_c > 0:
+                    c_scores = scores_cal[c_mask]
+                    lvl_c = min(1.0, math.ceil((n_c + 1) * (1.0 - conformal_alpha)) / float(n_c))
+                    q_emp_c = float(np.quantile(c_scores, lvl_c))
+                    q_eff_c = (n_c / (n_c + m0_eb)) * q_emp_c + (m0_eb / (n_c + m0_eb)) * q_err_conformal
+                else:
+                    q_eff_c = q_err_conformal
+                mondrian_q_err_table[ck] = float(q_eff_c)
 
     payload: Dict[str, Any] = {
         "schema_version": FEATURE_SCHEMA_VERSION,
@@ -676,6 +727,8 @@ def calibrate_guardian_stats(
         "scale_eps0": scale_eps0,
         "scale_c1": scale_c1,
         "n_cal": n_cal,
+        "mondrian_q_err_table": mondrian_q_err_table,
+        "oas_standardized": True,
     }
     if stats_path is not None:
         stats_path = Path(stats_path)

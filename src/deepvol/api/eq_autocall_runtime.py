@@ -357,20 +357,280 @@ def _concat_batched_greeks(
     return BatchedSurrogateGreeksOutput(**kwargs)
 
 
+def _parse_fx_tenor_to_years(tenor_val: Any) -> float:
+    """Converts an FX surface tenor token (e.g., '1W', '1M', '3M', '1Y' or float) to Act/365 years."""
+    if isinstance(tenor_val, (int, float, np.number)):
+        return max(float(tenor_val), 1e-6)
+    s = str(tenor_val).strip().upper()
+    if not s:
+        return 1.0
+    if s in ("ON", "O/N", "TN", "T/N", "SN", "S/N"):
+        return 1.0 / 365.0
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([DWMY])$", s)
+    if m:
+        num = float(m.group(1))
+        unit = m.group(2)
+        if unit == "D":
+            return max(num / 365.0, 1e-6)
+        if unit == "W":
+            return max((num * 7.0) / 365.0, 1e-6)
+        if unit == "M":
+            return max(num / 12.0, 1e-6)
+        if unit == "Y":
+            return max(num, 1e-6)
+    try:
+        return max(float(s), 1e-6)
+    except ValueError:
+        return 1.0
+
+
+class _CegaDict(dict):  # type: ignore[type-arg]
+    """Dictionary subclass for Result.Cega supporting both nested [A][B] and pair 'A&B' key lookups."""
+
+    def __contains__(self, key: object) -> bool:
+        if super().__contains__(key):
+            return True
+        if isinstance(key, str) and "&" in key:
+            a, b = key.split("&", 1)
+            row_a = super().get(a)
+            if isinstance(row_a, Mapping) and b in row_a:
+                return True
+            row_b = super().get(b)
+            if isinstance(row_b, Mapping) and a in row_b:
+                return True
+        return False
+
+    def __getitem__(self, key: Any) -> Any:
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        if isinstance(key, str) and "&" in key:
+            a, b = key.split("&", 1)
+            row_a = super().get(a)
+            if isinstance(row_a, Mapping) and b in row_a:
+                return row_a[b]
+            row_b = super().get(b)
+            if isinstance(row_b, Mapping) and a in row_b:
+                return row_b[a]
+        raise KeyError(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def _attach_runtime_market_metadata(
+    state: AutocallPreprocState,
+    req_model: EQAutocallableTradeRequest,
+) -> None:
+    """Attaches raw market specs (RepoSpreadCurves, FX VolatilitySurfaces) and warning flags onto state."""
+    mds = req_model.Model.MarketDataSet
+    if getattr(mds, "RepoSpreadCurves", None):
+        setattr(state, "repo_curves_map", dict(mds.RepoSpreadCurves))
+    fx_specs: dict[str, Any] = {}
+    quanto_meta = getattr(state, "quanto_meta", None) or {}
+    for ticker, qm in quanto_meta.items():
+        if not isinstance(qm, Mapping):
+            continue
+        fx_id = str(qm.get("fx_id", ""))
+        if fx_id and fx_id in mds.VolatilitySurfaces:
+            fx_specs[fx_id] = mds.VolatilitySurfaces[fx_id]
+        if "fx_sign" not in qm and isinstance(qm, dict):
+            pay_ccy = str(state.payment_currency).strip().upper()
+            fx_clean = fx_id.strip().upper().replace("_", "").replace("/", "")
+            qm["fx_sign"] = (
+                -1.0
+                if (pay_ccy and len(fx_clean) >= len(pay_ccy) and fx_clean.startswith(pay_ccy) and not fx_clean.endswith(pay_ccy))
+                else 1.0
+            )
+    if fx_specs:
+        setattr(state, "quanto_fx_specs", fx_specs)
+
+    prod = req_model.Product
+    ki_lvl = getattr(prod, "OptionDownAndInBarrierLevel", None)
+    ki_obs_type = getattr(prod, "OptionDownAndInBarrierObservationType", None)
+    if ki_lvl is not None and float(ki_lvl) > 0.0 and ki_obs_type is None:
+        st_warns = list(getattr(state, "warnings", None) or [])
+        if "KI_OBS_TYPE_DEFAULTED_EUROPEAN" not in st_warns:
+            st_warns.append("KI_OBS_TYPE_DEFAULTED_EUROPEAN")
+        setattr(state, "warnings", st_warns)
+        s_warns = getattr(state.seasoned_state, "warnings", None)
+        if isinstance(s_warns, list):
+            if "KI_OBS_TYPE_DEFAULTED_EUROPEAN" not in s_warns:
+                s_warns.append("KI_OBS_TYPE_DEFAULTED_EUROPEAN")
+        elif isinstance(s_warns, tuple):
+            if "KI_OBS_TYPE_DEFAULTED_EUROPEAN" not in s_warns:
+                try:
+                    object.__setattr__(
+                        state.seasoned_state,
+                        "warnings",
+                        (*s_warns, "KI_OBS_TYPE_DEFAULTED_EUROPEAN"),
+                    )
+                except Exception:
+                    pass
+        elif s_warns is None:
+            try:
+                object.__setattr__(
+                    state.seasoned_state,
+                    "warnings",
+                    ("KI_OBS_TYPE_DEFAULTED_EUROPEAN",),
+                )
+            except Exception:
+                pass
+
+
+def _collect_state_and_surface_warnings(state: AutocallPreprocState) -> list[str]:
+    """Collects deduplicated warnings from AutocallPreprocState, SeasonedScheduleState, and RegularizedVolSurface."""
+    out: list[str] = []
+    for src in (
+        getattr(state, "warnings", None),
+        getattr(state.seasoned_state, "warnings", None),
+    ):
+        if src:
+            for w in src:
+                w_s = str(w)
+                if w_s not in out:
+                    out.append(w_s)
+    for surf in (state.vol_surfaces or {}).values():
+        surf_warns = getattr(surf, "warnings", None)
+        if surf_warns:
+            for w in surf_warns:
+                w_s = str(w)
+                if w_s not in out:
+                    out.append(w_s)
+    return out
+
+
+def _merge_fx_vega_and_cega(
+    greeks_out: AutocallGreeksResult | None,
+    state: AutocallPreprocState,
+    req_model: EQAutocallableTradeRequest,
+) -> tuple[dict[str, list[list[float]]] | None, dict[str, dict[str, float]] | None]:
+    """Merges FX Vega (projected onto 2D surface grid) and Equity-FX Cega into Result.Vega and Result.Cega."""
+    if greeks_out is None:
+        return None, None
+
+    vega_merged: dict[str, list[list[float]]] | None = (
+        dict(greeks_out.vega) if greeks_out.vega is not None else None
+    )
+    if vega_merged is not None and greeks_out.fx_vega:
+        quanto_meta = getattr(state, "quanto_meta", None) or {}
+        fx_specs_map = getattr(state, "quanto_fx_specs", None) or req_model.Model.MarketDataSet.VolatilitySurfaces
+        tau_obs_np = state.tau_obs.detach().cpu().numpy().astype(np.float64)
+        as_of_dt = req_model.Model.MarketDataSet.AsOfDate
+        fx_accum: dict[str, np.ndarray] = {}
+
+        for ticker, vec_1d in greeks_out.fx_vega.items():
+            qm = quanto_meta.get(ticker) or {}
+            fx_id = str(qm.get("fx_id", ""))
+            if not fx_id or fx_id in vega_merged:
+                continue
+            fx_spec = fx_specs_map.get(fx_id) if isinstance(fx_specs_map, Mapping) else None
+            vec_arr = np.asarray(vec_1d, dtype=np.float64).reshape(-1)
+            if fx_spec is not None and getattr(fx_spec, "VolatilityQuotes", None) is not None:
+                q_arr = np.asarray(fx_spec.VolatilityQuotes, dtype=np.float64)
+                if q_arr.ndim == 2 and q_arr.shape[0] > 0 and q_arr.shape[1] > 0:
+                    n_ten, n_cols = q_arr.shape
+                    deltas_raw = getattr(fx_spec, "Deltas", None) or ()
+                    atm_idx = n_cols // 2
+                    for d_i, d_tok in enumerate(deltas_raw):
+                        if str(d_tok).strip().upper() in ("ATM", "ATMF", "DNS", "0.5", "50D"):
+                            atm_idx = d_i
+                            break
+                    tenors_raw = getattr(fx_spec, "Tenors", None)
+                    exp_raw = getattr(fx_spec, "ExpirationDates", None)
+                    if tenors_raw is not None and len(tenors_raw) == n_ten:
+                        t_grid = np.array([_parse_fx_tenor_to_years(t) for t in tenors_raw], dtype=np.float64)
+                    elif exp_raw is not None and len(exp_raw) == n_ten:
+                        t_grid = np.array(
+                            [max(year_fraction(as_of_dt, e_dt, "Act365"), 1e-6) for e_dt in exp_raw],
+                            dtype=np.float64,
+                        )
+                    else:
+                        t_grid = np.linspace(0.25, max(float(tau_obs_np[-1]) if tau_obs_np.size else 1.0, 0.25), n_ten)
+
+                    grid_2d = fx_accum.get(fx_id)
+                    if grid_2d is None:
+                        grid_2d = np.zeros((n_ten, n_cols), dtype=np.float64)
+                        fx_accum[fx_id] = grid_2d
+
+                    for m_i in range(min(len(vec_arr), len(tau_obs_np))):
+                        g_m = float(vec_arr[m_i])
+                        t_m = float(tau_obs_np[m_i])
+                        if n_ten == 1 or t_m <= float(t_grid[0]):
+                            grid_2d[0, atm_idx] += g_m
+                        elif t_m >= float(t_grid[-1]):
+                            grid_2d[-1, atm_idx] += g_m
+                        else:
+                            idx_hi = int(np.searchsorted(t_grid, t_m, side="right"))
+                            idx_lo = max(idx_hi - 1, 0)
+                            t_lo = float(t_grid[idx_lo])
+                            t_hi = float(t_grid[idx_hi])
+                            w_hi = (t_m - t_lo) / max(t_hi - t_lo, 1e-12)
+                            grid_2d[idx_lo, atm_idx] += (1.0 - w_hi) * g_m
+                            grid_2d[idx_hi, atm_idx] += w_hi * g_m
+                    continue
+            fx_accum[fx_id] = fx_accum.get(fx_id, np.zeros((1, len(vec_arr)), dtype=np.float64)) + vec_arr[None, :]
+
+        for fx_id, mat_2d in fx_accum.items():
+            vega_merged[fx_id] = mat_2d.tolist()
+
+    cega_merged: dict[str, dict[str, float]] | None = None
+    if greeks_out.cega is not None:
+        base_cega: dict[str, dict[str, float]] = {
+            k: dict(v) for k, v in greeks_out.cega.items()
+        }
+        if greeks_out.fx_cega:
+            for ticker, fx_map in greeks_out.fx_cega.items():
+                if not isinstance(fx_map, Mapping):
+                    continue
+                base_cega.setdefault(ticker, {})
+                for fx_id, c_val in fx_map.items():
+                    val_f = float(c_val)
+                    base_cega[ticker][fx_id] = val_f
+                    fx_row = base_cega.setdefault(fx_id, {})
+                    fx_row[ticker] = val_f
+                    fx_row.setdefault(fx_id, 0.0)
+        cega_merged = _CegaDict(base_cega)
+
+    return vega_merged, cega_merged
+
+
 def _compute_qmc_crn_if_available(
     state: AutocallPreprocState,
     *,
     queries: Sequence[str],
     n_paths: int,
 ) -> AutocallGreeksResult:
-    """Uses M5 `compute_qmc_crn_greeks` when merged, else falls back cleanly to `compute_eq_autocall_greeks`."""
+    """Uses `compute_qmc_crn_greeks` with fast CPU-safe `DupireQMCConfig` when on CPU."""
     crn_fn = getattr(_greeks_mod, "compute_qmc_crn_greeks", None)
     if callable(crn_fn):
         try:
-            qmc_mod = importlib.import_module("deepvol.models.autocall.dupire_qmc_solver")
-            cfg_cls = getattr(qmc_mod, "DupireQMCConfig", None)
+            cfg_cls = None
+            for mod_name in (
+                "deepvol.models.autocall.dupire_qmc_gpu",
+                "deepvol.models.autocall.dupire_qmc_solver",
+            ):
+                try:
+                    qmc_mod = importlib.import_module(mod_name)
+                    cfg_cls = getattr(qmc_mod, "DupireQMCConfig", None)
+                    if cfg_cls is not None:
+                        break
+                except Exception:
+                    continue
             if cfg_cls is not None:
-                cfg = cfg_cls(n_paths=int(n_paths))
+                is_cpu = state.spots_t0.device.type == "cpu" and not torch.cuda.is_available()
+                if is_cpu:
+                    cfg = cfg_cls(
+                        n_paths=min(int(n_paths), 2048),
+                        n_replicates=1,
+                        n_substeps=4,
+                        lv_grid_nt=32,
+                        lv_grid_ny=64,
+                    )
+                else:
+                    cfg = cfg_cls(n_paths=int(n_paths))
                 return crn_fn(state, queries=queries, config=cfg)  # type: ignore[no-any-return]
             return crn_fn(state, queries=queries)  # type: ignore[no-any-return]
         except Exception:
@@ -564,7 +824,8 @@ class EQAutocallRuntime:
             else EQAutocallModelGuardian(
                 d_max=self.d_max,
                 m_max=self.m_max,
-                record_drift_by_default=True,
+                record_drift_by_default=False,
+                psi_hard_circuit_breaker=False,
             )
         )
         if self.stats_path is not None and self.stats_path.is_file():
@@ -650,6 +911,7 @@ class EQAutocallRuntime:
             d_max=self.d_max,
             m_max=self.m_max,
         )
+        _attach_runtime_market_metadata(state, req_model)
         if state.baseline is None:
             state.baseline = compute_analytical_autocall_baseline(state)
 
@@ -690,9 +952,13 @@ class EQAutocallRuntime:
             if len(greek_queries_present) > 0:
                 greeks_engine_used = "Tier1_AnalyticalProxy"
         elif force_surrogate and state.m_rem > 0 and not state.seasoned_state.already_autocalled:
-            pre_passed, pre_reasons, r_psd, diag = self.guardian.evaluate_pre_inference(state)
+            pre_passed, pre_reasons, r_psd, diag = self.guardian.evaluate_pre_inference(
+                state,
+                record_drift=False,
+            )
             if bool(diag.get("correlation_shrunk_applied", diag.get("correlation_shrunk", False))):
                 _ = self.guardian._apply_shrunk_correlation_to_state(state, r_psd)
+                _attach_runtime_market_metadata(state, req_model)
             if len(greek_queries_present) > 0:
                 greeks_out = compute_eq_autocall_greeks(
                     state,
@@ -801,8 +1067,10 @@ class EQAutocallRuntime:
                 surrogate=self._cpu_surrogate,
                 n_fallback_paths=self.n_fallback_paths,
                 force_qmc=force_qmc,
+                record_drift=False,
                 greeks_fn=greeks_fn,
             )
+            _attach_runtime_market_metadata(guardian_res.preproc_state, req_model)
             pv_val = float(guardian_res.product_value)
             se_val = float(guardian_res.standard_error)
             notional_val = float(guardian_res.notional_pv)
@@ -859,6 +1127,15 @@ class EQAutocallRuntime:
             for cf in cf_items
         ]
 
+        if audit_dict is not None:
+            extra_warns = _collect_state_and_surface_warnings(active_state)
+            cur_warns = list(audit_dict.get("warnings") or [])
+            for w_s in extra_warns:
+                if w_s not in cur_warns:
+                    cur_warns.append(w_s)
+            audit_dict["warnings"] = cur_warns
+
+        vega_out, cega_out = _merge_fx_vega_and_cega(greeks_out, active_state, req_model)
         latency_ms = (time.perf_counter() - t0) * 1e3
         primary_fb_reason = fb_reasons_str[0] if len(fb_reasons_str) > 0 else None
 
@@ -875,13 +1152,13 @@ class EQAutocallRuntime:
                 if greeks_out is not None
                 else None
             ),
-            Vega=greeks_out.vega if greeks_out is not None else None,
+            Vega=vega_out,
             Rho=greeks_out.rho if greeks_out is not None else None,
             DividendsSensitivities=(
                 greeks_out.dividends_sensitivities if greeks_out is not None else None
             ),
             Theta=greeks_out.theta if greeks_out is not None else None,
-            Cega=greeks_out.cega if greeks_out is not None else None,
+            Cega=cega_out,
             TradeInfo=req_model.TradeInfo,
             engine_used=engine_used_str,
             fallback_triggered=fb_triggered,
@@ -1173,13 +1450,16 @@ class EQAutocallRuntime:
         greek_queries_present = [
             q for q in requested_queries if q in ALL_8_GREEK_QUERIES or q == "ConvexCega"
         ]
+        _attach_runtime_market_metadata(state_k, req_m)
         guardian_res = self.guardian.price_with_guardian(
             state_k,
             surrogate=None,
             n_fallback_paths=self.n_fallback_paths,
             force_qmc=True,
+            record_drift=False,
             greeks_fn=None,
         )
+        _attach_runtime_market_metadata(guardian_res.preproc_state, req_m)
         greeks_out: AutocallGreeksResult | None = None
         greeks_engine_used = "None"
         if compute_greeks and len(greek_queries_present) > 0:
@@ -1192,6 +1472,13 @@ class EQAutocallRuntime:
 
         audit_dict = guardian_res.audit_record.to_dict()
         audit_dict["greeks_engine_used"] = greeks_engine_used
+        extra_warns = _collect_state_and_surface_warnings(guardian_res.preproc_state)
+        cur_warns = list(audit_dict.get("warnings") or [])
+        for w_s in extra_warns:
+            if w_s not in cur_warns:
+                cur_warns.append(w_s)
+        audit_dict["warnings"] = cur_warns
+        vega_out, cega_out = _merge_fx_vega_and_cega(greeks_out, guardian_res.preproc_state, req_m)
         cf_rows = [
             CashFlowRow.model_construct(
                 Description=str(cf.Description),
@@ -1218,13 +1505,13 @@ class EQAutocallRuntime:
                 if greeks_out is not None
                 else None
             ),
-            Vega=greeks_out.vega if greeks_out is not None else None,
+            Vega=vega_out,
             Rho=greeks_out.rho if greeks_out is not None else None,
             DividendsSensitivities=(
                 greeks_out.dividends_sensitivities if greeks_out is not None else None
             ),
             Theta=greeks_out.theta if greeks_out is not None else None,
-            Cega=greeks_out.cega if greeks_out is not None else None,
+            Cega=cega_out,
             TradeInfo=req_m.TradeInfo,
             engine_used=guardian_res.engine_selected,
             fallback_triggered=bool(guardian_res.fallback_triggered),
@@ -1350,13 +1637,18 @@ class EQAutocallRuntime:
                         d_max=self.d_max,
                         m_max=self.m_max,
                     )
+                    _attach_runtime_market_metadata(state_i, req_m)
                     if state_i.baseline is None:
                         state_i.baseline = compute_analytical_autocall_baseline(state_i)
                     if state_i.m_rem == 0 or state_i.seasoned_state.already_autocalled:
                         continue
-                    pre_passed, pre_reasons, r_psd, diag = self.guardian.evaluate_pre_inference(state_i)
+                    pre_passed, pre_reasons, r_psd, diag = self.guardian.evaluate_pre_inference(
+                        state_i,
+                        record_drift=False,
+                    )
                     if bool(diag.get("correlation_shrunk", False)):
                         _ = self.guardian._apply_shrunk_correlation_to_state(state_i, r_psd)
+                        _attach_runtime_market_metadata(state_i, req_m)
                     pre_state_cache[req_cache_key] = (state_i, pre_passed, pre_reasons, r_psd, diag)
                 else:
                     state_i, pre_passed, pre_reasons, r_psd, diag = cached_pre

@@ -12,7 +12,7 @@ from deepvol.surrogates.eq_autocall_egno import MaskedEQAutocallSurrogate
 
 # Drop B=1024 from CUDAGraph buckets (compute-bound & Arrow B=1024 uses autograd); keeps VRAM <= 150 MB.
 BATCH_BUCKETS: Tuple[int, ...] = (1, 16, 64, 256)
-GEOM_BUCKETS: Tuple[Tuple[int, int], ...] = ((5, 1), (5, 12), (8, 12), (8, 48))
+GEOM_BUCKETS: Tuple[Tuple[int, int], ...] = ((5, 1), (5, 12), (8, 12), (8, 48), (8, 64))
 
 _ResidualsFn = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],

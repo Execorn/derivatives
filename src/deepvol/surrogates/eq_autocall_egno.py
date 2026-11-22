@@ -1074,7 +1074,7 @@ def assemble_surrogate_product_value(
         eff_put_loss = torch.minimum(eff_put_loss, k_eff * surv_term)
 
     long_t = torch.as_tensor(long_eff, dtype=dtype, device=device)
-    put_sign_t = 2.0 * long_t - 1.0
+    put_sign_t = -torch.ones_like(long_t, dtype=dtype, device=device)
     pv_option = put_sign_t * df_term * g_put * eff_put_loss
     pv_option = (
         pv_option

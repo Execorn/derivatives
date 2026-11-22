@@ -370,7 +370,8 @@ def _assemble_w1_pv_torch(
             pv_cpn = pv_cpn + df_u[m] * (sp_u[m] * eq_u[m] * c_eff + pm_u[m] * autocall_coupon)
             mem_buf = (1.0 - eq_u[m]) * c_eff
 
-    put_sign = 1.0 if is_long_basket else -1.0
+    _ = is_long_basket
+    put_sign = -1.0
     pv_opt = put_sign * df_pay[-1] * option_gearing * baseline.l_put_proxy
     return pv_notional + pv_cpn + pv_opt
 
@@ -430,7 +431,7 @@ def _build_contract_state_and_jacs(
     ref_np = np.full(d_active, 100.0, dtype=np.float64)
     spots_np = ref_np * m0_np
 
-    r_disc = 0.02 + 0.14 * float(u_row[2])
+    r_disc = (0.02 + 0.20 * float(u_row[2])) if domain_mode == "tier2_desk" else (0.02 + 0.14 * float(u_row[2]))
     div_yields = 0.04 * rng.random(d_active)
     repo_avg_np = 0.03 * rng.random(d_active)
     carry_1y_np = r_disc - div_yields - repo_avg_np
@@ -528,6 +529,12 @@ def _build_contract_state_and_jacs(
         generator=gen_corr,
     )
     corr_t = corr_b[0]
+    if domain_mode == "tier2_desk" and d_active >= 2:
+        rho_pos = 0.15 + 0.60 * float(u_row[5])
+        eye_c = torch.eye(d_active, dtype=torch.float64)
+        r_pos = rho_pos * (1.0 - eye_c) + eye_c
+        corr_t = 0.35 * corr_t + 0.65 * r_pos
+        corr_t.diagonal().fill_(1.0)
 
     # Contract payoff terms & independent digital spreads
     if opt_idx == "Dispersion":
@@ -570,7 +577,8 @@ def _build_contract_state_and_jacs(
 
     def _draw_spread() -> float:
         if domain_mode == "tier2_desk":
-            return -(0.005 + 0.135 * float(rng.random()))
+            u_sp = float(rng.random())
+            return 0.0 if u_sp < 0.03 else -(0.005 + 0.145 * ((u_sp - 0.03) / 0.97))
         u_s = float(rng.random())
         if u_s < 0.05:
             return 0.0
@@ -686,7 +694,7 @@ def _build_contract_state_and_jacs(
 
     carry_t = torch.tensor(carry_1y_np, dtype=torch.float64)
     repo_t = torch.tensor(repo_avg_np, dtype=torch.float64)
-    div_lev_cap = 0.05 if domain_mode == "tier2_desk" else 0.06
+    div_lev_cap = (0.30 if float(u_row[16]) < 0.25 else 0.06) if domain_mode == "tier2_desk" else 0.06
     div_lev_np = np.where(rng.random(d_active) < 0.35, 0.0, div_lev_cap * rng.random(d_active))
     div_lev_log_t = torch.tensor(div_lev_np, dtype=torch.float64)
     cash_lev_t = torch.exp(div_lev_log_t).unsqueeze(1).expand(d_active, m_rem).clone()
