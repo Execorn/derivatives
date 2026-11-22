@@ -123,6 +123,7 @@ class EscrowedDividendOutput:
     dividend_obs_incidence: dict[str, torch.Tensor] = field(default_factory=dict)
     quanto_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
     high_dividend_warning: bool = False
+    r_native_obs: torch.Tensor | None = None
 
 
 def build_repo_rate_evaluator(
@@ -342,11 +343,327 @@ def merge_dividend_schedules(
     return merged
 
 
-def _infer_asset_currency(ticker: str, default_ccy: str) -> str:
-    parts = ticker.rsplit("_", 1)
-    if len(parts) == 2 and len(parts[1]) == 3 and parts[1].isalpha():
-        return parts[1].upper()
-    return default_ccy.upper()
+_KNOWN_ISO_CURRENCIES: frozenset[str] = frozenset(
+    {
+        "RUB",
+        "USD",
+        "CNH",
+        "CNY",
+        "EUR",
+        "GBP",
+        "HKD",
+        "CHF",
+        "JPY",
+        "AED",
+        "KZT",
+        "TRY",
+        "INR",
+        "BRL",
+        "ZAR",
+        "BYN",
+        "CAD",
+        "AUD",
+        "SGD",
+    }
+)
+_ISO_CCY_CODES: frozenset[str] = _KNOWN_ISO_CURRENCIES
+
+_NON_CCY_TICKER_SUFFIXES: frozenset[str] = frozenset(
+    {
+        "OLD",
+        "NEW",
+        "REG",
+        "PREF",
+        "P",
+        "DR",
+        "ADR",
+        "GDR",
+        "CLS",
+        "LOCAL",
+        "SHS",
+        "ORD",
+        "A",
+        "B",
+        "C",
+        "1",
+        "2",
+        "RTS",
+        "MOEX",
+    }
+)
+_VERSION_TAG_SUFFIXES: frozenset[str] = _NON_CCY_TICKER_SUFFIXES
+
+_COUNTRY_SUFFIX_TO_CCY: dict[str, str] = {
+    "US": "USD",
+    "HK": "HKD",
+    "CN": "CNH",
+    "EU": "EUR",
+    "LN": "GBP",
+    "GR": "EUR",
+    "FP": "EUR",
+    "GY": "EUR",
+    "SW": "CHF",
+    "JP": "JPY",
+    "KZ": "KZT",
+}
+
+_OIS_CURVE_KEYWORDS: tuple[str, ...] = (
+    "OIS",
+    "SOFR",
+    "RUONIA",
+    "ESTR",
+    "SONIA",
+    "TONAR",
+    "SARON",
+    "SHIBOR",
+)
+_OIS_KEYWORDS: tuple[str, ...] = _OIS_CURVE_KEYWORDS
+
+_FUNDING_CURVE_KEYWORDS: tuple[str, ...] = (
+    "FUNDING",
+    "FUND",
+    "SECD",
+)
+
+
+def strip_version_tags(ticker: str) -> list[str]:
+    """Splits a ticker on '_' and strips trailing share-class or version tags."""
+    tokens = [tok.strip().upper() for tok in str(ticker).split("_") if tok.strip()]
+    while len(tokens) > 1:
+        tail = tokens[-1]
+        if tail in _NON_CCY_TICKER_SUFFIXES:
+            tokens.pop()
+        elif tail == "RX" and len(tokens) >= 3 and len(tokens[-2]) == 3 and tokens[-2].isalpha():
+            tokens.pop()
+        else:
+            break
+    return tokens
+
+
+def _extract_explicit_ccy(obj: Any) -> str | None:
+    if obj is None:
+        return None
+    if isinstance(obj, Mapping):
+        raw = obj.get("Currency", obj.get("currency"))
+    else:
+        raw = getattr(obj, "Currency", getattr(obj, "currency", None))
+    if raw is None:
+        return None
+    ccy = str(getattr(raw, "value", raw)).strip().upper()
+    if len(ccy) == 3 and ccy.isalpha() and ccy not in _NON_CCY_TICKER_SUFFIXES:
+        return ccy
+    return None
+
+
+def _is_equity_vol_surface_obj(obj: Any) -> bool:
+    if obj is None:
+        return False
+    t_name = obj.get("TypeName") if isinstance(obj, Mapping) else getattr(obj, "TypeName", None)
+    if t_name == "FXVolatilitySmileCollection":
+        return False
+    if t_name == "EquityVolatilitySmileCollection":
+        return True
+    has_strikes = (
+        ("Strikes" in obj or "strikes" in obj)
+        if isinstance(obj, Mapping)
+        else (hasattr(obj, "Strikes") or hasattr(obj, "strikes"))
+    )
+    has_deltas = (
+        ("Deltas" in obj or "deltas" in obj)
+        if isinstance(obj, Mapping)
+        else (hasattr(obj, "Deltas") or hasattr(obj, "deltas"))
+    )
+    return bool(has_strikes and not has_deltas)
+
+
+def _infer_asset_currency(
+    ticker: str,
+    default_ccy: str = "RUB",
+    div_spec: Any = None,
+    fx_smiles: Any = None,
+    correlations: Any = None,
+    rate_curve_ids: Sequence[str] = (),
+    *,
+    dividends_map: Mapping[str, Any] | None = None,
+    predefined_dividends_map: Mapping[str, Any] | None = None,
+    vol_surfaces: Mapping[str, Any] | None = None,
+    rates_bundles: Mapping[str, Any] | Sequence[str] | None = None,
+) -> str:
+    """5-tier deterministic asset currency resolution from metadata, tokens, FX pairs, and curves."""
+    pay_ccy = str(default_ccy).strip().upper()
+    ticker_str = str(ticker).strip()
+    ticker_u = ticker_str.upper()
+
+    explicit_ccy = _extract_explicit_ccy(div_spec)
+    if explicit_ccy is not None:
+        return explicit_ccy
+    for src_map in (predefined_dividends_map, dividends_map, vol_surfaces):
+        if isinstance(src_map, Mapping) and ticker_str in src_map and src_map[ticker_str] is not None:
+            map_ccy = _extract_explicit_ccy(src_map[ticker_str])
+            if map_ccy is not None:
+                return map_ccy
+
+    known_ccys: set[str] = set(_KNOWN_ISO_CURRENCIES)
+    if len(pay_ccy) == 3 and pay_ccy.isalpha() and pay_ccy not in _NON_CCY_TICKER_SUFFIXES:
+        known_ccys.add(pay_ccy)
+
+    active_rate_ccys: set[str] = set()
+    all_curve_ids: list[str] = [str(cid) for cid in (rate_curve_ids or ())]
+    if isinstance(rates_bundles, Mapping):
+        for k_cid, c_obj in rates_bundles.items():
+            all_curve_ids.append(str(k_cid))
+            c_ccy = _extract_explicit_ccy(c_obj)
+            if c_ccy is not None:
+                known_ccys.add(c_ccy)
+                active_rate_ccys.add(c_ccy)
+            c_ident = (
+                c_obj.get("Identifier", c_obj.get("identifier"))
+                if isinstance(c_obj, Mapping)
+                else getattr(c_obj, "Identifier", getattr(c_obj, "identifier", None))
+            )
+            if c_ident is not None:
+                all_curve_ids.append(str(c_ident))
+    elif isinstance(rates_bundles, Sequence) and not isinstance(rates_bundles, (str, bytes)):
+        all_curve_ids.extend(str(cid) for cid in rates_bundles)
+
+    for cid_raw in all_curve_ids:
+        cid_u = cid_raw.strip().upper()
+        if len(cid_u) >= 3 and cid_u[:3].isalpha():
+            prefix3 = cid_u[:3]
+            if prefix3 in _KNOWN_ISO_CURRENCIES:
+                active_rate_ccys.add(prefix3)
+                known_ccys.add(prefix3)
+            elif (len(cid_u) == 3 or cid_u[3] in ("_", "-", "/")) and prefix3 not in _NON_CCY_TICKER_SUFFIXES:
+                active_rate_ccys.add(prefix3)
+                known_ccys.add(prefix3)
+
+    active_fx_ccys: set[str] = set()
+    fx_pair_entries: list[tuple[str, str]] = []
+    for surf_src, is_dedicated_fx in ((fx_smiles, True), (vol_surfaces, False)):
+        if surf_src is None:
+            continue
+        if isinstance(surf_src, Mapping):
+            items_iter = list(surf_src.items())
+        elif isinstance(surf_src, Sequence) and not isinstance(surf_src, (str, bytes)):
+            items_iter = [(str(k), None) for k in surf_src]
+        else:
+            continue
+        for sid, s_obj in items_iter:
+            if _is_equity_vol_surface_obj(s_obj):
+                continue
+            t_name = (
+                s_obj.get("TypeName")
+                if isinstance(s_obj, Mapping)
+                else getattr(s_obj, "TypeName", None)
+            )
+            sid_clean = str(sid).strip().upper().replace("_", "").replace("/", "").replace("-", "")
+            if len(sid_clean) == 6 and sid_clean.isalpha():
+                c1, c2 = sid_clean[:3], sid_clean[3:]
+                is_fx_pair = (
+                    t_name == "FXVolatilitySmileCollection"
+                    or (c1 in known_ccys and c2 in known_ccys)
+                    or (is_dedicated_fx and s_obj is None)
+                )
+                if is_fx_pair and c1 not in _NON_CCY_TICKER_SUFFIXES and c2 not in _NON_CCY_TICKER_SUFFIXES:
+                    known_ccys.add(c1)
+                    known_ccys.add(c2)
+                    active_fx_ccys.add(c1)
+                    active_fx_ccys.add(c2)
+                    fx_pair_entries.append((str(sid), sid_clean))
+
+    tokens = strip_version_tags(ticker_u)
+    for tok in reversed(tokens[1:]):
+        if len(tok) == 3 and tok.isalpha() and tok in known_ccys:
+            return tok
+
+    if isinstance(correlations, Mapping) and len(correlations) > 0:
+        for raw_fx_id, fx_clean in fx_pair_entries:
+            if f"{ticker_str}&{raw_fx_id}" in correlations or f"{raw_fx_id}&{ticker_str}" in correlations:
+                c1, c2 = fx_clean[:3], fx_clean[3:]
+                if c1 == pay_ccy and c2 != pay_ccy:
+                    return c2
+                if c2 == pay_ccy and c1 != pay_ccy:
+                    return c1
+        for corr_key in correlations:
+            key_s = str(corr_key)
+            if "&" not in key_s:
+                continue
+            left_id, right_id = key_s.split("&", 1)
+            if left_id.strip().upper() == ticker_u:
+                other_id = right_id.strip()
+            elif right_id.strip().upper() == ticker_u:
+                other_id = left_id.strip()
+            else:
+                continue
+            p_clean = other_id.upper().replace("/", "").replace("_", "")
+            if len(p_clean) == 6 and p_clean.isalpha():
+                c1, c2 = p_clean[:3], p_clean[3:]
+                if c1 in known_ccys and c2 in known_ccys:
+                    if c1 == pay_ccy and c2 != pay_ccy:
+                        return c2
+                    if c2 == pay_ccy and c1 != pay_ccy:
+                        return c1
+
+    base_tok = tokens[0] if tokens else ticker_u
+    if len(base_tok) > 4:
+        mapped_ccy = _COUNTRY_SUFFIX_TO_CCY.get(base_tok[-2:])
+        if mapped_ccy is not None and (mapped_ccy in active_rate_ccys or mapped_ccy in active_fx_ccys):
+            return mapped_ccy
+
+    return pay_ccy
+
+
+def infer_asset_currency_from_context(
+    ticker: str,
+    payment_currency: str = "RUB",
+    *,
+    div_spec: Any = None,
+    fx_smiles: Any = None,
+    dividends_map: Mapping[str, Any] | None = None,
+    predefined_dividends_map: Mapping[str, Any] | None = None,
+    vol_surfaces: Mapping[str, Any] | None = None,
+    correlations: Mapping[str, float] | None = None,
+    rates_bundles: Mapping[str, Any] | Sequence[str] | None = None,
+    rate_curve_ids: Sequence[str] = (),
+) -> str:
+    """Context-aware 5-tier deterministic asset currency resolver."""
+    return _infer_asset_currency(
+        ticker,
+        payment_currency,
+        div_spec=div_spec,
+        fx_smiles=fx_smiles,
+        correlations=correlations,
+        rate_curve_ids=rate_curve_ids,
+        dividends_map=dividends_map,
+        predefined_dividends_map=predefined_dividends_map,
+        vol_surfaces=vol_surfaces,
+        rates_bundles=rates_bundles,
+    )
+
+
+_infer_asset_currency_from_context = infer_asset_currency_from_context
+
+
+def equity_forward_curve_priority(
+    curve_id: str,
+    financing_curve_ids: Sequence[str] = (),
+) -> tuple[int, str]:
+    """Ranks candidate same-currency curves for equity forward growth (0=OIS, 1=Std, 2=XCCY, 3=Funding)."""
+    cid_u = str(curve_id).strip().upper()
+    fin_set = {str(fid).strip().upper() for fid in (financing_curve_ids or ())}
+    has_xccy = "XCCY" in cid_u
+    has_funding_tag = any(k in cid_u for k in _FUNDING_CURVE_KEYWORDS)
+
+    if not has_xccy and not has_funding_tag and any(k in cid_u for k in _OIS_CURVE_KEYWORDS):
+        return (0, cid_u)
+    if not has_xccy and not has_funding_tag and cid_u not in fin_set:
+        return (1, cid_u)
+    if has_xccy and not has_funding_tag:
+        return (2, cid_u)
+    return (3, cid_u)
+
+
+curve_ois_priority_rank = equity_forward_curve_priority
 
 
 def _eval_fx_atm_vol_batch(fx_spec: Any, tau_eval_arr: npt.NDArray[np.float64]) -> Tuple[npt.NDArray[np.float64], str]:
@@ -445,7 +762,43 @@ def _eval_eq_atm_vol(eq_spec: Any, as_of_dt: datetime, obs_dt: datetime, spot_va
     slice_vols = np.array([float(np.interp(spot_val, strikes, row)) for row in quotes], dtype=np.float64)
     if len(tenors) == 1:
         return float(slice_vols[0])
-    return float(np.interp(t_eval, tenors, slice_vols))
+    order = np.argsort(tenors)
+    tenors = tenors[order]
+    slice_vols = slice_vols[order]
+    if t_eval <= float(tenors[0]):
+        return float(slice_vols[0])
+    if t_eval >= float(tenors[-1]):
+        return float(slice_vols[-1])
+    # Interpolate linearly in total variance (sigma^2 * T) to match RegularizedVolSurface.iv
+    slice_vars = (slice_vols * slice_vols) * np.maximum(tenors, 0.0)
+    w_eval = float(np.interp(t_eval, tenors, slice_vars))
+    return float(np.sqrt(max(w_eval / max(t_eval, 1e-12), 0.0)))
+
+
+class QuantoFXSpec(tuple[str, Any, float]):
+    """3-tuple (fx_id, fx_spec, rho_s_fx) exposing .fx_id, .fx_spec, .rho_s_fx, .fx_sign, and .rho_quoted."""
+
+    fx_id: str
+    fx_spec: Any
+    rho_s_fx: float
+    fx_sign: float
+    rho_quoted: float
+
+    def __new__(
+        cls,
+        fx_id: str,
+        fx_spec: Any,
+        rho_s_fx: float,
+        fx_sign: float = 1.0,
+        rho_quoted: float = 0.0,
+    ) -> QuantoFXSpec:
+        obj = super().__new__(cls, (str(fx_id), fx_spec, float(rho_s_fx)))
+        obj.fx_id = str(fx_id)
+        obj.fx_spec = fx_spec
+        obj.rho_s_fx = float(rho_s_fx)
+        obj.fx_sign = float(fx_sign)
+        obj.rho_quoted = float(rho_quoted)
+        return obj
 
 
 def _lookup_quanto_fx_spec(
@@ -454,22 +807,36 @@ def _lookup_quanto_fx_spec(
     payment_currency: str,
     vol_surfaces: Mapping[str, Any] | None,
     correlations: Mapping[str, float] | None,
-) -> Tuple[str, Any, float] | None:
-    """Resolves (fx_id, fx_spec, signed_rho_s_fx) for a foreign-currency equity."""
+    asset_ccy: str | None = None,
+    div_spec: Any = None,
+    rate_curve_ids: Sequence[str] = (),
+) -> QuantoFXSpec | None:
+    """Resolves (fx_id, fx_spec, signed_rho_s_fx) with .fx_sign and .fx_id for a foreign-currency equity."""
     if not vol_surfaces or not correlations:
         return None
     pay_ccy = payment_currency.strip().upper()
-    asset_ccy = _infer_asset_currency(ticker, pay_ccy)
-    if asset_ccy == pay_ccy:
+    resolved_asset_ccy = (
+        asset_ccy.strip().upper()
+        if (isinstance(asset_ccy, str) and len(asset_ccy.strip()) == 3)
+        else _infer_asset_currency(
+            ticker,
+            pay_ccy,
+            div_spec=div_spec,
+            fx_smiles=vol_surfaces,
+            correlations=correlations,
+            rate_curve_ids=rate_curve_ids,
+        )
+    )
+    if resolved_asset_ccy == pay_ccy:
         return None
 
     fx_candidates = (
-        f"{asset_ccy}_{pay_ccy}",
-        f"{asset_ccy}{pay_ccy}",
-        f"{asset_ccy}/{pay_ccy}",
-        f"{pay_ccy}_{asset_ccy}",
-        f"{pay_ccy}{asset_ccy}",
-        f"{pay_ccy}/{asset_ccy}",
+        f"{resolved_asset_ccy}_{pay_ccy}",
+        f"{resolved_asset_ccy}{pay_ccy}",
+        f"{resolved_asset_ccy}/{pay_ccy}",
+        f"{pay_ccy}_{resolved_asset_ccy}",
+        f"{pay_ccy}{resolved_asset_ccy}",
+        f"{pay_ccy}/{resolved_asset_ccy}",
     )
     fx_id: str | None = None
     fx_spec: Any = None
@@ -488,10 +855,14 @@ def _lookup_quanto_fx_spec(
                 if isinstance(v_surf, Mapping)
                 else getattr(v_surf, "TypeName", None)
             )
-            if t_name == "FXVolatilitySmileCollection" and asset_ccy in k_id.upper() and pay_ccy in k_id.upper():
+            if (
+                t_name == "FXVolatilitySmileCollection"
+                and resolved_asset_ccy in k_id.upper()
+                and pay_ccy in k_id.upper()
+            ):
                 fx_id = k_id
                 fx_spec = v_surf
-                if k_id.upper().index(pay_ccy) < k_id.upper().index(asset_ccy):
+                if k_id.upper().index(pay_ccy) < k_id.upper().index(resolved_asset_ccy):
                     fx_sign = -1.0
                 break
     if fx_spec is None or fx_id is None:
@@ -500,12 +871,19 @@ def _lookup_quanto_fx_spec(
     k1 = f"{ticker}&{fx_id}"
     k2 = f"{fx_id}&{ticker}"
     if k1 in correlations:
-        rho_s_fx = float(correlations[k1]) * fx_sign
+        rho_quoted = float(correlations[k1])
     elif k2 in correlations:
-        rho_s_fx = float(correlations[k2]) * fx_sign
+        rho_quoted = float(correlations[k2])
     else:
         return None
-    return fx_id, fx_spec, rho_s_fx
+    rho_s_fx = rho_quoted * fx_sign
+    return QuantoFXSpec(
+        str(fx_id),
+        fx_spec,
+        rho_s_fx,
+        fx_sign=fx_sign,
+        rho_quoted=rho_quoted,
+    )
 
 
 def _resolve_quanto_drift_rate(
@@ -601,11 +979,13 @@ def compute_escrowed_dividend_forwards(
             dividend_pv_weights={},
             dividend_obs_incidence={},
             quanto_meta={},
+            r_native_obs=empty_dm,
         )
 
     df_fin_np = np.zeros((d_assets, m_rem), dtype=np.float64)
     df_repo_np = np.zeros((d_assets, m_rem), dtype=np.float64)
     r_tot_np = np.zeros((d_assets, m_rem), dtype=np.float64)
+    r_native_np = np.zeros((d_assets, m_rem), dtype=np.float64)
     repo_avg_np = np.zeros(d_assets, dtype=np.float64)
 
     dividend_events_map: dict[str, list[ParsedDividendEvent]] = {}
@@ -622,6 +1002,29 @@ def compute_escrowed_dividend_forwards(
 
     pay_ccy_upper = payment_currency.strip().upper()
     has_quanto_data = bool(vol_surfaces and correlations)
+
+    rate_curve_id_list: list[str] = []
+    if asset_financing_curves is not None:
+        for k_cid, v_cobj in asset_financing_curves.items():
+            rate_curve_id_list.append(str(k_cid))
+            for attr_name in ("identifier", "Identifier", "currency", "Currency"):
+                attr_val = (
+                    v_cobj.get(attr_name)
+                    if isinstance(v_cobj, Mapping)
+                    else getattr(v_cobj, attr_name, None)
+                )
+                if attr_val is not None:
+                    rate_curve_id_list.append(str(attr_val))
+    if discount_curve is not None:
+        for attr_name in ("identifier", "Identifier", "currency", "Currency"):
+            attr_val = (
+                discount_curve.get(attr_name)
+                if isinstance(discount_curve, Mapping)
+                else getattr(discount_curve, attr_name, None)
+            )
+            if attr_val is not None:
+                rate_curve_id_list.append(str(attr_val))
+    rate_curve_ids_tuple = tuple(rate_curve_id_list)
 
     # Cache per-curve evaluators inside this call so domestic assets share one evaluation
     fin_eval_cache: dict[
@@ -738,6 +1141,22 @@ def compute_escrowed_dividend_forwards(
             df_fut_arr = np.zeros(0, dtype=np.float64)
 
         df_repo_np[i, :] = np.exp(-q_obs_arr * tau_repo_obs)
+        r_native_i = r_times_tau_fin_obs - q_obs_arr * tau_repo_obs
+        r_native_np[i, :] = r_native_i
+
+        div_spec_i = (
+            predefined_dividends.get(ticker)
+            if (predefined_dividends and ticker in predefined_dividends and predefined_dividends[ticker] is not None)
+            else (market_dividends.get(ticker) if market_dividends else None)
+        )
+        asset_ccy_i = _infer_asset_currency(
+            ticker,
+            pay_ccy_upper,
+            div_spec=div_spec_i,
+            fx_smiles=vol_surfaces,
+            correlations=correlations,
+            rate_curve_ids=rate_curve_ids_tuple,
+        )
 
         quanto_resolved = (
             _lookup_quanto_fx_spec(
@@ -745,8 +1164,11 @@ def compute_escrowed_dividend_forwards(
                 payment_currency=payment_currency,
                 vol_surfaces=vol_surfaces,
                 correlations=correlations,
+                asset_ccy=asset_ccy_i,
+                div_spec=div_spec_i,
+                rate_curve_ids=rate_curve_ids_tuple,
             )
-            if has_quanto_data and _infer_asset_currency(ticker, pay_ccy_upper) != pay_ccy_upper
+            if has_quanto_data and asset_ccy_i != pay_ccy_upper
             else None
         )
         if quanto_resolved is not None:
@@ -762,13 +1184,15 @@ def compute_escrowed_dividend_forwards(
                 dtype=np.float64,
             )
             quanto_obs_arr = -rho_s_fx * sig_eq_obs * sig_fx_obs
-            r_tot_np[i, :] = r_times_tau_fin_obs - q_obs_arr * tau_repo_obs + quanto_obs_arr * tau_365_obs
+            r_tot_np[i, :] = r_native_i + quanto_obs_arr * tau_365_obs
             quanto_meta_map[ticker] = {
-                "fx_id": fx_id,
+                "fx_id": str(quanto_resolved.fx_id),
+                "fx_sign": float(quanto_resolved.fx_sign),
+                "rho_quoted": float(quanto_resolved.rho_quoted),
                 "rho_s_fx": float(rho_s_fx),
                 "sig_fx_obs": sig_fx_obs.tolist(),
                 "fx_dcc": fx_dcc,
-                "asset_ccy": _infer_asset_currency(ticker, pay_ccy_upper),
+                "asset_ccy": asset_ccy_i,
             }
             if fut_ex_dates:
                 sig_fx_ex, _ = _eval_fx_atm_vol_batch(fx_spec, np.asarray(fut_ex_taus_365, dtype=np.float64))
@@ -783,7 +1207,7 @@ def compute_escrowed_dividend_forwards(
             else:
                 quanto_fut_arr = np.zeros(0, dtype=np.float64)
         else:
-            r_tot_np[i, :] = r_times_tau_fin_obs - q_obs_arr * tau_repo_obs
+            r_tot_np[i, :] = r_native_i
             quanto_fut_arr = np.zeros(0, dtype=np.float64)
 
         repo_avg_np[i] = float(np.mean(q_obs_arr)) if m_rem > 0 else 0.0
@@ -851,6 +1275,7 @@ def compute_escrowed_dividend_forwards(
     df_fin_t = torch.as_tensor(df_fin_np, dtype=torch.float64, device=device)
     df_repo_t = torch.as_tensor(df_repo_np, dtype=torch.float64, device=device)
     r_tot_t = torch.as_tensor(r_tot_np, dtype=torch.float64, device=device)
+    r_native_t = torch.as_tensor(r_native_np, dtype=torch.float64, device=device)
     repo_avg_t = torch.as_tensor(repo_avg_np, dtype=torch.float64, device=device)
 
     spots_col = spots_t.unsqueeze(1)
@@ -896,12 +1321,20 @@ def compute_escrowed_dividend_forwards(
         dividend_obs_incidence=div_incidence_map,
         quanto_meta=quanto_meta_map,
         high_dividend_warning=high_div_warn,
+        r_native_obs=r_native_t,
     )
 
 
 __all__ = [
     "ParsedDividendEvent",
     "EscrowedDividendOutput",
+    "QuantoFXSpec",
+    "strip_version_tags",
+    "_infer_asset_currency",
+    "infer_asset_currency_from_context",
+    "_infer_asset_currency_from_context",
+    "equity_forward_curve_priority",
+    "curve_ois_priority_rank",
     "build_repo_rate_evaluator",
     "build_discount_rate_evaluator",
     "merge_dividend_schedules",
