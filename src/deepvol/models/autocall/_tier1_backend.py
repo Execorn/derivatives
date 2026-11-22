@@ -931,8 +931,8 @@ def _exact_piecewise_terminal_put(
         if abs(ki_spread) <= 1e-6:
             pts.append(ki_barrier)
         else:
-            pts.append(min(ki_barrier, ki_barrier - ki_spread))
-            pts.append(max(ki_barrier, ki_barrier - ki_spread))
+            pts.append(min(ki_barrier, ki_barrier + ki_spread))
+            pts.append(max(ki_barrier, ki_barrier + ki_spread))
     if has_expiry_ko:
         if abs(ko_spread) <= 1e-6:
             pts.append(ko_barrier)
@@ -959,8 +959,8 @@ def _exact_piecewise_terminal_put(
                 if mid >= ki_barrier:
                     continue
             else:
-                b_ki_lo = min(ki_barrier, ki_barrier - ki_spread)
-                b_ki_hi = max(ki_barrier, ki_barrier - ki_spread)
+                b_ki_lo = min(ki_barrier, ki_barrier + ki_spread)
+                b_ki_hi = max(ki_barrier, ki_barrier + ki_spread)
                 if mid >= b_ki_hi:
                     continue
                 if mid > b_ki_lo:
@@ -1086,8 +1086,8 @@ def _onestar_payoff_fn(
             if w >= ki_barrier:
                 return 0.0
         else:
-            blo = min(ki_barrier, ki_barrier - ki_spread)
-            bhi = max(ki_barrier, ki_barrier - ki_spread)
+            blo = min(ki_barrier, ki_barrier + ki_spread)
+            bhi = max(ki_barrier, ki_barrier + ki_spread)
             pay *= min(max((bhi - w) / (bhi - blo), 0.0), 1.0)
     if use_direct_ko:
         if abs(ko_spread) <= 1e-6:
@@ -1118,9 +1118,10 @@ def _eval_1factor_onestar_np(
     surv_cur: float,
     surv_prev_term: float,
     option_gearing: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     l_put_out = 0.0
     l_onestar_out = 0.0
+    p_onestar_out = 0.0
     k_low = lower_strike if lower_strike > 0.0 else 0.0
     log_ks = math.log(max(one_star_strike, 1e-16))
 
@@ -1128,7 +1129,7 @@ def _eval_1factor_onestar_np(
         f0 = max(f_c[0], 1e-16)
         v0 = max(v_c[0], 1e-12)
         m0 = math.log(f0) - 0.5 * v0 * v0
-        if one_star_coupon > 0.0:
+        if one_star_strike > 0.0:
             if use_direct_ko:
                 p_os = 0.0
                 if abs(ko_spread) <= 1e-6:
@@ -1149,13 +1150,10 @@ def _eval_1factor_onestar_np(
                                 _ndtr_std((math.log(u) - m0) / v0) - _ndtr_std((log_ks - m0) / v0),
                                 0.0,
                             )
-                l_onestar_out = surv_prev_term * one_star_coupon * p_os
+                p_onestar_out = surv_prev_term * p_os
             else:
-                l_onestar_out = (
-                    surv_cur
-                    * one_star_coupon
-                    * _digital_call_spread_lognormal(f0, v0, one_star_strike, 0.0)
-                )
+                p_onestar_out = surv_cur * _digital_call_spread_lognormal(f0, v0, one_star_strike, 0.0)
+            l_onestar_out = p_onestar_out * one_star_coupon
         if strike > 1e-6 and option_gearing > 0.0 and one_star_strike > 1e-16:
             hi = min(strike, one_star_strike)
             if hi > 0.0:
@@ -1179,7 +1177,7 @@ def _eval_1factor_onestar_np(
                         ko_spread,
                     )
                 l_put_out = (surv_prev_term if use_direct_ko else surv_cur) * hw_u * acc
-        return l_put_out, l_onestar_out
+        return l_put_out, l_onestar_out, p_onestar_out
 
     sum_corr = 0.0
     for i in range(d):
@@ -1237,7 +1235,7 @@ def _eval_1factor_onestar_np(
             prod *= _ndtr_std((log_ks - mu_arr[i] - vb_arr[i] * y) / vs_arr[i])
         p_max_lt_ks_y[q] = prod
 
-    if one_star_coupon > 0.0:
+    if one_star_strike > 0.0:
         os_acc = 0.0
         if use_direct_ko:
             if abs(ko_spread) <= 1e-6:
@@ -1267,11 +1265,12 @@ def _eval_1factor_onestar_np(
                     p_term = (1.0 - p_ge_ko) - (p_mks - (p_in if ko_lt_ks else 0.0))
                     p_sub += (1.0 if n_ko == 1 else 0.5 * _GW4[r]) * max(p_term, 0.0)
                 os_acc += 0.5 * _GL16_W[q] * p_sub
-            l_onestar_out = surv_prev_term * one_star_coupon * os_acc
+            p_onestar_out = surv_prev_term * os_acc
         else:
             for q in range(16):
                 os_acc += 0.5 * _GL16_W[q] * (1.0 - p_max_lt_ks_y[q])
-            l_onestar_out = surv_cur * one_star_coupon * os_acc
+            p_onestar_out = surv_cur * os_acc
+        l_onestar_out = p_onestar_out * one_star_coupon
 
     if strike > 1e-6 and option_gearing > 0.0:
         def _eval_cum_joint(x: float) -> float:
@@ -1297,7 +1296,7 @@ def _eval_1factor_onestar_np(
                 if 0.0 <= ki_barrier <= strike:
                     pts_list.append(ki_barrier)
             else:
-                for p_v in (min(ki_barrier, ki_barrier - ki_spread), max(ki_barrier, ki_barrier - ki_spread)):
+                for p_v in (min(ki_barrier, ki_barrier + ki_spread), max(ki_barrier, ki_barrier + ki_spread)):
                     if 0.0 <= p_v <= strike:
                         pts_list.append(p_v)
         if use_direct_ko:
@@ -1377,7 +1376,7 @@ def _eval_1factor_onestar_np(
                 put_acc += jump * _eval_cum_joint(b_pt)
         l_put_out = (surv_prev_term if use_direct_ko else surv_cur) * put_acc
 
-    return l_put_out, l_onestar_out
+    return l_put_out, l_onestar_out, p_onestar_out
 
 
 class PureNumpyTier1Backend:
@@ -1575,7 +1574,7 @@ class PureNumpyTier1Backend:
         surv = np.empty(m_rem, dtype=np.float64)
         h_rate = np.empty(m_rem, dtype=np.float64)
         q_cpn = np.empty(m_rem, dtype=np.float64)
-        scalars = np.zeros(7, dtype=np.float64)
+        scalars = np.zeros(8, dtype=np.float64)
         if m_rem == 0 or d_assets == 0:
             scalars[4] = float(pv_in_transit)
             return f_w, v_w, delta_w, p_stop, surv, h_rate, q_cpn, scalars
@@ -1585,6 +1584,8 @@ class PureNumpyTier1Backend:
         c_list: List[List[float]] = [[float(corr[i, j]) for j in range(d_assets)] for i in range(d_assets)]
         perm_list: List[int] = [int(x) for x in inv_lex_perm.tolist()]
 
+        if is_long_basket and opt_index_code == 0:
+            opt_index_code = 2
         call_is_normal = 9 <= call_index_code <= 13
         cpn_is_normal = 9 <= cpn_index_code <= 13
         opt_is_normal = 9 <= opt_index_code <= 13
@@ -1763,6 +1764,7 @@ class PureNumpyTier1Backend:
 
         l_put_val = 0.0
         l_onestar_val = 0.0
+        p_onestar_val = 0.0
         if has_onestar:
             f_ot = list(f_cols[-1])
             v_ot = list(v_cols[-1])
@@ -1791,7 +1793,7 @@ class PureNumpyTier1Backend:
                 f_ot = f_ot_c
                 v_ot = v_ot_c
             use_direct_ko = expiry_ko_active and not opt_differs
-            l_put_val, l_onestar_val = _eval_1factor_onestar_np(
+            l_put_val, l_onestar_val, p_onestar_val = _eval_1factor_onestar_np(
                 d_assets,
                 f_ot,
                 v_ot,
@@ -1836,7 +1838,7 @@ class PureNumpyTier1Backend:
                 f_opt_cond, v_opt_cond, opt_is_normal, part_call_strike, use_direct_ko_c, ko_b_term, ko_spread
             )
 
-        opt_sign = -1.0 if is_long_basket else 1.0
+        opt_sign = 1.0
         opt_pv_val = float(df_pay[m_rem - 1]) * (
             -opt_sign * option_gearing * l_put_val + part_call_rate * l_call_val + l_onestar_val
         )
@@ -1848,6 +1850,7 @@ class PureNumpyTier1Backend:
         scalars[4] = pv_val
         scalars[5] = l_call_val
         scalars[6] = l_onestar_val
+        scalars[7] = p_onestar_val
         return f_w, v_w, delta_w, p_stop, surv, h_rate, q_cpn, scalars
 
     def stulz_analytical_bridge_cpu(
@@ -2259,7 +2262,7 @@ class Cpp23Tier1Backend:
 
         d_assets, m_rem = int(fp.shape[0]), int(fp.shape[1])
         dm = d_assets * m_rem
-        out_buf = np.empty(6 * m_rem + dm + 7, dtype=np.float64)
+        out_buf = np.zeros(6 * m_rem + dm + 8, dtype=np.float64)
         f_w = out_buf[0:m_rem]
         v_w = out_buf[m_rem : 2 * m_rem]
         p_stop = out_buf[2 * m_rem : 3 * m_rem]

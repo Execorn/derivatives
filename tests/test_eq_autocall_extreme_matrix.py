@@ -400,10 +400,7 @@ def _assert_prob_and_put_bounds(
         if float(state.participation_call_rate) == 0.0 and float(state.one_star_coupon) == 0.0:
             df_last = float(state.df_pay[-1].item())
             assert abs(option_pv) <= float(state.option_gearing) * k_eff * df_last + 1e-4
-            if not state.is_long_basket:
-                assert option_pv <= 1e-6
-            else:
-                assert option_pv >= -1e-6
+            assert option_pv <= 1e-6
 
 
 @dataclass

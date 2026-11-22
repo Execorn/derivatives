@@ -53,7 +53,14 @@ def _year_fraction(
 class CashFlowItem:
     """Canonical cash-flow row matching Murex Pricing Service CashFlows schema."""
 
-    Description: Literal["FundingLeg", "Coupon", "Notional", "Option"]
+    Description: Literal[
+        "FundingLeg",
+        "Coupon",
+        "Notional",
+        "Option",
+        "OneStarCoupon",
+        "IsLongBasket",
+    ]
     Date: datetime
     Amount: float
     StandardError: float = 0.0
@@ -160,6 +167,7 @@ class SeasonedScheduleState:
     )
     sentinel_barriers: SentinelBarrierResult | None = None
     cash_to_settle_today: float = 0.0
+    warnings: list[str] = field(default_factory=list)
 
 
 def canonicalize_asset_order(
@@ -404,23 +412,24 @@ def _eval_terminal_option_payoff(
 ) -> float:
     """Evaluates deterministic terminal Option payoff from observed expiry performances."""
     opt_paid = 0.0
+    eff_w_opt = float(evaluate_monitoring_index_np(perf_m, "AverageOf")) if is_long_basket else float(w_opt)
     if strike > 1e-6 and option_gearing > 0.0:
-        put_intrinsic = max(float(strike) - w_opt, 0.0)
+        put_intrinsic = max(float(strike) - eff_w_opt, 0.0)
         if lower_strike is not None and float(lower_strike) > 0.0:
             put_intrinsic = min(put_intrinsic, max(float(strike) - float(lower_strike), 0.0))
         if ki_barrier is not None and float(ki_barrier) > 0.0 and i_ki_past < 0.5:
-            if w_opt >= float(ki_barrier):
+            if eff_w_opt >= float(ki_barrier):
                 put_intrinsic = 0.0
         if one_star_strike is not None and float(one_star_strike) > 0.0:
             w_best = float(evaluate_monitoring_index_np(perf_m, "BestOf"))
             if w_best >= float(one_star_strike):
                 put_intrinsic = 0.0
-        put_sign = 1.0 if is_long_basket else -1.0
+        put_sign = -1.0
         opt_paid += put_sign * float(option_gearing) * put_intrinsic
 
     if participation_call_strike is not None and float(participation_call_rate) > 0.0:
         opt_paid += float(participation_call_rate) * max(
-            w_opt - float(participation_call_strike), 0.0
+            eff_w_opt - float(participation_call_strike), 0.0
         )
 
     if one_star_strike is not None and float(one_star_coupon) > 0.0:
@@ -544,7 +553,8 @@ def collapse_seasoned_schedule(
         cpn_arr = np.full(m_total, 1e-5, dtype=np.float64)
 
     eff_cpn_index = coupon_index if coupon_index else callability_index
-    eff_opt_index = option_index if option_index else callability_index
+    raw_opt_index = option_index if option_index else callability_index
+    eff_opt_index = "AverageOf" if (is_long_basket and raw_opt_index == "WorstOf") else raw_opt_index
     type_out = coupon_barrier_type.strip().lower() == "out"
     dir_down = coupon_barrier_direction.strip().lower() == "down"
 

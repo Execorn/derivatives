@@ -86,6 +86,7 @@ class AutocallBaselineOutput:
     product_value_proxy: torch.Tensor
     l_call_proxy: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0, dtype=torch.float64))
     l_onestar_proxy: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0, dtype=torch.float64))
+    p_onestar_proxy: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0, dtype=torch.float64))
     has_unsupported_exotic_index: bool = False
     unsupported_indices: Tuple[str, ...] = ()
 
@@ -1352,8 +1353,8 @@ def _exact_piecewise_terminal_put_torch(
         if abs(ki_spread) <= 1e-6:
             pts.append(ki_barrier)
         else:
-            pts.append(min(ki_barrier, ki_barrier - ki_spread))
-            pts.append(max(ki_barrier, ki_barrier - ki_spread))
+            pts.append(min(ki_barrier, ki_barrier + ki_spread))
+            pts.append(max(ki_barrier, ki_barrier + ki_spread))
     if has_expiry_ko:
         if abs(ko_spread) <= 1e-6:
             pts.append(ko_barrier)
@@ -1380,8 +1381,8 @@ def _exact_piecewise_terminal_put_torch(
                 if mid >= ki_barrier:
                     continue
             else:
-                b_ki_lo = min(ki_barrier, ki_barrier - ki_spread)
-                b_ki_hi = max(ki_barrier, ki_barrier - ki_spread)
+                b_ki_lo = min(ki_barrier, ki_barrier + ki_spread)
+                b_ki_hi = max(ki_barrier, ki_barrier + ki_spread)
                 if mid >= b_ki_hi:
                     continue
                 if mid > b_ki_lo:
@@ -1500,8 +1501,8 @@ def _onestar_payoff_fn_scalar(
             if w >= ki_barrier:
                 return 0.0
         else:
-            blo = min(ki_barrier, ki_barrier - ki_spread)
-            bhi = max(ki_barrier, ki_barrier - ki_spread)
+            blo = min(ki_barrier, ki_barrier + ki_spread)
+            bhi = max(ki_barrier, ki_barrier + ki_spread)
             pay *= min(max((bhi - w) / (bhi - blo), 0.0), 1.0)
     if use_direct_ko:
         if abs(ko_spread) <= 1e-6:
@@ -1531,7 +1532,7 @@ def _eval_1factor_onestar_torch(
     surv_cur: torch.Tensor,
     surv_prev_term: torch.Tensor,
     option_gearing: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Differentiable 1-factor CDF-mapped GL16 OneStar put & coupon expectation for (B, D)."""
     b_sz, d_assets = int(f_c.shape[0]), int(f_c.shape[1])
     device = f_c.device
@@ -1542,7 +1543,7 @@ def _eval_1factor_onestar_torch(
         f0 = f_c[:, 0].clamp(min=1e-16)
         v0 = v_c[:, 0].clamp(min=1e-12)
         m0 = torch.log(f0) - 0.5 * v0 * v0
-        if one_star_coupon > 0.0:
+        if one_star_strike > 0.0:
             if use_direct_ko:
                 p_os = torch.zeros(b_sz, dtype=torch.float64, device=device)
                 if abs(ko_spread) <= 1e-6:
@@ -1563,11 +1564,13 @@ def _eval_1factor_onestar_torch(
                                 torch.special.ndtr((math.log(u) - m0) / v0)
                                 - torch.special.ndtr((log_ks - m0) / v0)
                             ).clamp(min=0.0)
-                l_onestar_out = surv_prev_term * one_star_coupon * p_os
+                p_onestar_out = surv_prev_term * p_os
             else:
                 b_st = torch.full((b_sz,), one_star_strike, dtype=torch.float64, device=device)
-                l_onestar_out = surv_cur * one_star_coupon * _digital_call_spread_prob_torch(f0, v0, b_st, 0.0)
+                p_onestar_out = surv_cur * _digital_call_spread_prob_torch(f0, v0, b_st, 0.0)
+            l_onestar_out = p_onestar_out * one_star_coupon
         else:
+            p_onestar_out = torch.zeros(b_sz, dtype=torch.float64, device=device)
             l_onestar_out = torch.zeros(b_sz, dtype=torch.float64, device=device)
 
         l_put_out = torch.zeros(b_sz, dtype=torch.float64, device=device)
@@ -1589,8 +1592,8 @@ def _eval_1factor_onestar_torch(
                     if abs(ki_spread) <= 1e-6:
                         pay_g = torch.where(w_g < ki_barrier, pay_g, torch.zeros_like(pay_g))
                     else:
-                        blo_ki = min(ki_barrier, ki_barrier - ki_spread)
-                        bhi_ki = max(ki_barrier, ki_barrier - ki_spread)
+                        blo_ki = min(ki_barrier, ki_barrier + ki_spread)
+                        bhi_ki = max(ki_barrier, ki_barrier + ki_spread)
                         pay_g = pay_g * ((bhi_ki - w_g) / (bhi_ki - blo_ki)).clamp(0.0, 1.0)
                 if use_direct_ko:
                     if abs(ko_spread) <= 1e-6:
@@ -1602,7 +1605,7 @@ def _eval_1factor_onestar_torch(
                 phi_g = torch.exp(-0.5 * u_g * u_g) * _INV_SQRT2PI
                 acc = (gl_w * phi_g * pay_g).sum(dim=1)
                 l_put_out = (surv_prev_term if use_direct_ko else surv_cur) * hw_u * acc
-        return l_put_out, l_onestar_out
+        return l_put_out, l_onestar_out, p_onestar_out
 
     # Rank-1 off-diagonal fit via 8 differentiable Rayleigh power iterations
     corr_sum = corr.sum()
@@ -1634,7 +1637,7 @@ def _eval_1factor_onestar_torch(
     )
     p_max_lt_ks_y = c_ks.prod(dim=2)  # (B, 16)
 
-    if one_star_coupon > 0.0:
+    if one_star_strike > 0.0:
         if use_direct_ko:
             if abs(ko_spread) <= 1e-6:
                 ko_pts = [ko_b_term]
@@ -1660,11 +1663,13 @@ def _eval_1factor_onestar_torch(
                 wt_r = 1.0 if n_ko == 1 else (0.5 * _GW4[r])
                 p_sub = p_sub + wt_r * p_term
             os_acc = (0.5 * w_q * p_sub).sum(dim=1)
-            l_onestar_out = surv_prev_term * one_star_coupon * os_acc
+            p_onestar_out = surv_prev_term * os_acc
         else:
             os_acc = (0.5 * w_q * (1.0 - p_max_lt_ks_y)).sum(dim=1)
-            l_onestar_out = surv_cur * one_star_coupon * os_acc
+            p_onestar_out = surv_cur * os_acc
+        l_onestar_out = p_onestar_out * one_star_coupon
     else:
+        p_onestar_out = torch.zeros(b_sz, dtype=torch.float64, device=device)
         l_onestar_out = torch.zeros(b_sz, dtype=torch.float64, device=device)
 
     l_put_out = torch.zeros(b_sz, dtype=torch.float64, device=device)
@@ -1687,7 +1692,7 @@ def _eval_1factor_onestar_torch(
                 if 0.0 <= ki_barrier <= strike:
                     pts_list.append(ki_barrier)
             else:
-                for p_v in (min(ki_barrier, ki_barrier - ki_spread), max(ki_barrier, ki_barrier - ki_spread)):
+                for p_v in (min(ki_barrier, ki_barrier + ki_spread), max(ki_barrier, ki_barrier + ki_spread)):
                     if 0.0 <= p_v <= strike:
                         pts_list.append(p_v)
         if use_direct_ko:
@@ -1743,7 +1748,7 @@ def _eval_1factor_onestar_torch(
                 put_acc = put_acc + jump * _eval_cum_joint_t(b_pt)
         l_put_out = (surv_prev_term if use_direct_ko else surv_cur) * put_acc
 
-    return l_put_out, l_onestar_out
+    return l_put_out, l_onestar_out, p_onestar_out
 
 
 def _euler_next_corr_torch(
@@ -1831,11 +1836,13 @@ def _extract_state_fields(
             return preproc_state.get(key, default)
         return getattr(preproc_state, key, default)
 
+    is_long_basket_flag = bool(_get("is_long_basket", False))
     call_idx = str(_get("callability_index", "WorstOf"))
     raw_cpn_idx = coupon_index if coupon_index is not None else _get("coupon_index", None)
     raw_opt_idx = option_index if option_index is not None else _get("option_index", None)
     eff_cpn_idx = str(raw_cpn_idx) if raw_cpn_idx else call_idx
-    eff_opt_idx = str(raw_opt_idx) if raw_opt_idx else call_idx
+    base_opt_idx = str(raw_opt_idx) if raw_opt_idx else call_idx
+    eff_opt_idx = "AverageOf" if (is_long_basket_flag and base_opt_idx == "WorstOf") else base_opt_idx
 
     raw_ls_state = _get("lower_strike", None)
     if lower_strike != 0.0:
@@ -2004,7 +2011,7 @@ def _baseline_cpu_via_cpp(
     m_bytes = m_rem * 8
     arr_6m = torch.empty((6, m_rem), dtype=torch.float64)
     dw_all = torch.empty((d_assets, m_rem), dtype=torch.float64)
-    sc_buf = torch.empty(7, dtype=torch.float64)
+    sc_buf = torch.zeros(8, dtype=torch.float64)
     arr_ptr = arr_6m.data_ptr()
     packed = backend._args_pack(
         d_assets,
@@ -2059,7 +2066,7 @@ def _baseline_cpu_via_cpp(
     backend._fn_struct(packed)
     f_w_t, v_w_t, p_t, surv_t, h_t, q_t = torch.unbind(arr_6m, 0)
     dw_t = dw_all.squeeze(1) if m_rem == 1 else dw_all[:, -1].contiguous()
-    s0, s1, s2, s3, s4, s5, s6 = torch.unbind(sc_buf, 0)
+    s0, s1, s2, s3, s4, s5, s6, s7 = torch.unbind(sc_buf, 0)
     return AutocallBaselineOutput(
         f_w=f_w_t,
         v_w=v_w_t,
@@ -2075,6 +2082,7 @@ def _baseline_cpu_via_cpp(
         product_value_proxy=s4,
         l_call_proxy=s5,
         l_onestar_proxy=s6,
+        p_onestar_proxy=s7,
         has_unsupported_exotic_index=has_unsupported,
         unsupported_indices=unsupported_tup,
     )
@@ -2154,12 +2162,14 @@ def compute_analytical_autocall_baseline(
                 raw_opt_idx = option_index if option_index is not None else preproc_state.option_index
                 already_autocalled = preproc_state.already_autocalled
                 pv_in_transit = preproc_state.pv_in_transit
+                is_long_flag = bool(preproc_state.is_long_basket)
             else:
                 call_idx = str(getattr(preproc_state, "callability_index", "WorstOf"))
                 raw_cpn_idx = coupon_index if coupon_index is not None else getattr(preproc_state, "coupon_index", None)
                 raw_opt_idx = option_index if option_index is not None else getattr(preproc_state, "option_index", None)
                 already_autocalled = bool(getattr(preproc_state, "already_autocalled", False))
                 pv_in_transit = float(getattr(preproc_state, "pv_in_transit", 0.0))
+                is_long_flag = bool(getattr(preproc_state, "is_long_basket", False))
 
             call_code = 0 if call_idx == "WorstOf" else monitoring_index_to_code(call_idx)
             if raw_cpn_idx:
@@ -2174,6 +2184,9 @@ def compute_analytical_autocall_baseline(
             else:
                 opt_idx = call_idx
                 opt_code = call_code
+            if is_long_flag and opt_code == 0:
+                opt_idx = "AverageOf"
+                opt_code = 2
 
             if call_code <= 2 and cpn_code <= 2 and opt_code <= 2:
                 has_unsupported = False
@@ -2205,6 +2218,7 @@ def compute_analytical_autocall_baseline(
                     product_value_proxy=torch.tensor(pv_in_transit, dtype=torch.float64, device=device),
                     l_call_proxy=z_s.clone(),
                     l_onestar_proxy=z_s.clone(),
+                    p_onestar_proxy=z_s.clone(),
                     has_unsupported_exotic_index=has_unsupported,
                     unsupported_indices=unsupported_tup,
                 )
@@ -2393,6 +2407,7 @@ def compute_analytical_autocall_baseline(
                     product_value_proxy=sc_t[4],
                     l_call_proxy=sc_t[5],
                     l_onestar_proxy=sc_t[6],
+                    p_onestar_proxy=sc_t[7] if sc_t.numel() > 7 else torch.zeros_like(sc_t[6]),
                     has_unsupported_exotic_index=has_unsupported,
                     unsupported_indices=unsupported_tup,
                 )
@@ -2464,6 +2479,7 @@ def compute_analytical_autocall_baseline(
                 product_value_proxy=pv_t,
                 l_call_proxy=z_s.clone(),
                 l_onestar_proxy=z_s.clone(),
+                p_onestar_proxy=z_s.clone(),
                 has_unsupported_exotic_index=has_unsupported,
                 unsupported_indices=unsupported_tup,
             )
@@ -2542,6 +2558,7 @@ def compute_analytical_autocall_baseline(
                 product_value_proxy=sc_t[4],
                 l_call_proxy=sc_t[5],
                 l_onestar_proxy=sc_t[6],
+                p_onestar_proxy=sc_t[7] if sc_t.numel() > 7 else torch.zeros_like(sc_t[6]),
                 has_unsupported_exotic_index=has_unsupported,
                 unsupported_indices=unsupported_tup,
             )
@@ -2578,6 +2595,7 @@ def compute_analytical_autocall_baseline(
                 product_value_proxy=pv_t_b,
                 l_call_proxy=z_s_b.clone(),
                 l_onestar_proxy=z_s_b.clone(),
+                p_onestar_proxy=z_s_b.clone(),
                 has_unsupported_exotic_index=has_unsupported,
                 unsupported_indices=unsupported_tup,
             )
@@ -2599,6 +2617,7 @@ def compute_analytical_autocall_baseline(
             product_value_proxy=pv_t,
             l_call_proxy=z_s.clone(),
             l_onestar_proxy=z_s.clone(),
+            p_onestar_proxy=z_s.clone(),
             has_unsupported_exotic_index=has_unsupported,
             unsupported_indices=unsupported_tup,
         )
@@ -2865,7 +2884,7 @@ def compute_analytical_autocall_baseline(
             )
             v_ot_c = (v_r * torch.sqrt(z_vc.clamp(min=1e-12))).clamp(min=1e-12)
         use_direct_ko = expiry_ko_active and not opt_differs
-        l_put_proxy, l_onestar_proxy = _eval_1factor_onestar_torch(
+        l_put_proxy, l_onestar_proxy, p_onestar_proxy = _eval_1factor_onestar_torch(
             f_ot_c,
             v_ot_c,
             cm_t,
@@ -2885,6 +2904,7 @@ def compute_analytical_autocall_baseline(
         )
     else:
         l_onestar_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
+        p_onestar_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
         if strike <= 1e-6 or option_gearing <= 0.0:
             l_put_proxy = torch.zeros(b_sz, dtype=torch.float64, device=device)
         else:
@@ -2943,7 +2963,7 @@ def compute_analytical_autocall_baseline(
             mem_acc = eff_c_m_t * (1.0 - q_proxy[:, m])
 
     coupon_pv_proxy = torch.stack(cpn_pv_terms, dim=1).sum(dim=1)
-    opt_sign = -1.0 if bool(fields["is_long_basket"]) else 1.0
+    opt_sign = 1.0
     option_pv_proxy = df_t[-1] * (
         -opt_sign * option_gearing * l_put_proxy + part_call_rate * l_call_proxy + l_onestar_proxy
     )
@@ -2970,6 +2990,7 @@ def compute_analytical_autocall_baseline(
             product_value_proxy=product_value_proxy.squeeze(0),
             l_call_proxy=l_call_proxy.squeeze(0),
             l_onestar_proxy=l_onestar_proxy.squeeze(0),
+            p_onestar_proxy=p_onestar_proxy.squeeze(0),
             has_unsupported_exotic_index=has_unsupported,
             unsupported_indices=unsupported_tup,
         )
@@ -2989,6 +3010,7 @@ def compute_analytical_autocall_baseline(
         product_value_proxy=product_value_proxy,
         l_call_proxy=l_call_proxy,
         l_onestar_proxy=l_onestar_proxy,
+        p_onestar_proxy=p_onestar_proxy,
         has_unsupported_exotic_index=has_unsupported,
         unsupported_indices=unsupported_tup,
     )

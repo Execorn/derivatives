@@ -1022,8 +1022,8 @@ double exact_piecewise_terminal_put(
         if (std::abs(ki_spread) <= 1e-6) {
             push_pt(ki_barrier);
         } else {
-            push_pt(std::min(ki_barrier, ki_barrier - ki_spread));
-            push_pt(std::max(ki_barrier, ki_barrier - ki_spread));
+            push_pt(std::min(ki_barrier, ki_barrier + ki_spread));
+            push_pt(std::max(ki_barrier, ki_barrier + ki_spread));
         }
     }
     if (has_expiry_ko) {
@@ -1065,8 +1065,8 @@ double exact_piecewise_terminal_put(
             if (std::abs(ki_spread) <= 1e-6) {
                 if (mid >= ki_barrier) continue;
             } else {
-                const double b_ki_lo = std::min(ki_barrier, ki_barrier - ki_spread);
-                const double b_ki_hi = std::max(ki_barrier, ki_barrier - ki_spread);
+                const double b_ki_lo = std::min(ki_barrier, ki_barrier + ki_spread);
+                const double b_ki_hi = std::max(ki_barrier, ki_barrier + ki_spread);
                 if (mid >= b_ki_hi) continue;
                 if (mid > b_ki_lo) {
                     const double db = b_ki_hi - b_ki_lo;
@@ -1236,8 +1236,8 @@ inline double onestar_payoff_fn(
         if (std::abs(ki_spread) <= 1e-6) {
             if (w >= ki_barrier) return 0.0;
         } else {
-            const double blo = std::min(ki_barrier, ki_barrier - ki_spread);
-            const double bhi = std::max(ki_barrier, ki_barrier - ki_spread);
+            const double blo = std::min(ki_barrier, ki_barrier + ki_spread);
+            const double bhi = std::max(ki_barrier, ki_barrier + ki_spread);
             pay *= std::clamp((bhi - w) / (bhi - blo), 0.0, 1.0);
         }
     }
@@ -1272,10 +1272,12 @@ void eval_1factor_onestar(
     double surv_prev_term,
     double option_gearing,
     double& l_put_out,
-    double& l_onestar_out
+    double& l_onestar_out,
+    double& p_onestar_out
 ) noexcept {
     l_put_out = 0.0;
     l_onestar_out = 0.0;
+    p_onestar_out = 0.0;
     const double k_low = lower_strike > 0.0 ? lower_strike : 0.0;
     const double log_ks = std::log(std::max(one_star_strike, 1e-16));
 
@@ -1283,7 +1285,7 @@ void eval_1factor_onestar(
         const double f0 = std::max(f_c[0], 1e-16);
         const double v0 = std::max(v_c[0], 1e-12);
         const double m0 = std::log(f0) - 0.5 * v0 * v0;
-        if (one_star_coupon > 0.0) {
+        if (one_star_strike > 0.0) {
             if (use_direct_ko) {
                 double p_os = 0.0;
                 if (std::abs(ko_spread) <= 1e-6) {
@@ -1302,10 +1304,11 @@ void eval_1factor_onestar(
                         }
                     }
                 }
-                l_onestar_out = surv_prev_term * one_star_coupon * p_os;
+                p_onestar_out = surv_prev_term * p_os;
             } else {
-                l_onestar_out = surv_cur * one_star_coupon * digital_call_spread_lognormal(f0, v0, one_star_strike, 0.0);
+                p_onestar_out = surv_cur * digital_call_spread_lognormal(f0, v0, one_star_strike, 0.0);
             }
+            l_onestar_out = p_onestar_out * one_star_coupon;
         }
         if (strike > 1e-6 && option_gearing > 0.0 && one_star_strike > 1e-16) {
             const double hi = std::min(strike, one_star_strike);
@@ -1399,7 +1402,7 @@ void eval_1factor_onestar(
         p_max_lt_ks_y[q] = prod;
     }
 
-    if (one_star_coupon > 0.0) {
+    if (one_star_strike > 0.0) {
         double os_acc = 0.0;
         if (use_direct_ko) {
             std::array<double, 4> ko_pts{};
@@ -1437,13 +1440,14 @@ void eval_1factor_onestar(
                 }
                 os_acc += 0.5 * kGL16W[q] * p_sub;
             }
-            l_onestar_out = surv_prev_term * one_star_coupon * os_acc;
+            p_onestar_out = surv_prev_term * os_acc;
         } else {
             for (int q = 0; q < 16; ++q) {
                 os_acc += 0.5 * kGL16W[q] * (1.0 - p_max_lt_ks_y[q]);
             }
-            l_onestar_out = surv_cur * one_star_coupon * os_acc;
+            p_onestar_out = surv_cur * os_acc;
         }
+        l_onestar_out = p_onestar_out * one_star_coupon;
     }
 
     if (strike > 1e-6 && option_gearing > 0.0) {
@@ -1476,8 +1480,8 @@ void eval_1factor_onestar(
             if (std::abs(ki_spread) <= 1e-6) {
                 push_pt(ki_barrier);
             } else {
-                push_pt(std::min(ki_barrier, ki_barrier - ki_spread));
-                push_pt(std::max(ki_barrier, ki_barrier - ki_spread));
+                push_pt(std::min(ki_barrier, ki_barrier + ki_spread));
+                push_pt(std::max(ki_barrier, ki_barrier + ki_spread));
             }
         }
         if (use_direct_ko) {
@@ -1721,13 +1725,16 @@ void tier1_eval_autocall_bridge_cpu(
 ) {
     (void)tau_obs;
     if (m_rem <= 0 || d_assets <= 0) {
-        for (int i = 0; i < 7; ++i) scalars_out[i] = 0.0;
+        for (int i = 0; i < 8; ++i) scalars_out[i] = 0.0;
         scalars_out[4] = pv_in_transit;
         return;
     }
 
     const int d = static_cast<int>(d_assets);
     const int m_tot = static_cast<int>(m_rem);
+    if (is_long_basket != 0 && opt_index_code == 0) {
+        opt_index_code = 2;
+    }
     const bool call_is_normal = is_diff_index(call_index_code);
     const bool cpn_is_normal = is_diff_index(cpn_index_code);
     const bool opt_is_normal = is_diff_index(opt_index_code);
@@ -1975,6 +1982,7 @@ void tier1_eval_autocall_bridge_cpu(
 
     double l_put_val = 0.0;
     double l_onestar_val = 0.0;
+    double p_onestar_val = 0.0;
     if (has_onestar) {
         load_period(m_tot - 1, f_opt_t, v_opt_t);
         const double* f_os_in = f_opt_t;
@@ -2014,7 +2022,7 @@ void tier1_eval_autocall_bridge_cpu(
             use_direct_ko, ko_b_term, ko_spread,
             one_star_strike, one_star_coupon,
             surv_cur, surv_prev_term, option_gearing,
-            l_put_val, l_onestar_val
+            l_put_val, l_onestar_val, p_onestar_val
         );
     } else if (strike > 1e-6 && option_gearing > 0.0) {
         const bool use_direct_ko = expiry_ko_active && !opt_differs;
@@ -2038,7 +2046,7 @@ void tier1_eval_autocall_bridge_cpu(
         );
     }
 
-    const double opt_sign = (is_long_basket != 0) ? -1.0 : 1.0;
+    const double opt_sign = 1.0;
     const double opt_pv_val = df_pay[m_tot - 1] * (
         -opt_sign * option_gearing * l_put_val
         + part_call_rate * l_call_val
@@ -2053,6 +2061,7 @@ void tier1_eval_autocall_bridge_cpu(
     scalars_out[4] = pv_val;
     scalars_out[5] = l_call_val;
     scalars_out[6] = l_onestar_val;
+    scalars_out[7] = p_onestar_val;
 }
 
 void tier1_eval_index_moments_cpu(
