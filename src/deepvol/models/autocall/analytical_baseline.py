@@ -2392,6 +2392,7 @@ def compute_analytical_autocall_baseline(
                 dw_col = torch.from_numpy(dw_np)[:, -1]
                 if m_rem > 1:
                     dw_col = dw_col.contiguous()
+                sc6 = sc_t[6]
                 return AutocallBaselineOutput(
                     f_w=torch.from_numpy(f_w_np),
                     v_w=torch.from_numpy(v_w_np),
@@ -2406,8 +2407,8 @@ def compute_analytical_autocall_baseline(
                     coupon_pv_proxy=sc_t[3],
                     product_value_proxy=sc_t[4],
                     l_call_proxy=sc_t[5],
-                    l_onestar_proxy=sc_t[6],
-                    p_onestar_proxy=sc_t[7] if sc_t.numel() > 7 else torch.zeros_like(sc_t[6]),
+                    l_onestar_proxy=sc6,
+                    p_onestar_proxy=sc_t[7] if (os_raw is not None and float(os_raw) > 0.0) else sc6,
                     has_unsupported_exotic_index=has_unsupported,
                     unsupported_indices=unsupported_tup,
                 )

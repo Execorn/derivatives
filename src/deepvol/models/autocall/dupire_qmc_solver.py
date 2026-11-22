@@ -1940,9 +1940,15 @@ def price_eq_autocall_dupire_qmc(
                 )
                 r_nat_curr = r_native_obs_np[:, m]
                 esc_prev = (
-                    spots_t0 if (m == 0 or escrowed_spot_np is None) else escrowed_spot_np[:, m - 1]
+                    spots_t0
+                    if (m == 0 or escrowed_spot_np is None or escrowed_spot_np.ndim < 2)
+                    else escrowed_spot_np[:, m - 1]
                 )
-                esc_curr = spots_t0 if escrowed_spot_np is None else escrowed_spot_np[:, m]
+                esc_curr = (
+                    spots_t0
+                    if (escrowed_spot_np is None or escrowed_spot_np.ndim < 2)
+                    else escrowed_spot_np[:, m]
+                )
                 q_div_m = (
                     -np.log(np.maximum(esc_curr / np.maximum(esc_prev, 1e-12), 1e-12))
                     / dt_period

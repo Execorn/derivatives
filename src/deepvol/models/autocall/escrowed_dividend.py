@@ -755,8 +755,8 @@ def _eval_eq_atm_vol(eq_spec: Any, as_of_dt: datetime, obs_dt: datetime, spot_va
     if not strikes_raw or not quotes_raw or not exp_dates:
         return 0.0
     dcc = str(getattr(raw_dcc, "value", raw_dcc))
-    t_eval = year_fraction(as_of_dt, obs_dt, dcc)
-    tenors = np.asarray([year_fraction(as_of_dt, d, dcc) for d in exp_dates], dtype=np.float64)
+    t_eval = year_fraction(as_of_dt, _to_utc_datetime(obs_dt), dcc)
+    tenors = np.asarray([year_fraction(as_of_dt, _to_utc_datetime(d), dcc) for d in exp_dates], dtype=np.float64)
     strikes = np.asarray(strikes_raw, dtype=np.float64)
     quotes = np.asarray(quotes_raw, dtype=np.float64)
     slice_vols = np.array([float(np.interp(spot_val, strikes, row)) for row in quotes], dtype=np.float64)
