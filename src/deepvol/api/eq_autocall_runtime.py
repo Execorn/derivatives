@@ -12,6 +12,7 @@ import time
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Union
 
 import numpy as np
+import numpy.typing as npt
 import orjson
 from pydantic import ConfigDict, Field
 import torch
@@ -23,6 +24,7 @@ from deepvol.api.eq_autocall_arrow import (
     encode_eq_autocall_arrow_response,
 )
 from deepvol.api.schemas_eq_autocall import (
+    _DESCRIPTION_TO_SHORT_CODE,
     AutocallQueryMetric,
     AutoCallableProductSpec,
     CashFlowRow,
@@ -38,6 +40,7 @@ from deepvol.market.eq_curves import year_fraction
 from deepvol.models.autocall.escrowed_dividend import build_discount_rate_evaluator
 from deepvol.models.autocall.feature_layout import (
     AutocallGlobalCol,
+    AutocallNodeCol,
     AutocallSchedCol,
 )
 import deepvol.models.autocall.greeks_engine as _greeks_mod
@@ -122,6 +125,54 @@ _GREEKS_BATCH_PARAMS = frozenset(inspect.signature(compute_batched_surrogate_gre
 _ASSEMBLE_SURR_PARAMS = frozenset(inspect.signature(assemble_surrogate_product_value).parameters.keys())
 _SURR_INIT_PARAMS = tuple(inspect.signature(MaskedEQAutocallSurrogate.__init__).parameters.keys())
 
+_CPU_GREEKS_CACHE_LOCK = threading.Lock()
+_CPU_GREEKS_MICROBATCH_CACHE: dict[tuple[Any, ...], BatchedSurrogateGreeksOutput] = {}
+
+
+def _cpu_greeks_cache_key(
+    surrogate: MaskedEQAutocallSurrogate,
+    node_d: torch.Tensor,
+    edge_d: torch.Tensor,
+    amask_d: torch.Tensor,
+    sched_d: torch.Tensor,
+    smask_d: torch.Tensor,
+    glob_d: torch.Tensor,
+    compute_cash_gamma: bool,
+    no_notional_repayment: bool,
+    autocall_coupon: float,
+    force_coupons_on_autocall: bool,
+    is_long_basket: torch.Tensor | None,
+    w_fund_per_period: torch.Tensor | None,
+    lower_strike: torch.Tensor | None,
+) -> tuple[Any, ...]:
+    """Builds a deterministic content digest key for CPU `compute_batched_surrogate_greeks` microbatches."""
+    is_zero = surrogate.is_zero_residual()
+    surr_tag: Any = (
+        ("zero_res", int(surrogate.d_max), int(surrogate.m_max))
+        if is_zero
+        else tuple((id(p), int(p._version)) for p in surrogate.parameters())
+    )
+    h = hashlib.blake2b(digest_size=16)
+    for t in (node_d, edge_d, amask_d, sched_d, smask_d, glob_d):
+        arr = t.detach().cpu().contiguous().numpy()
+        h.update(arr.tobytes())
+    for opt_t in (is_long_basket, w_fund_per_period, lower_strike):
+        if opt_t is None:
+            h.update(b"N")
+        else:
+            h.update(b"T")
+            h.update(opt_t.detach().cpu().contiguous().numpy().tobytes())
+    return (
+        surr_tag,
+        node_d.shape,
+        sched_d.shape,
+        bool(compute_cash_gamma),
+        bool(no_notional_repayment),
+        float(autocall_coupon),
+        bool(force_coupons_on_autocall),
+        h.digest(),
+    )
+
 ALL_8_GREEK_QUERIES: tuple[str, ...] = (
     "Delta",
     "Gamma",
@@ -164,9 +215,9 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
         quotes = np.asarray(surf.VolatilityQuotes, dtype=np.float64)
         if not np.all(np.isfinite(quotes)):
             raise ValueError(f"SMILE_ARBITRAGE: Non-finite volatility surface quotes for {ticker}.")
-        if np.any(quotes <= 0.0) or np.any(quotes > 5.00):
+        if np.any(quotes < 1e-4) or np.any(quotes > 5.00):
             raise ValueError(
-                f"SMILE_ARBITRAGE: Volatility quotes for {ticker} out of certifiable bounds (0.0, 5.00]."
+                f"SMILE_ARBITRAGE: Volatility quotes for {ticker} out of certifiable bounds [1e-4, 5.00]."
             )
         strikes_attr = getattr(surf, "Strikes", None)
         exp_dates_attr = getattr(surf, "ExpirationDates", None)
@@ -519,7 +570,7 @@ def _merge_fx_vega_and_cega(
         fx_specs_map = getattr(state, "quanto_fx_specs", None) or req_model.Model.MarketDataSet.VolatilitySurfaces
         tau_obs_np = state.tau_obs.detach().cpu().numpy().astype(np.float64)
         as_of_dt = req_model.Model.MarketDataSet.AsOfDate
-        fx_accum: dict[str, np.ndarray] = {}
+        fx_accum: dict[str, npt.NDArray[np.float64]] = {}
 
         for ticker, vec_1d in greeks_out.fx_vega.items():
             qm = quanto_meta.get(ticker) or {}
@@ -602,8 +653,8 @@ def _compute_qmc_crn_if_available(
     *,
     queries: Sequence[str],
     n_paths: int,
-) -> AutocallGreeksResult:
-    """Uses `compute_qmc_crn_greeks` with fast CPU-safe `DupireQMCConfig` when on CPU."""
+) -> AutocallGreeksResult | None:
+    """Uses `compute_qmc_crn_greeks` with a bounded CPU-safe `DupireQMCConfig`; returns None on unexpected failure."""
     crn_fn = getattr(_greeks_mod, "compute_qmc_crn_greeks", None)
     if callable(crn_fn):
         try:
@@ -620,29 +671,51 @@ def _compute_qmc_crn_if_available(
                 except Exception:
                     continue
             if cfg_cls is not None:
-                is_cpu = state.spots_t0.device.type == "cpu" and not torch.cuda.is_available()
-                if is_cpu:
-                    cfg = cfg_cls(
-                        n_paths=min(int(n_paths), 2048),
-                        n_replicates=1,
-                        n_substeps=4,
-                        lv_grid_nt=32,
-                        lv_grid_ny=64,
-                    )
-                else:
-                    cfg = cfg_cls(n_paths=int(n_paths))
+                cfg = cfg_cls(
+                    n_paths=min(int(n_paths), 2048),
+                    n_replicates=1,
+                    n_substeps=4,
+                    lv_grid_nt=32,
+                    lv_grid_ny=64,
+                )
                 return crn_fn(state, queries=queries, config=cfg)  # type: ignore[no-any-return]
             return crn_fn(state, queries=queries)  # type: ignore[no-any-return]
-        except Exception:
-            pass
-    return compute_eq_autocall_greeks(state, queries=queries, surrogate=None)
+        except Exception as exc:
+            logger.warning(
+                "QMC CRN Greeks failed (%s); falling back to Tier-1 Analytical Proxy AD.",
+                exc,
+            )
+            return None
+    return None
+
+
+def _mds_digest_hex(mds: Any) -> str:
+    """Computes and caches a stable 16-byte blake2b hex digest for `MarketDataSetSpec`."""
+    cached = getattr(mds, "_cached_mds_digest_hex", None)
+    if isinstance(cached, str):
+        return cached
+    raw = orjson.dumps(
+        mds.model_dump(mode="json", by_alias=True),
+        option=orjson.OPT_SORT_KEYS,
+    )
+    digest = hashlib.blake2b(raw, digest_size=16).hexdigest()
+    try:
+        object.__setattr__(mds, "_cached_mds_digest_hex", digest)
+    except Exception:
+        pass
+    return digest
 
 
 def _market_dedup_key(req: EQAutocallableTradeRequest) -> str:
-    """Computes a stable digest for `Model.MarketDataSet` to deduplicate surface validation in batches."""
-    mds = req.Model.MarketDataSet
-    raw = orjson.dumps(mds.model_dump(mode="json", by_alias=True))
-    return hashlib.blake2b(raw, digest_size=16).hexdigest()
+    """Computes a stable digest for `Model` (`MarketDataSet` + `FinancingCurveIdentifiers` + legacy fields)."""
+    model = req.Model
+    mds_hex = _mds_digest_hex(model.MarketDataSet)
+    fin_ids = model.FinancingCurveIdentifiers
+    fin_part = ",".join(str(x) for x in fin_ids) if fin_ids is not None else "<NONE>"
+    leg_fields = getattr(model, "stripped_legacy_fields", None)
+    leg_part = ",".join(str(x) for x in leg_fields) if leg_fields else ""
+    raw_key = f"{mds_hex}|fin:{fin_part}|leg:{leg_part}".encode("utf-8")
+    return hashlib.blake2b(raw_key, digest_size=16).hexdigest()
 
 
 def _compute_w_fund_per_period(state: AutocallPreprocState, m_max: int) -> torch.Tensor:
@@ -1107,6 +1180,21 @@ class EQAutocallRuntime:
                     queries=requested_queries,
                     n_paths=self.n_fallback_paths,
                 )
+                if greeks_out is None:
+                    greeks_engine_used = "Tier1_AnalyticalProxy_AD"
+                    st_warns = list(getattr(active_state, "warnings", None) or [])
+                    if "QMC_CRN_GREEKS_FALLBACK_TO_PROXY" not in st_warns:
+                        st_warns.append("QMC_CRN_GREEKS_FALLBACK_TO_PROXY")
+                    setattr(active_state, "warnings", st_warns)
+                    greeks_out = compute_eq_autocall_greeks(
+                        active_state,
+                        queries=requested_queries,
+                        surrogate=None,
+                    )
+                else:
+                    greeks_engine_used = "Tier4_DupireQMC_CRN"
+                if audit_dict is not None:
+                    audit_dict["greeks_engine_used"] = greeks_engine_used
             else:
                 greeks_out = compute_eq_autocall_greeks(
                     active_state,
@@ -1123,6 +1211,7 @@ class EQAutocallRuntime:
                 Currency=str(cf.Currency),
                 Leg=int(cf.Leg),
                 StatusText=str(cf.StatusText),
+                ShortCode=_DESCRIPTION_TO_SHORT_CODE.get(str(cf.Description)),
             )
             for cf in cf_items
         ]
@@ -1216,6 +1305,89 @@ class EQAutocallRuntime:
         _, m_max, _ = sched_d.shape
 
         if compute_greeks:
+            if dev.type == "cpu" and not torch.is_grad_enabled():
+                ckey = _cpu_greeks_cache_key(
+                    self.surrogate,
+                    node_d,
+                    edge_d,
+                    amask_d,
+                    sched_d,
+                    smask_d,
+                    glob_d,
+                    compute_cash_gamma=compute_cash_gamma,
+                    no_notional_repayment=no_notional_repayment,
+                    autocall_coupon=autocall_coupon,
+                    force_coupons_on_autocall=force_coupons_on_autocall,
+                    is_long_basket=is_long_basket,
+                    w_fund_per_period=w_fund_per_period,
+                    lower_strike=lower_strike,
+                )
+                with _CPU_GREEKS_CACHE_LOCK:
+                    unit_out = _CPU_GREEKS_MICROBATCH_CACHE.get(ckey)
+                if unit_out is None:
+                    unit_out = _call_with_supported_kwargs(
+                        compute_batched_surrogate_greeks,
+                        _GREEKS_BATCH_PARAMS,
+                        self.surrogate,
+                        node_d,
+                        edge_d,
+                        amask_d,
+                        sched_d,
+                        smask_d,
+                        glob_d,
+                        spots_t0=None,
+                        ref_spots=None,
+                        pv_in_transit=0.0,
+                        compute_cash_gamma=compute_cash_gamma,
+                        no_notional_repayment=no_notional_repayment,
+                        autocall_coupon=autocall_coupon,
+                        force_coupons_on_autocall=force_coupons_on_autocall,
+                        is_long_basket=is_long_basket,
+                        w_fund_per_period=w_fund_per_period,
+                        lower_strike=lower_strike,
+                    )
+                    with _CPU_GREEKS_CACHE_LOCK:
+                        if len(_CPU_GREEKS_MICROBATCH_CACHE) >= 8:
+                            _CPU_GREEKS_MICROBATCH_CACHE.pop(next(iter(_CPU_GREEKS_MICROBATCH_CACHE)))
+                        _CPU_GREEKS_MICROBATCH_CACHE[ckey] = unit_out
+                assert unit_out is not None
+                pv_adj = unit_out.product_value.clone()
+                if pv_in_transit is not None:
+                    pv_adj = pv_adj + torch.as_tensor(pv_in_transit, dtype=torch.float64, device=dev)
+                delta_adj = unit_out.delta.clone()
+                if spots_t0 is not None or ref_spots is not None:
+                    amask_bool = amask_d > 0.5
+                    amask_64 = amask_bool.to(dtype=torch.float64)
+                    log_m0_64 = torch.where(
+                        amask_bool,
+                        node_d[:, :, int(AutocallNodeCol.LOG_MONEYNESS)],
+                        torch.zeros_like(amask_64),
+                    )
+                    sp_unit = torch.exp(log_m0_64).clamp(min=1e-12)
+                    g_log_s = delta_adj * sp_unit
+                    if spots_t0 is not None:
+                        sp_eff = spots_t0.to(dtype=torch.float64, device=dev).clamp(min=1e-12)
+                    else:
+                        assert ref_spots is not None
+                        sp_eff = sp_unit * ref_spots.to(dtype=torch.float64, device=dev).clamp(min=1e-12)
+                    delta_adj = (g_log_s / sp_eff) * amask_64
+                return BatchedSurrogateGreeksOutput(
+                    product_value=pv_adj,
+                    stopping_probs=unit_out.stopping_probs.clone(),
+                    survival_probs=unit_out.survival_probs.clone(),
+                    coupon_probs=unit_out.coupon_probs.clone(),
+                    put_loss=unit_out.put_loss.clone(),
+                    delta=delta_adj,
+                    vega_atm=unit_out.vega_atm.clone(),
+                    vega_surface_feats=unit_out.vega_surface_feats.clone(),
+                    rho_df=unit_out.rho_df.clone(),
+                    cega=unit_out.cega.clone(),
+                    cash_gamma_euler=(
+                        unit_out.cash_gamma_euler.clone()
+                        if unit_out.cash_gamma_euler is not None
+                        else None
+                    ),
+                )
             return _call_with_supported_kwargs(  # type: ignore[no-any-return]
                 compute_batched_surrogate_greeks,
                 _GREEKS_BATCH_PARAMS,
@@ -1239,24 +1411,56 @@ class EQAutocallRuntime:
             )
 
         with torch.no_grad():
-            node_f32 = node_d.to(dtype=torch.float32)
-            edge_f32 = edge_d.to(dtype=torch.float32)
-            amask_f32 = amask_d.to(dtype=torch.float32)
-            sched_f32 = sched_d.to(dtype=torch.float32)
-            smask_f32 = smask_d.to(dtype=torch.float32)
+            d_act, m_act = _trim_active_dimensions(node_d, edge_d, amask_d, sched_d, smask_d)
+            node_f32 = node_d[:, :d_act, :].to(dtype=torch.float32)
+            edge_f32 = edge_d[:, :d_act, :d_act, :].to(dtype=torch.float32)
+            amask_f32 = amask_d[:, :d_act].to(dtype=torch.float32)
+            sched_f32 = sched_d[:, :m_act, :].to(dtype=torch.float32)
+            smask_f32 = smask_d[:, :m_act].to(dtype=torch.float32)
             glob_f32 = glob_d.to(dtype=torch.float32)
 
             if self._compiled_runner is not None and dev.type == "cuda":
-                dhaz, dcpn, dput = self._compiled_runner.predict_residuals(
+                dhaz_act, dcpn_act, dput = self._compiled_runner.predict_residuals(
                     node_f32, edge_f32, amask_f32, sched_f32, smask_f32, glob_f32
                 )
+                if m_act < m_max:
+                    dhaz = torch.nn.functional.pad(dhaz_act, (0, m_max - m_act))
+                    dcpn = torch.nn.functional.pad(dcpn_act, (0, m_max - m_act))
+                else:
+                    dhaz = dhaz_act
+                    dcpn = dcpn_act
                 out = _decode_residuals_to_surrogate_output(
-                    dhaz, dcpn, dput, sched_f32, smask_f32, glob_f32
+                    dhaz,
+                    dcpn,
+                    dput,
+                    sched_d.to(dtype=torch.float32),
+                    smask_d.to(dtype=torch.float32),
+                    glob_f32,
                 )
             else:
-                out = self.surrogate(
+                out_act = self.surrogate(
                     node_f32, edge_f32, amask_f32, sched_f32, smask_f32, glob_f32
                 )
+                if m_act < m_max:
+                    pad_len = m_max - m_act
+                    out = AutocallSurrogateOutput(
+                        stopping_probs=torch.nn.functional.pad(out_act.stopping_probs, (0, pad_len)),
+                        survival_probs=torch.cat(
+                            [
+                                out_act.survival_probs,
+                                out_act.survival_probs[:, -1:].expand(-1, pad_len),
+                            ],
+                            dim=1,
+                        ),
+                        hazard_rates=torch.nn.functional.pad(out_act.hazard_rates, (0, pad_len)),
+                        coupon_probs=torch.nn.functional.pad(out_act.coupon_probs, (0, pad_len)),
+                        put_loss=out_act.put_loss,
+                        delta_hazard_logits=torch.nn.functional.pad(out_act.delta_hazard_logits, (0, pad_len)),
+                        delta_coupon_logits=torch.nn.functional.pad(out_act.delta_coupon_logits, (0, pad_len)),
+                        delta_put_loss=out_act.delta_put_loss,
+                    )
+                else:
+                    out = out_act
             pv_f64 = _call_with_supported_kwargs(
                 assemble_surrogate_product_value,
                 _ASSEMBLE_SURR_PARAMS,
@@ -1326,11 +1530,30 @@ class EQAutocallRuntime:
             )
         expected_d_node = int(getattr(self.surrogate, "d_node", 16))
         expected_d_global = int(getattr(self.surrogate, "d_global", 16))
-        if n_col != expected_d_node or g_col != expected_d_global:
+        allowed_d_node = {14, 16, 18, expected_d_node}
+        allowed_d_global = {10, 16, expected_d_global}
+        if (
+            n_col not in allowed_d_node
+            or g_col not in allowed_d_global
+            or n_col > max(expected_d_node, 18)
+            or g_col > max(expected_d_global, 16)
+        ):
             raise ValueError(
                 f"Feature schema width mismatch: got (d_node={n_col}, d_global={g_col}), "
                 f"expected ({expected_d_node}, {expected_d_global})."
             )
+        if n_col < expected_d_node:
+            node_feats = torch.nn.functional.pad(node_feats, (0, expected_d_node - n_col))
+            n_col = expected_d_node
+        elif n_col > expected_d_node:
+            node_feats = node_feats[:, :, :expected_d_node]
+            n_col = expected_d_node
+        if g_col < expected_d_global:
+            global_feats = torch.nn.functional.pad(global_feats, (0, expected_d_global - g_col))
+            g_col = expected_d_global
+        elif g_col > expected_d_global:
+            global_feats = global_feats[:, :expected_d_global]
+            g_col = expected_d_global
         if edge_feats.shape[:3] != (batch_size, d_dim, d_dim) or asset_mask.shape != (batch_size, d_dim):
             raise ValueError("edge_feats or asset_mask shape mismatch with node_feats.")
         if sched_mask.shape != (batch_size, m_dim) or global_feats.shape[0] != batch_size:
@@ -1463,12 +1686,24 @@ class EQAutocallRuntime:
         greeks_out: AutocallGreeksResult | None = None
         greeks_engine_used = "None"
         if compute_greeks and len(greek_queries_present) > 0:
-            greeks_engine_used = "Tier4_DupireQMC_CRN"
             greeks_out = _compute_qmc_crn_if_available(
                 guardian_res.preproc_state,
                 queries=requested_queries,
                 n_paths=self.n_fallback_paths,
             )
+            if greeks_out is None:
+                greeks_engine_used = "Tier1_AnalyticalProxy_AD"
+                st_warns = list(getattr(guardian_res.preproc_state, "warnings", None) or [])
+                if "QMC_CRN_GREEKS_FALLBACK_TO_PROXY" not in st_warns:
+                    st_warns.append("QMC_CRN_GREEKS_FALLBACK_TO_PROXY")
+                setattr(guardian_res.preproc_state, "warnings", st_warns)
+                greeks_out = compute_eq_autocall_greeks(
+                    guardian_res.preproc_state,
+                    queries=requested_queries,
+                    surrogate=None,
+                )
+            else:
+                greeks_engine_used = "Tier4_DupireQMC_CRN"
 
         audit_dict = guardian_res.audit_record.to_dict()
         audit_dict["greeks_engine_used"] = greeks_engine_used
@@ -1488,6 +1723,7 @@ class EQAutocallRuntime:
                 Currency=str(cf.Currency),
                 Leg=int(cf.Leg),
                 StatusText=str(cf.StatusText),
+                ShortCode=_DESCRIPTION_TO_SHORT_CODE.get(str(cf.Description)),
             )
             for cf in guardian_res.cashflows
         ]
@@ -1542,6 +1778,8 @@ class EQAutocallRuntime:
         full_jacobian_queries = {"Gamma", "Vega", "Rho", "DividendsSensitivities", "Theta"}
 
         model_cache: dict[str, DupireModelSpec] = {}
+        mds_cache: dict[str, Any] = {}
+        mds_id_cache: dict[int, str] = {}
         parsed_items: list[tuple[EQAutocallableTradeRequest, list[str], list[str], set[str], str]] = []
         _standard_keys = {
             "Product",
@@ -1557,49 +1795,144 @@ class EQAutocallRuntime:
             if isinstance(item, Mapping) and "Product" in item and "Model" in item and set(item.keys()) <= _standard_keys:
                 raw_model_obj = item["Model"]
                 if isinstance(raw_model_obj, Mapping):
-                    m_bytes = orjson.dumps(
-                        dict(raw_model_obj),
-                        option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SORT_KEYS,
-                    )
-                    mkt_key = hashlib.blake2b(m_bytes, digest_size=16).hexdigest()
-                    cached_model = model_cache.get(mkt_key)
-                    if cached_model is None:
-                        cached_model = DupireModelSpec.model_validate(raw_model_obj)
-                        temp_req = EQAutocallableTradeRequest.model_construct(
-                            Product=AutoCallableProductSpec.model_validate(item["Product"]),
-                            Model=cached_model,
-                            Queries=[
-                                AutocallQueryMetric(q) for q in item.get("Queries", ("ProductValue", "CashFlows"))
-                            ],
-                            TradeInfo=item.get("TradeInfo"),
-                            stripped_legacy_fields=list(item.get("stripped_legacy_fields", [])),
-                        )
-                        _validate_surfaces_for_arbitrage(temp_req)
-                        model_cache[mkt_key] = cached_model
-                        req_m = temp_req
+                    raw_mds = raw_model_obj.get("MarketDataSet")
+                    mds_key_opt: str | None = None
+                    if isinstance(raw_mds, Mapping):
+                        mds_key_opt = mds_id_cache.get(id(raw_mds))
+                        if mds_key_opt is None:
+                            mds_bytes = orjson.dumps(
+                                dict(raw_mds),
+                                option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SORT_KEYS,
+                            )
+                            mds_key_opt = hashlib.blake2b(mds_bytes, digest_size=16).hexdigest()
+                            mds_id_cache[id(raw_mds)] = mds_key_opt
+                    if (
+                        mds_key_opt is not None
+                        and mds_key_opt in mds_cache
+                        and set(raw_model_obj.keys())
+                        <= {"TypeName", "MarketDataSet", "FinancingCurveIdentifiers", "stripped_legacy_fields"}
+                    ):
+                        cached_mds = mds_cache[mds_key_opt]
+                        fin_raw = raw_model_obj.get("FinancingCurveIdentifiers")
+                        fin_list = [str(x) for x in fin_raw] if fin_raw is not None else None
+                        model_leg = [str(x) for x in raw_model_obj.get("stripped_legacy_fields", ())]
+                        for curve in cached_mds.RatesCurvesBundles.values():
+                            for f_s in curve.stripped_legacy_fields:
+                                if f_s not in model_leg:
+                                    model_leg.append(f_s)
+                        fin_part = ",".join(fin_list) if fin_list is not None else "<NONE>"
+                        leg_part = ",".join(model_leg)
+                        mkt_key = hashlib.blake2b(
+                            f"{mds_key_opt}|fin:{fin_part}|leg:{leg_part}".encode("utf-8"),
+                            digest_size=16,
+                        ).hexdigest()
+                        cached_model = model_cache.get(mkt_key)
+                        if cached_model is None:
+                            cached_model = DupireModelSpec.model_construct(
+                                TypeName="DupireModel",
+                                MarketDataSet=cached_mds,
+                                FinancingCurveIdentifiers=fin_list,
+                                stripped_legacy_fields=model_leg,
+                            )
+                            model_cache[mkt_key] = cached_model
                     else:
-                        req_m = EQAutocallableTradeRequest.model_construct(
-                            Product=AutoCallableProductSpec.model_validate(item["Product"]),
-                            Model=cached_model,
-                            Queries=[
-                                AutocallQueryMetric(q) for q in item.get("Queries", ("ProductValue", "CashFlows"))
-                            ],
-                            TradeInfo=item.get("TradeInfo"),
-                            stripped_legacy_fields=list(item.get("stripped_legacy_fields", [])),
+                        m_bytes = orjson.dumps(
+                            dict(raw_model_obj),
+                            option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SORT_KEYS,
                         )
+                        raw_mkt_key = hashlib.blake2b(m_bytes, digest_size=16).hexdigest()
+                        cached_model = model_cache.get(raw_mkt_key)
+                        if cached_model is None:
+                            if mds_key_opt is not None and mds_key_opt in mds_cache:
+                                model_copy_in = dict(raw_model_obj)
+                                model_copy_in["MarketDataSet"] = mds_cache[mds_key_opt]
+                                cached_model = DupireModelSpec.model_validate(model_copy_in)
+                            else:
+                                cached_model = DupireModelSpec.model_validate(raw_model_obj)
+                                eff_mds_key = mds_key_opt or _mds_digest_hex(cached_model.MarketDataSet)
+                                try:
+                                    object.__setattr__(
+                                        cached_model.MarketDataSet,
+                                        "_cached_mds_digest_hex",
+                                        eff_mds_key,
+                                    )
+                                except Exception:
+                                    pass
+                                mds_cache[eff_mds_key] = cached_model.MarketDataSet
+                            model_cache[raw_mkt_key] = cached_model
+                        mkt_key = raw_mkt_key
+
+                    prod_spec = AutoCallableProductSpec.model_validate(item["Product"])
+                    queries_list = [
+                        AutocallQueryMetric(q) for q in item.get("Queries", ("ProductValue", "CashFlows"))
+                    ]
+                    if len(queries_list) == 0:
+                        raise ValueError("Queries must not be empty")
+                    if (
+                        len(prod_spec.UnderlyingIdentifiers) >= 2
+                        and len(cached_model.MarketDataSet.Correlations) == 0
+                    ):
+                        raise ValueError(
+                            "MarketDataSet.Correlations must not be empty for multi-asset baskets"
+                        )
+                    merged_stripped = list(
+                        dict.fromkeys(
+                            [
+                                *item.get("stripped_legacy_fields", ()),
+                                *cached_model.stripped_legacy_fields,
+                            ]
+                        )
+                    )
+                    req_m = EQAutocallableTradeRequest.model_construct(
+                        Product=prod_spec,
+                        Model=cached_model,
+                        Queries=queries_list,
+                        TradeInfo=item.get("TradeInfo"),
+                        stripped_legacy_fields=merged_stripped,
+                    )
+                    if not getattr(cached_model.MarketDataSet, "_batch_arbitrage_checked", False):
+                        _validate_surfaces_for_arbitrage(req_m)
+                        try:
+                            object.__setattr__(cached_model.MarketDataSet, "_batch_arbitrage_checked", True)
+                        except Exception:
+                            pass
+                    mkt_key = _market_dedup_key(req_m)
+                    model_cache[mkt_key] = cached_model
                 else:
                     req_m, _is_dag = self._parse_request(item)
+                    mds_hex = _mds_digest_hex(req_m.Model.MarketDataSet)
+                    if mds_hex not in mds_cache:
+                        _validate_surfaces_for_arbitrage(req_m)
+                        mds_cache[mds_hex] = req_m.Model.MarketDataSet
+                    elif req_m.Model.MarketDataSet is not mds_cache[mds_hex]:
+                        req_m = req_m.model_copy(
+                            update={
+                                "Model": req_m.Model.model_copy(
+                                    update={"MarketDataSet": mds_cache[mds_hex]}
+                                )
+                            }
+                        )
                     mkt_key = _market_dedup_key(req_m)
                     if mkt_key not in model_cache:
-                        _validate_surfaces_for_arbitrage(req_m)
                         model_cache[mkt_key] = req_m.Model
                     else:
                         req_m = req_m.model_copy(update={"Model": model_cache[mkt_key]})
             else:
                 req_m, _is_dag = self._parse_request(item)
+                mds_hex = _mds_digest_hex(req_m.Model.MarketDataSet)
+                if mds_hex not in mds_cache:
+                    _validate_surfaces_for_arbitrage(req_m)
+                    mds_cache[mds_hex] = req_m.Model.MarketDataSet
+                elif req_m.Model.MarketDataSet is not mds_cache[mds_hex]:
+                    req_m = req_m.model_copy(
+                        update={
+                            "Model": req_m.Model.model_copy(
+                                update={"MarketDataSet": mds_cache[mds_hex]}
+                            )
+                        }
+                    )
                 mkt_key = _market_dedup_key(req_m)
                 if mkt_key not in model_cache:
-                    _validate_surfaces_for_arbitrage(req_m)
                     model_cache[mkt_key] = req_m.Model
                 else:
                     req_m = req_m.model_copy(update={"Model": model_cache[mkt_key]})
@@ -1646,7 +1979,7 @@ class EQAutocallRuntime:
                         state_i,
                         record_drift=False,
                     )
-                    if bool(diag.get("correlation_shrunk", False)):
+                    if bool(diag.get("correlation_shrunk_applied", diag.get("correlation_shrunk", False))):
                         _ = self.guardian._apply_shrunk_correlation_to_state(state_i, r_psd)
                         _attach_runtime_market_metadata(state_i, req_m)
                     pre_state_cache[req_cache_key] = (state_i, pre_passed, pre_reasons, r_psd, diag)
@@ -1807,6 +2140,7 @@ class EQAutocallRuntime:
                                 Currency=str(cf.Currency),
                                 Leg=int(cf.Leg),
                                 StatusText=str(cf.StatusText),
+                                ShortCode=_DESCRIPTION_TO_SHORT_CODE.get(str(cf.Description)),
                             )
                             for cf in post_res.cashflows
                         ]
@@ -1834,7 +2168,7 @@ class EQAutocallRuntime:
                 min_pin_z = float(pre_diag_k.get("min_pin_risk_z", 100.0))
                 conf_hw = float(pre_diag_k.get("conformal_half_width_bps", 0.0))
                 audit_rec = SR262AuditRecord(
-                    trade_id=state_k.trade_info if state_k.trade_info is not None else f"BATCH_{orig_idx}",
+                    trade_id=req_m.TradeInfo if req_m.TradeInfo is not None else (state_k.trade_info if state_k.trade_info is not None else f"BATCH_{orig_idx}"),
                     timestamp_utc=ts_now,
                     pre_gate_passed=(len(pre_reasons_k) == 0),
                     post_gate_passed=bool(post_passed),
@@ -1843,7 +2177,9 @@ class EQAutocallRuntime:
                     warnings=list(pre_diag_k.get("warnings", [])),
                     min_corr_eigenvalue_raw=float(pre_diag_k.get("min_corr_eigenvalue_raw", 1.0)),
                     min_corr_eigenvalue_shrunk=float(pre_diag_k.get("min_corr_eigenvalue_shrunk", 1.0)),
-                    correlation_shrunk_applied=bool(pre_diag_k.get("correlation_shrunk", False)),
+                    correlation_shrunk_applied=bool(
+                        pre_diag_k.get("correlation_shrunk_applied", pre_diag_k.get("correlation_shrunk", False))
+                    ),
                     mahalanobis_d2=float(pre_diag_k.get("mahalanobis_d2", 0.0)),
                     max_psi_score=float(pre_diag_k.get("max_psi_score", 0.0)),
                     min_pin_risk_z=min_pin_z,
@@ -1925,6 +2261,10 @@ class EQAutocallRuntime:
             if decoded.pv_in_transit is not None
             else float(decoded.metadata.get("pv_in_transit", 0.0))
         )
+        no_notional = bool(decoded.metadata.get("no_notional_repayment", False))
+        ac_coupon = float(decoded.metadata.get("autocall_coupon", 0.0))
+        force_cpn = bool(decoded.metadata.get("force_coupons_on_autocall", False))
+        fund_pv = float(decoded.metadata.get("funding_pv", 0.0))
         batch_out = self.price_tensor_batch(
             decoded.node_feats,
             decoded.edge_feats,
@@ -1937,6 +2277,10 @@ class EQAutocallRuntime:
             pv_in_transit=pvit,
             compute_greeks=compute_greeks,
             compute_cash_gamma=compute_greeks,
+            no_notional_repayment=no_notional,
+            autocall_coupon=ac_coupon,
+            force_coupons_on_autocall=force_cpn,
+            funding_pv=fund_pv,
             run_guardian=True,
         )
         latency_ms = (time.perf_counter() - t0) * 1e3

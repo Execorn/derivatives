@@ -520,8 +520,8 @@ def compute_conformal_half_width_bps(
     if isinstance(mondrian_tbl, dict) and len(mondrian_tbl) > 0:
         cell_keys = _extract_mondrian_cell_keys_from_batch(batch)
         q_vec = np.array([float(mondrian_tbl.get(k, q_err)) for k in cell_keys], dtype=np.float64)
-        return q_vec * scale * 1e4
-    return q_err * scale * 1e4
+        return np.asarray(q_vec * scale * 1e4, dtype=np.float64)
+    return np.asarray(q_err * scale * 1e4, dtype=np.float64)
 
 
 def _predict_batch_pv(

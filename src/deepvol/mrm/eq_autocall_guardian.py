@@ -811,9 +811,11 @@ class EQAutocallModelGuardian:
             self.psi_ref_probs = ref_probs
 
     def reset_drift_history(self) -> None:
-        """Clears the rolling feature history window."""
+        """Clears the rolling feature history window and PSI deduplication caches."""
         with self._lock:
             self.feature_history.clear()
+            self._recent_psi_trade_ids.clear()
+            self._recent_psi_batch_hashes.clear()
 
     def record_feature_vector(
         self,
@@ -1316,11 +1318,13 @@ class EQAutocallModelGuardian:
             t_id = str(preproc_state.trade_info) if preproc_state.trade_info is not None else ""
             should_push = True
             if t_id:
+                feat_sig = hashlib.blake2b(np.round(summary_16d, 6).tobytes(), digest_size=8).hexdigest()
+                dedup_id = f"{t_id}:{feat_sig}"
                 with self._lock:
-                    if t_id in self._recent_psi_trade_ids:
+                    if dedup_id in self._recent_psi_trade_ids or t_id in self._recent_psi_trade_ids:
                         should_push = False
                     else:
-                        self._recent_psi_trade_ids.append(t_id)
+                        self._recent_psi_trade_ids.append(dedup_id)
             if should_push:
                 self.record_feature_vector(summary_16d)
 
@@ -1582,6 +1586,33 @@ class EQAutocallModelGuardian:
 
         new_baseline = compute_analytical_autocall_baseline(preproc_state)
         preproc_state.baseline = new_baseline
+        if d_assets > 0:
+            node_clone = preproc_state.node_feats.clone()
+            node_clone[0, :d_assets, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)] = (
+                new_baseline.proxy_delta_weights.to(dtype=node_clone.dtype, device=device)
+            )
+            preproc_state.node_feats = node_clone
+        m_rem = int(preproc_state.m_rem)
+        if m_rem > 0:
+            sched_clone = preproc_state.sched_feats.clone()
+            sched_clone[0, :m_rem, int(AutocallSchedCol.STULZ_FWD_W)] = torch.log(
+                new_baseline.f_w.clamp(min=1e-12)
+            ).to(dtype=sched_clone.dtype, device=device)
+            sched_clone[0, :m_rem, int(AutocallSchedCol.STULZ_VOL_W)] = new_baseline.v_w.to(
+                dtype=sched_clone.dtype, device=device
+            )
+            sched_clone[0, :m_rem, int(AutocallSchedCol.PROXY_KO_PROB)] = new_baseline.p_proxy.to(
+                dtype=sched_clone.dtype, device=device
+            )
+            sched_clone[0, :m_rem, int(AutocallSchedCol.PROXY_CPN_PROB)] = new_baseline.q_proxy.to(
+                dtype=sched_clone.dtype, device=device
+            )
+            preproc_state.sched_feats = sched_clone
+        glob_clone = preproc_state.global_feats.clone()
+        glob_clone[0, int(AutocallGlobalCol.L_PUT_PROXY)] = new_baseline.l_put_proxy.to(
+            dtype=glob_clone.dtype, device=device
+        )
+        preproc_state.global_feats = glob_clone
         return new_baseline
 
     def _extract_batch_16d_summary(
@@ -1654,23 +1685,34 @@ class EQAutocallModelGuardian:
             vw_last = np.full(b_sz, 0.25, dtype=np.float64)
         out[:, 8] = np.where(has_m, tau_last, 0.0)
 
-        is_call = (sched_np[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)] > 0.5) & smask_np
-        call_cnt = np.sum(is_call, axis=1)
         log_ko = sched_np[:, :, int(AutocallSchedCol.LOG_KO_BARRIER)]
+        ko_non_finite = smask_np & (~(log_ko >= -50.0) | ~(log_ko <= 50.0))
+        is_call = smask_np & (
+            ((sched_np[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)] > 0.5) & ~(log_ko >= math.log(100.0)))
+            | ko_non_finite
+        )
+        call_cnt = np.sum(is_call, axis=1)
         out[:, 9] = np.where(
             call_cnt > 0,
             np.sum(np.where(is_call, log_ko, 0.0), axis=1) / np.maximum(call_cnt, 1),
             0.05,
         )
+        out[:, 9] = np.where(np.any(ko_non_finite, axis=1), np.nan, out[:, 9])
+
         log_cpn = sched_np[:, :, int(AutocallSchedCol.LOG_CPN_BARRIER)]
+        cpn_non_finite = smask_np & (~(log_cpn >= -50.0) | ~(log_cpn <= 50.0))
         guar = sched_np[:, :, int(AutocallSchedCol.IS_GUARANTEED_CPN)]
-        cpn_act = smask_np & (guar < 0.5) & (log_cpn > math.log(1e-4) + 1e-4)
+        cpn_act = smask_np & (
+            ((guar < 0.5) & ~(log_cpn <= math.log(1e-4) + 1e-4))
+            | cpn_non_finite
+        )
         cpn_cnt = np.sum(cpn_act, axis=1)
         out[:, 10] = np.where(
             cpn_cnt > 0,
             np.sum(np.where(cpn_act, log_cpn, 0.0), axis=1) / np.maximum(cpn_cnt, 1),
             -0.50,
         )
+        out[:, 10] = np.where(np.any(cpn_non_finite, axis=1), np.nan, out[:, 10])
         out[:, 11] = glob_np[:, int(AutocallGlobalCol.K_PUT)]
         out[:, 12] = np.where(has_m, fw_last, out[:, 1])
         out[:, 13] = np.where(has_m, vw_last, 0.25)
@@ -1698,59 +1740,41 @@ class EQAutocallModelGuardian:
         glob_np = global_feats.detach().cpu().numpy().astype(np.float64, copy=False)
 
         b_sz = node_np.shape[0]
-        summary_batch = np.zeros((b_sz, 16), dtype=np.float64)
-        a_cnt = np.maximum(np.sum(amask_np, axis=1), 1).astype(np.float64)
-        log_m = node_np[:, :, int(AutocallNodeCol.LOG_MONEYNESS)]
-        has_a = np.any(amask_np, axis=1)
-        summary_batch[:, 0] = np.where(has_a, np.sum(np.where(amask_np, log_m, 0.0), axis=1) / a_cnt, 0.0)
-        summary_batch[:, 1] = np.where(has_a, np.min(np.where(amask_np, log_m, np.inf), axis=1), 0.0)
-        summary_batch[:, 2] = np.where(has_a, np.max(np.where(amask_np, log_m, -np.inf), axis=1), 0.0)
-
-        iv_s = node_np[:, :, int(AutocallNodeCol.IV_SHORT_ATM)]
-        iv_t = node_np[:, :, int(AutocallNodeCol.IV_TERM_ATM)]
-        iv_p = 0.5 * (iv_s + iv_t)
-        summary_batch[:, 3] = np.where(has_a, np.sum(np.where(amask_np, iv_p, 0.0), axis=1) / a_cnt, 0.35)
-        summary_batch[:, 4] = np.where(has_a, np.max(np.where(amask_np, iv_p, -np.inf), axis=1), 0.35)
-
-        corr_np = edge_np[:, :, :, int(AutocallEdgeCol.CORR_RHO)]
-        off_mask = edge_np[:, :, :, int(AutocallEdgeCol.OFF_DIAG_MASK)] > 0.5
-        off_cnt = np.sum(off_mask, axis=(1, 2))
-        has_off = off_cnt > 0
-        summary_batch[:, 5] = np.where(has_off, np.sum(np.where(off_mask, corr_np, 0.0), axis=(1, 2)) / np.maximum(off_cnt, 1), 1.0)
-        summary_batch[:, 6] = np.where(has_off, np.min(np.where(off_mask, corr_np, np.inf), axis=(1, 2)), 1.0)
-
-        div_l = node_np[:, :, int(AutocallNodeCol.CASH_DIV_LEVERAGE)]
-        summary_batch[:, 7] = np.where(has_a, np.max(np.where(amask_np, div_l, 0.0), axis=1), 0.0)
-
-        tau_np = sched_np[:, :, int(AutocallSchedCol.TAU_OBS)]
-        fw_np = sched_np[:, :, int(AutocallSchedCol.STULZ_FWD_W)]
+        summary_batch = self._extract_batch_16d_summary(
+            node_feats,
+            edge_feats,
+            asset_mask,
+            sched_feats,
+            sched_mask,
+            global_feats,
+        )
         vw_all = sched_np[:, :, int(AutocallSchedCol.STULZ_VOL_W)]
-        has_m = np.any(smask_np, axis=1)
-        m_last_idx = np.maximum(np.sum(smask_np, axis=1) - 1, 0)
-        b_idx = np.arange(b_sz)
-        summary_batch[:, 8] = np.where(has_m, tau_np[b_idx, m_last_idx], 0.0) if tau_np.shape[1] > 0 else 0.0
 
-        log_ko = sched_np[:, :, int(AutocallSchedCol.LOG_KO_BARRIER)]
-        is_call = smask_np & (sched_np[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)] > 0.5) & (log_ko < math.log(100.0))
-        call_cnt = np.sum(is_call, axis=1)
-        summary_batch[:, 9] = np.where(call_cnt > 0, np.sum(np.where(is_call, log_ko, 0.0), axis=1) / np.maximum(call_cnt, 1), 0.05)
-
-        log_cpn = sched_np[:, :, int(AutocallSchedCol.LOG_CPN_BARRIER)]
-        guar = sched_np[:, :, int(AutocallSchedCol.IS_GUARANTEED_CPN)]
-        cpn_act = smask_np & (guar < 0.5) & (log_cpn > math.log(1e-4) + 1e-4)
-        cpn_cnt = np.sum(cpn_act, axis=1)
-        summary_batch[:, 10] = np.where(cpn_cnt > 0, np.sum(np.where(cpn_act, log_cpn, 0.0), axis=1) / np.maximum(cpn_cnt, 1), -0.50)
-
-        summary_batch[:, 11] = glob_np[:, int(AutocallGlobalCol.K_PUT)]
-        summary_batch[:, 12] = np.where(has_m, fw_np[b_idx, m_last_idx], summary_batch[:, 1]) if fw_np.shape[1] > 0 else summary_batch[:, 1]
-        summary_batch[:, 13] = np.where(has_m, vw_all[b_idx, m_last_idx], 0.25) if vw_all.shape[1] > 0 else 0.25
-        summary_batch[:, 14] = glob_np[:, int(AutocallGlobalCol.C_MEM_0)]
-        summary_batch[:, 15] = np.abs(glob_np[:, int(AutocallGlobalCol.ABS_KO_SPREAD)])
-
-        finite_mask = np.all(np.isfinite(summary_batch), axis=1)
+        node_active_ok = np.all(
+            np.where(amask_np[:, :, None], np.isfinite(node_np), True),
+            axis=(1, 2),
+        )
+        pair_active = amask_np[:, :, None] & amask_np[:, None, :]
+        edge_active_ok = np.all(
+            np.where(pair_active[:, :, :, None], np.isfinite(edge_np), True),
+            axis=(1, 2, 3),
+        )
+        sched_active_ok = np.all(
+            np.where(smask_np[:, :, None], np.isfinite(sched_np), True),
+            axis=(1, 2),
+        )
+        glob_active_ok = np.all(np.isfinite(glob_np), axis=1)
+        finite_mask = (
+            np.all(np.isfinite(summary_batch), axis=1)
+            & node_active_ok
+            & edge_active_ok
+            & sched_active_ok
+            & glob_active_ok
+        )
         with self._lock:
             ref_mean = self.ref_mean_16d
             cov_inv = self.ref_cov_inv_16d
+            cov_inv_d1 = self.ref_cov_inv_d1_16d
             eff_ood = (
                 float(self.q_ood_conformal)
                 if self._conformal_calibrated
@@ -1759,10 +1783,18 @@ class EQAutocallModelGuardian:
             conformal_active = bool(self._conformal_calibrated)
             q_err = float(self.q_err_conformal)
             w5 = self.scale_weights_5d.copy()
+            mondrian_tbl = dict(self.mondrian_q_err_table)
             tau_desk = float(self.tau_desk_bps)
 
         diff = summary_batch - ref_mean[None, :]
-        d2_vec = np.maximum(np.sum((diff @ cov_inv) * diff, axis=1), 0.0)
+        d_cnt_vec = np.sum(amask_np, axis=1)
+        is_d1_vec = d_cnt_vec == 1
+        d2_full = np.maximum(np.sum((diff @ cov_inv) * diff, axis=1), 0.0)
+        if bool(np.any(is_d1_vec)):
+            d2_d1 = np.maximum(np.sum((diff @ cov_inv_d1) * diff, axis=1), 0.0)
+            d2_vec = np.where(is_d1_vec, d2_d1, d2_full)
+        else:
+            d2_vec = d2_full
         d2_vec = np.where(finite_mask, d2_vec, 1e6)
 
         if conformal_active:
@@ -1775,8 +1807,12 @@ class EQAutocallModelGuardian:
             raw_m_cnt = np.sum(smask_np, axis=1)
             m_cnt = np.maximum(raw_m_cnt, 1)
             v_bar = np.sum(np.where(smask_np, vw_all, 0.0), axis=1) / m_cnt
-            call_id = np.round(glob_np[:, int(AutocallGlobalCol.CALL_INDEX_ID)])
-            opt_id = np.round(glob_np[:, int(AutocallGlobalCol.OPT_INDEX_ID)])
+            if glob_np.shape[1] > int(AutocallGlobalCol.OPT_INDEX_ID):
+                call_id = np.round(glob_np[:, int(AutocallGlobalCol.CALL_INDEX_ID)])
+                opt_id = np.round(glob_np[:, int(AutocallGlobalCol.OPT_INDEX_ID)])
+            else:
+                call_id = np.zeros(b_sz, dtype=np.float64)
+                opt_id = np.zeros(b_sz, dtype=np.float64)
             is_wof = (
                 (call_id == int(MonitoringIndexCode.WORST_OF))
                 | (opt_id == int(MonitoringIndexCode.WORST_OF))
@@ -1798,7 +1834,23 @@ class EQAutocallModelGuardian:
                 ],
                 axis=1,
             )
-            conf_hw_vec = np.maximum(q_err * (phi_mat @ w5) * 1e4, 0.0)
+            if mondrian_tbl:
+                ki_untrig_vec = has_ki_b & i_kip_b
+                q_err_vec = np.array(
+                    [
+                        float(
+                            mondrian_tbl.get(
+                                f"ki{1 if bool(ki_u) else 0}_m{0 if int(m_c) <= 12 else (1 if int(m_c) <= 25 else 2)}_d{0 if int(d_c) <= 2 else 1}",
+                                q_err,
+                            )
+                        )
+                        for ki_u, m_c, d_c in zip(ki_untrig_vec, raw_m_cnt, d_cnt_vec)
+                    ],
+                    dtype=np.float64,
+                )
+            else:
+                q_err_vec = np.full(b_sz, q_err, dtype=np.float64)
+            conf_hw_vec = np.maximum(q_err_vec * (phi_mat @ w5) * 1e4, 0.0)
         else:
             conf_hw_vec = np.zeros(b_sz, dtype=np.float64)
 
@@ -1827,6 +1879,13 @@ class EQAutocallModelGuardian:
                     self.record_feature_vector(distinct_rows[::stride])
 
         max_psi, _ = self.compute_psi()
+        with self._lock:
+            n_hist = len(self.feature_history)
+        eff_psi_thresh = (
+            self.effective_psi_threshold(n_hist)
+            if n_hist > 0
+            else float(self.psi_fallback_threshold)
+        )
         ood_flags = d2_vec > eff_ood
         conf_flags = conf_hw_vec > tau_desk if conformal_active else np.zeros(b_sz, dtype=bool)
         return {
@@ -1837,7 +1896,7 @@ class EQAutocallModelGuardian:
             "max_conformal_half_width_bps": float(np.max(conf_hw_vec)) if b_sz > 0 else 0.0,
             "conformal_breach_count": int(np.sum(conf_flags)),
             "max_psi_score": float(max_psi),
-            "psi_breached": bool(max_psi >= self.psi_fallback_threshold),
+            "psi_breached": bool(max_psi >= eff_psi_thresh),
             "non_finite_count": int(np.sum(~finite_mask)),
         }
 
