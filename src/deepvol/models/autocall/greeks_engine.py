@@ -960,44 +960,56 @@ def _escrowed_spot_softplus(spots_col: torch.Tensor, div_pv_t: torch.Tensor) -> 
 def _eval_index_scalar(
     perf_m: npt.NDArray[np.float64],
     idx_name: str,
-    inv_lex_perm: npt.NDArray[np.int64],
+    inv_lex_perm: Sequence[int] | npt.NDArray[np.int64],
 ) -> float:
     """Evaluates a deterministic Murex monitoring index on 1D sorted asset performances."""
-    if idx_name == "WorstOf":
+    idx_clean = idx_name.strip()
+    if idx_clean in ("WorstOf", "Lookback"):
         return float(np.min(perf_m))
-    if idx_name == "BestOf":
+    if idx_clean == "BestOf":
         return float(np.max(perf_m))
-    if idx_name in ("Average", "AverageOf", "MultiPerf"):
+    if idx_clean in ("Average", "AverageOf", "MultiPerf", "EquallyWeightedBasket"):
         return float(np.mean(perf_m))
-    if idx_name == "Dispersion":
+    if idx_clean == "TwinWin":
+        w_min = float(np.min(perf_m))
+        return 2.0 - w_min if w_min < 1.0 else w_min
+    if idx_clean == "Dispersion":
         return float(np.std(perf_m))
-    if idx_name in ("RatioAB", "Outperformance", "Ratio"):
+    if idx_clean in ("RatioAB", "Ratio"):
         a = float(perf_m[int(inv_lex_perm[0])])
-        b = max(float(perf_m[int(inv_lex_perm[1])]), 1e-12) if len(perf_m) >= 2 else 1.0
+        if len(perf_m) < 2:
+            return a
+        b = max(float(perf_m[int(inv_lex_perm[1])]), 1e-12)
         return a / b
-    if idx_name == "RatioBA":
-        a = max(float(perf_m[int(inv_lex_perm[0])]), 1e-12)
-        b = float(perf_m[int(inv_lex_perm[1])]) if len(perf_m) >= 2 else a
-        return b / a
-    if idx_name in ("DiffAB", "Spread"):
+    if idx_clean == "RatioBA":
         a = float(perf_m[int(inv_lex_perm[0])])
-        b = float(perf_m[int(inv_lex_perm[1])]) if len(perf_m) >= 2 else 0.0
+        if len(perf_m) < 2:
+            return a
+        b = float(perf_m[int(inv_lex_perm[1])])
+        return b / max(a, 1e-12)
+    if idx_clean in ("DiffAB", "Outperformance", "Spread"):
+        a = float(perf_m[int(inv_lex_perm[0])])
+        if len(perf_m) < 2:
+            return a
+        b = float(perf_m[int(inv_lex_perm[1])])
         return a - b
-    if idx_name == "DiffBA":
+    if idx_clean == "DiffBA":
         a = float(perf_m[int(inv_lex_perm[0])])
-        b = float(perf_m[int(inv_lex_perm[1])]) if len(perf_m) >= 2 else 0.0
+        if len(perf_m) < 2:
+            return a
+        b = float(perf_m[int(inv_lex_perm[1])])
         return b - a
-    if idx_name == "RatioBestWorst":
+    if idx_clean == "RatioBestWorst":
         return float(np.max(perf_m)) / max(float(np.min(perf_m)), 1e-12)
-    if idx_name == "RatioBestAverage":
+    if idx_clean == "RatioBestAverage":
         return float(np.max(perf_m)) / max(float(np.mean(perf_m)), 1e-12)
-    if idx_name == "RatioAverageWorst":
+    if idx_clean == "RatioAverageWorst":
         return float(np.mean(perf_m)) / max(float(np.min(perf_m)), 1e-12)
-    if idx_name == "DiffBestWorst":
+    if idx_clean in ("DiffBestWorst", "Rainbow", "SpreadBestWorst"):
         return float(np.max(perf_m) - np.min(perf_m))
-    if idx_name == "DiffBestAverage":
+    if idx_clean in ("DiffBestAverage", "SpreadBestAverage"):
         return float(np.max(perf_m) - np.mean(perf_m))
-    if idx_name == "DiffAverageWorst":
+    if idx_clean in ("DiffAverageWorst", "SpreadAverageWorst"):
         return float(np.mean(perf_m) - np.min(perf_m))
     return float(np.min(perf_m))
 
@@ -1255,7 +1267,12 @@ def _collapse_crossed_periods_for_roll(
         k_cross = m + 1
         if eff_autocalled:
             continue
-        if base_state.ki_barrier is not None and base_state.ki_barrier > 0.0 and w_opt < float(base_state.ki_barrier):
+        if (
+            base_state.ki_barrier is not None
+            and base_state.ki_barrier > 0.0
+            and (bool(getattr(base_state.seasoned_state, "ki_monitored_past", False)) or m == m_rem - 1)
+            and w_opt < float(base_state.ki_barrier)
+        ):
             eff_i_ki = 1.0
 
         b_ko = float(ko_arr[m])
@@ -1282,11 +1299,17 @@ def _collapse_crossed_periods_for_roll(
             eff_autocalled = True
         elif m == m_rem - 1:
             notional_paid = 0.0 if base_state.no_notional_repayment else 1.0
+            has_one_star = base_state.one_star_strike is not None and float(base_state.one_star_strike) > 0.0
+            one_star_hit = bool(
+                has_one_star
+                and base_state.one_star_strike is not None
+                and float(np.max(perf_m)) >= float(base_state.one_star_strike)
+            )
             k_put = float(base_state.strike)
             k_low = float(base_state.lower_strike) if base_state.lower_strike is not None else 0.0
             ki_active = (base_state.ki_barrier is None or base_state.ki_barrier <= 0.0) or (eff_i_ki > 0.5)
             put_loss_val = 0.0
-            if ki_active and k_put > max(k_low, 0.0):
+            if ki_active and not one_star_hit and k_put > max(k_low, 0.0):
                 put_loss_val = max(k_put - w_opt, 0.0) - max(max(k_low, 0.0) - w_opt, 0.0)
             put_sign = -1.0
             opt_paid += put_sign * float(base_state.option_gearing) * put_loss_val
@@ -1294,9 +1317,8 @@ def _collapse_crossed_periods_for_roll(
                 opt_paid += float(base_state.participation_call_rate) * max(
                     w_opt - float(base_state.participation_call_strike), 0.0
                 )
-            if base_state.one_star_strike is not None and base_state.one_star_coupon != 0.0:
-                if float(np.max(perf_m)) >= float(base_state.one_star_strike):
-                    opt_paid += float(base_state.one_star_coupon)
+            if one_star_hit and base_state.one_star_coupon != 0.0:
+                opt_paid += float(base_state.one_star_coupon)
             eff_autocalled = True
         else:
             notional_paid = 0.0
@@ -4814,11 +4836,6 @@ class _PreSurrFusedFn(torch.autograd.Function):
         sf_fn = _SURR_FEAT_CPP_FN
         assert c_fn is not None and sf_fn is not None
 
-        gn = np.ascontiguousarray(g_nf[:b_diff].detach().cpu().numpy(), dtype=np.float64) if g_nf is not None else np.zeros((b_diff, d_cnt, d_node), dtype=np.float64)
-        ge_n = np.ascontiguousarray(g_ef[:b_diff].detach().cpu().numpy(), dtype=np.float64) if g_ef is not None else np.zeros((b_diff, d_cnt, d_cnt, 4), dtype=np.float64)
-        gs = np.ascontiguousarray(g_sf[:b_diff].detach().cpu().numpy(), dtype=np.float64) if g_sf is not None else np.zeros((b_diff, m_cnt, 12), dtype=np.float64)
-        gg = np.ascontiguousarray(g_gf[:b_diff].detach().cpu().numpy(), dtype=np.float64) if g_gf is not None else np.zeros((b_diff, d_global), dtype=np.float64)
-
         g_m = np.zeros_like(moneyness)
         g_fr = np.zeros_like(fwd_rel)
         g_fp = np.zeros_like(fwd_perf)
@@ -4835,33 +4852,38 @@ class _PreSurrFusedFn(torch.autograd.Function):
         g_lp = np.zeros_like(lp_o)
         g_rspr = np.zeros_like(repo_spr)
 
-        sf_fn(
-            b_diff, d_cnt, m_cnt, q_len, d_node, d_global, 1, float(k_eff_n),
-            moneyness.__array_interface__["data"][0], fwd_rel.__array_interface__["data"][0],
-            fwd_perf.__array_interface__["data"][0], cd_lev.__array_interface__["data"][0],
-            v_perf.__array_interface__["data"][0], iv_all.__array_interface__["data"][0],
-            dw_o.__array_interface__["data"][0], corr_b.__array_interface__["data"][0],
-            df_pay_diff.__array_interface__["data"][0], fw_o.__array_interface__["data"][0],
-            vw_o.__array_interface__["data"][0], p_o.__array_interface__["data"][0],
-            q_o.__array_interface__["data"][0], lp_o.__array_interface__["data"][0],
-            repo_spr.__array_interface__["data"][0],
-            tau_np_s.__array_interface__["data"][0], dtau_np_s.__array_interface__["data"][0],
-            lko_np_s.__array_interface__["data"][0], ic_np_s.__array_interface__["data"][0],
-            lcp_np_s.__array_interface__["data"][0], ig_np_s.__array_interface__["data"][0],
-            cpn_np_s.__array_interface__["data"][0], ra_np.__array_interface__["data"][0],
-            rb_np.__array_interface__["data"][0], gst_np.__array_interface__["data"][0],
-            0, 0, 0, 0,
-            gn.__array_interface__["data"][0], ge_n.__array_interface__["data"][0],
-            gs.__array_interface__["data"][0], gg.__array_interface__["data"][0],
-            g_m.__array_interface__["data"][0], g_fr.__array_interface__["data"][0],
-            g_fp.__array_interface__["data"][0], g_cd.__array_interface__["data"][0],
-            g_vp.__array_interface__["data"][0], g_iv.__array_interface__["data"][0],
-            g_dw.__array_interface__["data"][0], g_cm.__array_interface__["data"][0],
-            g_dfp.__array_interface__["data"][0], g_fw.__array_interface__["data"][0],
-            g_vw.__array_interface__["data"][0], g_p.__array_interface__["data"][0],
-            g_q.__array_interface__["data"][0], g_lp.__array_interface__["data"][0],
-            g_rspr.__array_interface__["data"][0],
-        )
+        if g_nf is not None or g_ef is not None or g_sf is not None or g_gf is not None:
+            gn = np.ascontiguousarray(g_nf[:b_diff].detach().cpu().numpy(), dtype=np.float64) if g_nf is not None else np.zeros((b_diff, d_cnt, d_node), dtype=np.float64)
+            ge_n = np.ascontiguousarray(g_ef[:b_diff].detach().cpu().numpy(), dtype=np.float64) if g_ef is not None else np.zeros((b_diff, d_cnt, d_cnt, 4), dtype=np.float64)
+            gs = np.ascontiguousarray(g_sf[:b_diff].detach().cpu().numpy(), dtype=np.float64) if g_sf is not None else np.zeros((b_diff, m_cnt, 12), dtype=np.float64)
+            gg = np.ascontiguousarray(g_gf[:b_diff].detach().cpu().numpy(), dtype=np.float64) if g_gf is not None else np.zeros((b_diff, d_global), dtype=np.float64)
+            sf_fn(
+                b_diff, d_cnt, m_cnt, q_len, d_node, d_global, 1, float(k_eff_n),
+                moneyness.__array_interface__["data"][0], fwd_rel.__array_interface__["data"][0],
+                fwd_perf.__array_interface__["data"][0], cd_lev.__array_interface__["data"][0],
+                v_perf.__array_interface__["data"][0], iv_all.__array_interface__["data"][0],
+                dw_o.__array_interface__["data"][0], corr_b.__array_interface__["data"][0],
+                df_pay_diff.__array_interface__["data"][0], fw_o.__array_interface__["data"][0],
+                vw_o.__array_interface__["data"][0], p_o.__array_interface__["data"][0],
+                q_o.__array_interface__["data"][0], lp_o.__array_interface__["data"][0],
+                repo_spr.__array_interface__["data"][0],
+                tau_np_s.__array_interface__["data"][0], dtau_np_s.__array_interface__["data"][0],
+                lko_np_s.__array_interface__["data"][0], ic_np_s.__array_interface__["data"][0],
+                lcp_np_s.__array_interface__["data"][0], ig_np_s.__array_interface__["data"][0],
+                cpn_np_s.__array_interface__["data"][0], ra_np.__array_interface__["data"][0],
+                rb_np.__array_interface__["data"][0], gst_np.__array_interface__["data"][0],
+                0, 0, 0, 0,
+                gn.__array_interface__["data"][0], ge_n.__array_interface__["data"][0],
+                gs.__array_interface__["data"][0], gg.__array_interface__["data"][0],
+                g_m.__array_interface__["data"][0], g_fr.__array_interface__["data"][0],
+                g_fp.__array_interface__["data"][0], g_cd.__array_interface__["data"][0],
+                g_vp.__array_interface__["data"][0], g_iv.__array_interface__["data"][0],
+                g_dw.__array_interface__["data"][0], g_cm.__array_interface__["data"][0],
+                g_dfp.__array_interface__["data"][0], g_fw.__array_interface__["data"][0],
+                g_vw.__array_interface__["data"][0], g_p.__array_interface__["data"][0],
+                g_q.__array_interface__["data"][0], g_lp.__array_interface__["data"][0],
+                g_rspr.__array_interface__["data"][0],
+            )
 
         if g_p_in is not None:
             g_p += np.ascontiguousarray(g_p_in.detach().cpu().numpy(), dtype=np.float64)
@@ -5545,7 +5567,7 @@ def evaluate_differentiable_pv(
         "already_autocalled": eff_autocalled,
         "callability_index": base_state.callability_index,
         "coupon_index": base_state.coupon_index,
-        "option_index": base_state.option_index,
+        "option_index": "AverageOf" if bool(getattr(base_state, "is_long_basket", False)) else base_state.option_index,
         "allow_autocall_on_expiry": base_state.allow_autocall_on_expiry,
         "inv_lex_perm": base_state.inv_lex_perm,
     }
@@ -5557,9 +5579,14 @@ def evaluate_differentiable_pv(
     want_fast_cpu = (use_fast_cpu_baseline is True) or (
         use_fast_cpu_baseline is None and device.type == "cpu" and not t1_needs_grad
     )
+    eff_opt_idx_base = (
+        "AverageOf"
+        if bool(getattr(base_state, "is_long_basket", False))
+        else (base_state.option_index or base_state.callability_index)
+    )
     call_code = monitoring_index_to_code(base_state.callability_index)
     cpn_code = monitoring_index_to_code(base_state.coupon_index or base_state.callability_index)
-    opt_code = monitoring_index_to_code(base_state.option_index or base_state.callability_index)
+    opt_code = monitoring_index_to_code(eff_opt_idx_base)
     can_pure_tier1 = (
         not want_fast_cpu
         and m_active >= 1
@@ -5568,7 +5595,7 @@ def evaluate_differentiable_pv(
         and cpn_code in (0, 1)
         and opt_code in (0, 1)
         and (base_state.participation_call_strike is None or float(base_state.participation_call_strike) <= 0.0 or float(base_state.participation_call_rate) == 0.0)
-        and (base_state.one_star_strike is None or float(base_state.one_star_strike) <= 0.0 or float(base_state.one_star_coupon) == 0.0)
+        and (base_state.one_star_strike is None or float(base_state.one_star_strike) <= 0.0)
         and not _in_functorch_transform()
     )
     if want_fast_cpu:
@@ -5652,7 +5679,7 @@ def evaluate_differentiable_pv(
         active_idx_names = (
             base_state.callability_index,
             base_state.coupon_index or base_state.callability_index,
-            base_state.option_index or base_state.callability_index,
+            eff_opt_idx_base,
         )
         if d_assets >= 2 and any(nm in PAIR_ORDER_DEPENDENT_INDICES for nm in active_idx_names):
             role_leg_a[int(base_state.inv_lex_perm[0])] = 1.0
@@ -5737,7 +5764,7 @@ def evaluate_differentiable_pv(
         g_cols[AutocallGlobalCol.LOWER_STRIKE] = torch.tensor(lower_k_val, dtype=torch.float64, device=device)
         g_cols[AutocallGlobalCol.CALL_INDEX_ID] = torch.tensor(float(monitoring_index_to_code(base_state.callability_index)), dtype=torch.float64, device=device)
         g_cols[AutocallGlobalCol.CPN_INDEX_ID] = torch.tensor(float(monitoring_index_to_code(base_state.coupon_index or base_state.callability_index)), dtype=torch.float64, device=device)
-        g_cols[AutocallGlobalCol.OPT_INDEX_ID] = torch.tensor(float(monitoring_index_to_code(base_state.option_index or base_state.callability_index)), dtype=torch.float64, device=device)
+        g_cols[AutocallGlobalCol.OPT_INDEX_ID] = torch.tensor(float(monitoring_index_to_code(eff_opt_idx_base)), dtype=torch.float64, device=device)
         g_cols[AutocallGlobalCol.IS_LONG_BASKET] = torch.tensor(1.0 if base_state.is_long_basket else 0.0, dtype=torch.float64, device=device)
         g_cols[AutocallGlobalCol.ABS_KI_SPREAD] = torch.tensor(abs(float(base_state.ki_spread)), dtype=torch.float64, device=device)
         global_feats = torch.stack(g_cols, dim=0)[:surr_d_global].unsqueeze(0)
@@ -6232,8 +6259,7 @@ def _try_eval_fused_pre_surr(
 ) -> tuple[Any, ...] | None:
     """Fast fused C++23 + NumPy pre-surrogate pipeline for standard pure Tier-1 surrogate calls."""
     if (
-        eff_surrogate is None
-        or vol_deltas is not None
+        vol_deltas is not None
         or pillar_deltas is not None
         or (div_vars is not None and len(div_vars) > 0)
         or funding_pillar_deltas is not None
@@ -6246,13 +6272,18 @@ def _try_eval_fused_pre_surr(
         return None
     if (
         (state.participation_call_strike is not None and float(state.participation_call_strike) > 0.0 and float(state.participation_call_rate) != 0.0)
-        or (state.one_star_strike is not None and float(state.one_star_strike) > 0.0 and float(state.one_star_coupon) != 0.0)
+        or (state.one_star_strike is not None and float(state.one_star_strike) > 0.0)
     ):
         return None
 
+    eff_opt_idx = (
+        "AverageOf"
+        if bool(getattr(state, "is_long_basket", False))
+        else (state.option_index or state.callability_index)
+    )
     call_code = monitoring_index_to_code(state.callability_index)
     cpn_code = monitoring_index_to_code(state.coupon_index or state.callability_index)
-    opt_code = monitoring_index_to_code(state.option_index or state.callability_index)
+    opt_code = monitoring_index_to_code(eff_opt_idx)
     if call_code not in (0, 1) or cpn_code not in (0, 1) or opt_code not in (0, 1):
         return None
 
@@ -6350,7 +6381,7 @@ def _try_eval_fused_pre_surr(
     active_idx_names = (
         state.callability_index,
         state.coupon_index or state.callability_index,
-        state.option_index or state.callability_index,
+        eff_opt_idx,
     )
     if d_assets >= 2 and any(nm in PAIR_ORDER_DEPENDENT_INDICES for nm in active_idx_names):
         role_a_np[int(state.inv_lex_perm[0])] = 1.0
@@ -7091,15 +7122,20 @@ def _evaluate_greeks_single_batch(
     ig_t = state.is_guaranteed_cpn.to(dtype=torch.float64, device=device)
     cpn_t = state.coupon_amounts.to(dtype=torch.float64, device=device)
 
+    eff_opt_idx_sb = (
+        "AverageOf"
+        if bool(getattr(state, "is_long_basket", False))
+        else (state.option_index or state.callability_index)
+    )
     call_code = monitoring_index_to_code(state.callability_index)
     cpn_code = monitoring_index_to_code(state.coupon_index or state.callability_index)
-    opt_code = monitoring_index_to_code(state.option_index or state.callability_index)
+    opt_code = monitoring_index_to_code(eff_opt_idx_sb)
     can_pure_tier1 = (
         call_code in (0, 1)
         and cpn_code in (0, 1)
         and opt_code in (0, 1)
         and (state.participation_call_strike is None or float(state.participation_call_strike) <= 0.0 or float(state.participation_call_rate) == 0.0)
-        and (state.one_star_strike is None or float(state.one_star_strike) <= 0.0 or float(state.one_star_coupon) == 0.0)
+        and (state.one_star_strike is None or float(state.one_star_strike) <= 0.0)
     )
     if can_pure_tier1:
         is_call_flags = tuple(bool(x) for x in (ic_t.detach().cpu() > 0.5).tolist())
@@ -7163,7 +7199,7 @@ def _evaluate_greeks_single_batch(
             "already_autocalled": False,
             "callability_index": state.callability_index,
             "coupon_index": state.coupon_index,
-            "option_index": state.option_index,
+            "option_index": "AverageOf" if bool(getattr(state, "is_long_basket", False)) else state.option_index,
             "allow_autocall_on_expiry": state.allow_autocall_on_expiry,
             "inv_lex_perm": state.inv_lex_perm,
         }
@@ -7492,7 +7528,7 @@ def _evaluate_greeks_single_batch(
                             "already_autocalled": False,
                             "callability_index": state.callability_index,
                             "coupon_index": state.coupon_index,
-                            "option_index": state.option_index,
+                            "option_index": "AverageOf" if bool(getattr(state, "is_long_basket", False)) else state.option_index,
                             "allow_autocall_on_expiry": state.allow_autocall_on_expiry,
                             "inv_lex_perm": state.inv_lex_perm,
                         },
@@ -7667,7 +7703,7 @@ def _evaluate_greeks_single_batch(
             active_idx_names = (
                 state.callability_index,
                 state.coupon_index or state.callability_index,
-                state.option_index or state.callability_index,
+                eff_opt_idx_sb,
             )
             if d_assets >= 2 and any(nm in PAIR_ORDER_DEPENDENT_INDICES for nm in active_idx_names):
                 role_a_np[int(state.inv_lex_perm[0])] = 1.0
@@ -7769,7 +7805,7 @@ def _evaluate_greeks_single_batch(
             active_idx_names = (
                 state.callability_index,
                 state.coupon_index or state.callability_index,
-                state.option_index or state.callability_index,
+                eff_opt_idx_sb,
             )
             if d_assets >= 2 and any(nm in PAIR_ORDER_DEPENDENT_INDICES for nm in active_idx_names):
                 role_leg_a[int(state.inv_lex_perm[0])] = 1.0
@@ -8177,7 +8213,14 @@ def _eval_post_surr_tail(
         q_cpn_0_t = q_cpn_b[0].detach()
         l_put_0_t = l_put_b[0].detach()
 
-    if use_cpp_glue and state.funding_leg is None and m_rem > 0 and not state.already_autocalled:
+    if (
+        use_cpp_glue
+        and state.funding_leg is None
+        and m_rem > 0
+        and not state.already_autocalled
+        and not state.is_long_basket
+        and (state.one_star_strike is None or float(state.one_star_strike) <= 0.0)
+    ):
         p0_np = p_stop_0_t.detach().cpu().numpy() * ic_np_s
         q0_np = q_cpn_0_t.detach().cpu().numpy()
         lp0_f = float(l_put_0_t.detach().cpu().item())
@@ -8549,7 +8592,7 @@ def compute_eq_autocall_greeks(
         (want_gamma or want_cash_gamma)
         and m_rem > 0
         and not state.already_autocalled
-        and is_f32_surr
+        and (eff_surrogate is None or is_f32_surr)
     )
 
     div_vars: dict[str, torch.Tensor] = {}
@@ -8597,7 +8640,7 @@ def compute_eq_autocall_greeks(
                 fx_corr_deltas[ticker] = torch.zeros((), dtype=torch.float64, device=device, requires_grad=True)
     spots_gamma_leaf: torch.Tensor | None = None
     h_gamma_vec: torch.Tensor | None = None
-    h_euler_rel: float = 1.0e-3
+    h_euler_rel: float = 1.0e-5 if eff_surrogate is None else 1.0e-3
     pv_theta_batched: torch.Tensor | None = None
 
     cuda_graph_ctx: Any = contextlib.nullcontext()
@@ -14591,6 +14634,7 @@ def _reconstruct_period_forwards_and_cdl(
     vw_base: torch.Tensor | None = None,
     *,
     term_only: bool = False,
+    idx_last: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reconstructs per-period forward_perf and cash_div_leverage from STULZ_FWD_W when omitted."""
     b_sz, d_act, m_act = v_m_raw.shape
@@ -14608,6 +14652,7 @@ def _reconstruct_period_forwards_and_cdl(
     is_best = call_idx_str == "BestOf"
     if (
         not term_only
+        and idx_last is None
         and use_triton_f64
         and d_act == 5
         and (b_sz * d_act * m_act) <= 150_000
@@ -14727,6 +14772,11 @@ def _reconstruct_period_forwards_and_cdl(
     c_flat = corr_sym_64.unsqueeze(1).expand(b_sz, m_act, d_act, d_act).reshape(b_sz * m_act, d_act, d_act)
     am_flat = amask_64.unsqueeze(1).expand(b_sz, m_act, d_act).reshape(b_sz * m_act, d_act)
     v_flat = v_m_raw.transpose(1, 2).reshape(b_sz * m_act, d_act)
+    row_act_flat = (
+        None
+        if idx_last is None
+        else (torch.arange(m_act, device=v_m_raw.device).unsqueeze(0) <= idx_last.unsqueeze(1)).reshape(-1)
+    )
 
     def _run_moments(fp_m_3d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         fp_fl = fp_m_3d.transpose(1, 2).reshape(b_sz * m_act, d_act)
@@ -14852,8 +14902,8 @@ def _reconstruct_period_forwards_and_cdl(
                 fp_fl.float(), v_flat.float(), c_flat.float(), am_flat.float(), is_best_of=is_best
             )
             return fw_fl.double().view(b_sz, m_act).clamp(min=1e-16), vw_fl.double().view(b_sz, m_act).clamp(min=1e-12)
-        fw_fl, vw_fl, _ = stulz_margrabe_moments_with_weights(
-            fp_fl, v_flat, c_flat, am_flat, monitoring_index=call_idx_str
+        fw_fl, vw_fl, _ = _stulz_margrabe_moments_grouped(
+            fp_fl, v_flat, c_flat, am_flat, monitoring_index=call_idx_str, row_active=row_act_flat
         )
         return fw_fl.view(b_sz, m_act).clamp(min=1e-16), vw_fl.view(b_sz, m_act).clamp(min=1e-12)
 
@@ -14885,7 +14935,7 @@ def _reconstruct_period_forwards_and_cdl(
                 f_lo = vw_nd - vw_base
                 f_hi = vw_d - vw_base
                 al = ((vw_nd - vw_base) / torch.where(use_vw, vw_span, torch.ones_like(vw_span))).clamp(0.0, 1.0)
-                for _ in range(5):
+                for _ in range(2 if not v_m_raw.is_cuda else 5):
                     fp_c = torch.exp(torch.log(fp_nodiv.clamp(min=1e-16)) - al.unsqueeze(1) * log_dlev.unsqueeze(2)) * amask_64.unsqueeze(2)
                     _, vw_c = _run_moments(fp_c)
                     f_c = vw_c - vw_base
@@ -14902,7 +14952,10 @@ def _reconstruct_period_forwards_and_cdl(
                 alpha = alpha_fw
         else:
             alpha = alpha_fw
-        alpha[:, -1] = 1.0
+        if idx_last is None:
+            alpha[:, -1] = 1.0
+        else:
+            alpha.scatter_(1, idx_last.unsqueeze(1), 1.0)
         fp_est = torch.exp(torch.log(fp_nodiv.clamp(min=1e-16)) - alpha.unsqueeze(1) * log_dlev.unsqueeze(2)) * amask_64.unsqueeze(2)
         fw_est, _ = _run_moments(fp_est)
         fp_est = fp_est * (fw_base / fw_est).unsqueeze(1)
@@ -14913,6 +14966,46 @@ def _reconstruct_period_forwards_and_cdl(
     fp_scaled = fp_nodiv * (fw_base / fw_nd).unsqueeze(1)
     cdl_ones = torch.ones_like(fp_scaled) * amask_64.unsqueeze(2)
     return fp_scaled, cdl_ones
+
+
+def _stulz_margrabe_moments_grouped(
+    fp_fl: torch.Tensor,
+    v_flat: torch.Tensor,
+    c_flat: torch.Tensor,
+    am_flat: torch.Tensor,
+    *,
+    monitoring_index: str,
+    row_active: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Evaluates Stulz-Margrabe moments grouped by active asset count to avoid row-by-row fallbacks."""
+    act_cnt = (am_flat > 0.5).sum(dim=1)
+    if row_active is not None:
+        act_cnt = torch.where(row_active, act_cnt, torch.zeros_like(act_cnt))
+    min_c = int(act_cnt.min().item())
+    max_c = int(act_cnt.max().item())
+    if min_c == max_c and min_c > 0:
+        return stulz_margrabe_moments_with_weights(
+            fp_fl, v_flat, c_flat, am_flat, monitoring_index=monitoring_index
+        )
+    n_rows, d_act = fp_fl.shape
+    fw_out = torch.ones(n_rows, dtype=torch.float64, device=fp_fl.device)
+    vw_out = torch.full((n_rows,), 0.1, dtype=torch.float64, device=fp_fl.device)
+    w_out = torch.zeros((n_rows, d_act), dtype=torch.float64, device=fp_fl.device)
+    for c_val in range(max(1, min_c), max_c + 1):
+        idx_g = (act_cnt == c_val).nonzero(as_tuple=True)[0]
+        if int(idx_g.numel()) == 0:
+            continue
+        fw_g, vw_g, w_g = stulz_margrabe_moments_with_weights(
+            fp_fl.index_select(0, idx_g),
+            v_flat.index_select(0, idx_g),
+            c_flat.index_select(0, idx_g),
+            am_flat.index_select(0, idx_g),
+            monitoring_index=monitoring_index,
+        )
+        fw_out = fw_out.index_put((idx_g,), fw_g)
+        vw_out = vw_out.index_put((idx_g,), vw_g)
+        w_out = w_out.index_put((idx_g,), w_g)
+    return fw_out, vw_out, w_out
 
 
 def _batched_tier1_proxies(
@@ -14946,8 +15039,9 @@ def _batched_tier1_proxies(
     v_flat = v_bm.transpose(1, 2).reshape(b_sz * m_act, d_act)
     c_flat = corr_sym.unsqueeze(1).expand(b_sz, m_act, d_act, d_act).reshape(b_sz * m_act, d_act, d_act)
     am_flat = amask_64.unsqueeze(1).expand(b_sz, m_act, d_act).reshape(b_sz * m_act, d_act)
-    fw_flat, vw_flat, w_flat = stulz_margrabe_moments_with_weights(
-        fp_flat, v_flat, c_flat, am_flat, monitoring_index=call_idx_str,
+    row_act_flat = None if all_sched_act else (smask_64 > 0.5).reshape(b_sz * m_act)
+    fw_flat, vw_flat, w_flat = _stulz_margrabe_moments_grouped(
+        fp_flat, v_flat, c_flat, am_flat, monitoring_index=call_idx_str, row_active=row_act_flat,
     )
     f_w = fw_flat.view(b_sz, m_act).clamp(min=1e-16)
     v_w = vw_flat.view(b_sz, m_act).clamp(min=1e-12)
@@ -15062,6 +15156,8 @@ def _batched_tier1_proxies(
         float((k_strike.max() - k_strike.min()).item()) < 1e-12
         and float((k_low.max() - k_low.min()).item()) < 1e-12
         and float((b_ki.max() - b_ki.min()).item()) < 1e-12
+        and float((ki_spread_mag.max() - ki_spread_mag.min()).item()) < 1e-12
+        and float((ko_spread_mag.max() - ko_spread_mag.min()).item()) < 1e-12
         and bool((active_ki == active_ki[0]).all().item())
         and bool(((is_call_term > 0.5) == (is_call_term[0] > 0.5)).all().item())
         and float((b_ko_term.max() - b_ko_term.min()).item()) < 1e-12
@@ -15090,7 +15186,7 @@ def _batched_tier1_proxies(
             k_low,
             active_ki,
             b_ki,
-            ko_spread_mag.squeeze(1),
+            ki_spread_mag.squeeze(1),
         )
     return torch.log(f_w.clamp(min=1e-12)), v_w, p_proxy, q_proxy, l_put_proxy, w_term
 
@@ -15670,14 +15766,29 @@ def compute_batched_surrogate_greeks(
     surr_d_global = int(getattr(surrogate, "d_global", global_feats.shape[-1]))
     amask_64 = amask_f64[:, :d_act]
     smask_64 = smask_f64[:, :m_act]
-    all_sched_act = bool(smask_bool[:, :m_act].all())
+    amask_act_bool = amask_bool[:, :d_act]
+    smask_act_bool = smask_bool[:, :m_act]
+    pair_act_bool = amask_act_bool.unsqueeze(1) & amask_act_bool.unsqueeze(2)
+    all_sched_act = bool(smask_act_bool.all())
     idx_last: torch.Tensor | None = (
         None if all_sched_act else (smask_64.sum(dim=1).long() - 1).clamp(min=0)
     )
 
-    node_64 = node_feats[:, :d_act, :].detach().to(dtype=torch.float64, device=device)
-    edge_64 = edge_feats[:, :d_act, :d_act, :].detach().to(dtype=torch.float64, device=device)
-    sched_64 = sched_feats[:, :m_act, :].detach().to(dtype=torch.float64, device=device)
+    node_64 = torch.where(
+        amask_act_bool.unsqueeze(-1),
+        node_feats[:, :d_act, :].detach().to(dtype=torch.float64, device=device),
+        0.0,
+    )
+    edge_64 = torch.where(
+        pair_act_bool.unsqueeze(-1),
+        edge_feats[:, :d_act, :d_act, :].detach().to(dtype=torch.float64, device=device),
+        0.0,
+    )
+    sched_64 = torch.where(
+        smask_act_bool.unsqueeze(-1),
+        sched_feats[:, :m_act, :].detach().to(dtype=torch.float64, device=device),
+        0.0,
+    )
     glob_64 = global_feats.detach().to(dtype=torch.float64, device=device)
 
     w_fund_act = (
@@ -15747,7 +15858,11 @@ def compute_batched_surrogate_greeks(
         span_t = (tau_term - tau_short).clamp(min=1e-8)
         alpha_m = ((tau_all - tau_short) / span_t).clamp(0.0, 1.0)
         if v_perf is not None:
-            v_m_raw = v_perf[:, :d_act, :m_act].detach().to(dtype=torch.float64, device=device) * amask_64.unsqueeze(2)
+            v_m_raw = torch.where(
+                amask_act_bool.unsqueeze(2) & smask_act_bool.unsqueeze(1),
+                v_perf[:, :d_act, :m_act].detach().to(dtype=torch.float64, device=device),
+                0.0,
+            )
         else:
             iv_m_bm = (
                 (1.0 - alpha_m).unsqueeze(1) * iv_short_node.unsqueeze(2)
@@ -15769,50 +15884,83 @@ def compute_batched_surrogate_greeks(
         call_idx_str = "BestOf" if call_code_0 == 1 else "WorstOf"
         sym5_call_cache: dict[str, Any] = {}
 
-        term_rec_only = bool(not use_markov_tier1 and all_sched_act and m_act > 1)
+        term_rec_only = bool(not use_markov_tier1 and m_act > 1)
+        am_sm_bool = amask_act_bool.unsqueeze(2) & smask_act_bool.unsqueeze(1)
+        if term_rec_only:
+            if idx_last is None:
+                v_m_rec = v_m_raw[:, :, -1:]
+                tau_rec = tau_all[:, -1:]
+                lfw_rec = log_fw_base[:, -1:]
+                vw_rec = v_w_base[:, -1:]
+            else:
+                idx_3d_rec = idx_last.view(batch_size, 1, 1).expand(batch_size, d_act, 1)
+                idx_2d_rec = idx_last.unsqueeze(1)
+                v_m_rec = v_m_raw.gather(2, idx_3d_rec)
+                tau_rec = tau_all.gather(1, idx_2d_rec)
+                lfw_rec = log_fw_base.gather(1, idx_2d_rec)
+                vw_rec = v_w_base.gather(1, idx_2d_rec)
         if forward_perf is not None and cash_div_leverage is not None:
-            fp_bm_raw = forward_perf[:, :d_act, :m_act].detach().to(dtype=torch.float64, device=device) * amask_64.unsqueeze(2)
-            cdl_bm = cash_div_leverage[:, :d_act, :m_act].detach().to(dtype=torch.float64, device=device) * amask_64.unsqueeze(2)
+            fp_bm_raw = torch.where(
+                am_sm_bool,
+                forward_perf[:, :d_act, :m_act].detach().to(dtype=torch.float64, device=device),
+                0.0,
+            )
+            cdl_bm = torch.where(
+                am_sm_bool,
+                cash_div_leverage[:, :d_act, :m_act].detach().to(dtype=torch.float64, device=device),
+                0.0,
+            )
         elif forward_perf is not None:
-            fp_bm_raw = forward_perf[:, :d_act, :m_act].detach().to(dtype=torch.float64, device=device) * amask_64.unsqueeze(2)
+            fp_bm_raw = torch.where(
+                am_sm_bool,
+                forward_perf[:, :d_act, :m_act].detach().to(dtype=torch.float64, device=device),
+                0.0,
+            )
             if term_rec_only:
                 _, cdl_bm = _reconstruct_period_forwards_and_cdl(
-                    node_64, v_m_raw[:, :, -1:], corr_sym_64, amask_64, tau_all[:, -1:], tau_term,
-                    log_fw_base[:, -1:], call_idx_str, vw_base=v_w_base[:, -1:], term_only=True,
+                    node_64, v_m_rec, corr_sym_64, amask_64, tau_rec, tau_term,
+                    lfw_rec, call_idx_str, vw_base=vw_rec, term_only=True,
                 )
             else:
                 _, cdl_bm = _reconstruct_period_forwards_and_cdl(
-                    node_64, v_m_raw, corr_sym_64, amask_64, tau_all, tau_term, log_fw_base, call_idx_str, vw_base=v_w_base
+                    node_64, v_m_raw, corr_sym_64, amask_64, tau_all, tau_term, log_fw_base, call_idx_str,
+                    vw_base=v_w_base, idx_last=idx_last,
                 )
         elif cash_div_leverage is not None:
             if term_rec_only:
                 fp_bm_raw, _ = _reconstruct_period_forwards_and_cdl(
-                    node_64, v_m_raw[:, :, -1:], corr_sym_64, amask_64, tau_all[:, -1:], tau_term,
-                    log_fw_base[:, -1:], call_idx_str, vw_base=v_w_base[:, -1:], term_only=True,
+                    node_64, v_m_rec, corr_sym_64, amask_64, tau_rec, tau_term,
+                    lfw_rec, call_idx_str, vw_base=vw_rec, term_only=True,
                 )
             else:
                 fp_bm_raw, _ = _reconstruct_period_forwards_and_cdl(
-                    node_64, v_m_raw, corr_sym_64, amask_64, tau_all, tau_term, log_fw_base, call_idx_str, vw_base=v_w_base
+                    node_64, v_m_raw, corr_sym_64, amask_64, tau_all, tau_term, log_fw_base, call_idx_str,
+                    vw_base=v_w_base, idx_last=idx_last,
                 )
-            cdl_bm = cash_div_leverage[:, :d_act, :m_act].detach().to(dtype=torch.float64, device=device) * amask_64.unsqueeze(2)
+            cdl_bm = torch.where(
+                am_sm_bool,
+                cash_div_leverage[:, :d_act, :m_act].detach().to(dtype=torch.float64, device=device),
+                0.0,
+            )
         elif term_rec_only:
             fp_bm_raw, cdl_bm = _reconstruct_period_forwards_and_cdl(
-                node_64, v_m_raw[:, :, -1:], corr_sym_64, amask_64, tau_all[:, -1:], tau_term,
-                log_fw_base[:, -1:], call_idx_str, vw_base=v_w_base[:, -1:], term_only=True,
+                node_64, v_m_rec, corr_sym_64, amask_64, tau_rec, tau_term,
+                lfw_rec, call_idx_str, vw_base=vw_rec, term_only=True,
             )
         else:
             fp_bm_raw, cdl_bm = _reconstruct_period_forwards_and_cdl(
-                node_64, v_m_raw, corr_sym_64, amask_64, tau_all, tau_term, log_fw_base, call_idx_str, vw_base=v_w_base
+                node_64, v_m_raw, corr_sym_64, amask_64, tau_all, tau_term, log_fw_base, call_idx_str,
+                vw_base=v_w_base, idx_last=idx_last,
             )
 
         cdl_term = (
             cdl_bm[:, :, -1]
-            if idx_last is None
+            if (idx_last is None or cdl_bm.shape[2] == 1)
             else cdl_bm.gather(2, idx_last.view(batch_size, 1, 1).expand(batch_size, d_act, 1)).squeeze(2)
         )
         f_p_term = (
             fp_bm_raw[:, :, -1]
-            if idx_last is None
+            if (idx_last is None or fp_bm_raw.shape[2] == 1)
             else fp_bm_raw.gather(2, idx_last.view(batch_size, 1, 1).expand(batch_size, d_act, 1)).squeeze(2)
         ) * amask_64
         w_log_fw = w_proxy * (f_p_term / f_w_term)
@@ -15835,10 +15983,12 @@ def compute_batched_surrogate_greeks(
         escrow_frac_bm = (one_plus_u.unsqueeze(2) - (1.0 - inv_lev_bm)).clamp(min=1e-6)
         log_fp_shift_bm = torch.log(escrow_frac_bm / inv_lev_bm.clamp(min=1e-6))
         if idx_last is None:
-            log_fp_shift_term = log_fp_shift_bm[:, :, -1]
             idx_last_eff: torch.Tensor | None = None
         else:
             idx_last_eff = torch.cat([idx_last, idx_last], dim=0)
+        if idx_last_eff is None or log_fp_shift_bm.shape[2] == 1:
+            log_fp_shift_term = log_fp_shift_bm[:, :, -1]
+        else:
             log_fp_shift_term = log_fp_shift_bm.gather(
                 2, idx_last_eff.view(b_eff, 1, 1).expand(b_eff, d_act, 1)
             ).squeeze(2)
@@ -15870,8 +16020,12 @@ def compute_batched_surrogate_greeks(
         b_ki_2 = torch.cat([b_ki, b_ki], dim=0)
 
         log_m0_u = node_2[:, :, int(AutocallNodeCol.LOG_MONEYNESS)] + torch.log(one_plus_u)
-        log_div_lev_u = torch.log((one_plus_u / escrow_frac_bm[:, :, -1]).clamp(min=1.0)) if idx_last_eff is None else torch.log(
-            (one_plus_u / escrow_frac_bm.gather(2, idx_last_eff.view(b_eff, 1, 1).expand(b_eff, d_act, 1)).squeeze(2)).clamp(min=1.0)
+        log_div_lev_u = (
+            torch.log((one_plus_u / escrow_frac_bm[:, :, -1]).clamp(min=1.0))
+            if (idx_last_eff is None or escrow_frac_bm.shape[2] == 1)
+            else torch.log(
+                (one_plus_u / escrow_frac_bm.gather(2, idx_last_eff.view(b_eff, 1, 1).expand(b_eff, d_act, 1)).squeeze(2)).clamp(min=1.0)
+            )
         )
         log_carry_u = (
             node_2[:, :, int(AutocallNodeCol.LOG_FWD_CARRY_1Y)]
@@ -15963,7 +16117,7 @@ def compute_batched_surrogate_greeks(
                 f_w_term_cg = f_w_cg.gather(1, idx_last_eff.unsqueeze(1)).squeeze(1)
                 v_w_term_cg = v_w_2.gather(1, idx_last_eff.unsqueeze(1)).squeeze(1)
             l_put_proxy_cg = surv_term_cg * _batched_put_spread_loss_torch(
-                f_w_term_cg, v_w_term_cg, k_strike_2, k_low_2, active_ki_2, b_ki_2, ko_sp_2.squeeze(1)
+                f_w_term_cg, v_w_term_cg, k_strike_2, k_low_2, active_ki_2, b_ki_2, ki_sp_2.squeeze(1)
             )
             sched_2[:, :, int(AutocallSchedCol.STULZ_FWD_W)] = log_fw_2 + dlog_fw_u
             sched_2[:, :, int(AutocallSchedCol.PROXY_KO_PROB)] = p_proxy_cg
@@ -16000,7 +16154,7 @@ def compute_batched_surrogate_greeks(
         cdl_bm_eff = cdl_bm_u
         cdl_term_eff = (
             cdl_bm_u[:, :, -1]
-            if idx_last_eff is None
+            if (idx_last_eff is None or cdl_bm_u.shape[2] == 1)
             else cdl_bm_u.gather(2, idx_last_eff.view(b_eff, 1, 1).expand(b_eff, d_act, 1)).squeeze(2)
         )
         log_fp_eff = log_fp_term_2
@@ -16178,23 +16332,31 @@ def compute_batched_surrogate_greeks(
         )
 
     with torch.no_grad():
+        am_eff_bool = amask_eff_64 > 0.5
+        sm_eff_bool = smask_eff_64 > 0.5
+        pm_eff_bool = pair_mask_eff > 0.5
         g_node_64 = (
-            g_node_act.detach().to(dtype=torch.float64)
+            torch.where(am_eff_bool.unsqueeze(-1), g_node_act.detach().to(dtype=torch.float64), 0.0)
             if g_node_act is not None
             else torch.zeros_like(node_eff_64[:, :, :surr_d_node])
         )
         if g_node_64.shape[-1] < d_node:
             g_node_64 = torch.nn.functional.pad(g_node_64, (0, d_node - g_node_64.shape[-1]))
         g_edge_64 = (
-            g_edge_act.detach().to(dtype=torch.float64)
+            torch.where(pm_eff_bool.unsqueeze(-1), g_edge_act.detach().to(dtype=torch.float64), 0.0)
             if g_edge_act is not None
             else torch.zeros_like(edge_eff_64)
         )
-        g_sched_64 = (
-            g_sched_act.detach().to(dtype=torch.float64)
-            if g_sched_act is not None
-            else torch.zeros_like(sched_eff_64)
-        ) + g_sched_w1
+        g_sched_64 = torch.where(
+            sm_eff_bool.unsqueeze(-1),
+            (
+                g_sched_act.detach().to(dtype=torch.float64)
+                if g_sched_act is not None
+                else torch.zeros_like(sched_eff_64)
+            )
+            + g_sched_w1,
+            0.0,
+        )
         g_glob_64 = (
             g_glob_act.detach().to(dtype=torch.float64)
             if g_glob_act is not None
@@ -16337,7 +16499,7 @@ def compute_batched_surrogate_greeks(
                 surv_term_pts = surv_mod_pts.gather(2, idx_last_3d).squeeze(2)
             l_put_pts = surv_term_pts * _batched_put_spread_loss_torch(
                 f_w_term_pts, v_w_term_pts, k_strike_eff.unsqueeze(0), k_low_eff.unsqueeze(0),
-                active_ki_eff.unsqueeze(0), b_ki_eff.unsqueeze(0), ko_sp_eff.squeeze(1).unsqueeze(0),
+                active_ki_eff.unsqueeze(0), b_ki_eff.unsqueeze(0), ki_sp_eff.squeeze(1).unsqueeze(0),
             )
             dp_dfw = (p_mod_pts[1] - p_mod_pts[0]) / (2.0 * h_fd)
             dq_dfw = (q_mod_pts[1] - q_mod_pts[0]) / (2.0 * h_fd)
@@ -16398,16 +16560,18 @@ def compute_batched_surrogate_greeks(
         g_carry = g_node_64[:, :, int(AutocallNodeCol.LOG_FWD_CARRY_1Y)] * ((cdl_term_eff - 1.0) / tau_term_eff)
         g_div_lev = g_node_64[:, :, int(AutocallNodeCol.CASH_DIV_LEVERAGE)] * (1.0 - cdl_term_eff)
 
-        g_log_s_total = (
+        g_log_s_total = torch.where(
+            am_eff_bool,
             g_node_64[:, :, int(AutocallNodeCol.LOG_MONEYNESS)]
             + g_dist_put
             + g_carry
             + g_div_lev
             + d_edge_lpd_d_log_s
-            + t1_d_log_s
+            + t1_d_log_s,
+            0.0,
         )
 
-        g_cov_64 = g_edge_64[:, :, :, int(AutocallEdgeCol.COVARIANCE_TERM)] * pair_mask_eff
+        g_cov_64 = torch.where(pm_eff_bool, g_edge_64[:, :, :, int(AutocallEdgeCol.COVARIANCE_TERM)], 0.0)
         vega_cov_term = (
             (g_cov_64 + g_cov_64.transpose(1, 2))
             * corr_sym_eff
@@ -16421,21 +16585,29 @@ def compute_batched_surrogate_greeks(
             * node_eff_64[:, :, int(AutocallNodeCol.DIST_TO_PUT_STRIKE)]
             / iv_term_node_eff
         )
-        g_node_64[:, :, int(AutocallNodeCol.IV_SHORT_ATM)] = (
-            g_node_64[:, :, int(AutocallNodeCol.IV_SHORT_ATM)] + vega_tier1_short
+        g_node_64[:, :, int(AutocallNodeCol.IV_SHORT_ATM)] = torch.where(
+            am_eff_bool,
+            g_node_64[:, :, int(AutocallNodeCol.IV_SHORT_ATM)] + vega_tier1_short,
+            0.0,
         )
-        g_node_64[:, :, int(AutocallNodeCol.IV_TERM_ATM)] = (
+        g_node_64[:, :, int(AutocallNodeCol.IV_TERM_ATM)] = torch.where(
+            am_eff_bool,
             g_node_64[:, :, int(AutocallNodeCol.IV_TERM_ATM)]
             + vega_tier1_term
             + vega_cov_term
-            + vega_dist_term
+            + vega_dist_term,
+            0.0,
         )
 
         g_corr_direct = g_edge_64[:, :, :, int(AutocallEdgeCol.CORR_RHO)]
         cega_cov_term = (g_cov_64 + g_cov_64.transpose(1, 2)) * (
             v_i_term_eff.unsqueeze(2) * v_i_term_eff.unsqueeze(1)
         )
-        cega_act_64 = ((g_corr_direct + g_corr_direct.transpose(1, 2)) + cega_cov_term + w_v_term_ij) * pair_mask_eff
+        cega_act_64 = torch.where(
+            pm_eff_bool,
+            (g_corr_direct + g_corr_direct.transpose(1, 2)) + cega_cov_term + w_v_term_ij,
+            0.0,
+        )
 
         cash_gamma_t: torch.Tensor | None = None
         if compute_cash_gamma:
@@ -16482,15 +16654,23 @@ def compute_batched_surrogate_greeks(
         put_loss_f64 = put_loss_base
 
         if spots_t0 is not None:
-            sp_f64 = spots_t0.to(dtype=torch.float64, device=device)[:, :d_act].clamp(min=1e-12)
+            sp_f64 = torch.where(
+                amask_act_bool,
+                spots_t0.to(dtype=torch.float64, device=device)[:, :d_act],
+                1.0,
+            ).clamp(min=1e-12)
         else:
             log_m0_f64 = node_64[:, :, int(AutocallNodeCol.LOG_MONEYNESS)]
             sp_f64 = torch.exp(log_m0_f64).clamp(min=1e-12)
             if ref_spots is not None:
-                sp_f64 = sp_f64 * ref_spots.to(dtype=torch.float64, device=device)[:, :d_act].clamp(min=1e-12)
+                sp_f64 = sp_f64 * torch.where(
+                    amask_act_bool,
+                    ref_spots.to(dtype=torch.float64, device=device)[:, :d_act],
+                    1.0,
+                ).clamp(min=1e-12)
 
         delta_f64 = torch.zeros((batch_size, d_max), dtype=torch.float64, device=device)
-        delta_f64[:, :d_act] = (g_log_s_base / sp_f64) * amask_64
+        delta_f64[:, :d_act] = torch.where(amask_act_bool, g_log_s_base / sp_f64, 0.0)
 
         vega_surface_f64 = g_node_f64[:, :, 4:11] * amask_f64.unsqueeze(-1)
         vega_atm_f64 = g_node_f64[:, :, 4:6] * amask_f64.unsqueeze(-1)
@@ -16593,32 +16773,182 @@ def _safe_cholesky_corr_np(corr_mat: npt.NDArray[np.float64]) -> npt.NDArray[np.
 def _eval_index_batch_3d_np(
     perf_b_d_n: npt.NDArray[np.float64],
     index_name: str,
-    inv_perm: Sequence[int],
+    inv_perm: Sequence[int] | npt.NDArray[np.int64],
 ) -> npt.NDArray[np.float64]:
     """Vectorized monitoring index evaluation on (B, D, N) paths in float64."""
     idx_clean = index_name.strip()
     d = perf_b_d_n.shape[1]
-    if d == 1 or idx_clean == "WorstOf":
-        return np.min(perf_b_d_n, axis=1)
+    if idx_clean in ("WorstOf", "Lookback"):
+        return np.asarray(perf_b_d_n[:, 0, :] if d == 1 else np.min(perf_b_d_n, axis=1), dtype=np.float64)
     if idx_clean == "BestOf":
-        return np.max(perf_b_d_n, axis=1)
-    if idx_clean in ("AverageOf", "EquallyWeightedBasket"):
-        return np.mean(perf_b_d_n, axis=1)
+        return np.asarray(perf_b_d_n[:, 0, :] if d == 1 else np.max(perf_b_d_n, axis=1), dtype=np.float64)
+    if idx_clean in ("Average", "AverageOf", "MultiPerf", "EquallyWeightedBasket"):
+        return np.asarray(perf_b_d_n[:, 0, :] if d == 1 else np.mean(perf_b_d_n, axis=1), dtype=np.float64)
+    if idx_clean == "TwinWin":
+        w_min = perf_b_d_n[:, 0, :] if d == 1 else np.min(perf_b_d_n, axis=1)
+        return np.asarray(np.where(w_min < 1.0, 2.0 - w_min, w_min), dtype=np.float64)
+    if idx_clean == "Dispersion":
+        return np.asarray(np.std(perf_b_d_n, axis=1), dtype=np.float64)
+    if idx_clean == "RatioBestWorst":
+        w_max = perf_b_d_n[:, 0, :] if d == 1 else np.max(perf_b_d_n, axis=1)
+        w_min = perf_b_d_n[:, 0, :] if d == 1 else np.min(perf_b_d_n, axis=1)
+        return np.asarray(w_max / np.maximum(w_min, 1e-12), dtype=np.float64)
+    if idx_clean == "RatioBestAverage":
+        w_max = perf_b_d_n[:, 0, :] if d == 1 else np.max(perf_b_d_n, axis=1)
+        w_avg = perf_b_d_n[:, 0, :] if d == 1 else np.mean(perf_b_d_n, axis=1)
+        return np.asarray(w_max / np.maximum(w_avg, 1e-12), dtype=np.float64)
+    if idx_clean == "RatioAverageWorst":
+        w_avg = perf_b_d_n[:, 0, :] if d == 1 else np.mean(perf_b_d_n, axis=1)
+        w_min = perf_b_d_n[:, 0, :] if d == 1 else np.min(perf_b_d_n, axis=1)
+        return np.asarray(w_avg / np.maximum(w_min, 1e-12), dtype=np.float64)
+    if idx_clean in ("DiffBestWorst", "Rainbow", "SpreadBestWorst"):
+        if d == 1:
+            return np.zeros((perf_b_d_n.shape[0], perf_b_d_n.shape[2]), dtype=np.float64)
+        return np.asarray(np.max(perf_b_d_n, axis=1) - np.min(perf_b_d_n, axis=1), dtype=np.float64)
+    if idx_clean in ("DiffBestAverage", "SpreadBestAverage"):
+        if d == 1:
+            return np.zeros((perf_b_d_n.shape[0], perf_b_d_n.shape[2]), dtype=np.float64)
+        return np.asarray(np.max(perf_b_d_n, axis=1) - np.mean(perf_b_d_n, axis=1), dtype=np.float64)
+    if idx_clean in ("DiffAverageWorst", "SpreadAverageWorst"):
+        if d == 1:
+            return np.zeros((perf_b_d_n.shape[0], perf_b_d_n.shape[2]), dtype=np.float64)
+        return np.asarray(np.mean(perf_b_d_n, axis=1) - np.min(perf_b_d_n, axis=1), dtype=np.float64)
     if idx_clean == "SecondWorstOf":
-        return np.partition(perf_b_d_n, 1, axis=1)[:, 1, :]
+        k_idx = min(1, d - 1)
+        return np.asarray(np.partition(perf_b_d_n, k_idx, axis=1)[:, k_idx, :], dtype=np.float64)
     if idx_clean == "ThirdWorstOf":
         k_idx = min(2, d - 1)
-        return np.partition(perf_b_d_n, k_idx, axis=1)[:, k_idx, :]
+        return np.asarray(np.partition(perf_b_d_n, k_idx, axis=1)[:, k_idx, :], dtype=np.float64)
     if idx_clean == "SecondBestOf":
         k_idx = max(0, d - 2)
-        return np.partition(perf_b_d_n, k_idx, axis=1)[:, k_idx, :]
+        return np.asarray(np.partition(perf_b_d_n, k_idx, axis=1)[:, k_idx, :], dtype=np.float64)
     idx_a = int(inv_perm[0])
-    idx_b = int(inv_perm[1]) if d > 1 else idx_a
-    if idx_clean == "Outperformance":
-        return perf_b_d_n[:, idx_a, :] - perf_b_d_n[:, idx_b, :] + 1.0
-    if idx_clean == "Ratio":
-        return perf_b_d_n[:, idx_a, :] / np.maximum(perf_b_d_n[:, idx_b, :], 1e-12)
+    if d < 2:
+        return np.asarray(perf_b_d_n[:, idx_a, :], dtype=np.float64)
+    idx_b = int(inv_perm[1])
+    if idx_clean in ("DiffAB", "Outperformance", "Spread"):
+        return np.asarray(perf_b_d_n[:, idx_a, :] - perf_b_d_n[:, idx_b, :], dtype=np.float64)
+    if idx_clean == "DiffBA":
+        return np.asarray(perf_b_d_n[:, idx_b, :] - perf_b_d_n[:, idx_a, :], dtype=np.float64)
+    if idx_clean in ("RatioAB", "Ratio"):
+        return np.asarray(perf_b_d_n[:, idx_a, :] / np.maximum(perf_b_d_n[:, idx_b, :], 1e-12), dtype=np.float64)
+    if idx_clean == "RatioBA":
+        return np.asarray(perf_b_d_n[:, idx_b, :] / np.maximum(perf_b_d_n[:, idx_a, :], 1e-12), dtype=np.float64)
     raise ValueError(f"Unsupported monitoring index {index_name!r}.")
+
+
+def _eval_iv_batch_with_slice_override_np(
+    surf: RegularizedVolSurface,
+    tenors_q: npt.NDArray[np.float64],
+    spot_val: float,
+    slice_override_idx: int,
+    slice_override_coeffs: npt.NDArray[np.float64],
+    slice_override_quotes: npt.NDArray[np.float64] | None = None,
+) -> npt.NDArray[np.float64]:
+    """Thread-safe evaluation of `surf.iv_batch(tenors_q, spot_val)` with a local slice override."""
+    if surf._fast_slice_coeffs is None:
+        return np.asarray(surf.iv_batch(tenors_q, np.full(len(tenors_q), spot_val)), dtype=np.float64)
+    t_flat = np.maximum(np.asarray(tenors_q, dtype=np.float64).reshape(-1), 1e-8)
+    n_q = len(t_flat)
+    if n_q == 0:
+        return np.empty(0, dtype=np.float64)
+
+    k_min = float(surf.strikes[0])
+    k_max = float(surf.strikes[-1])
+    k_val = float(spot_val)
+    k_clip = min(max(k_val, k_min), k_max)
+    seg_idx = int(np.clip(np.searchsorted(surf.strikes, k_clip, side="right") - 1, 0, surf.n_unique_strikes - 2))
+    dx = k_clip - float(surf.strikes[seg_idx])
+
+    c_seg = surf._fast_slice_coeffs[:, seg_idx, :].copy()  # (4, n_exp)
+    if 0 <= slice_override_idx < surf.n_exp:
+        c_seg[:, slice_override_idx] = slice_override_coeffs[:, seg_idx]
+    vals_all = ((c_seg[0] * dx + c_seg[1]) * dx + c_seg[2]) * dx + c_seg[3]  # (n_exp,)
+
+    if k_val < k_min:
+        q0 = surf.quotes[:, 0].copy()
+        if 0 <= slice_override_idx < surf.n_exp and slice_override_quotes is not None:
+            q0[slice_override_idx] = float(slice_override_quotes[0])
+        vals_all = q0 + surf._slopes_left * (k_val - k_min)
+    elif k_val > k_max:
+        q_end = surf.quotes[:, -1].copy()
+        if 0 <= slice_override_idx < surf.n_exp and slice_override_quotes is not None:
+            q_end[slice_override_idx] = float(slice_override_quotes[-1])
+        vals_all = q_end + surf._slopes_right * (k_val - k_max)
+    vals_all = np.maximum(vals_all, float(surf.min_vol))
+
+    if surf.n_exp == 1:
+        return np.full(n_q, float(vals_all[0]), dtype=np.float64)
+
+    idx0 = np.clip(np.searchsorted(surf.tenors, t_flat, side="right") - 1, 0, surf.n_exp - 2)
+    idx1 = idx0 + 1
+    v0 = vals_all[idx0]
+    v1 = vals_all[idx1]
+    t0 = surf.tenors[idx0]
+    t1 = surf.tenors[idx1]
+    alpha = (t_flat - t0) / np.maximum(t1 - t0, 1e-12)
+    w = (1.0 - alpha) * (v0 * v0 * t0) + alpha * (v1 * v1 * t1)
+    res = np.sqrt(np.maximum(w / t_flat, float(surf.min_vol) * float(surf.min_vol)))
+    res = np.where(t_flat <= float(surf.tenors[0]), vals_all[0], res)
+    res = np.where(t_flat >= float(surf.tenors[-1]), vals_all[-1], res)
+    return np.asarray(res, dtype=np.float64)
+
+
+def _eval_slices_with_derivs_2d_np(
+    surf: RegularizedVolSurface,
+    s_idx_1d: npt.NDArray[np.int64],
+    s_mat: npt.NDArray[np.float64],
+    seg_idx: npt.NDArray[np.int64],
+    dx: npt.NDArray[np.float64],
+    left_mask: npt.NDArray[np.bool_],
+    right_mask: npt.NDArray[np.bool_],
+    any_left: bool,
+    any_right: bool,
+    *,
+    slice_override_idx: int = -1,
+    slice_override_coeffs: npt.NDArray[np.float64] | None = None,
+    slice_override_quotes: npt.NDArray[np.float64] | None = None,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Thread-safe vectorized 2D evaluation of `(sig, dsig/dK, d2sig/dK2)` across `(lv_nt, lv_ny)`."""
+    assert surf._fast_slice_coeffs is not None
+    c = surf._fast_slice_coeffs[:, seg_idx, s_idx_1d[:, None]]  # (4, lv_nt, lv_ny)
+    if 0 <= slice_override_idx < surf.n_exp and slice_override_coeffs is not None:
+        ov_rows = s_idx_1d == slice_override_idx
+        if np.any(ov_rows):
+            c = c.copy()
+            c[:, ov_rows, :] = slice_override_coeffs[:, seg_idx[ov_rows]]
+
+    c0, c1, c2, c3 = c[0], c[1], c[2], c[3]
+    val = ((c0 * dx + c1) * dx + c2) * dx + c3
+    dval = (3.0 * c0 * dx + 2.0 * c1) * dx + c2
+    d2val = 6.0 * c0 * dx + 2.0 * c1
+
+    k_min = float(surf.strikes[0])
+    k_max = float(surf.strikes[-1])
+    if any_left:
+        sl = surf._slopes_left[s_idx_1d][:, None]
+        q0 = surf.quotes[s_idx_1d, 0].copy()
+        if 0 <= slice_override_idx < surf.n_exp and slice_override_quotes is not None:
+            q0[s_idx_1d == slice_override_idx] = float(slice_override_quotes[0])
+        val = np.where(left_mask, q0[:, None] + sl * (s_mat - k_min), val)
+        dval = np.where(left_mask, sl, dval)
+        d2val = np.where(left_mask, 0.0, d2val)
+    if any_right:
+        sr = surf._slopes_right[s_idx_1d][:, None]
+        q_end = surf.quotes[s_idx_1d, -1].copy()
+        if 0 <= slice_override_idx < surf.n_exp and slice_override_quotes is not None:
+            q_end[s_idx_1d == slice_override_idx] = float(slice_override_quotes[-1])
+        val = np.where(right_mask, q_end[:, None] + sr * (s_mat - k_max), val)
+        dval = np.where(right_mask, sr, dval)
+        d2val = np.where(right_mask, 0.0, d2val)
+
+    min_v = float(surf.min_vol)
+    clamped_low = val < min_v
+    if np.any(clamped_low):
+        val = np.maximum(val, min_v)
+        dval = np.where(clamped_low, 0.0, dval)
+        d2val = np.where(clamped_low, 0.0, d2val)
+    return val, dval, d2val
 
 
 def _build_single_asset_lv_table_fast_np(
@@ -16629,43 +16959,168 @@ def _build_single_asset_lv_table_fast_np(
     lv_t_grid: npt.NDArray[np.float64],
     lv_y_grid: npt.NDArray[np.float64],
     *,
+    div_pv_obs_np: npt.NDArray[np.float64] | None = None,
     slice_override_idx: int = -1,
     slice_override_coeffs: npt.NDArray[np.float64] | None = None,
     slice_override_quotes: npt.NDArray[np.float64] | None = None,
 ) -> npt.NDArray[np.float64]:
-    """Builds a single asset's 2D Dupire local-vol table (lv_nt, lv_ny) on (t, y=ln(K/F))."""
-    r_grid = np.interp(lv_t_grid, tau_obs_np, r_native_obs_np)
-    f_t = max(float(spot_0), 1e-8) * np.exp(r_grid * lv_t_grid)
-    k_mat = f_t[:, None] * np.exp(lv_y_grid[None, :])
-    lv_nt, lv_ny = k_mat.shape
-    out = np.empty((lv_nt, lv_ny), dtype=np.float64)
-    if slice_override_idx < 0 or slice_override_coeffs is None or surf._fast_slice_coeffs is None:
+    """Thread-safe vectorized 2D Dupire local-vol table builder `(lv_nt, lv_ny)` on `(t, y=ln(K/F_native))`."""
+    t_eff = np.maximum(np.asarray(lv_t_grid, dtype=np.float64), 1e-4)
+    tau_knots = np.concatenate([[0.0], np.asarray(tau_obs_np, dtype=np.float64)])
+    r_nat_knots = np.concatenate([[0.0], np.asarray(r_native_obs_np, dtype=np.float64)])
+
+    m_len = len(tau_obs_np)
+    k_idx = np.clip(np.searchsorted(tau_knots, t_eff, side="right") - 1, 0, max(m_len - 1, 0))
+    tau0 = tau_knots[k_idx]
+    tau1 = tau_knots[k_idx + 1]
+    dt_k = np.maximum(tau1 - tau0, 1e-8)
+    alpha_k = np.clip((t_eff - tau0) / dt_k, 0.0, 1.0)
+
+    r_nat_grid = r_nat_knots[k_idx] + alpha_k * (r_nat_knots[k_idx + 1] - r_nat_knots[k_idx])
+    dr_nat_dt = (r_nat_knots[k_idx + 1] - r_nat_knots[k_idx]) / dt_k
+
+    sp0_safe = max(float(spot_0), 1e-8)
+    if div_pv_obs_np is not None and len(div_pv_obs_np) == m_len:
+        dpv_knots = np.concatenate([[0.0], np.asarray(div_pv_obs_np, dtype=np.float64)])
+        esc_knots = _escrowed_spot_softplus_np(np.full(m_len + 1, sp0_safe, dtype=np.float64), dpv_knots)
+        esc0 = esc_knots[k_idx]
+        esc1 = esc_knots[k_idx + 1]
+        q_div_grid = -np.log(np.maximum(esc1 / np.maximum(esc0, 1e-12), 1e-12)) / dt_k
+        esc_grid = esc0 * np.exp(-q_div_grid * np.maximum(t_eff - tau0, 0.0))
+    else:
+        q_div_grid = np.zeros_like(t_eff)
+        esc_grid = np.full_like(t_eff, sp0_safe)
+
+    f_t = np.maximum(esc_grid * np.exp(r_nat_grid), 1e-4)
+    mu_eff_grid = dr_nat_dt - q_div_grid
+    s_mat = np.maximum(f_t[:, None] * np.exp(lv_y_grid[None, :]), 1e-4)
+    lv_nt, lv_ny = s_mat.shape
+
+    if surf._fast_slice_coeffs is None:
+        out = np.empty((lv_nt, lv_ny), dtype=np.float64)
         for it in range(lv_nt):
             out[it] = np.asarray(
-                surf.local_vol(float(lv_t_grid[it]), k_mat[it], forward_at_t=float(f_t[it])),
+                surf.local_vol(
+                    float(t_eff[it]),
+                    s_mat[it],
+                    forward_at_t=float(f_t[it]),
+                    r_zero=float(mu_eff_grid[it]),
+                    q_repo=0.0,
+                ),
                 dtype=np.float64,
             )
         return out
 
-    old_c = surf._fast_slice_coeffs[:, :, slice_override_idx].copy()
-    old_q = surf.quotes[slice_override_idx].copy()
-    surf._fast_slice_coeffs.setflags(write=True)
-    surf.quotes.setflags(write=True)
-    try:
-        surf._fast_slice_coeffs[:, :, slice_override_idx] = slice_override_coeffs
-        if slice_override_quotes is not None:
-            surf.quotes[slice_override_idx] = slice_override_quotes
-        for it in range(lv_nt):
-            out[it] = np.asarray(
-                surf.local_vol(float(lv_t_grid[it]), k_mat[it], forward_at_t=float(f_t[it])),
-                dtype=np.float64,
-            )
-        return out
-    finally:
-        surf._fast_slice_coeffs[:, :, slice_override_idx] = old_c
-        surf.quotes[slice_override_idx] = old_q
-        surf._fast_slice_coeffs.setflags(write=False)
-        surf.quotes.setflags(write=False)
+    k_min = float(surf.strikes[0])
+    k_max = float(surf.strikes[-1])
+    k_clip = np.clip(s_mat, k_min, k_max)
+    seg_idx = np.clip(
+        np.searchsorted(surf.strikes, k_clip, side="right") - 1,
+        0,
+        surf.n_unique_strikes - 2,
+    )
+    dx = k_clip - surf.strikes[seg_idx]
+    left_mask = s_mat < k_min
+    right_mask = s_mat > k_max
+    any_left = bool(np.any(left_mask))
+    any_right = bool(np.any(right_mask))
+
+    t_first = float(surf.tenors[0])
+    t_last = float(surf.tenors[-1])
+    if surf.n_exp == 1:
+        idx0 = np.zeros(lv_nt, dtype=np.int64)
+        v0, dv0_dk, d2v0_dk2 = _eval_slices_with_derivs_2d_np(
+            surf,
+            idx0,
+            s_mat,
+            seg_idx,
+            dx,
+            left_mask,
+            right_mask,
+            any_left,
+            any_right,
+            slice_override_idx=slice_override_idx,
+            slice_override_coeffs=slice_override_coeffs,
+            slice_override_quotes=slice_override_quotes,
+        )
+        t_col = t_eff[:, None]
+        w = (v0 * v0) * t_col
+        dw_dt = v0 * v0
+        dw_dk = 2.0 * t_col * v0 * dv0_dk
+        d2w_dk2 = 2.0 * t_col * (dv0_dk * dv0_dk + v0 * d2v0_dk2)
+    else:
+        is_left_t = t_eff <= t_first
+        is_right_t = t_eff >= t_last
+        is_bnd = is_left_t | is_right_t
+        idx0 = np.clip(np.searchsorted(surf.tenors, t_eff, side="right") - 1, 0, surf.n_exp - 2)
+        idx1 = idx0 + 1
+        idx0 = np.where(is_left_t, 0, np.where(is_right_t, surf.n_exp - 1, idx0))
+        idx1 = np.where(is_bnd, idx0, idx1)
+
+        v0, dv0_dk, d2v0_dk2 = _eval_slices_with_derivs_2d_np(
+            surf,
+            idx0,
+            s_mat,
+            seg_idx,
+            dx,
+            left_mask,
+            right_mask,
+            any_left,
+            any_right,
+            slice_override_idx=slice_override_idx,
+            slice_override_coeffs=slice_override_coeffs,
+            slice_override_quotes=slice_override_quotes,
+        )
+        v1, dv1_dk, d2v1_dk2 = _eval_slices_with_derivs_2d_np(
+            surf,
+            idx1,
+            s_mat,
+            seg_idx,
+            dx,
+            left_mask,
+            right_mask,
+            any_left,
+            any_right,
+            slice_override_idx=slice_override_idx,
+            slice_override_coeffs=slice_override_coeffs,
+            slice_override_quotes=slice_override_quotes,
+        )
+
+        t0 = np.where(is_bnd, t_eff, surf.tenors[idx0])[:, None]
+        t1 = np.where(is_bnd, t_eff, surf.tenors[idx1])[:, None]
+        dt_inv = np.where(is_bnd[:, None], 0.0, 1.0 / np.maximum(t1 - t0, 1e-12))
+        alpha = np.where(is_bnd[:, None], 0.0, (t_eff[:, None] - t0) * dt_inv)
+
+        w0 = (v0 * v0) * t0
+        w1 = (v1 * v1) * t1
+        w = (1.0 - alpha) * w0 + alpha * w1
+        dw_dt = np.where(is_bnd[:, None], v0 * v0, (w1 - w0) * dt_inv)
+
+        dw0_dk = 2.0 * t0 * v0 * dv0_dk
+        dw1_dk = 2.0 * t1 * v1 * dv1_dk
+        dw_dk = (1.0 - alpha) * dw0_dk + alpha * dw1_dk
+
+        d2w0_dk2 = 2.0 * t0 * (dv0_dk * dv0_dk + v0 * d2v0_dk2)
+        d2w1_dk2 = 2.0 * t1 * (dv1_dk * dv1_dk + v1 * d2v1_dk2)
+        d2w_dk2 = (1.0 - alpha) * d2w0_dk2 + alpha * d2w1_dk2
+
+    y = np.log(s_mat / f_t[:, None])
+    w_safe = np.maximum(w, 1e-8)
+    dw_dy = s_mat * dw_dk
+    dw_dt_y = dw_dt + mu_eff_grid[:, None] * dw_dy
+    d2w_dy2 = (s_mat * s_mat) * d2w_dk2 + dw_dy
+
+    denom = (
+        1.0
+        - (y / w_safe) * dw_dy
+        + 0.25 * (-0.25 - 1.0 / w_safe + (y * y) / (w_safe * w_safe)) * (dw_dy * dw_dy)
+        + 0.5 * d2w_dy2
+    )
+    denom_safe = np.maximum(denom, 0.05)
+    min_v = float(surf.min_vol)
+    loc_var = np.maximum(dw_dt_y / denom_safe, min_v * min_v)
+    lv_out = np.clip(np.sqrt(loc_var), min_v, float(surf.max_local_vol))
+    return np.asarray(lv_out, dtype=np.float64)
 
 
 def _step_1d_asset_trajectories_np(
@@ -16677,14 +17132,19 @@ def _step_1d_asset_trajectories_np(
     lv_y_min: float,
     lv_y_max: float,
     n_sub: int,
+    *,
+    r_tot_obs_np: npt.NDArray[np.float64] | None = None,
 ) -> npt.NDArray[np.float64]:
     """Vectorized 1D log-Euler SDE stepping for B bumped 2D LV tables of a single asset."""
     b_sz, lv_nt, lv_ny = lv_tables_b.shape
-    m_rem = z_corr_1d.shape[0]
-    n_total = z_corr_1d.shape[2] * z_corr_1d.shape[3]
+    m_rem = int(z_corr_1d.shape[0])
+    n_replicates = int(z_corr_1d.shape[2])
+    n_paths_rep = int(z_corr_1d.shape[3])
+    n_total = n_replicates * n_paths_rep
     z_flat = z_corr_1d.reshape(m_rem, n_sub, n_total)
 
-    x = np.zeros((b_sz, n_total), dtype=np.float64)
+    eff_r_tot = r_tot_obs_np if r_tot_obs_np is not None else r_native_obs_np
+    log_x = np.zeros((b_sz, n_total), dtype=np.float64)
     out_norm_x = np.empty((b_sz, m_rem, n_total), dtype=np.float64)
 
     t_max = float(lv_t_grid[-1])
@@ -16694,19 +17154,22 @@ def _step_1d_asset_trajectories_np(
     b_idx = np.arange(b_sz, dtype=np.int64)[:, None]
     t_prev = 0.0
     rt_prev = 0.0
+    rn_prev = 0.0
 
     for m in range(m_rem):
         t_cur = float(tau_obs_np[m])
-        rt_cur = float(r_native_obs_np[m]) * t_cur
+        rt_cur = float(eff_r_tot[m])
+        rn_cur = float(r_native_obs_np[m])
         d_tau = max(t_cur - t_prev, 1e-10)
         dt = d_tau / float(n_sub)
         sqrt_dt = math.sqrt(dt)
-        r_fwd = (rt_cur - rt_prev) / d_tau
-        drift_r = r_fwd * dt
+        drt = rt_cur - rt_prev
+        drn = rn_cur - rn_prev
 
         for s in range(n_sub):
-            t_mid = t_prev + (float(s) + 0.5) * dt
-            rt_mid = rt_prev + r_fwd * (float(s) + 0.5) * dt
+            alpha_s = (float(s) + 0.5) / float(n_sub)
+            t_mid = t_prev + alpha_s * d_tau
+            q_shift_mid = (rt_prev + alpha_s * drt) - (rn_prev + alpha_s * drn)
             u_t = min(max(t_mid * inv_dt_grid, 0.0), float(lv_nt - 1) - 1e-9)
             it0 = int(u_t)
             it1 = min(it0 + 1, lv_nt - 1)
@@ -16714,7 +17177,7 @@ def _step_1d_asset_trajectories_np(
 
             lv_slice = (1.0 - wt) * lv_tables_b[:, it0, :] + wt * lv_tables_b[:, it1, :]
 
-            y_val = x - rt_mid
+            y_val = log_x + q_shift_mid if abs(q_shift_mid) > 1e-15 else log_x
             u_y = np.clip((y_val - lv_y_min) * inv_dy_grid, 0.0, float(lv_ny - 1) - 1e-9)
             iy0 = u_y.astype(np.int64)
             iy1 = np.minimum(iy0 + 1, lv_ny - 1)
@@ -16724,32 +17187,32 @@ def _step_1d_asset_trajectories_np(
             v1 = lv_slice[b_idx, iy1]
             sig = (1.0 - wy) * v0 + wy * v1
 
-            x = x + (drift_r - 0.5 * sig * sig * dt) + sig * sqrt_dt * z_flat[m, s][None, :]
+            log_x = log_x - 0.5 * (sig * sig) * dt + sig * sqrt_dt * z_flat[m, s][None, :]
 
-        out_norm_x[:, m, :] = np.exp(x - rt_cur)
+        ex_rep = np.exp(log_x).reshape(b_sz, n_replicates, n_paths_rep)
+        mean_rep = np.maximum(np.mean(ex_rep, axis=2, keepdims=True), 1e-12)
+        out_norm_x[:, m, :] = (ex_rep / mean_rep).reshape(b_sz, n_total)
+        log_x = (log_x.reshape(b_sz, n_replicates, n_paths_rep) - np.log(mean_rep)).reshape(b_sz, n_total)
         t_prev = t_cur
         rt_prev = rt_cur
+        rn_prev = rn_cur
 
     return out_norm_x
 
 
-def _eval_autocall_payoff_pv_batch_np(
-    perf_b_d_m_n: npt.NDArray[np.float64],
+def _eval_autocall_payoff_from_3d_indices_np(
+    w_call_b_m_n: npt.NDArray[np.float64],
+    w_cpn_b_m_n: npt.NDArray[np.float64],
+    w_opt_b_m_n: npt.NDArray[np.float64],
+    w_best_term_b_n: npt.NDArray[np.float64] | None,
     state: AutocallPreprocState,
     *,
     df_pay_b: npt.NDArray[np.float64] | None = None,
     w_fund_b: npt.NDArray[np.float64] | None = None,
     pv_in_transit_b: npt.NDArray[np.float64] | None = None,
 ) -> npt.NDArray[np.float64]:
-    """Vectorized continuous-ramp autocall payoff evaluator across B scenario states and N paths."""
-    b_sz, _d_assets, m_rem, n_total = perf_b_d_m_n.shape
-    inv_perm = state.inv_lex_perm
-    call_idx = state.callability_index
-    cpn_idx = state.coupon_index or call_idx
-    opt_idx = "AverageOf" if state.is_long_basket else (state.option_index or call_idx)
-    same_cpn_call = cpn_idx == call_idx
-    same_opt_call = opt_idx == call_idx
-
+    """Core pathwise stopping & payoff evaluator given pre-reduced `(B, M_rem, N)` index arrays."""
+    b_sz, m_rem, n_total = w_call_b_m_n.shape
     ko_arr = state.ko_barriers.detach().cpu().numpy().astype(np.float64)
     cpn_arr = state.cpn_barriers.detach().cpu().numpy().astype(np.float64)
     is_call_arr = state.is_callable.detach().cpu().numpy().astype(np.float64)
@@ -16767,10 +17230,11 @@ def _eval_autocall_payoff_pv_batch_np(
     cpn_spread = float(state.cpn_spread)
     ki_spread = float(state.ki_spread)
     has_ki = state.ki_barrier is not None and float(state.ki_barrier) > 0.0
-    b_ki = float(state.ki_barrier) if has_ki else 0.0
+    b_ki = float(state.ki_barrier) if (state.ki_barrier is not None and has_ki) else 0.0
 
     type_out = state.coupon_barrier_type.strip().lower() == "out"
     dir_down = state.coupon_barrier_direction.strip().lower() == "down"
+    eff_cpn_sp = -cpn_spread if dir_down else cpn_spread
 
     surv_prev = np.ones((b_sz, n_total), dtype=np.float64)
     c_mem = np.full((b_sz, n_total), float(state.c_mem_0), dtype=np.float64)
@@ -16783,12 +17247,14 @@ def _eval_autocall_payoff_pv_batch_np(
     ac_cpn = float(state.autocall_coupon)
     is_mem = bool(state.is_memory)
     force_ac = bool(state.force_coupons_on_autocall)
+    l_put_mean = np.zeros(b_sz, dtype=np.float64)
+    l_call_mean = np.zeros(b_sz, dtype=np.float64)
+    l_onestar_mean = np.zeros(b_sz, dtype=np.float64)
 
     for m in range(m_rem):
-        perf_m = perf_b_d_m_n[:, :, m, :]
-        w_call = _eval_index_batch_3d_np(perf_m, call_idx, inv_perm)
-        w_cpn = w_call if same_cpn_call else _eval_index_batch_3d_np(perf_m, cpn_idx, inv_perm)
-        w_opt = w_call if same_opt_call else _eval_index_batch_3d_np(perf_m, opt_idx, inv_perm)
+        w_call = w_call_b_m_n[:, m, :]
+        w_cpn = w_cpn_b_m_n[:, m, :]
+        w_opt = w_opt_b_m_n[:, m, :]
 
         if has_ki and m == m_rem - 1:
             if abs(ki_spread) <= 1e-6:
@@ -16814,12 +17280,12 @@ def _eval_autocall_payoff_pv_batch_np(
             g_cpn = np.ones_like(w_cpn)
         else:
             b_cp = float(cpn_arr[m])
-            if abs(cpn_spread) <= 1e-6:
+            if abs(eff_cpn_sp) <= 1e-6:
                 hit_dir = (w_cpn <= b_cp) if dir_down else (w_cpn >= b_cp)
                 g_cpn = (1.0 - hit_dir.astype(np.float64)) if type_out else hit_dir.astype(np.float64)
             else:
-                blo_cp = min(b_cp, b_cp + cpn_spread)
-                bhi_cp = max(b_cp, b_cp + cpn_spread)
+                blo_cp = min(b_cp, b_cp + eff_cpn_sp)
+                bhi_cp = max(b_cp, b_cp + eff_cpn_sp)
                 ramp_up = np.clip((w_cpn - blo_cp) / max(bhi_cp - blo_cp, 1e-12), 0.0, 1.0)
                 hit_g = (1.0 - ramp_up) if dir_down else ramp_up
                 g_cpn = (1.0 - hit_g) if type_out else hit_g
@@ -16841,12 +17307,19 @@ def _eval_autocall_payoff_pv_batch_np(
         surv_prev = np.maximum(surv_prev - p_m, 0.0)
 
         if m == m_rem - 1:
+            has_one_star = state.one_star_strike is not None and float(state.one_star_strike) > 0.0
+            if has_one_star and state.one_star_strike is not None and w_best_term_b_n is not None:
+                k_os = float(state.one_star_strike)
+                star_ind = (w_best_term_b_n >= k_os).astype(np.float64)
+            else:
+                star_ind = np.zeros_like(w_opt)
+
             k_put = max(float(state.strike), 0.0)
             k_low = max(float(state.lower_strike), 0.0) if state.lower_strike is not None else 0.0
             if k_put > k_low:
                 put_intr = np.maximum(k_put - w_opt, 0.0) - np.maximum(k_low - w_opt, 0.0)
                 ki_gate = i_ki if has_ki else 1.0
-                l_put_mean = np.mean(surv_prev * ki_gate * put_intr, axis=1)
+                l_put_mean = np.mean(surv_prev * ki_gate * (1.0 - star_ind) * put_intr, axis=1)
             else:
                 l_put_mean = np.zeros(b_sz, dtype=np.float64)
 
@@ -16856,16 +17329,8 @@ def _eval_autocall_payoff_pv_batch_np(
             else:
                 l_call_mean = np.zeros(b_sz, dtype=np.float64)
 
-            if state.one_star_strike is not None and float(state.one_star_coupon) != 0.0:
-                w_best = np.max(perf_m, axis=1)
-                k_os = float(state.one_star_strike)
-                if abs(ko_spread) <= 1e-6:
-                    g_os = (w_best >= k_os).astype(np.float64)
-                else:
-                    blo_os = min(k_os, k_os + ko_spread)
-                    bhi_os = max(k_os, k_os + ko_spread)
-                    g_os = np.clip((w_best - blo_os) / max(bhi_os - blo_os, 1e-12), 0.0, 1.0)
-                l_onestar_mean = np.mean(surv_prev * g_os * float(state.one_star_coupon), axis=1)
+            if has_one_star and float(state.one_star_coupon) != 0.0:
+                l_onestar_mean = np.mean(surv_prev * star_ind, axis=1) * float(state.one_star_coupon)
             else:
                 l_onestar_mean = np.zeros(b_sz, dtype=np.float64)
 
@@ -16897,11 +17362,151 @@ def _eval_autocall_payoff_pv_batch_np(
         if pv_in_transit_b is not None
         else np.full(b_sz, float(state.pv_in_transit), dtype=np.float64)
     )
-    return notional_pv + coupon_pv + option_pv - funding_pv + in_tr
+    return np.asarray(notional_pv + coupon_pv + option_pv - funding_pv + in_tr, dtype=np.float64)
+
+
+def _eval_autocall_payoff_pv_batch_np(
+    perf_b_d_m_n: npt.NDArray[np.float64],
+    state: AutocallPreprocState,
+    *,
+    df_pay_b: npt.NDArray[np.float64] | None = None,
+    w_fund_b: npt.NDArray[np.float64] | None = None,
+    pv_in_transit_b: npt.NDArray[np.float64] | None = None,
+) -> npt.NDArray[np.float64]:
+    """Vectorized continuous-ramp autocall payoff evaluator across B scenario states and N paths."""
+    b_sz, d_assets, m_rem, n_total = perf_b_d_m_n.shape
+    inv_perm = state.inv_lex_perm
+    call_idx = state.callability_index
+    cpn_idx = state.coupon_index or call_idx
+    opt_idx = "AverageOf" if bool(getattr(state, "is_long_basket", False)) else (state.option_index or call_idx)
+    same_cpn_call = cpn_idx == call_idx
+    same_opt_call = opt_idx == call_idx
+
+    perf_flat = perf_b_d_m_n.transpose(0, 2, 1, 3).reshape(b_sz * m_rem, d_assets, n_total)
+    w_call_3d = _eval_index_batch_3d_np(perf_flat, call_idx, inv_perm).reshape(b_sz, m_rem, n_total)
+    w_cpn_3d = (
+        w_call_3d
+        if same_cpn_call
+        else _eval_index_batch_3d_np(perf_flat, cpn_idx, inv_perm).reshape(b_sz, m_rem, n_total)
+    )
+    w_opt_3d = (
+        w_call_3d
+        if same_opt_call
+        else _eval_index_batch_3d_np(perf_flat, opt_idx, inv_perm).reshape(b_sz, m_rem, n_total)
+    )
+    has_one_star = state.one_star_strike is not None and float(state.one_star_strike) > 0.0
+    w_best_term = (
+        np.asarray(np.max(perf_b_d_m_n[:, :, -1, :], axis=1), dtype=np.float64)
+        if has_one_star
+        else None
+    )
+    return _eval_autocall_payoff_from_3d_indices_np(
+        w_call_3d,
+        w_cpn_3d,
+        w_opt_3d,
+        w_best_term,
+        state,
+        df_pay_b=df_pay_b,
+        w_fund_b=w_fund_b,
+        pv_in_transit_b=pv_in_transit_b,
+    )
+
+
+_DECOMPOSABLE_1D_INDICES = frozenset(
+    {"WorstOf", "Lookback", "BestOf", "Average", "AverageOf", "MultiPerf", "EquallyWeightedBasket"}
+)
+
+
+def _eval_single_asset_bump_pv_batch_np(
+    perf_i_b_m_n: npt.NDArray[np.float64],
+    asset_idx: int,
+    perf_base: npt.NDArray[np.float64],
+    state: AutocallPreprocState,
+    loo_cache: dict[tuple[int, str], npt.NDArray[np.float64]],
+    *,
+    df_pay_b: npt.NDArray[np.float64] | None = None,
+    w_fund_b: npt.NDArray[np.float64] | None = None,
+    pv_in_transit_b: npt.NDArray[np.float64] | None = None,
+) -> npt.NDArray[np.float64]:
+    """Evaluates single-asset bumped PV batch using O(1) leave-one-out partial basket summaries."""
+    call_idx = state.callability_index.strip()
+    cpn_idx = (state.coupon_index or call_idx).strip()
+    opt_idx = ("AverageOf" if bool(getattr(state, "is_long_basket", False)) else (state.option_index or call_idx)).strip()
+    d_assets = int(perf_base.shape[0])
+
+    if (
+        call_idx in _DECOMPOSABLE_1D_INDICES
+        and cpn_idx in _DECOMPOSABLE_1D_INDICES
+        and opt_idx in _DECOMPOSABLE_1D_INDICES
+    ):
+        def _combine_1d(idx_nm: str) -> npt.NDArray[np.float64]:
+            if d_assets == 1:
+                return perf_i_b_m_n
+            if idx_nm in ("WorstOf", "Lookback"):
+                key = (asset_idx, "min")
+                if key not in loo_cache:
+                    others = [j for j in range(d_assets) if j != asset_idx]
+                    loo_cache[key] = np.asarray(np.min(perf_base[others], axis=0), dtype=np.float64)
+                return np.minimum(perf_i_b_m_n, loo_cache[key][None, :, :])
+            if idx_nm == "BestOf":
+                key = (asset_idx, "max")
+                if key not in loo_cache:
+                    others = [j for j in range(d_assets) if j != asset_idx]
+                    loo_cache[key] = np.asarray(np.max(perf_base[others], axis=0), dtype=np.float64)
+                return np.maximum(perf_i_b_m_n, loo_cache[key][None, :, :])
+            key = (asset_idx, "sum")
+            if key not in loo_cache:
+                others = [j for j in range(d_assets) if j != asset_idx]
+                loo_cache[key] = np.asarray(np.sum(perf_base[others], axis=0), dtype=np.float64)
+            return (perf_i_b_m_n + loo_cache[key][None, :, :]) * (1.0 / float(d_assets))
+
+        w_call = _combine_1d(call_idx)
+        w_cpn = w_call if cpn_idx == call_idx else _combine_1d(cpn_idx)
+        w_opt = w_call if opt_idx == call_idx else (w_cpn if opt_idx == cpn_idx else _combine_1d(opt_idx))
+        has_one_star = state.one_star_strike is not None and float(state.one_star_strike) > 0.0
+        if has_one_star:
+            if d_assets == 1:
+                w_best_term: npt.NDArray[np.float64] | None = perf_i_b_m_n[:, -1, :]
+            else:
+                key_max = (asset_idx, "max")
+                if key_max not in loo_cache:
+                    others = [j for j in range(d_assets) if j != asset_idx]
+                    loo_cache[key_max] = np.asarray(np.max(perf_base[others], axis=0), dtype=np.float64)
+                w_best_term = np.maximum(perf_i_b_m_n[:, -1, :], loo_cache[key_max][-1, :][None, :])
+        else:
+            w_best_term = None
+
+        return _eval_autocall_payoff_from_3d_indices_np(
+            w_call,
+            w_cpn,
+            w_opt,
+            w_best_term,
+            state,
+            df_pay_b=df_pay_b,
+            w_fund_b=w_fund_b,
+            pv_in_transit_b=pv_in_transit_b,
+        )
+
+    b_v, m_rem, n_total = perf_i_b_m_n.shape
+    p_full = np.broadcast_to(perf_base[None, ...], (b_v, d_assets, m_rem, n_total)).copy()
+    p_full[:, asset_idx, :, :] = perf_i_b_m_n
+    return _eval_autocall_payoff_pv_batch_np(
+        p_full,
+        state,
+        df_pay_b=df_pay_b,
+        w_fund_b=w_fund_b,
+        pv_in_transit_b=pv_in_transit_b,
+    )
+
+
+def _next_power_of_two_int(n: int) -> int:
+    v = max(int(n), 2)
+    return 1 << (v - 1).bit_length()
 
 
 def compute_qmc_crn_greeks(
     state: AutocallPreprocState,
+    request: Any = None,
     *,
     queries: Sequence[str] | None = None,
     config: DupireQMCConfig | None = None,
@@ -16915,6 +17520,7 @@ def compute_qmc_crn_greeks(
     - Evaluates Equity Vega via O(N_u) slice spline update + 1D marginal diffusion of only the bumped asset.
     - Evaluates Theta using the SAME QMC CRN engine at t_0 + 1d (eliminating cross-engine proxy bias).
     """
+    del request
     qmc_device = (
         torch.device("cuda")
         if (state.spots_t0.device.type == "cpu" and torch.cuda.is_available())
@@ -16932,18 +17538,18 @@ def compute_qmc_crn_greeks(
         else:
             eff_cfg = DupireQMCConfig()
     elif qmc_device.type == "cpu" and (
-        int(config.n_paths) > 2048 or int(config.n_replicates) > 2 or int(config.n_substeps) > 4
+        int(config.n_paths) > 4096 or int(config.n_replicates) > 2 or int(config.n_substeps) > 4
     ):
         eff_cfg = DupireQMCConfig(
-            n_paths=min(int(config.n_paths), 2048),
-            n_replicates=min(int(config.n_replicates), 2),
-            n_substeps=min(int(config.n_substeps), 4),
+            n_paths=min(int(config.n_paths), 4096),
+            n_replicates=min(max(1, int(config.n_replicates)), 2),
+            n_substeps=min(max(1, int(config.n_substeps)), 4),
             mode=config.mode,
             precision=config.precision,
             cv_mode=config.cv_mode,
             seed=int(config.seed),
-            lv_grid_nt=min(int(config.lv_grid_nt), 32),
-            lv_grid_ny=min(int(config.lv_grid_ny), 64),
+            lv_grid_nt=min(max(8, int(config.lv_grid_nt)), 32),
+            lv_grid_ny=min(max(16, int(config.lv_grid_ny)), 64),
         )
     else:
         eff_cfg = config
@@ -16978,6 +17584,24 @@ def compute_qmc_crn_greeks(
     disc_curve = _normalize_curve_obj(state.discount_curve, as_of_date=as_of_orig)
     disc_id = str(getattr(disc_curve, "identifier", state.discount_curve_id or "DEFAULT"))
     k_pil = len(disc_curve.tenors) if (disc_curve is not None and hasattr(disc_curve, "tenors")) else 0
+
+    delta_dict: dict[str, float] | None = None
+    delta_tensor_orig: torch.Tensor | None = None
+    gamma_dict: dict[str, dict[str, float]] | None = None
+    gamma_tensor_orig: torch.Tensor | None = None
+    cash_gamma_agg: float | None = None
+    vega_dict: dict[str, list[list[float]]] | None = None
+    vega_arrays: dict[str, npt.NDArray[np.float64]] | None = None
+    fx_vega_dict: dict[str, list[float]] | None = None
+    rho_dict: dict[str, list[float]] | None = None
+    rho_arrays: dict[str, npt.NDArray[np.float64]] | None = None
+    repo_rho_dict: dict[str, list[float]] | None = None
+    divs_dict: dict[str, list[float]] | None = None
+    divs_arrays: dict[str, npt.NDArray[np.float64]] | None = None
+    cega_dict: dict[str, dict[str, float]] | None = None
+    cega_tensor_orig: torch.Tensor | None = None
+    fx_cega_dict: dict[str, dict[str, float]] | None = None
+    theta_val: float | None = None
 
     if m_rem == 0 or state.already_autocalled or not (
         want_delta or want_gamma or want_cash_gamma or want_vega or want_rho or want_divs or want_theta or want_cega
@@ -17049,12 +17673,18 @@ def compute_qmc_crn_greeks(
 
     from deepvol.models.autocall.dupire_qmc_solver import _generate_sobol_normals
 
-    n_sub = max(int(eff_cfg.n_substeps), 1)
-    n_rep = max(int(eff_cfg.n_replicates), 1)
-    n_paths = max(int(eff_cfg.n_paths), 2)
-    eff_r = (n_paths + 1) // 2 * 2
-    half_r = eff_r // 2
-    n_total = n_rep * eff_r
+    n_paths_cfg = int(config.n_paths) if config is not None else 1024
+    n_replicates_cfg = int(config.n_replicates) if config is not None else 2
+    n_sub_cfg = int(config.n_substeps) if config is not None else 4
+    lv_nt_cfg = int(config.lv_grid_nt) if config is not None else 32
+    lv_ny_cfg = int(config.lv_grid_ny) if config is not None else 64
+
+    n_paths_total = min(max(n_paths_cfg, 2), 4096)
+    eff_r = min(max(1, n_replicates_cfg), 2)
+    n_rep = _next_power_of_two_int(max(2, n_paths_total // eff_r))
+    half_r = n_rep // 2
+    n_total = eff_r * n_rep
+    n_sub = min(max(n_sub_cfg, 1), 4)
     n_steps = m_rem * n_sub
 
     tau_obs_np = state.tau_obs.detach().cpu().numpy().astype(np.float64)
@@ -17066,7 +17696,6 @@ def compute_qmc_crn_greeks(
     corr_np = state.corr_matrix.detach().cpu().numpy().astype(np.float64)
     quanto_meta = getattr(state, "quanto_meta", None) or {}
 
-    # Native carry rate r_native_obs for Dupire local vol (excludes quanto drift rate)
     r_tot_obs_np = state.dividend_schedule.r_tot_obs.detach().cpu().numpy().astype(np.float64)
     r_native_attr = getattr(state.dividend_schedule, "r_native_obs", None)
     if r_native_attr is not None:
@@ -17077,12 +17706,13 @@ def compute_qmc_crn_greeks(
             qm = quanto_meta.get(ticker)
             if qm:
                 rho_q = float(qm.get("rho_s_fx", 0.0))
+                fx_sign_q = _resolve_quanto_fx_sign(qm, state.payment_currency)
                 sig_fx_q = np.asarray(qm.get("sig_fx_obs", [0.0] * m_rem), dtype=np.float64)
                 sig_eq_q = np.asarray(
                     state.vol_surfaces[ticker].iv_batch(tau_obs_np, np.full(m_rem, spots_np[i])),
                     dtype=np.float64,
                 )
-                r_native_obs_np[i, :] = r_tot_obs_np[i, :] + rho_q * sig_eq_q * sig_fx_q
+                r_native_obs_np[i, :] = r_tot_obs_np[i, :] + (fx_sign_q * rho_q * sig_eq_q * sig_fx_q) * tau_obs_np
 
     esc_base = _escrowed_spot_softplus_np(spots_np[:, None], div_pv_np)
     growth_base = (fwd_perf_np * ref_spots_np[:, None]) / np.maximum(esc_base, 1e-12)
@@ -17096,26 +17726,24 @@ def compute_qmc_crn_greeks(
         else None
     )
 
-    # 1. Pre-draw antithetic Sobol normals ONCE
     dim_sobol = n_steps * d_assets
-    z_reps = np.empty((n_rep, eff_r, dim_sobol), dtype=np.float64)
-    for r_idx in range(n_rep):
+    z_reps = np.empty((eff_r, n_rep, dim_sobol), dtype=np.float64)
+    for r_idx in range(eff_r):
         z_half = _generate_sobol_normals(
             half_r,
             dim_sobol,
-            scramble=(n_rep > 1),
+            scramble=(eff_r > 1),
             seed=int(eff_cfg.seed) + 7919 * r_idx,
         )
         z_reps[r_idx, :half_r, :] = z_half
         z_reps[r_idx, half_r:, :] = -z_half
-    z_indep = z_reps.reshape(n_rep, eff_r, m_rem, n_sub, d_assets).transpose(2, 3, 1, 0, 4)
+    z_indep = z_reps.reshape(eff_r, n_rep, m_rem, n_sub, d_assets).transpose(2, 3, 0, 1, 4)
 
     chol_base = _safe_cholesky_corr_np(corr_np)
     z_corr_base = np.einsum("tsrbi,ji->tsrbj", z_indep, chol_base)
 
-    # 2. Build base 2D LV tables and cache base 1D normalized trajectories
-    lv_nt = max(int(eff_cfg.lv_grid_nt), 8)
-    lv_ny = max(int(eff_cfg.lv_grid_ny), 16)
+    lv_nt = min(max(lv_nt_cfg, 8), 32)
+    lv_ny = min(max(lv_ny_cfg, 16), 64)
     lv_y_min = float(getattr(eff_cfg, "lv_y_min", -1.25))
     lv_y_max = float(getattr(eff_cfg, "lv_y_max", 1.25))
     t_max = max(float(tau_obs_np[-1]), 1e-4)
@@ -17134,6 +17762,7 @@ def compute_qmc_crn_greeks(
             r_native_obs_np[i],
             lv_t_grid,
             lv_y_grid,
+            div_pv_obs_np=div_pv_np[i],
         )
         norm_x_base[i] = _step_1d_asset_trajectories_np(
             base_lv_tables[i : i + 1],
@@ -17144,9 +17773,11 @@ def compute_qmc_crn_greeks(
             lv_y_min,
             lv_y_max,
             n_sub,
+            r_tot_obs_np=r_tot_obs_np[i],
         )[0]
 
     perf_base = norm_x_base * fwd_perf_np[:, :, None]
+    loo_cache: dict[tuple[int, str], npt.NDArray[np.float64]] = {}
     pv0_1d = float(
         _eval_autocall_payoff_pv_batch_np(
             perf_base[None, ...],
@@ -17156,14 +17787,8 @@ def compute_qmc_crn_greeks(
         )[0]
     )
 
-    # 3. Spot bumps: Delta, Diagonal Gamma, Cross-Gamma (0 extra diffusions), and CashGamma
     h_spot_rel = 5.0e-3
     h_spots_np = np.maximum(spots_np * h_spot_rel, 1e-4)
-    delta_dict: dict[str, float] | None = None
-    delta_tensor_orig: torch.Tensor | None = None
-    gamma_dict: dict[str, dict[str, float]] | None = None
-    gamma_tensor_orig: torch.Tensor | None = None
-    cash_gamma_agg: float | None = None
 
     if want_delta or want_gamma or want_cash_gamma:
         perf_sp_p = np.empty((d_assets, m_rem, n_total), dtype=np.float64)
@@ -17175,10 +17800,22 @@ def compute_qmc_crn_greeks(
             sp_m_i = float(max(spots_np[i] - h_spots_np[i], 1e-6))
 
             lv_p = _build_single_asset_lv_table_fast_np(
-                surf_i, sp_p_i, tau_obs_np, r_native_obs_np[i], lv_t_grid, lv_y_grid
+                surf_i,
+                sp_p_i,
+                tau_obs_np,
+                r_native_obs_np[i],
+                lv_t_grid,
+                lv_y_grid,
+                div_pv_obs_np=div_pv_np[i],
             )
             lv_m = _build_single_asset_lv_table_fast_np(
-                surf_i, sp_m_i, tau_obs_np, r_native_obs_np[i], lv_t_grid, lv_y_grid
+                surf_i,
+                sp_m_i,
+                tau_obs_np,
+                r_native_obs_np[i],
+                lv_t_grid,
+                lv_y_grid,
+                div_pv_obs_np=div_pv_np[i],
             )
             nx_pm = _step_1d_asset_trajectories_np(
                 np.stack([lv_p, lv_m], axis=0),
@@ -17189,6 +17826,7 @@ def compute_qmc_crn_greeks(
                 lv_y_min,
                 lv_y_max,
                 n_sub,
+                r_tot_obs_np=r_tot_obs_np[i],
             )
             esc_p = _escrowed_spot_softplus_np(np.array([[sp_p_i]]), div_pv_np[i : i + 1])[0]
             esc_m = _escrowed_spot_softplus_np(np.array([[sp_m_i]]), div_pv_np[i : i + 1])[0]
@@ -17196,12 +17834,13 @@ def compute_qmc_crn_greeks(
             qm = quanto_meta.get(ticker)
             if qm:
                 rho_q = float(qm.get("rho_s_fx", 0.0))
+                fx_sign_q = _resolve_quanto_fx_sign(qm, state.payment_currency)
                 sig_fx_q = np.asarray(qm.get("sig_fx_obs", [0.0] * m_rem), dtype=np.float64)
                 sig_eq_0 = np.asarray(surf_i.iv_batch(tau_obs_np, np.full(m_rem, spots_np[i])), dtype=np.float64)
                 sig_eq_p = np.asarray(surf_i.iv_batch(tau_obs_np, np.full(m_rem, sp_p_i)), dtype=np.float64)
                 sig_eq_m = np.asarray(surf_i.iv_batch(tau_obs_np, np.full(m_rem, sp_m_i)), dtype=np.float64)
-                q_mult_p = np.exp(-rho_q * (sig_eq_p - sig_eq_0) * sig_fx_q * tau_obs_np)
-                q_mult_m = np.exp(-rho_q * (sig_eq_m - sig_eq_0) * sig_fx_q * tau_obs_np)
+                q_mult_p = np.exp(-fx_sign_q * rho_q * (sig_eq_p - sig_eq_0) * sig_fx_q * tau_obs_np)
+                q_mult_m = np.exp(-fx_sign_q * rho_q * (sig_eq_m - sig_eq_0) * sig_fx_q * tau_obs_np)
             else:
                 q_mult_p = np.ones(m_rem, dtype=np.float64)
                 q_mult_m = np.ones(m_rem, dtype=np.float64)
@@ -17211,47 +17850,60 @@ def compute_qmc_crn_greeks(
             perf_sp_p[i] = nx_pm[0] * fwd_p_i[:, None]
             perf_sp_m[i] = nx_pm[1] * fwd_m_i[:, None]
 
-        n_1d = 2 * d_assets
-        n_cross = d_assets * (d_assets - 1) if want_gamma else 0
-        n_euler = 2 if (want_cash_gamma and not want_gamma) else 0
-        perf_spot_batch = np.broadcast_to(
-            perf_base[None, ...], (n_1d + n_cross + n_euler, d_assets, m_rem, n_total)
-        ).copy()
-
+        pv_1d_spot = np.empty(2 * d_assets, dtype=np.float64)
         for i in range(d_assets):
-            perf_spot_batch[2 * i, i] = perf_sp_p[i]
-            perf_spot_batch[2 * i + 1, i] = perf_sp_m[i]
+            pv_1d_spot[2 * i : 2 * i + 2] = _eval_single_asset_bump_pv_batch_np(
+                np.stack([perf_sp_p[i], perf_sp_m[i]], axis=0),
+                i,
+                perf_base,
+                state,
+                loo_cache,
+                df_pay_b=np.broadcast_to(df_pay_np[None, :], (2, m_rem)),
+                w_fund_b=np.broadcast_to(w_fund_base_np[None, :], (2, m_rem)) if w_fund_base_np is not None else None,
+            )
 
         cross_pairs: list[tuple[int, int]] = []
-        if want_gamma:
-            idx_c = n_1d
+        pv_cross_arr: npt.NDArray[np.float64] = np.empty(0, dtype=np.float64)
+        if want_gamma and d_assets > 1:
+            n_cross = d_assets * (d_assets - 1)
+            perf_cross_batch = np.broadcast_to(
+                perf_base[None, ...], (n_cross, d_assets, m_rem, n_total)
+            ).copy()
+            idx_c = 0
             for i in range(d_assets):
                 for j in range(i + 1, d_assets):
                     cross_pairs.append((i, j))
-                    perf_spot_batch[idx_c, i] = perf_sp_p[i]
-                    perf_spot_batch[idx_c, j] = perf_sp_p[j]
-                    perf_spot_batch[idx_c + 1, i] = perf_sp_m[i]
-                    perf_spot_batch[idx_c + 1, j] = perf_sp_m[j]
+                    perf_cross_batch[idx_c, i] = perf_sp_p[i]
+                    perf_cross_batch[idx_c, j] = perf_sp_p[j]
+                    perf_cross_batch[idx_c + 1, i] = perf_sp_m[i]
+                    perf_cross_batch[idx_c + 1, j] = perf_sp_m[j]
                     idx_c += 2
-        elif want_cash_gamma:
-            for i in range(d_assets):
-                perf_spot_batch[n_1d, i] = perf_sp_p[i]
-                perf_spot_batch[n_1d + 1, i] = perf_sp_m[i]
-
-        pv_spot_arr = _eval_autocall_payoff_pv_batch_np(
-            perf_spot_batch,
-            state,
-            df_pay_b=np.broadcast_to(df_pay_np[None, :], (perf_spot_batch.shape[0], m_rem)),
-            w_fund_b=(
-                np.broadcast_to(w_fund_base_np[None, :], (perf_spot_batch.shape[0], m_rem))
-                if w_fund_base_np is not None
-                else None
-            ),
-        )
+            pv_cross_arr = _eval_autocall_payoff_pv_batch_np(
+                perf_cross_batch,
+                state,
+                df_pay_b=np.broadcast_to(df_pay_np[None, :], (n_cross, m_rem)),
+                w_fund_b=(
+                    np.broadcast_to(w_fund_base_np[None, :], (n_cross, m_rem))
+                    if w_fund_base_np is not None
+                    else None
+                ),
+            )
+        elif want_cash_gamma and not want_gamma:
+            perf_euler = np.stack([perf_sp_p, perf_sp_m], axis=0)
+            pv_cross_arr = _eval_autocall_payoff_pv_batch_np(
+                perf_euler,
+                state,
+                df_pay_b=np.broadcast_to(df_pay_np[None, :], (2, m_rem)),
+                w_fund_b=(
+                    np.broadcast_to(w_fund_base_np[None, :], (2, m_rem))
+                    if w_fund_base_np is not None
+                    else None
+                ),
+            )
 
         if want_delta:
             d_sorted = torch.tensor(
-                [(pv_spot_arr[2 * i] - pv_spot_arr[2 * i + 1]) / (2.0 * h_spots_np[i]) for i in range(d_assets)],
+                [(pv_1d_spot[2 * i] - pv_1d_spot[2 * i + 1]) / (2.0 * h_spots_np[i]) for i in range(d_assets)],
                 dtype=torch.float64,
                 device=device,
             )
@@ -17262,12 +17914,12 @@ def compute_qmc_crn_greeks(
             hess_sorted = torch.zeros((d_assets, d_assets), dtype=torch.float64, device=device)
             for i in range(d_assets):
                 hi = float(h_spots_np[i])
-                hess_sorted[i, i] = (pv_spot_arr[2 * i] - 2.0 * pv0_1d + pv_spot_arr[2 * i + 1]) / (hi * hi)
+                hess_sorted[i, i] = (pv_1d_spot[2 * i] - 2.0 * pv0_1d + pv_1d_spot[2 * i + 1]) / (hi * hi)
             for c_idx, (i, j) in enumerate(cross_pairs):
                 hi = float(h_spots_np[i])
                 hj = float(h_spots_np[j])
-                pv_pp = float(pv_spot_arr[n_1d + 2 * c_idx])
-                pv_mm = float(pv_spot_arr[n_1d + 2 * c_idx + 1])
+                pv_pp = float(pv_cross_arr[2 * c_idx])
+                pv_mm = float(pv_cross_arr[2 * c_idx + 1])
                 d2 = pv_pp - 2.0 * pv0_1d + pv_mm
                 gij = (d2 - hi * hi * float(hess_sorted[i, i]) - hj * hj * float(hess_sorted[j, j])) / (2.0 * hi * hj)
                 hess_sorted[i, j] = gij
@@ -17281,14 +17933,10 @@ def compute_qmc_crn_greeks(
                 s_out = spots_orig.unsqueeze(1) * spots_orig.unsqueeze(0)
                 cash_gamma_agg = float((s_out * gamma_tensor_orig).sum().cpu().item())
         elif want_cash_gamma:
-            pv_ep = float(pv_spot_arr[n_1d])
-            pv_em = float(pv_spot_arr[n_1d + 1])
+            pv_ep = float(pv_cross_arr[0])
+            pv_em = float(pv_cross_arr[1])
             cash_gamma_agg = (pv_ep - 2.0 * pv0_1d + pv_em) / (h_spot_rel * h_spot_rel)
 
-    # 4. Vega (1D marginal LV update per active slice/strike) + FX Vega (0 SDE steps)
-    vega_dict: dict[str, list[list[float]]] | None = None
-    vega_arrays: dict[str, npt.NDArray[np.float64]] | None = None
-    fx_vega_dict: dict[str, list[float]] | None = None
     if want_vega:
         vega_dict = {}
         vega_arrays = {}
@@ -17308,12 +17956,14 @@ def compute_qmc_crn_greeks(
             qm_i = quanto_meta.get(ticker)
             if qm_i:
                 rho_q_i = float(qm_i.get("rho_s_fx", 0.0))
+                fx_sign_i = _resolve_quanto_fx_sign(qm_i, state.payment_currency)
                 sig_fx_q_i = np.asarray(qm_i.get("sig_fx_obs", [0.0] * m_rem), dtype=np.float64)
                 sig_eq_base_i = np.asarray(
                     surf.iv_batch(tau_obs_np, np.full(m_rem, spots_np[i])), dtype=np.float64
                 )
             else:
                 rho_q_i = 0.0
+                fx_sign_i = 1.0
                 sig_fx_q_i = np.zeros(m_rem, dtype=np.float64)
                 sig_eq_base_i = np.zeros(m_rem, dtype=np.float64)
 
@@ -17335,29 +17985,22 @@ def compute_qmc_crn_greeks(
                             r_native_obs_np[i],
                             lv_t_grid,
                             lv_y_grid,
+                            div_pv_obs_np=div_pv_np[i],
                             slice_override_idx=e_idx,
                             slice_override_coeffs=c_bumped,
                             slice_override_quotes=q_bumped,
                         )
                         lv_vega_list.append(lv_b)
                         if qm_i:
-                            old_ce = surf._fast_slice_coeffs[:, :, e_idx].copy()
-                            old_qe = surf.quotes[e_idx].copy()
-                            surf._fast_slice_coeffs.setflags(write=True)
-                            surf.quotes.setflags(write=True)
-                            try:
-                                surf._fast_slice_coeffs[:, :, e_idx] = c_bumped
-                                surf.quotes[e_idx] = q_bumped
-                                sig_eq_b = np.asarray(
-                                    surf.iv_batch(tau_obs_np, np.full(m_rem, spots_np[i])),
-                                    dtype=np.float64,
-                                )
-                            finally:
-                                surf._fast_slice_coeffs[:, :, e_idx] = old_ce
-                                surf.quotes[e_idx] = old_qe
-                                surf._fast_slice_coeffs.setflags(write=False)
-                                surf.quotes.setflags(write=False)
-                            q_mult_v = np.exp(-rho_q_i * (sig_eq_b - sig_eq_base_i) * sig_fx_q_i * tau_obs_np)
+                            sig_eq_b = _eval_iv_batch_with_slice_override_np(
+                                surf,
+                                tau_obs_np,
+                                float(spots_np[i]),
+                                e_idx,
+                                c_bumped,
+                                q_bumped,
+                            )
+                            q_mult_v = np.exp(-fx_sign_i * rho_q_i * (sig_eq_b - sig_eq_base_i) * sig_fx_q_i * tau_obs_np)
                             fwd_vega_list.append(fwd_perf_np[i] * q_mult_v)
                         else:
                             fwd_vega_list.append(fwd_perf_np[i])
@@ -17375,28 +18018,23 @@ def compute_qmc_crn_greeks(
                         lv_y_min,
                         lv_y_max,
                         n_sub,
+                        r_tot_obs_np=r_tot_obs_np[i],
                     )
                     perf_v_i = nx_v * fwd_v_arr[:, :, None]
                     b_v = perf_v_i.shape[0]
-                    chunk_sz = 24
-                    pv_v_all = np.empty(b_v, dtype=np.float64)
-                    for c_start in range(0, b_v, chunk_sz):
-                        c_end = min(c_start + chunk_sz, b_v)
-                        c_len = c_end - c_start
-                        p_chunk = np.broadcast_to(
-                            perf_base[None, ...], (c_len, d_assets, m_rem, n_total)
-                        ).copy()
-                        p_chunk[:, i, :, :] = perf_v_i[c_start:c_end]
-                        pv_v_all[c_start:c_end] = _eval_autocall_payoff_pv_batch_np(
-                            p_chunk,
-                            state,
-                            df_pay_b=np.broadcast_to(df_pay_np[None, :], (c_len, m_rem)),
-                            w_fund_b=(
-                                np.broadcast_to(w_fund_base_np[None, :], (c_len, m_rem))
-                                if w_fund_base_np is not None
-                                else None
-                            ),
-                        )
+                    pv_v_all = _eval_single_asset_bump_pv_batch_np(
+                        perf_v_i,
+                        i,
+                        perf_base,
+                        state,
+                        loo_cache,
+                        df_pay_b=np.broadcast_to(df_pay_np[None, :], (b_v, m_rem)),
+                        w_fund_b=(
+                            np.broadcast_to(w_fund_base_np[None, :], (b_v, m_rem))
+                            if w_fund_base_np is not None
+                            else None
+                        ),
+                    )
                     for b_idx, (e_idx, u_idx) in enumerate(active_bumps):
                         arr_u[e_idx, u_idx] = (pv_v_all[b_idx] - pv0_1d) / h_vega
 
@@ -17412,7 +18050,6 @@ def compute_qmc_crn_greeks(
             vega_arrays[ticker] = arr_v
             vega_dict[ticker] = [[float(x) for x in row] for row in arr_v]
 
-        # Optional FX Vega when quanto metadata is present (0 SDE steps!)
         if quanto_meta:
             fx_vega_dict = {}
             h_fxv = 1.0e-3
@@ -17421,17 +18058,21 @@ def compute_qmc_crn_greeks(
                 if not qm:
                     continue
                 rho_q = float(qm.get("rho_s_fx", 0.0))
+                fx_sign_q = _resolve_quanto_fx_sign(qm, state.payment_currency)
                 sig_eq_q = np.asarray(
                     state.vol_surfaces[ticker].iv_batch(tau_obs_np, np.full(m_rem, spots_np[i])),
                     dtype=np.float64,
                 )
-                p_fxv = np.broadcast_to(perf_base[None, ...], (m_rem, d_assets, m_rem, n_total)).copy()
+                p_fxv_i = np.broadcast_to(perf_base[i : i + 1, :, :], (m_rem, m_rem, n_total)).copy()
                 for m_idx in range(m_rem):
-                    mult_m = math.exp(-rho_q * float(sig_eq_q[m_idx]) * h_fxv * float(tau_obs_np[m_idx]))
-                    p_fxv[m_idx, i, m_idx, :] *= mult_m
-                pv_fxv = _eval_autocall_payoff_pv_batch_np(
-                    p_fxv,
+                    mult_m = math.exp(-fx_sign_q * rho_q * float(sig_eq_q[m_idx]) * h_fxv * float(tau_obs_np[m_idx]))
+                    p_fxv_i[m_idx, m_idx, :] *= mult_m
+                pv_fxv = _eval_single_asset_bump_pv_batch_np(
+                    p_fxv_i,
+                    i,
+                    perf_base,
                     state,
+                    loo_cache,
                     df_pay_b=np.broadcast_to(df_pay_np[None, :], (m_rem, m_rem)),
                     w_fund_b=(
                         np.broadcast_to(w_fund_base_np[None, :], (m_rem, m_rem))
@@ -17441,10 +18082,6 @@ def compute_qmc_crn_greeks(
                 )
                 fx_vega_dict[ticker] = [float((pv_fxv[m_idx] - pv0_1d) / h_fxv) for m_idx in range(m_rem)]
 
-    # 5. Multi-Curve Rho + Repo Rho (0 LV builds, 0 SDE steps: pure discount & forward rescaling!)
-    rho_dict: dict[str, list[float]] | None = None
-    rho_arrays: dict[str, npt.NDArray[np.float64]] | None = None
-    repo_rho_dict: dict[str, list[float]] | None = None
     if want_rho:
         rho_dict = {}
         rho_arrays = {}
@@ -17452,7 +18089,6 @@ def compute_qmc_crn_greeks(
         fut_obs_dts = state.seasoned_state.future_obs_dates
         fut_pay_dts = state.seasoned_state.future_pay_dates
 
-        # Collect all active curves: discount curve, distinct funding curve, and distinct asset financing curves
         f_curve_leg = (
             _normalize_curve_obj(state.funding_leg.get("funding_curve"), as_of_date=as_of_orig)
             if state.funding_leg is not None
@@ -17637,7 +18273,6 @@ def compute_qmc_crn_greeks(
             rho_arrays[cid_cur] = arr_r
             rho_dict[cid_cur] = [float(x) for x in arr_r]
 
-        # Per-ticker RepoCurve sensitivities (0 SDE steps)
         repo_curves_map = _extract_repo_curves_map(state, sorted_ids, as_of_orig)
         if repo_curves_map:
             repo_rho_dict = {}
@@ -17654,7 +18289,7 @@ def compute_qmc_crn_greeks(
                 )
                 if n_pil_r <= 0:
                     continue
-                fwd_repo_b = np.broadcast_to(fwd_perf_np[None, :, :], (n_pil_r, d_assets, m_rem)).copy()
+                fwd_repo_i = np.empty((n_pil_r, m_rem), dtype=np.float64)
                 events_i = state.dividend_schedule.dividend_events.get(ticker, [])
                 for p_idx in range(n_pil_r):
                     p_vec = torch.zeros(n_pil_r, dtype=torch.float64, device=device)
@@ -17700,13 +18335,16 @@ def compute_qmc_crn_greeks(
                         w_bumped = w_i / np.where(active_ex_i > 0.5, np.maximum(m_div_ex, 1e-12), 1.0)
                         dpv_i = (amt_i * w_bumped) @ inc_i
                         esc_i = _escrowed_spot_softplus_np(np.array([[spots_np[i]]]), dpv_i[None, :])[0]
-                        fwd_repo_b[p_idx, i, :] = esc_i * (growth_base[i] * m_repo_obs) / ref_spots_np[i]
+                        fwd_repo_i[p_idx] = esc_i * (growth_base[i] * m_repo_obs) / ref_spots_np[i]
                     else:
-                        fwd_repo_b[p_idx, i, :] = fwd_perf_np[i, :] * m_repo_obs
-                p_repo_all = norm_x_base[None, :, :, :] * fwd_repo_b[:, :, :, None]
-                pv_repo_arr = _eval_autocall_payoff_pv_batch_np(
-                    p_repo_all,
+                        fwd_repo_i[p_idx] = fwd_perf_np[i, :] * m_repo_obs
+                p_repo_i = norm_x_base[i][None, :, :] * fwd_repo_i[:, :, None]
+                pv_repo_arr = _eval_single_asset_bump_pv_batch_np(
+                    p_repo_i,
+                    i,
+                    perf_base,
                     state,
+                    loo_cache,
                     df_pay_b=np.broadcast_to(df_pay_np[None, :], (n_pil_r, m_rem)),
                     w_fund_b=(
                         np.broadcast_to(w_fund_base_np[None, :], (n_pil_r, m_rem))
@@ -17716,9 +18354,6 @@ def compute_qmc_crn_greeks(
                 )
                 repo_rho_dict[ticker] = [float((pv_repo_arr[p_idx] - pv0_1d) / h_rho) for p_idx in range(n_pil_r)]
 
-    # 6. DividendsSensitivities (0 LV builds, 0 SDE steps: pure forward rescaling!)
-    divs_dict: dict[str, list[float]] | None = None
-    divs_arrays: dict[str, npt.NDArray[np.float64]] | None = None
     if want_divs:
         divs_dict = {}
         divs_arrays = {}
@@ -17730,17 +18365,18 @@ def compute_qmc_crn_greeks(
             if n_ev > 0:
                 w_base = state.dividend_schedule.dividend_pv_weights[ticker].detach().cpu().numpy().astype(np.float64)
                 inc = state.dividend_schedule.dividend_obs_incidence[ticker].detach().cpu().numpy().astype(np.float64)
-                p_div_batch = np.broadcast_to(
-                    perf_base[None, ...], (n_ev, d_assets, m_rem, n_total)
-                ).copy()
+                p_div_i = np.empty((n_ev, m_rem, n_total), dtype=np.float64)
                 for k_ev in range(n_ev):
                     dpv_i = div_pv_np[i_s] + h_div * w_base[k_ev] * inc[k_ev]
                     esc_i = _escrowed_spot_softplus_np(np.array([[spots_np[i_s]]]), dpv_i[None, :])[0]
                     fwd_b_i = (esc_i * growth_base[i_s]) / ref_spots_np[i_s]
-                    p_div_batch[k_ev, i_s] = norm_x_base[i_s] * fwd_b_i[:, None]
-                pv_div_arr = _eval_autocall_payoff_pv_batch_np(
-                    p_div_batch,
+                    p_div_i[k_ev] = norm_x_base[i_s] * fwd_b_i[:, None]
+                pv_div_arr = _eval_single_asset_bump_pv_batch_np(
+                    p_div_i,
+                    i_s,
+                    perf_base,
                     state,
+                    loo_cache,
                     df_pay_b=np.broadcast_to(df_pay_np[None, :], (n_ev, m_rem)),
                     w_fund_b=(
                         np.broadcast_to(w_fund_base_np[None, :], (n_ev, m_rem))
@@ -17755,10 +18391,6 @@ def compute_qmc_crn_greeks(
             divs_arrays[ticker] = arr_d
             divs_dict[ticker] = [float(x) for x in arr_d]
 
-    # 7. Cega (0 LV builds: re-correlate normals on cached base 2D LV tables) + FX Cega (0 SDE steps)
-    cega_dict: dict[str, dict[str, float]] | None = None
-    cega_tensor_orig: torch.Tensor | None = None
-    fx_cega_dict: dict[str, dict[str, float]] | None = None
     if want_cega:
         cega_sorted = torch.zeros((d_assets, d_assets), dtype=torch.float64, device=device)
         if d_assets > 1:
@@ -17783,6 +18415,7 @@ def compute_qmc_crn_greeks(
                             lv_y_min,
                             lv_y_max,
                             n_sub,
+                            r_tot_obs_np=r_tot_obs_np[k_a],
                         )[0]
                         p_up[k_a] = nx_k * fwd_perf_np[k_a, :, None]
                     perf_cega_list.append(p_up)
@@ -17824,20 +18457,20 @@ def compute_qmc_crn_greeks(
                     dtype=np.float64,
                 )
                 mult_fxc = np.exp(-fx_sign_f * h_fxc * sig_eq_q * sig_fx_q * tau_obs_np)
-                p_fxc = perf_base[None, ...].copy()
-                p_fxc[0, i, :, :] *= mult_fxc[:, None]
+                p_fxc_i = (perf_base[i] * mult_fxc[:, None])[None, :, :]
                 pv_fxc = float(
-                    _eval_autocall_payoff_pv_batch_np(
-                        p_fxc,
+                    _eval_single_asset_bump_pv_batch_np(
+                        p_fxc_i,
+                        i,
+                        perf_base,
                         state,
+                        loo_cache,
                         df_pay_b=df_pay_np[None, :],
                         w_fund_b=w_fund_base_np[None, :] if w_fund_base_np is not None else None,
                     )[0]
                 )
                 fx_cega_dict[ticker] = {fx_id: (pv_fxc - pv0_1d) / h_fxc}
 
-    # 8. Same-Engine Theta: evaluate t_0 + 1d using the SAME 1D-Marginal QMC CRN engine
-    theta_val: float | None = None
     if want_theta:
         dt_shift = 1.0 / 365.0
         as_of_rolled = (
@@ -17846,7 +18479,6 @@ def compute_qmc_crn_greeks(
             else None
         )
         if as_of_rolled is not None and state.seasoned_state.future_obs_dates and state.seasoned_state.future_obs_dates[0] <= as_of_rolled:
-            # Fallback when the 1-day calendar roll crosses an observation date
             with torch.no_grad():
                 pv_r = evaluate_differentiable_pv(
                     state,
@@ -17884,6 +18516,8 @@ def compute_qmc_crn_greeks(
                 df_obs_disc_th = df_pay_th_np
 
             fwd_perf_th_np = np.empty_like(fwd_perf_np)
+            r_tot_th_np = np.empty_like(r_tot_obs_np)
+            r_nat_th_np = np.empty_like(r_native_obs_np)
             repo_map_th = _extract_repo_curves_map(state, sorted_ids, as_of_orig)
             for i, ticker in enumerate(sorted_ids):
                 c_fin_i = (
@@ -17920,13 +18554,16 @@ def compute_qmc_crn_greeks(
                 qm_i = quanto_meta.get(ticker)
                 if qm_i:
                     rho_q_i = float(qm_i.get("rho_s_fx", 0.0))
+                    fx_sign_i = _resolve_quanto_fx_sign(qm_i, state.payment_currency)
                     sig_fx_q_i = np.asarray(qm_i.get("sig_fx_obs", [0.0] * m_rem), dtype=np.float64)
                     sig_eq_q_i = np.asarray(
                         state.vol_surfaces[ticker].iv_batch(tau_obs_th_np, np.full(m_rem, spots_np[i])),
                         dtype=np.float64,
                     )
-                    q_df_th_i = np.exp(-rho_q_i * sig_eq_q_i * sig_fx_q_i * tau_obs_th_np)
+                    q_carry_th_i = -fx_sign_i * rho_q_i * sig_eq_q_i * sig_fx_q_i * tau_obs_th_np
+                    q_df_th_i = np.exp(q_carry_th_i)
                 else:
+                    q_carry_th_i = np.zeros(m_rem, dtype=np.float64)
                     q_df_th_i = np.ones(m_rem, dtype=np.float64)
 
                 events_i = state.dividend_schedule.dividend_events.get(ticker, [])
@@ -17971,6 +18608,8 @@ def compute_qmc_crn_greeks(
                 esc_th_i = _escrowed_spot_softplus_np(np.array([[spots_np[i]]]), dpv_th_i[None, :])[0]
                 growth_th_i = (df_repo_th_i * q_df_th_i) / np.maximum(df_fin_th_i, 1e-12)
                 fwd_perf_th_np[i] = (esc_th_i * growth_th_i) / ref_spots_np[i]
+                r_nat_th_np[i] = np.log(np.maximum(df_repo_th_i / np.maximum(df_fin_th_i, 1e-15), 1e-15))
+                r_tot_th_np[i] = r_nat_th_np[i] + q_carry_th_i
 
             norm_x_th = np.empty_like(norm_x_base)
             for i in range(d_assets):
@@ -17978,11 +18617,12 @@ def compute_qmc_crn_greeks(
                     base_lv_tables[i : i + 1],
                     z_corr_base[..., i],
                     tau_obs_th_np,
-                    r_native_obs_np[i],
+                    r_nat_th_np[i],
                     lv_t_grid,
                     lv_y_min,
                     lv_y_max,
                     n_sub,
+                    r_tot_obs_np=r_tot_th_np[i],
                 )[0]
             perf_th = norm_x_th * fwd_perf_th_np[:, :, None]
 
