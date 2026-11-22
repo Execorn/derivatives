@@ -1817,8 +1817,14 @@ def price_eq_autocall_dupire_qmc(
     elif use_gpu is None and device is None and state.spots_t0.is_cuda:
         want_gpu = True
 
-    if want_gpu and precision != "fp64_audit" and torch.cuda.is_available():
-        from deepvol.models.autocall.dupire_qmc_gpu import DupireQMCConfig, DupireQMCGpuSolver
+    if precision != "fp64_audit" and (
+        (want_gpu and torch.cuda.is_available()) or int(n_paths) >= 16384
+    ):
+        from deepvol.models.autocall.dupire_qmc_gpu import (
+            DupireQMCConfig,
+            DupireQMCGpuSolver,
+            GpuTorchDupireQMC,
+        )
 
         gpu_eff_mode: Literal["dupire_lv", "terminal_iv"] = (
             "terminal_iv" if mode == "terminal_iv" else "dupire_lv"
@@ -1832,7 +1838,9 @@ def price_eq_autocall_dupire_qmc(
             cv_mode=cv_mode,
             seed=42 if seed is None else int(seed),
         )
-        return DupireQMCGpuSolver(device=device or "cuda").simulate_and_price(state, config=cfg)
+        if want_gpu and torch.cuda.is_available():
+            return DupireQMCGpuSolver(device=device or "cuda").simulate_and_price(state, config=cfg)
+        return GpuTorchDupireQMC(device="cpu", use_triton=False).simulate_and_price(state, config=cfg)
 
     d_assets = state.d_assets
     m_rem = state.m_rem

@@ -708,11 +708,11 @@ def _generate_gpu_sobol_tile(
     if n_sobol > 0:
         sv_gpu = _get_sobol_direction_numbers(device)
         m_pow = int(round(math.log2(n_rep)))
-        gen_s = torch.Generator(device=device)
+        gen_s = torch.Generator(device="cpu")
         gen_s.manual_seed(int(seed) + dim_offset * 131 + 17)
         shifts = torch.randint(
-            0, 1 << _SOBOL_BITS, (n_replicates, n_sobol), dtype=torch.int32, device=device, generator=gen_s
-        )
+            0, 1 << _SOBOL_BITS, (n_replicates, n_sobol), dtype=torch.int32, device="cpu", generator=gen_s
+        ).to(device=device)
         if use_triton and _HAS_TRITON and device.type == "cuda":
             z_sobol = torch.empty((n_replicates, n_sobol, n_rep), dtype=torch.float32, device=device)
             block_n = min(256, n_rep)
@@ -744,12 +744,12 @@ def _generate_gpu_sobol_tile(
         parts.append(z_sobol)
 
     if n_philox > 0:
-        gen_p = torch.Generator(device=device)
+        gen_p = torch.Generator(device="cpu")
         gen_p.manual_seed(int(seed) + dim_offset * 977 + 99991)
         half = (n_rep + 1) // 2
         z_half = torch.randn(
-            (n_replicates, n_philox, half), dtype=torch.float32, device=device, generator=gen_p
-        )
+            (n_replicates, n_philox, half), dtype=torch.float32, device="cpu", generator=gen_p
+        ).to(device=device)
         z_philox = torch.cat([z_half, -z_half], dim=-1)[:, :, :n_rep]
         parts.append(z_philox)
 
@@ -1308,31 +1308,20 @@ class CpuNumpyDupireQMC:
         config: Optional[DupireQMCConfig] = None,
         compute_pathwise_delta: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        cfg = config or DupireQMCConfig()
-        b_size = len(states)
-        if b_size == 0:
+        if len(states) == 0:
             z0 = torch.empty(0, dtype=torch.float64)
-            return z0, torch.empty((0, 48), dtype=torch.float64), torch.empty((0, 48), dtype=torch.float64), z0, z0.unsqueeze(-1) if compute_pathwise_delta else None
-        d_max = max(int(s.d_max) for s in states)
-        m_max = max(int(s.m_max) for s in states)
-        pv_out = torch.zeros(b_size, dtype=torch.float64)
-        p_out = torch.zeros((b_size, m_max), dtype=torch.float64)
-        q_out = torch.zeros((b_size, m_max), dtype=torch.float64)
-        l_out = torch.zeros(b_size, dtype=torch.float64)
-        delta_out = torch.zeros((b_size, d_max), dtype=torch.float64) if compute_pathwise_delta else None
-
-        for b, st in enumerate(states):
-            res = self.simulate_and_price(st, cfg)
-            pv_out[b] = res.product_value
-            p_out[b, : st.m_rem] = torch.as_tensor(res.p_stop, dtype=torch.float64)
-            q_out[b, : st.m_rem] = torch.as_tensor(res.q_cpn, dtype=torch.float64)
-            l_out[b] = res.l_put
-            if delta_out is not None:
-                for i in range(st.d_assets):
-                    s0_i = float(st.spots_t0[i].item())
-                    # Use baseline delta proxy scaled if full FD unavailable on raw state
-                    delta_out[b, i] = float(st.baseline.proxy_delta_weights[i].item()) * s0_i
-        return pv_out, p_out, q_out, l_out, delta_out
+            return (
+                z0,
+                torch.empty((0, 48), dtype=torch.float64),
+                torch.empty((0, 48), dtype=torch.float64),
+                z0,
+                z0.unsqueeze(-1) if compute_pathwise_delta else None,
+            )
+        return GpuTorchDupireQMC(device="cpu", use_triton=False).simulate_batch_for_training(
+            states,
+            config=config,
+            compute_pathwise_delta=compute_pathwise_delta,
+        )
 
 
 class GpuTorchDupireQMC:
@@ -1862,19 +1851,26 @@ class GpuTorchDupireQMC:
         # Preserve exact CV PV delta inside option_pv + product_value while keeping CashFlows reconciled
         cv_shift = cv_pv_est - raw_pv_mean
         adj_prod = float(asm.product_value.item()) + cv_shift
-        adj_opt = float(asm.option_pv.item()) + cv_shift
+        has_zero_opt = (
+            float(getattr(state, "option_gearing", 1.0)) == 0.0
+            and float(getattr(state, "participation_call_rate", 0.0)) == 0.0
+            and not bool(getattr(state, "is_long_basket", False))
+        )
+        adj_opt = float(asm.option_pv.item()) if has_zero_opt else (float(asm.option_pv.item()) + cv_shift)
+        adj_notional = (float(asm.notional_pv.item()) + cv_shift) if has_zero_opt else float(asm.notional_pv.item())
         if cv_shift != 0.0 and asm.cashflows:
-            target_desc = (
-                "IsLongBasket"
-                if (
-                    bool(getattr(state, "is_long_basket", False))
-                    and any(
-                        cf.Description == "IsLongBasket" and cf.StatusText == "Estimate"
-                        for cf in asm.cashflows
-                    )
+            if (
+                bool(getattr(state, "is_long_basket", False))
+                and any(
+                    cf.Description == "IsLongBasket" and cf.StatusText == "Estimate"
+                    for cf in asm.cashflows
                 )
-                else "Option"
-            )
+            ):
+                target_desc = "IsLongBasket"
+            elif has_zero_opt:
+                target_desc = "Notional"
+            else:
+                target_desc = "Option"
             for idx_cf in range(len(asm.cashflows) - 1, -1, -1):
                 cf = asm.cashflows[idx_cf]
                 if cf.Description == target_desc and cf.StatusText == "Estimate":
@@ -1894,7 +1890,7 @@ class GpuTorchDupireQMC:
             standard_error=total_se,
             option_pv=adj_opt,
             option_se=option_se,
-            notional_pv=float(asm.notional_pv.item()),
+            notional_pv=adj_notional,
             coupon_pv=float(asm.coupon_pv.item()),
             funding_pv=float(asm.funding_pv.item()),
             p_stop=p_stop_arr,
