@@ -672,11 +672,11 @@ def _compute_qmc_crn_if_available(
                     continue
             if cfg_cls is not None:
                 cfg = cfg_cls(
-                    n_paths=min(int(n_paths), 2048),
+                    n_paths=min(int(n_paths), 1024),
                     n_replicates=1,
-                    n_substeps=4,
-                    lv_grid_nt=32,
-                    lv_grid_ny=64,
+                    n_substeps=2,
+                    lv_grid_nt=24,
+                    lv_grid_ny=48,
                 )
                 return crn_fn(state, queries=queries, config=cfg)  # type: ignore[no-any-return]
             return crn_fn(state, queries=queries)  # type: ignore[no-any-return]

@@ -7032,7 +7032,9 @@ def _evaluate_greeks_single_batch(
         )
         iv_all_mat = iv_flat_d.view(d_assets, b_diff, q_len).transpose(0, 1)
         if iv_0_delta_leaf is not None:
-            iv_all_mat = torch.cat([(iv_all_mat[0] + iv_0_delta_leaf).unsqueeze(0), iv_all_mat[1:]], dim=0)
+            iv_all_mat = torch.cat(
+                [(iv_all_mat[0] + iv_0_delta_leaf[:, :q_len]).unsqueeze(0), iv_all_mat[1:]], dim=0
+            )
         iv_at_fwd_b = iv_all_mat[:, :, :m_rem]
         if eff_surrogate is not None and not use_cpp_glue:
             iv_short_a = iv_at_fwd_b[:, :, 0]
@@ -7086,7 +7088,9 @@ def _evaluate_greeks_single_batch(
                 delta_prefix_len=q_len if q_del_i is not None else None,
             ).view(b_diff, q_len)
             if iv_0_delta_leaf is not None:
-                iv_mat = torch.cat([(iv_mat[0] + iv_0_delta_leaf[i]).unsqueeze(0), iv_mat[1:]], dim=0)
+                iv_mat = torch.cat(
+                    [(iv_mat[0] + iv_0_delta_leaf[i, :q_len]).unsqueeze(0), iv_mat[1:]], dim=0
+                )
 
             iv_mat_rows.append(iv_mat)
             iv_m = iv_mat[:, :m_rem]
@@ -8835,11 +8839,12 @@ def compute_eq_autocall_greeks(
                     sc_pair = batch_aux["surf_caches_b"][ticker]
                     g_v: torch.Tensor | None = None
                     if g_iv_0_all is not None:
+                        q_len_vjp = int(batch_aux["t_1_q"].shape[0])
                         g_v = _surface_quote_vjp(
                             surf_i,
                             batch_aux["t_1_q"],
                             batch_aux["k_0_surf"][i],
-                            g_iv_0_all[i],
+                            g_iv_0_all[i, :q_len_vjp],
                             cached_pair=sc_pair,
                         )
                     if g_iv_q0_all is not None and batch_aux["k_0_q"][i] is not None:
@@ -17310,7 +17315,8 @@ def _eval_autocall_payoff_from_3d_indices_np(
             has_one_star = state.one_star_strike is not None and float(state.one_star_strike) > 0.0
             if has_one_star and state.one_star_strike is not None and w_best_term_b_n is not None:
                 k_os = float(state.one_star_strike)
-                star_ind = (w_best_term_b_n >= k_os).astype(np.float64)
+                s_os = max(abs(ko_spread), abs(ki_spread), 0.02)
+                star_ind = np.clip((w_best_term_b_n - (k_os - s_os)) / s_os, 0.0, 1.0)
             else:
                 star_ind = np.zeros_like(w_opt)
 
@@ -17554,10 +17560,6 @@ def compute_qmc_crn_greeks(
     else:
         eff_cfg = config
 
-    solver = DupireQMCGpuSolver(device=qmc_device, backend="auto")
-    base_res = solver.simulate_and_price(state, config=eff_cfg)
-    pv0 = float(base_res.product_value)
-
     raw_queries = queries if queries is not None else state.queries
     q_set = {str(getattr(q, "value", q)) for q in raw_queries}
 
@@ -17572,6 +17574,32 @@ def compute_qmc_crn_greeks(
 
     d_assets = state.d_assets
     m_rem = state.m_rem
+    need_full_base_qmc = (
+        m_rem == 0
+        or state.already_autocalled
+        or "ProductValue" in q_set
+        or "CashFlows" in q_set
+        or not (
+            want_delta
+            or want_gamma
+            or want_cash_gamma
+            or want_vega
+            or want_rho
+            or want_divs
+            or want_theta
+            or want_cega
+        )
+    )
+    solver = DupireQMCGpuSolver(device=qmc_device, backend="auto")
+    if need_full_base_qmc:
+        base_res = solver.simulate_and_price(state, config=eff_cfg)
+        pv0 = float(base_res.product_value)
+        base_cfs = list(base_res.cashflows)
+        base_se = float(base_res.standard_error)
+    else:
+        pv0 = 0.0
+        base_cfs = []
+        base_se = 0.0
     orig_ids = state.original_identifiers
     sorted_ids = state.sorted_identifiers
     inv_perm = state.inv_lex_perm
@@ -17650,7 +17678,7 @@ def compute_qmc_crn_greeks(
         theta_val = 0.0 if want_theta else None
         return AutocallGreeksResult(
             product_value=pv0,
-            cash_flows=list(base_res.cashflows),
+            cash_flows=base_cfs,
             delta=delta_dict,
             gamma=gamma_dict,
             multivariate_aggregated_cash_gamma=cash_gamma_agg,
@@ -17666,7 +17694,7 @@ def compute_qmc_crn_greeks(
             dividends_arrays=divs_arrays,
             cega_tensor=cega_tensor_orig,
             reporting_currency=state.payment_currency,
-            standard_error=float(base_res.standard_error),
+            standard_error=base_se,
             cash_to_settle_today=float(state.cash_to_settle_today),
             greeks_engine_used=f"qmc_crn_{solver.backend_name}",
         )
@@ -17732,7 +17760,7 @@ def compute_qmc_crn_greeks(
         z_half = _generate_sobol_normals(
             half_r,
             dim_sobol,
-            scramble=(eff_r > 1),
+            scramble=True,
             seed=int(eff_cfg.seed) + 7919 * r_idx,
         )
         z_reps[r_idx, :half_r, :] = z_half
@@ -17786,6 +17814,8 @@ def compute_qmc_crn_greeks(
             w_fund_b=w_fund_base_np[None, :] if w_fund_base_np is not None else None,
         )[0]
     )
+    if not need_full_base_qmc:
+        pv0 = pv0_1d
 
     h_spot_rel = 5.0e-3
     h_spots_np = np.maximum(spots_np * h_spot_rel, 1e-4)
@@ -17940,7 +17970,6 @@ def compute_qmc_crn_greeks(
     if want_vega:
         vega_dict = {}
         vega_arrays = {}
-        tau_max = float(tau_obs_np[-1])
         h_vega = 1.0e-3
 
         for i, ticker in enumerate(sorted_ids):
@@ -17948,101 +17977,89 @@ def compute_qmc_crn_greeks(
             if surf is None:
                 vega_arrays[ticker] = np.zeros((0, 0), dtype=np.float64)
                 continue
-            surf._ensure_basis_spline()
-            n_u_strikes = int(getattr(surf, "n_unique_strikes", len(surf.strikes)))
-            arr_u = np.zeros((surf.n_exp, n_u_strikes), dtype=np.float64)
-            basis_i = getattr(surf, "_fast_basis_coeffs", None)
-            base_c_i = getattr(surf, "_fast_slice_coeffs", None)
             qm_i = quanto_meta.get(ticker)
+            lv_m_batch = np.repeat(base_lv_tables[i : i + 1], m_rem, axis=0)
+            for m_idx in range(m_rem):
+                t_lo = 0.0 if m_idx == 0 else float(tau_obs_np[m_idx - 1])
+                t_hi = float(tau_obs_np[m_idx])
+                mask_t = (lv_t_grid >= t_lo - 1e-9) & (lv_t_grid <= t_hi + 1e-9)
+                if not np.any(mask_t):
+                    mask_t[int(np.argmin(np.abs(lv_t_grid - 0.5 * (t_lo + t_hi))))] = True
+                lv_m_batch[m_idx, mask_t, :] += h_vega
+
+            nx_v = _step_1d_asset_trajectories_np(
+                lv_m_batch,
+                z_corr_base[..., i],
+                tau_obs_np,
+                r_native_obs_np[i],
+                lv_t_grid,
+                lv_y_min,
+                lv_y_max,
+                n_sub,
+                r_tot_obs_np=r_tot_obs_np[i],
+            )
+            perf_v_i = nx_v * fwd_perf_np[i][None, :, None]
+            pv_v_all = _eval_single_asset_bump_pv_batch_np(
+                perf_v_i,
+                i,
+                perf_base,
+                state,
+                loo_cache,
+                df_pay_b=np.broadcast_to(df_pay_np[None, :], (m_rem, m_rem)),
+                w_fund_b=(
+                    np.broadcast_to(w_fund_base_np[None, :], (m_rem, m_rem))
+                    if w_fund_base_np is not None
+                    else None
+                ),
+            )
+            g_m = (pv_v_all - pv0_1d) / h_vega
+            iv_fwd_jacs_map = getattr(state, "iv_at_fwd_jacobians", None)
+            if iv_fwd_jacs_map is not None and ticker in iv_fwd_jacs_map:
+                jac_i = np.asarray(iv_fwd_jacs_map[ticker], dtype=np.float64)
+            else:
+                jac_i = np.stack(
+                    [
+                        surf.iv_and_d_iv_d_quotes(
+                            float(tau_obs_np[m_idx]),
+                            float(state.dividend_schedule.forward_price[i, m_idx].item()),
+                        )[1]
+                        for m_idx in range(m_rem)
+                    ],
+                    axis=0,
+                )
+            arr_raw = np.einsum("m,mek->ek", g_m, jac_i)
+
             if qm_i:
                 rho_q_i = float(qm_i.get("rho_s_fx", 0.0))
                 fx_sign_i = _resolve_quanto_fx_sign(qm_i, state.payment_currency)
                 sig_fx_q_i = np.asarray(qm_i.get("sig_fx_obs", [0.0] * m_rem), dtype=np.float64)
-                sig_eq_base_i = np.asarray(
-                    surf.iv_batch(tau_obs_np, np.full(m_rem, spots_np[i])), dtype=np.float64
+                p_qv_i = np.broadcast_to(perf_base[i : i + 1, :, :], (m_rem, m_rem, n_total)).copy()
+                for m_idx in range(m_rem):
+                    mult_qm = math.exp(-fx_sign_i * rho_q_i * h_vega * float(sig_fx_q_i[m_idx]) * float(tau_obs_np[m_idx]))
+                    p_qv_i[m_idx, m_idx, :] *= mult_qm
+                pv_qv_all = _eval_single_asset_bump_pv_batch_np(
+                    p_qv_i,
+                    i,
+                    perf_base,
+                    state,
+                    loo_cache,
+                    df_pay_b=np.broadcast_to(df_pay_np[None, :], (m_rem, m_rem)),
+                    w_fund_b=(
+                        np.broadcast_to(w_fund_base_np[None, :], (m_rem, m_rem))
+                        if w_fund_base_np is not None
+                        else None
+                    ),
                 )
-            else:
-                rho_q_i = 0.0
-                fx_sign_i = 1.0
-                sig_fx_q_i = np.zeros(m_rem, dtype=np.float64)
-                sig_eq_base_i = np.zeros(m_rem, dtype=np.float64)
+                g_qm = (pv_qv_all - pv0_1d) / h_vega
+                jac_q_i = np.stack(
+                    [
+                        surf.iv_and_d_iv_d_quotes(float(tau_obs_np[m_idx]), float(spots_np[i]))[1]
+                        for m_idx in range(m_rem)
+                    ],
+                    axis=0,
+                )
+                arr_raw = arr_raw + np.einsum("m,mek->ek", g_qm, jac_q_i)
 
-            if basis_i is not None and base_c_i is not None:
-                active_bumps: list[tuple[int, int]] = []
-                lv_vega_list: list[npt.NDArray[np.float64]] = []
-                fwd_vega_list: list[npt.NDArray[np.float64]] = []
-                for e_idx in range(surf.n_exp):
-                    if e_idx > 0 and float(surf.tenors[e_idx - 1]) > tau_max + 1e-8:
-                        continue
-                    for u_idx in range(n_u_strikes):
-                        c_bumped = base_c_i[:, :, e_idx] + h_vega * basis_i[:, :, u_idx]
-                        q_bumped = surf.quotes[e_idx].copy()
-                        q_bumped[u_idx] += h_vega
-                        lv_b = _build_single_asset_lv_table_fast_np(
-                            surf,
-                            float(spots_np[i]),
-                            tau_obs_np,
-                            r_native_obs_np[i],
-                            lv_t_grid,
-                            lv_y_grid,
-                            div_pv_obs_np=div_pv_np[i],
-                            slice_override_idx=e_idx,
-                            slice_override_coeffs=c_bumped,
-                            slice_override_quotes=q_bumped,
-                        )
-                        lv_vega_list.append(lv_b)
-                        if qm_i:
-                            sig_eq_b = _eval_iv_batch_with_slice_override_np(
-                                surf,
-                                tau_obs_np,
-                                float(spots_np[i]),
-                                e_idx,
-                                c_bumped,
-                                q_bumped,
-                            )
-                            q_mult_v = np.exp(-fx_sign_i * rho_q_i * (sig_eq_b - sig_eq_base_i) * sig_fx_q_i * tau_obs_np)
-                            fwd_vega_list.append(fwd_perf_np[i] * q_mult_v)
-                        else:
-                            fwd_vega_list.append(fwd_perf_np[i])
-                        active_bumps.append((e_idx, u_idx))
-
-                if lv_vega_list:
-                    lv_v_arr = np.stack(lv_vega_list, axis=0)
-                    fwd_v_arr = np.stack(fwd_vega_list, axis=0)
-                    nx_v = _step_1d_asset_trajectories_np(
-                        lv_v_arr,
-                        z_corr_base[..., i],
-                        tau_obs_np,
-                        r_native_obs_np[i],
-                        lv_t_grid,
-                        lv_y_min,
-                        lv_y_max,
-                        n_sub,
-                        r_tot_obs_np=r_tot_obs_np[i],
-                    )
-                    perf_v_i = nx_v * fwd_v_arr[:, :, None]
-                    b_v = perf_v_i.shape[0]
-                    pv_v_all = _eval_single_asset_bump_pv_batch_np(
-                        perf_v_i,
-                        i,
-                        perf_base,
-                        state,
-                        loo_cache,
-                        df_pay_b=np.broadcast_to(df_pay_np[None, :], (b_v, m_rem)),
-                        w_fund_b=(
-                            np.broadcast_to(w_fund_base_np[None, :], (b_v, m_rem))
-                            if w_fund_base_np is not None
-                            else None
-                        ),
-                    )
-                    for b_idx, (e_idx, u_idx) in enumerate(active_bumps):
-                        arr_u[e_idx, u_idx] = (pv_v_all[b_idx] - pv0_1d) / h_vega
-
-            dedup_mat = getattr(surf, "dedup_matrix", None)
-            if dedup_mat is not None and dedup_mat.shape == (n_u_strikes, surf.n_raw_strikes):
-                arr_raw = arr_u @ dedup_mat
-            else:
-                arr_raw = arr_u
             vega_arrays[ticker] = arr_raw
 
         for ticker in orig_ids:
@@ -18677,7 +18694,7 @@ def compute_qmc_crn_greeks(
 
     return AutocallGreeksResult(
         product_value=pv0,
-        cash_flows=list(base_res.cashflows),
+        cash_flows=base_cfs,
         delta=delta_dict,
         gamma=gamma_dict,
         multivariate_aggregated_cash_gamma=cash_gamma_agg,
@@ -18696,7 +18713,7 @@ def compute_qmc_crn_greeks(
         fx_cega=fx_cega_dict,
         repo_rho=repo_rho_dict,
         reporting_currency=state.payment_currency,
-        standard_error=float(base_res.standard_error),
+        standard_error=base_se,
         cash_to_settle_today=float(state.cash_to_settle_today),
         greeks_engine_used=f"qmc_crn_{solver.backend_name}",
     )
