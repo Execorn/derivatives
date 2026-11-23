@@ -1317,9 +1317,21 @@ class CpuNumpyDupireQMC:
                 z0,
                 z0.unsqueeze(-1) if compute_pathwise_delta else None,
             )
+        cfg = config or DupireQMCConfig()
+        cpu_cfg = DupireQMCConfig(
+            n_paths=int(cfg.n_paths),
+            n_replicates=int(cfg.n_replicates),
+            n_substeps=int(cfg.n_substeps),
+            mode=cfg.mode,
+            precision=cfg.precision,
+            cv_mode=cfg.cv_mode,
+            lv_grid_nt=min(int(cfg.lv_grid_nt), 16),
+            lv_grid_ny=min(int(cfg.lv_grid_ny), 32),
+            seed=int(cfg.seed),
+        )
         return GpuTorchDupireQMC(device="cpu", use_triton=False).simulate_batch_for_training(
             states,
-            config=config,
+            config=cpu_cfg,
             compute_pathwise_delta=compute_pathwise_delta,
         )
 

@@ -1818,7 +1818,7 @@ def price_eq_autocall_dupire_qmc(
         want_gpu = True
 
     if precision != "fp64_audit" and (
-        (want_gpu and torch.cuda.is_available()) or int(n_paths) >= 16384
+        (want_gpu and torch.cuda.is_available()) or int(n_paths) >= 32768
     ):
         from deepvol.models.autocall.dupire_qmc_gpu import (
             DupireQMCConfig,

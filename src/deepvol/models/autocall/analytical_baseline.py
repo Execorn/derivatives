@@ -2065,8 +2065,13 @@ def _baseline_cpu_via_cpp(
     )
     backend._fn_struct(packed)
     f_w_t, v_w_t, p_t, surv_t, h_t, q_t = torch.unbind(arr_6m, 0)
-    dw_t = dw_all.squeeze(1) if m_rem == 1 else dw_all[:, -1].contiguous()
-    s0, s1, s2, s3, s4, s5, s6, s7 = torch.unbind(sc_buf, 0)
+    dw_t = dw_all.squeeze(1) if m_rem == 1 else dw_all[:, -1]
+    if one_star_strike == 0.0 and part_call_rate == 0.0:
+        s0, s1, s2, s3, s4, s5 = torch.unbind(sc_buf[:6], 0)
+        s6 = s5
+        s7 = s5
+    else:
+        s0, s1, s2, s3, s4, s5, s6, s7 = torch.unbind(sc_buf, 0)
     return AutocallBaselineOutput(
         f_w=f_w_t,
         v_w=v_w_t,
@@ -2150,9 +2155,11 @@ def compute_analytical_autocall_baseline(
             and device.type == "cpu"
             and (
                 use_fast_cpu is True
-                or not _is_ad_active(fp_t, vp_t, cm_t, df_t, ko_t, cb_t, cr_t)
+                or (
+                    not _is_ad_active(fp_t, vp_t, cm_t, df_t, ko_t, cb_t, cr_t)
+                    and not _has_near_tied_forwards(fp_t)
+                )
             )
-            and not _has_near_tied_forwards(fp_t)
         )
         if can_cpu:
             is_preproc = hasattr(preproc_state, "baseline")

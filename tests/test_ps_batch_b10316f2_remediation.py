@@ -18,9 +18,6 @@ from deepvol.calibration.autocall_sobol_generator import (
     generate_synthetic_autocall_batch,
 )
 from deepvol.models.autocall.dupire_qmc_solver import RegularizedVolSurface
-from deepvol.models.autocall.analytical_baseline import (
-    compute_analytical_autocall_baseline,
-)
 from deepvol.models.autocall.dupire_qmc_gpu import DupireQMCConfig
 from deepvol.models.autocall.greeks_engine import (
     _assemble_pv_batch_torch,
@@ -30,7 +27,6 @@ from deepvol.models.autocall.greeks_engine import (
     _resolve_quanto_fx_sign,
     compute_eq_autocall_greeks,
     compute_qmc_crn_greeks,
-    evaluate_differentiable_pv,
 )
 from deepvol.models.autocall.pre_post_processor import (
     assemble_autocall_cashflows_and_pv,
@@ -261,8 +257,6 @@ def test_I4a_ki_digital_ramp_bounds_and_pv_shift() -> None:
 
     fc_t = torch.tensor([f_w], dtype=torch.float32)
     vc_t = torch.tensor([v_w], dtype=torch.float32)
-    surv_t = torch.tensor([1.0], dtype=torch.float32)
-    surv_prev_t = torch.tensor([1.0], dtype=torch.float32)
     is_call_t = torch.tensor([0.0], dtype=torch.float32)
     k_strike_t = torch.tensor([1.0], dtype=torch.float32)
     k_low_t = torch.tensor([0.0], dtype=torch.float32)

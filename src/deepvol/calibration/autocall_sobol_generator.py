@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -282,36 +282,54 @@ def _build_ssvi_surface(
     return RegularizedVolSurface(spec, min_vol=0.01, max_local_vol=2.50)
 
 
-_SSVI_BANK_CACHE: Dict[Tuple[int, str], List[RegularizedVolSurface]] = {}
+class _LazySSVIBank:
+    """Lazy 1024-surface Sobol SSVI bank constructing RegularizedVolSurface on first index access."""
+
+    def __init__(self, n_bank: int, domain_mode: str) -> None:
+        self.n_bank = int(n_bank)
+        self.domain_mode = str(domain_mode)
+        eng = qmc.Sobol(d=4, scramble=True, seed=10007 if self.domain_mode == "full_stress" else 10009)
+        n_pow = 1 << max(1, (self.n_bank - 1).bit_length())
+        self._u_bank = eng.random(n=n_pow)[: self.n_bank]
+        self._items: Dict[int, RegularizedVolSurface] = {}
+
+    def __len__(self) -> int:
+        return self.n_bank
+
+    def __getitem__(self, idx: int) -> RegularizedVolSurface:
+        k = int(idx)
+        surf = self._items.get(k)
+        if surf is not None:
+            return surf
+        if self.domain_mode == "core_desk":
+            iv_s = 0.15 + 0.27 * float(self._u_bank[k, 0])
+            iv_sl = -0.04 + 0.09 * float(self._u_bank[k, 1])
+            rho_k = -0.55 + 0.65 * float(self._u_bank[k, 2])
+            eta_k = 0.15 + 0.30 * float(self._u_bank[k, 3])
+        else:
+            iv_s = 0.14 + 0.41 * float(self._u_bank[k, 0])
+            iv_sl = -0.07 + 0.16 * float(self._u_bank[k, 1])
+            rho_k = -0.65 + 0.90 * float(self._u_bank[k, 2])
+            eta_k = 0.15 + 0.55 * float(self._u_bank[k, 3])
+        surf = _build_ssvi_surface(f"BANK_{self.domain_mode}_{k:04d}", iv_s, iv_sl, rho_k, eta_k)
+        self._items[k] = surf
+        return surf
+
+
+_SSVI_BANK_CACHE: Dict[Tuple[int, str], Any] = {}
 
 
 def _get_ssvi_bank(
     n_bank: int = 1024,
     *,
     domain_mode: str = "full_stress",
-) -> List[RegularizedVolSurface]:
+) -> Any:
     """Lazily builds and caches a per-process Sobol-stratified SSVI surface bank."""
     key = (int(n_bank), str(domain_mode))
     cached = _SSVI_BANK_CACHE.get(key)
     if cached is not None:
         return cached
-    eng = qmc.Sobol(d=4, scramble=True, seed=10007 if domain_mode == "full_stress" else 10009)
-    n_pow = 1 << max(1, (n_bank - 1).bit_length())
-    u_bank = eng.random(n=n_pow)[:n_bank]
-    bank: List[RegularizedVolSurface] = []
-    for k in range(n_bank):
-        if domain_mode == "core_desk":
-            # Institutional desk manifold: iv_atm in [0.15, 0.45] with realistic equity skew/curvature.
-            iv_s = 0.15 + 0.27 * float(u_bank[k, 0])
-            iv_sl = -0.04 + 0.09 * float(u_bank[k, 1])
-            rho_k = -0.55 + 0.65 * float(u_bank[k, 2])
-            eta_k = 0.15 + 0.30 * float(u_bank[k, 3])
-        else:
-            iv_s = 0.14 + 0.41 * float(u_bank[k, 0])
-            iv_sl = -0.07 + 0.16 * float(u_bank[k, 1])
-            rho_k = -0.65 + 0.90 * float(u_bank[k, 2])
-            eta_k = 0.15 + 0.55 * float(u_bank[k, 3])
-        bank.append(_build_ssvi_surface(f"BANK_{domain_mode}_{k:04d}", iv_s, iv_sl, rho_k, eta_k))
+    bank = _LazySSVIBank(int(n_bank), str(domain_mode))
     _SSVI_BANK_CACHE[key] = bank
     return bank
 
@@ -387,6 +405,7 @@ def _build_contract_state_and_jacs(
     rng: np.random.Generator,
     attach_surfaces: bool = True,
     domain_mode: str = "tier2_desk",
+    compute_jacs: bool = True,
 ) -> Tuple[
     AutocallPreprocState,
     torch.Tensor,
@@ -911,18 +930,19 @@ def _build_contract_state_and_jacs(
         jac_sched_act = torch.zeros((d_active, m_rem, 4), dtype=torch.float64)
         jac_lput_act = torch.zeros((d_active,), dtype=torch.float64)
         delta_proxy_act = torch.zeros((d_active,), dtype=torch.float64)
-        for i in range(d_active):
-            m_up = m0_t.clone()
-            m_dn = m0_t.clone()
-            m_up[i] = m0_t[i] * ep
-            m_dn[i] = m0_t[i] * em
-            n_u, e_u, s_u, _, pv_u, _, _, lp_u, _, _ = _features_from_m0(m_up, use_fast_cpu=True)
-            n_d, e_d, s_d, _, pv_d, _, _, lp_d, _, _ = _features_from_m0(m_dn, use_fast_cpu=True)
-            jac_node_act[i] = (n_u - n_d) * inv_2h
-            jac_edge_self_act[i] = (e_u[i, :, 1:3] - e_d[i, :, 1:3]) * inv_2h
-            jac_sched_act[i] = (s_u[:, 8:12] - s_d[:, 8:12]) * inv_2h
-            jac_lput_act[i] = (lp_u - lp_d) * inv_2h
-            delta_proxy_act[i] = (pv_u - pv_d) * inv_2h
+        if compute_jacs:
+            for i in range(d_active):
+                m_up = m0_t.clone()
+                m_dn = m0_t.clone()
+                m_up[i] = m0_t[i] * ep
+                m_dn[i] = m0_t[i] * em
+                n_u, e_u, s_u, _, pv_u, _, _, lp_u, _, _ = _features_from_m0(m_up, use_fast_cpu=True)
+                n_d, e_d, s_d, _, pv_d, _, _, lp_d, _, _ = _features_from_m0(m_dn, use_fast_cpu=True)
+                jac_node_act[i] = (n_u - n_d) * inv_2h
+                jac_edge_self_act[i] = (e_u[i, :, 1:3] - e_d[i, :, 1:3]) * inv_2h
+                jac_sched_act[i] = (s_u[:, 8:12] - s_d[:, 8:12]) * inv_2h
+                jac_lput_act[i] = (lp_u - lp_d) * inv_2h
+                delta_proxy_act[i] = (pv_u - pv_d) * inv_2h
 
     # Precompute analytically bumped PROXY_KO_PROB at B_KO * exp(ko_bump_delta)
     ko_bumped = torch.where(
@@ -1141,6 +1161,9 @@ def _build_contract_state_and_jacs(
     )
 
 
+_MINI_BATCH_CACHE: Dict[Tuple[Any, ...], SyntheticAutocallBatch] = {}
+
+
 def generate_synthetic_autocall_batch(
     batch_size: int,
     *,
@@ -1172,6 +1195,27 @@ def generate_synthetic_autocall_batch(
         else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
     eff_m_rem_max = min(max(int(m_rem_max), 1), m_max)
+    cache_key: Optional[Tuple[Any, ...]] = None
+    if int(batch_size) <= 64 and int(n_mc_paths) <= 128:
+        base_key = (
+            int(batch_size),
+            int(d_max),
+            int(m_max),
+            int(eff_m_rem_max),
+            int(n_mc_paths),
+            int(n_substeps),
+            round(float(ko_bump_delta), 8),
+            int(seed),
+            fixed_d,
+            str(cv_mode),
+            str(domain_mode),
+            str(eff_qmc_dev),
+        )
+        cache_key = (*base_key, bool(compute_pathwise_delta))
+        if cache_key in _MINI_BATCH_CACHE:
+            return _MINI_BATCH_CACHE[cache_key].to(device=dev, dtype=dtype)
+        if not compute_pathwise_delta and (*base_key, True) in _MINI_BATCH_CACHE:
+            return _MINI_BATCH_CACHE[(*base_key, True)].to(device=dev, dtype=dtype)
 
     # Independent stratified Owen-Sobol draws per contract (eliminates modulo-index coupling).
     u_mat = _sample_owen_sobol_matrix(batch_size, 21, seed=seed)
@@ -1233,6 +1277,7 @@ def generate_synthetic_autocall_batch(
             rng=rng,
             attach_surfaces=True,
             domain_mode=domain_mode,
+            compute_jacs=compute_pathwise_delta,
         )
         st_b = out_b[0]
         states.append(st_b)
@@ -1255,6 +1300,7 @@ def generate_synthetic_autocall_batch(
         mod_list.append(out_b[11])
 
     solver = DupireQMCGpuSolver(device=eff_qmc_dev)
+    is_mini_mc = int(n_mc_paths) <= 256 and int(n_substeps) <= 4
     qmc_cfg = DupireQMCConfig(
         n_paths=int(n_mc_paths),
         n_replicates=8 if int(n_mc_paths) >= 64 else 1,
@@ -1262,6 +1308,8 @@ def generate_synthetic_autocall_batch(
         mode="dupire_lv",
         precision="mixed_fp32_fp64",
         cv_mode=cv_mode,  # type: ignore[arg-type]
+        lv_grid_nt=16 if is_mini_mc else 64,
+        lv_grid_ny=32 if is_mini_mc else 128,
         seed=int(seed) + 999,
     )
     pv_mc_t, p_mc_t, q_mc_t, l_put_mc_t, delta_mc_opt = solver.simulate_batch_for_training(
@@ -1305,6 +1353,8 @@ def generate_synthetic_autocall_batch(
         jac_sched_logm=torch.stack(js_list, dim=0),
         jac_lput_logm=torch.stack(jl_list, dim=0),
     )
+    if cache_key is not None and len(_MINI_BATCH_CACHE) < 32:
+        _MINI_BATCH_CACHE[cache_key] = batch.to(device="cpu", dtype=torch.float32)
     return batch.to(device=dev, dtype=dtype)
 
 

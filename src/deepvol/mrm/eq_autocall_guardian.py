@@ -1250,7 +1250,7 @@ class EQAutocallModelGuardian:
                     curv_eta = float(node_np[i, int(AutocallNodeCol.SSVI_CURV_ETA)])
                     pc1 = abs(float(node_np[i, int(AutocallNodeCol.SMILE_RESIDUAL_PC1)]))
                     pc2 = abs(float(node_np[i, int(AutocallNodeCol.SMILE_RESIDUAL_PC2)]))
-                    if skew_rho > 0.75 or curv_eta > 3.5 or pc1 > 0.25 or pc2 > 0.25:
+                    if skew_rho > 0.52 or curv_eta > 3.5 or pc1 > 0.25 or pc2 > 0.25:
                         domain_box_ood = True
                         break
                     ticker_i = preproc_state.sorted_identifiers[i]
@@ -1556,7 +1556,13 @@ class EQAutocallModelGuardian:
                 if m_rem > 0
                 else 0.0
             )
-            tau_res = min(0.0050 + 0.0350 * h_disp * math.sqrt(max(v_bar, 1e-4)), 0.0200)
+            tau_res = min(
+                0.0050
+                + 0.0350 * h_disp * math.sqrt(max(v_bar, 1e-4))
+                + 0.0450 * max((m_rem - 10) / 38.0, 0.0)
+                + 0.0150 * max(int(preproc_state.d_assets) - 2, 0),
+                0.0750,
+            )
         else:
             tau_res = float(self.residual_threshold)
         if abs(pv_surrogate - pv_proxy) > tau_res:

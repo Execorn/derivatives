@@ -709,6 +709,10 @@ def calibrate_guardian_stats(
                 else:
                     q_eff_c = q_err_conformal
                 mondrian_q_err_table[ck] = float(q_eff_c)
+            mondrian_q_err_table[f"ki{ki_b}_m{m_b}_d0"] = min(
+                mondrian_q_err_table[f"ki{ki_b}_m{m_b}_d0"],
+                mondrian_q_err_table[f"ki{ki_b}_m{m_b}_d1"],
+            )
 
     payload: Dict[str, Any] = {
         "schema_version": FEATURE_SCHEMA_VERSION,
@@ -995,6 +999,7 @@ def train_eq_autocall_surrogate(
         qmc_device=dev,
         dtype=torch.float32,
         cv_mode="none",
+        compute_pathwise_delta=False,
         domain_mode=domain_mode,
     )
     cal_data = generate_synthetic_autocall_batch(
@@ -1009,6 +1014,7 @@ def train_eq_autocall_surrogate(
         qmc_device=dev,
         dtype=torch.float32,
         cv_mode="bs1d_exact" if n_mc_paths_test >= 4096 else "none",
+        compute_pathwise_delta=False,
         domain_mode=domain_mode,
     )
     test_data = generate_synthetic_autocall_batch(
