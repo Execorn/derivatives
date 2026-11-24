@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import numpy as np
-import pytest
 import torch
 from pathlib import Path
 
@@ -12,14 +11,14 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from deepvol.arbitrage.surface_completion import (
+from deepvol.arbitrage.surface_completion import (  # noqa: E402
     check_calendar_spread,
     check_butterfly,
     fit_svi_slice,
     enforce_calendar_spread_monotonicity,
     complete_surface
 )
-from deepvol.market.spx_data import T_GRID, K_GRID
+from deepvol.market.spx_data import T_GRID, K_GRID  # noqa: E402
 
 
 def test_enforce_calendar_spread_monotonicity():
@@ -44,12 +43,12 @@ def test_check_butterfly_arbitrage():
     # Slice with a butterfly violation: middle strike has huge IV, outer strikes have tiny IV
     iv_violation = np.array([[0.05, 0.95, 0.05]])
     mask = check_butterfly(iv_violation, K_grid, T_grid, S=1.0)
-    assert np.all(mask == True), "Butterfly spread violation check failed to detect arbitrage."
+    assert np.all(mask), "Butterfly spread violation check failed to detect arbitrage."
     
     # Slice with no violation (flat IV)
     iv_ok = np.array([[0.20, 0.20, 0.20]])
     mask_ok = check_butterfly(iv_ok, K_grid, T_grid, S=1.0)
-    assert np.all(mask_ok == False), "Butterfly spread violation check detected false arbitrage on flat IV surface."
+    assert np.all(~mask_ok), "Butterfly spread violation check detected false arbitrage on flat IV surface."
 
 
 def test_fit_svi_slice_bounds():

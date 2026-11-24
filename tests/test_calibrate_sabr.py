@@ -5,7 +5,6 @@ test_calibrate_sabr.py — Tests formulas, SSVI arbitrage-free conditions, and s
 import os
 import sys
 import numpy as np
-import pytest
 
 # Ensure src path is in sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))

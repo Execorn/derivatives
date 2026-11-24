@@ -3,7 +3,6 @@ import sys
 import subprocess
 import json
 import numpy as np
-import pytest
 import torch
 
 # Ensure project root is in sys.path
@@ -13,7 +12,7 @@ if project_root not in sys.path:
 if os.path.join(project_root, "src") not in sys.path:
     sys.path.insert(0, os.path.join(project_root, "src"))
 
-from deepvol.models.lifted_heston_gpu import price_batch_gpu
+from deepvol.models.lifted_heston_gpu import price_batch_gpu  # noqa: E402
 
 def test_script_execution_and_report_generation():
     # Path to report
@@ -24,7 +23,8 @@ def test_script_execution_and_report_generation():
         os.remove(report_path)
         
     script_path = os.path.join(project_root, "src", "deepvol", "models", "lifted_heston_study.py")
-    python_exe = os.path.join(project_root, ".venv", "bin", "python")
+    venv_python = os.path.join(project_root, ".venv", "bin", "python")
+    python_exe = venv_python if os.path.exists(venv_python) else sys.executable
     
     # Run the script
     result = subprocess.run([python_exe, script_path], capture_output=True, text=True)

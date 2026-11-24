@@ -11,19 +11,9 @@ import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
 
-from deepvol.models.bachelier import (
-    bachelier_price,
-    black_price,
-    shifted_black_price,
-    bachelier_implied_vol,
-    black_implied_vol
-)
 from deepvol.models.sabr_rates import (
     displaced_sabr_vol,
-    calibrate_sabr_node,
-    SwaptionVolCube,
-    bilinear_interpolate,
-    solve_alpha_from_atm
+    calibrate_sabr_node
 )
 from deepvol.models.schwartz_smith import (
     schwartz_smith_price_black76,
@@ -32,10 +22,7 @@ from deepvol.models.schwartz_smith import (
     schwartz_smith_price_fourier_pt,
     schwartz_smith_price_cos,
     schwartz_smith_price_cos_pt,
-    schwartz_smith_greeks_pt,
-    calibrate_schwartz_smith,
     run_kalman_filter,
-    conditional_variance,
     futures_price
 )
 
@@ -226,7 +213,7 @@ def test_sabr_rates_calibration_adversarial_inputs():
         assert alpha > 0.0
         assert -0.999 <= rho <= 0.999
         assert nu >= 0.0
-    except Exception as e:
+    except Exception:
         # If it raises an error, that is also a valid graceful failure, but it shouldn't hang.
         pass
 

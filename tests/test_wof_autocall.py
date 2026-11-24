@@ -163,7 +163,7 @@ def test_extreme_negative_correlation():
     coupon = torch.tensor([0.02], dtype=torch.float64, device=DEVICE)
     r_t = torch.tensor([r], dtype=torch.float64, device=DEVICE)
     npv, cp, el = price_wof_autocall_mc(S1, S2, OBS_INDICES, B, coupon, r_t, T, T / N_STEPS)
-    assert not npv.isnan().any(), f"NaN NPV at rho=-0.99"
+    assert not npv.isnan().any(), "NaN NPV at rho=-0.99"
     assert npv.item() > 0.5, f"Unreasonable NPV at rho=-0.99: {npv.item():.4f}"
 
 

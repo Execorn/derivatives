@@ -10,9 +10,9 @@ import tensorrt as trt
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
-from deepvol.deploy.export_onnx import FNODeploymentWrapper
-from deepvol.surrogates.normalizers import IVSurfaceNormalizer
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d  # noqa: E402
+from deepvol.deploy.export_onnx import FNODeploymentWrapper  # noqa: E402
+from deepvol.surrogates.normalizers import IVSurfaceNormalizer  # noqa: E402
 
 @pytest.fixture(scope="module")
 def paths():
@@ -52,6 +52,10 @@ def original_model_f32(paths, device):
 
 @pytest.fixture(scope="module")
 def trt_engine(paths):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU required for TensorRT inference")
+    if not os.path.exists(paths["engine"]):
+        pytest.skip(f"TensorRT engine not found: {paths['engine']}")
     logger = trt.Logger(trt.Logger.WARNING)
     runtime = trt.Runtime(logger)
     with open(paths["engine"], "rb") as f:
@@ -92,6 +96,8 @@ def test_onnx_runtime_inference(paths, original_model_f32):
     """
     Validate ONNX model inference using ONNX Runtime vs the original PyTorch model.
     """
+    if not os.path.exists(paths["onnx"]):
+        pytest.skip(f"ONNX model not found: {paths['onnx']}")
     ort_session = ort.InferenceSession(paths["onnx"], providers=["CPUExecutionProvider"])
     
     np.random.seed(42)
@@ -116,6 +122,8 @@ def test_onnx_runtime_inference(paths, original_model_f32):
     diff = np.max(np.abs(py_output - ort_output))
     assert diff < 1e-4, f"ONNX outputs mismatch: {diff:.2e}"
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required for TensorRT inference")
 def test_tensorrt_inference_rmse_and_zero_copy(trt_engine, original_model_f64, normalizer, device):
     """
     Verify TensorRT engine outputs vs PyTorch double-precision FNO outputs

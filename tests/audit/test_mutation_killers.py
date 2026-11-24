@@ -16,14 +16,12 @@ from deepvol.models.fx_cross_analytic import (
     bucketed_rho,
     lee_slope_bound,
     greeks_from_outputs,
-    AnalyticTriangulated,
 )
 
 
 @pytest.mark.audit
 def test_kill_mut_jet_31_scale_dd() -> None:
     """Kills MUT_JET_31: verifies tj.scale correctly scales second derivative dd by scalar c != 1."""
-    x = torch.tensor([2.0], dtype=torch.float64)
     jet = tj.Jet(
         v=torch.tensor([3.0], dtype=torch.float64),
         d=torch.tensor([4.0], dtype=torch.float64),
@@ -235,8 +233,6 @@ def test_kill_mut_ana_43_sticky_moneyness_roll_term() -> None:
     """Kills MUT_ANA_43: verifies sticky moneyness theta includes non-zero roll term when r_C != r_A."""
     # Under STICKY_MONEYNESS, roll_term = B_s * s_k * (r_C - r_A)
     # We construct inputs where s_k != 0 and r_C != r_A
-    F = torch.tensor([1.25], dtype=torch.float64)
-    K = torch.tensor([1.30], dtype=torch.float64)  # OTM call -> s_k != 0
     from deepvol.models.fx_cross_analytic import EngineOutputs, Col
     X = torch.zeros(1, 34, dtype=torch.float64)
     X[0, Col.F] = 1.25

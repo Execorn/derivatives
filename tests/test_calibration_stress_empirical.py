@@ -8,12 +8,12 @@ import torch
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from deepvol.app.components.models import (
+from deepvol.app.components.models import (  # noqa: E402
     reconstruct_sabr_surface,
     reconstruct_heston_surface,
     load_fno_model
 )
-from deepvol.calibration.interface import calibrate, CalibrationResult
+from deepvol.calibration.interface import calibrate, CalibrationResult  # noqa: E402
 
 class TestCalibrationStressEmpirical:
     def test_sabr_surface_extreme_parameters(self):

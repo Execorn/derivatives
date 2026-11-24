@@ -6,7 +6,6 @@ and calibration states programmatically without requiring playwright.
 
 import os
 import sys
-import numpy as np
 import pytest
 from streamlit.testing.v1 import AppTest
 

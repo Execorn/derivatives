@@ -20,7 +20,7 @@ Audits:
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Tuple
+from typing import List, Tuple
 import numpy as np
 import pytest
 import torch
@@ -29,21 +29,9 @@ from deepvol.models.fx_cross_analytic import (
     AnalyticTriangulated,
     Col,
     N_COLS,
-    smooth_T,
 )
 from deepvol.models.fx_cross_safeguards import (
-    AuditResult,
     cross_slice_audit,
-)
-from deepvol.mrm.fx_cross_guardian import (
-    FallbackReasonEnum,
-    FXCrossGuardian,
-    PricingEngineEnum,
-)
-from artifacts.audit.scripts.oracles import (
-    black76_price,
-    check_arbitrage_grid,
-    svi_total_variance,
 )
 
 

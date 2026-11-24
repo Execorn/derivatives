@@ -7,17 +7,24 @@ import torch
 import numpy as np
 import scipy.special
 
+pytestmark = pytest.mark.gpu
+
 # Add deepvol C++ extension path to import path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 cpp_path = os.path.join(project_root, "src/deepvol/cpp")
 if cpp_path not in sys.path:
     sys.path.insert(0, cpp_path)
 
-# Verify import
+# Optional CUDA extension import (skipped cleanly on CPU-only / uncompiled runs)
 try:
     import deepvol_cuda
-except ImportError as e:
-    raise ImportError(f"Could not import deepvol_cuda. Is it compiled? Error: {e}")
+except ImportError:
+    deepvol_cuda = None
+
+_SKIP_NO_GREY_CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available() or deepvol_cuda is None,
+    reason="CUDA and compiled deepvol_cuda extension required",
+)
 
 from deepvol.calibration.grey_calibrator import GreyRoughBergomiCalibrator
 from deepvol.calibration.active_learning import (
@@ -52,9 +59,7 @@ def mittag_leffler_py(z, beta, max_iter=500, tol=1e-9):
         return (1.0 / beta) * math.exp(val_check) - sum_terms
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA must be available for testing"
-)
+@_SKIP_NO_GREY_CUDA
 def test_mittag_leffler_validation():
     """Compare the C++/CUDA mittag_leffler_cuda against a reference Python/SciPy Mittag-Leffler implementation"""
     beta = 0.85
@@ -75,9 +80,7 @@ def test_mittag_leffler_validation():
         )
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA must be available for testing"
-)
+@_SKIP_NO_GREY_CUDA
 def test_rbergomi_recovery():
     """Verify that when beta = 1, the simulated variance paths match standard rBergomi paths within 1e-5 tolerance"""
     params = torch.tensor(
@@ -113,9 +116,7 @@ def test_rbergomi_recovery():
     assert max_diff < 1e-5, f"rBergomi recovery failed: max diff = {max_diff}"
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA must be available for testing"
-)
+@_SKIP_NO_GREY_CUDA
 def test_hurst_parameter_check():
     """Verify the scaling properties of simulated fBm paths, asserting that the Hurst exponent matches the target H"""
     H_target = 0.25

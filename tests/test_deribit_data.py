@@ -12,26 +12,26 @@ Tests:
   8. test_check_and_clip_params_warning— warns when v0 > FNO bound
 """
 import asyncio
-from datetime import date
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import date, timedelta
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
 
 # ── Path setup (mirrors conftest.py) ────────────────────────────────────────
-import os, sys
+import os
+import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from deepvol.market.deribit_data import (
+from deepvol.market.deribit_data import (  # noqa: E402
     parse_instrument_name,
     build_iv_surface,
     estimate_hurst_exponent,
     MATURITIES,
     STRIKES,
     _check_and_clip_params,
-    _add_log_moneyness,
     fetch_option_snapshot,
 )
 
@@ -72,7 +72,11 @@ def _make_fake_api_response(n: int = 150) -> list[dict]:
     """Create synthetic Deribit-style API response with n options."""
     rng = np.random.default_rng(42)
     records = []
-    expiries = ["28JUN26", "26SEP26", "26DEC26", "26MAR27"]
+    today = date.today()
+    expiries = [
+        (today + timedelta(days=d)).strftime("%d%b%y").upper()
+        for d in (60, 150, 240, 330)
+    ]
     strikes  = [50000, 55000, 60000, 65000, 70000, 75000, 80000]
 
     for i in range(n):

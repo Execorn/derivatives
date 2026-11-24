@@ -5,7 +5,6 @@ test_rates.py — Unit and stress tests for Interest Rate Swaptions LMM-SABR cal
 import os
 import sys
 import numpy as np
-import pytest
 
 # Inject src path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
@@ -18,7 +17,6 @@ from deepvol.models.bachelier import (
     black_implied_vol
 )
 from deepvol.market.rates_data import (
-    load_sofr_swap_rates,
     get_synthetic_forward_rates,
     load_swaption_vol_cube
 )

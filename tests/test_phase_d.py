@@ -15,7 +15,6 @@ Validates:
 """
 
 import os
-import json
 import pytest
 import numpy as np
 import torch
@@ -26,7 +25,6 @@ from deepvol.calibration.autocall_dataset import (
 )
 from deepvol.calibration.generate_pde_labels import compute_pde_label
 from deepvol.surrogates.correction_ensemble import CorrectionEnsemble
-from deepvol.surrogates.correction_mlp import CorrectionMLP
 from deepvol.training.train_correction import (
     CorrectionInputNormalizer,
     CorrectionOutputNormalizer,

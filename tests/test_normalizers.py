@@ -1,5 +1,4 @@
 import os
-import pytest
 import numpy as np
 import torch
 import deepvol.calibration.calibrate_bfgs as calibrate

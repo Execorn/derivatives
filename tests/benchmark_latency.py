@@ -3,7 +3,6 @@ import asyncio
 import json
 import random
 import time
-import sys
 import numpy as np
 import websockets
 

@@ -4,10 +4,8 @@ This validates the YAML syntax, schemas, and resource reservations.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import yaml
-import pytest
 
 DEPLOY_DIR = Path(__file__).parents[1] / "deploy"
 

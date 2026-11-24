@@ -29,58 +29,33 @@ Adversarial Defect Reproductions:
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import copy
-import gc
-import json
-import math
 import os
 from pathlib import Path
-import queue
-import sys
 import threading
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 
 import httpx
 import numpy as np
 import pytest
 import torch
-from torch import Tensor
 
 from deepvol.api.fx_cross_runtime import (
-    BATCH_BUCKETS,
     QUOTE_BUCKET_GPU,
     CPUQuotePath,
     FXCrossGPUExecutor,
     FXCrossRuntime,
-    GraphBucket,
-)
-from deepvol.api.schemas_fx_cross import (
-    ContractTerms,
-    ExecutionOptions,
-    FXLegData,
-    MarketData,
-    ParityEnum,
-    PricingEngineEnum,
-    SmileQuotes,
-    TriangulatedFXOptionColumnarBatchRequest,
-    TriangulatedFXOptionRequest,
 )
 from deepvol.api.server import (
-    _FX_CROSS_RW_LOCK,
-    _FX_CROSS_STATE,
     _get_fx_cross_state,
     app,
     reload_fx_cross_weights,
 )
-from deepvol.models.fx_cross_analytic import Col, EngineOutputs, N_COLS
+from deepvol.models.fx_cross_analytic import Col, N_COLS
 from deepvol.models.fx_cross_surrogate import (
     CrossVolSurrogateEngine,
     ResidualCrossVolNet,
 )
 from deepvol.mrm.fx_cross_guardian import (
-    FallbackReasonEnum,
     FXCrossGuardian,
 )
 
@@ -278,7 +253,7 @@ def test_padding_strict_xfail_b1_compile_exists() -> None:
 
     spec = importlib.util.spec_from_file_location("test_api_fx_cross_mod", test_file)
     assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
+    importlib.util.module_from_spec(spec)
     # Read source text to verify @pytest.mark.xfail(strict=True) on test_gpu_forward_single_b1_regression
     src = test_file.read_text(encoding="utf-8")
     assert "def test_gpu_forward_single_b1_regression" in src, "test_gpu_forward_single_b1_regression must exist"
@@ -770,7 +745,7 @@ async def test_F008_queue_depth_busy_gpu_blindspot() -> None:
 
     try:
         # 1. Dispatch slow batch task to occupy GPU worker thread
-        batch_fut = executor.submit(_create_sample_row(), single=False)
+        _batch_fut = executor.submit(_create_sample_row(), single=False)
         assert gpu_working.wait(timeout=3.0), "GPU worker thread did not start execution"
 
         # At this point, the GPU thread is busy, and self._queue is empty (qsize == 0)
@@ -786,7 +761,7 @@ async def test_F008_queue_depth_busy_gpu_blindspot() -> None:
 
         runtime.cpu_quote_path.price_single = hook_cpu_single
 
-        quote_fut = executor.submit(_create_sample_row(), single=True)
+        _quote_fut = executor.submit(_create_sample_row(), single=True)
         # Give CPU pool brief moment to pick up task if routed to CPU
         await asyncio.sleep(0.1)
 

@@ -11,7 +11,6 @@ Validates:
   - Float32 vs float64 accuracy equivalence
 """
 
-import math
 import pytest
 import torch
 
@@ -209,7 +208,6 @@ def test_milstein_vs_euler_bias():
     )
     dt_fine = 1.0 / (4 * 32)
     npv_fine, _, _ = price_autocall_mc(S_fine, oi, B, c, r_t, 1.0, dt_fine)
-    ref = float(npv_fine.item())
     del S_fine
     torch.cuda.empty_cache()
 

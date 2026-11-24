@@ -6,13 +6,10 @@ import os
 import sys
 import numpy as np
 import torch
-import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from deepvol.models.heston import (
-    heston_cf,
     heston_iv_surface,
-    batch_heston_iv_surface,
     calibrate_heston,
 )
 

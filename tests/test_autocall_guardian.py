@@ -11,11 +11,9 @@ Validates:
 import os
 import pytest
 import numpy as np
-import torch
 
 from deepvol.mrm.autocall_guardian import AutocallModelGuardian
 from deepvol.training.train_correction import (
-    CorrectionInputNormalizer,
     CorrectionOutputNormalizer,
 )
 

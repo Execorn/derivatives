@@ -2,13 +2,11 @@
 tests/test_signature_vol.py - Unit and integration tests for the Signature Volatility Model.
 """
 
-import pytest
 import numpy as np
 import torch
 from deepvol.models.signature_vol import (
     compute_path_signature,
     SignatureVolatilityModel,
-    simulate_signature_vol_paths,
 )
 
 

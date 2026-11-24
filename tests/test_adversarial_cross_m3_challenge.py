@@ -402,8 +402,12 @@ def test_challenge_task34_non_blocking_with_1s_delayed_copula() -> None:
                 dt_us = (time.perf_counter_ns() - t0) / 5000.0
                 latencies_us[idx] = dt_us
                 assert stale is True
-                # Yield event loop briefly
-                await asyncio.sleep(0.0005)
+                # Yield event loop while keeping total probe duration well within the 1.0s copula delay
+                if idx % 10 == 0:
+                    await asyncio.sleep(0.0005)
+                else:
+                    await asyncio.sleep(0)
+            assert not refresh_task.done()
         finally:
             if gc_was_enabled:
                 gc.enable()

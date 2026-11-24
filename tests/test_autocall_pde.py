@@ -16,7 +16,10 @@ from deepvol.models.autocall_pde import (
 )
 
 FLAT_SIGMA = 0.20
-flat_sigma_func = lambda t, S: np.full_like(S, FLAT_SIGMA)
+
+
+def flat_sigma_func(t, S):
+    return np.full_like(S, FLAT_SIGMA)
 
 S0 = 100.0
 r = 0.05
@@ -42,7 +45,7 @@ def test_european_call_no_obs_dates():
 @pytest.mark.slow
 def test_pde_vs_mc_autocall():
     """20 random param sets: |PDE price - MC(100k paths)| < 5 bps."""
-    from deepvol.models.autocall import price_autocall_mc, make_obs_indices
+    from deepvol.models.autocall import price_autocall_mc
     from deepvol.hedging.d_xva import simulate_heston_paths
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -51,7 +54,10 @@ def test_pde_vs_mc_autocall():
 
     for _ in range(5):  # 5 fast parameter sets for standard pytest runs
         sigma_atm = float(rng.uniform(0.15, 0.30))
-        sigma_f = lambda t, S, sig=sigma_atm: np.full_like(S, sig)
+
+        def sigma_f(t, S, sig=sigma_atm):
+            return np.full_like(S, sig)
+
         r_test = float(rng.uniform(0.02, 0.05))
         B_test = float(rng.uniform(0.95, 1.05))
         coupon_test = float(rng.uniform(0.02, 0.05))
@@ -90,7 +96,6 @@ def test_gamma_near_barrier():
     barrier_spot = B * S0
     idx_barrier = np.searchsorted(S_grid, barrier_spot)
 
-    window = slice(max(0, idx_barrier - 25), min(len(gamma_grid), idx_barrier + 25))
     peak_idx = int(np.argmax(gamma_grid))
     assert abs(peak_idx - idx_barrier) <= 25, f"Gamma peak at {S_grid[peak_idx]:.2f}, barrier at {barrier_spot:.2f}"
 

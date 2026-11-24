@@ -20,9 +20,8 @@ import torch
 project_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(project_root / "src"))
 
-from deepvol.analysis.cross_asset_roughness import (
+from deepvol.analysis.cross_asset_roughness import (  # noqa: E402
     ParameterTrajectoryGenerator,
-    CrossAssetDataPipeline,
     run_cross_asset_study,
     run_pettitt_test,
     compute_hurst_statistics,

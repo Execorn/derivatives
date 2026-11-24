@@ -5,7 +5,6 @@ All tests use mocked WebSocket connections — no real network calls.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import math
 import sys
@@ -13,8 +12,6 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import numpy as np
-import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))

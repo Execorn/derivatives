@@ -3,7 +3,6 @@ import sys
 import time
 from pathlib import Path
 import numpy as np
-import pytest
 import torch
 
 # Ensure project root is in sys.path
@@ -13,7 +12,7 @@ if project_root not in sys.path:
 if os.path.join(project_root, "src") not in sys.path:
     sys.path.insert(0, os.path.join(project_root, "src"))
 
-from deepvol.benchmarks.hedging_backtest import (
+from deepvol.benchmarks.hedging_backtest import (  # noqa: E402
     bs_call_price,
     bs_delta,
     bs_vega,
@@ -22,8 +21,8 @@ from deepvol.benchmarks.hedging_backtest import (
     T_GRID,
     K_GRID
 )
-from deepvol.calibration.calibrate_bfgs import _load_normalizers, _make_spatial_input, _fno_predict_real_iv
-from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
+from deepvol.calibration.calibrate_bfgs import _load_normalizers, _make_spatial_input, _fno_predict_real_iv  # noqa: E402
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d  # noqa: E402
 
 # Global test results store for report generation
 RESULTS_STORE = {}

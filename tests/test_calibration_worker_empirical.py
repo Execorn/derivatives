@@ -1,5 +1,10 @@
+import json
+import os
 import sys
 from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
 
 # Mock confluent_kafka and redis modules before importing worker
 class MockKafkaException(Exception):
@@ -20,19 +25,12 @@ mock_kafka.KafkaException = MockKafkaException
 sys.modules['redis'] = MagicMock()
 sys.modules['confluent_kafka'] = mock_kafka
 
-import os
-import json
-import time
-import pytest
-import numpy as np
-import torch
-
 # Ensure deepvol package is importable
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from deepvol.calibration.worker import CalibrationWorker
-from deepvol.calibration.interface import CalibrationResult
+from deepvol.calibration.worker import CalibrationWorker  # noqa: E402
+from deepvol.calibration.interface import CalibrationResult  # noqa: E402
 
 class TestCalibrationWorkerEmpirical:
     @pytest.fixture

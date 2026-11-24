@@ -6,7 +6,6 @@ the Interest Rate Swaptions LMM-SABR calibration engine.
 import os
 import sys
 import numpy as np
-import pytest
 from unittest.mock import patch
 
 # Inject src path
@@ -14,7 +13,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from deepvol.models.bachelier import (
     bachelier_price,
-    black_price,
     shifted_black_price,
     bachelier_implied_vol,
     black_implied_vol
@@ -23,8 +21,7 @@ from deepvol.models.sabr_rates import (
     displaced_sabr_vol,
     calibrate_sabr_node,
     SwaptionVolCube,
-    bilinear_interpolate,
-    solve_alpha_from_atm
+    bilinear_interpolate
 )
 from deepvol.market.rates_data import (
     get_synthetic_forward_rates,

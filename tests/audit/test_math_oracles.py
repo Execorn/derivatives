@@ -7,7 +7,6 @@ Marked with @pytest.mark.audit.
 from __future__ import annotations
 
 import math
-from typing import Dict, List
 import numpy as np
 import pytest
 import torch
@@ -28,7 +27,6 @@ from artifacts.audit.scripts.oracles import (
     smile_inclusive_greeks,
     adaptive_stencil_gamma,
     gaussian_copula_cross_pricer_lognormal,
-    svi_total_variance,
 )
 
 
@@ -214,8 +212,8 @@ def test_beta_split_lee_bound_p5() -> None:
     rho = torch.tensor([0.3, -0.5, 0.8], dtype=torch.float64)
 
     L_bar = lee_slope_bound(L1, L2, beta1, beta2, rho)
-    for l in L_bar:
-        assert l.item() <= 1.9, f"Lee slope bound exceeded: {l.item()}"
+    for slope_val in L_bar:
+        assert slope_val.item() <= 1.9, f"Lee slope bound exceeded: {slope_val.item()}"
 
 
 @pytest.mark.audit

@@ -5,7 +5,6 @@ test_autocall_mlp.py — Unit and Numerical Tests for Autocall MLP Surrogate and
 import os
 import sys
 import tempfile
-import pytest
 import numpy as np
 import torch
 import torch.nn as nn

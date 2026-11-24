@@ -1,6 +1,4 @@
 import torch
-import pytest
-import torchsde
 from deepvol.models.neural_sde import NeuralSDE, NeuralSDEPricer, compute_calibration_loss
 
 def test_neural_sde_vol_positivity():

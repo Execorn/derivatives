@@ -4,13 +4,9 @@ import torch
 import time
 from deepvol.greeks.portfolio_greeks import (
     bs_greeks,
-    fno_parameter_jacobian,
     fno_surface_greeks,
     portfolio_greeks,
-    pnl_attribution,
-    portfolio_price_tensor,
-    interpolate_bilinear,
-    _bilinear_interp
+    portfolio_price_tensor
 )
 from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
 
@@ -102,8 +98,8 @@ def test_adversarial_fno_greeks_boundaries(fno_v2_model):
     for ni in nan_infs:
         print(f"Scenario: {ni[0]} | Surface '{ni[1]}' has {ni[2]} non-finite values")
         
-    assert len(failures) == 0, f"Detected FNO surface greeks crash under extreme parameters"
-    assert len(nan_infs) == 0, f"Detected FNO surface greeks NaN/Infs"
+    assert len(failures) == 0, "Detected FNO surface greeks crash under extreme parameters"
+    assert len(nan_infs) == 0, "Detected FNO surface greeks NaN/Infs"
 
 
 def test_portfolio_greeks_robustness(fno_v2_model):

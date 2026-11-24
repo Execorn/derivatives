@@ -34,10 +34,8 @@ from __future__ import annotations
 import copy
 import gc
 import json
-import os
-import re
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -47,30 +45,16 @@ import pytest
 from pydantic import ValidationError
 
 from deepvol.api.fx_cross_arrow import (
-    ARROW_MIME,
     decode_arrow_batch,
     decode_json_batch,
-    encode_arrow_response,
-    encode_json_response,
 )
 from deepvol.api.schemas_fx_cross import (
-    AtmConventionEnum,
-    ContractTerms,
-    DeltaConventionEnum,
-    ExecutionOptions,
-    FallbackReasonEnum,
     FXLegData,
     MarketData,
     MarketStateColumnar,
-    ParityEnum,
-    PricingEngineEnum,
-    SettlementTypeEnum,
-    SmileDynamicsEnum,
     SmileQuotes,
-    StrangleConventionEnum,
     TriangulatedFXOptionColumnarBatchRequest,
     TriangulatedFXOptionRequest,
-    TriangulatedFXOptionResponse,
 )
 
 pytestmark = pytest.mark.audit
@@ -527,7 +511,6 @@ class TestDefectReproductions:
             repo_root / "src/deepvol/training/train_cross_surrogate.py",
         ]
 
-        pattern = re.compile(r"torch\.load\((?![^)]*weights_only\s*=\s*True)")
         violating_lines = []
 
         for f in target_files:
@@ -539,7 +522,7 @@ class TestDefectReproductions:
                         violating_lines.append(f"{f.name}:{idx} -> {line.strip()}")
 
         assert not violating_lines, (
-            f"[F001] Found torch.load without weights_only=True:\n" + "\n".join(violating_lines)
+            "[F001] Found torch.load without weights_only=True:\n" + "\n".join(violating_lines)
         )
 
     def test_F002_api_missing_content_negotiation_415_406(self) -> None:

@@ -8,6 +8,7 @@ Validates:
 - Normalizer negative handling
 """
 
+import os as _os
 import pytest
 import torch
 import numpy as np
@@ -16,7 +17,9 @@ class TestRannacherSmoothing:
     def test_rannacher_produces_valid_output(self):
         """PDE with Rannacher smoothing produces valid, reasonable NPV and Greeks."""
         from deepvol.models.autocall_pde import price_autocall_pde
-        sigma_func = lambda t, S: np.full_like(S, 0.2)
+
+        def sigma_func(t, S):
+            return np.full_like(S, 0.2)
         # Without rannacher
         npv_no, delta_no, gamma_no = price_autocall_pde(
             S0=100, r=0.05, T=1.0, N_S=300, N_T=252,
@@ -125,8 +128,6 @@ _VAL_PDE_PATH = "data/autocall/val_10k_sobol_pde.npz"
 _WEIGHTS_PATH = "artifacts/weights/autocall_correction_mlp.pth"
 _NORM_IN_PATH = "artifacts/scalers/correction_input_normalizer.npz"
 _NORM_OUT_PATH = "artifacts/scalers/correction_output_normalizer.npz"
-
-import os as _os
 
 
 class TestCorrectionIntegration:

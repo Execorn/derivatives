@@ -7,14 +7,11 @@ violations and that the pricing MSE remains extremely low.
 
 import os
 from pathlib import Path
-import pytest
 import numpy as np
 import torch
-import torch.nn as nn
 from deepvol.arbitrage.projection_layer import ArbitrageFreeFNO, DifferentiableArbitrageFreeProjection
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d, arbitrage_free_regularization
 from deepvol.surrogates.normalizers import ParameterNormalizerHeston, IVSurfaceNormalizer
-from deepvol.mrm.arbitrage import check_arbitrage
 
 
 def test_e2e_no_arbitrage_and_low_mse():

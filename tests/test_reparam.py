@@ -1,5 +1,4 @@
 import torch
-import pytest
 from deepvol.calibration.calibrate_newton import _reparam_to_6d
 
 def test_reparam_to_6d_values():

@@ -1,4 +1,3 @@
-import pytest
 import numpy as np
 import torch
 from deepvol.analysis.model_comparison import (

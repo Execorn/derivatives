@@ -1,4 +1,3 @@
-import pytest
 import torch
 import numpy as np
 from scipy.stats import norm
@@ -7,7 +6,6 @@ from deepvol.greeks.portfolio_greeks import (
     bs_call_price,
     bs_greeks,
     fno_parameter_jacobian,
-    fno_surface_greeks,
     portfolio_greeks,
     pnl_attribution
 )

@@ -1,4 +1,3 @@
-import pytest
 import numpy as np
 from deepvol.market.vix_pricing import (
     model_vix,

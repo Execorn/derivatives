@@ -1,4 +1,3 @@
-import pytest
 import torch
 import numpy as np
 import deepvol.calibration.calibrate_bfgs as calibrate
@@ -75,7 +74,6 @@ def test_calibrate_newton_theta_history(fno_v2_model):
         calibrate._iv_norm = None
 
 def test_fim_properties(fno_v2_model):
-    device = next(fno_v2_model.parameters()).device
     orig_norm_versions = calibrate._NORM_VERSIONS.copy()
     calibrate._NORM_VERSIONS["v1"] = calibrate._NORM_VERSIONS["v2"]
     calibrate._param_norm = None

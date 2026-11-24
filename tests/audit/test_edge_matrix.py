@@ -27,22 +27,16 @@ Scope of Verifications:
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict
 import numpy as np
 import pytest
 from pydantic import ValidationError
 import torch
 
 from deepvol.api.fx_cross_runtime import (
-    BATCH_BUCKETS,
-    QUOTE_BUCKET_GPU,
-    CPUQuotePath,
     FXCrossRuntime,
 )
 from deepvol.api.schemas_fx_cross import (
-    ExecutionOptions,
-    MarketData,
-    MarketStateColumnar,
     TriangulatedFXOptionColumnarBatchRequest,
     TriangulatedFXOptionRequest,
 )
@@ -50,16 +44,10 @@ from deepvol.models.fx_cross_analytic import (
     AnalyticTriangulated,
     Col,
     N_COLS,
-    greeks_from_outputs,
-    smooth_T,
 )
 from deepvol.models.fx_cross_surrogate import (
     CrossVolSurrogateEngine,
     ResidualCrossVolNet,
-)
-from artifacts.audit.scripts.oracles import (
-    black76_price,
-    closed_form_greeks,
 )
 
 

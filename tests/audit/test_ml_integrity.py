@@ -34,35 +34,27 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Dict, Set
 
 import numpy as np
 import pytest
 import torch
-import torch.nn as nn
 from torch import Tensor
 
 from deepvol.hedging.pivot_iv import pivot_implied_vol
-from deepvol.models import taylor_jets as tj
 from deepvol.models.fx_cross_analytic import (
     AnalyticTriangulated,
     Col,
     N_COLS,
-    smooth_T,
 )
 from deepvol.models.fx_cross_surrogate import (
     CrossVolSurrogateEngine,
     ResidualCrossVolNet,
 )
-from deepvol.training.data_generation_cross import (
-    CrossSobolSampler,
-    SamplerConfig,
-)
 from deepvol.training.train_cross_surrogate import (
     ShardedCrossDataset,
     TrainConfig,
     evaluate_gate_g1,
-    fit_ood_statistics,
 )
 
 

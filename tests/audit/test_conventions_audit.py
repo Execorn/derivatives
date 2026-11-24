@@ -12,6 +12,7 @@ from typing import List, Tuple
 import numpy as np
 import pytest
 import torch
+from torch import Tensor
 
 from deepvol.market.fx_conventions import (
     AtmConvention,
@@ -31,17 +32,12 @@ from deepvol.market.svi_slice import (
     fit_raw_svi_5pt,
 )
 from deepvol.market.smile_canonicalizer import (
-    CanonicalSmile,
-    SmileArbitrageError,
     SmileCanonicalizer,
     fit_ssvi_slice,
     ssvi_to_raw_svi,
 )
 from artifacts.audit.scripts.oracles import (
     durrleman_g as oracle_durrleman_g,
-    fx_delta_solve_strike as oracle_delta_solve,
-    ssvi_to_raw_svi as oracle_ssvi_to_raw,
-    svi_total_variance as oracle_svi_total_variance,
 )
 
 
@@ -229,7 +225,6 @@ def test_svi_fit_rmse_and_durrleman_grid() -> None:
     """Phase 5.4: SVI fit RMSE in vol-pts and Durrleman certificate comparison on 2,001 points."""
     # Known admissible raw SVI parameters
     p_true = [0.04, 0.10, -0.20, 0.05, 0.15]
-    T_val = 1.0
 
     # 5 pillar strikes
     x_5 = torch.tensor([[-0.4, -0.2, 0.0, 0.2, 0.4]], dtype=torch.float64)

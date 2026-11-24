@@ -1,4 +1,3 @@
-import pytest
 import os
 import sys
 
@@ -8,7 +7,7 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from deepvol.benchmarks.greeks_benchmark import benchmark_greeks
+from deepvol.benchmarks.greeks_benchmark import benchmark_greeks  # noqa: E402
 
 def test_benchmark_greeks_targets():
     """

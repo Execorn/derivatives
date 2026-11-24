@@ -6,21 +6,22 @@ The self-consistency tests use the v2 model (H=0.08 fixed in training) to
 verify that calibrate_newton_h recovers the correct H when H_target=0.08.
 """
 
-import os, sys
+import os
+import sys
 import numpy as np
 import torch
 import pytest
 
-CUDA_OK = torch.cuda.is_available()
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from deepvol.calibration.calibrate_newton import (
+from deepvol.calibration.calibrate_newton import (  # noqa: E402
     _reparam_to_6d_with_H,
     _BOUNDS_LOWER_4D,
     _BOUNDS_UPPER_4D,
     calibrate_newton_h,
 )
+
+CUDA_OK = torch.cuda.is_available()
 
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 K_GRID = np.linspace(-0.5, 0.5, 11)
@@ -78,13 +79,13 @@ class TestReparamWithH:
     def test_v0_is_preserved(self):
         for v0, zeta, lam, H in self.CASES:
             p6 = self._run(v0, zeta, lam, H)
-            assert abs(float(p6[4]) - v0) < 1e-5, f"v0 mismatch"
+            assert abs(float(p6[4]) - v0) < 1e-5, "v0 mismatch"
 
     def test_H_is_preserved_when_in_range(self):
         for _, _, _, H in self.CASES:
             if 0.04 <= H <= 0.15:
                 p6 = self._run(0.07, -0.30, 0.40, H)
-                assert abs(float(p6[5]) - H) < 1e-5, f"H mismatch (no clamp expected)"
+                assert abs(float(p6[5]) - H) < 1e-5, "H mismatch (no clamp expected)"
 
 
 # ─── Bound checks ─────────────────────────────────────────────────────────────

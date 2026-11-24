@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 import pytest
 import numpy as np
 import pandas as pd
-from datetime import date, datetime
+from datetime import date
 from deepvol.market.vix_futures import (
     get_vix_expiry,
     get_active_vix_months,

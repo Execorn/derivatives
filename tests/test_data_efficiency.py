@@ -1,6 +1,4 @@
-import os
 import sys
-import pytest
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -10,7 +8,7 @@ from sklearn.linear_model import Ridge, RidgeCV, MultiTaskLassoCV
 
 # Ensure deepvol package is importable
 import deepvol.benchmarks.data_efficiency as de
-from deepvol.benchmarks.data_efficiency import BatchSVGPModel, _make_spatial_input, compute_metrics
+from deepvol.benchmarks.data_efficiency import BatchSVGPModel, _make_spatial_input
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d, arbitrage_free_regularization
 from deepvol.surrogates.normalizers import ParameterNormalizerHeston, IVSurfaceNormalizer
 
@@ -238,8 +236,6 @@ def test_fno_training_step_and_loss():
     optimizer.step()
 
 def test_entire_smoke_test_execution(monkeypatch, tmp_path):
-    import sys
-    
     # Generate dummy npz dataset to feed to data_efficiency.py main function
     dummy_path = tmp_path / "dummy_dataset.npz"
     N_total = 110

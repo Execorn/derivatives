@@ -1,14 +1,12 @@
-import pytest
-import os
 import numpy as np
 import pandas as pd
 from datetime import date
 from pathlib import Path
 import json
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from deepvol.market.spx_data import download_spx_chain, clean_chain, calibrate_to_market
 
-from deepvol.market.spx_data import download_spx_chain, clean_chain, to_iv_surface, calibrate_to_market
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Mark the whole module to skip if CUDA is not available
 # Wait, FNO calibration runs on CPU as well if CUDA is not available.

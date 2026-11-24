@@ -693,19 +693,38 @@ def test_ood_request_handling(
     base_single_request: Dict[str, Any],
     client: TestClient,
 ) -> None:
-    """Gate G3.2: Crisis shock activates OOD fallback, HTTP 200, bitwise matches Analytic_Triangulated."""
-    req = copy.deepcopy(base_single_request)
-    # Inject crisis shock beyond 99.5% boundary: USDRUB ATM vol = 1.50 (150%), RR25 = 0.40
-    req["market_data"]["leg2"]["smile"]["atm_vol"] = 1.50
-    req["market_data"]["leg2"]["smile"]["rr25"] = 0.40
+    """Gate G3.2: Uninvertible PA quote returns 422 SMILE_ARBITRAGE; invertible crisis shock triggers OOD_MARKET_REGIME."""
+    from deepvol.api import server
+    from deepvol.mrm.fx_cross_guardian import MarketStateOODDetector
 
-    resp = client.post("/fx_cross/price", json=req)
-    assert resp.status_code == 200, f"OOD expected 200, got {resp.status_code}"
-    data = resp.json()
+    # 1. Uninvertible forward_pa quote (max 25-delta PA call < 0.25 at sigma_25c*sqrt(T)=1.715) -> 422 SMILE_ARBITRAGE
+    req_uninv = copy.deepcopy(base_single_request)
+    req_uninv["market_data"]["leg2"]["smile"]["atm_vol"] = 1.50
+    req_uninv["market_data"]["leg2"]["smile"]["rr25"] = 0.40
+    resp_422 = client.post("/fx_cross/price", json=req_uninv)
+    assert resp_422.status_code == 422, f"Uninvertible forward_pa expected 422, got {resp_422.status_code}"
+    assert "SMILE_ARBITRAGE" in resp_422.json()["detail"]
 
-    assert data["telemetry"]["fallback_activated"] is True
-    assert data["telemetry"]["fallback_reason"] == "OOD_MARKET_REGIME"
-    assert data["telemetry"]["is_out_of_distribution"] is True
+    # 2. Invertible spot_pna crisis shock beyond 99.5% OOD boundary -> HTTP 200 + OOD_MARKET_REGIME fallback
+    req_ood = copy.deepcopy(base_single_request)
+    req_ood["market_data"]["leg1"]["smile"]["atm_vol"] = 1.50
+    req_ood["market_data"]["leg1"]["smile"]["rr25"] = 0.10
+    req_ood["market_data"]["leg1"]["smile"]["rr10"] = 0.18
+
+    guardian = server._get_fx_cross_state()["guardian"]
+    old_ood = guardian.ood_detector
+    guardian.ood_detector = MarketStateOODDetector.from_checkpoint("artifacts/models/fx_cross/model_card.json")
+    try:
+        resp = client.post("/fx_cross/price", json=req_ood)
+        assert resp.status_code == 200, f"OOD expected 200, got {resp.status_code}"
+        data = resp.json()
+
+        assert data["telemetry"]["fallback_activated"] is True
+        assert data["telemetry"]["fallback_reason"] == "OOD_MARKET_REGIME"
+        assert data["telemetry"]["is_out_of_distribution"] is True
+        assert data["telemetry"]["engine_used"] == "Analytic_Triangulated"
+    finally:
+        guardian.ood_detector = old_ood
 
 
 # ── 8. Arrow IPC Request/Response Numerical Parity ────────────────────────────

@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List
 
 import numpy as np
 import pytest
@@ -34,13 +33,11 @@ from deepvol.api.schemas_fx_cross import (
     ModelRiskTelemetry,
     ParityEnum,
     PricingEngineEnum,
-    SmileDynamicsEnum,
     TriangulatedFXOptionRequest,
     TriangulatedFXOptionResponse,
     VegaLegs,
 )
 from deepvol.market.legacy_adapter import (
-    ConstMessage,
     ConstMessageGraph,
     DiscountCurve,
     LegacyContext,

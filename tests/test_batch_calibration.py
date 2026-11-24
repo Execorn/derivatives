@@ -107,7 +107,7 @@ def test_results_to_dataframe_values():
     df = results_to_dataframe([r])
     assert df.iloc[0]["date"] == "2024-01-02"
     assert abs(df.iloc[0]["rmse_bps"] - 42.0) < 1e-9
-    assert df.iloc[0]["converged"] == True
+    assert df.iloc[0]["converged"]
     assert abs(df.iloc[0]["kappa"] - 2.5) < 1e-9
 
 

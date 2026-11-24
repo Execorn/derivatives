@@ -8,7 +8,6 @@ import torch
 import numpy as np
 import time
 import logging
-from typing import List, Dict, Any
 
 from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
 from deepvol.surrogates.fno_greeks import compute_greeks
@@ -16,6 +15,8 @@ from deepvol.risk.portfolio_mc import MonteCarloVaREngine
 from deepvol.mrm.compliance import check_compliance, _global_monitor
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required for Greeks speed SLA")
 def test_greeks_speed_and_accuracy(fno_v2_model):
     """
     Benchmark vectorized Greeks calculation speed and verify outputs are finite.
@@ -61,6 +62,8 @@ def test_greeks_speed_and_accuracy(fno_v2_model):
     assert torch.all(torch.isfinite(vanna))
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required for VaR latency SLA")
 def test_var_latency_and_precision(fno_v2_model):
     """
     Benchmark portfolio-level VaR/ES calculation latency on the GPU.

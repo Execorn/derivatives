@@ -101,7 +101,7 @@ def test_joint_loss_lower_at_true_params(synthetic_surface):
 
 def test_joint_loss_vix_weight_zero(synthetic_surface):
     """With w_vix=0, loss should equal the SPX-only RMSE term."""
-    from deepvol.calibration.joint_calibration import _get_assets, _fno_predict, _rmse_bps
+    from deepvol.calibration.joint_calibration import _get_assets
     model, pn, yn, device = _get_assets()
     loss = joint_loss(
         _TRUE_ARR, synthetic_surface, 9999.0,   # absurd VIX — should not matter
@@ -115,7 +115,7 @@ def test_joint_loss_vix_weight_zero(synthetic_surface):
 def test_calibrate_vix_only_matches_target():
     """Calibrated params should reproduce VIX within ±1 VIX point."""
     result = calibrate_vix_only(vix_level=_VIX_OBSERVED)
-    assert result["converged"] == True
+    assert result["converged"]
     assert result["vix_error"] < 1.0, (
         f"VIX error too large: {result['vix_error']:.3f} VIX pts "
         f"(target={_VIX_OBSERVED:.2f})"

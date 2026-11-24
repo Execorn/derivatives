@@ -1,9 +1,8 @@
 import os
 import sys
 import json
-import warnings
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import pytest
@@ -12,17 +11,16 @@ import pytest
 project_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(project_root / "src"))
 
-from deepvol.analysis.hurst_dynamics import (
+from deepvol.analysis.hurst_dynamics import (  # noqa: E402
     run_historical_study,
     compute_hurst_statistics,
     detect_regime_changes,
 )
-from deepvol.analysis.crypto_hurst import (
+from deepvol.analysis.crypto_hurst import (  # noqa: E402
     align_crypto_inputs,
-    generate_mock_crypto_data,
     run_crypto_historical_study,
 )
-from deepvol.calibration.batch_calibration import CalibrationResult
+from deepvol.calibration.batch_calibration import CalibrationResult  # noqa: E402
 
 
 # ============================================================================
@@ -46,7 +44,7 @@ def test_pettitt_test_synthetic_step_change():
     assert res.loc[0, "change_point_index"] == 15
     assert res.loc[0, "change_point_date"] == "2024-01-16"
     assert res.loc[0, "p_value"] < 0.05  # highly significant
-    assert res.loc[0, "is_significant"] == True
+    assert res.loc[0, "is_significant"]
 
 
 # ============================================================================

@@ -3,15 +3,12 @@ test_calibrate_rbergomi.py — Test suite for Rough Bergomi model.
 Verifies self-consistency, hybrid scheme vs naive Euler, and variance reduction.
 """
 
-import pytest
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from deepvol.models.rbergomi_gpu import (
     simulate_rbergomi_paths,
-    batch_rbergomi_iv_surface,
-    rbergomi_iv_surface,
 )
 
 
@@ -129,28 +126,26 @@ def test_variance_reduction_antithetic():
     params = torch.tensor([[0.04, 0.07, 1.5, -0.7]], device=device, dtype=torch.float32)
     T = 1.0
     steps_per_unit = 100
-    N_paths = 2000
+    n_batches = 400
+    batch_paths = 100
+    N_paths = n_batches * batch_paths
     K = 1.0  # ATM strike
 
-    n_runs = 10
-    prices_std = []
-    prices_anti = []
+    torch.manual_seed(0)
+    S_std, _, _ = simulate_rbergomi_paths(
+        params, T, steps_per_unit, N_paths, antithetic=False, device=device
+    )
+    payoff_std = torch.clamp(S_std[0, :, -1] - K, min=0.0)
+    prices_std = payoff_std.reshape(n_batches, batch_paths).mean(dim=1).cpu().numpy()
 
-    # Run multiple times with different seeds
-    for run in range(n_runs):
-        torch.manual_seed(run)
-        S_std, _, _ = simulate_rbergomi_paths(
-            params, T, steps_per_unit, N_paths, antithetic=False, device=device
-        )
-        payoff_std = torch.clamp(S_std[:, :, -1] - K, min=0.0)
-        prices_std.append(payoff_std.mean().item())
-
-        torch.manual_seed(run)
-        S_anti, _, _ = simulate_rbergomi_paths(
-            params, T, steps_per_unit, N_paths, antithetic=True, device=device
-        )
-        payoff_anti = torch.clamp(S_anti[:, :, -1] - K, min=0.0)
-        prices_anti.append(payoff_anti.mean().item())
+    torch.manual_seed(0)
+    S_anti, _, _ = simulate_rbergomi_paths(
+        params, T, steps_per_unit, N_paths, antithetic=True, device=device
+    )
+    payoff_anti = torch.clamp(S_anti[0, :, -1] - K, min=0.0)
+    half = N_paths // 2
+    pair_avg = 0.5 * (payoff_anti[:half] + payoff_anti[half:])
+    prices_anti = pair_avg.reshape(n_batches, batch_paths // 2).mean(dim=1).cpu().numpy()
 
     var_std = np.var(prices_std)
     var_anti = np.var(prices_anti)

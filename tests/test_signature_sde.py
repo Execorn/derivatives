@@ -2,16 +2,13 @@
 tests/test_signature_sde.py - Unit and integration tests for the Signature Neural SDE and FNO surrogate.
 """
 
-import pytest
 import numpy as np
 import torch
-import torch.nn as nn
 from deepvol.surrogates.signature_sde import (
     SignatureNeuralSDE,
     SignatureSDEPricer,
     DualLegSignatureFNO2d,
     implied_volatility,
-    vix_implied_volatility,
     ModelRiskGuardian,
     compute_path_signature
 )

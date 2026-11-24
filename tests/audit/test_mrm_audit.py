@@ -28,13 +28,11 @@ Scope:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import hashlib
 import json
-import logging
 from pathlib import Path
 import time
-from typing import Any, Dict, List
 
 import numpy as np
 import pytest
@@ -42,7 +40,6 @@ import torch
 from torch import Tensor
 
 from deepvol.market.svi_slice import RawSVI
-from deepvol.models.fx_cross_analytic import Col, N_COLS
 from deepvol.models.fx_cross_copula import (
     CopulaConfig,
     CrossState,
@@ -54,10 +51,8 @@ from deepvol.mrm.fx_cross_guardian import (
     FXCrossGuardian,
     MarketStateDriftMonitor,
     MarketStateOODDetector,
-    ModelReserveEntry,
     ModelReserveTracker,
     PricingEngineEnum,
-    RoutingDecision,
 )
 
 

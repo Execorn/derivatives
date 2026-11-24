@@ -48,7 +48,7 @@ def _make_leg(spot: float, df_f: float, df_d: float, T: float) -> LegMarket:
 
 def test_probe_extreme_tenors_and_vols_pna_cartesian() -> None:
     """Probes T in [1e-4, 10.0] and sigma in [0.01, 3.0] across PNA conventions."""
-    np.seterr(all="raise")
+    old_err = np.seterr(all="raise")
     torch.autograd.set_detect_anomaly(True)
     try:
         extreme_tenors = [1e-4, 1e-3, 1/365, 0.1, 1.0, 5.0, 10.0]
@@ -79,6 +79,7 @@ def test_probe_extreme_tenors_and_vols_pna_cartesian() -> None:
                                 )
     finally:
         torch.autograd.set_detect_anomaly(False)
+        np.seterr(**old_err)
 
 
 # ── Probe 2: Deep Tail Deltas (1e-6 to 0.999999) ──
@@ -109,10 +110,9 @@ def test_probe_deep_tail_deltas() -> None:
 
 def test_probe_ssvi_fallback_autograd_backward() -> None:
     """Forces SSVI fallback and verifies backward pass, Jacobian finite differences, and zero LinAlgError."""
+    old_err = np.seterr(all="raise")
     torch.autograd.set_detect_anomaly(True)
     try:
-        np.seterr(all="raise")
-
         can = SmileCanonicalizer(cache_size=0)
         leg = _make_leg(1.20, 0.98, 0.95, 0.5)
         conv = [(DeltaConvention.FORWARD_PNA, AtmConvention.DNS, StrangleConvention.SMILE)]
@@ -143,6 +143,7 @@ def test_probe_ssvi_fallback_autograd_backward() -> None:
         assert grad_err < 1e-10, f"Autograd gradient differs from manifold Jacobian by {grad_err:.3e}"
     finally:
         torch.autograd.set_detect_anomaly(False)
+        np.seterr(**old_err)
 
 
 # ── Probe 4: Convention Inversion Round-Trip Under Stress Regimes ──

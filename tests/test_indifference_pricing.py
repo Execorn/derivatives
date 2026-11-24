@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import numpy as np
 import pytest
 from deepvol.hedging.frictional_env import (
@@ -11,9 +10,7 @@ from deepvol.hedging.indifference_pricing import (
     IndifferencePricingEngine,
     invert_implied_volatility_hybrid,
     bs_call_price,
-    bs_call_vega,
-    train_frictional_hedger,
-    evaluate_loss
+    bs_call_vega
 )
 from deepvol.hedging.deep_hedging import HedgingPolicy
 

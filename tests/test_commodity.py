@@ -281,7 +281,7 @@ def test_calibration_and_kalman_filter():
     
     # Match data
     adapter = CMECommodityDataAdapter(ref_year=2026)
-    matched = adapter.match_options_to_futures(opts_df, futs_df)
+    adapter.match_options_to_futures(opts_df, futs_df)
     
     # Pivot futures prices and maturities to shape (num_dates, num_contracts)
     # We have weekly dates, and 3 contracts per date (1m, 3m, 6m)

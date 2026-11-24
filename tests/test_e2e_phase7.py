@@ -606,8 +606,8 @@ def test_call_put_parity_mlsv():
     strike = 95.0
     maturity = 0.5
     vol = 0.25
-    r = 0.0  # MLSV pricing base uses 0 interest rate inside stub (pure BS d1/d2)
-    
+    # MLSV pricing base uses 0 interest rate inside stub (pure BS d1/d2)
+
     price_c = engine.price_option(spot, strike, maturity, vol, is_call=True)
     price_p = engine.price_option(spot, strike, maturity, vol, is_call=False)
     
@@ -841,8 +841,7 @@ def test_scenario_commodity_schwartz_smith_calibration():
     spot = wti_data["spot"]
     maturity = wti_data["futures_maturities"][2] # ~6M
     strike = wti_data["strikes"][3]            # strike 80.0
-    mkt_vol = wti_data["vols"][2, 3]           # vol for 6M at 80.0 strike
-    
+
     # 2. Setup Schwartz-Smith engine with calibrated parameters
     # Let's assume these are calibrated to the term structure of volatility
     ss_engine = SchwartzSmithEngine(kappa=1.4, mu_y=0.02, sigma_x=0.32, sigma_y=0.12, rho_xy=-0.25)

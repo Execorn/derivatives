@@ -1,4 +1,3 @@
-import pytest
 import numpy as np
 import os
 import sys
@@ -9,7 +8,7 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from deepvol.greeks.pnl_attribution import pnl_attribution
+from deepvol.greeks.pnl_attribution import pnl_attribution  # noqa: E402
 
 def test_pnl_attribution_scalar_div():
     """

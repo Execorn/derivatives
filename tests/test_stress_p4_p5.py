@@ -4,14 +4,13 @@ tests/test_stress_p4_p5.py — Stress and boundary condition testing for Phase 4
 
 import numpy as np
 import torch
-import pytest
 
-from deepvol.models.heston import heston_cf, heston_iv_surface, batch_heston_iv_surface
-from deepvol.models.sabr import sabr_iv_lognormal, sabr_iv_normal, ssvi_total_variance
+from deepvol.models.heston import heston_cf, batch_heston_iv_surface
+from deepvol.models.sabr import sabr_iv_lognormal, ssvi_total_variance
 from deepvol.models.local_vol import svi_to_lv_surface, check_arbitrage_free
-from deepvol.models.rbergomi_gpu import simulate_rbergomi_paths, rbergomi_iv_surface
+from deepvol.models.rbergomi_gpu import simulate_rbergomi_paths
 from deepvol.models.neural_sde import NeuralSDE, NeuralSDEPricer, compute_calibration_loss
-from deepvol.models.signature_vol import SignatureVolatilityModel, compute_path_signature
+from deepvol.models.signature_vol import SignatureVolatilityModel
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 

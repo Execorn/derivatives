@@ -3,13 +3,11 @@ import torch
 import numpy as np
 import math
 import warnings
-from deepvol.models.mlsv_gpu import MLSVSolverGPU, compute_conditional_expectation
+from deepvol.models.mlsv_gpu import MLSVSolverGPU
 from deepvol.models.lifted_heston_gpu import (
     solve_riccati_rk4,
     solve_riccati_rk4_mixed,
-    price_batch_gpu,
-    _riccati_rhs,
-    bs_iv_gpu
+    price_batch_gpu
 )
 from deepvol.calibration.fx_calibration import (
     sabr_iv_lognormal_pytorch,
@@ -19,9 +17,7 @@ from deepvol.calibration.fx_calibration import (
     sabr_initial_guess
 )
 from deepvol.market.fx_data import (
-    gk_price,
     gk_delta,
-    gk_delta_dk,
     invert_gk_delta
 )
 
@@ -193,7 +189,6 @@ def test_riccati_rk4_instability_and_mixed_precision_stability():
     The exponential midpoint integrator in solve_riccati_rk4_mixed should remain stable.
     """
     device = "cpu"
-    B = 2
     N = 20
     N_u = 64
     
@@ -216,12 +211,10 @@ def test_riccati_rk4_instability_and_mixed_precision_stability():
     T_grid = np.array([0.5, 1.0])
     
     # 1. Standard RK4 solver under extreme kappa should blow up / raise NaN/Inf
-    log_phi_rk4 = solve_riccati_rk4(
+    _log_phi_rk4 = solve_riccati_rk4(
         kappa, theta, sigma, rho, v0, u_c, x, c, T_grid, N_steps_per_unit=100, device=device
     )
-    # Check if there are any NaNs or Infs (representing numerical instability)
-    has_unstable_rk4 = torch.isnan(log_phi_rk4).any() or torch.isinf(log_phi_rk4).any()
-    
+
     # 2. Mixed-precision exponential midpoint solver should remain stable and finite
     log_phi_mixed = solve_riccati_rk4_mixed(
         kappa, theta, sigma, rho, v0, u_c, x, c, T_grid, N_steps_per_unit=100, device=device

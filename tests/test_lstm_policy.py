@@ -1,7 +1,4 @@
 import torch
-import torch.nn as nn
-import numpy as np
-import pytest
 from deepvol.hedging.deep_hedging import RecurrentHedgingPolicy, DeepHedgingEnv
 from deepvol.models.signature_vol import compute_path_signature
 

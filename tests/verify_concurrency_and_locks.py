@@ -102,8 +102,9 @@ async def test_reload(model_name: str):
 async def run_stress_test():
     patched_file = create_patched_server()
     
-    # Start the server using the virtual env python interpreter
-    python_bin = str(PROJECT_ROOT / ".venv" / "bin" / "python")
+    # Start the server using the virtual env python interpreter (falling back to sys.executable in worktrees)
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    python_bin = str(venv_python) if venv_python.exists() else sys.executable
     
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{PROJECT_ROOT}:{PROJECT_ROOT / 'src'}"

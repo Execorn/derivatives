@@ -1,15 +1,11 @@
-import os
 import subprocess
 import sys
 import numpy as np
-import pytest
-import torch
 
 import deepvol
 from deepvol.calibration.interface import calibrate, CalibrationResult
 from deepvol.greeks.interface import compute_greeks
 from deepvol.models.heston import HestonEngine
-from deepvol.models.rbergomi_gpu import rBergomiEngine
 
 def test_package_metadata():
     """Verify package metadata is present and correct."""

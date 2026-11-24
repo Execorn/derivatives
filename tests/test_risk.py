@@ -22,8 +22,7 @@ def test_autograd_vs_finite_difference(risk_engine_setup):
 
     # Create a smooth, double-precision volatility surface to bypass float32 FNO roundoff limitations.
     from deepvol.greeks.portfolio_greeks import MATURITIES, STRIKES
-    nT, nK = len(MATURITIES), len(STRIKES)
-    
+
     # We define a smooth float64 surface: 0.2 + 0.05 * T - 0.1 * k
     T_grid_np = np.array(MATURITIES, dtype=np.float64)
     K_grid_np = np.array(STRIKES, dtype=np.float64)

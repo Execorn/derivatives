@@ -1,7 +1,5 @@
 import torch
-import torch.nn as nn
 import numpy as np
-import pytest
 from scipy.stats import norm
 from deepvol.hedging.deep_hedging import HedgingPolicy, DeepHedgingEnv, train_deep_hedger
 

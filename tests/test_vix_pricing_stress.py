@@ -5,8 +5,6 @@ from scipy.integrate import solve_ivp
 from deepvol.market.vix_pricing import (
     model_vix,
     vix_futures_curve,
-    model_variance_swap_rate,
-    download_vix_futures,
     joint_calibration_loss
 )
 

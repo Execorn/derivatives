@@ -1,4 +1,3 @@
-import pytest
 import numpy as np
 import time
 from deepvol.market.vix_pricing import (
@@ -36,7 +35,7 @@ def test_model_vix_performance():
     p99_lat = np.percentile(latencies, 99)
     max_lat = np.max(latencies)
     
-    print(f"\n[PERFORMANCE] model_vix latency (ms):")
+    print("\n[PERFORMANCE] model_vix latency (ms):")
     print(f"  Mean: {mean_lat:.3f} ms")
     print(f"  p50:  {p50_lat:.3f} ms")
     print(f"  p90:  {p90_lat:.3f} ms")

@@ -7,7 +7,8 @@ from deepvol.models.mlsv_gpu import MLSVSolverGPU, compute_conditional_expectati
 
 def test_mlsv_solver_initialization():
     # Valid initialization
-    dup_vol_fn = lambda t, s: torch.full_like(s, 0.2)
+    def dup_vol_fn(t, s):
+        return torch.full_like(s, 0.2)
     solver = MLSVSolverGPU(
         S0=100.0,
         r=0.05,
@@ -82,7 +83,8 @@ def test_compute_conditional_expectation_cpu():
 
 
 def test_mlsv_solver_simulation_cpu():
-    dup_vol_fn = lambda t, s: torch.full_like(s, 0.2)
+    def dup_vol_fn(t, s):
+        return torch.full_like(s, 0.2)
     solver = MLSVSolverGPU(
         S0=100.0,
         r=0.05,
@@ -124,7 +126,8 @@ def test_mlsv_solver_simulation_cpu():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_mlsv_solver_simulation_gpu():
-    dup_vol_fn = lambda t, s: torch.full_like(s, 0.2)
+    def dup_vol_fn(t, s):
+        return torch.full_like(s, 0.2)
     solver = MLSVSolverGPU(
         S0=100.0,
         r=0.05,

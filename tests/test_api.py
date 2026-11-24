@@ -11,14 +11,13 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import numpy as np
 import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from fastapi.testclient import TestClient
-from deepvol.api.server import app, _MODEL_STATE
+from deepvol.api.server import app
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 

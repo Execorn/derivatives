@@ -5,14 +5,11 @@ import gc
 from deepvol.models.bachelier import (
     bachelier_price,
     black_price,
-    shifted_black_price,
     bachelier_implied_vol,
     black_implied_vol
 )
 from deepvol.models.heston import (
     heston_cf,
-    heston_iv_surface,
-    batch_heston_iv_surface,
     HestonEngine
 )
 from deepvol.models.local_vol import (
@@ -22,9 +19,7 @@ from deepvol.models.local_vol import (
 )
 from deepvol.models.sabr import (
     sabr_iv_lognormal,
-    sabr_iv_normal,
-    sabr_iv_surface,
-    ssvi_total_variance
+    sabr_iv_normal
 )
 from deepvol.models.rbergomi_gpu import rBergomiEngine
 

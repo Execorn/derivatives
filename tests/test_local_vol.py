@@ -1,7 +1,6 @@
 import numpy as np
-import pytest
 import torch
-from deepvol.models.local_vol import svi_slice, svi_to_lv_surface, check_arbitrage_free
+from deepvol.models.local_vol import svi_to_lv_surface, check_arbitrage_free
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 
 def test_flat_surface_identity():

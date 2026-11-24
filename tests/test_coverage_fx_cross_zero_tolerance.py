@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import tempfile
 import time
-from typing import Any, List, Optional
+from typing import Any
 import pytest
 import numpy as np
 import torch
@@ -27,7 +27,6 @@ from deepvol.api.schemas_fx_cross import (
     CurvePillar,
     DeltaConventionEnum,
     DeltaLegs,
-    ExecutionOptions,
     FallbackReasonEnum,
     FXLegData,
     InterestRates,
@@ -58,7 +57,7 @@ from deepvol.models.fx_cross_analytic import (
     AnalyticTriangulated,
     Col,
 )
-from deepvol.models.fx_cross_copula import CrossState, GaussianCopulaCrossEngine
+from deepvol.models.fx_cross_copula import CrossState
 from deepvol.models.fx_cross_safeguards import (
     AuditResult,
     cross_slice_audit,
@@ -70,7 +69,6 @@ from deepvol.models.fx_cross_safeguards import (
     z_squash,
 )
 from deepvol.mrm.fx_cross_guardian import (
-    FEATURE_NAMES_12D,
     FXCrossGuardian,
     MarketStateDriftMonitor,
     MarketStateOODDetector,

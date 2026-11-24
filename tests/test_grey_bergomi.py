@@ -6,17 +6,24 @@ import numpy as np
 import scipy.special
 import math
 
+pytestmark = pytest.mark.gpu
+
 # Add deepvol C++ extension path to import path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 cpp_path = os.path.join(project_root, "src/deepvol/cpp")
 if cpp_path not in sys.path:
     sys.path.insert(0, cpp_path)
 
-# Verify import
+# Optional CUDA extension import (skipped cleanly on CPU-only / uncompiled runs)
 try:
     import deepvol_cuda
-except ImportError as e:
-    raise ImportError(f"Could not import deepvol_cuda. Is it compiled? Error: {e}")
+except ImportError:
+    deepvol_cuda = None
+
+_SKIP_NO_GREY_CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available() or deepvol_cuda is None,
+    reason="CUDA and compiled deepvol_cuda extension required",
+)
 
 
 def mittag_leffler_py(z, beta, max_iter=500, tol=1e-9):
@@ -43,6 +50,7 @@ def mittag_leffler_py(z, beta, max_iter=500, tol=1e-9):
         return (1.0 / beta) * math.exp(val_check) - sum_terms
 
 
+@_SKIP_NO_GREY_CUDA
 def test_mittag_leffler_cuda():
     """
     Test Mittag-Leffler kernel correctness on CUDA against reference Python implementation.
@@ -63,6 +71,7 @@ def test_mittag_leffler_cuda():
         assert np.allclose(actual, expected, rtol=1e-6), f"Mismatch at z={z}: expected={expected}, got={actual}"
 
 
+@_SKIP_NO_GREY_CUDA
 def test_generate_grey_paths_cuda_shapes_and_device():
     """
     Test that generate_grey_paths_cuda runs on GPU and returns correct shapes, dtypes, and devices.
@@ -102,6 +111,7 @@ def test_generate_grey_paths_cuda_shapes_and_device():
     assert torch.isfinite(B_H).all()
 
 
+@_SKIP_NO_GREY_CUDA
 def test_generate_grey_paths_cuda_batched():
     """
     Test batched generation (B > 1) of Grey Rough Bergomi paths.
@@ -136,6 +146,7 @@ def test_generate_grey_paths_cuda_batched():
     assert torch.allclose(V[2, :, 0], torch.tensor(0.06, device="cuda"))
 
 
+@_SKIP_NO_GREY_CUDA
 def test_fbm_variance_and_martingale():
     """
     Verify mathematical properties:

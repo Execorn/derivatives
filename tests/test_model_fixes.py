@@ -1,7 +1,5 @@
-import pytest
 import numpy as np
 import torch
-import math
 from deepvol.models.rbergomi_gpu import rBergomiEngine
 from deepvol.models.bachelier import (
     bachelier_price,
@@ -10,7 +8,6 @@ from deepvol.models.bachelier import (
     bachelier_implied_vol,
     black_implied_vol
 )
-from deepvol.models.heston import HestonEngine
 
 def test_rbergomi_engine_simulate_paths():
     """Verify that the fixed rBergomiEngine.simulate_paths correctly aligns with simulate_rbergomi_paths."""

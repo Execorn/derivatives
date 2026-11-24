@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 import torch
 from deepvol.calibration.interface import calibrate, CalibrationResult
 from deepvol.calibration.calibrate_newton import calibrate_newton_h

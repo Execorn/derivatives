@@ -1,13 +1,10 @@
 import pytest
 import numpy as np
-import torch
 import time
 from deepvol.greeks.portfolio_greeks import (
     bs_greeks,
-    fno_parameter_jacobian,
     fno_surface_greeks,
-    portfolio_greeks,
-    pnl_attribution
+    portfolio_greeks
 )
 from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
 
@@ -144,7 +141,7 @@ def test_performance_benchmarks(fno_v2_model):
     t_end = time.perf_counter()
     avg_latency_ms = (t_end - t_start) / iterations * 1000.0
     
-    print(f"\n--- Portfolio Greeks Performance Benchmark ---")
+    print("\n--- Portfolio Greeks Performance Benchmark ---")
     print(f"Average latency for 100 positions: {avg_latency_ms:.2f} ms")
     
     # Ensure it meets reasonable real-time requirements (e.g., < 100ms for a 100-position portfolio)
