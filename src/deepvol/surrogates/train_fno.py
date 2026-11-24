@@ -11,7 +11,9 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any, cast
 import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -19,7 +21,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.swa_utils import AveragedModel, SWALR
 
 from deepvol.arbitrage.projection_layer import ArbitrageFreeFNO, DifferentiableArbitrageFreeProjection
-from deepvol.surrogates.fno_model import MirrorPaddedFNO2d, arbitrage_free_regularization
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 from deepvol.surrogates.normalizers import ParameterNormalizerHeston, IVSurfaceNormalizer
 
 # --- Config ---
@@ -42,7 +44,9 @@ NORM_PARAM = 'artifacts/models/param_normalizer_heston.npz'
 NORM_IV = 'artifacts/models/iv_normalizer_heston.npz'
 
 
-def _make_spatial_input(T_grid, K_grid, device):
+def _make_spatial_input(
+    T_grid: npt.NDArray[Any], K_grid: npt.NDArray[Any], device: torch.device
+) -> torch.Tensor:
     T_norm = (T_grid - T_grid.mean()) / T_grid.std()
     K_norm = (K_grid - K_grid.mean()) / K_grid.std()
     T_mesh, K_mesh = np.meshgrid(T_norm, K_norm, indexing='ij')
@@ -50,7 +54,7 @@ def _make_spatial_input(T_grid, K_grid, device):
     return torch.tensor(spatial, dtype=torch.float32, device=device)
 
 
-def train():
+def train() -> None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"  Training End-to-End Arbitrage-Free Heston FNO on: {device}")
     
@@ -154,7 +158,7 @@ def train():
             optimizer.zero_grad(set_to_none=True)
             pred = wrapped_model(sp, X_b)
             loss = F.huber_loss(pred, Y_b, delta=1.0)
-            loss.backward()
+            loss.backward()  # type: ignore[no-untyped-call]
             torch.nn.utils.clip_grad_norm_(wrapped_model.parameters(), 1.0)
             optimizer.step()
             
@@ -196,7 +200,7 @@ def train():
     if EPOCHS >= SWA_START:
         torch.optim.swa_utils.update_bn(tr_dl, swa_mod, device=device)
         # Save SWA base FNO weights to WEIGHTS_PROD
-        torch.save(swa_mod.module.base_fno.state_dict(), WEIGHTS_PROD)
+        torch.save(cast(ArbitrageFreeFNO, swa_mod.module).base_fno.state_dict(), WEIGHTS_PROD)
         print(f"  SWA model saved → {WEIGHTS_PROD}")
     else:
         # If SWA did not start, copy the best model to final prod

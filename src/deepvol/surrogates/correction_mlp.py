@@ -9,8 +9,7 @@ Architecture:
   - Accelerated via torch.compile(mode="reduce-overhead") with .clone() output protection.
 """
 
-from typing import Dict, Optional, Tuple, Union
-import numpy as np
+from typing import cast
 import torch
 import torch.nn as nn
 
@@ -32,7 +31,7 @@ class CorrectionResidualBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.block(x)
+        return cast(torch.Tensor, x + self.block(x))
 
 
 class CorrectionMLP(nn.Module):
@@ -64,7 +63,7 @@ class CorrectionMLP(nn.Module):
         h = self.in_proj(x)
         for block in self.blocks:
             h = block(h)
-        out = self.out_head(h)
+        out: torch.Tensor = self.out_head(h)
         return out
 
     @torch.compile(mode="reduce-overhead")

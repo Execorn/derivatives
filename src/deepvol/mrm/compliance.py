@@ -5,9 +5,10 @@ OOD detection/clamping, and structured compliance logging.
 """
 
 import numpy as np
+import numpy.typing as npt
 import logging
 import json
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
 logger = logging.getLogger("deepvol.compliance")
 
@@ -43,11 +44,11 @@ class DriftMonitor:
     """
     Tracks parameter drift over a rolling window using the Population Stability Index (PSI).
     """
-    def __init__(self, window_size: int = 100):
+    def __init__(self, window_size: int = 100) -> None:
         self.window_size = window_size
-        self.history: List[np.ndarray] = []
+        self.history: List[npt.NDArray[Any]] = []
 
-    def add_parameters(self, theta: np.ndarray):
+    def add_parameters(self, theta: npt.NDArray[Any]) -> None:
         self.history.append(theta.copy())
         if len(self.history) > self.window_size:
             self.history.pop(0)
@@ -58,7 +59,7 @@ class DriftMonitor:
             return {}
 
         data = np.array(self.history)  # shape: (W, 6)
-        psi_dict = {}
+        psi_dict: Dict[str, float] = {}
 
         for idx, name in enumerate(PARAM_NAMES):
             low, high = RH_BOUNDS[name]
@@ -104,14 +105,14 @@ class DriftMonitor:
 _global_monitor = DriftMonitor()
 
 
-def check_compliance(theta: np.ndarray) -> np.ndarray:
+def check_compliance(theta: npt.NDArray[Any]) -> npt.NDArray[Any]:
     """
     Inspects input parameters for OOD violations and logs any anomalies.
     Applies boundary clamping and feeds the parameters to the rolling drift monitor.
     """
-    theta_clamped = theta.copy()
+    theta_clamped: npt.NDArray[Any] = theta.copy()
     ood_detected = False
-    log_details = []
+    log_details: List[Dict[str, Any]] = []
 
     for idx, name in enumerate(PARAM_NAMES):
         low, high = RH_BOUNDS[name]

@@ -4,9 +4,10 @@ guardian.py — Model Risk Guardian and Fallback Routing for PI-M-FNO.
 
 import logging
 import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn as nn
-from typing import Dict
+from typing import Any, Dict, Mapping, Optional
 
 
 class ModelRiskGuardian:
@@ -24,12 +25,12 @@ class ModelRiskGuardian:
         pde_loss_fn: nn.Module,
         drift_threshold: float = 0.25,
         pde_threshold: float = 1e-3,
-    ):
-        self.model = model
+    ) -> None:
+        self.model: Any = model
         self.pde_loss_fn = pde_loss_fn
         self.drift_threshold = drift_threshold
         self.pde_threshold = pde_threshold
-        self.reference_distribution = None
+        self.reference_distribution: Optional[npt.NDArray[Any]] = None
 
     def calculate_psi(self, current_batch: torch.Tensor) -> float:
         """
@@ -62,7 +63,7 @@ class ModelRiskGuardian:
         return float(psi)
 
     def check_compliance_and_clamp(
-        self, inputs: Dict[str, torch.Tensor]
+        self, inputs: Mapping[str, Any]
     ) -> Dict[str, torch.Tensor]:
         """
         Performs OOD checks on interest rates, dividend yields, and local volatilities.
@@ -114,7 +115,7 @@ class ModelRiskGuardian:
         return clamped_inputs
 
     def route_query(
-        self, inputs: Dict[str, torch.Tensor], fallback_type: str = "fourier"
+        self, inputs: Mapping[str, Any], fallback_type: str = "fourier"
     ) -> torch.Tensor:
         """
         Checks model safety and evaluates option prices.
@@ -157,7 +158,7 @@ class ModelRiskGuardian:
         return C_pred
 
     def adapt_model(
-        self, inputs: Dict[str, torch.Tensor], lr: float = 1e-3, steps: int = 2
+        self, inputs: Mapping[str, Any], lr: float = 1e-3, steps: int = 2
     ) -> None:
         """
         Executes fast online parameter updates on the output MLP layers using split forward pass.
@@ -184,7 +185,7 @@ class ModelRiskGuardian:
             optimizer.step()
 
     def run_fallback(
-        self, inputs: Dict[str, torch.Tensor], fallback_type: str
+        self, inputs: Mapping[str, Any], fallback_type: str
     ) -> torch.Tensor:
         """
         Executes fallback routing to Fourier-COS or McKean-Vlasov SDE particle solver.
@@ -203,22 +204,30 @@ class ModelRiskGuardian:
         T_raw = T_tensor[0, 0, :].detach().cpu().numpy()
 
         # Get S0 (spot price) from the inputs, default to 100.0 if not specified
-        S0 = inputs.get("S0", torch.tensor(100.0)).item()
+        S0_val = inputs.get("S0", torch.tensor(100.0))
+        S0 = float(S0_val.item()) if isinstance(S0_val, torch.Tensor) else float(S0_val)
 
         # Extract parameters or use default safe Heston parameters
-        params = inputs.get(
+        params_raw = inputs.get(
             "params",
             {"kappa": 2.0, "theta": 0.04, "sigma": 0.3, "rho": -0.7, "v0": 0.04},
         )
+        params: Dict[str, Any] = dict(params_raw) if isinstance(params_raw, dict) else {
+            "kappa": 2.0,
+            "theta": 0.04,
+            "sigma": 0.3,
+            "rho": -0.7,
+            "v0": 0.04,
+        }
 
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
 
         if fallback_type == "fourier":
-            engine = FourierCOSEngine(device=device_str)
-            res = engine.price_surface(params, T_raw, K_raw, S0=S0)
+            fourier_engine = FourierCOSEngine(device=device_str)
+            res = fourier_engine.price_surface(params, T_raw, K_raw, S0=S0)
         else:  # McKean-Vlasov particle solver
-            engine = McKeanVlasovFallbackEngine(device=device_str)
-            res = engine.price_surface(params, T_raw, K_raw, S0=S0)
+            mv_engine = McKeanVlasovFallbackEngine(device=device_str)
+            res = mv_engine.price_surface(params, T_raw, K_raw, S0=S0)
 
         prices = res["prices"]  # shape [N_T, N_K]
         # Transpose to [N_K, N_T] and add batch dimension [1, N_K, N_T]

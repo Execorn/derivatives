@@ -9,8 +9,9 @@ Architecture:
   - Accelerated via torch.compile(mode="reduce-overhead") with .clone() output protection.
 """
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, cast
 import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn as nn
 from deepvol.surrogates.autocall_normalizer import (
@@ -36,7 +37,7 @@ class AutocallResidualBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.block(x)
+        return cast(torch.Tensor, x + self.block(x))
 
 
 class AutocallMLP(nn.Module):
@@ -70,7 +71,7 @@ class AutocallMLP(nn.Module):
         h = self.in_proj(x)
         for block in self.blocks:
             h = block(h)
-        out = self.out_head(h)
+        out: torch.Tensor = self.out_head(h)
         if self.bounded_output:
             out = torch.sigmoid(out)
         return out
@@ -96,7 +97,7 @@ class AutocallMLP(nn.Module):
 
 def compute_greeks(
     model: AutocallMLP,
-    x_raw: np.ndarray,
+    x_raw: npt.NDArray[Any],
     norm_in: AutocallInputNormalizer,
     norm_out: AutocallOutputNormalizer,
 ) -> Dict[str, float]:
@@ -126,7 +127,7 @@ def compute_greeks(
     out_real = norm_out.inverse_transform_tensor(out_norm)
     npv = out_real[0, 0]
 
-    npv.backward()
+    npv.backward()  # type: ignore[no-untyped-call]
     grad = x_tensor.grad
 
     # delta_B: spot sensitivity. Since higher barrier B decreases NPV (dNPV/dB < 0),

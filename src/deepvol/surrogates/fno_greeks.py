@@ -16,36 +16,44 @@ Design decisions:
 import os
 import sys
 import torch
-import torch.nn as nn
 from torch.func import functional_call, jacrev, jacfwd
-import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
-from typing import Tuple, Dict
+import seaborn as sns  # type: ignore[import-untyped]
+from typing import Callable, Dict, List, Tuple, cast
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 
 
-def _fno_iv_flat(params: torch.Tensor, model: torch.nn.Module, T_grid: torch.Tensor, K_grid: torch.Tensor) -> torch.Tensor:
-    """
-    Pure-function wrapper: maps params (6,) -> IV surface flattened (T*K,).
-    Uses functional_call to trace through model parameters.
-    """
-    params_dict = dict(model.named_parameters())
-    device = params.device
-
-    # Load normalizers v2 once
+def _load_v2_normalizer_tensors(
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Loads v2 parameter and IV surface normalizer tensors on the target device."""
     from deepvol.calibration import calibrate_bfgs as cb
     if cb._ROOT_DIR.endswith("src/deepvol"):
         cb._ROOT_DIR = os.path.dirname(os.path.dirname(cb._ROOT_DIR))
     cb._load_normalizers(version="v2")
-
+    assert cb._param_norm is not None and cb._iv_norm is not None
 
     pn_mean = torch.tensor(cb._param_norm.mean, dtype=torch.float32, device=device)
-    pn_std  = torch.tensor(cb._param_norm.std,  dtype=torch.float32, device=device)
+    pn_std = torch.tensor(cb._param_norm.std, dtype=torch.float32, device=device)
     yn_mean = torch.tensor(cb._iv_norm.mean, dtype=torch.float32, device=device)
-    yn_std  = torch.tensor(cb._iv_norm.std,  dtype=torch.float32, device=device)
+    yn_std = torch.tensor(cb._iv_norm.std, dtype=torch.float32, device=device)
+    return pn_mean, pn_std, yn_mean, yn_std
+
+
+def _eval_fno_iv_flat(
+    params: torch.Tensor,
+    model: torch.nn.Module,
+    params_dict: Dict[str, torch.Tensor],
+    T_grid: torch.Tensor,
+    K_grid: torch.Tensor,
+    pn_mean: torch.Tensor,
+    pn_std: torch.Tensor,
+    yn_mean: torch.Tensor,
+    yn_std: torch.Tensor,
+) -> torch.Tensor:
+    device = params.device
 
     # Clamp volatility parameters (sigma and v0) to prevent Durrleman singularities (>= 0.01)
     p6_clamped = params.clone()
@@ -54,20 +62,32 @@ def _fno_iv_flat(params: torch.Tensor, model: torch.nn.Module, T_grid: torch.Ten
         torch.clamp(p6_clamped[2:3], min=0.01),  # sigma
         p6_clamped[3:4],
         torch.clamp(p6_clamped[4:5], min=0.01),  # v0
-        p6_clamped[5:6]
+        p6_clamped[5:6],
     ])
 
     # Normalize T and K coordinates matching the FNO training distribution
     T_norm = (T_grid - T_grid.mean()) / (T_grid.std() + 1e-8)
     K_norm = K_grid / 0.5
-    T_mesh, K_mesh = torch.meshgrid(T_norm, K_norm, indexing='ij')
+    T_mesh, K_mesh = torch.meshgrid(T_norm, K_norm, indexing="ij")
     spatial = torch.stack([T_mesh, K_mesh], dim=-1).unsqueeze(0).to(device)  # (1, T, K, 2)
 
     p_norm = (p6_clamped - pn_mean) / pn_std
-    iv_norm = functional_call(model, params_dict, (spatial, p_norm.unsqueeze(0)))
+    iv_norm = cast(torch.Tensor, functional_call(model, params_dict, (spatial, p_norm.unsqueeze(0))))
     iv_real = iv_norm * yn_std + yn_mean
     iv_real = torch.clamp(iv_real, min=1e-6)
     return iv_real.squeeze(0).reshape(-1)
+
+
+def _fno_iv_flat(params: torch.Tensor, model: torch.nn.Module, T_grid: torch.Tensor, K_grid: torch.Tensor) -> torch.Tensor:
+    """
+    Pure-function wrapper: maps params (6,) -> IV surface flattened (T*K,).
+    Uses functional_call to trace through model parameters.
+    """
+    params_dict = cast(Dict[str, torch.Tensor], dict(model.named_parameters()))
+    pn_mean, pn_std, yn_mean, yn_std = _load_v2_normalizer_tensors(params.device)
+    return _eval_fno_iv_flat(
+        params, model, params_dict, T_grid, K_grid, pn_mean, pn_std, yn_mean, yn_std
+    )
 
 
 def compute_greeks(
@@ -103,41 +123,16 @@ def compute_greeks(
         _ = check_compliance(params_np)
     
     # Load normalizers v2 once
-    from deepvol.calibration import calibrate_bfgs as cb
-    if cb._ROOT_DIR.endswith("src/deepvol"):
-        cb._ROOT_DIR = os.path.dirname(os.path.dirname(cb._ROOT_DIR))
-    cb._load_normalizers(version="v2")
-
-    pn_mean = torch.tensor(cb._param_norm.mean, dtype=torch.float32, device=device)
-    pn_std  = torch.tensor(cb._param_norm.std,  dtype=torch.float32, device=device)
-    yn_mean = torch.tensor(cb._iv_norm.mean, dtype=torch.float32, device=device)
-    yn_std  = torch.tensor(cb._iv_norm.std,  dtype=torch.float32, device=device)
+    pn_mean, pn_std, yn_mean, yn_std = _load_v2_normalizer_tensors(device)
 
     # Extract model parameters for functional tracing
-    params_dict = dict(model.named_parameters())
+    params_dict = cast(Dict[str, torch.Tensor], dict(model.named_parameters()))
 
     # Differentiable forward pass closing over params_dict
-    def _iv_flat_fn(p):
-        p6_clamped = p.clone()
-        p6_clamped = torch.cat([
-            p6_clamped[0:2],
-            torch.clamp(p6_clamped[2:3], min=0.01),  # sigma
-            p6_clamped[3:4],
-            torch.clamp(p6_clamped[4:5], min=0.01),  # v0
-            p6_clamped[5:6]
-        ])
-
-        # Normalize T and K coordinates matching the FNO training distribution
-        T_norm = (T_grid - T_grid.mean()) / (T_grid.std() + 1e-8)
-        K_norm = K_grid / 0.5
-        T_mesh, K_mesh = torch.meshgrid(T_norm, K_norm, indexing='ij')
-        spatial = torch.stack([T_mesh, K_mesh], dim=-1).unsqueeze(0).to(device)  # (1, T, K, 2)
-
-        p_norm = (p6_clamped - pn_mean) / pn_std
-        iv_norm = functional_call(model, params_dict, (spatial, p_norm.unsqueeze(0)))
-        iv_real = iv_norm * yn_std + yn_mean
-        iv_real = torch.clamp(iv_real, min=1e-6)
-        return iv_real.squeeze(0).reshape(-1)
+    def _iv_flat_fn(p: torch.Tensor) -> torch.Tensor:
+        return _eval_fno_iv_flat(
+            p, model, params_dict, T_grid, K_grid, pn_mean, pn_std, yn_mean, yn_std
+        )
 
     # Free fragmented GPU memory before heavy AD computation (CC-C1 fix)
     if params.is_cuda:
@@ -149,21 +144,24 @@ def compute_greeks(
     n_total = nT * nK
     chunk_size = 22  # Process ~22 grid points at a time (safe for 6 GB GPU)
 
-    volga_chunks = []
-    vanna_chunks = []
+    volga_chunks: List[torch.Tensor] = []
+    vanna_chunks: List[torch.Tensor] = []
 
     for start in range(0, n_total, chunk_size):
         end = min(start + chunk_size, n_total)
 
         # Inner function outputs ONLY the chunk slice — jacrev differentiates
         # only chunk_size outputs, not the full 88-element surface.
-        def _iv_chunk_fn(p, _s=start, _e=end):
+        def _iv_chunk_fn(p: torch.Tensor, _s: int = start, _e: int = end) -> torch.Tensor:
             return _iv_flat_fn(p)[_s:_e]  # shape (chunk,)
 
         # First-order: jacrev over the small chunk → (chunk, 6) Jacobian
-        def _dIV_dsigma_chunk(p, _fn=_iv_chunk_fn):
+        def _dIV_dsigma_chunk(
+            p: torch.Tensor,
+            _fn: Callable[[torch.Tensor], torch.Tensor] = _iv_chunk_fn,
+        ) -> torch.Tensor:
             J = jacrev(_fn, argnums=0)(p)
-            return J[:, SIGMA_IDX]  # shape (chunk,)
+            return cast(torch.Tensor, J[:, SIGMA_IDX])  # shape (chunk,)
 
         # Second-order: jacfwd over the small first-order → (chunk, 6)
         H_chunk = jacfwd(_dIV_dsigma_chunk, argnums=0)(params)
@@ -184,7 +182,7 @@ def compute_greeks(
     return volga, vanna
 
 
-def main():
+def main() -> None:
     print("Testing Vectorized Autograd Greeks Engine...")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

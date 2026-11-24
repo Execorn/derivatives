@@ -18,11 +18,13 @@ Mathematical Formulations:
 """
 
 import logging
+import math
 import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from deepvol.surrogates.fno_model import SpectralConv2d, FiLMGenerator
 
@@ -198,7 +200,7 @@ class SignatureNeuralSDE(nn.Module):
     @property
     def rho(self) -> torch.Tensor:
         # Enforce range [-0.95, -0.05]
-        return -0.05 - 0.90 * torch.sigmoid(self.raw_rho)
+        return cast(torch.Tensor, -0.05 - 0.90 * torch.sigmoid(self.raw_rho))
         
     def simulate_paths(
         self,
@@ -263,6 +265,14 @@ class SignatureNeuralSDE(nn.Module):
 
 # ─── Option Pricing & Implied Volatility Inversion ─────────────────────────────
 
+def _normal_cdf(x: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+
+
+def _normal_pdf(x: torch.Tensor) -> torch.Tensor:
+    return torch.exp(-0.5 * x**2) / math.sqrt(2.0 * math.pi)
+
+
 def black_scholes_call(
     S0: torch.Tensor,
     K: torch.Tensor,
@@ -280,8 +290,7 @@ def black_scholes_call(
     d1 = (torch.log(S0 / K) + (r + 0.5 * sigma**2) * T) / (sigma * torch.sqrt(T) + 1e-12)
     d2 = d1 - sigma * torch.sqrt(T)
     
-    normal_cdf = lambda x: 0.5 * (1.0 + torch.erf(x / np.sqrt(2.0)))
-    return S0 * normal_cdf(d1) - K * torch.exp(-r * T) * normal_cdf(d2)
+    return S0 * _normal_cdf(d1) - K * torch.exp(-r * T) * _normal_cdf(d2)
 
 
 def black_scholes_vega(
@@ -293,8 +302,7 @@ def black_scholes_vega(
 ) -> torch.Tensor:
     """Vega (derivative w.r.t volatility) of European call."""
     d1 = (torch.log(S0 / K) + (r + 0.5 * sigma**2) * T) / (sigma * torch.sqrt(T) + 1e-12)
-    normal_pdf = lambda x: torch.exp(-0.5 * x**2) / np.sqrt(2.0 * np.pi)
-    return S0 * torch.sqrt(T) * normal_pdf(d1)
+    return S0 * torch.sqrt(T) * _normal_pdf(d1)
 
 
 def implied_volatility(
@@ -563,14 +571,14 @@ class ModelRiskGuardian:
     Tracks parameter drift using Population Stability Index (PSI),
     detects out-of-distribution (OOD) parameter inputs, and routes to robust fallbacks.
     """
-    def __init__(self, expected_prior: np.ndarray, param_names: Optional[list] = None):
+    def __init__(self, expected_prior: npt.NDArray[Any], param_names: Optional[List[str]] = None) -> None:
         self.expected_prior = expected_prior
         if param_names is None:
             self.param_names = [f"param_{i}" for i in range(len(expected_prior))]
         else:
             self.param_names = param_names
             
-    def compute_psi(self, actual: np.ndarray, expected: np.ndarray, num_bins: int = 10) -> float:
+    def compute_psi(self, actual: npt.NDArray[Any], expected: npt.NDArray[Any], num_bins: int = 10) -> float:
         """Computes the Population Stability Index (PSI) between two samples."""
         combined = np.concatenate([actual, expected])
         bins = np.percentile(combined, np.linspace(0, 100, num_bins + 1))
@@ -593,7 +601,7 @@ class ModelRiskGuardian:
         psi = np.sum((act_pcts - exp_pcts) * np.log(act_pcts / exp_pcts))
         return float(psi)
         
-    def log_and_verify_drift(self, calibrated_history: np.ndarray) -> Dict[str, float]:
+    def log_and_verify_drift(self, calibrated_history: npt.NDArray[Any]) -> Dict[str, float]:
         """
         Verifies drift for all linear drivers and parameter coefficients.
         Logs violations under SR 26-2.

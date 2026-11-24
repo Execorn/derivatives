@@ -34,6 +34,8 @@ No-arbitrage regularization (updated 2026-06-11):
   Calendar spread now divides by ΔT for grid-independent penalty magnitude.
 """
 
+from typing import Tuple, cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,7 +44,7 @@ import torch.nn.functional as F
 # ─── Spectral Convolution ────────────────────────────────────────────────────
 
 class SpectralConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, modes1, modes2):
+    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int) -> None:
         super().__init__()
         self.in_channels  = in_channels
         self.out_channels = out_channels
@@ -54,8 +56,7 @@ class SpectralConv2d(nn.Module):
         self.weights2 = nn.Parameter(
             scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat))
 
-    def forward(self, x):
-        B = x.shape[0]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_ft  = torch.fft.rfft2(x)
         
         part1 = torch.einsum(
@@ -71,7 +72,7 @@ class SpectralConv2d(nn.Module):
         column = torch.cat([slice1, part2], dim=2)
         
         out_ft = torch.nn.functional.pad(column, (0, W - self.modes2))
-        return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+        return cast(torch.Tensor, torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1))))
 
 
 # ─── FiLM Generator ──────────────────────────────────────────────────────────
@@ -107,12 +108,14 @@ class FiLMGenerator(nn.Module):
         # near-identity at init while maintaining live gradient paths to all 6
         # input parameters.  Zero weights would zero theta.grad entirely.
         with torch.no_grad():
-            self.mlp[-1].weight.mul_(0.01)
-            bias = self.mlp[-1].bias
+            last_layer = cast(nn.Linear, self.mlp[-1])
+            last_layer.weight.mul_(0.01)
+            bias = last_layer.bias
+            assert bias is not None
             bias[:width * n_layers].fill_(1.0)   # γ → 1 (identity scale)
             bias[width * n_layers:].fill_(0.0)   # β → 0 (zero shift)
 
-    def forward(self, theta: torch.Tensor):
+    def forward(self, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         theta: (B, 6) — z-score normalised parameters
 
@@ -254,12 +257,12 @@ class MirrorPaddedFNO2d(nn.Module):
 
         # 7. Return raw normalised IV (no softplus — targets are z-score normalised
         #    and can be negative; positivity is enforced after denormalisation)
-        return out.squeeze(-1)                    # (B, T, K)
+        return cast(torch.Tensor, out.squeeze(-1))                    # (B, T, K)
 
 
 # ─── Utility losses (unchanged) ──────────────────────────────────────────────
 
-def martingale_loss_prior(S_paths, r=0.0, dt=1/252.0):
+def martingale_loss_prior(S_paths: torch.Tensor, r: float = 0.0, dt: float = 1/252.0) -> torch.Tensor:
     """
     Post-hoc validation tool for the CUDA SDE engine.
     Not used in FNO training (requires path-level data not available per batch).
@@ -427,7 +430,7 @@ class MirrorPaddedFNO2dWithAttention(nn.Module):
         self.q = nn.Linear(width, out_channels)
 
     @staticmethod
-    def _film_modulate(h, gamma, beta):
+    def _film_modulate(h: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         g = gamma.unsqueeze(-1).unsqueeze(-1)
         b = beta.unsqueeze(-1).unsqueeze(-1)
         return F.elu(g * h + b)
@@ -462,7 +465,7 @@ class MirrorPaddedFNO2dWithAttention(nn.Module):
 
         out = self.q(x_ext)                            # (B, 2T, K, 1)
         out = out[:, :original_T, :, :]                # truncate mirror: (B, T, K, 1)
-        return out.squeeze(-1)                         # (B, T, K)
+        return cast(torch.Tensor, out.squeeze(-1))     # (B, T, K)
 
 
 if __name__ == '__main__':
@@ -480,7 +483,8 @@ if __name__ == '__main__':
         out   = model(spatial, theta)
         n_p   = sum(p.numel() for p in model.parameters())
         assert out.shape == (B, T, K), f"{name}: shape mismatch {out.shape}"
-        loss  = out.mean(); loss.backward()
+        loss  = out.mean()
+        loss.backward()
         dead  = [n for n, p in model.named_parameters() if p.grad is None]
         assert not dead, f"{name}: dead params: {dead}"
         print(f'{name}: {n_p:,} params  OK')

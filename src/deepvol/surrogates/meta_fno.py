@@ -40,11 +40,7 @@ class MetaFNO2d(nn.Module):
         self.fc1 = nn.Linear(self.width, 128)
         self.fc2 = nn.Linear(128, 1)
 
-    @torch.compile(mode="reduce-overhead")
-    def _forward_core_compiled(self, grid_inputs: torch.Tensor) -> torch.Tensor:
-        """
-        Compiled internal method running the frozen core layers.
-        """
+    def _forward_core_uncompiled(self, grid_inputs: torch.Tensor) -> torch.Tensor:
         x = self.fc0(grid_inputs)  # [Batch, N_K, N_T, width]
         x = x.permute(0, 3, 1, 2)  # [Batch, width, N_K, N_T]
 
@@ -58,27 +54,45 @@ class MetaFNO2d(nn.Module):
         x3 = x3.permute(0, 2, 3, 1)  # [Batch, N_K, N_T, width]
         return x3
 
+    @torch.compile(mode="reduce-overhead", dynamic=False)
+    def _forward_core_compiled(self, grid_inputs: torch.Tensor) -> torch.Tensor:
+        """
+        Compiled internal method running the frozen core layers.
+        """
+        return self._forward_core_uncompiled(grid_inputs)
+
     def forward_core(self, grid_inputs: torch.Tensor) -> torch.Tensor:
         """
         Runs the frozen core layers of the FNO and returns extracted spatial features.
         Clones the tensor outside of torch.compile() to prevent CUDAGraphs buffer overwrites.
         """
+        if (
+            not grid_inputs.is_cuda
+            or grid_inputs.requires_grad
+            or torch.is_grad_enabled()
+        ):
+            return self._forward_core_uncompiled(grid_inputs)
         return self._forward_core_compiled(grid_inputs).clone()
 
-    @torch.compile(mode="reduce-overhead")
+    def _forward_mlp_uncompiled(self, core_features: torch.Tensor) -> torch.Tensor:
+        x4 = torch.tanh(self.fc1(core_features))  # [Batch, N_K, N_T, 128]
+        out: torch.Tensor = self.fc2(x4).squeeze(-1)  # [Batch, N_K, N_T]
+        return out
+
+    @torch.compile(mode="reduce-overhead", dynamic=False)
     def _forward_mlp_compiled(self, core_features: torch.Tensor) -> torch.Tensor:
         """
         Compiled internal method running the adaptable output MLP layers.
         """
-        x4 = torch.tanh(self.fc1(core_features))  # [Batch, N_K, N_T, 128]
-        out = self.fc2(x4).squeeze(-1)  # [Batch, N_K, N_T]
-        return out
+        return self._forward_mlp_uncompiled(core_features)
 
     def forward_mlp(self, core_features: torch.Tensor) -> torch.Tensor:
         """
         Runs only the adaptable output MLP layers.
         Clones the tensor outside of torch.compile() to prevent CUDAGraphs buffer overwrites.
         """
+        if not core_features.is_cuda:
+            return self._forward_mlp_uncompiled(core_features)
         return self._forward_mlp_compiled(core_features).clone()
 
     def forward(self, grid_inputs: torch.Tensor) -> torch.Tensor:

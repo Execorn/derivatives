@@ -6,8 +6,9 @@ Output normalizer applies min-max scaling to [0, 1] across NPV, early call proba
 and expected note life.
 """
 
-from typing import List, Optional, Union
+from typing import Any, List, Optional, cast
 import numpy as np
+import numpy.typing as npt
 import torch
 
 
@@ -31,34 +32,35 @@ class AutocallInputNormalizer:
     ]
 
     def __init__(self) -> None:
-        self.mean: Optional[np.ndarray] = None
-        self.std: Optional[np.ndarray] = None
+        self.mean: Optional[npt.NDArray[Any]] = None
+        self.std: Optional[npt.NDArray[Any]] = None
 
-    def fit(self, X: np.ndarray) -> "AutocallInputNormalizer":
+    def fit(self, X: npt.NDArray[Any]) -> "AutocallInputNormalizer":
         """Fit mean and standard deviation from numpy array of shape (N, 10)."""
         X_arr = np.asarray(X, dtype=np.float64)
         self.mean = np.mean(X_arr, axis=0).astype(np.float32)
-        self.std = np.std(X_arr, axis=0).astype(np.float32)
+        std = np.std(X_arr, axis=0).astype(np.float32)
         # Guard against zero variance
-        self.std[self.std < 1e-8] = 1.0
+        std[std < 1e-8] = 1.0
+        self.std = std
         return self
 
-    def transform(self, X: np.ndarray) -> np.ndarray:
+    def transform(self, X: npt.NDArray[Any]) -> npt.NDArray[Any]:
         """Transform raw inputs to z-scored float32 array."""
         if self.mean is None or self.std is None:
             raise ValueError("AutocallInputNormalizer is not fitted yet.")
         X_arr = np.asarray(X, dtype=np.float32)
-        return ((X_arr - self.mean) / self.std).astype(np.float32)
+        return cast(npt.NDArray[Any], ((X_arr - self.mean) / self.std).astype(np.float32))
 
-    def inverse_transform(self, X_norm: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, X_norm: npt.NDArray[Any]) -> npt.NDArray[Any]:
         """Invert z-scored array back to real parameter space."""
         if self.mean is None or self.std is None:
             raise ValueError("AutocallInputNormalizer is not fitted yet.")
         X_arr = np.asarray(X_norm, dtype=np.float32)
-        return (X_arr * self.std + self.mean).astype(np.float32)
+        return cast(npt.NDArray[Any], (X_arr * self.std + self.mean).astype(np.float32))
 
     def to_tensor(
-        self, X: np.ndarray, device: Optional[torch.device] = None
+        self, X: npt.NDArray[Any], device: Optional[torch.device] = None
     ) -> torch.Tensor:
         """Transform raw inputs to a float32 PyTorch tensor on target device."""
         transformed = self.transform(X)
@@ -110,10 +112,10 @@ class AutocallOutputNormalizer:
     TARGET_NAMES: List[str] = ["npv", "call_prob", "exp_life"]
 
     def __init__(self) -> None:
-        self.min_val: Optional[np.ndarray] = None
-        self.max_val: Optional[np.ndarray] = None
+        self.min_val: Optional[npt.NDArray[Any]] = None
+        self.max_val: Optional[npt.NDArray[Any]] = None
 
-    def fit(self, Y: np.ndarray) -> "AutocallOutputNormalizer":
+    def fit(self, Y: npt.NDArray[Any]) -> "AutocallOutputNormalizer":
         """Fit min and max values from numpy array of shape (N, 3)."""
         Y_arr = np.asarray(Y, dtype=np.float64)
         self.min_val = np.min(Y_arr, axis=0).astype(np.float32)
@@ -123,24 +125,24 @@ class AutocallOutputNormalizer:
         diff[diff < 1e-8] = 1.0
         return self
 
-    def transform(self, Y: np.ndarray) -> np.ndarray:
+    def transform(self, Y: npt.NDArray[Any]) -> npt.NDArray[Any]:
         """Scale targets into [0, 1]."""
         if self.min_val is None or self.max_val is None:
             raise ValueError("AutocallOutputNormalizer is not fitted yet.")
         Y_arr = np.asarray(Y, dtype=np.float32)
         range_val = self.max_val - self.min_val
-        return ((Y_arr - self.min_val) / range_val).astype(np.float32)
+        return cast(npt.NDArray[Any], ((Y_arr - self.min_val) / range_val).astype(np.float32))
 
-    def inverse_transform(self, Y_norm: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, Y_norm: npt.NDArray[Any]) -> npt.NDArray[Any]:
         """Unscale targets from [0, 1] back to real domain."""
         if self.min_val is None or self.max_val is None:
             raise ValueError("AutocallOutputNormalizer is not fitted yet.")
         Y_arr = np.asarray(Y_norm, dtype=np.float32)
         range_val = self.max_val - self.min_val
-        return (Y_arr * range_val + self.min_val).astype(np.float32)
+        return cast(npt.NDArray[Any], (Y_arr * range_val + self.min_val).astype(np.float32))
 
     def to_tensor(
-        self, Y: np.ndarray, device: Optional[torch.device] = None
+        self, Y: npt.NDArray[Any], device: Optional[torch.device] = None
     ) -> torch.Tensor:
         """Transform raw targets to a float32 PyTorch tensor on target device."""
         transformed = self.transform(Y)

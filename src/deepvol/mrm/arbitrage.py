@@ -2,10 +2,16 @@
 arbitrage.py — Vectorized static calendar and butterfly arbitrage checks for implied volatility surfaces.
 """
 
-import numpy as np
-import scipy.stats as stats
+import math
+from typing import Any, Dict, List, Tuple, Union, cast, overload
 
-def check_calendar_arbitrage(iv_surface: np.ndarray, T_grid: np.ndarray) -> dict:
+import numpy as np
+import numpy.typing as npt
+import scipy.optimize as optimize
+import scipy.stats as stats
+import torch
+
+def check_calendar_arbitrage(iv_surface: npt.NDArray[Any], T_grid: npt.NDArray[Any]) -> Dict[str, Any]:
     """
     Check calendar spread arbitrage: total variance w(T, k) = iv^2 * T must be non-decreasing in T.
     
@@ -39,7 +45,9 @@ def check_calendar_arbitrage(iv_surface: np.ndarray, T_grid: np.ndarray) -> dict
         "violations": violations
     }
 
-def check_butterfly_arbitrage_durrleman(iv_surface: np.ndarray, K_grid: np.ndarray, T_grid: np.ndarray) -> dict:
+def check_butterfly_arbitrage_durrleman(
+    iv_surface: npt.NDArray[Any], K_grid: npt.NDArray[Any], T_grid: npt.NDArray[Any]
+) -> Dict[str, Any]:
     """
     Check butterfly arbitrage using Durrleman's condition on total variance w(k, T):
     g(k) = (1 - k*w'/(2*w))^2 - (w')^2/4 * (1/w + 1/4) + w''/2 >= 0
@@ -115,7 +123,7 @@ def check_butterfly_arbitrage_durrleman(iv_surface: np.ndarray, K_grid: np.ndarr
         "g_values": g
     }
 
-def construct_butterfly_matrix(K: np.ndarray) -> np.ndarray:
+def construct_butterfly_matrix(K: npt.NDArray[Any]) -> npt.NDArray[Any]:
     """
     Constructs the tridiagonal convexity check matrix M_but of shape (m-2, m).
     M_but @ C.T computes the convexity term at interior points.
@@ -129,7 +137,9 @@ def construct_butterfly_matrix(K: np.ndarray) -> np.ndarray:
         M[i, i + 2] = 1.0 / h[i+1]
     return M
 
-def check_butterfly_arbitrage_price(iv_surface: np.ndarray, K_grid: np.ndarray, T_grid: np.ndarray, S: float = 1.0) -> dict:
+def check_butterfly_arbitrage_price(
+    iv_surface: npt.NDArray[Any], K_grid: npt.NDArray[Any], T_grid: npt.NDArray[Any], S: float = 1.0
+) -> Dict[str, Any]:
     """
     Check butterfly arbitrage by pricing European call options and verifying convexity of prices.
     Uses tridiagonal convexity matrix operator M_but for fast vectorization.
@@ -194,7 +204,9 @@ def check_butterfly_arbitrage_price(iv_surface: np.ndarray, K_grid: np.ndarray, 
         "d2C": d2C
     }
 
-def check_arbitrage(iv_surface: np.ndarray, K_grid: np.ndarray, T_grid: np.ndarray, S: float = 1.0) -> dict:
+def check_arbitrage(
+    iv_surface: npt.NDArray[Any], K_grid: npt.NDArray[Any], T_grid: npt.NDArray[Any], S: float = 1.0
+) -> Dict[str, Any]:
     """
     Combined check for calendar and butterfly arbitrage.
     
@@ -214,9 +226,6 @@ def check_arbitrage(iv_surface: np.ndarray, K_grid: np.ndarray, T_grid: np.ndarr
         "butterfly_price": but_prc
     }
 
-import torch
-import scipy.optimize as optimize
-
 def invert_black_scholes_vectorized(
     C: torch.Tensor,
     S: torch.Tensor,
@@ -230,7 +239,6 @@ def invert_black_scholes_vectorized(
     Clamps the minimum volatility parameter to 0.01 to prevent Durrleman singularities.
     Operates strictly in torch.float64.
     """
-    import math
     # 1. Cast all inputs to torch.float64
     C_d = C.to(torch.float64)
     S_d = S.to(torch.float64) if isinstance(S, torch.Tensor) else torch.tensor(S, dtype=torch.float64, device=C.device)
@@ -278,12 +286,30 @@ def invert_black_scholes_vectorized(
         
     return vol
 
+@overload
 def project_arbitrage_free(
-    iv_surface: np.ndarray,
-    K_grid: np.ndarray,
-    T_grid: np.ndarray,
+    iv_surface: npt.NDArray[Any],
+    K_grid: npt.NDArray[Any],
+    T_grid: npt.NDArray[Any],
     S: float = 1.0
-) -> np.ndarray:
+) -> npt.NDArray[Any]: ...
+
+
+@overload
+def project_arbitrage_free(
+    iv_surface: torch.Tensor,
+    K_grid: npt.NDArray[Any],
+    T_grid: npt.NDArray[Any],
+    S: float = 1.0
+) -> torch.Tensor: ...
+
+
+def project_arbitrage_free(
+    iv_surface: Union[npt.NDArray[Any], torch.Tensor],
+    K_grid: npt.NDArray[Any],
+    T_grid: npt.NDArray[Any],
+    S: float = 1.0
+) -> Union[npt.NDArray[Any], torch.Tensor]:
     """
     Project an arbitrated implied volatility surface onto the space of arbitrage-free surfaces
     using a convex Quadratic Programming (QP) projection of Call option prices.
@@ -324,20 +350,20 @@ def project_arbitrage_free(
     
     c_flat = C.flatten()
     
-    def objective(x):
+    def objective(x: npt.NDArray[Any]) -> float:
         diff = x - c_flat
-        return 0.5 * np.sum(diff ** 2)
+        return float(0.5 * np.sum(diff ** 2))
         
-    def jacobian(x):
-        return x - c_flat
+    def jacobian(x: npt.NDArray[Any]) -> npt.NDArray[Any]:
+        return cast(npt.NDArray[Any], x - c_flat)
         
-    bounds = []
+    bounds: List[Tuple[float, float]] = []
     for i in range(M):
         for j in range(N):
-            lb = max(S_val - K_abs[j], 0.0)
+            lb = max(float(S_val - K_abs[j]), 0.0)
             bounds.append((lb, S_val))
             
-    A_list = []
+    A_list: List[npt.NDArray[Any]] = []
     # Butterfly constraints
     for i in range(M):
         h = np.diff(K_abs)
@@ -362,7 +388,7 @@ def project_arbitrage_free(
         lb_con = np.zeros(A.shape[0])
         ub_con = np.full(A.shape[0], np.inf)
         linear_constraint = optimize.LinearConstraint(A, lb_con, ub_con)
-        constraints = [linear_constraint]
+        constraints: List[optimize.LinearConstraint] = [linear_constraint]
     else:
         constraints = []
         
@@ -378,7 +404,7 @@ def project_arbitrage_free(
     
     C_proj = res.x.reshape((M, N))
     
-    device = iv_surface.device if isinstance(iv_surface, torch.Tensor) else "cpu"
+    device: Union[torch.device, str] = iv_surface.device if isinstance(iv_surface, torch.Tensor) else "cpu"
     C_proj_t = torch.tensor(C_proj, dtype=torch.float64, device=device)
     K_abs_t = torch.tensor(np.tile(K_abs, (M, 1)), dtype=torch.float64, device=device)
     T_t = torch.tensor(np.tile(T[:, None], (1, N)), dtype=torch.float64, device=device)
@@ -390,8 +416,7 @@ def project_arbitrage_free(
         T=T_t
     )
     
-    iv_proj = iv_proj_t.cpu().numpy()
-    iv_proj = np.clip(iv_proj, 0.01, None)
+    iv_proj: npt.NDArray[Any] = np.clip(iv_proj_t.cpu().numpy(), 0.01, None)
     
     if isinstance(iv_surface, torch.Tensor):
         return torch.tensor(iv_proj, device=iv_surface.device, dtype=iv_surface.dtype)

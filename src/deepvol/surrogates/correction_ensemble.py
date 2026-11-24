@@ -12,7 +12,7 @@ References:
 """
 
 import os
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Tuple, Union, cast
 import torch
 import torch.nn as nn
 
@@ -63,7 +63,7 @@ class CorrectionEnsemble(nn.Module):
 
     @torch.compile(mode="reduce-overhead")
     def _forward_compiled(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        preds = torch.stack([m._forward_uncompiled(x) for m in self.members], dim=0)
+        preds = torch.stack([cast(CorrectionMLP, m)._forward_uncompiled(x) for m in self.members], dim=0)
         mean_pred = preds.mean(dim=0)
         std_pred = preds.std(dim=0, unbiased=True) if self.K > 1 else torch.zeros_like(mean_pred)
         return mean_pred, std_pred
@@ -87,7 +87,7 @@ class CorrectionEnsemble(nn.Module):
 
     def _forward_uncompiled(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Uncompiled forward pass for autograd and dynamic Jacobian tracking."""
-        preds = torch.stack([m._forward_uncompiled(x) for m in self.members], dim=0)
+        preds = torch.stack([cast(CorrectionMLP, m)._forward_uncompiled(x) for m in self.members], dim=0)
         mean_pred = preds.mean(dim=0)
         std_pred = preds.std(dim=0, unbiased=True) if self.K > 1 else torch.zeros_like(mean_pred)
         return mean_pred, std_pred

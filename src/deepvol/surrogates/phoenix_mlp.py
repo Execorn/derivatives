@@ -11,12 +11,11 @@ Implements:
 """
 
 import os
-import warnings
-from typing import Dict, List, Optional
+from typing import Any, Dict, Optional, cast
 import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class PhoenixInputNormalizer:
@@ -26,40 +25,46 @@ class PhoenixInputNormalizer:
     ]
 
     def __init__(self) -> None:
-        self.mean: Optional[np.ndarray] = None
-        self.std: Optional[np.ndarray] = None
+        self.mean: Optional[npt.NDArray[Any]] = None
+        self.std: Optional[npt.NDArray[Any]] = None
 
-    def fit(self, X: np.ndarray) -> "PhoenixInputNormalizer":
+    def fit(self, X: npt.NDArray[Any]) -> "PhoenixInputNormalizer":
         self.mean = np.mean(X, axis=0, dtype=np.float64).astype(np.float32)
-        self.std = np.std(X, axis=0, dtype=np.float64).astype(np.float32)
-        self.std = np.where(self.std < 1e-8, 1.0, self.std)
+        std = np.std(X, axis=0, dtype=np.float64).astype(np.float32)
+        self.std = np.where(std < 1e-8, 1.0, std)
         return self
 
-    def transform(self, X: np.ndarray) -> np.ndarray:
+    def transform(self, X: npt.NDArray[Any]) -> npt.NDArray[Any]:
         if self.mean is None or self.std is None:
             raise RuntimeError("Normalizer has not been fitted yet.")
-        return ((X - self.mean) / self.std).astype(np.float32)
+        return cast(npt.NDArray[Any], ((X - self.mean) / self.std).astype(np.float32))
 
-    def inverse_transform(self, X_norm: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, X_norm: npt.NDArray[Any]) -> npt.NDArray[Any]:
         if self.mean is None or self.std is None:
             raise RuntimeError("Normalizer has not been fitted yet.")
-        return (X_norm * self.std + self.mean).astype(np.float32)
+        return cast(npt.NDArray[Any], (X_norm * self.std + self.mean).astype(np.float32))
 
     def transform_tensor(self, X: torch.Tensor) -> torch.Tensor:
+        if self.mean is None or self.std is None:
+            raise RuntimeError("Normalizer has not been fitted yet.")
         mean_t = torch.tensor(self.mean, dtype=X.dtype, device=X.device)
         std_t = torch.tensor(self.std, dtype=X.dtype, device=X.device)
         return (X - mean_t) / std_t
 
     def inverse_transform_tensor(self, X_norm: torch.Tensor) -> torch.Tensor:
+        if self.mean is None or self.std is None:
+            raise RuntimeError("Normalizer has not been fitted yet.")
         mean_t = torch.tensor(self.mean, dtype=X_norm.dtype, device=X_norm.device)
         std_t = torch.tensor(self.std, dtype=X_norm.dtype, device=X_norm.device)
         return X_norm * std_t + mean_t
 
-    def to_tensor(self, X: np.ndarray, device: torch.device) -> torch.Tensor:
+    def to_tensor(self, X: npt.NDArray[Any], device: torch.device) -> torch.Tensor:
         X_norm = self.transform(X)
         return torch.tensor(X_norm, dtype=torch.float32, device=device)
 
     def save(self, path: str) -> None:
+        if self.mean is None or self.std is None:
+            raise RuntimeError("Normalizer has not been fitted yet.")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, mean=self.mean, std=self.std)
 
@@ -76,40 +81,47 @@ class PhoenixOutputNormalizer:
     TARGET_NAMES = ["npv", "call_prob", "cpn_prob", "exp_life"]
 
     def __init__(self) -> None:
-        self.min_val: Optional[np.ndarray] = None
-        self.max_val: Optional[np.ndarray] = None
+        self.min_val: Optional[npt.NDArray[Any]] = None
+        self.max_val: Optional[npt.NDArray[Any]] = None
 
-    def fit(self, Y: np.ndarray) -> "PhoenixOutputNormalizer":
-        self.min_val = np.min(Y, axis=0).astype(np.float32)
-        self.max_val = np.max(Y, axis=0).astype(np.float32)
-        diff = self.max_val - self.min_val
+    def fit(self, Y: npt.NDArray[Any]) -> "PhoenixOutputNormalizer":
+        min_val = np.min(Y, axis=0).astype(np.float32)
+        max_val = np.max(Y, axis=0).astype(np.float32)
+        diff = max_val - min_val
         diff = np.where(diff < 1e-8, 1.0, diff)
-        self.max_val = self.min_val + diff
+        self.min_val = min_val
+        self.max_val = min_val + diff
         return self
 
-    def transform(self, Y: np.ndarray) -> np.ndarray:
+    def transform(self, Y: npt.NDArray[Any]) -> npt.NDArray[Any]:
         if self.min_val is None or self.max_val is None:
             raise RuntimeError("Normalizer has not been fitted yet.")
         diff = self.max_val - self.min_val
-        return ((Y - self.min_val) / diff).astype(np.float32)
+        return cast(npt.NDArray[Any], ((Y - self.min_val) / diff).astype(np.float32))
 
-    def inverse_transform(self, Y_norm: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, Y_norm: npt.NDArray[Any]) -> npt.NDArray[Any]:
         if self.min_val is None or self.max_val is None:
             raise RuntimeError("Normalizer has not been fitted yet.")
         diff = self.max_val - self.min_val
-        return (Y_norm * diff + self.min_val).astype(np.float32)
+        return cast(npt.NDArray[Any], (Y_norm * diff + self.min_val).astype(np.float32))
 
     def transform_tensor(self, Y: torch.Tensor) -> torch.Tensor:
+        if self.min_val is None or self.max_val is None:
+            raise RuntimeError("Normalizer has not been fitted yet.")
         min_t = torch.tensor(self.min_val, dtype=Y.dtype, device=Y.device)
         max_t = torch.tensor(self.max_val, dtype=Y.dtype, device=Y.device)
         return (Y - min_t) / (max_t - min_t)
 
     def inverse_transform_tensor(self, Y_norm: torch.Tensor) -> torch.Tensor:
+        if self.min_val is None or self.max_val is None:
+            raise RuntimeError("Normalizer has not been fitted yet.")
         min_t = torch.tensor(self.min_val, dtype=Y_norm.dtype, device=Y_norm.device)
         max_t = torch.tensor(self.max_val, dtype=Y_norm.dtype, device=Y_norm.device)
         return Y_norm * (max_t - min_t) + min_t
 
     def save(self, path: str) -> None:
+        if self.min_val is None or self.max_val is None:
+            raise RuntimeError("Normalizer has not been fitted yet.")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, min_val=self.min_val, max_val=self.max_val)
 
@@ -136,7 +148,7 @@ class PhoenixResidualBlock(nn.Module):
         h = self.act(self.ln(self.fc1(x)))
         h = self.drop(h)
         h = self.fc2(h)
-        return res + h
+        return cast(torch.Tensor, res + h)
 
 
 class PhoenixMLP(nn.Module):
@@ -163,12 +175,12 @@ class PhoenixMLP(nn.Module):
         h = self.in_proj(x)
         for block in self.blocks:
             h = block(h)
-        return self.out_head(h)
+        return cast(torch.Tensor, self.out_head(h))
 
 
 def compute_phoenix_greeks(
     model: PhoenixMLP,
-    x_raw: np.ndarray,
+    x_raw: npt.NDArray[Any],
     norm_in: PhoenixInputNormalizer,
     norm_out: PhoenixOutputNormalizer,
 ) -> Dict[str, float]:
@@ -185,7 +197,7 @@ def compute_phoenix_greeks(
     out_real = norm_out.inverse_transform_tensor(out_norm)
     npv = out_real[0, 0]
 
-    npv.backward()
+    npv.backward()  # type: ignore[no-untyped-call]
     grad = x_tensor.grad
 
     # Feature indices: 4=v0, 5=B_call, 6=B_cpn, 7=coupon, 8=T

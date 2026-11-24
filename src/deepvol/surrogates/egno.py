@@ -26,9 +26,8 @@ References:
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
-from typing import Union
+from typing import Callable, Union, cast
 
 class EGNOLayer(nn.Module):
     """
@@ -36,7 +35,14 @@ class EGNOLayer(nn.Module):
     
     Updates edge and node representation while maintaining permutation equivariance.
     """
-    def __init__(self, node_dim: int, edge_dim: int, global_dim: int, hidden_dim: int, activation=nn.ELU):
+    def __init__(
+        self,
+        node_dim: int,
+        edge_dim: int,
+        global_dim: int,
+        hidden_dim: int,
+        activation: Callable[[], nn.Module] = nn.ELU,
+    ) -> None:
         super().__init__()
         # Edge update MLP: processes [h_i, h_j, e_ij, g_proj]
         # Input size: 2 * node_dim + edge_dim + global_dim
@@ -120,8 +126,8 @@ class EGNO(nn.Module):
                  global_in_dim: int = 2,
                  hidden_dim: int = 64,
                  num_layers: int = 3,
-                 activation=nn.ELU,
-                 validate_psd: Union[bool, str] = 'auto'):
+                 activation: Callable[[], nn.Module] = nn.ELU,
+                 validate_psd: Union[bool, str] = 'auto') -> None:
         """
         Parameters
         ----------
@@ -231,7 +237,7 @@ class EGNO(nn.Module):
         price = self.out_mlp(global_rep)         # (B, 1)
         
         # return clone to prevent CUDAGraph static buffer overwriting under mode="reduce-overhead"
-        return price.clone()
+        return cast(torch.Tensor, price.clone())
 
 
 # ─── GPU-Accelerated SOTA Monte Carlo Pricing Engine ─────────────────────────

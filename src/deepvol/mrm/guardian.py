@@ -4,9 +4,10 @@ guardian.py — Model risk guardian that monitors parameters and intercepts pric
 
 import logging
 import numpy as np
+import numpy.typing as npt
 import torch
 import scipy.stats as stats
-from typing import Union, Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from deepvol.utils.strikes import resolve_strikes
 from deepvol.mrm.arbitrage import check_arbitrage
 from deepvol.models.heston import HestonEngine
@@ -27,7 +28,7 @@ class ModelRiskGuardian:
         residual_limit: float = 0.0150,  # 150 bps
         safe_heston_params: Optional[Dict[str, float]] = None,
         safe_mlsv_params: Optional[Dict[str, float]] = None
-    ):
+    ) -> None:
         self.vol_of_vol_limit = vol_of_vol_limit
         self.hurst_limit = hurst_limit
         self.residual_limit = residual_limit
@@ -47,12 +48,12 @@ class ModelRiskGuardian:
             "rho": -0.7
         }
 
-    def check_parameters(self, model_name: str, parameters: Any, rmse: float = 0.0) -> dict:
+    def check_parameters(self, model_name: str, parameters: Any, rmse: float = 0.0) -> Dict[str, Any]:
         """
         Check calibrated parameters for boundary pinning anomalies and high residuals.
         """
-        anomalies = []
-        params_dict = {}
+        anomalies: List[str] = []
+        params_dict: Dict[str, Any] = {}
         m_name = model_name.lower()
         
         # 1. Parse parameter inputs to dictionary
@@ -129,13 +130,19 @@ class ModelRiskGuardian:
             "params_dict": params_dict
         }
 
-    def check_surface(self, iv_surface: np.ndarray, T_grid: np.ndarray, K_grid: np.ndarray, S: float = 1.0) -> dict:
+    def check_surface(
+        self,
+        iv_surface: npt.NDArray[Any],
+        T_grid: npt.NDArray[Any],
+        K_grid: npt.NDArray[Any],
+        S: float = 1.0,
+    ) -> Dict[str, Any]:
         """
         Check fitted or predicted implied volatility surface for calendar/butterfly arbitrage.
         """
         arb_res = check_arbitrage(iv_surface, K_grid, T_grid, S=S)
         
-        anomalies = []
+        anomalies: List[str] = []
         if arb_res["calendar"]["has_arbitrage"]:
             anomalies.append("Static calendar spread arbitrage detected on surface.")
         if arb_res["butterfly_durrleman"]["has_arbitrage"] or arb_res["butterfly_price"]["has_arbitrage"]:
@@ -150,15 +157,15 @@ class ModelRiskGuardian:
     def price_or_fallback(
         self,
         model_name: str,
-        parameters: Union[dict, np.ndarray, torch.Tensor],
+        parameters: Union[Dict[str, Any], npt.NDArray[Any], torch.Tensor],
         spot: float,
-        strikes: np.ndarray,
-        maturities: np.ndarray,
-        market_iv_surface: Optional[np.ndarray] = None,
+        strikes: npt.NDArray[Any],
+        maturities: npt.NDArray[Any],
+        market_iv_surface: Optional[npt.NDArray[Any]] = None,
         calibration_rmse: float = 0.0,
         fallback_route: str = "fourier",  # 'fourier' or 'particle'
-        **kwargs
-    ) -> dict:
+        **kwargs: Any
+    ) -> Dict[str, Any]:
         """
         Inspect parameters and predicted surface for model risk anomalies and arbitrage.
         If clean: price options normally.
@@ -169,12 +176,11 @@ class ModelRiskGuardian:
         """
         # 1. Run parameter checks
         param_check = self.check_parameters(model_name, parameters, calibration_rmse)
-        anomalies = list(param_check["anomalies"])
-        params_dict = param_check["params_dict"]
+        anomalies: List[str] = list(param_check["anomalies"])
+        params_dict: Dict[str, Any] = param_check["params_dict"]
         
         # 2. Try generating initial surface to check for arbitrage
         iv_surface = None
-        has_surface_arb = False
         
         try:
             if model_name.lower() in ("heston", "rough_heston") and len(params_dict) >= 5:
@@ -197,7 +203,6 @@ class ModelRiskGuardian:
                 surf_check = self.check_surface(iv_surface, maturities, strikes, S=spot)
                 if surf_check["anomaly_detected"]:
                     anomalies.extend(surf_check["anomalies"])
-                    has_surface_arb = True
         except Exception as e:
             anomalies.append(f"Failed to generate check surface: {str(e)}")
             
@@ -205,8 +210,7 @@ class ModelRiskGuardian:
         
         # 3. Handle Fallback Routing if anomalies found
         if anomaly_detected:
-            fallback_triggered = True
-            
+            active_params: Dict[str, Any]
             if fallback_route == "fourier":
                 # Route to exact analytical Fourier-COS solver (HestonEngine)
                 # If parameters were pinned/anomalous, use safe Heston parameters
@@ -217,8 +221,8 @@ class ModelRiskGuardian:
                     active_params = params_dict
                     status = "fallback_fourier_calibrated_params"
                     
-                engine = HestonEngine()
-                fallback_ivs = engine.price_surface(active_params, maturities, strikes, S0=spot)
+                cos_engine = HestonEngine()
+                fallback_ivs = cos_engine.price_surface(active_params, maturities, strikes, S0=spot)
                 
                 # Convert implied volatilities to call prices
                 T_m = maturities[:, None]
@@ -257,7 +261,7 @@ class ModelRiskGuardian:
                     status = "fallback_particle_calibrated_params"
                     
                 # Setup MLSV engine
-                engine = MLSVEngine(
+                mlsv_engine = MLSVEngine(
                     kappa=active_params["kappa"],
                     theta=active_params["theta"],
                     epsilon=active_params["epsilon"],
@@ -283,7 +287,7 @@ class ModelRiskGuardian:
                         K_abs = spot * np.exp(K_val) if (K_val < 0 or K_val < 5.0) else K_val
                         vol_init = np.sqrt(active_params["theta"])
                         
-                        price = engine.price_option(
+                        price = mlsv_engine.price_option(
                             spot=spot,
                             strike=K_abs,
                             maturity=T,
@@ -314,8 +318,8 @@ class ModelRiskGuardian:
             # Clean case: price normally
             # For simplicity, we price with HestonEngine if it is a Heston model
             if model_name.lower() in ("heston", "rough_heston"):
-                engine = HestonEngine()
-                ivs = engine.price_surface(params_dict, maturities, strikes, S0=spot)
+                heston_engine = HestonEngine()
+                ivs = heston_engine.price_surface(params_dict, maturities, strikes, S0=spot)
                 
                 T_m = maturities[:, None]
                 K_m = resolve_strikes(strikes, spot)[None, :]
@@ -358,17 +362,17 @@ def price_to_iv(price: float, S: float, K: float, T: float) -> float:
     if price >= S - 1e-15:
         return 5.0
     
-    def bs_call(sigma):
+    def bs_call(sigma: float) -> float:
         if T <= 0.0 or sigma <= 0.0:
             return max(S - K, 0.0)
         d1 = (np.log(S / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
-        return S * stats.norm.cdf(d1) - K * stats.norm.cdf(d2)
+        return float(S * stats.norm.cdf(d1) - K * stats.norm.cdf(d2))
         
     try:
-        return optimize.brentq(
+        return float(optimize.brentq(
             lambda sigma: bs_call(sigma) - price,
             1e-4, 5.0, xtol=1e-12
-        )
+        ))
     except ValueError:
         return 1e-4

@@ -21,8 +21,9 @@ IVSurfaceNormalizer (per-grid-point z-score):
   training loss, restoring gradient coverage for κ, σ, ρ, H.
 """
 
-import os
+from typing import Any, Optional, cast
 import numpy as np
+import numpy.typing as npt
 import torch
 
 
@@ -34,40 +35,44 @@ class ParameterNormalizer:
 
     PARAM_NAMES = ["kappa", "theta", "sigma", "rho", "v0", "H"]
 
-    def __init__(self):
-        self.mean: np.ndarray | None = None
-        self.std: np.ndarray | None = None
+    def __init__(self) -> None:
+        self.mean: Optional[npt.NDArray[Any]] = None
+        self.std: Optional[npt.NDArray[Any]] = None
 
-    def fit(self, X: np.ndarray) -> "ParameterNormalizer":
+    def fit(self, X: npt.NDArray[Any]) -> "ParameterNormalizer":
         """Fit on training data X of shape (N, 6)."""
         self.mean = X.mean(axis=0)
-        self.std  = X.std(axis=0)
+        std = X.std(axis=0)
         # Guard against degenerate constant parameters
-        self.std[self.std < 1e-4] = 1.0
+        std[std < 1e-4] = 1.0
+        self.std = std
         return self
 
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        assert self.mean is not None, "Call fit() first"
+    def transform(self, X: npt.NDArray[Any]) -> npt.NDArray[Any]:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
         std_safe = np.where(self.std < 1e-4, 1.0, self.std)
-        return (X - self.mean) / std_safe
+        return cast(npt.NDArray[Any], (X - self.mean) / std_safe)
 
-    def inverse_transform(self, X_norm: np.ndarray) -> np.ndarray:
-        assert self.mean is not None, "Call fit() first"
-        return X_norm * self.std + self.mean
+    def inverse_transform(self, X_norm: npt.NDArray[Any]) -> npt.NDArray[Any]:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
+        return cast(npt.NDArray[Any], X_norm * self.std + self.mean)
 
     def transform_tensor(self, t: torch.Tensor) -> torch.Tensor:
         """Transform a torch.Tensor on any device."""
+        assert self.mean is not None and self.std is not None, "Call fit() first"
         mean = torch.tensor(self.mean, dtype=t.dtype, device=t.device)
         std  = torch.tensor(self.std,  dtype=t.dtype, device=t.device)
         std_safe = torch.where(std < 1e-4, torch.ones_like(std), std)
         return (t - mean) / std_safe
 
     def inverse_transform_tensor(self, t: torch.Tensor) -> torch.Tensor:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
         mean = torch.tensor(self.mean, dtype=t.dtype, device=t.device)
         std  = torch.tensor(self.std,  dtype=t.dtype, device=t.device)
         return t * std + mean
 
     def save(self, path: str) -> None:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
         np.savez(path, mean=self.mean, std=self.std)
 
     @classmethod
@@ -75,12 +80,14 @@ class ParameterNormalizer:
         data = np.load(path)
         n = cls()
         n.mean = data["mean"]
-        n.std  = data["std"].copy()
+        std = data["std"].copy()
         # Guard against degenerate constant parameters that have numerical-noise std (< 1e-4)
-        n.std[n.std < 1e-4] = 1.0
+        std[std < 1e-4] = 1.0
+        n.std = std
         return n
 
     def summary(self) -> str:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
         lines = ["ParameterNormalizer (μ ± σ):"]
         for name, m, s in zip(self.PARAM_NAMES, self.mean, self.std):
             lines.append(f"  {name:6s}: {m:.4f} ± {s:.4f}")
@@ -106,36 +113,40 @@ class IVSurfaceNormalizer:
     calibration loss and before any display to the user.
     """
 
-    def __init__(self):
-        self.mean: np.ndarray | None = None   # shape (8, 11)
-        self.std:  np.ndarray | None = None   # shape (8, 11)
+    def __init__(self) -> None:
+        self.mean: Optional[npt.NDArray[Any]] = None   # shape (8, 11)
+        self.std: Optional[npt.NDArray[Any]] = None    # shape (8, 11)
 
-    def fit(self, Y: np.ndarray) -> "IVSurfaceNormalizer":
+    def fit(self, Y: npt.NDArray[Any]) -> "IVSurfaceNormalizer":
         """Fit on training data Y of shape (N, 8, 11)."""
         self.mean = Y.mean(axis=0)   # (8, 11)
-        self.std  = Y.std(axis=0)    # (8, 11)
-        self.std[self.std < 1e-8] = 1.0
+        std = Y.std(axis=0)          # (8, 11)
+        std[std < 1e-8] = 1.0
+        self.std = std
         return self
 
-    def transform(self, Y: np.ndarray) -> np.ndarray:
-        assert self.mean is not None, "Call fit() first"
-        return (Y - self.mean) / self.std
+    def transform(self, Y: npt.NDArray[Any]) -> npt.NDArray[Any]:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
+        return cast(npt.NDArray[Any], (Y - self.mean) / self.std)
 
-    def inverse_transform(self, Y_norm: np.ndarray) -> np.ndarray:
-        assert self.mean is not None, "Call fit() first"
-        return Y_norm * self.std + self.mean
+    def inverse_transform(self, Y_norm: npt.NDArray[Any]) -> npt.NDArray[Any]:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
+        return cast(npt.NDArray[Any], Y_norm * self.std + self.mean)
 
     def transform_tensor(self, t: torch.Tensor) -> torch.Tensor:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
         mean = torch.tensor(self.mean, dtype=t.dtype, device=t.device)
         std  = torch.tensor(self.std,  dtype=t.dtype, device=t.device)
         return (t - mean) / std
 
     def inverse_transform_tensor(self, t: torch.Tensor) -> torch.Tensor:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
         mean = torch.tensor(self.mean, dtype=t.dtype, device=t.device)
         std  = torch.tensor(self.std,  dtype=t.dtype, device=t.device)
         return t * std + mean
 
     def save(self, path: str) -> None:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
         np.savez(path, mean=self.mean, std=self.std)
 
     @classmethod
@@ -147,6 +158,7 @@ class IVSurfaceNormalizer:
         return n
 
     def summary(self) -> str:
+        assert self.mean is not None and self.std is not None, "Call fit() first"
         maturities = [0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0]
         lines = ["IVSurfaceNormalizer — per-maturity avg std:"]
         for i, T in enumerate(maturities):
