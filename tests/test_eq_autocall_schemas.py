@@ -204,7 +204,7 @@ def test_parse_murex_autocall_dag_production_fixture() -> None:
 def test_parse_murex_dag_path_and_dict_inputs() -> None:
     """Verifies `parse_murex_autocall_dag` accepts Path, file path string, and already-resolved dicts."""
     req_from_path, res_from_path = parse_murex_autocall_dag(REQUEST_TXT_PATH)
-    req_from_str_path, _ = parse_murex_autocall_dag(str(REQUEST_TXT_PATH))
+    req_from_str_path, _ = parse_murex_autocall_dag(str(REQUEST_TXT_PATH), allow_file_path=True)
     assert req_from_path.TradeInfo == req_from_str_path.TradeInfo == "45476647/EMTN_CIB_SEC"
 
     dumped = req_from_path.model_dump()
@@ -655,8 +655,13 @@ def test_sch_additional_dag_datetime_and_smile_validation_branches(tmp_path: Pat
     # Dividend validators + cyclical DAG & missing filename path resolution
     from deepvol.api.schemas_eq_autocall import DividendItemSpec, PredefinedDividendsSpec
 
+    dt_ex = datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc)
+    dt_pay = datetime.datetime(2026, 6, 5, tzinfo=datetime.timezone.utc)
     with pytest.raises(ValidationError):
-        DividendItemSpec(ExDate=datetime.date(2026, 6, 1), Amount=-1.0)
+        DividendItemSpec(ExDate=dt_ex, PaymentDate=dt_pay, Amount=-1.0)
+    for bad_amt in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(ValidationError):
+            DividendItemSpec(ExDate=dt_ex, PaymentDate=dt_pay, Amount=bad_amt)
     with pytest.raises(ValidationError):
         PredefinedDividendsSpec(ExDates=[datetime.date(2026, 6, 1)], Amounts=[-1.0])
     with pytest.raises(ValidationError):
@@ -674,7 +679,7 @@ def test_sch_additional_dag_datetime_and_smile_validation_branches(tmp_path: Pat
     with pytest.raises(ValueError, match="cycle"):
         parse_murex_autocall_dag(cyc_file)
 
-    r_rel, _ = parse_murex_autocall_dag("eq_autocallable_request.txt")
+    r_rel, _ = parse_murex_autocall_dag("eq_autocallable_request.txt", allow_file_path=True)
     assert r_rel.TradeInfo == req.TradeInfo
 
     # DAG tokenizer/scalar/stream helpers & anonymous dict + root errors
@@ -700,7 +705,7 @@ def test_sch_additional_dag_datetime_and_smile_validation_branches(tmp_path: Pat
     anon_text = f"{{ Product: {repr(json_d['Product'])}, Model: {repr(json_d['Model'])}, Queries: ['ProductValue'] }}"
     r_anon, _ = parse_murex_autocall_dag(anon_text)
     assert len(r_anon.Product.ObservationDates) == 12
-    with pytest.raises(KeyError):
+    with pytest.raises((ValueError, KeyError)):
         parse_murex_autocall_dag(f"@{'a' * 40}\n{'b' * 40} : {{ Foo: 1 }}")
     with pytest.raises(ValueError):
         parse_murex_autocall_dag("   ")
@@ -778,6 +783,180 @@ def test_sch_additional_dag_datetime_and_smile_validation_branches(tmp_path: Pat
     assert _extract_reference_hash(123, {h_node: {}}) is None
     assert _extract_reference_hash(h_node.upper(), {h_node: {}}) == h_node
     assert _extract_reference_hash("d" * 40, {h_node: {}}) is None
+
+
+def test_schema_audit_blind_spots() -> None:
+    for lfi_or_long in ("/etc/passwd", "x" * 260, "data/autocall/eq_autocallable_request.txt"):
+        with pytest.raises(ValueError):
+            parse_murex_autocall_dag(lfi_or_long)
+
+    req, _ = parse_murex_autocall_dag(REQUEST_TXT_PATH)
+    base_d = req.model_dump(mode="json")
+    base_d.pop("stripped_legacy_fields", None)
+
+    required_indices = {
+        "EquallyWeightedBasket",
+        "SecondWorstOf",
+        "ThirdWorstOf",
+        "SecondBestOf",
+        "MultiPerf",
+        "Lookback",
+        "TwinWin",
+        "Outperformance",
+        "Spread",
+        "Rainbow",
+        "Ratio",
+        "SpreadBestWorst",
+        "SpreadBestAverage",
+        "SpreadAverageWorst",
+    }
+    actual_indices = {m.value for m in MonitoringIndexEnum}
+    assert required_indices.issubset(actual_indices)
+    for idx_name in (
+        "EquallyWeightedBasket",
+        "SecondWorstOf",
+        "ThirdWorstOf",
+        "SecondBestOf",
+        "MultiPerf",
+    ):
+        d_idx = copy.deepcopy(base_d)
+        d_idx["Product"]["CallabilityMonitoringIndex"] = idx_name
+        d_idx["Product"]["CouponBarrierMonitoringIndex"] = idx_name
+        d_idx["Product"]["OptionMonitoringIndex"] = idx_name
+        parsed_idx = EQAutocallableTradeRequest.model_validate(d_idx)
+        assert parsed_idx.Product.CallabilityMonitoringIndex.value == idx_name
+
+    # Currency must survive serialization on dividends and vol smiles.
+    d_ccy = copy.deepcopy(base_d)
+    first_tkr = d_ccy["Product"]["UnderlyingIdentifiers"][0]
+    d_ccy["Model"]["MarketDataSet"]["VolatilitySurfaces"][first_tkr]["Currency"] = "USD"
+    if first_tkr in d_ccy["Model"]["MarketDataSet"].get("Dividends", {}):
+        d_ccy["Model"]["MarketDataSet"]["Dividends"][first_tkr]["Currency"] = "USD"
+    d_ccy["Product"]["PredefinedDividends"] = {
+        first_tkr: {
+            "Currency": "USD",
+            "ExDates": ["2026-12-01"],
+            "Amounts": [1.5],
+        }
+    }
+    req_ccy = EQAutocallableTradeRequest.model_validate(d_ccy)
+    dumped_ccy = req_ccy.model_dump(mode="json")
+    assert dumped_ccy["Model"]["MarketDataSet"]["VolatilitySurfaces"][first_tkr]["Currency"] == "USD"
+    assert dumped_ccy["Product"]["PredefinedDividends"][first_tkr]["Currency"] == "USD"
+    if first_tkr in dumped_ccy["Model"]["MarketDataSet"].get("Dividends", {}):
+        assert dumped_ccy["Model"]["MarketDataSet"]["Dividends"][first_tkr]["Currency"] == "USD"
+
+    # Explicit None values on optional top-level/nested schema fields must coalesce cleanly.
+    d_none_1d = copy.deepcopy(base_d)
+    keep_tkr = first_tkr
+    d_none_1d["Product"]["UnderlyingIdentifiers"] = [keep_tkr]
+    d_none_1d["Product"]["UnderlyingReferenceSpots"] = [d_none_1d["Product"]["UnderlyingReferenceSpots"][0]]
+    d_none_1d["Product"]["DayCountConvention"] = None
+    d_none_1d["Product"]["CallabilityMonitoringIndex"] = None
+    d_none_1d["Product"]["PredefinedDividends"] = None
+    d_none_1d["Model"]["TypeName"] = None
+    d_none_1d["Model"]["FinancingCurveIdentifiers"] = None
+    d_none_1d["Model"]["MarketDataSet"]["Spots"] = {keep_tkr: d_none_1d["Model"]["MarketDataSet"]["Spots"][keep_tkr]}
+    d_none_1d["Model"]["MarketDataSet"]["VolatilitySurfaces"] = {
+        keep_tkr: d_none_1d["Model"]["MarketDataSet"]["VolatilitySurfaces"][keep_tkr]
+    }
+    d_none_1d["Model"]["MarketDataSet"]["Correlations"] = None
+    d_none_1d["Model"]["MarketDataSet"]["RepoSpreadCurves"] = None
+    d_none_1d["Model"]["MarketDataSet"]["Dividends"] = None
+    d_none_1d["Model"]["MarketDataSet"]["Fixings"] = None
+    d_none_1d["stripped_legacy_fields"] = None
+    req_none = EQAutocallableTradeRequest.model_validate(d_none_1d)
+    assert req_none.Product.DayCountConvention == DayCountConventionEnum.Act360
+    assert req_none.Model.TypeName == "DupireLocalVolatilityModel"
+
+    # Ticker-keyed Fixings without Identifier on Pydantic schema + {date_str: float} dict fixings on collapser.
+    from deepvol.models.autocall.seasoned_collapser import collapse_seasoned_schedule
+
+    d_fix = copy.deepcopy(base_d)
+    obs_iso = str(d_fix["Product"]["ObservationDates"][0])
+    d_fix["Model"]["MarketDataSet"]["Fixings"] = {
+        keep_tkr: {"Dates": [obs_iso], "Values": [99.5]},
+    }
+    req_fix = EQAutocallableTradeRequest.model_validate(d_fix)
+    assert req_fix.Model.MarketDataSet.Fixings[keep_tkr].Identifier == keep_tkr
+
+    val_fix = datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc)
+    cs_dict_fix = collapse_seasoned_schedule(
+        as_of_date=val_fix,
+        start_date=val_fix - datetime.timedelta(days=60),
+        observation_dates=[val_fix - datetime.timedelta(days=10), val_fix + datetime.timedelta(days=30)],
+        payment_dates=[val_fix - datetime.timedelta(days=7), val_fix + datetime.timedelta(days=33)],
+        underlying_identifiers=[keep_tkr],
+        underlying_reference_spots=[100.0],
+        spots_t0=[90.0],
+        ko_barriers=[0.95, 1.15],
+        cpn_barriers=[0.80, 0.80],
+        fixed_coupon_amount=0.04,
+        fixings={keep_tkr: {(val_fix - datetime.timedelta(days=10)).date().isoformat(): 99.5}},
+    )
+    assert cs_dict_fix.already_autocalled is True
+
+    from typing import Callable
+
+    # Non-finite values must be rejected across request and response schemas.
+    bad_mutations: list[Callable[[dict[str, Any]], Any]] = [
+        lambda x: x["Product"].__setitem__("Strike", float("nan")),
+        lambda x: x["Product"].__setitem__("OptionGearing", float("inf")),
+        lambda x: x["Product"]["AutoCallTriggerLevels"].__setitem__(0, float("nan")),
+        lambda x: x["Model"]["MarketDataSet"]["Spots"].__setitem__(keep_tkr, float("nan")),
+        lambda x: next(iter(x["Model"]["MarketDataSet"]["RatesCurvesBundles"].values()))["RatesSchedule"][
+            "Rates"
+        ].__setitem__(0, float("inf")),
+        lambda x: x["Model"]["MarketDataSet"]["VolatilitySurfaces"][keep_tkr]["VolatilityQuotes"][0].__setitem__(
+            0, float("nan")
+        ),
+        lambda x: x["Model"]["MarketDataSet"]["Fixings"][keep_tkr]["Values"].__setitem__(0, float("nan")),
+        lambda x: x["Model"]["MarketDataSet"]["Correlations"].__setitem__(
+            next(iter(x["Model"]["MarketDataSet"]["Correlations"])), float("inf")
+        ),
+    ]
+    for mutate in bad_mutations:
+        bad_d = copy.deepcopy(base_d)
+        mutate(bad_d)
+        with pytest.raises(ValidationError):
+            EQAutocallableTradeRequest.model_validate(bad_d)
+
+    with pytest.raises(ValidationError):
+        CashFlowRow(
+            Description="Option",
+            Leg=0,
+            Date=datetime.datetime(2027, 2, 9, tzinfo=datetime.timezone.utc),
+            StatusText="Estimate",
+            Amount=float("nan"),
+        )
+    with pytest.raises(ValidationError):
+        EQAutocallableTradeResponse(ProductValue=float("inf"), ReportingCurrency="RUB")
+
+    cf_intransit = CashFlowRow.model_validate(
+        {
+            "Description": "FundingLeg",
+            "Leg": 0,
+            "Date": "2026-10-30T00:00:00Z",
+            "StatusText": "In-Transit",
+            "Amount": -0.01,
+            "ExpectedValue": None,
+        }
+    )
+    assert cf_intransit.Amount == pytest.approx(-0.01)
+
+    resp_2d = EQAutocallableTradeResponse.model_validate(
+        {
+            "ProductValue": 0.5,
+            "ReportingCurrency": "RUB",
+            "Gamma": {"A": {"A": 0.1, "B": -0.02}, "B": {"A": -0.02, "B": 0.1}},
+            "Cega": {"A": {"B": 0.03}, "B": {"A": 0.03}},
+        }
+    )
+    gamma_map: Any = resp_2d.Gamma
+    cega_map: Any = resp_2d.Cega
+    assert isinstance(gamma_map, dict) and float(gamma_map["A"]["B"]) == pytest.approx(-0.02)
+    assert isinstance(cega_map, dict) and float(cega_map["A"]["B"]) == pytest.approx(0.03)
+
 
 
 

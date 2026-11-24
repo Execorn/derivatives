@@ -665,3 +665,135 @@ def test_egno_v2_modifiers_second_order_sdpa_and_empty_schedule() -> None:
     assert torch.isfinite(out_all_active.stopping_probs).all()
 
 
+def test_egno_audit_blind_spots_shapes_masks_diff_and_runner() -> None:
+    from deepvol.models.autocall.feature_layout import MonitoringIndexCode
+    from deepvol.surrogates.compiled_runner import CompiledSurrogateRunner
+
+    model = MaskedEQAutocallSurrogate(
+        d_max=8, m_max=48, d_model=64, n_egno_layers=2, n_sched_layers=1
+    ).eval()
+    model.zero_init_residual_heads(std=1e-3)
+
+    # forward_residuals supports (14, 10) and (16, 16) feature dims and non-zero double-backward.
+    for d_node_in, d_glob_in in ((14, 10), (16, 16)):
+        nf = torch.randn(2, 6, d_node_in, dtype=torch.float32, requires_grad=True)
+        ef = torch.randn(2, 6, 6, 4, dtype=torch.float32)
+        am = torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
+        sf = torch.rand(2, 8, 12, dtype=torch.float32)
+        sm = torch.tensor(
+            [[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+        )
+        gf = torch.zeros(2, d_glob_in, dtype=torch.float32)
+        dh, dc, dp = model.forward_residuals(nf, ef, am, sf, sm, gf, require_second_order_sdpa=True)
+        assert dh.shape == (2, 8) and dc.shape == (2, 8) and dp.shape == (2,)
+        assert torch.isfinite(dh).all() and torch.isfinite(dp).all()
+        g1 = torch.autograd.grad(dh.sum() + dc.sum() + dp.sum(), nf, create_graph=True)[0]
+        g2 = torch.autograd.grad((g1 * nf.detach()).sum(), nf)[0]
+        assert torch.isfinite(g2).all()
+
+    # m_dim=0, d_dim=0, and all-zero sched_mask (m_rem=0) keep put_loss=0 and outputs finite.
+    out_m0_len = model(
+        torch.randn(2, 4, 16),
+        torch.randn(2, 4, 4, 4),
+        torch.ones(2, 4),
+        torch.zeros(2, 0, 12),
+        torch.zeros(2, 0),
+        torch.zeros(2, 16),
+    )
+    assert out_m0_len.stopping_probs.shape == (2, 0) and torch.all(out_m0_len.put_loss == 0.0)
+
+    out_d0 = model(
+        torch.zeros(2, 4, 16),
+        torch.zeros(2, 4, 4, 4),
+        torch.zeros(2, 4),
+        torch.rand(2, 4, 12),
+        torch.ones(2, 4),
+        torch.zeros(2, 16),
+    )
+    assert (
+        torch.isfinite(out_d0.stopping_probs).all()
+        and torch.isfinite(out_d0.coupon_probs).all()
+        and torch.isfinite(out_d0.put_loss).all()
+    )
+
+    out_mrem0 = model(
+        torch.randn(2, 4, 16),
+        torch.randn(2, 4, 4, 4),
+        torch.ones(2, 4),
+        torch.rand(2, 4, 12),
+        torch.zeros(2, 4),
+        torch.zeros(2, 16),
+    )
+    assert torch.all(out_mrem0.put_loss == 0.0)
+
+    # Non-prefix sched_mask and uncapped Diff* put_loss (L_put > K_put).
+    sf_np = torch.rand(1, 4, 12)
+    sf_np[:, :, int(AutocallSchedCol.DF_PAY)] = 0.95
+    sm_np = torch.tensor([[0.0, 1.0, 0.0, 1.0]], dtype=torch.float32)
+    out_np = model(
+        torch.randn(1, 4, 16),
+        torch.randn(1, 4, 4, 4),
+        torch.ones(1, 4),
+        sf_np,
+        sm_np,
+        torch.zeros(1, 16),
+    )
+    assert (
+        torch.isfinite(out_np.stopping_probs).all()
+        and torch.isfinite(out_np.coupon_probs).all()
+        and torch.isfinite(out_np.put_loss).all()
+    )
+
+    gf_diff = torch.zeros(1, 16, dtype=torch.float32)
+    gf_diff[:, int(AutocallGlobalCol.K_PUT)] = 0.10
+    gf_diff[:, int(AutocallGlobalCol.G_PUT)] = 1.0
+    gf_diff[:, int(AutocallGlobalCol.LOWER_STRIKE)] = -5.0
+    gf_diff[:, int(AutocallGlobalCol.L_PUT_PROXY)] = 0.85
+    gf_diff[:, int(AutocallGlobalCol.OPT_INDEX_ID)] = float(int(MonitoringIndexCode.DIFF_AB))
+    nf_diff = torch.zeros(1, 4, 16, dtype=torch.float32)
+    nf_diff[0, 0, int(AutocallNodeCol.LOG_MONEYNESS)] = math.log(0.50)
+    nf_diff[0, 1, int(AutocallNodeCol.LOG_MONEYNESS)] = math.log(1.50)
+    nf_diff[0, :2, int(AutocallNodeCol.IV_SHORT_ATM)] = 0.25
+    nf_diff[0, :2, int(AutocallNodeCol.IV_TERM_ATM)] = 0.25
+    sf_diff = torch.zeros(1, 4, 12, dtype=torch.float32)
+    sf_diff[0, 0, int(AutocallSchedCol.DF_PAY)] = 1.0
+    sf_diff[0, 0, int(AutocallSchedCol.TAU_OBS)] = 1.0
+    sf_diff[0, 0, int(AutocallSchedCol.LOG_KO_BARRIER)] = math.log(3.0)
+    sf_diff[0, 0, int(AutocallSchedCol.IS_CALLABLE_FLAG)] = 0.0
+    sf_diff[0, 0, int(AutocallSchedCol.LOG_CPN_BARRIER)] = 0.0
+    model_zero = MaskedEQAutocallSurrogate(
+        d_max=8, m_max=48, d_model=32, n_egno_layers=1, n_sched_layers=1
+    ).eval()
+    model_zero.zero_init_residual_heads(std=1e-3)
+    out_diff_raw = model_zero(
+        nf_diff,
+        torch.zeros(1, 4, 4, 4),
+        torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+        sf_diff,
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        gf_diff,
+    )
+    assert float(out_diff_raw.put_loss.item()) > 0.50
+
+    runner = CompiledSurrogateRunner(model, enable_inductor=False, enable_cudagraphs=False)
+    dh_r, dc_r, dp_r = runner.predict_residuals(
+        nf_diff,
+        torch.zeros(1, 4, 4, 4),
+        torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+        sf_diff,
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        gf_diff,
+    )
+    assert torch.isfinite(dh_r).all() and torch.isfinite(dc_r).all() and torch.isfinite(dp_r).all()
+    dh_m0, dc_m0, dp_m0 = runner.predict_residuals(
+        nf_diff,
+        torch.zeros(1, 4, 4, 4),
+        torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+        sf_diff,
+        torch.zeros(1, 4),
+        gf_diff,
+    )
+    assert torch.isfinite(dh_m0).all() and torch.isfinite(dc_m0).all() and torch.isfinite(dp_m0).all()
+
+
+

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Final, Mapping, Sequence
 
 import numpy as np
@@ -25,7 +26,7 @@ HEADER_METADATA_KEY: Final[bytes] = b"deepvol.header"
 SCHEMA_VERSION_METADATA_KEY: Final[bytes] = b"schema_version"
 
 SUPPORTED_ARROW_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"1.0", "2.0"})
-SUPPORTED_D_NODE: Final[frozenset[int]] = frozenset({14, len(AutocallNodeCol)})
+SUPPORTED_D_NODE: Final[frozenset[int]] = frozenset({14, 18, len(AutocallNodeCol)})
 SUPPORTED_D_GLOBAL: Final[frozenset[int]] = frozenset({10, len(AutocallGlobalCol)})
 
 D_MAX_ARROW: Final[int] = D_MAX_DEFAULT
@@ -103,7 +104,10 @@ def _to_contiguous_f64_np(
     if isinstance(val, torch.Tensor):
         arr = val.detach().cpu().to(dtype=torch.float64).contiguous().numpy()
     else:
-        arr = np.ascontiguousarray(val, dtype=np.float64)
+        try:
+            arr = np.ascontiguousarray(val, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Input tensor '{name}' could not be converted to float64: {exc}") from exc
     if not bool(np.all(np.isfinite(arr))):
         raise ValueError(f"Input tensor '{name}' contains non-finite (NaN or Inf) values.")
     return arr
@@ -131,10 +135,27 @@ def _make_1d_f64_column(
     return pa.Array.from_buffers(pa.float64(), batch_size, [None, val_buf])
 
 
+def _parse_strict_int(val: Any, name: str) -> int:
+    if isinstance(val, bool) or not isinstance(val, (int, np.integer)):
+        raise ValueError(f"Arrow header '{name}' must be an integer, got {val!r}.")
+    return int(val)
+
+
+def _parse_finite_float(val: Any, name: str) -> float:
+    if isinstance(val, bool) or not isinstance(val, (int, float, np.number)):
+        raise ValueError(f"Arrow field '{name}' must be numeric, got {val!r}.")
+    out = float(val)
+    if not math.isfinite(out):
+        raise ValueError(f"Arrow field '{name}' must be finite, got {val!r}.")
+    return out
+
+
 def _extract_column_f64_np(
     table: pa.Table,
     col_name: str,
     expected_shape: tuple[int, ...],
+    *,
+    copy_readonly: bool = False,
 ) -> npt.NDArray[np.float64]:
     """Extracts a column from `table` into a `np.float64` array of `expected_shape` safely."""
     if col_name not in table.column_names:
@@ -200,6 +221,8 @@ def _extract_column_f64_np(
             count=expected_numel,
             offset=int(flat_arr.offset) * 8,
         ).reshape(expected_shape)
+        if copy_readonly and not out.flags.writeable:
+            out = out.copy()
     else:
         raw_np = flat_arr.to_numpy(zero_copy_only=False)
         if raw_np.size != expected_numel:
@@ -258,7 +281,7 @@ def encode_eq_autocall_arrow_request(
 
     if node_np.ndim != 3 or node_np.shape[2] not in SUPPORTED_D_NODE:
         raise ValueError(
-            f"Expected node_feats of shape (B, D_max, 14|16), got {node_np.shape}."
+            f"Expected node_feats of shape (B, D_max, 14|16|18), got {node_np.shape}."
         )
     batch_size, d_max, d_node = node_np.shape
     if batch_size < 1 or batch_size > MAX_BATCH_TRADES:
@@ -328,8 +351,11 @@ def encode_eq_autocall_arrow_request(
         names.append("ref_spots")
 
     if pv_in_transit is not None:
-        if isinstance(pv_in_transit, (int, float)):
-            pvit_np = np.full(batch_size, float(pv_in_transit), dtype=np.float64)
+        if isinstance(pv_in_transit, bool):
+            raise ValueError(f"Invalid boolean pv_in_transit={pv_in_transit!r}.")
+        if isinstance(pv_in_transit, (int, float, np.number)):
+            pvit_scalar = _parse_finite_float(pv_in_transit, "pv_in_transit")
+            pvit_np = np.full(batch_size, pvit_scalar, dtype=np.float64)
         else:
             pvit_np = _to_contiguous_f64_np(pv_in_transit, name="pv_in_transit")
             if pvit_np.ndim == 0:
@@ -340,7 +366,7 @@ def encode_eq_autocall_arrow_request(
         names.append("pv_in_transit")
 
     user_meta = dict(metadata_dict) if metadata_dict is not None else {}
-    default_schema_ver = FEATURE_SCHEMA_VERSION if (d_node == 16 and d_global == 16) else "1.0"
+    default_schema_ver = FEATURE_SCHEMA_VERSION if (d_node in (16, 18) and d_global == 16) else "1.0"
     schema_ver = str(user_meta.get("schema_version", default_schema_ver))
     if schema_ver not in SUPPORTED_ARROW_SCHEMA_VERSIONS:
         raise ValueError(
@@ -428,10 +454,11 @@ def decode_eq_autocall_arrow_request(body: bytes) -> DecodedEQAutocallArrowBatch
     if header_raw_bytes is not None:
         try:
             loaded = orjson.loads(header_raw_bytes)
-            if isinstance(loaded, dict):
-                header_dict = loaded
         except Exception as exc:
             raise ValueError(f"Corrupt JSON in Arrow header metadata: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError("Arrow header metadata JSON must decode to an object.")
+        header_dict = loaded
 
     schema_ver = _resolve_arrow_schema_version(raw_meta, header_dict, kind="IPC")
 
@@ -439,8 +466,25 @@ def decode_eq_autocall_arrow_request(body: bytes) -> DecodedEQAutocallArrowBatch
     if batch_size < 1 or batch_size > MAX_BATCH_TRADES:
         raise ValueError(f"Arrow batch row count {batch_size} out of bounds [1, {MAX_BATCH_TRADES}].")
 
-    d_max = int(header_dict.get("d_max", D_MAX_ARROW))
-    m_max = int(header_dict.get("m_max", M_MAX_ARROW))
+    if "d_max" in header_dict:
+        d_max = _parse_strict_int(header_dict["d_max"], "d_max")
+    else:
+        inferred_d = _infer_col_inner_size(table, "asset_mask")
+        if inferred_d is None:
+            inferred_d = _infer_col_inner_size(table, "spots_t0") or _infer_col_inner_size(table, "ref_spots")
+        d_max = inferred_d if inferred_d is not None else D_MAX_ARROW
+
+    if "m_max" in header_dict:
+        m_max = _parse_strict_int(header_dict["m_max"], "m_max")
+    else:
+        inferred_m = _infer_col_inner_size(table, "sched_mask")
+        if inferred_m is None:
+            inferred_sched = _infer_col_inner_size(table, "sched_feats")
+            d_sched_w = len(AutocallSchedCol)
+            if inferred_sched is not None and d_sched_w > 0 and inferred_sched % d_sched_w == 0:
+                inferred_m = inferred_sched // d_sched_w
+        m_max = inferred_m if inferred_m is not None else M_MAX_ARROW
+
     if d_max < 1 or d_max > MAX_D_ARROW:
         raise ValueError(f"Arrow header d_max={d_max} out of bounds [1, {MAX_D_ARROW}].")
     if m_max < 1 or m_max > MAX_M_ARROW:
@@ -451,7 +495,7 @@ def decode_eq_autocall_arrow_request(body: bytes) -> DecodedEQAutocallArrowBatch
 
     inferred_node_inner = _infer_col_inner_size(table, "node_feats")
     if "d_node" in header_dict:
-        d_node = int(header_dict["d_node"])
+        d_node = _parse_strict_int(header_dict["d_node"], "d_node")
     elif inferred_node_inner is not None and inferred_node_inner % d_max == 0:
         d_node = inferred_node_inner // d_max
     else:
@@ -461,7 +505,7 @@ def decode_eq_autocall_arrow_request(body: bytes) -> DecodedEQAutocallArrowBatch
 
     inferred_glob_inner = _infer_col_inner_size(table, "global_feats")
     if "d_global" in header_dict:
-        d_global = int(header_dict["d_global"])
+        d_global = _parse_strict_int(header_dict["d_global"], "d_global")
     elif inferred_glob_inner is not None:
         d_global = inferred_glob_inner
     else:
@@ -549,13 +593,52 @@ def encode_eq_autocall_arrow_response(
     rho_df_np = _to_contiguous_f64_np(batch_out.rho_df, name="rho_df")
     cega_np = _to_contiguous_f64_np(batch_out.cega, name="cega")
 
+    latency_ms_val = _parse_finite_float(latency_ms, "latency_ms")
+    if pv_np.ndim != 1:
+        raise ValueError(f"Expected product_value of shape (B,), got {pv_np.shape}.")
+    if delta_np.ndim != 2:
+        raise ValueError(f"Expected delta of shape (B, D_max), got {delta_np.shape}.")
+    if stop_np.ndim != 2:
+        raise ValueError(f"Expected stopping_probs of shape (B, M_max), got {stop_np.shape}.")
+
     batch_size = int(pv_np.shape[0])
     d_max = int(delta_np.shape[1])
     m_max = int(stop_np.shape[1])
+    if batch_size < 1 or batch_size > MAX_BATCH_TRADES:
+        raise ValueError(f"Response batch_size={batch_size} out of bounds [1, {MAX_BATCH_TRADES}].")
+    if d_max < 1 or d_max > MAX_D_ARROW:
+        raise ValueError(f"Response d_max={d_max} out of bounds [1, {MAX_D_ARROW}].")
+    if m_max < 1 or m_max > MAX_M_ARROW:
+        raise ValueError(f"Response m_max={m_max} out of bounds [1, {MAX_M_ARROW}].")
+
+    if surv_np.shape != (batch_size, m_max):
+        raise ValueError(f"Expected survival_probs of shape {(batch_size, m_max)}, got {surv_np.shape}.")
+    if cpn_np.shape != (batch_size, m_max):
+        raise ValueError(f"Expected coupon_probs of shape {(batch_size, m_max)}, got {cpn_np.shape}.")
+    if put_np.shape != (batch_size,):
+        raise ValueError(f"Expected put_loss of shape {(batch_size,)}, got {put_np.shape}.")
+    if delta_np.shape != (batch_size, d_max):
+        raise ValueError(f"Expected delta of shape {(batch_size, d_max)}, got {delta_np.shape}.")
+    if vega_atm_np.shape not in ((batch_size, d_max, 2), (batch_size, d_max * 2)):
+        raise ValueError(
+            f"Expected vega_atm of shape {(batch_size, d_max, 2)} or {(batch_size, d_max * 2)}, got {vega_atm_np.shape}."
+        )
+    if vega_surf_np.shape not in ((batch_size, d_max, 7), (batch_size, d_max * 7)):
+        raise ValueError(
+            f"Expected vega_surface_feats of shape {(batch_size, d_max, 7)} or {(batch_size, d_max * 7)}, got {vega_surf_np.shape}."
+        )
+    if rho_df_np.shape != (batch_size, m_max):
+        raise ValueError(f"Expected rho_df of shape {(batch_size, m_max)}, got {rho_df_np.shape}.")
+    if cega_np.shape not in ((batch_size, d_max, d_max), (batch_size, d_max * d_max)):
+        raise ValueError(
+            f"Expected cega of shape {(batch_size, d_max, d_max)} or {(batch_size, d_max * d_max)}, got {cega_np.shape}."
+        )
 
     has_cash_gamma = batch_out.cash_gamma_euler is not None
     if batch_out.cash_gamma_euler is not None:
         cg_np = _to_contiguous_f64_np(batch_out.cash_gamma_euler, name="cash_gamma_euler")
+        if cg_np.shape != (batch_size,):
+            raise ValueError(f"Expected cash_gamma_euler of shape {(batch_size,)}, got {cg_np.shape}.")
     else:
         cg_np = np.zeros(batch_size, dtype=np.float64)
 
@@ -597,7 +680,7 @@ def encode_eq_autocall_arrow_response(
         "batch_size": batch_size,
         "d_max": d_max,
         "m_max": m_max,
-        "latency_ms": float(latency_ms),
+        "latency_ms": latency_ms_val,
         "engine_used": str(engine_used),
         "has_cash_gamma_euler": bool(has_cash_gamma),
         "metadata": user_meta,
@@ -612,7 +695,7 @@ def encode_eq_autocall_arrow_response(
             SCHEMA_VERSION_METADATA_KEY: schema_ver.encode("utf-8"),
             b"status": b"done",
             b"engine_used": str(engine_used).encode("utf-8"),
-            b"latency_ms": f"{float(latency_ms):.4f}".encode("utf-8"),
+            b"latency_ms": f"{latency_ms_val:.4f}".encode("utf-8"),
         }
     )
     batch = batch.replace_schema_metadata(schema_with_meta.metadata)
@@ -641,36 +724,47 @@ def decode_eq_autocall_arrow_response(body: bytes) -> dict[str, Any]:
     if header_raw_bytes is not None:
         try:
             loaded = orjson.loads(header_raw_bytes)
-            if isinstance(loaded, dict):
-                header_dict = loaded
         except Exception as exc:
             raise ValueError(f"Corrupt JSON in Arrow response header metadata: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError("Arrow response header metadata JSON must decode to an object.")
+        header_dict = loaded
 
     schema_ver = _resolve_arrow_schema_version(raw_meta, header_dict, kind="response")
 
     batch_size = int(table.num_rows)
     if batch_size < 1 or batch_size > MAX_BATCH_TRADES:
         raise ValueError(f"Arrow response row count {batch_size} out of bounds [1, {MAX_BATCH_TRADES}].")
-    d_max = int(header_dict.get("d_max", D_MAX_ARROW))
-    m_max = int(header_dict.get("m_max", M_MAX_ARROW))
+    if "d_max" in header_dict:
+        d_max = _parse_strict_int(header_dict["d_max"], "d_max")
+    else:
+        inferred_d = _infer_col_inner_size(table, "delta")
+        d_max = inferred_d if inferred_d is not None else D_MAX_ARROW
+    if "m_max" in header_dict:
+        m_max = _parse_strict_int(header_dict["m_max"], "m_max")
+    else:
+        inferred_m = _infer_col_inner_size(table, "stopping_probs")
+        if inferred_m is None:
+            inferred_m = _infer_col_inner_size(table, "survival_probs") or _infer_col_inner_size(table, "rho_df")
+        m_max = inferred_m if inferred_m is not None else M_MAX_ARROW
     if d_max < 1 or d_max > MAX_D_ARROW:
         raise ValueError(f"Arrow response header d_max={d_max} out of bounds [1, {MAX_D_ARROW}].")
     if m_max < 1 or m_max > MAX_M_ARROW:
         raise ValueError(f"Arrow response header m_max={m_max} out of bounds [1, {MAX_M_ARROW}].")
-    latency_ms = float(header_dict.get("latency_ms", 0.0))
+    latency_ms = _parse_finite_float(header_dict.get("latency_ms", 0.0), "latency_ms")
     engine_used = str(header_dict.get("engine_used", "MaskedEGNO_Surrogate"))
     status = str(header_dict.get("status", "done"))
 
-    pv_np = _extract_column_f64_np(table, "product_value", (batch_size,))
-    stop_np = _extract_column_f64_np(table, "stopping_probs", (batch_size, m_max))
-    surv_np = _extract_column_f64_np(table, "survival_probs", (batch_size, m_max))
-    cpn_np = _extract_column_f64_np(table, "coupon_probs", (batch_size, m_max))
-    put_np = _extract_column_f64_np(table, "put_loss", (batch_size,))
-    delta_np = _extract_column_f64_np(table, "delta", (batch_size, d_max))
-    vega_atm_np = _extract_column_f64_np(table, "vega_atm", (batch_size, d_max, 2))
-    rho_df_np = _extract_column_f64_np(table, "rho_df", (batch_size, m_max))
-    cega_np = _extract_column_f64_np(table, "cega", (batch_size, d_max, d_max))
-    cg_np = _extract_column_f64_np(table, "cash_gamma_euler", (batch_size,))
+    pv_np = _extract_column_f64_np(table, "product_value", (batch_size,), copy_readonly=True)
+    stop_np = _extract_column_f64_np(table, "stopping_probs", (batch_size, m_max), copy_readonly=True)
+    surv_np = _extract_column_f64_np(table, "survival_probs", (batch_size, m_max), copy_readonly=True)
+    cpn_np = _extract_column_f64_np(table, "coupon_probs", (batch_size, m_max), copy_readonly=True)
+    put_np = _extract_column_f64_np(table, "put_loss", (batch_size,), copy_readonly=True)
+    delta_np = _extract_column_f64_np(table, "delta", (batch_size, d_max), copy_readonly=True)
+    vega_atm_np = _extract_column_f64_np(table, "vega_atm", (batch_size, d_max, 2), copy_readonly=True)
+    rho_df_np = _extract_column_f64_np(table, "rho_df", (batch_size, m_max), copy_readonly=True)
+    cega_np = _extract_column_f64_np(table, "cega", (batch_size, d_max, d_max), copy_readonly=True)
+    cg_np = _extract_column_f64_np(table, "cash_gamma_euler", (batch_size,), copy_readonly=True)
 
     out: dict[str, Any] = {
         "schema_version": schema_ver,
@@ -694,7 +788,7 @@ def decode_eq_autocall_arrow_response(body: bytes) -> dict[str, Any]:
     }
     if "vega_surface_feats" in table.column_names:
         out["vega_surface_feats"] = _extract_column_f64_np(
-            table, "vega_surface_feats", (batch_size, d_max, 7)
+            table, "vega_surface_feats", (batch_size, d_max, 7), copy_readonly=True
         )
     return out
 

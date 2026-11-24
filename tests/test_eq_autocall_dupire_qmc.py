@@ -554,6 +554,121 @@ def test_m3_wing_projection_surface_dcc_and_validation_errors() -> None:
     assert res_m0.standard_error == 0.0
 
 
+def test_dupire_qmc_audit_blind_spots(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    import datetime
+    from deepvol.models.autocall.dupire_qmc_solver import enforce_no_arbitrage_projection_with_jacobian
+    from deepvol.models.autocall.feature_layout import MonitoringIndexCode
+
+    # Scale-invariant Durrleman convexity projection at tiny K~0.01 and huge K~50000.
+    for scale in (1e-4, 500.0):
+        strikes_s = np.array([80.0, 90.0, 100.0, 110.0, 120.0], dtype=np.float64) * scale
+        tenors_s = np.array([0.25, 1.0], dtype=np.float64)
+        q_raw = np.array(
+            [
+                [0.30, 0.25, 0.27, 0.24, 0.30],
+                [0.29, 0.25, 0.26, 0.25, 0.29],
+            ],
+            dtype=np.float64,
+        )
+        _, proj_q, _, _, _, _, jac_p = enforce_no_arbitrage_projection_with_jacobian(
+            tenors_s,
+            strikes_s,
+            q_raw,
+        )
+        assert proj_q.shape == q_raw.shape and np.all(np.isfinite(proj_q))
+        assert jac_p.shape[0] == 2 and np.all(np.isfinite(jac_p))
+        surf_s = RegularizedVolSurface(
+            {
+                "Identifier": f"SCALE_{scale}",
+                "DayCountConvention": "Act365",
+                "tenors": [0.25, 1.0],
+                "Strikes": strikes_s.tolist(),
+                "VolatilityQuotes": proj_q.tolist(),
+            },
+            as_of_date=datetime.datetime(2026, 10, 23, tzinfo=datetime.timezone.utc),
+        )
+        assert surf_s.iv(0.5, 100.0 * scale) > 0.0
+
+    # Capitalized "Tenors" numeric list must parse cleanly alongside lowercase "tenors".
+    surf_cap_t = RegularizedVolSurface(
+        {
+            "Identifier": "TENORS_CAP",
+            "DayCountConvention": "Act365",
+            "Tenors": [0.25, 1.0],
+            "Strikes": [80.0, 100.0, 120.0],
+            "VolatilityQuotes": [[0.25, 0.22, 0.24], [0.24, 0.21, 0.23]],
+        },
+        as_of_date=datetime.datetime(2026, 10, 23, tzinfo=datetime.timezone.utc),
+    )
+    assert surf_cap_t.iv(0.5, 100.0) > 0.0
+
+    # All 18 indices including SecondWorstOf (15), ThirdWorstOf (16), SecondBestOf (17),
+    # EquallyWeightedBasket, MultiPerf, and d==1 pair-index edge cases.
+    perf4 = np.array([[0.82, 0.94, 1.07, 1.22], [1.0, 1.0, 1.0, 1.0]], dtype=np.float64)
+    perf4_t = torch.tensor(perf4, dtype=torch.float64)
+    for idx_name, expected_row0 in (
+        ("SecondWorstOf", 0.94),
+        ("ThirdWorstOf", 1.07),
+        ("SecondBestOf", 1.07),
+        ("EquallyWeightedBasket", float(np.mean(perf4[0]))),
+        ("MultiPerf", float(np.mean(perf4[0]))),
+    ):
+        v_np = evaluate_monitoring_index_np(perf4, idx_name, None)
+        v_th = evaluate_monitoring_index_torch(perf4_t, idx_name, None)
+        assert float(v_np[0]) == pytest.approx(expected_row0, abs=1e-12)
+        np.testing.assert_allclose(v_np, v_th.numpy(), atol=1e-12)
+        assert int(MonitoringIndexCode.SECOND_WORST_OF) == 15
+
+    p1 = np.array([[1.08]], dtype=np.float64)
+    p1_t = torch.tensor(p1, dtype=torch.float64)
+    assert float(evaluate_monitoring_index_np(p1, "RatioAB", None)[0]) == pytest.approx(1.08, abs=1e-12)
+    assert float(evaluate_monitoring_index_torch(p1_t, "RatioAB", None)[0]) == pytest.approx(1.08, abs=1e-12)
+    assert float(evaluate_monitoring_index_np(p1, "DiffAB", None)[0]) == pytest.approx(0.0, abs=1e-12)
+    assert float(evaluate_monitoring_index_torch(p1_t, "DiffAB", None)[0]) == pytest.approx(0.0, abs=1e-12)
+
+    # CPU solver: cv_mode="none" vs "bs1d_exact", one_star_coupon < 0, Continuous KI vs European,
+    # and In-Transit FundingLeg alpha_rem + funding_fixings matching preprocessor.
+    req_orig, _ = parsed_dag
+    req_fl = copy.deepcopy(req_orig)
+    req_fl.Product.RateIdentifier = "RUB_RUONIA_OIS"
+    req_fl.Product.FundingSpread = 0.02
+    req_fl.Product.FundingLegPaymentDates = list(req_fl.Product.PaymentDates)
+    as_of_fl = req_fl.Model.MarketDataSet.AsOfDate
+    req_fl.Product.PaymentDates[-2] = as_of_fl + datetime.timedelta(days=10)
+    req_fl.Product.FundingLegPaymentDates[-2] = as_of_fl + datetime.timedelta(days=10)
+    st_fl = preprocess_eq_autocall(req_fl)
+    res_fl_none = price_eq_autocall_dupire_qmc(st_fl, n_paths=2048, n_replicates=4, cv_mode="none", seed=42)
+    res_fl_cv = price_eq_autocall_dupire_qmc(st_fl, n_paths=2048, n_replicates=4, cv_mode="bs1d_exact", seed=42)
+    assert abs(res_fl_none.product_value - res_fl_cv.product_value) < 0.015
+
+    # Continuous KI increases downside loss relative to European KI on deep barrier breach paths.
+    req_ki = copy.deepcopy(req_orig)
+    req_ki.Model.MarketDataSet.AsOfDate = datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc)
+    for c in req_ki.Model.MarketDataSet.RatesCurvesBundles.values():
+        c.AsOfDate = req_ki.Model.MarketDataSet.AsOfDate
+    req_ki.Product.OptionDownAndInBarrierLevel = 0.85
+    req_ki.Product.OptionDownAndInBarrierObservationType = "European"
+    st_eu = preprocess_eq_autocall(req_ki)
+    req_ki.Product.OptionDownAndInBarrierObservationType = "Continuous"
+    st_cont = preprocess_eq_autocall(req_ki)
+    pv_eu = price_eq_autocall_dupire_qmc(st_eu, n_paths=2048, n_replicates=4, seed=11)
+    pv_cont = price_eq_autocall_dupire_qmc(st_cont, n_paths=2048, n_replicates=4, seed=11)
+    assert np.isfinite(pv_eu.product_value) and np.isfinite(pv_cont.product_value)
+    assert pv_cont.l_put >= pv_eu.l_put - 1e-4
+
+    # Negative one_star_coupon (!= 0) must affect option PV cleanly.
+    req_os = copy.deepcopy(req_ki)
+    req_os.Product.OneStarStrike = 1.05
+    req_os.Product.OneStarCoupon = -0.04
+    res_os_neg = price_eq_autocall_dupire_qmc(preprocess_eq_autocall(req_os), n_paths=512, n_replicates=2, seed=7)
+    req_os.Product.OneStarCoupon = 0.0
+    res_os_zero = price_eq_autocall_dupire_qmc(preprocess_eq_autocall(req_os), n_paths=512, n_replicates=2, seed=7)
+    assert abs(res_os_neg.product_value - res_os_zero.product_value) > 1e-5
+
+
+
 
 
 

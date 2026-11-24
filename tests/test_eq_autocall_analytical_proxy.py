@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import sys
 import time
@@ -457,7 +458,7 @@ def test_m2_multi_index_ratio_diff_out_down_onestar_and_tier1_backend() -> None:
         np.testing.assert_allclose(d2_c, d2_np, rtol=0.0, atol=2.2e-14)
 
 
-def test_m2_erfcx_normal_clark_and_stulz_margrabe_branch_parity() -> None:
+def test_erfcx_normal_clark_and_stulz_margrabe_branch_parity() -> None:
     import math
     from deepvol.models.autocall import _tier1_backend as tb
     from deepvol.models.autocall import analytical_baseline as ab
@@ -538,10 +539,22 @@ def test_m2_erfcx_normal_clark_and_stulz_margrabe_branch_parity() -> None:
         np.testing.assert_allclose(w_f, w_t.numpy(), atol=1e-12)
         assert p_fast >= 0.0
 
-    p_diff, _, _, _ = ab.fast_stulz_margrabe_cpu([1.02, 0.96], [0.25, 0.30], [[1.0, 0.4], [0.4, 1.0]], k_strike=0.0, monitoring_index="DiffAB")
-    assert p_diff == 0.0
-    p_diff_pos, _, _, _ = ab.fast_stulz_margrabe_cpu([1.02, 0.96], [0.25, 0.30], [[1.0, 0.4], [0.4, 1.0]], k_strike=0.05, monitoring_index="DiffAB")
-    assert p_diff_pos >= 0.0
+    for k_diff in (0.0, 0.05, -0.05):
+        p_diff, fw_d, vw_d, _ = ab.fast_stulz_margrabe_cpu(
+            [1.02, 0.96], [0.25, 0.30], [[1.0, 0.4], [0.4, 1.0]], k_strike=k_diff, monitoring_index="DiffAB"
+        )
+        s_d = max(vw_d, 1e-12)
+        z_d = (k_diff - fw_d) / s_d
+        expected_diff_put = (k_diff - fw_d) * float(ab._ndtr_scalar(z_d)) + s_d * float(
+            ab._INV_SQRT2PI * math.exp(-0.5 * z_d * z_d)
+        )
+        assert p_diff > 0.0
+        assert p_diff == pytest.approx(expected_diff_put, abs=1e-12)
+
+    p_wof_zero, _, _, _ = ab.fast_stulz_margrabe_cpu(
+        [1.02, 0.96], [0.25, 0.30], [[1.0, 0.4], [0.4, 1.0]], k_strike=0.0, monitoring_index="WorstOf"
+    )
+    assert p_wof_zero == 0.0
 
     fw_1d, vw_1d, w_1d = ab.stulz_margrabe_moments_with_weights(
         torch.tensor([1.05], dtype=torch.float64),
@@ -556,7 +569,7 @@ def test_m2_erfcx_normal_clark_and_stulz_margrabe_branch_parity() -> None:
         ("BestOf", "Average", "Out", "Down", True, True, True),
         ("Average", "WorstOf", "In", "Up", False, False, False),
     ):
-        st_full = {
+        st_full: dict[str, Any] = {
             "forward_perf": torch.tensor([[0.85, 0.88], [1.00, 1.02], [1.18, 1.20]], dtype=torch.float64),
             "v_perf": torch.tensor([[0.22, 0.30], [0.26, 0.35], [0.20, 0.28]], dtype=torch.float64),
             "corr_matrix": torch.tensor([[1.0, 0.4, 0.2], [0.4, 1.0, 0.3], [0.2, 0.3, 1.0]], dtype=torch.float64),
@@ -733,6 +746,296 @@ def test_m2_erfcx_normal_clark_and_stulz_margrabe_branch_parity() -> None:
     assert torch.isfinite(o3_os.product_value_proxy).all()
     assert ab._black76_call_scalar(1.0, 0.9, 0.2) > 0.1
     assert 0.0 <= ab._digital_call_spread_prob_scalar(1.0, 0.2, 1.0, -0.05) <= 1.0
+
+
+def test_analytical_proxy_audit_blind_spots() -> None:
+    import ctypes
+    from scipy.stats import qmc
+    from deepvol.models.autocall import _tier1_backend as tb, analytical_baseline as ab
+
+    # TwinWin M=4 vs 65,536-path QMC reference (two-sided KO and max(W, 2 - W) put payoff).
+    for ko_lvl in (0.85, 1.35):
+        m_tw = 4
+        fwd_tw = torch.full((1, m_tw), 1.02, dtype=torch.float64)
+        v_tw = torch.tensor([[0.12, 0.17, 0.21, 0.25]], dtype=torch.float64)
+        df_tw = torch.full((m_tw,), 0.96, dtype=torch.float64)
+        st_tw = {
+            "forward_perf": fwd_tw,
+            "v_perf": v_tw,
+            "corr_matrix": torch.ones((1, 1), dtype=torch.float64),
+            "df_pay": df_tw,
+            "ko_barriers": torch.full((m_tw,), ko_lvl, dtype=torch.float64),
+            "is_callable": torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float64),
+            "cpn_barriers": torch.full((m_tw,), 1.08, dtype=torch.float64),
+            "is_guaranteed_cpn": torch.zeros(m_tw, dtype=torch.float64),
+            "coupon_amounts": torch.full((m_tw,), 0.03, dtype=torch.float64),
+            "strike": 1.28,
+            "lower_strike": 0.0,
+            "ki_barrier": 0.0,
+            "has_ki": False,
+            "ko_spread": 0.0,
+            "cpn_spread": 0.0,
+            "ki_spread": 0.0,
+            "is_memory": False,
+            "option_gearing": 1.0,
+            "option_index": "TwinWin",
+            "callability_index": "TwinWin",
+            "coupon_index": "TwinWin",
+            "allow_autocall_on_expiry": True,
+        }
+        tw_cpu = compute_analytical_autocall_baseline(st_tw, use_fast_cpu=True)
+        tw_pt = compute_analytical_autocall_baseline(st_tw, use_fast_cpu=False)
+        torch.testing.assert_close(tw_cpu.product_value_proxy, tw_pt.product_value_proxy, atol=1e-9, rtol=1e-9)
+        if ko_lvl <= 1.0:
+            # 100% immediate/two-sided KO when max(W, 2 - W) >= 1.0 >= B_ko leaves zero surviving path.
+            assert float(tw_pt.survival_proxy[-1]) <= 1e-6
+        else:
+            sob = qmc.Sobol(d=m_tw, scramble=True, seed=2026)
+            z = torch.from_numpy(
+                np.sqrt(2.0) * torch.erfinv(2.0 * torch.from_numpy(sob.random_base2(16)).clamp(1e-12, 1 - 1e-12) - 1.0).numpy()
+            ).to(torch.float64)
+            # Incremental lognormal steps up to variance v_tw^2.
+            dv2 = torch.cat([v_tw[0, :1] ** 2, v_tw[0, 1:] ** 2 - v_tw[0, :-1] ** 2])
+            s_paths = torch.ones((65536, m_tw), dtype=torch.float64)
+            lw = torch.zeros(65536, dtype=torch.float64)
+            prev_f = 1.0
+            for m in range(m_tw):
+                drift_m = math.log(float(fwd_tw[0, m]) / prev_f) - 0.5 * float(dv2[m])
+                lw = lw + drift_m + math.sqrt(float(dv2[m])) * z[:, m]
+                s_paths[:, m] = torch.exp(lw)
+                prev_f = float(fwd_tw[0, m])
+            alive = torch.ones(65536, dtype=torch.bool)
+            mc_pv = torch.zeros(65536, dtype=torch.float64)
+            for m in range(m_tw):
+                tw_idx_m = torch.maximum(s_paths[:, m], 2.0 - s_paths[:, m])
+                hit = alive & (tw_idx_m >= ko_lvl)
+                cpn_hit = alive & (tw_idx_m >= 1.08)
+                mc_pv += torch.where(cpn_hit, 0.03 * df_tw[m], 0.0)
+                mc_pv += torch.where(hit, df_tw[m], 0.0)
+                alive = alive & (~hit)
+            tw_term = torch.maximum(s_paths[:, -1], 2.0 - s_paths[:, -1])
+            tw_payoff = 1.0 - torch.clamp(1.28 - tw_term, min=0.0)
+            mc_pv += torch.where(alive, tw_payoff * df_tw[-1], 0.0)
+            assert abs(float(tw_pt.product_value_proxy.item()) - float(mc_pv.mean().item())) < 0.015
+
+    # d=1 OneStar deep ITM (f=0.50, K=0.90 -> put ~ 0.40) parity between CPU C++ and PureTorch.
+    st_1d_itm = {
+        "forward_perf": torch.tensor([[0.50]], dtype=torch.float64),
+        "v_perf": torch.tensor([[0.15]], dtype=torch.float64),
+        "corr_matrix": torch.tensor([[1.0]], dtype=torch.float64),
+        "df_pay": torch.tensor([1.0], dtype=torch.float64),
+        "ko_barriers": torch.tensor([1.20], dtype=torch.float64),
+        "is_callable": torch.tensor([0.0], dtype=torch.float64),
+        "cpn_barriers": torch.tensor([0.80], dtype=torch.float64),
+        "is_guaranteed_cpn": torch.tensor([0.0], dtype=torch.float64),
+        "coupon_amounts": torch.tensor([0.0], dtype=torch.float64),
+        "strike": 0.90,
+        "lower_strike": 0.0,
+        "option_gearing": 1.0,
+        "one_star_strike": 1.10,
+        "one_star_coupon": 0.05,
+        "no_notional_repayment": True,
+    }
+    os_cpu = compute_analytical_autocall_baseline(st_1d_itm, use_fast_cpu=True)
+    os_pt = compute_analytical_autocall_baseline(st_1d_itm, use_fast_cpu=False)
+    torch.testing.assert_close(os_cpu.l_put_proxy, os_pt.l_put_proxy, atol=1e-10, rtol=1e-10)
+    assert float(os_pt.l_put_proxy.item()) == pytest.approx(0.40, abs=0.02)
+
+    # Extreme left tail u_hi <= -20 and -1000 lognormal ramp stability.
+    for u_hi in (-20.0, -50.0, -1000.0):
+        mu_ln, var_ln = tb._ramp_survival_post_moments_lognormal(math.exp(u_hi), 0.25, 1.0, -0.05)
+        assert math.isfinite(mu_ln) and math.isfinite(var_ln) and var_ln > 0.0
+        mu_t, var_t = ab._ramp_survival_post_moments_lognormal_torch(
+            torch.tensor(math.exp(u_hi), dtype=torch.float64),
+            torch.tensor(0.25, dtype=torch.float64),
+            torch.tensor(1.0, dtype=torch.float64),
+            -0.05,
+        )
+        assert torch.isfinite(mu_t) and torch.isfinite(var_t) and float(var_t.item()) > 0.0
+
+    # EquallyWeightedBasket + SecondWorstOf/ThirdWorstOf/SecondBestOf parity (CPU & Torch).
+    f4 = np.array([0.82, 0.94, 1.07, 1.22], dtype=np.float64)
+    v4 = np.array([0.20, 0.25, 0.22, 0.28], dtype=np.float64)
+    c4 = np.full((4, 4), 0.35, dtype=np.float64)
+    np.fill_diagonal(c4, 1.0)
+    for idx_ex in ("EquallyWeightedBasket", "SecondWorstOf", "ThirdWorstOf", "SecondBestOf"):
+        fw_c, vw_c, w_c = tb._eval_index_moments(
+            4, f4.tolist(), v4.tolist(), c4.tolist(), [0, 1, 2, 3], tb.monitoring_index_to_code(idx_ex)
+        )
+        fw_t, vw_t, w_t = ab.stulz_margrabe_moments_with_weights(
+            torch.tensor(f4), torch.tensor(v4), torch.tensor(c4), monitoring_index=idx_ex
+        )
+        assert fw_c == pytest.approx(float(fw_t.item()), abs=1e-10)
+        assert vw_c == pytest.approx(float(vw_t.item()), abs=1e-10)
+        np.testing.assert_allclose(w_c, w_t.numpy(), atol=1e-10)
+
+    # Dispersion near-zero variance at equal forwards [1.0, 1.0].
+    fw_disp, vw_disp, _ = ab.stulz_margrabe_moments_with_weights(
+        torch.tensor([1.0, 1.0], dtype=torch.float64),
+        torch.tensor([1e-5, 1e-5], dtype=torch.float64),
+        torch.tensor([[1.0, 1.0 - 1e-10], [1.0 - 1e-10, 1.0]], dtype=torch.float64),
+        monitoring_index="Dispersion",
+    )
+    assert torch.isfinite(fw_disp) and torch.isfinite(vw_disp)
+
+    # 3D (B, M) batch, b_size == 0, m_rem == 0 AD-attached zero return, ParticipationCall(strike=0),
+    # and ForceCouponsOnAutocall opposite-tail BVN union.
+    fwd_bm = torch.tensor([[1.01, 0.99], [0.95, 1.04]], dtype=torch.float64, requires_grad=True)
+    v_bm = torch.full((2, 2), 0.20, dtype=torch.float64)
+    out_b0 = compute_analytical_autocall_baseline(
+        {
+            "forward_perf": torch.zeros((0, 1, 2), dtype=torch.float64),
+            "v_perf": torch.zeros((0, 1, 2), dtype=torch.float64),
+            "corr_matrix": torch.zeros((0, 1, 1), dtype=torch.float64),
+            "df_pay": torch.zeros((0, 2), dtype=torch.float64),
+            "ko_barriers": torch.zeros((0, 2), dtype=torch.float64),
+            "is_callable": torch.zeros((0, 2), dtype=torch.float64),
+            "cpn_barriers": torch.zeros((0, 2), dtype=torch.float64),
+            "is_guaranteed_cpn": torch.zeros((0, 2), dtype=torch.float64),
+            "coupon_amounts": torch.zeros((0, 2), dtype=torch.float64),
+        },
+        use_fast_cpu=False,
+    )
+    assert out_b0.product_value_proxy.shape == (0,)
+
+    out_m0_ad = compute_analytical_autocall_baseline(
+        {
+            "forward_perf": fwd_bm[:, :0],
+            "v_perf": v_bm[:, :0],
+            "corr_matrix": torch.tensor([[1.0]], dtype=torch.float64),
+            "df_pay": torch.zeros((0,), dtype=torch.float64),
+            "ko_barriers": torch.zeros((0,), dtype=torch.float64),
+            "is_callable": torch.zeros((0,), dtype=torch.float64),
+            "cpn_barriers": torch.zeros((0,), dtype=torch.float64),
+            "is_guaranteed_cpn": torch.zeros((0,), dtype=torch.float64),
+            "coupon_amounts": torch.zeros((0,), dtype=torch.float64),
+        },
+        use_fast_cpu=False,
+    )
+    g_m0 = torch.autograd.grad(out_m0_ad.product_value_proxy.sum(), fwd_bm, allow_unused=True)[0]
+    assert g_m0 is None or torch.all(g_m0 == 0.0)
+
+    out_pc0 = compute_analytical_autocall_baseline(
+        {
+            "forward_perf": torch.tensor([[1.02]], dtype=torch.float64),
+            "v_perf": torch.tensor([[0.20]], dtype=torch.float64),
+            "corr_matrix": torch.tensor([[1.0]], dtype=torch.float64),
+            "df_pay": torch.tensor([0.98], dtype=torch.float64),
+            "ko_barriers": torch.tensor([1.50], dtype=torch.float64),
+            "is_callable": torch.tensor([1.0], dtype=torch.float64),
+            "cpn_barriers": torch.tensor([0.50], dtype=torch.float64),
+            "is_guaranteed_cpn": torch.tensor([0.0], dtype=torch.float64),
+            "coupon_amounts": torch.tensor([0.0], dtype=torch.float64),
+            "participation_call_strike": 0.0,
+            "participation_call_rate": 0.50,
+            "no_notional_repayment": True,
+        },
+        use_fast_cpu=False,
+    )
+    assert float(out_pc0.product_value_proxy.item()) > 0.30
+
+    out_fc = compute_analytical_autocall_baseline(
+        {
+            "forward_perf": torch.tensor([[1.00, 1.00], [1.00, 1.00]], dtype=torch.float64),
+            "v_perf": torch.tensor([[0.25, 0.35], [0.25, 0.35]], dtype=torch.float64),
+            "corr_matrix": torch.tensor([[1.0, 0.5], [0.5, 1.0]], dtype=torch.float64),
+            "df_pay": torch.tensor([0.96, 0.92], dtype=torch.float64),
+            "ko_barriers": torch.tensor([1.05, 1.05], dtype=torch.float64),
+            "is_callable": torch.tensor([1.0, 1.0], dtype=torch.float64),
+            "cpn_barriers": torch.tensor([1.02, 1.02], dtype=torch.float64),
+            "is_guaranteed_cpn": torch.tensor([0.0, 0.0], dtype=torch.float64),
+            "coupon_amounts": torch.tensor([0.05, 0.05], dtype=torch.float64),
+            "coupon_barrier_type": "Out",
+            "coupon_barrier_direction": "Down",
+            "force_coupons_on_autocall": True,
+        },
+        use_fast_cpu=True,
+    )
+    out_fc_pt = compute_analytical_autocall_baseline(
+        {
+            "forward_perf": torch.tensor([[1.00, 1.00], [1.00, 1.00]], dtype=torch.float64),
+            "v_perf": torch.tensor([[0.25, 0.35], [0.25, 0.35]], dtype=torch.float64),
+            "corr_matrix": torch.tensor([[1.0, 0.5], [0.5, 1.0]], dtype=torch.float64),
+            "df_pay": torch.tensor([0.96, 0.92], dtype=torch.float64),
+            "ko_barriers": torch.tensor([1.05, 1.05], dtype=torch.float64),
+            "is_callable": torch.tensor([1.0, 1.0], dtype=torch.float64),
+            "cpn_barriers": torch.tensor([1.02, 1.02], dtype=torch.float64),
+            "is_guaranteed_cpn": torch.tensor([0.0, 0.0], dtype=torch.float64),
+            "coupon_amounts": torch.tensor([0.05, 0.05], dtype=torch.float64),
+            "coupon_barrier_type": "Out",
+            "coupon_barrier_direction": "Down",
+            "force_coupons_on_autocall": True,
+        },
+        use_fast_cpu=False,
+    )
+    torch.testing.assert_close(out_fc.q_proxy, out_fc_pt.q_proxy, atol=1e-9, rtol=1e-9)
+
+    # C++23 ABI handshake and L2O order-stat (15..17) + nullptr safety verification when C++ lib present.
+    backend = tb.get_tier1_backend()
+    cpp_lib = getattr(backend, "_lib", None)
+    if cpp_lib is not None and hasattr(cpp_lib, "tier1_abi_info"):
+        class _AbiInfo(ctypes.Structure):
+            _fields_ = [
+                ("abi_version", ctypes.c_uint32),
+                ("sizeof_autocall_args", ctypes.c_uint32),
+                ("alignof_autocall_args", ctypes.c_uint32),
+                ("sizeof_crn_batch_args", ctypes.c_uint32),
+                ("alignof_crn_batch_args", ctypes.c_uint32),
+            ]
+
+        fn = cpp_lib.tier1_abi_info
+        fn.restype = _AbiInfo
+        info = fn()
+        assert int(info.abi_version) == 20261124
+        assert int(info.sizeof_autocall_args) == 336 and int(info.alignof_autocall_args) == 8
+        assert int(info.sizeof_crn_batch_args) == 320 and int(info.alignof_crn_batch_args) == 8
+        cpp_lib.crn_eval_payoff_loo_l2o_cpp(None)
+
+    # Extreme tail lognormal moments (za < zb <= -6.0 and 6.0 <= za < zb, plus a=0 and v=40)
+    # must match across PureNumPy fallback, PureTorch, and C++23 with zero OverflowError.
+    tail_cases = [
+        (1.0, 0.2, 0.0, 1e-4, 4),
+        (1.0, 0.2, 1e-6, 1e-5, 4),
+        (1.0, 40.0, 0.0, 1e-3, 2),
+        (1.0, 0.2, 5.0, 6.0, 4),
+        (1.0, 0.1, 1e4, 1e5, 2),
+    ]
+    for f_t, v_t, a_t, b_t, k_ord in tail_cases:
+        m_np = tb._lognormal_moments_interval(f_t, v_t, a_t, b_t, k_ord)
+        m_th = ab._lognormal_moments_interval_torch(
+            torch.tensor([f_t], dtype=torch.float64),
+            torch.tensor([v_t], dtype=torch.float64),
+            a_t,
+            b_t,
+            k_ord,
+        )
+        assert len(m_np) == k_ord + 1 and all(math.isfinite(x) and x >= 0.0 for x in m_np)
+        for k_i in range(k_ord + 1):
+            np.testing.assert_allclose(m_np[k_i], float(m_th[k_i].item()), rtol=1e-11, atol=1e-14)
+
+    saved_backend = tb._CACHED_BACKEND
+    try:
+        tb._CACHED_BACKEND = tb.PureNumpyTier1Backend()
+        st_tail = {
+            "forward_perf": torch.tensor([[1.0]], dtype=torch.float64),
+            "v_perf": torch.tensor([[0.20]], dtype=torch.float64),
+            "corr_matrix": torch.tensor([[1.0]], dtype=torch.float64),
+            "df_pay": torch.tensor([0.96], dtype=torch.float64),
+            "ko_barriers": torch.tensor([1.50], dtype=torch.float64),
+            "is_callable": torch.tensor([1.0], dtype=torch.float64),
+            "cpn_barriers": torch.tensor([0.05], dtype=torch.float64),
+            "is_guaranteed_cpn": torch.tensor([0.0], dtype=torch.float64),
+            "coupon_amounts": torch.tensor([0.02], dtype=torch.float64),
+            "strike": 0.08,
+            "lower_strike": 0.04,
+            "option_gearing": 1.0,
+        }
+        out_np_fb = compute_analytical_autocall_baseline(st_tail, use_fast_cpu=True)
+        out_th_fb = compute_analytical_autocall_baseline(st_tail, use_fast_cpu=False)
+        torch.testing.assert_close(out_np_fb.product_value_proxy, out_th_fb.product_value_proxy, atol=1e-11, rtol=1e-11)
+    finally:
+        tb._CACHED_BACKEND = saved_backend
+
 
 
 

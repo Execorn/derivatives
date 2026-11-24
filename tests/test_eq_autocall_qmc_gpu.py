@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import copy
 import datetime
+import gc
 import math
+import os
 from pathlib import Path
+import subprocess
 import sys
+import textwrap
 import time
 from typing import Any
 import warnings
@@ -185,6 +189,10 @@ def test_cpu_numpy_dupire_qmc_facade_and_empty_training_batch(
         "RatioBA",
         "DiffAB",
         "DiffBA",
+        "EquallyWeightedBasket",
+        "SecondWorstOf",
+        "ThirdWorstOf",
+        "SecondBestOf",
         "UnknownCustom",
     )
     for idx_name in all_idx:
@@ -194,9 +202,21 @@ def test_cpu_numpy_dupire_qmc_facade_and_empty_training_batch(
         torch.testing.assert_close(w3, w3g, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(w3, w3n, atol=1e-5, rtol=1e-5)
         assert g3 is not None and torch.isfinite(g3).all() and g3n is None
-        _ = _evaluate_monitoring_index_gpu(perf1, idx_name, None, asset_dim=-1)
+        w1_val = _evaluate_monitoring_index_gpu(perf1, idx_name, None, asset_dim=-1)
         _, g1 = _eval_index_and_grad_gpu(perf1, idx_name, None, compute_grad=True, asset_dim=-1)
         assert g1 is not None and g1.shape == (1, 1)
+        if idx_name == "SecondWorstOf":
+            assert float(w3[0]) == pytest.approx(1.1, abs=1e-12)
+        elif idx_name == "ThirdWorstOf":
+            assert float(w3[0]) == pytest.approx(1.3, abs=1e-12)
+        elif idx_name == "SecondBestOf":
+            assert float(w3[0]) == pytest.approx(1.1, abs=1e-12)
+        elif idx_name == "EquallyWeightedBasket":
+            assert float(w3[0]) == pytest.approx(1.1, abs=1e-12)
+        elif idx_name in ("DiffAB", "DiffBA", "Dispersion"):
+            assert float(w1_val[0]) == pytest.approx(0.0, abs=1e-12)
+        elif idx_name in ("RatioAB", "RatioBA"):
+            assert float(w1_val[0]) == pytest.approx(1.05, abs=1e-12)
 
     _ = _digital_ramp_torch(torch.tensor([0.8, 1.0], dtype=torch.float64), 0.9, 0.0)
     est1, se1 = _apply_loo_control_variate(
@@ -428,3 +448,154 @@ def test_gpu_dupire_qmc_latency_and_training_batch_teacher(
     assert p_mc.shape == (16, 48) and q_mc.shape == (16, 48) and l_mc.shape == (16,)
     assert delta_mc is not None and delta_mc.shape == (16, 8)
     assert torch.isfinite(pv).all() and torch.isfinite(delta_mc).all()
+
+
+def test_gpu_cache_manager_contract_and_cpu_parity_blind_spots(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    from dataclasses import dataclass
+    from deepvol.models.autocall.gpu_cache_manager import (
+        GLOBAL_GPU_CACHE_MANAGER,
+        PartitionedGpuLRU,
+        measure_tensor_nbytes,
+        normalize_cuda_device,
+    )
+
+    @dataclass
+    class _Bundle:
+        a: torch.Tensor
+        b: tuple[torch.Tensor, ...]
+
+    t1 = torch.zeros(16, dtype=torch.float64)
+    t2 = torch.zeros(8, dtype=torch.float32)
+    bundle = _Bundle(a=t1, b=(t2,))
+    assert measure_tensor_nbytes(bundle) == 16 * 8 + 8 * 4
+
+    evicted: list[Any] = []
+    lru: PartitionedGpuLRU[torch.Tensor] = PartitionedGpuLRU(
+        "unit_test", max_entries=4, max_bytes=256, on_evict=lambda k, _v: evicted.append(k)
+    )
+    lru.put("ok1", torch.zeros(16, dtype=torch.float64))
+    assert lru.resident_bytes == 128 and len(lru) == 1
+    lru.put("too_big", torch.zeros(64, dtype=torch.float64))
+    assert lru.resident_bytes <= 256 and "too_big" not in lru._store
+    assert GLOBAL_GPU_CACHE_MANAGER.TOTAL_BUDGET_BYTES <= 192 * 1024 * 1024
+    assert normalize_cuda_device("cpu") == ("cpu", -1)
+
+    # Already-autocalled state must yield finite zeroed training deltas rather than pricing dead periods.
+    req_ko = copy.deepcopy(parsed_dag[0])
+    for tkr, ref_s in zip(req_ko.Product.UnderlyingIdentifiers, req_ko.Product.UnderlyingReferenceSpots):
+        req_ko.Model.MarketDataSet.Fixings[tkr].Values[-1] = float(ref_s) * 1.5
+    st_ko = preprocess_eq_autocall(req_ko)
+    cpu_solver = CpuNumpyDupireQMC()
+    pv_tr, _, _, _, delta_tr = cpu_solver.simulate_batch_for_training(
+        [st_ko],
+        config=DupireQMCConfig(n_paths=256, n_replicates=2, n_substeps=2),
+        compute_pathwise_delta=True,
+    )
+    assert torch.isfinite(pv_tr).all() and delta_tr is not None and torch.all(delta_tr == 0.0)
+
+
+@pytest.mark.gpu
+def test_gpu_qmc_vram_m60_d12_qshift_onestar_and_nonpow2_replicates(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU required")
+
+    from deepvol.models.autocall.gpu_cache_manager import GLOBAL_GPU_CACHE_MANAGER
+
+    solver = DupireQMCGpuSolver(device="cuda", backend="triton")
+
+    # Non-pow2 n_replicates=3 (BLOCK_N alignment) & multifidelity_gbm on M=60, d=12 <= 250 MB VRAM.
+    req_m60_d12 = _build_synthetic_request(parsed_dag, d_assets=12, m_periods=60, div_amt=1.5)
+    st_m60_d12 = preprocess_eq_autocall(req_m60_d12, d_max=12, m_max=60)
+    GLOBAL_GPU_CACHE_MANAGER.clear_all(clear_canonical_models=True)
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base_res = torch.cuda.memory_reserved()
+
+    res_np2 = solver.simulate_and_price(
+        st_m60_d12,
+        DupireQMCConfig(n_paths=1536, n_replicates=3, n_substeps=4, cv_mode="bs1d_exact"),
+    )
+    assert np.isfinite(res_np2.product_value)
+
+    res_mf = solver.simulate_and_price(
+        st_m60_d12,
+        DupireQMCConfig(n_paths=8192, n_replicates=8, n_substeps=4, cv_mode="multifidelity_gbm"),
+    )
+    torch.cuda.synchronize()
+    peak_alloc_mb = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+    max_res = torch.cuda.max_memory_reserved()
+    assert np.isfinite(res_mf.product_value)
+    assert peak_alloc_mb <= 237.0, f"M=60 d=12 peak allocated {peak_alloc_mb:.1f} MB > 237 MB"
+    if base_res > 64 * 1024 * 1024 and os.environ.get("_DEEPVOL_VRAM_SUBPROC") != "1":
+        delta_res_mb = (max_res - base_res) / (1024.0 * 1024.0)
+        assert delta_res_mb <= 250.0, (
+            f"M=60 d=12 delta reserved {delta_res_mb:.1f} MB > 250 MB (base={base_res / (1024.0 * 1024.0):.1f} MB)"
+        )
+        sub_env = os.environ.copy()
+        sub_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        sub_env["_DEEPVOL_VRAM_SUBPROC"] = "1"
+        sub_env["PYTHONPATH"] = os.pathsep.join(
+            [str(REPO_ROOT), str(REPO_ROOT / "src")]
+            + ([sub_env["PYTHONPATH"]] if sub_env.get("PYTHONPATH") else [])
+        )
+        sub_code = textwrap.dedent(
+            f"""
+            import gc, sys, torch
+            sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
+            from deepvol.api.schemas_eq_autocall import parse_murex_autocall_dag
+            from deepvol.models.autocall import preprocess_eq_autocall
+            from deepvol.models.autocall.dupire_qmc_gpu import DupireQMCConfig, DupireQMCGpuSolver
+            from deepvol.models.autocall.gpu_cache_manager import GLOBAL_GPU_CACHE_MANAGER
+            from test_eq_autocall_qmc_gpu import REF_REQUEST_PATH, _build_synthetic_request
+            solver = DupireQMCGpuSolver(device="cuda", backend="triton")
+            req_m60_d12 = _build_synthetic_request(parse_murex_autocall_dag(REF_REQUEST_PATH), d_assets=12, m_periods=60, div_amt=1.5)
+            st_m60_d12 = preprocess_eq_autocall(req_m60_d12, d_max=12, m_max=60)
+            GLOBAL_GPU_CACHE_MANAGER.clear_all(clear_canonical_models=True)
+            gc.collect(); torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+            solver.simulate_and_price(st_m60_d12, DupireQMCConfig(n_paths=1536, n_replicates=3, n_substeps=4, cv_mode="bs1d_exact"))
+            solver.simulate_and_price(st_m60_d12, DupireQMCConfig(n_paths=8192, n_replicates=8, n_substeps=4, cv_mode="multifidelity_gbm"))
+            torch.cuda.synchronize()
+            assert torch.cuda.max_memory_allocated() <= 237.0 * 1024 * 1024
+            assert torch.cuda.max_memory_reserved() <= 250.0 * 1024 * 1024
+            assert GLOBAL_GPU_CACHE_MANAGER.total_resident_bytes() <= GLOBAL_GPU_CACHE_MANAGER.TOTAL_BUDGET_BYTES
+            """
+        )
+        subprocess.run([sys.executable, "-c", sub_code], env=sub_env, check=True, timeout=120)
+    else:
+        peak_res_mb = max_res / (1024.0 * 1024.0)
+        assert peak_res_mb <= 250.0, f"M=60 d=12 peak reserved {peak_res_mb:.1f} MB > 250 MB"
+    assert GLOBAL_GPU_CACHE_MANAGER.total_resident_bytes() <= GLOBAL_GPU_CACHE_MANAGER.TOTAL_BUDGET_BYTES
+
+    # Quanto training q_shift != 0 & OneStar pathwise Delta finite-difference parity on GPU.
+    req_q_os = copy.deepcopy(parsed_dag[0])
+    req_q_os.Product.PaymentCurrency = "USD"
+    req_q_os.Product.OneStarStrike = 1.02
+    req_q_os.Product.OneStarCoupon = 0.05
+    st_q_os = preprocess_eq_autocall(req_q_os)
+    cfg_tr = DupireQMCConfig(n_paths=2048, n_replicates=4, n_substeps=4, cv_mode="none")
+    pv_base, _, _, _, delta_base = solver.simulate_batch_for_training(
+        [st_q_os], config=cfg_tr, compute_pathwise_delta=True
+    )
+    assert torch.isfinite(pv_base).all() and delta_base is not None and torch.isfinite(delta_base).all()
+    h_rel = 1e-3
+    req_up = copy.deepcopy(req_q_os)
+    first_tkr = req_up.Product.UnderlyingIdentifiers[0]
+    req_up.Model.MarketDataSet.Spots[first_tkr] *= 1.0 + h_rel
+    req_dn = copy.deepcopy(req_q_os)
+    req_dn.Model.MarketDataSet.Spots[first_tkr] *= 1.0 - h_rel
+    pv_up, _, _, _, _ = solver.simulate_batch_for_training(
+        [preprocess_eq_autocall(req_up)], config=cfg_tr, compute_pathwise_delta=False
+    )
+    pv_dn, _, _, _, _ = solver.simulate_batch_for_training(
+        [preprocess_eq_autocall(req_dn)], config=cfg_tr, compute_pathwise_delta=False
+    )
+    idx_sorted = st_q_os.sorted_identifiers.index(first_tkr)
+    fd_log_delta = (float(pv_up[0]) - float(pv_dn[0])) / (2.0 * h_rel)
+    assert abs(float(delta_base[0, idx_sorted]) - fd_log_delta) < 0.05
+

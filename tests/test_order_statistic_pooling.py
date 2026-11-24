@@ -215,3 +215,60 @@ def test_order_statistic_pooling_validation_all_active_weights_and_all_func_code
         )
         assert out.shape == (3, 32) and torch.isfinite(out).all()
 
+
+def test_order_statistic_pooling_18_codes_counterexample_compat_and_empty_nodes() -> None:
+    pool18 = OrderStatisticPooling(
+        hidden_dim=16, out_dim=32, n_func_codes=18, func_emb_dim=8
+    ).to(dtype=torch.float64).eval()
+    pool18.freeze_eval_buffers()
+
+    h_test = torch.randn(2, 5, 16, dtype=torch.float64)
+    m_test = torch.ones(2, 5, dtype=torch.float64)
+    for code in range(18):
+        out_c = pool18(
+            h_test, m_test, func_codes=torch.full((2, 3), code, dtype=torch.long)
+        )
+        assert out_c.shape == (2, 32) and torch.isfinite(out_c).all()
+
+    # Verify legacy 15-code checkpoint weights load cleanly into 18-code module.
+    pool15 = OrderStatisticPooling(hidden_dim=16, out_dim=32, n_func_codes=15, func_emb_dim=8)
+    load_res = pool18.load_state_dict(pool15.state_dict(), strict=False)
+    for bad_key in load_res.missing_keys:
+        assert "func" in bad_key or "order" in bad_key
+    out_compat = pool18(
+        h_test, m_test, func_codes=torch.full((2, 3), 16, dtype=torch.long)
+    )
+    assert out_compat.shape == (2, 32) and torch.isfinite(out_compat).all()
+
+    # Identical (mean, var, min, max) counterexample: (-3, -2, 1, 1, 3) vs (-3, -1, -1, 2, 3).
+    torch.manual_seed(7)
+    pool_ce = OrderStatisticPooling(
+        hidden_dim=4, out_dim=16, init_tau=0.05, sharp_tau=0.02, n_func_codes=18, func_emb_dim=4
+    ).to(dtype=torch.float64).eval()
+    vals_a = torch.tensor([-3.0, -2.0, 1.0, 1.0, 3.0], dtype=torch.float64)
+    vals_b = torch.tensor([-3.0, -1.0, -1.0, 2.0, 3.0], dtype=torch.float64)
+    h_ce = torch.stack([vals_a, vals_b], dim=0).unsqueeze(-1).expand(2, 5, 4).clone()
+    m_ce = torch.ones(2, 5, dtype=torch.float64)
+    for interior_code in (15, 16, 17):
+        out_ab = pool_ce(h_ce, m_ce, func_codes=torch.full((2, 3), interior_code, dtype=torch.long))
+        assert float((out_ab[0] - out_ab[1]).abs().max().item()) > 1e-4
+
+    # S_d permutation equivariance across d=1..12 and safe output on d_dim == 0.
+    for d_act in (1, 2, 5, 9, 12):
+        h_d = torch.randn(1, 12, 16, dtype=torch.float64)
+        m_d = torch.zeros(1, 12, dtype=torch.float64)
+        m_d[0, :d_act] = 1.0
+        codes = torch.tensor([[15, 16, 17]], dtype=torch.long)
+        perm = torch.randperm(12)
+        out_o = pool18(h_d, m_d, func_codes=codes)
+        out_p = pool18(h_d[:, perm, :], m_d[:, perm], func_codes=codes)
+        torch.testing.assert_close(out_o, out_p, atol=1e-12, rtol=1e-12)
+
+    out_d0 = pool18(
+        torch.zeros(2, 4, 16, dtype=torch.float64),
+        torch.zeros(2, 4, dtype=torch.float64),
+        func_codes=torch.full((2, 3), 15, dtype=torch.long),
+    )
+    assert out_d0.shape == (2, 32) and torch.isfinite(out_d0).all()
+
+

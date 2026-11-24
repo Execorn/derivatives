@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import logging
+import math
 import re
+import threading
 from typing import Any, Callable, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -24,6 +27,9 @@ from deepvol.models.autocall.seasoned_collapser import _to_utc_datetime
 
 _LOGGER = logging.getLogger(__name__)
 _PERIOD_DAYS_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([DWMYdwmy])\s*$")
+_FX_ATM_VOL_CACHE_LOCK = threading.RLock()
+_FX_ATM_VOL_CACHE: OrderedDict[Any, Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], str, str, str, Any]] = OrderedDict()
+_FX_ATM_VOL_CACHE_MAXSIZE: int = 256
 
 
 def _parse_period_days(period_str: str | int | float) -> float:
@@ -126,11 +132,67 @@ class EscrowedDividendOutput:
     r_native_obs: torch.Tensor | None = None
 
 
+def _eval_curve_method_scalar(
+    method: Callable[[Any], Any],
+    dt_or_tau: datetime | date | float,
+    t0_dt: datetime,
+    curve_dcc: str,
+) -> float:
+    """Evaluates a custom curve scalar method regardless of datetime vs float signature."""
+    if isinstance(dt_or_tau, (datetime, date)):
+        dt_utc = _to_utc_datetime(dt_or_tau)
+        try:
+            res = method(dt_utc)
+            return float(np.asarray(res, dtype=np.float64).reshape(-1)[0])
+        except (TypeError, ValueError):
+            tau = year_fraction(t0_dt, dt_utc, curve_dcc)
+            res = method(tau)
+            return float(np.asarray(res, dtype=np.float64).reshape(-1)[0])
+    tau_f = float(dt_or_tau)
+    try:
+        res = method(tau_f)
+        return float(np.asarray(res, dtype=np.float64).reshape(-1)[0])
+    except (TypeError, ValueError):
+        dt_est = t0_dt + timedelta(seconds=tau_f * dcc_denominator(curve_dcc) * 86400.0)
+        res = method(dt_est)
+        return float(np.asarray(res, dtype=np.float64).reshape(-1)[0])
+
+
+def _eval_curve_method_batch(
+    method: Callable[[Any], Any],
+    tau_arr: npt.NDArray[np.float64],
+    t0_dt: datetime,
+    curve_dcc: str,
+) -> npt.NDArray[np.float64]:
+    """Evaluates custom curve batch inputs safely when curves return scalars or require datetimes."""
+    n_len = len(tau_arr)
+    if n_len == 0:
+        return np.zeros(0, dtype=np.float64)
+    try:
+        raw = method(tau_arr)
+        arr = np.asarray(raw, dtype=np.float64).reshape(-1)
+        if len(arr) == n_len:
+            return arr
+    except (TypeError, ValueError):
+        pass
+    out = np.empty(n_len, dtype=np.float64)
+    denom_sec = dcc_denominator(curve_dcc) * 86400.0
+    for idx in range(n_len):
+        tau_i = float(tau_arr[idx])
+        try:
+            out[idx] = float(np.asarray(method(tau_i), dtype=np.float64).reshape(-1)[0])
+        except (TypeError, ValueError):
+            dt_i = t0_dt + timedelta(seconds=tau_i * denom_sec)
+            out[idx] = float(np.asarray(method(dt_i), dtype=np.float64).reshape(-1)[0])
+    return out
+
+
 def build_repo_rate_evaluator(
     repo_spec: Any | None,
     as_of_date: datetime | date | str,
 ) -> Callable[[datetime | float], float]:
     """Builds a float64 repo rate evaluator q_repo(t) delegating directly to RepoCurve."""
+    t0_dt = _to_utc_datetime(as_of_date)
     if repo_spec is None:
         def fn_zero(_t: datetime | float) -> float:
             return 0.0
@@ -140,22 +202,23 @@ def build_repo_rate_evaluator(
 
     if hasattr(repo_spec, "repo_rate") and callable(repo_spec.repo_rate):
         rc_existing = repo_spec
+        rc_dcc = _extract_curve_dcc(rc_existing, "Act360")
 
         def fn_rc(dt_or_tau: datetime | float) -> float:
-            return float(np.asarray(rc_existing.repo_rate(dt_or_tau), dtype=np.float64).reshape(-1)[0])
+            return _eval_curve_method_scalar(rc_existing.repo_rate, dt_or_tau, t0_dt, rc_dcc)
 
-        fn_rc._eval_tau_batch = lambda tau_arr: np.asarray(rc_existing.repo_rate(tau_arr), dtype=np.float64).reshape(-1)  # type: ignore[attr-defined]
+        fn_rc._eval_tau_batch = lambda tau_arr: _eval_curve_method_batch(rc_existing.repo_rate, tau_arr, t0_dt, rc_dcc)  # type: ignore[attr-defined]
         return fn_rc
 
     if hasattr(repo_spec, "zero_rate") and callable(repo_spec.zero_rate):
-        def _eval_curve_obj(dt_or_tau: datetime | float) -> float:
-            res = repo_spec.zero_rate([dt_or_tau] if isinstance(dt_or_tau, datetime) else np.asarray([float(dt_or_tau)], dtype=np.float64))
-            return float(np.asarray(res, dtype=np.float64).reshape(-1)[0])
+        zr_dcc = _extract_curve_dcc(repo_spec, "Act360")
 
-        _eval_curve_obj._eval_tau_batch = lambda tau_arr: np.asarray(repo_spec.zero_rate(tau_arr), dtype=np.float64).reshape(-1)  # type: ignore[attr-defined]
+        def _eval_curve_obj(dt_or_tau: datetime | float) -> float:
+            return _eval_curve_method_scalar(repo_spec.zero_rate, dt_or_tau, t0_dt, zr_dcc)
+
+        _eval_curve_obj._eval_tau_batch = lambda tau_arr: _eval_curve_method_batch(repo_spec.zero_rate, tau_arr, t0_dt, zr_dcc)  # type: ignore[attr-defined]
         return _eval_curve_obj
 
-    t0_dt = _to_utc_datetime(as_of_date)
     rc = RepoCurve(repo_spec, as_of_date=t0_dt)
     if rc.is_flat_zero:
         def fn_empty(_t: datetime | float) -> float:
@@ -171,21 +234,41 @@ def build_repo_rate_evaluator(
     return _eval_repo
 
 
+def _extract_field(obj: Any, *keys: str, default: Any = None) -> Any:
+    """Extracts the first non-None mapping entry or attribute, falling back to `default`."""
+    is_map = isinstance(obj, Mapping)
+    for key in keys:
+        val = obj.get(key) if is_map else getattr(obj, key, None)
+        if val is not None:
+            return val
+    return default
+
+
+def _extract_str_field(obj: Any, *keys: str, default: str) -> str:
+    """Extracts the first non-None string/Enum entry or attribute, falling back to `default`."""
+    val = _extract_field(obj, *keys, default=default)
+    return str(getattr(val, "value", val))
+
+
 def _extract_curve_dcc(curve_obj: Any, default_dcc: str = "Act365") -> str:
     if curve_obj is None:
         return default_dcc
     if isinstance(curve_obj, Mapping):
-        raw = curve_obj.get(
+        return _extract_str_field(
+            curve_obj,
             "InterpolationDayCountConvention",
-            curve_obj.get("DayCountConvention", curve_obj.get("day_count_convention", default_dcc)),
+            "DayCountConvention",
+            "day_count_convention",
+            default=default_dcc,
         )
-        return str(getattr(raw, "value", raw))
-    for attr in ("dcc", "InterpolationDayCountConvention", "DayCountConvention", "day_count_convention"):
-        if hasattr(curve_obj, attr):
-            val = getattr(curve_obj, attr)
-            if val is not None:
-                return str(getattr(val, "value", val))
-    return default_dcc
+    return _extract_str_field(
+        curve_obj,
+        "dcc",
+        "InterpolationDayCountConvention",
+        "DayCountConvention",
+        "day_count_convention",
+        default=default_dcc,
+    )
 
 
 def build_discount_rate_evaluator(
@@ -213,8 +296,7 @@ def build_discount_rate_evaluator(
         dt_utc = _to_utc_datetime(dt)
         if dt_utc <= t0_dt:
             return 1.0
-        val = discount_curve.df(dt_utc)
-        return float(np.asarray(val, dtype=np.float64).reshape(-1)[0])
+        return _eval_curve_method_scalar(discount_curve.df, dt_utc, t0_dt, curve_dcc)
 
     def _r_from_obj(dt: datetime) -> float:
         dt_utc = _to_utc_datetime(dt)
@@ -222,29 +304,22 @@ def build_discount_rate_evaluator(
         if tau <= 0.0:
             return 0.0
         if hasattr(discount_curve, "zero_rate") and callable(discount_curve.zero_rate):
-            val = discount_curve.zero_rate(dt_utc)
-            return float(np.asarray(val, dtype=np.float64).reshape(-1)[0])
+            return _eval_curve_method_scalar(discount_curve.zero_rate, dt_utc, t0_dt, curve_dcc)
         df_val = _df_from_obj(dt_utc)
         return float(-np.log(max(df_val, 1e-15)) / tau)
 
     def _df_tau_batch_obj(tau_arr: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         if len(tau_arr) == 0:
             return np.zeros(0, dtype=np.float64)
-        return np.where(
-            tau_arr <= 0.0,
-            1.0,
-            np.asarray(discount_curve.df(tau_arr), dtype=np.float64).reshape(-1),
-        )
+        df_vals = _eval_curve_method_batch(discount_curve.df, tau_arr, t0_dt, curve_dcc)
+        return np.where(tau_arr <= 0.0, 1.0, df_vals)
 
     if hasattr(discount_curve, "zero_rate") and callable(discount_curve.zero_rate):
         def _r_tau_batch_obj(tau_arr: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
             if len(tau_arr) == 0:
                 return np.zeros(0, dtype=np.float64)
-            return np.where(
-                tau_arr <= 0.0,
-                0.0,
-                np.asarray(discount_curve.zero_rate(tau_arr), dtype=np.float64).reshape(-1),
-            )
+            r_vals = _eval_curve_method_batch(discount_curve.zero_rate, tau_arr, t0_dt, curve_dcc)
+            return np.where(tau_arr <= 0.0, 0.0, r_vals)
         _r_from_obj._eval_tau_batch = _r_tau_batch_obj  # type: ignore[attr-defined]
     _df_from_obj._eval_tau_batch = _df_tau_batch_obj  # type: ignore[attr-defined]
 
@@ -255,69 +330,106 @@ def _parse_div_item(item: Any) -> tuple[datetime, datetime, float]:
     """Extracts (ex_date, payment_date, amount) from a DividendItemSpec or dict."""
     if isinstance(item, Mapping):
         ex_val: Any = item.get("ExDate", item.get("ex_date"))
+        if ex_val is None:
+            raise ValueError("Dividend item missing ExDate.")
         ex_d = _to_utc_datetime(ex_val)
-        pay_val: Any = item.get("PaymentDate", item.get("payment_date", ex_d))
-        pay_d = _to_utc_datetime(pay_val)
-        amt = float(item.get("Amount", item.get("amount", 0.0)))
+        pay_val: Any = item.get("PaymentDate", item.get("payment_date"))
+        pay_d = _to_utc_datetime(pay_val if pay_val is not None else ex_d)
+        amt_raw: Any = item.get("Amount", item.get("amount"))
+        amt = 0.0 if amt_raw is None else float(amt_raw)
+        if not math.isfinite(amt):
+            raise ValueError(f"Non-finite dividend amount {amt_raw!r}.")
         return ex_d, pay_d, amt
 
     ex_raw: Any = getattr(item, "ExDate", None)
     if ex_raw is None:
-        ex_raw = getattr(item, "ex_date")
+        ex_raw = getattr(item, "ex_date", None)
+    if ex_raw is None:
+        raise ValueError("Dividend item missing ExDate.")
     ex_d = _to_utc_datetime(ex_raw)
     pay_raw: Any = getattr(item, "PaymentDate", None)
     if pay_raw is None:
-        pay_raw = getattr(item, "payment_date", ex_d)
+        pay_raw = getattr(item, "payment_date", None)
     pay_d = _to_utc_datetime(pay_raw if pay_raw is not None else ex_d)
-    amt_raw: Any = getattr(item, "Amount", None)
+    amt_raw = getattr(item, "Amount", None)
     if amt_raw is None:
-        amt_raw = getattr(item, "amount", 0.0)
-    return ex_d, pay_d, float(amt_raw if amt_raw is not None else 0.0)
+        amt_raw = getattr(item, "amount", None)
+    amt = 0.0 if amt_raw is None else float(amt_raw)
+    if not math.isfinite(amt):
+        raise ValueError(f"Non-finite dividend amount {amt_raw!r}.")
+    return ex_d, pay_d, amt
 
 
 def _extract_events_from_div_source(source_obj: Any) -> list[tuple[datetime, datetime, float]]:
     events: list[tuple[datetime, datetime, float]] = []
     if source_obj is None:
         return events
-    if isinstance(source_obj, Sequence) and not isinstance(source_obj, (str, bytes, Mapping)):
+    if isinstance(source_obj, (Sequence, np.ndarray)) and not isinstance(source_obj, (str, bytes, Mapping)):
         for item in source_obj:
             events.append(_parse_div_item(item))
     elif isinstance(source_obj, Mapping):
         if "CashDividendList" in source_obj or "cash_dividend_list" in source_obj:
-            cd_list = source_obj.get("CashDividendList", source_obj.get("cash_dividend_list", []))
-            for item in cd_list:
+            cd_raw = source_obj.get("CashDividendList", source_obj.get("cash_dividend_list"))
+            for item in ([] if cd_raw is None else cd_raw):
                 events.append(_parse_div_item(item))
         elif "ExDates" in source_obj or "ex_dates" in source_obj:
-            ex_dates = source_obj.get("ExDates", source_obj.get("ex_dates", []))
-            pay_dates = source_obj.get("PaymentDates", source_obj.get("payment_dates", ex_dates))
-            amounts = source_obj.get("Amounts", source_obj.get("amounts", []))
-            for ex_d, pay_d, amt in zip(ex_dates, pay_dates, amounts):
-                events.append((_to_utc_datetime(ex_d), _to_utc_datetime(pay_d), float(amt)))
-        elif "ExDate" in source_obj and isinstance(source_obj["ExDate"], Sequence) and not isinstance(source_obj["ExDate"], (str, bytes)):
-            ex_dates = source_obj["ExDate"]
-            pay_dates = source_obj.get("PaymentDate", ex_dates)
-            amounts = source_obj.get("Amount", [])
-            for ex_d, pay_d, amt in zip(ex_dates, pay_dates, amounts):
-                events.append((_to_utc_datetime(ex_d), _to_utc_datetime(pay_d), float(amt)))
+            ex_raw = source_obj.get("ExDates", source_obj.get("ex_dates"))
+            ex_list = [] if ex_raw is None else list(ex_raw)
+            pay_raw = source_obj.get("PaymentDates", source_obj.get("payment_dates"))
+            pay_list = list(ex_list) if pay_raw is None else list(pay_raw)
+            amt_raw = source_obj.get("Amounts", source_obj.get("amounts"))
+            amt_list = [] if amt_raw is None else list(amt_raw)
+            if len(ex_list) != len(amt_list) or len(pay_list) != len(ex_list):
+                raise ValueError("Dividend ExDates, PaymentDates, and Amounts lengths must match.")
+            for ex_d, pay_d, amt in zip(ex_list, pay_list, amt_list):
+                amt_f = float(amt)
+                if not math.isfinite(amt_f):
+                    raise ValueError(f"Non-finite dividend amount {amt!r}.")
+                events.append((_to_utc_datetime(ex_d), _to_utc_datetime(pay_d), amt_f))
+        elif (
+            "ExDate" in source_obj
+            and isinstance(source_obj["ExDate"], (Sequence, np.ndarray))
+            and not isinstance(source_obj["ExDate"], (str, bytes))
+        ):
+            ex_list = list(source_obj["ExDate"])
+            pay_raw = source_obj.get("PaymentDate")
+            pay_list = list(ex_list) if pay_raw is None else list(pay_raw)
+            amt_raw = source_obj.get("Amount")
+            amt_list = [] if amt_raw is None else list(amt_raw)
+            if len(ex_list) != len(amt_list) or len(pay_list) != len(ex_list):
+                raise ValueError("Dividend ExDate, PaymentDate, and Amount lengths must match.")
+            for ex_d, pay_d, amt in zip(ex_list, pay_list, amt_list):
+                amt_f = float(amt)
+                if not math.isfinite(amt_f):
+                    raise ValueError(f"Non-finite dividend amount {amt!r}.")
+                events.append((_to_utc_datetime(ex_d), _to_utc_datetime(pay_d), amt_f))
     else:
         if hasattr(source_obj, "CashDividendList") or hasattr(source_obj, "cash_dividend_list"):
-            cd_list = getattr(source_obj, "CashDividendList", None)
-            if cd_list is None:
-                cd_list = getattr(source_obj, "cash_dividend_list", [])
-            for item in cd_list:
+            cd_raw = getattr(source_obj, "CashDividendList", None)
+            if cd_raw is None:
+                cd_raw = getattr(source_obj, "cash_dividend_list", None)
+            for item in ([] if cd_raw is None else cd_raw):
                 events.append(_parse_div_item(item))
         elif hasattr(source_obj, "ExDates") or hasattr(source_obj, "ex_dates"):
-            ex_dates = getattr(source_obj, "ExDates", None)
-            if ex_dates is None:
-                ex_dates = getattr(source_obj, "ex_dates", [])
-            pay_dates = getattr(source_obj, "PaymentDates", None)
-            if pay_dates is None:
-                pay_dates = getattr(source_obj, "payment_dates", ex_dates)
-            amounts = getattr(source_obj, "Amounts", None)
-            if amounts is None:
-                amounts = getattr(source_obj, "amounts", [])
-            for ex_d, pay_d, amt in zip(ex_dates, pay_dates, amounts):
-                events.append((_to_utc_datetime(ex_d), _to_utc_datetime(pay_d), float(amt)))
+            ex_raw = getattr(source_obj, "ExDates", None)
+            if ex_raw is None:
+                ex_raw = getattr(source_obj, "ex_dates", None)
+            ex_list = [] if ex_raw is None else list(ex_raw)
+            pay_raw = getattr(source_obj, "PaymentDates", None)
+            if pay_raw is None:
+                pay_raw = getattr(source_obj, "payment_dates", None)
+            pay_list = list(ex_list) if pay_raw is None else list(pay_raw)
+            amt_raw = getattr(source_obj, "Amounts", None)
+            if amt_raw is None:
+                amt_raw = getattr(source_obj, "amounts", None)
+            amt_list = [] if amt_raw is None else list(amt_raw)
+            if len(ex_list) != len(amt_list) or len(pay_list) != len(ex_list):
+                raise ValueError("Dividend ExDates, PaymentDates, and Amounts lengths must match.")
+            for ex_d, pay_d, amt in zip(ex_list, pay_list, amt_list):
+                amt_f = float(amt)
+                if not math.isfinite(amt_f):
+                    raise ValueError(f"Non-finite dividend amount {amt!r}.")
+                events.append((_to_utc_datetime(ex_d), _to_utc_datetime(pay_d), amt_f))
     return events
 
 
@@ -356,14 +468,22 @@ _KNOWN_ISO_CURRENCIES: frozenset[str] = frozenset(
         "JPY",
         "AED",
         "KZT",
+        "BYN",
         "TRY",
         "INR",
         "BRL",
         "ZAR",
-        "BYN",
         "CAD",
         "AUD",
         "SGD",
+        "NZD",
+        "SEK",
+        "NOK",
+        "DKK",
+        "PLN",
+        "MXN",
+        "KRW",
+        "TWD",
     }
 )
 _ISO_CCY_CODES: frozenset[str] = _KNOWN_ISO_CURRENCIES
@@ -382,6 +502,8 @@ _NON_CCY_TICKER_SUFFIXES: frozenset[str] = frozenset(
         "LOCAL",
         "SHS",
         "ORD",
+        "ETF",
+        "IDX",
         "A",
         "B",
         "C",
@@ -484,12 +606,18 @@ def _infer_asset_currency(
     correlations: Any = None,
     rate_curve_ids: Sequence[str] = (),
     *,
+    asset_ccy: str | None = None,
     dividends_map: Mapping[str, Any] | None = None,
     predefined_dividends_map: Mapping[str, Any] | None = None,
     vol_surfaces: Mapping[str, Any] | None = None,
     rates_bundles: Mapping[str, Any] | Sequence[str] | None = None,
 ) -> str:
     """5-tier deterministic asset currency resolution from metadata, tokens, FX pairs, and curves."""
+    if isinstance(asset_ccy, str):
+        cand = asset_ccy.strip().upper()
+        if len(cand) == 3 and cand.isalpha() and cand not in _NON_CCY_TICKER_SUFFIXES:
+            return cand
+
     pay_ccy = str(default_ccy).strip().upper()
     ticker_str = str(ticker).strip()
     ticker_u = ticker_str.upper()
@@ -595,7 +723,7 @@ def _infer_asset_currency(
                 other_id = left_id.strip()
             else:
                 continue
-            p_clean = other_id.upper().replace("/", "").replace("_", "")
+            p_clean = other_id.upper().replace("/", "").replace("_", "").replace("-", "")
             if len(p_clean) == 6 and p_clean.isalpha():
                 c1, c2 = p_clean[:3], p_clean[3:]
                 if c1 in known_ccys and c2 in known_ccys:
@@ -604,11 +732,15 @@ def _infer_asset_currency(
                     if c2 == pay_ccy and c1 != pay_ccy:
                         return c1
 
-    base_tok = tokens[0] if tokens else ticker_u
-    if len(base_tok) > 4:
-        mapped_ccy = _COUNTRY_SUFFIX_TO_CCY.get(base_tok[-2:])
-        if mapped_ccy is not None and (mapped_ccy in active_rate_ccys or mapped_ccy in active_fx_ccys):
-            return mapped_ccy
+    mapped_ccy: str | None = None
+    if len(tokens) >= 2 and tokens[-1] in _COUNTRY_SUFFIX_TO_CCY:
+        mapped_ccy = _COUNTRY_SUFFIX_TO_CCY[tokens[-1]]
+    else:
+        base_tok = tokens[0] if tokens else ticker_u
+        if len(base_tok) >= 5:
+            mapped_ccy = _COUNTRY_SUFFIX_TO_CCY.get(base_tok[-2:])
+    if mapped_ccy is not None and (mapped_ccy in active_rate_ccys or mapped_ccy in active_fx_ccys):
+        return mapped_ccy
 
     return pay_ccy
 
@@ -617,6 +749,7 @@ def infer_asset_currency_from_context(
     ticker: str,
     payment_currency: str = "RUB",
     *,
+    asset_ccy: str | None = None,
     div_spec: Any = None,
     fx_smiles: Any = None,
     dividends_map: Mapping[str, Any] | None = None,
@@ -634,6 +767,7 @@ def infer_asset_currency_from_context(
         fx_smiles=fx_smiles,
         correlations=correlations,
         rate_curve_ids=rate_curve_ids,
+        asset_ccy=asset_ccy,
         dividends_map=dividends_map,
         predefined_dividends_map=predefined_dividends_map,
         vol_surfaces=vol_surfaces,
@@ -667,55 +801,63 @@ curve_ois_priority_rank = equity_forward_curve_priority
 
 
 def _eval_fx_atm_vol_batch(fx_spec: Any, tau_eval_arr: npt.NDArray[np.float64]) -> Tuple[npt.NDArray[np.float64], str]:
-    if isinstance(fx_spec, Mapping):
-        tenors_raw = fx_spec.get("Tenors", fx_spec.get("tenors", []))
-        deltas_raw = fx_spec.get("Deltas", fx_spec.get("deltas", ["ATM"]))
-        quotes_raw = fx_spec.get(
-            "VolatilityQuotes", fx_spec.get("volatility_quotes", fx_spec.get("Quotes", fx_spec.get("quotes", [])))
-        )
-        raw_dcc = fx_spec.get("DayCountConvention", fx_spec.get("day_count_convention", "Act365"))
-        raw_interp = fx_spec.get("SmileInterpolationMethod", fx_spec.get("smile_interpolation_method", "Linear"))
-        raw_extrap = fx_spec.get("SmileExtrapolationMethod", fx_spec.get("smile_extrapolation_method", "Flat"))
-    else:
-        tenors_raw = getattr(fx_spec, "Tenors", getattr(fx_spec, "tenors", []))
-        deltas_raw = getattr(fx_spec, "Deltas", getattr(fx_spec, "deltas", ["ATM"]))
-        quotes_raw = getattr(
-            fx_spec,
-            "VolatilityQuotes",
-            getattr(fx_spec, "volatility_quotes", getattr(fx_spec, "Quotes", getattr(fx_spec, "quotes", []))),
-        )
-        raw_dcc = getattr(fx_spec, "DayCountConvention", getattr(fx_spec, "day_count_convention", "Act365"))
-        raw_interp = getattr(fx_spec, "SmileInterpolationMethod", getattr(fx_spec, "smile_interpolation_method", "Linear"))
-        raw_extrap = getattr(fx_spec, "SmileExtrapolationMethod", getattr(fx_spec, "smile_extrapolation_method", "Flat"))
-
-    dcc = str(getattr(raw_dcc, "value", raw_dcc))
-    interp_method = str(getattr(raw_interp, "value", raw_interp))
-    extrap_method = str(getattr(raw_extrap, "value", raw_extrap))
-    if not tenors_raw or not quotes_raw:
+    tenors_raw = _extract_field(fx_spec, "Tenors", "tenors")
+    deltas_raw = _extract_field(fx_spec, "Deltas", "deltas")
+    quotes_raw = _extract_field(fx_spec, "VolatilityQuotes", "volatility_quotes", "Quotes", "quotes")
+    dcc = _extract_str_field(fx_spec, "DayCountConvention", "day_count_convention", default="Act365")
+    interp_method = _extract_str_field(fx_spec, "SmileInterpolationMethod", "smile_interpolation_method", default="Linear")
+    extrap_method = _extract_str_field(fx_spec, "SmileExtrapolationMethod", "smile_extrapolation_method", default="Flat")
+    tenors_list = [] if tenors_raw is None else list(tenors_raw)
+    if len(tenors_list) == 0 or quotes_raw is None:
+        return np.zeros(len(tau_eval_arr), dtype=np.float64), dcc
+    quotes_np = np.asarray(quotes_raw, dtype=np.float64)
+    if quotes_np.size == 0:
         return np.zeros(len(tau_eval_arr), dtype=np.float64), dcc
 
-    deltas_list = [str(d).upper() for d in deltas_raw]
+    deltas_seq = ["ATM"] if deltas_raw is None else list(deltas_raw)
+    deltas_list = [str(d).upper() for d in deltas_seq]
     atm_idx = deltas_list.index("ATM") if "ATM" in deltas_list else len(deltas_list) // 2
-    t_arr = np.asarray([_parse_tenor_years(t, dcc) for t in tenors_raw], dtype=np.float64)
-    v_arr = np.asarray(
-        [
-            float(row[atm_idx]) if isinstance(row, Sequence) and not isinstance(row, (str, bytes)) else float(row)
-            for row in quotes_raw
-        ],
-        dtype=np.float64,
-    )
-
-    order = np.argsort(t_arr)
-    t_arr = t_arr[order]
-    v_arr = v_arr[order]
+    if quotes_np.ndim >= 2:
+        v_tuple = tuple(float(x) for x in quotes_np[:, min(atm_idx, quotes_np.shape[1] - 1)])
+    else:
+        v_tuple = tuple(float(x) for x in quotes_np.reshape(-1))
+    fx_cache_key = (dcc, interp_method, extrap_method, tuple(str(t) for t in tenors_list), v_tuple)
+    with _FX_ATM_VOL_CACHE_LOCK:
+        cached_fx = _FX_ATM_VOL_CACHE.get(fx_cache_key)
+        if cached_fx is not None:
+            _FX_ATM_VOL_CACHE.move_to_end(fx_cache_key)
+    if cached_fx is None:
+        t_arr = np.asarray([_parse_tenor_years(t, dcc) for t in tenors_list], dtype=np.float64)
+        v_arr = np.asarray(v_tuple, dtype=np.float64)
+        order = np.argsort(t_arr, kind="mergesort")
+        t_arr = t_arr[order]
+        v_arr = v_arr[order]
+        # Keep the last quote when aliases such as '12M' and '1Y' resolve to identical tenors.
+        keep_idx: list[int] = []
+        for idx_t in range(len(t_arr)):
+            if keep_idx and abs(t_arr[idx_t] - t_arr[keep_idx[-1]]) <= 1e-12:
+                keep_idx[-1] = idx_t
+            else:
+                keep_idx.append(idx_t)
+        if len(keep_idx) < len(t_arr):
+            t_arr = t_arr[keep_idx]
+            v_arr = v_arr[keep_idx]
+        cs_obj = CubicSpline(t_arr, v_arr, bc_type="natural") if (len(t_arr) >= 3 and interp_method in ("CubicSpline", "Smooth")) else None
+        cached_fx = (t_arr, v_arr, dcc, interp_method, extrap_method, cs_obj)
+        with _FX_ATM_VOL_CACHE_LOCK:
+            _FX_ATM_VOL_CACHE[fx_cache_key] = cached_fx
+            _FX_ATM_VOL_CACHE.move_to_end(fx_cache_key)
+            if len(_FX_ATM_VOL_CACHE) > _FX_ATM_VOL_CACHE_MAXSIZE:
+                _FX_ATM_VOL_CACHE.popitem(last=False)
+    else:
+        t_arr, v_arr, dcc, interp_method, extrap_method, cs_obj = cached_fx
 
     if len(t_arr) == 1:
         return np.full(len(tau_eval_arr), float(v_arr[0]), dtype=np.float64), dcc
 
     t_clip = np.clip(tau_eval_arr, t_arr[0], t_arr[-1])
-    if interp_method in ("CubicSpline", "Smooth") and len(t_arr) >= 3:
-        cs = CubicSpline(t_arr, v_arr, bc_type="natural")
-        out = np.asarray(cs(t_clip), dtype=np.float64)
+    if cs_obj is not None:
+        out = np.asarray(cs_obj(t_clip), dtype=np.float64)
     else:
         out = np.interp(t_clip, t_arr, v_arr)
 
@@ -748,7 +890,7 @@ def _eval_eq_atm_vol_batch(
     if n_eval == 0 or eq_spec is None:
         return np.zeros(n_eval, dtype=np.float64)
     if hasattr(eq_spec, "iv_batch") and callable(eq_spec.iv_batch):
-        surf_dcc = str(getattr(eq_spec, "dcc", "Act365"))
+        surf_dcc = _extract_str_field(eq_spec, "dcc", default="Act365")
         taus = np.asarray(
             [year_fraction(as_of_dt, _to_utc_datetime(d), surf_dcc) for d in eval_dts],
             dtype=np.float64,
@@ -756,34 +898,34 @@ def _eval_eq_atm_vol_batch(
         spots = np.full(n_eval, float(spot_val), dtype=np.float64)
         return np.asarray(eq_spec.iv_batch(taus, spots), dtype=np.float64)
     if hasattr(eq_spec, "iv") and callable(eq_spec.iv):
-        surf_dcc = str(getattr(eq_spec, "dcc", "Act365"))
+        surf_dcc = _extract_str_field(eq_spec, "dcc", default="Act365")
         return np.asarray(
             [float(eq_spec.iv(year_fraction(as_of_dt, _to_utc_datetime(d), surf_dcc), spot_val)) for d in eval_dts],
             dtype=np.float64,
         )
-    if isinstance(eq_spec, Mapping):
-        strikes_raw = eq_spec.get("Strikes", eq_spec.get("strikes", []))
-        quotes_raw = eq_spec.get("VolatilityQuotes", eq_spec.get("volatility_quotes", []))
-        exp_dates = eq_spec.get("ExpirationDates", eq_spec.get("expiration_dates", []))
-        raw_dcc = eq_spec.get("DayCountConvention", eq_spec.get("day_count_convention", "Act365"))
-    else:
-        strikes_raw = getattr(eq_spec, "Strikes", getattr(eq_spec, "strikes", []))
-        quotes_raw = getattr(eq_spec, "VolatilityQuotes", getattr(eq_spec, "volatility_quotes", []))
-        exp_dates = getattr(eq_spec, "ExpirationDates", getattr(eq_spec, "expiration_dates", []))
-        raw_dcc = getattr(eq_spec, "DayCountConvention", getattr(eq_spec, "day_count_convention", "Act365"))
-    if not strikes_raw or not quotes_raw or not exp_dates:
+    strikes_raw = _extract_field(eq_spec, "Strikes", "strikes")
+    quotes_raw = _extract_field(eq_spec, "VolatilityQuotes", "volatility_quotes")
+    exp_dates = _extract_field(eq_spec, "ExpirationDates", "expiration_dates")
+    strikes = np.asarray([] if strikes_raw is None else strikes_raw, dtype=np.float64).reshape(-1)
+    quotes = np.asarray([] if quotes_raw is None else quotes_raw, dtype=np.float64)
+    exp_list = [] if exp_dates is None else list(exp_dates)
+    if strikes.size == 0 or quotes.size == 0 or len(exp_list) == 0:
         return np.zeros(n_eval, dtype=np.float64)
-    dcc = str(getattr(raw_dcc, "value", raw_dcc))
+    dcc = _extract_str_field(eq_spec, "DayCountConvention", "day_count_convention", default="Act365")
     t_eval = np.asarray(
         [year_fraction(as_of_dt, _to_utc_datetime(d), dcc) for d in eval_dts],
         dtype=np.float64,
     )
     tenors = np.asarray(
-        [year_fraction(as_of_dt, _to_utc_datetime(d), dcc) for d in exp_dates],
+        [year_fraction(as_of_dt, _to_utc_datetime(d), dcc) for d in exp_list],
         dtype=np.float64,
     )
-    strikes = np.asarray(strikes_raw, dtype=np.float64)
-    quotes = np.asarray(quotes_raw, dtype=np.float64)
+    if quotes.ndim == 1:
+        quotes = quotes.reshape(len(tenors), -1)
+    if len(strikes) > 1 and not bool(np.all(np.diff(strikes) >= 0.0)):
+        s_ord = np.argsort(strikes, kind="mergesort")
+        strikes = strikes[s_ord]
+        quotes = quotes[:, s_ord]
     if len(strikes) <= 1:
         slice_vols = quotes[:, 0].astype(np.float64)
     elif bool(np.all(np.diff(strikes) > 0.0)):
@@ -795,11 +937,20 @@ def _eval_eq_atm_vol_batch(
         slice_vols = np.asarray((1.0 - w_k) * quotes[:, k_idx] + w_k * quotes[:, k_idx + 1], dtype=np.float64)
     else:
         slice_vols = np.array([float(np.interp(spot_val, strikes, row)) for row in quotes], dtype=np.float64)
-    if len(tenors) == 1:
-        return np.full(n_eval, float(slice_vols[0]), dtype=np.float64)
-    order = np.argsort(tenors)
+    order = np.argsort(tenors, kind="mergesort")
     tenors = tenors[order]
     slice_vols = slice_vols[order]
+    keep_t: list[int] = []
+    for idx_t in range(len(tenors)):
+        if keep_t and abs(tenors[idx_t] - tenors[keep_t[-1]]) <= 1e-12:
+            keep_t[-1] = idx_t
+        else:
+            keep_t.append(idx_t)
+    if len(keep_t) < len(tenors):
+        tenors = tenors[keep_t]
+        slice_vols = slice_vols[keep_t]
+    if len(tenors) == 1:
+        return np.full(n_eval, float(slice_vols[0]), dtype=np.float64)
     slice_vars = (slice_vols * slice_vols) * np.maximum(tenors, 0.0)
     w_eval = np.interp(t_eval, tenors, slice_vars)
     out = np.sqrt(np.maximum(w_eval / np.maximum(t_eval, 1e-12), 0.0))
@@ -977,25 +1128,31 @@ def compute_escrowed_dividend_forwards(
     m_rem = len(obs_dts)
 
     if isinstance(spots_t0, torch.Tensor):
-        spots_t = spots_t0.to(dtype=torch.float64)
+        spots_t = spots_t0.to(dtype=torch.float64).reshape(-1)
     elif isinstance(spots_t0, Mapping):
         spots_t = torch.tensor([float(spots_t0[t]) for t in id_list], dtype=torch.float64)
     else:
-        spots_t = torch.as_tensor(spots_t0, dtype=torch.float64)
+        spots_t = torch.as_tensor(spots_t0, dtype=torch.float64).reshape(-1)
     device = spots_t.device
 
-    if not bool(torch.all(torch.isfinite(spots_t) & (spots_t > 0.0)).item()):
+    if spots_t.numel() != d_assets:
+        raise ValueError(f"spots_t0 length ({spots_t.numel()}) != identifiers ({d_assets}).")
+    if d_assets > 0 and not bool(torch.all(torch.isfinite(spots_t) & (spots_t > 0.0)).item()):
         raise ValueError("Spots must be strictly positive and finite.")
 
     if isinstance(ref_spots, torch.Tensor):
-        ref_t = ref_spots.to(dtype=torch.float64, device=device)
+        ref_t = ref_spots.to(dtype=torch.float64, device=device).reshape(-1)
     else:
-        ref_t = torch.as_tensor(ref_spots, dtype=torch.float64, device=device)
+        ref_t = torch.as_tensor(ref_spots, dtype=torch.float64, device=device).reshape(-1)
+    if ref_t.numel() != d_assets:
+        raise ValueError(f"ref_spots length ({ref_t.numel()}) != identifiers ({d_assets}).")
+    if d_assets > 0 and not bool(torch.all(torch.isfinite(ref_t) & (ref_t > 0.0)).item()):
+        raise ValueError("Reference spots must be strictly positive and finite.")
 
     merged_divs = merge_dividend_schedules(id_list, market_dividends, predefined_dividends)
 
-    if m_rem == 0:
-        empty_dm = torch.zeros((d_assets, 0), dtype=torch.float64, device=device)
+    if d_assets == 0 or m_rem == 0:
+        empty_dm = torch.zeros((d_assets, m_rem), dtype=torch.float64, device=device)
         return EscrowedDividendOutput(
             identifiers=id_list,
             as_of_date=t0_dt,
@@ -1193,6 +1350,10 @@ def compute_escrowed_dividend_forwards(
             fx_smiles=vol_surfaces,
             correlations=correlations,
             rate_curve_ids=rate_curve_ids_tuple,
+            dividends_map=market_dividends,
+            predefined_dividends_map=predefined_dividends,
+            vol_surfaces=vol_surfaces,
+            rates_bundles=asset_financing_curves,
         )
 
         quanto_resolved = (
@@ -1284,7 +1445,11 @@ def compute_escrowed_dividend_forwards(
 
         if len(parsed_events_i) > 0:
             if dividend_amount_overrides and ticker in dividend_amount_overrides:
-                amt_t = dividend_amount_overrides[ticker].to(dtype=torch.float64, device=device)
+                amt_t = dividend_amount_overrides[ticker].to(dtype=torch.float64, device=device).reshape(-1)
+                if amt_t.numel() != len(parsed_events_i):
+                    raise ValueError(
+                        f"dividend_amount_overrides[{ticker!r}] length ({amt_t.numel()}) != dividend events ({len(parsed_events_i)})."
+                    )
             else:
                 amt_t = torch.tensor(amounts_i, dtype=torch.float64, device=device)
             w_t = torch.tensor(weights_i, dtype=torch.float64, device=device)

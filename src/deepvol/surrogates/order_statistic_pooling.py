@@ -1,9 +1,9 @@
-"""FiLM-conditioned 7-operator permutation-invariant order-statistic pooling."""
+"""FiLM-conditioned 10-operator permutation-invariant order-statistic pooling."""
 
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,8 @@ def masked_log_mean_exp_max(
     Detaching the per-row maximum shift preserves the exact forward value while
     keeping the autograd graph strictly C-infinity smooth across exact asset ties.
     """
+    if h.shape[1] == 0:
+        return h.new_zeros((h.shape[0], h.shape[2]))
     active_bool = active_mask > 0.5
     active_3d = active_bool.unsqueeze(-1)
     m = active_bool.to(dtype=h.dtype)
@@ -62,10 +64,10 @@ def _freeze_pool_buffers(module: nn.Module, *_args: object) -> None:
 
 
 class OrderStatisticPooling(nn.Module):
-    """FiLM-conditioned 7-operator permutation-invariant order-statistic readout bank.
+    """FiLM-conditioned permutation-invariant order-statistic readout bank.
 
-    Computes [h_mean, h_min, h_max, h_softmin(tau_min), h_softmax(tau_max), h_std, h_wsum]
-    over active basket constituents and modulates the projected summary via FiLM from
+    Combines 7 core basket statistics with differentiable pairwise soft-rank operators
+    (2nd-worst, 3rd-worst, 2nd-best) and modulates the projection via FiLM from
     (call_idx, cpn_idx, opt_idx) functional embeddings.
     """
 
@@ -75,7 +77,7 @@ class OrderStatisticPooling(nn.Module):
         out_dim: Optional[int] = None,
         init_tau: float = 0.15,
         sharp_tau: float = 0.10,
-        n_func_codes: int = 15,
+        n_func_codes: int = 18,
         func_emb_dim: int = 16,
     ) -> None:
         super().__init__()
@@ -120,6 +122,7 @@ class OrderStatisticPooling(nn.Module):
             nn.LayerNorm(self.out_dim),
             nn.SiLU(),
         )
+        self.soft_rank_proj = nn.Linear(3 * self.hidden_dim, self.out_dim, bias=False)
 
         self.register_buffer(
             "_frozen_tau_min",
@@ -163,22 +166,20 @@ class OrderStatisticPooling(nn.Module):
         with torch.inference_mode(False), torch.no_grad():
             t_min = torch.exp(self.log_tau_min).clamp(min=1e-3, max=10.0).detach()
             t_max = torch.exp(self.log_tau_max).clamp(min=1e-3, max=10.0).detach()
-            frozen_t_min = self._frozen_tau_min
-            frozen_t_max = self._frozen_tau_max
-            frozen_inv_min = self._frozen_inv_tau_min_3d
-            frozen_inv_max = self._frozen_inv_tau_max_3d
-            assert isinstance(frozen_t_min, torch.Tensor)
-            assert isinstance(frozen_t_max, torch.Tensor)
-            assert isinstance(frozen_inv_min, torch.Tensor)
-            assert isinstance(frozen_inv_max, torch.Tensor)
-            frozen_t_min.copy_(t_min.to(device=frozen_t_min.device, dtype=frozen_t_min.dtype))
-            frozen_t_max.copy_(t_max.to(device=frozen_t_max.device, dtype=frozen_t_max.dtype))
-            frozen_inv_min.copy_(
-                (1.0 / t_min).unsqueeze(1).to(device=frozen_inv_min.device, dtype=frozen_inv_min.dtype)
-            )
-            frozen_inv_max.copy_(
-                (1.0 / t_max).unsqueeze(1).to(device=frozen_inv_max.device, dtype=frozen_inv_max.dtype)
-            )
+            for name, src in (
+                ("_frozen_tau_min", t_min),
+                ("_frozen_tau_max", t_max),
+                ("_frozen_inv_tau_min_3d", (1.0 / t_min).unsqueeze(1)),
+                ("_frozen_inv_tau_max_3d", (1.0 / t_max).unsqueeze(1)),
+            ):
+                buf = self._buffers.get(name)
+                assert isinstance(buf, torch.Tensor)
+                val = src.to(device=buf.device, dtype=buf.dtype).contiguous()
+                if buf.is_inference() or val.is_inference():
+                    # Rebind outside inference_mode rather than inplace copy_ on an inference tensor.
+                    self._buffers[name] = val.clone()
+                else:
+                    buf.copy_(val)
 
     def train(self, mode: bool = True) -> OrderStatisticPooling:
         super().train(mode)
@@ -208,6 +209,58 @@ class OrderStatisticPooling(nn.Module):
         t_max = self.tau_max.to(device=device, dtype=dtype)
         return t_min, t_max, (1.0 / t_min).unsqueeze(1), (1.0 / t_max).unsqueeze(1)
 
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # Preserve strict=True compatibility with legacy 15-code checkpoints lacking soft_rank_proj.
+        proj_key = prefix + "proj.0.weight"
+        sr_key = prefix + "soft_rank_proj.weight"
+        if proj_key in state_dict and sr_key not in state_dict:
+            ref_proj = state_dict[proj_key]
+            state_dict[sr_key] = torch.zeros(
+                self.soft_rank_proj.weight.shape,
+                dtype=ref_proj.dtype,
+                device=ref_proj.device,
+            )
+
+        for emb_name in ("emb_call.weight", "emb_cpn.weight", "emb_opt.weight"):
+            emb_key = prefix + emb_name
+            emb_val = state_dict.get(emb_key)
+            if (
+                isinstance(emb_val, torch.Tensor)
+                and emb_val.ndim == 2
+                and emb_val.shape[0] == 15
+                and self.n_func_codes > 15
+                and emb_val.shape[1] == self.func_emb_dim
+            ):
+                padded = torch.empty(
+                    (self.n_func_codes, self.func_emb_dim),
+                    dtype=emb_val.dtype,
+                    device=emb_val.device,
+                )
+                padded[:15] = emb_val
+                for extra_idx in range(15, self.n_func_codes):
+                    src_idx = 1 if (extra_idx == 17 and emb_val.shape[0] > 1) else 0
+                    padded[extra_idx] = emb_val[src_idx]
+                state_dict[emb_key] = padded
+
+        super()._load_from_state_dict(  # type: ignore[no-untyped-call]
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def compute_seven_statistics(
         self,
         h: torch.Tensor,
@@ -225,6 +278,10 @@ class OrderStatisticPooling(nn.Module):
         torch.Tensor,
     ]:
         """Return (h_mean, h_min, h_max, h_softmin, h_softmax, h_std, h_wsum) each of shape (B, C)."""
+        if h.shape[1] == 0:
+            zeros = h.new_zeros((h.shape[0], h.shape[2]))
+            return zeros, zeros, zeros, zeros, zeros, zeros, zeros
+
         inv_tau_sharp = 1.0 / self.sharp_tau
         tau_min, tau_max, inv_tau_min_3d, inv_tau_max_3d = self._resolve_taus(h.device, h.dtype)
 
@@ -317,12 +374,98 @@ class OrderStatisticPooling(nn.Module):
 
         s_max_sq = shift_max.squeeze(1)
         s_min_sq = shift_min.squeeze(1)
+        eps_tiny = max(float(torch.finfo(h.dtype).tiny), 1e-30)
 
-        h_max = (s_max_sq + self.sharp_tau * torch.log(exp_max_sharp.clamp(min=1e-30))) * active_float
-        h_min = (s_min_sq - self.sharp_tau * torch.log(exp_min_sharp.clamp(min=1e-30))) * active_float
-        h_softmax = (s_max_sq + tau_max * torch.log(exp_max_soft.clamp(min=1e-30))) * active_float
-        h_softmin = (s_min_sq - tau_min * torch.log(exp_min_soft.clamp(min=1e-30))) * active_float
+        h_max = (s_max_sq + self.sharp_tau * torch.log(exp_max_sharp.clamp(min=eps_tiny))) * active_float
+        h_min = (s_min_sq - self.sharp_tau * torch.log(exp_min_sharp.clamp(min=eps_tiny))) * active_float
+        h_softmax = (s_max_sq + tau_max * torch.log(exp_max_soft.clamp(min=eps_tiny))) * active_float
+        h_softmin = (s_min_sq - tau_min * torch.log(exp_min_soft.clamp(min=eps_tiny))) * active_float
         return h_mean, h_min, h_max, h_softmin, h_softmax, h_std, h_wsum
+
+    def compute_soft_rank_statistics(
+        self,
+        h: torch.Tensor,
+        asset_mask: torch.Tensor,
+        *,
+        all_active: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return differentiable order statistics (h_min2, h_min3, h_max2) each of shape (B, C)."""
+        d_dim = h.shape[1]
+        if d_dim == 0:
+            zeros = h.new_zeros((h.shape[0], h.shape[2]))
+            return zeros, zeros, zeros
+
+        eps_tiny = max(float(torch.finfo(h.dtype).tiny), 1e-30)
+        inv_2sigma2 = 0.5 / (0.55 * 0.55)
+        eye_mask = (1.0 - torch.eye(d_dim, device=h.device, dtype=h.dtype)).unsqueeze(0).unsqueeze(-1)
+
+        if all_active is True:
+            h_mean = h.mean(dim=1, keepdim=True)
+            diff_mean = h - h_mean
+            h_std = torch.sqrt((diff_mean * diff_mean).mean(dim=1, keepdim=True) + 1e-6)
+            tau_r = (0.25 * h_std).clamp(min=self.sharp_tau).unsqueeze(1)
+            ranks = (torch.sigmoid((h.unsqueeze(2) - h.unsqueeze(1)) / tau_r) * eye_mask).sum(dim=2)
+
+            t_min2_f = float(min(max(d_dim - 1, 0), 1))
+            t_min3_f = float(min(max(d_dim - 1, 0), 2))
+            t_max2_f = float(max(d_dim - 2, 0))
+            targets_all = torch.tensor(
+                [t_min2_f, t_min3_f, t_max2_f], device=h.device, dtype=h.dtype
+            ).view(1, 1, 3, 1)
+            log_w = -((ranks.unsqueeze(2) - targets_all) ** 2) * inv_2sigma2
+            with torch.no_grad():
+                shift_w = log_w.amax(dim=1, keepdim=True)
+            w_raw = torch.exp((log_w - shift_w).clamp(max=0.0))
+            w_sum = w_raw.sum(dim=1, keepdim=True).clamp(min=eps_tiny)
+            h_soft_3 = (w_raw / w_sum * h.unsqueeze(2)).sum(dim=1)
+            h_min2, h_min3, h_max2 = h_soft_3.unbind(dim=1)
+            return h_min2, h_min3, h_max2
+
+        active_bool = asset_mask > 0.5
+        active_3d = active_bool.unsqueeze(-1)
+        m = active_bool.to(dtype=h.dtype)
+        act_count = m.sum(dim=1, keepdim=True)
+        inv_count = 1.0 / act_count.clamp(min=1.0)
+        has_active = active_bool.any(dim=1, keepdim=True)
+        active_float = has_active.to(dtype=h.dtype)
+
+        zeros_h = torch.zeros_like(h)
+        h_clean = torch.where(active_3d, h, zeros_h)
+        h_mean = h_clean.sum(dim=1) * inv_count
+        diff_mean = torch.where(active_3d, h_clean - h_mean.unsqueeze(1), zeros_h)
+        h_var = (diff_mean * diff_mean).sum(dim=1) * inv_count
+        h_std = torch.sqrt(h_var + 1e-6) * active_float
+        tau_r = (0.25 * h_std).clamp(min=self.sharp_tau).unsqueeze(1).unsqueeze(1)
+
+        pair_mask = (m.unsqueeze(2) * m.unsqueeze(1)).unsqueeze(-1) * eye_mask
+        ranks = (
+            torch.sigmoid((h_clean.unsqueeze(2) - h_clean.unsqueeze(1)) / tau_r) * pair_mask
+        ).sum(dim=2)
+
+        t_min2 = (act_count - 1.0).clamp(min=0.0, max=1.0)
+        t_min3 = (act_count - 1.0).clamp(min=0.0, max=2.0)
+        t_max2 = (act_count - 2.0).clamp(min=0.0)
+        targets = torch.cat([t_min2, t_min3, t_max2], dim=1).unsqueeze(1).unsqueeze(-1)
+
+        log_w = -((ranks.unsqueeze(2) - targets) ** 2) * inv_2sigma2
+        active_4d = active_bool.unsqueeze(-1).unsqueeze(-1)
+        # Use -1e4 rather than -1e9 so float16 masking never overflows.
+        log_w_masked = torch.where(active_4d, log_w, torch.full_like(log_w, -1e4))
+        with torch.no_grad():
+            shift_w = torch.where(
+                has_active.unsqueeze(-1).unsqueeze(-1),
+                log_w_masked.amax(dim=1, keepdim=True),
+                torch.zeros_like(log_w_masked[:, :1]),
+            )
+        w_raw = torch.where(
+            active_4d,
+            torch.exp((log_w_masked - shift_w).clamp(max=0.0)),
+            torch.zeros_like(log_w),
+        )
+        w_sum = w_raw.sum(dim=1, keepdim=True).clamp(min=eps_tiny)
+        h_soft_3 = (w_raw / w_sum * h_clean.unsqueeze(2)).sum(dim=1) * active_float.unsqueeze(1)
+        h_min2, h_min3, h_max2 = h_soft_3.unbind(dim=1)
+        return h_min2, h_min3, h_max2
 
     def compute_five_statistics(
         self,
@@ -350,13 +493,19 @@ class OrderStatisticPooling(nn.Module):
         h_mean, h_min, h_max, h_softmin, h_softmax, h_std, h_wsum = self.compute_seven_statistics(
             h, asset_mask, asset_weights=asset_weights, all_active=all_active
         )
+        h_min2, h_min3, h_max2 = self.compute_soft_rank_statistics(
+            h, asset_mask, all_active=all_active
+        )
         cat_stats = torch.cat(
             [h_mean, h_min, h_max, h_softmin, h_softmax, h_std, h_wsum], dim=-1
         )
+        cat_soft_rank = torch.cat([h_min2, h_min3, h_max2], dim=-1)
         proj_lin = self.proj[0]
         proj_norm = self.proj[1]
         assert isinstance(proj_lin, nn.Linear) and isinstance(proj_norm, nn.LayerNorm)
-        lin_out = F.linear(cat_stats, proj_lin.weight, proj_lin.bias)
+        lin_out = F.linear(cat_stats, proj_lin.weight, proj_lin.bias) + F.linear(
+            cat_soft_rank, self.soft_rank_proj.weight
+        )
 
         if func_codes is None:
             default_fc = self._default_func_codes

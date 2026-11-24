@@ -481,3 +481,193 @@ def test_t1m004_t1m007_t1m015_t1m019_t1m023_ext014_curves_and_dcc() -> None:
         ClampedYieldCurve(as_of_date=as_of, pillar_tenors=[1.0, 2.0], rates=[10.0], input_mode="bad_mode")
 
 
+def test_curves_audit_blind_spots() -> None:
+    as_of = datetime.datetime(2026, 10, 23, 0, 0, tzinfo=datetime.timezone.utc)
+    tenors = np.array([0.25, 0.5, 1.0, 2.0, 5.0], dtype=np.float64)
+    rates_pct = np.array([12.0, 12.5, 13.0, 13.4, 13.8], dtype=np.float64)
+    rates_dec = rates_pct / 100.0
+    log_df_vals = -rates_dec * tenors
+    df_vals = np.exp(log_df_vals)
+    eval_int = np.array([0.25, 0.35, 0.75, 1.5, 3.5, 5.0], dtype=np.float64)
+    eval_t = np.array([0.1, 0.35, 0.75, 1.5, 3.5, 6.0], dtype=np.float64)
+
+    for method in (
+        "LogLinear",
+        "LogDiscountLinear",
+        "PiecewiseConstantForward",
+        "FwdFwdLinear",
+    ):
+        c_rates = ClampedYieldCurve(
+            as_of_date=as_of,
+            pillar_tenors=tenors,
+            rates=rates_pct,
+            interpolation_method=method,
+            space_coords="Rates",
+        )
+        ref_df_int, ref_ddp_int = c_rates.df_and_d_df_d_pillar(eval_int)
+
+        c_logdf = ClampedYieldCurve(
+            as_of_date=as_of,
+            pillar_tenors=tenors,
+            rates=log_df_vals,
+            interpolation_method=method,
+            space_coords="LogarithmOfDiscountFactors",
+            quote_expression="Standard",
+        )
+        c_df = ClampedYieldCurve(
+            as_of_date=as_of,
+            pillar_tenors=tenors,
+            rates=df_vals,
+            interpolation_method=method,
+            space_coords="DiscountFactors",
+            quote_expression="Standard",
+        )
+
+        # Verify interior DF parity AND Jacobian sign against exact equivalent Rates parameterization.
+        np.testing.assert_allclose(c_logdf.df(eval_int), ref_df_int, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(c_df.df(eval_int), ref_df_int, rtol=1e-12, atol=1e-12)
+        assert np.all(np.sum(ref_ddp_int, axis=1) <= -1e-12)
+        if method != "FwdFwdLinear":
+            assert np.all(ref_ddp_int <= 1e-14)
+
+        for c_alt, quotes_alt in ((c_logdf, log_df_vals), (c_df, df_vals)):
+            vals_alt, jac_alt = c_alt.df_and_d_df_d_pillar(eval_t)
+            np.testing.assert_allclose(c_alt.df(eval_int), ref_df_int, rtol=1e-12, atol=1e-12)
+            eps = 1e-6
+            fd_jac = np.zeros_like(jac_alt)
+            for k in range(len(quotes_alt)):
+                q_up = quotes_alt.copy()
+                q_dn = quotes_alt.copy()
+                q_up[k] += eps
+                q_dn[k] -= eps
+                df_u = ClampedYieldCurve(
+                    as_of_date=as_of,
+                    pillar_tenors=tenors,
+                    rates=q_up,
+                    interpolation_method=method,
+                    space_coords=c_alt.space_coords,
+                    quote_expression="Standard",
+                ).df(eval_t)
+                df_d = ClampedYieldCurve(
+                    as_of_date=as_of,
+                    pillar_tenors=tenors,
+                    rates=q_dn,
+                    interpolation_method=method,
+                    space_coords=c_alt.space_coords,
+                    quote_expression="Standard",
+                ).df(eval_t)
+                fd_jac[:, k] = (df_u - df_d) / (2.0 * eps)
+            np.testing.assert_allclose(jac_alt, fd_jac, rtol=1e-6, atol=1e-9)
+
+    # CurveInterpolationMethodEnum.Smooth support and FD Jacobian consistency.
+    c_smooth = ClampedYieldCurve(
+        as_of_date=as_of,
+        pillar_tenors=tenors,
+        rates=rates_pct,
+        interpolation_method=CurveInterpolationMethodEnum.Smooth,
+    )
+    sm_df, sm_ddp = c_smooth.df_and_d_df_d_pillar(eval_t)
+    assert np.all(np.isfinite(sm_df)) and np.all((sm_df > 0.0) & (sm_df <= 1.0))
+    np.testing.assert_allclose(c_smooth.zero_rate(tenors), rates_dec, atol=1e-12)
+    np.testing.assert_allclose(np.sum(c_smooth.spline_weights(eval_t), axis=1), 1.0, atol=1e-12)
+    fd_sm = np.zeros_like(sm_ddp)
+    for k in range(len(rates_pct)):
+        ru, rd = rates_pct.copy(), rates_pct.copy()
+        ru[k] += 1e-5
+        rd[k] -= 1e-5
+        df_u = ClampedYieldCurve(
+            as_of_date=as_of,
+            pillar_tenors=tenors,
+            rates=ru,
+            interpolation_method=CurveInterpolationMethodEnum.Smooth,
+        ).df(eval_t)
+        df_d = ClampedYieldCurve(
+            as_of_date=as_of,
+            pillar_tenors=tenors,
+            rates=rd,
+            interpolation_method=CurveInterpolationMethodEnum.Smooth,
+        ).df(eval_t)
+        fd_sm[:, k] = (df_u - df_d) / (2.0 * 1e-5)
+    np.testing.assert_allclose(sm_ddp, fd_sm, rtol=1e-6, atol=1e-9)
+
+    # MonotoneConvex C^0 instantaneous forward continuity on stress knot geometries.
+    for stress_r in ([1.0, 2.0, 3.0, 6.0], [5.0, 5.0, 6.0, 30.0], [18.0, 4.0, 12.0, 2.0]):
+        stress_t = np.array([0.25, 0.5, 1.0, 2.0], dtype=np.float64)
+        c_mc = ClampedYieldCurve(
+            as_of_date=as_of,
+            pillar_tenors=stress_t,
+            rates=stress_r,
+            interpolation_method="MonotoneConvex",
+        )
+        dt_probe = 1e-6
+        for t_knot in stress_t[1:-1]:
+            df_m = float(c_mc.df(t_knot - dt_probe))
+            df_0 = float(c_mc.df(t_knot))
+            df_p = float(c_mc.df(t_knot + dt_probe))
+            f_left = -(np.log(df_0) - np.log(df_m)) / dt_probe
+            f_right = -(np.log(df_p) - np.log(df_0)) / dt_probe
+            assert abs(f_right - f_left) < 1e-3
+        np.testing.assert_allclose(
+            c_mc.df(stress_t), np.exp(-(np.asarray(stress_r, dtype=np.float64) / 100.0) * stress_t), atol=1e-12
+        )
+        grid_t = np.linspace(0.01, 2.0, 200)
+        df_grid = c_mc.df(grid_t)
+        assert np.all(np.isfinite(df_grid)) and np.all(df_grid > 0.0)
+        if np.all(np.diff((np.asarray(stress_r, dtype=np.float64) / 100.0) * stress_t) > 0.0):
+            assert np.all(np.diff(np.log(df_grid)) <= 1e-12)
+
+    # Rates=[] + Spreads fallback, RepoCurve edge inputs, NaN validation, and dotted DCC normalization.
+    c_spread_only = ClampedYieldCurve(
+        DiscountFactorCurveSpec(
+            Identifier="SPREAD_ONLY",
+            Currency="RUB",
+            AsOfDate=as_of,
+            InterpolationDayCountConvention=DayCountConventionEnum.Act365,
+            InterpolationMethod=CurveInterpolationMethodEnum.Linear,
+            RatesSchedule=RatesScheduleSpec(
+                Dates=[
+                    as_of + datetime.timedelta(days=30),
+                    as_of + datetime.timedelta(days=365),
+                ],
+                Rates=[],
+                Spreads=[12.0, 13.0],
+            ),
+        )
+    )
+    assert np.all(np.isfinite(c_spread_only.df([0.25, 1.0])))
+
+    with pytest.raises(ValueError, match="repo period"):
+        RepoCurve(
+            {
+                "Identifier": "REPO_NEG",
+                "AsOfDate": as_of,
+                "RatesSchedule": {
+                    "Periods": ["-30D", "30D", "1Y"],
+                    "Rates": [0.4, 0.6, 0.8],
+                },
+            }
+        )
+    repo_edge = RepoCurve(
+        {
+            "Identifier": "REPO_EDGE",
+            "AsOfDate": as_of,
+            "RatesSchedule": {
+                "Periods": ["30D", "1Y"],
+                "Rates": [0.6, 0.8],
+            },
+        }
+    )
+    assert np.isfinite(float(repo_edge.repo_rate(np.int64(90) / 365.0)))
+    assert float(RepoCurve({"Identifier": "REPO_EMPTY", "RatesSchedule": {"Periods": [], "Rates": []}}, as_of_date=as_of).repo_rate(0.5)) == 0.0
+
+    for bad_t, bad_r in (([0.5, float("nan")], [10.0, 11.0]), ([0.5, 1.0], [10.0, float("inf")])):
+        with pytest.raises(ValueError):
+            ClampedYieldCurve(as_of_date=as_of, pillar_tenors=bad_t, rates=bad_r)
+
+    assert year_fraction(as_of, as_of + datetime.timedelta(days=365), "Act/365.25") == pytest.approx(
+        365.0 / 365.25, rel=1e-12
+    )
+    assert year_fraction(as_of, as_of + datetime.timedelta(days=365), "Act.365") == pytest.approx(1.0, rel=1e-12)
+
+
+

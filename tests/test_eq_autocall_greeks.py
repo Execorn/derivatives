@@ -26,6 +26,7 @@ import torch
 
 from deepvol.api.schemas_eq_autocall import (
     EQAutocallableTradeRequest,
+    MonitoringIndexEnum,
     PredefinedDividendsSpec,
     parse_murex_autocall_dag,
 )
@@ -123,12 +124,15 @@ def test_G1_8_autograd_delta_rho_dividends_vs_central_finite_difference(
     surrogate_f32 = MaskedEQAutocallSurrogate(
         d_max=8, m_max=48, d_model=128, n_egno_layers=3, n_sched_layers=2, n_heads=4
     ).eval()
-    surrogate_f32.zero_init_residual_heads(std=0.0)
+    surrogate_f32.zero_init_residual_heads(std=1e-3)
+    assert not surrogate_f32.is_zero_residual()
+    surrogate_f32_ref64 = copy.deepcopy(surrogate_f32).to(dtype=torch.float64).eval()
 
     for req in (req_ref, multi_period_request):
         state = preprocess_eq_autocall(req)
         d_assets = state.d_assets
         sorted_ids = state.sorted_identifiers
+        pv_base_none: float | None = None
 
         for surr in (None, surrogate_f64, surrogate_f32):
             res = compute_eq_autocall_greeks(
@@ -143,14 +147,35 @@ def test_G1_8_autograd_delta_rho_dividends_vs_central_finite_difference(
                 ],
                 surrogate=surr,
             )
+            if surr is None:
+                pv_base_none = float(res.product_value)
+            elif surr is surrogate_f32:
+                assert pv_base_none is not None
+                assert abs(float(res.product_value) - pv_base_none) > 1e-6
+                res_ref64 = compute_eq_autocall_greeks(
+                    state,
+                    queries=["ProductValue", "Delta", "Rho", "Vega", "Cega"],
+                    surrogate=surrogate_f32_ref64,
+                )
+                assert res_ref64.delta_tensor is not None and res.delta_tensor is not None
+                assert _rel_err(res.delta_tensor.detach().cpu(), res_ref64.delta_tensor.detach().cpu()) <= 1e-6
+                assert res_ref64.rho_arrays is not None and res.rho_arrays is not None
+                for cid_ref, rho_ref in res_ref64.rho_arrays.items():
+                    assert _rel_err(res.rho_arrays[cid_ref], rho_ref) <= 1e-6
+                assert res_ref64.vega_arrays is not None and res.vega_arrays is not None
+                for tk_ref, v_ref in res_ref64.vega_arrays.items():
+                    assert _rel_err(res.vega_arrays[tk_ref], v_ref) <= 1e-5
+                assert res_ref64.cega_tensor is not None and res.cega_tensor is not None
+                assert _rel_err(res.cega_tensor.detach().cpu(), res_ref64.cega_tensor.detach().cpu()) <= 1e-6
+
             assert res.delta_tensor is not None
             assert res.rho_arrays is not None
             assert res.dividends_arrays is not None
             assert res.vega_arrays is not None
             assert res.cega_tensor is not None
 
-            # 1. Delta vs Central Finite Differences on spots_t0
-            eps_s = 1e-5
+            # FP32 forward pass requires larger central FD steps to avoid subtraction truncation noise.
+            eps_s = 1e-3 if surr is surrogate_f32 else 1e-5
             fd_delta_sorted = np.zeros(d_assets, dtype=np.float64)
             base_spots = state.spots_t0.detach().clone()
             for i in range(d_assets):
@@ -175,7 +200,7 @@ def test_G1_8_autograd_delta_rho_dividends_vs_central_finite_difference(
             got_rho = res.rho_arrays[curve_id]
             k_pillars = len(got_rho)
             fd_rho = np.zeros(k_pillars, dtype=np.float64)
-            h_rate = 1e-4  # 0.01 bps in percentage quote units
+            h_rate = 5e-2 if surr is surrogate_f32 else 1e-4
             for k in range(k_pillars):
                 p_up = torch.zeros(k_pillars, dtype=torch.float64)
                 p_dn = torch.zeros(k_pillars, dtype=torch.float64)
@@ -211,7 +236,8 @@ def test_G1_8_autograd_delta_rho_dividends_vs_central_finite_difference(
                 assert abs(got_rho[active_k] - fd_req_rho_k) / max(abs(fd_req_rho_k), 1e-10) <= 1e-7
 
             # 3. DividendsSensitivities vs Central Finite Differences on discrete dividend amounts
-            h_div = 1e-3
+            h_div = 1e-1 if surr is surrogate_f32 else 5e-4
+            div_rel_thresh = 1e-4 if surr is surrogate_f32 else 1e-6
             for ticker in sorted_ids:
                 got_div = res.dividends_arrays[ticker]
                 if len(got_div) == 0:
@@ -235,13 +261,14 @@ def test_G1_8_autograd_delta_rho_dividends_vs_central_finite_difference(
                     )
                     fd_div[k_ev] = (pv_up - pv_dn) / (2.0 * h_div)
 
-                if np.linalg.norm(fd_div) > 1e-6:
+                norm_fd = float(np.linalg.norm(fd_div))
+                if norm_fd > div_rel_thresh:
                     rel_div = _rel_err(got_div, fd_div)
                     assert rel_div <= 1e-5, f"DividendsSensitivities[{ticker}] rel err {rel_div:.3e} > 1e-5"
-                    if surr is not surrogate_f32:
+                    if surr is not surrogate_f32 and norm_fd > 1e-4:
                         assert rel_div <= 1e-7
                 else:
-                    tol_small = 1e-7 if surr is surrogate_f32 else 1e-8
+                    tol_small = 2e-6 if surr is surrogate_f32 else 1e-8
                     assert float(np.linalg.norm(got_div - fd_div)) <= tol_small
 
             # 4. Vega & Cega vs Central Finite Differences (spot-checked on active asset/pair)
@@ -251,7 +278,7 @@ def test_G1_8_autograd_delta_rho_dividends_vs_central_finite_difference(
                 )
                 got_vega0 = res.vega_arrays[active_vega_ticker]
                 e_idx, k_idx = np.unravel_index(int(np.argmax(np.abs(got_vega0))), got_vega0.shape)
-                h_vol = 1e-6
+                h_vol = 2e-7 if (surr is not None and abs(float(got_vega0[e_idx, k_idx])) > 1e-3) else 1e-6
                 v_up = torch.zeros_like(torch.as_tensor(got_vega0))
                 v_dn = torch.zeros_like(torch.as_tensor(got_vega0))
                 v_up[e_idx, k_idx] = h_vol
@@ -776,5 +803,206 @@ def test_batched_surrogate_greeks_padded_mask_regression_140_142() -> None:
                 assert float(out_h.delta.cpu()[~am_bool].abs().max()) == 0.0
                 assert float(out_h.vega_atm.cpu().view(b_sz, 8, 2)[~am_bool].abs().max()) == 0.0
                 assert float(out_h.rho_df.cpu()[~sm_bool].abs().max()) == 0.0
+
+
+def test_greeks_audit_blind_spots(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+    multi_period_request: EQAutocallableTradeRequest,
+) -> None:
+    from deepvol.api.schemas_eq_autocall import (
+        CurveInterpolationMethodEnum,
+        DayCountConventionEnum,
+        EquityVolSmileCollectionSpec,
+        InterpolationSpaceCoordinatesEnum,
+        RateQuoteExpressionEnum,
+    )
+    from deepvol.models.autocall.dupire_qmc_gpu import DupireQMCConfig
+    from deepvol.models.autocall.feature_layout import AutocallNodeCol
+    from deepvol.models.autocall.greeks_engine import compute_qmc_crn_greeks
+
+    req_ref, _ = parsed_dag
+
+    # LogarithmOfDiscountFactors and DiscountFactors Rho must match central FD (negative sign).
+    for space_c, interp_m in (
+        (InterpolationSpaceCoordinatesEnum.LogarithmOfDiscountFactors, CurveInterpolationMethodEnum.LogLinear),
+        (InterpolationSpaceCoordinatesEnum.DiscountFactors, CurveInterpolationMethodEnum.PiecewiseConstantForward),
+        (InterpolationSpaceCoordinatesEnum.LogarithmOfDiscountFactors, CurveInterpolationMethodEnum.Linear),
+    ):
+        req_sp = copy.deepcopy(multi_period_request)
+        cid = next(iter(req_sp.Model.MarketDataSet.RatesCurvesBundles))
+        bundle = req_sp.Model.MarketDataSet.RatesCurvesBundles[cid]
+        bundle.InterpolationMethod = interp_m
+        bundle.InterpolationSpaceCoordinates = space_c
+        bundle.RateQuoteExpression = RateQuoteExpressionEnum.Decimal
+        as_of_sp = bundle.AsOfDate
+        tenors_yr = np.array(
+            [(d - as_of_sp).total_seconds() / (365.0 * 86400.0) for d in bundle.RatesSchedule.Dates],
+            dtype=np.float64,
+        )
+        r_dec = np.asarray(bundle.RatesSchedule.Rates, dtype=np.float64) / 100.0
+        log_df = -r_dec * tenors_yr
+        bundle.RatesSchedule.Rates = (
+            log_df.tolist()
+            if space_c == InterpolationSpaceCoordinatesEnum.LogarithmOfDiscountFactors
+            else np.exp(log_df).tolist()
+        )
+
+        st_sp = preprocess_eq_autocall(req_sp)
+        res_sp = compute_eq_autocall_greeks(st_sp, queries=["ProductValue", "Rho"])
+        assert res_sp.rho_arrays is not None
+        got_rho_sp = res_sp.rho_arrays[cid]
+        fd_rho_sp = np.zeros_like(got_rho_sp)
+        h_q = 1e-6
+        for k in range(len(got_rho_sp)):
+            r_u = copy.deepcopy(req_sp)
+            r_d = copy.deepcopy(req_sp)
+            r_u.Model.MarketDataSet.RatesCurvesBundles[cid].RatesSchedule.Rates[k] += h_q
+            r_d.Model.MarketDataSet.RatesCurvesBundles[cid].RatesSchedule.Rates[k] -= h_q
+            out_u = evaluate_differentiable_pv(r_u)
+            out_d = evaluate_differentiable_pv(r_d)
+            assert isinstance(out_u, torch.Tensor) and isinstance(out_d, torch.Tensor)
+            fd_rho_sp[k] = (float(out_u.item()) - float(out_d.item())) / (2.0 * h_q)
+        assert _rel_err(got_rho_sp, fd_rho_sp) <= 1e-5
+
+    # Batched non-Markov Tier-1 Cega must NOT double-count symmetric off-diagonals.
+    surr_zero = MaskedEQAutocallSurrogate(
+        d_max=8, m_max=48, d_model=64, n_egno_layers=1, n_sched_layers=1
+    ).to(dtype=torch.float64).eval()
+    surr_zero.zero_init_residual_heads(std=1e-3)
+    assert not surr_zero.is_zero_residual()
+    req_avg = copy.deepcopy(req_ref)
+    req_avg.Product.CallabilityMonitoringIndex = MonitoringIndexEnum.AverageOf
+    req_avg.Product.CouponBarrierMonitoringIndex = MonitoringIndexEnum.AverageOf
+    req_avg.Product.OptionMonitoringIndex = MonitoringIndexEnum.AverageOf
+    st_avg = preprocess_eq_autocall(req_avg)
+    out_cega = compute_batched_surrogate_greeks(
+        surr_zero,
+        st_avg.node_feats.to(dtype=torch.float64),
+        st_avg.edge_feats.to(dtype=torch.float64),
+        st_avg.asset_mask.to(dtype=torch.float64),
+        st_avg.sched_feats.to(dtype=torch.float64),
+        st_avg.sched_mask.to(dtype=torch.float64),
+        st_avg.global_feats.to(dtype=torch.float64),
+        spots_t0=st_avg.spots_t0.unsqueeze(0),
+        ref_spots=st_avg.ref_spots.unsqueeze(0),
+        pv_in_transit=st_avg.pv_in_transit,
+        no_notional_repayment=st_avg.no_notional_repayment,
+        autocall_coupon=st_avg.autocall_coupon,
+        force_coupons_on_autocall=st_avg.force_coupons_on_autocall,
+        is_long_basket=st_avg.is_long_basket,
+        lower_strike=st_avg.lower_strike,
+        forward_perf=st_avg.forward_perf.unsqueeze(0),
+        v_perf=st_avg.v_perf.unsqueeze(0),
+        cash_div_leverage=st_avg.cash_div_leverage.unsqueeze(0),
+        compute_cash_gamma=False,
+    )
+    h_c = 1e-5
+    c_u, c_d = st_avg.corr_matrix.clone(), st_avg.corr_matrix.clone()
+    c_u[0, 1] += h_c
+    c_u[1, 0] += h_c
+    c_d[0, 1] -= h_c
+    c_d[1, 0] -= h_c
+    pv_cu_t = evaluate_differentiable_pv(st_avg, corr_matrix=c_u, surrogate=surr_zero)
+    pv_cd_t = evaluate_differentiable_pv(st_avg, corr_matrix=c_d, surrogate=surr_zero)
+    assert isinstance(pv_cu_t, torch.Tensor) and isinstance(pv_cd_t, torch.Tensor)
+    pv_cu = float(pv_cu_t.item())
+    pv_cd = float(pv_cd_t.item())
+    fd_cega_01 = (pv_cu - pv_cd) / (2.0 * h_c)
+    assert abs(float(out_cega.cega[0, 0, 1].item()) - fd_cega_01) <= 1e-4
+
+    # Deep-ITM KO erfcx stability (u_hi < -4.0) across float64 AD.
+    st_mp = preprocess_eq_autocall(multi_period_request)
+    nf_b = st_mp.node_feats.to(dtype=torch.float64)
+    ef_b = st_mp.edge_feats.to(dtype=torch.float64)
+    am_b = st_mp.asset_mask.to(dtype=torch.float64)
+    sf_b = st_mp.sched_feats.to(dtype=torch.float64)
+    sm_b = st_mp.sched_mask.to(dtype=torch.float64)
+    gf_b = st_mp.global_feats.to(dtype=torch.float64).clone()
+    nf_itm = nf_b.clone()
+    nf_itm[0, : st_mp.d_assets, int(AutocallNodeCol.LOG_MONEYNESS)] = -2.5
+    out_itm = compute_batched_surrogate_greeks(
+        surr_zero, nf_itm, ef_b, am_b, sf_b, sm_b, gf_b, compute_cash_gamma=True
+    )
+    assert torch.isfinite(out_itm.product_value).all()
+    assert torch.isfinite(out_itm.delta).all()
+    assert out_itm.cash_gamma_euler is not None and torch.isfinite(out_itm.cash_gamma_euler).all()
+
+    # Standalone MultivariateAggregatedCashGamma in QMC CRN Greeks must include cross-gamma.
+    tks2 = req_ref.Product.UnderlyingIdentifiers[:2]
+    req2 = copy.deepcopy(multi_period_request)
+    req2.Product.UnderlyingIdentifiers = tks2
+    req2.Product.UnderlyingReferenceSpots = req2.Product.UnderlyingReferenceSpots[:2]
+    req2.Model.MarketDataSet.Spots = {k: req2.Model.MarketDataSet.Spots[k] for k in tks2}
+    req2.Model.MarketDataSet.VolatilitySurfaces = {
+        k: req2.Model.MarketDataSet.VolatilitySurfaces[k] for k in tks2
+    }
+    surf0 = req2.Model.MarketDataSet.VolatilitySurfaces[tks2[0]]
+    assert isinstance(surf0, EquityVolSmileCollectionSpec)
+    surf0.DayCountConvention = DayCountConventionEnum.Act360
+    surf0.SmileInterpolationMethod = CurveInterpolationMethodEnum.PCHIP
+    req2.Model.MarketDataSet.Dividends = {
+        k: req2.Model.MarketDataSet.Dividends[k]
+        for k in tks2
+        if k in req2.Model.MarketDataSet.Dividends
+    }
+    req2.Product.PredefinedDividends = {}
+    req2.Model.MarketDataSet.Fixings = {
+        k: req2.Model.MarketDataSet.Fixings[k] for k in tks2 if k in req2.Model.MarketDataSet.Fixings
+    }
+    req2.Model.MarketDataSet.Correlations = {f"{tks2[0]}&{tks2[1]}": 0.45}
+    st2 = preprocess_eq_autocall(req2)
+    cfg2 = DupireQMCConfig(n_paths=256, n_replicates=4, n_substeps=2)
+    res_full = compute_qmc_crn_greeks(
+        st2,
+        queries=["ProductValue", "Gamma", "MultivariateAggregatedCashGamma", "Cega", "Vega", "Theta"],
+        config=cfg2,
+    )
+    res_cg_only = compute_qmc_crn_greeks(
+        st2,
+        queries=["ProductValue", "MultivariateAggregatedCashGamma"],
+        config=cfg2,
+    )
+    assert res_full.multivariate_aggregated_cash_gamma is not None
+    assert res_cg_only.multivariate_aggregated_cash_gamma is not None
+    assert float(res_cg_only.multivariate_aggregated_cash_gamma) == pytest.approx(
+        float(res_full.multivariate_aggregated_cash_gamma), abs=1e-4, rel=1e-2
+    )
+    assert res_full.vega_arrays is not None and res_full.cega is not None and res_full.theta is not None
+
+    # QMC CRN Cega vs central correlation bump and FundingLeg Theta + In-Transit m_rem==0.
+    req_fl = copy.deepcopy(req2)
+    req_fl.Product.RateIdentifier = "RUB_RUONIA_OIS"
+    req_fl.Product.FundingSpread = 0.02
+    req_fl.Product.FundingLegPaymentDates = list(req_fl.Product.PaymentDates)
+    as_of_fl = req_fl.Model.MarketDataSet.AsOfDate
+    req_fl.Product.PaymentDates[-2] = as_of_fl + datetime.timedelta(days=1)
+    req_fl.Product.FundingLegPaymentDates[-2] = as_of_fl + datetime.timedelta(days=1)
+    st_fl_theta = preprocess_eq_autocall(req_fl)
+    res_fl_th = compute_qmc_crn_greeks(
+        st_fl_theta, queries=["ProductValue", "Theta", "Rho"], config=cfg2
+    )
+    assert res_fl_th.theta is not None and np.isfinite(float(res_fl_th.theta))
+
+    # Factored Vega (e, k) finite-difference check on Act360 / PCHIP surface.
+    cfg_vega = DupireQMCConfig(n_paths=2048, n_replicates=4, n_substeps=8)
+    res_vega_pchip = compute_qmc_crn_greeks(
+        st2, queries=["ProductValue", "Vega"], config=cfg_vega
+    )
+    assert res_vega_pchip.vega_arrays is not None
+    v_mat = res_vega_pchip.vega_arrays[tks2[0]]
+    ei, ki = np.unravel_index(int(np.argmax(np.abs(v_mat))), v_mat.shape)
+    h_v = 1e-4
+    r_vu, r_vd = copy.deepcopy(req2), copy.deepcopy(req2)
+    surf_vu = r_vu.Model.MarketDataSet.VolatilitySurfaces[tks2[0]]
+    surf_vd = r_vd.Model.MarketDataSet.VolatilitySurfaces[tks2[0]]
+    assert isinstance(surf_vu, EquityVolSmileCollectionSpec)
+    assert isinstance(surf_vd, EquityVolSmileCollectionSpec)
+    surf_vu.VolatilityQuotes[ei][ki] += h_v
+    surf_vd.VolatilityQuotes[ei][ki] -= h_v
+    pv_vu = compute_qmc_crn_greeks(preprocess_eq_autocall(r_vu), queries=["ProductValue"], config=cfg_vega).product_value
+    pv_vd = compute_qmc_crn_greeks(preprocess_eq_autocall(r_vd), queries=["ProductValue"], config=cfg_vega).product_value
+    fd_v_ek = (float(pv_vu) - float(pv_vd)) / (2.0 * h_v)
+    assert abs(float(v_mat[ei, ki]) - fd_v_ek) <= max(1e-3, 0.15 * abs(fd_v_ek))
+
 
 

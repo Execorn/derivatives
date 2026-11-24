@@ -1225,15 +1225,15 @@ def test_eq_autocall_arrow_validation_and_runtime_batch_branches(
         coupon_probs=torch.zeros(2, 4, dtype=torch.float64),
         put_loss=torch.zeros(2, dtype=torch.float64),
         delta=torch.zeros(2, 3, dtype=torch.float64),
-        vega_atm=torch.zeros(2, 6, dtype=torch.float64),
+        vega_atm=torch.zeros(2, 3, 2, dtype=torch.float64),
         vega_surface_feats=torch.zeros(2, 21, dtype=torch.float64),
         rho_df=torch.zeros(2, 4, dtype=torch.float64),
-        cega=torch.zeros(2, 9, dtype=torch.float64),
+        cega=torch.zeros(2, 3, 3, dtype=torch.float64),
         cash_gamma_euler=None,
     )
     resp_bytes_none = encode_eq_autocall_arrow_response(
         resp_obj,
-        metadata_dict={"schema_version": "invalid_ver"},
+        metadata_dict={"schema_version": "2.0"},
     )
     assert _concat_batched_greeks([resp_obj]) is resp_obj
     cat_two = _concat_batched_greeks([resp_obj, resp_obj])
@@ -1257,6 +1257,185 @@ def test_eq_autocall_arrow_validation_and_runtime_batch_branches(
 
     with pytest.raises(ValueError):
         runtime.price_batch_json([])
+
+
+def test_api_audit_blind_spots(client: TestClient) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    import datetime
+    import io
+    import orjson
+    import pyarrow as pa
+    from deepvol.models.autocall.pre_post_processor import build_vol_surface_cache_key
+
+    req_model, _ = parse_murex_autocall_dag(REF_REQUEST_PATH)
+    base_d = req_model.model_dump(mode="json")
+    base_d.pop("stripped_legacy_fields", None)
+    runtime = EQAutocallRuntime(device="cpu", enable_compiled_runner=False)
+
+    first_tkr = base_d["Product"]["UnderlyingIdentifiers"][0]
+    missing_spot = copy.deepcopy(base_d)
+    missing_spot["Model"]["MarketDataSet"]["Spots"].pop(first_tkr, None)
+    assert client.post("/eq_autocall/price", json=missing_spot).status_code == 422
+
+    missing_surf = copy.deepcopy(base_d)
+    missing_surf["Model"]["MarketDataSet"]["VolatilitySurfaces"].pop(first_tkr, None)
+    assert client.post("/eq_autocall/price", json=missing_surf).status_code == 422
+
+    missing_corr = copy.deepcopy(base_d)
+    missing_corr["Model"]["MarketDataSet"]["Correlations"] = {}
+    assert client.post("/eq_autocall/price", json=missing_corr).status_code == 422
+
+    missing_fix = copy.deepcopy(base_d)
+    missing_fix["Model"]["MarketDataSet"]["Fixings"] = {}
+    assert client.post("/eq_autocall/price", json=missing_fix).status_code == 422
+
+    assert client.post("/eq_autocall/price_murex_dag", json={"dag_text": 123}).status_code == 422
+
+    # Strict boolean parsing across /eq_autocall/price (?include_all_greeks) and /eq_autocall/price_batch (?compute_greeks).
+    d_pv = copy.deepcopy(base_d)
+    d_pv["Queries"] = ["ProductValue", "CashFlows"]
+    resp_all_on = client.post("/eq_autocall/price?include_all_greeks=true&engine=auto", json=d_pv)
+    assert resp_all_on.status_code == 200 and resp_all_on.json()["Delta"] is not None
+    resp_nogrk = client.post("/eq_autocall/price?include_all_greeks=false&engine=auto", json=d_pv)
+    assert resp_nogrk.status_code == 200
+    assert resp_nogrk.json()["Delta"] is None
+    assert client.post("/eq_autocall/price?include_all_greeks=notabool", json=d_pv).status_code == 422
+
+    d_grk = copy.deepcopy(base_d)
+    d_grk["Queries"] = ["ProductValue", "Delta"]
+    resp_batch_nogrk = client.post("/eq_autocall/price_batch?compute_greeks=false&engine=auto", json=[d_grk])
+    assert resp_batch_nogrk.status_code == 200
+    assert resp_batch_nogrk.json()[0]["Delta"] is None
+    assert client.post("/eq_autocall/price_batch?compute_greeks=notabool", json=[d_grk]).status_code == 422
+    assert (
+        client.post("/eq_autocall/price_batch", json={"requests": [d_grk], "compute_greeks": "false"}).status_code
+        == 422
+    )
+
+    # spots_t0 rank/NaN validation in /eq_autocall/price_batch.
+    synth = generate_synthetic_autocall_batch(
+        batch_size=2, d_max=8, m_max=48, n_mc_paths=32, seed=202611, device="cpu", dtype=torch.float64
+    )
+    bad_rank_payload = {
+        "node_feats": synth.node_feats.tolist(),
+        "edge_feats": synth.edge_feats.tolist(),
+        "asset_mask": synth.asset_mask.tolist(),
+        "sched_feats": synth.sched_feats.tolist(),
+        "sched_mask": synth.sched_mask.tolist(),
+        "global_feats": synth.global_feats.tolist(),
+        "spots_t0": [100.0, 100.0],
+    }
+    assert client.post("/eq_autocall/price_batch", json=bad_rank_payload).status_code == 422
+    assert (
+        client.post(
+            "/eq_autocall/price_batch",
+            content=b'{"node_feats": NaN}',
+            headers={"Content-Type": "application/json"},
+        ).status_code
+        == 422
+    )
+
+    # HTTP 413 payload limit guard (> 50 MiB).
+    oversized_body = b"{" + (b" " * (50 * 1024 * 1024 + 16)) + b"}"
+    resp_413 = client.post(
+        "/eq_autocall/price",
+        content=oversized_body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp_413.status_code == 413
+
+    # Arrow IPC m_rem == 0 (all sched_mask zeros) returns HTTP 200 with zero Greeks & finite pv_in_transit.
+    zero_sched = torch.zeros_like(synth.sched_mask)
+    arrow_m0 = encode_eq_autocall_arrow_request(
+        synth.node_feats,
+        synth.edge_feats,
+        synth.asset_mask,
+        synth.sched_feats,
+        zero_sched,
+        synth.global_feats,
+        pv_in_transit=torch.tensor([0.125, 0.25], dtype=torch.float64),
+    )
+    resp_m0 = client.post(
+        "/eq_autocall/price_arrow?compute_greeks=true",
+        content=arrow_m0,
+        headers={"Content-Type": ARROW_MIME},
+    )
+    assert resp_m0.status_code == 200
+    dec_m0 = decode_eq_autocall_arrow_response(resp_m0.content)
+    assert np.all(np.isfinite(dec_m0["product_value"]))
+    assert np.allclose(dec_m0["delta"], 0.0)
+
+    # Arrow non-finite scalar pv_in_transit and non-dict Arrow metadata must be rejected.
+    with pytest.raises(ValueError):
+        encode_eq_autocall_arrow_request(
+            synth.node_feats,
+            synth.edge_feats,
+            synth.asset_mask,
+            synth.sched_feats,
+            synth.sched_mask,
+            synth.global_feats,
+            pv_in_transit=torch.tensor([float("nan"), 0.0], dtype=torch.float64),
+        )
+    tbl_bad_hdr = pa.RecordBatch.from_arrays(
+        [
+            pa.array(synth.node_feats.reshape(2, -1).numpy().tolist(), type=pa.list_(pa.float64())),
+            pa.array(synth.edge_feats.reshape(2, -1).numpy().tolist(), type=pa.list_(pa.float64())),
+            pa.array(synth.asset_mask.numpy().tolist(), type=pa.list_(pa.float64())),
+            pa.array(synth.sched_feats.reshape(2, -1).numpy().tolist(), type=pa.list_(pa.float64())),
+            pa.array(synth.sched_mask.numpy().tolist(), type=pa.list_(pa.float64())),
+            pa.array(synth.global_feats.numpy().tolist(), type=pa.list_(pa.float64())),
+        ],
+        names=["node_feats", "edge_feats", "asset_mask", "sched_feats", "sched_mask", "global_feats"],
+    ).replace_schema_metadata({HEADER_METADATA_KEY: orjson.dumps([1, 2, 3])})
+    buf_bad = io.BytesIO()
+    with pa.ipc.new_stream(buf_bad, tbl_bad_hdr.schema) as wr_bad:
+        wr_bad.write_batch(tbl_bad_hdr)
+    with pytest.raises(ValueError):
+        decode_eq_autocall_arrow_request(buf_bad.getvalue())
+
+    # Invalid vol surface cache key shape & duplicate Deltas safeguard.
+    fx_a = {
+        "Identifier": "USD/RUB",
+        "TypeName": "FXVolatilitySmileCollection",
+        "DayCountConvention": "Act365",
+        "Deltas": ["-25D", "ATM", "+25D"],
+        "Tenors": ["1M"],
+        "VolatilityQuotes": [[0.20, 0.21, 0.22]],
+    }
+    fx_b = {**fx_a, "Deltas": ["-10D", "ATM", "+10D"]}
+    as_of_k = datetime.datetime(2026, 10, 23, tzinfo=datetime.timezone.utc)
+    assert build_vol_surface_cache_key(fx_a, as_of_k) != build_vol_surface_cache_key(fx_b, as_of_k)
+
+    # Explicit Queries=None coalesces to default [ProductValue, CashFlows] (200); empty Queries=[] returns 422.
+    none_q = copy.deepcopy(base_d)
+    none_q["Queries"] = None
+    r_none_q = client.post("/eq_autocall/price", json=none_q)
+    assert r_none_q.status_code == 200, f"Queries=None failed: {r_none_q.status_code} {r_none_q.text}"
+    body_none_q = r_none_q.json()
+    assert np.isfinite(float(body_none_q["ProductValue"]))
+    assert isinstance(body_none_q.get("CashFlows"), list) and len(body_none_q["CashFlows"]) > 0
+
+    empty_q = copy.deepcopy(base_d)
+    empty_q["Queries"] = []
+    assert client.post("/eq_autocall/price", json=empty_q).status_code == 422
+
+    no_q = copy.deepcopy(base_d)
+    no_q.pop("Queries", None)
+    dag_text = REF_REQUEST_PATH.read_text(encoding="utf-8")
+
+    def _worker(idx: int) -> tuple[int, float]:
+        if idx % 2 == 0:
+            r = client.post("/eq_autocall/price", json=no_q)
+        else:
+            r = client.post("/eq_autocall/price_murex_dag", content=dag_text, headers={"Content-Type": "text/plain"})
+        assert r.status_code == 200, f"worker={idx} failed with {r.status_code}: {r.text}"
+        return r.status_code, float(r.json()["ProductValue"])
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(_worker, range(16)))
+    assert all(code == 200 and np.isfinite(pv) for code, pv in results)
+    assert callable(getattr(runtime, "price_trade"))
+
 
 
 

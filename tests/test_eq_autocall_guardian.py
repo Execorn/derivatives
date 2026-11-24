@@ -1028,5 +1028,129 @@ def test_guardian_v2_calibrated_5d_conformal_exotic_routing_and_batch_audit(
     assert isinstance(res_nc, dict) and res_nc["conformal_breach_count"] == 0
 
 
+def test_guardian_audit_blind_spots(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    from deepvol.api.eq_autocall_runtime import EQAutocallRuntime
+
+    req_model, _ = parsed_dag
+    st_ref = preprocess_eq_autocall(req_model)
+    guardian = EQAutocallModelGuardian(
+        d_max=8,
+        m_max=48,
+        tau_desk_bps=80.0,
+        psi_window_size=4,
+    )
+
+    # Non-finite post_inference / NaN put_loss / empty put_loss / None optional bounds.
+    ok_nan_out, reasons_nan = guardian.evaluate_post_inference(
+        {
+            "stopping_probs": torch.full((1, st_ref.m_rem), float("nan")),
+            "coupon_probs": torch.full((1, st_ref.m_rem), 0.1),
+            "put_loss": torch.tensor([0.05]),
+        },
+        None,
+        st_ref,
+    )
+    assert ok_nan_out is False and AutocallFallbackReason.NON_FINITE_OUTPUT in reasons_nan
+
+    st_inf_hw = copy.copy(st_ref)
+    guardian_hw = EQAutocallModelGuardian(d_max=8, m_max=48, tau_desk_bps=80.0)
+    guardian_hw.q_err_conformal = float("nan")
+    guardian_hw._conformal_calibrated = True
+    ok_nan_hw, reasons_hw, _, _ = guardian_hw.evaluate_pre_inference(st_inf_hw)
+    assert ok_nan_hw is False and AutocallFallbackReason.NON_FINITE_OUTPUT in reasons_hw
+
+    ok_empty_put, reasons_empty_put = guardian.evaluate_post_inference(
+        {
+            "stopping_probs": torch.zeros((1, st_ref.m_rem)),
+            "coupon_probs": torch.zeros((1, st_ref.m_rem)),
+            "put_loss": torch.zeros((0,)),
+        },
+        None,
+        st_ref,
+    )
+    assert ok_empty_put is False and AutocallFallbackReason.NON_FINITE_OUTPUT in reasons_empty_put
+
+    # baseline_out=None and sig_fx_obs=None must not crash pre-inference screening.
+    st_null_opt = copy.copy(st_ref)
+    st_null_opt.quanto_meta = {st_ref.sorted_identifiers[0]: {"rho_s_fx": 0.0, "sig_fx_obs": None}}
+    ok_null, reasons_null, _, _ = guardian.evaluate_pre_inference(st_null_opt, baseline_out=None)
+    assert ok_null is True and reasons_null == []
+
+    # NaN in pv_proxy / v_w must fail closed rather than leaking through min(nan, 0.075).
+    b_nan = copy.copy(st_ref.baseline)
+    assert b_nan is not None
+    b_nan.product_value_proxy = torch.tensor(float("nan"), dtype=torch.float64)
+    ok_b_nan, _, _, _ = guardian.evaluate_pre_inference(st_ref, baseline_out=b_nan)
+    assert ok_b_nan is False
+
+    # PSI tracking must stay clean when trade_info is None/"" or psi_window_size=0.
+    g_psi0 = EQAutocallModelGuardian(d_max=8, m_max=48, psi_window_size=0)
+    st_no_tid = copy.copy(st_ref)
+    st_no_tid.trade_info = None
+    for _ in range(3):
+        ok_p0, reasons_p0, _, _ = g_psi0.evaluate_pre_inference(st_no_tid)
+        assert ok_p0 is True and reasons_p0 == []
+
+    # evaluate_tensor_batch_post enforces simplex / put bounds checks cleanly.
+    m_b = st_ref.m_rem
+    post_diag = guardian.evaluate_tensor_batch_post(
+        torch.full((2, m_b), 0.1),
+        torch.full((2, m_b), 0.1),
+        torch.tensor([9.9, 9.9]),
+        torch.tensor([0.9, 0.9]),
+        torch.ones((2, m_b)),
+        torch.zeros((2, 16)),
+    )
+    assert post_diag["all_passed"] is False
+
+    # Runtime engine="surrogate" must trigger failover/reject on corrupted surrogate NaN output
+    # and persist audit_log[-1] fields cleanly.
+    runtime = EQAutocallRuntime(device="cpu", enable_compiled_runner=False)
+    orig_model = runtime.surrogate
+    if orig_model is not None:
+        class _NanSurrogate(torch.nn.Module):
+            d_max = getattr(orig_model, "d_max", 8)
+            m_max = getattr(orig_model, "m_max", 48)
+
+            def is_zero_residual(self) -> bool:
+                return False
+
+            def forward(self, *args: Any, **kwargs: Any) -> AutocallSurrogateOutput:
+                b = args[0].shape[0]
+                m = args[3].shape[1]
+                nan_m = torch.full((b, m), float("nan"))
+                return AutocallSurrogateOutput(
+                    stopping_probs=nan_m,
+                    survival_probs=torch.ones((b, m)),
+                    hazard_rates=nan_m,
+                    coupon_probs=torch.zeros((b, m)),
+                    put_loss=torch.full((b,), float("nan")),
+                    delta_hazard_logits=torch.zeros((b, m)),
+                    delta_coupon_logits=torch.zeros((b, m)),
+                    delta_put_loss=torch.zeros((b,)),
+                )
+
+        runtime.surrogate = _NanSurrogate()  # type: ignore[assignment]
+        resp_surr_fail = runtime.price_trade(req_model, engine="surrogate", include_all_greeks=False)
+        assert np.isfinite(resp_surr_fail.ProductValue)
+        assert len(runtime.guardian.audit_log) >= 1
+        assert runtime.guardian.audit_log[-1].greeks_engine_used is not None
+
+    # m_rem == 0 request stays deterministic and finite without Tier-2 fallback failure.
+    req_m0 = copy.deepcopy(req_model)
+    as_of_0 = req_m0.Model.MarketDataSet.AsOfDate
+    req_m0.Product.ObservationDates[-1] = as_of_0 - datetime.timedelta(days=1)
+    for tkr, ref_s in zip(req_m0.Product.UnderlyingIdentifiers, req_m0.Product.UnderlyingReferenceSpots):
+        req_m0.Model.MarketDataSet.Fixings[tkr].Dates.append(req_m0.Product.ObservationDates[-1])
+        req_m0.Model.MarketDataSet.Fixings[tkr].Values.append(float(ref_s) * 0.85)
+    resp_m0 = EQAutocallRuntime(device="cpu", enable_compiled_runner=False).price_trade(
+        req_m0, engine="auto", include_all_greeks=True
+    )
+    assert np.isfinite(resp_m0.ProductValue)
+
+
+
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import calendar
 import datetime
 from enum import Enum
+from functools import lru_cache
 import re
 from typing import Any, Mapping, Sequence, Tuple
 
@@ -33,8 +34,13 @@ _REPO_PERIOD_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([DWMYdwmy])\s*$")
 
 def _to_date_and_frac_days(d: datetime.date | datetime.datetime) -> Tuple[datetime.date, float]:
     """Extracts calendar date and any sub-day fractional seconds as days."""
-    if isinstance(d, datetime.datetime):
-        dt_utc = d.astimezone(datetime.timezone.utc) if d.tzinfo is not None else d
+    if type(d) is datetime.datetime or isinstance(d, datetime.datetime):
+        if d.tzinfo is None or d.tzinfo is datetime.timezone.utc:
+            if d.hour == 0 and d.minute == 0 and d.second == 0 and d.microsecond == 0:
+                return d.date(), 0.0
+            sec = d.hour * 3600.0 + d.minute * 60.0 + d.second + d.microsecond * 1e-6
+            return d.date(), sec / 86400.0
+        dt_utc = d.astimezone(datetime.timezone.utc)
         sec = (
             dt_utc.hour * 3600.0
             + dt_utc.minute * 60.0
@@ -117,9 +123,13 @@ def _thirty_e_360(
     return days_360 / 360.0
 
 
+@lru_cache(maxsize=64)
+def _normalize_dcc_str(dcc_str: str) -> str:
+    return dcc_str.strip().upper().replace("/", "").replace("_", "").replace("-", "").replace(".", "")
+
+
 def _normalize_dcc_token(dcc: str | DayCountConventionEnum) -> str:
-    dcc_str = dcc.value if isinstance(dcc, Enum) else str(dcc)
-    return dcc_str.strip().upper().replace("/", "").replace("_", "").replace("-", "")
+    return _normalize_dcc_str(dcc.value if isinstance(dcc, Enum) else str(dcc))
 
 
 _FIXED_DENOM_DCCS: dict[str, float] = {
@@ -175,9 +185,14 @@ def year_fraction(
     if norm in ("30E360", "THIRTYE360", "EURO30360", "30360ISDA"):
         return float(_thirty_e_360(d1, d2))
     if norm in ("BUSINESS252", "BUS252"):
-        date1, _ = _to_date_and_frac_days(d1)
-        date2, _ = _to_date_and_frac_days(d2)
-        b_days = int(np.busday_count(date1.isoformat(), date2.isoformat()))
+        date1, frac1 = _to_date_and_frac_days(d1)
+        date2, frac2 = _to_date_and_frac_days(d2)
+        b_days = float(int(np.busday_count(date1.isoformat(), date2.isoformat())))
+        if frac1 != 0.0 or frac2 != 0.0:
+            if frac2 != 0.0 and bool(np.is_busday(date2.isoformat())):
+                b_days += frac2
+            if frac1 != 0.0 and bool(np.is_busday(date1.isoformat())):
+                b_days -= frac1
         return float(b_days / 252.0)
 
     dcc_str = dcc.value if isinstance(dcc, Enum) else str(dcc)
@@ -190,7 +205,16 @@ def year_fractions(
     dcc: str | DayCountConventionEnum = "Act365",
 ) -> npt.NDArray[np.float64]:
     """Vectorized year fraction computation returning a 1D `np.float64` array."""
-    return np.array([year_fraction(as_of, d, dcc) for d in dates], dtype=np.float64)
+    norm = _normalize_dcc_token(dcc)
+    denom = _FIXED_DENOM_DCCS.get(norm)
+    if denom is not None:
+        d1_date, d1_frac = _to_date_and_frac_days(as_of)
+        out = np.empty(len(dates), dtype=np.float64)
+        for i, d2 in enumerate(dates):
+            d2_date, d2_frac = _to_date_and_frac_days(d2)
+            out[i] = (float((d2_date - d1_date).days) + (d2_frac - d1_frac)) / denom
+        return out
+    return np.array([year_fraction(as_of, d, norm) for d in dates], dtype=np.float64)
 
 
 def year_fraction_batch_epoch_sec(
@@ -247,16 +271,19 @@ def _bessel_hermite_basis(
     s_sec = (eye_k[1:, :] - eye_k[:-1, :]) / dx[:, None]
 
     m_slope = np.zeros((k_len, k_len), dtype=np.float64)
-    if k_len > 2:
+    if k_len == 2:
+        m_slope[0, :] = s_sec[0, :]
+        m_slope[1, :] = s_sec[0, :]
+    elif k_len > 2:
         denom = dx[:-1] + dx[1:]
         m_slope[1:-1, :] = (
             dx[:-1, None] * s_sec[1:, :] + dx[1:, None] * s_sec[:-1, :]
         ) / denom[:, None]
-
-    if not left_flat:
-        m_slope[0, :] = s_sec[0, :]
-    if not right_flat:
-        m_slope[-1, :] = s_sec[-1, :]
+        # Endpoint slopes depend only on interior knots so Flat vs Linear extrapolation does not alter the interior spline.
+        m_slope[0, :] = ((2.0 * dx[0] + dx[1]) * s_sec[0, :] - dx[0] * s_sec[1, :]) / (dx[0] + dx[1])
+        m_slope[-1, :] = (
+            (2.0 * dx[-1] + dx[-2]) * s_sec[-1, :] - dx[-1] * s_sec[-2, :]
+        ) / (dx[-1] + dx[-2])
 
     w_out = np.zeros((m_eval, k_len), dtype=np.float64)
     t_min = tenors[0]
@@ -340,8 +367,11 @@ def _log_linear_rate_basis(
     tau_eval: npt.NDArray[np.float64],
     *,
     extrapolation: str = "Flat",
+    space_coords: str = "Rates",
 ) -> npt.NDArray[np.float64]:
     """Computes the basis weight matrix W in R^{M_eval x K} for LogLinear / PiecewiseConstantForward."""
+    if space_coords == "LogarithmOfDiscountFactors":
+        return _linear_basis(tenors, tau_eval, extrapolation=extrapolation)
     k_len = len(tenors)
     m_eval = len(tau_eval)
     w_out = np.zeros((m_eval, k_len), dtype=np.float64)
@@ -389,6 +419,7 @@ def _fwd_fwd_linear_basis(
     tau_eval: npt.NDArray[np.float64],
     *,
     extrapolation: str = "Flat",
+    space_coords: str = "Rates",
 ) -> npt.NDArray[np.float64]:
     """Computes the exact basis weight matrix W for linear forward-rate interpolation preserving pillar DFs."""
     k_len = len(tenors)
@@ -435,6 +466,7 @@ def _fwd_fwd_linear_basis(
             return np.asarray(f_knot[0, :], dtype=np.float64)
         return np.asarray(total_int / tau_val, dtype=np.float64)
 
+    inv_tenors = np.where(tenors > 1e-12, 1.0 / np.maximum(tenors, 1e-12), 0.0)
     for i, t_raw in enumerate(tau_eval):
         if t_raw <= t_min:
             if left_flat:
@@ -449,7 +481,11 @@ def _fwd_fwd_linear_basis(
                 slope_r = (eye_k[-1, :] - eye_k[-2, :]) / (tenors[-1] - tenors[-2])
                 w_out[i, :] = eye_k[-1, :] + (t_raw - t_max) * slope_r
         else:
-            w_out[i, :] = _eval_interior_weights(float(t_raw))
+            w_r = _eval_interior_weights(float(t_raw))
+            if space_coords == "LogarithmOfDiscountFactors":
+                w_out[i, :] = float(t_raw) * w_r * inv_tenors
+            else:
+                w_out[i, :] = w_r
     return w_out
 
 
@@ -487,7 +523,7 @@ def _monotone_convex_eval(
     dt_hw = np.diff(t_hw)
     f_d = np.diff(rt_hw) / np.maximum(dt_hw, 1e-12)  # length n_seg, 0-based
 
-    # Estimate knot forwards f_knot[0..n_seg]
+    # Estimate knot forwards f_knot[0..n_seg] and apply Hagan-West §3.3 positivity bounds
     f_knot = np.zeros(n_seg + 1, dtype=np.float64)
     for i in range(1, n_seg):
         denom = dt_hw[i - 1] + dt_hw[i]
@@ -499,53 +535,74 @@ def _monotone_convex_eval(
         f_knot[0] = f_d[0]
         f_knot[1] = f_d[0]
 
+    if f_d[0] > 0.0:
+        f_knot[0] = min(max(f_knot[0], 0.0), 2.0 * f_d[0])
+    for i in range(1, n_seg):
+        if f_d[i - 1] > 0.0 and f_d[i] > 0.0:
+            f_knot[i] = min(max(f_knot[i], 0.0), 2.0 * min(f_d[i - 1], f_d[i]))
+    if f_d[n_seg - 1] > 0.0:
+        f_knot[n_seg] = min(max(f_knot[n_seg], 0.0), 2.0 * f_d[n_seg - 1])
+
     def _hw_segment_integral(i_seg: int, x: float) -> float:
         """Evaluates int_0^x (f(u) - f_d[i_seg]) du on unit interval [0, 1] for Hagan-West §3.2."""
         g0 = f_knot[i_seg] - f_d[i_seg]
         g1 = f_knot[i_seg + 1] - f_d[i_seg]
         if abs(g0) < 1e-15 and abs(g1) < 1e-15:
             return 0.0
-        # Enforce Hagan-West monotonicity regions
-        if (g0 > 0.0 and -0.5 * g0 <= g1 <= -2.0 * g0) or (
-            g0 < 0.0 and -2.0 * g0 <= g1 <= -0.5 * g0
+
+        # Case (i): opposite signs with ratio in [0.5, 2.0]
+        if abs(g0) <= 1e-15 and abs(g1) <= 1e-15:
+            return 0.0
+        # Case (i): single cubic polynomial (covers |g1| in [0.5|g0|, 2|g0|] and g0==0 or g1==0 limits)
+        if (
+            (g0 > 0.0 and -2.0 * g0 <= g1 <= -0.5 * g0)
+            or (g0 < 0.0 and -2.0 * g0 >= g1 >= -0.5 * g0)
+            or abs(g0) <= 1e-15
+            or abs(g1) <= 1e-15
         ):
-            pass
-        if (g0 >= 0.0 and g1 >= 0.0) or (g0 <= 0.0 and g1 <= 0.0):
-            # Case (i): flat midpoint clamp when both endpoints have same sign
-            eta = g0 + g1
-            if abs(eta) < 1e-15:
-                return 0.0
-            # Quadratic fit with zero integral on [0,1]: g(x) = g0*(1-4x+3x^2) + g1*(-2x+3x^2)
             return float(g0 * (x - 2.0 * x * x + x * x * x) + g1 * (-x * x + x * x * x))
-        if abs(g1) > 2.0 * abs(g0) and abs(g0) > 1e-15:
-            # Case (ii): g(x) = g0 for x <= eta, quadratic on [eta, 1]
-            eta = 1.0 + g0 / (g1 - g0) if abs(g1 - g0) > 1e-15 else 1.0
+
+        # Case (ii): opposite signs with |g1| > 2*|g0|
+        if (g0 < 0.0 and g1 > -2.0 * g0) or (g0 > 0.0 and g1 < -2.0 * g0):
+            eta = 1.0 + (3.0 * g0) / (g1 - g0)
             eta = min(max(eta, 0.0), 1.0)
-            if x <= eta:
-                return float(g0 * x)
-            if eta >= 1.0 - 1e-15:
+            if x <= eta or eta >= 1.0 - 1e-15:
                 return float(g0 * x)
             u = (x - eta) / (1.0 - eta)
-            return float(g0 * eta + (1.0 - eta) * (g0 * u + (g1 - g0) * (u * u * u) / 3.0))
-        if abs(g0) > 2.0 * abs(g1) and abs(g1) > 1e-15:
-            # Case (iii): quadratic on [0, eta], g(x) = g1 for x >= eta
-            eta = g1 / (g1 - g0) if abs(g1 - g0) > 1e-15 else 0.0
+            return float(g0 * x + (g1 - g0) * (1.0 - eta) * (u * u * u) / 3.0)
+
+        # Case (iii): opposite signs with |g0| > 2*|g1|
+        if (g0 > 0.0 and -0.5 * g0 < g1 < 0.0) or (g0 < 0.0 and 0.0 < g1 < -0.5 * g0):
+            eta = (3.0 * g1) / (g1 - g0)
             eta = min(max(eta, 0.0), 1.0)
             if eta <= 1e-15:
                 return float(g1 * x)
             if x <= eta:
                 return float(g1 * x + (g0 - g1) * eta * (1.0 - ((1.0 - x / eta) ** 3)) / 3.0)
             return float(g1 * x + (g0 - g1) * eta / 3.0)
-        # Case (i) quadratic
-        return float(g0 * (x - 2.0 * x * x + x * x * x) + g1 * (-x * x + x * x * x))
+
+        # Case (iv): strictly same-sign (g0 * g1 > 0) two-piece quadratic preserving G(0) = G(1) = 0
+        eta = g1 / (g1 + g0)
+        a_val = -(g0 * g1) / (g0 + g1)
+        if x <= eta:
+            return float(a_val * x + ((g0 - a_val) / (3.0 * eta * eta)) * ((x - eta) ** 3 + eta ** 3))
+        return float(
+            a_val * x
+            + ((g0 - a_val) / 3.0) * eta
+            + ((g1 - a_val) / (3.0 * (1.0 - eta) ** 2)) * ((x - eta) ** 3)
+        )
 
     def _eval_zero_rate_at(tau_val: float) -> float:
         if tau_val <= t_hw[0] + 1e-12:
             return float(f_knot[0])
         if tau_val >= t_hw[-1]:
+            if abs(t_hw[-1]) < 1e-12:
+                return float(f_knot[-1])
             return float(rt_hw[-1] / t_hw[-1])
         idx = int(np.searchsorted(t_hw, tau_val, side="right")) - 1
         idx = max(0, min(idx, n_seg - 1))
+        if abs(tau_val) < 1e-12:
+            return float(f_knot[idx]) if abs(t_hw[idx]) < 1e-12 else float(f_knot[0])
         h = dt_hw[idx]
         x = (tau_val - t_hw[idx]) / max(h, 1e-12)
         rt_val = rt_hw[idx] + h * (f_d[idx] * x + _hw_segment_integral(idx, x))
@@ -596,18 +653,23 @@ def _nelson_siegel_basis(
     if right_flat:
         t_eval = np.minimum(t_eval, t_max)
 
+    def _ns_factors(u: npt.NDArray[np.float64]) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        small = u < 1e-5
+        u_safe = np.where(small, 1.0, u)
+        expm1_u = np.expm1(-u_safe)
+        f1_large = -expm1_u / u_safe
+        f2_large = f1_large - (1.0 + expm1_u)
+        f1_small = 1.0 - 0.5 * u + (u * u) / 6.0 - (u * u * u) / 24.0
+        f2_small = 0.5 * u - (u * u) / 3.0 + (u * u * u) / 8.0 - (u * u * u * u) / 30.0
+        return np.where(small, f1_small, f1_large), np.where(small, f2_small, f2_large)
+
     def _design(t: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-        t_safe = np.maximum(t, 1e-8)
-        lam1 = 1.5
-        u1 = t_safe / lam1
-        f0 = np.ones_like(t_safe)
-        f1 = (1.0 - np.exp(-u1)) / u1
-        f2 = f1 - np.exp(-u1)
+        t_pos = np.maximum(t, 0.0)
+        f0 = np.ones_like(t_pos)
+        f1, f2 = _ns_factors(t_pos / 1.5)
         if not svensson or k_len < 4:
             return np.column_stack([f0, f1, f2])[:, : min(3, k_len)]
-        lam2 = 0.5
-        u2 = t_safe / lam2
-        f3 = (1.0 - np.exp(-u2)) / u2 - np.exp(-u2)
+        _, f3 = _ns_factors(t_pos / 0.5)
         return np.column_stack([f0, f1, f2, f3])[:, : min(4, k_len)]
 
     x_pil = _design(tenors)
@@ -676,11 +738,58 @@ def eval_clamped_cubic_coeffs(
     return np.asarray(((c0 * dx_b + c1) * dx_b + c2) * dx_b + c3, dtype=np.float64)
 
 
-def _extract_curve_field(obj: Mapping[str, Any], *names: str, default: Any = None) -> Any:
+def _extract_curve_field(obj: Any, *names: str, default: Any = None) -> Any:
+    if isinstance(obj, Mapping):
+        for name in names:
+            if name in obj and obj[name] is not None:
+                return obj[name]
+        return default
     for name in names:
-        if name in obj and obj[name] is not None:
-            return obj[name]
+        val = getattr(obj, name, None)
+        if val is not None:
+            return val
     return default
+
+
+def _convert_dates_or_tenors(
+    dates_or_tenors: Any,
+    *,
+    as_of_date: datetime.date | datetime.datetime | None,
+    dcc: str,
+    caller_name: str,
+) -> Tuple[npt.NDArray[np.float64], bool]:
+    if isinstance(dates_or_tenors, np.ndarray):
+        if dates_or_tenors.ndim == 0:
+            return _convert_dates_or_tenors(
+                dates_or_tenors.item(),
+                as_of_date=as_of_date,
+                dcc=dcc,
+                caller_name=caller_name,
+            )
+        if dates_or_tenors.ndim == 1 and np.issubdtype(dates_or_tenors.dtype, np.number):
+            return dates_or_tenors.astype(np.float64, copy=False), False
+    if isinstance(dates_or_tenors, (datetime.date, datetime.datetime)):
+        if as_of_date is None:
+            raise ValueError(f"{caller_name} requires `as_of_date` to evaluate date inputs.")
+        t = year_fraction(as_of_date, dates_or_tenors, dcc)
+        return np.array([t], dtype=np.float64), True
+    if isinstance(dates_or_tenors, str):
+        if as_of_date is None:
+            raise ValueError(f"{caller_name} requires `as_of_date` to evaluate date string inputs.")
+        t = year_fraction(as_of_date, _normalize_datetime(dates_or_tenors), dcc)
+        return np.array([t], dtype=np.float64), True
+    if isinstance(dates_or_tenors, (int, float, np.floating, np.integer)):
+        return np.array([float(dates_or_tenors)], dtype=np.float64), True
+
+    seq = list(dates_or_tenors)
+    if len(seq) == 0:
+        return np.zeros(0, dtype=np.float64), False
+    if isinstance(seq[0], (datetime.date, datetime.datetime, str)):
+        if as_of_date is None:
+            raise ValueError(f"{caller_name} requires `as_of_date` to evaluate date inputs.")
+        dt_seq = [_normalize_datetime(d) if isinstance(d, str) else d for d in seq]
+        return year_fractions(as_of_date, dt_seq, dcc), False
+    return np.asarray(seq, dtype=np.float64), False
 
 
 # ── ClampedYieldCurve ─────────────────────────────────────────────────────────
@@ -722,10 +831,10 @@ class ClampedYieldCurve:
             tenors_arr = year_fractions(self.as_of_date, self.pillar_dates, self.dcc)
             raw_rates = (
                 np.asarray(spec.RatesSchedule.Rates, dtype=np.float64)
-                if spec.RatesSchedule.Rates
+                if len(spec.RatesSchedule.Rates) > 0
                 else np.zeros(len(self.pillar_dates), dtype=np.float64)
             )
-            if spec.RatesSchedule.Spreads is not None:
+            if spec.RatesSchedule.Spreads is not None and len(spec.RatesSchedule.Spreads) > 0:
                 raw_rates = raw_rates + np.asarray(spec.RatesSchedule.Spreads, dtype=np.float64)
         elif isinstance(spec, Mapping):
             self.identifier = str(_extract_curve_field(spec, "Identifier", "identifier", default=identifier))
@@ -753,24 +862,22 @@ class ClampedYieldCurve:
             )
             self.quote_expression = str(getattr(raw_qe, "value", raw_qe))
 
+            default_dates = pillar_dates if pillar_dates is not None else []
             sched = _extract_curve_field(spec, "RatesSchedule", "rates_schedule", default=spec)
-            if isinstance(sched, Mapping):
-                raw_dates = _extract_curve_field(sched, "Dates", "dates", default=pillar_dates or [])
-                raw_tenors = _extract_curve_field(sched, "Tenors", "tenors", "pillar_tenors", default=pillar_tenors)
-                raw_r = _extract_curve_field(sched, "Rates", "rates", "rates_pct", default=rates)
-                raw_sp = _extract_curve_field(sched, "Spreads", "spreads", default=spreads)
-                raw_dfs = _extract_curve_field(sched, "DiscountFactors", "discount_factors", default=None)
-            else:
-                raw_dates = getattr(sched, "Dates", getattr(sched, "dates", pillar_dates or []))
-                raw_tenors = getattr(sched, "Tenors", getattr(sched, "tenors", pillar_tenors))
-                raw_r = getattr(sched, "Rates", getattr(sched, "rates", rates))
-                raw_sp = getattr(sched, "Spreads", getattr(sched, "spreads", spreads))
-                raw_dfs = getattr(sched, "DiscountFactors", getattr(sched, "discount_factors", None))
+            raw_dates = _extract_curve_field(sched, "Dates", "dates", default=default_dates)
+            raw_tenors = _extract_curve_field(sched, "Tenors", "tenors", "pillar_tenors", default=pillar_tenors)
+            raw_r = _extract_curve_field(sched, "Rates", "rates", "rates_pct", default=rates)
+            raw_sp = _extract_curve_field(sched, "Spreads", "spreads", default=spreads)
+            raw_dfs = _extract_curve_field(sched, "DiscountFactors", "discount_factors", default=None)
 
-            self.pillar_dates = [_normalize_datetime(d) for d in raw_dates] if raw_dates else []
+            self.pillar_dates = (
+                [_normalize_datetime(d) for d in raw_dates]
+                if (raw_dates is not None and len(raw_dates) > 0)
+                else []
+            )
             if raw_tenors is not None:
                 tenors_arr = np.asarray(raw_tenors, dtype=np.float64)
-            elif self.pillar_dates and self.as_of_date is not None:
+            elif len(self.pillar_dates) > 0 and self.as_of_date is not None:
                 tenors_arr = year_fractions(self.as_of_date, self.pillar_dates, self.dcc)
             else:
                 raise ValueError(
@@ -778,7 +885,7 @@ class ClampedYieldCurve:
                 )
             if raw_r is None and raw_sp is None and raw_dfs is None:
                 raise ValueError("ClampedYieldCurve dict spec requires Rates, Spreads, or DiscountFactors.")
-            if raw_r is None and raw_dfs is not None:
+            if (raw_r is None or len(raw_r) == 0) and raw_dfs is not None:
                 raw_rates = np.asarray(raw_dfs, dtype=np.float64)
                 if input_mode is None:
                     input_mode = "df"
@@ -787,10 +894,10 @@ class ClampedYieldCurve:
             else:
                 raw_rates = (
                     np.asarray(raw_r, dtype=np.float64)
-                    if raw_r is not None
+                    if (raw_r is not None and len(raw_r) > 0)
                     else np.zeros(len(tenors_arr), dtype=np.float64)
                 )
-            if raw_sp is not None:
+            if raw_sp is not None and len(raw_sp) > 0:
                 raw_rates = raw_rates + np.asarray(raw_sp, dtype=np.float64)
         else:
             if isinstance(spec, (datetime.date, datetime.datetime)) and as_of_date is None:
@@ -820,7 +927,7 @@ class ClampedYieldCurve:
             self.pillar_dates = list(pillar_dates) if pillar_dates is not None else []
             if pillar_tenors is not None:
                 tenors_arr = np.asarray(pillar_tenors, dtype=np.float64)
-            elif self.pillar_dates and self.as_of_date is not None:
+            elif len(self.pillar_dates) > 0 and self.as_of_date is not None:
                 tenors_arr = year_fractions(self.as_of_date, self.pillar_dates, self.dcc)
             else:
                 raise ValueError(
@@ -830,10 +937,10 @@ class ClampedYieldCurve:
                 raise ValueError("ClampedYieldCurve requires `rates` or `spreads`.")
             raw_rates = (
                 np.asarray(rates, dtype=np.float64)
-                if rates is not None
+                if (rates is not None and len(rates) > 0)
                 else np.zeros(len(tenors_arr), dtype=np.float64)
             )
-            if spreads is not None:
+            if spreads is not None and len(spreads) > 0:
                 raw_rates = raw_rates + np.asarray(spreads, dtype=np.float64)
 
         if len(tenors_arr) == 0:
@@ -842,6 +949,10 @@ class ClampedYieldCurve:
             raise ValueError(
                 f"Pillar tenors length ({len(tenors_arr)}) != rates length ({len(raw_rates)})"
             )
+        if not np.all(np.isfinite(tenors_arr)):
+            raise ValueError("ClampedYieldCurve pillar tenors must be finite.")
+        if not np.all(np.isfinite(raw_rates)):
+            raise ValueError("ClampedYieldCurve rates/quotes must be finite.")
         if len(tenors_arr) > 1 and np.any(np.diff(tenors_arr) <= 0.0):
             raise ValueError("ClampedYieldCurve pillar tenors must be strictly increasing.")
 
@@ -929,6 +1040,7 @@ class ClampedYieldCurve:
             "AdaptiveSpline": "ClampedCubicSpline",
             "Kruger": "PCHIP",
             "Harmonic": "PCHIP",
+            "Smooth": "PCHIP",
         }
         if method in approx_aliases:
             self.interpolation_metadata = {"exact": False, "surrogate_method": approx_aliases[method]}
@@ -963,7 +1075,7 @@ class ClampedYieldCurve:
         elif method in ("QuadraticSpline", "Quadratic"):
             deg = min(2, k_len - 1)
             self._cs_val = make_interp_spline(self._tenors, self._y_pillars, k=deg)
-        elif method in ("MonotoneCubic", "PCHIP", "Kruger", "Harmonic"):
+        elif method in ("MonotoneCubic", "PCHIP", "Kruger", "Harmonic", "Smooth"):
             self._nonlin_interp = PchipInterpolator(self._tenors, self._y_pillars)
         elif method == "Akima":
             if k_len >= 5:
@@ -1040,27 +1152,12 @@ class ClampedYieldCurve:
     def _to_tenors_and_scalar_flag(
         self, dates_or_tenors: Any
     ) -> Tuple[npt.NDArray[np.float64], bool]:
-        if isinstance(dates_or_tenors, np.ndarray):
-            if dates_or_tenors.ndim == 0:
-                return self._to_tenors_and_scalar_flag(dates_or_tenors.item())
-            if dates_or_tenors.ndim == 1 and np.issubdtype(dates_or_tenors.dtype, np.number):
-                return dates_or_tenors.astype(np.float64, copy=False), False
-        if isinstance(dates_or_tenors, (datetime.date, datetime.datetime)):
-            if self.as_of_date is None:
-                raise ValueError("Cannot convert date to tenor when `as_of_date` is None.")
-            t = year_fraction(self.as_of_date, dates_or_tenors, self.dcc)
-            return np.array([t], dtype=np.float64), True
-        if isinstance(dates_or_tenors, (int, float, np.floating, np.integer)):
-            return np.array([float(dates_or_tenors)], dtype=np.float64), True
-
-        seq = list(dates_or_tenors)
-        if len(seq) == 0:
-            return np.zeros(0, dtype=np.float64), False
-        if isinstance(seq[0], (datetime.date, datetime.datetime)):
-            if self.as_of_date is None:
-                raise ValueError("Cannot convert dates to tenors when `as_of_date` is None.")
-            return year_fractions(self.as_of_date, seq, self.dcc), False
-        return np.asarray(seq, dtype=np.float64), False
+        return _convert_dates_or_tenors(
+            dates_or_tenors,
+            as_of_date=self.as_of_date,
+            dcc=self.dcc,
+            caller_name="ClampedYieldCurve",
+        )
 
     def _spline_weights_interior_and_extrap(self, tau_arr: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         m_eval = len(tau_arr)
@@ -1111,13 +1208,55 @@ class ClampedYieldCurve:
         if method == "Linear":
             return _linear_basis(self._tenors, tau_arr, extrapolation=self.extrapolation_method)
         if method == "FwdFwdLinear":
-            return _fwd_fwd_linear_basis(
-                self._tenors, tau_arr, extrapolation=self.extrapolation_method
+            if self.space_coords in ("Rates", "LogarithmOfDiscountFactors"):
+                return _fwd_fwd_linear_basis(
+                    self._tenors,
+                    tau_arr,
+                    extrapolation=self.extrapolation_method,
+                    space_coords=self.space_coords,
+                )
+            w_r = _fwd_fwd_linear_basis(
+                self._tenors,
+                tau_arr,
+                extrapolation=self.extrapolation_method,
+                space_coords="Rates",
             )
+            s_vals = self._eval_space_coord(tau_arr)
+            y_pos = np.maximum(self._y_pillars, 1e-15)
+            pos_pil = (self._tenors > 1e-12).astype(np.float64)
+            t_safe = np.maximum(np.abs(self._tenors), 1e-12)
+            jac = (s_vals[:, None] * (tau_arr[:, None] * w_r)) * (pos_pil / (t_safe * y_pos))[None, :]
+            mask_l = tau_arr <= t_min
+            if np.any(mask_l):
+                jac[mask_l] = 0.0
+                if left_flat or k_len < 2:
+                    jac[mask_l, 0] = 1.0
+                else:
+                    alpha_l = (tau_arr[mask_l] - t_min) / (self._tenors[1] - t_min)
+                    jac[mask_l, 0] = 1.0 - alpha_l
+                    jac[mask_l, 1] = alpha_l
+            mask_r = tau_arr >= t_max
+            if np.any(mask_r):
+                jac[mask_r] = 0.0
+                if right_flat or k_len < 2:
+                    jac[mask_r, -1] = 1.0
+                else:
+                    alpha_r = (tau_arr[mask_r] - t_max) / (t_max - self._tenors[-2])
+                    jac[mask_r, -2] = -alpha_r
+                    jac[mask_r, -1] = 1.0 + alpha_r
+            return np.asarray(jac, dtype=np.float64)
         if method in ("LogLinear", "LogDiscountLinear", "PiecewiseConstantForward"):
-            return _log_linear_rate_basis(
-                self._tenors, tau_arr, extrapolation=self.extrapolation_method
-            )
+            if self.space_coords in ("Rates", "LogarithmOfDiscountFactors"):
+                return _log_linear_rate_basis(
+                    self._tenors,
+                    tau_arr,
+                    extrapolation=self.extrapolation_method,
+                    space_coords=self.space_coords,
+                )
+            w_lin = _linear_basis(self._tenors, tau_arr, extrapolation=self.extrapolation_method)
+            y_pos = np.maximum(self._y_pillars, 1e-15)
+            s_vals = np.exp(w_lin @ np.log(y_pos))
+            return np.asarray((s_vals[:, None] * w_lin) / y_pos[None, :], dtype=np.float64)
         if method == "FlatLeft":
             w = np.zeros((m_eval, k_len), dtype=np.float64)
             idx = np.clip(np.searchsorted(self._tenors, tau_arr, side="right") - 1, 0, k_len - 1)
@@ -1261,6 +1400,38 @@ class ClampedYieldCurve:
                 extrapolation=self.extrapolation_method,
             )
 
+        if self.space_coords in ("DiscountFactors", "Factors"):
+            if self.interpolation_method in ("LogLinear", "LogDiscountLinear", "PiecewiseConstantForward"):
+                w_lin = _linear_basis(self._tenors, tau_arr, extrapolation=self.extrapolation_method)
+                y_pos = np.maximum(self._y_pillars, 1e-15)
+                return np.asarray(np.exp(w_lin @ np.log(y_pos)), dtype=np.float64)
+            if self.interpolation_method == "FwdFwdLinear":
+                t_safe = np.maximum(np.abs(self._tenors), 1e-12)
+                y_pos = np.maximum(self._y_pillars, 1e-15)
+                r_pil = np.where(self._tenors > 1e-12, -np.log(y_pos) / t_safe, 0.0)
+                w_r = _fwd_fwd_linear_basis(
+                    self._tenors,
+                    tau_arr,
+                    extrapolation=self.extrapolation_method,
+                    space_coords="Rates",
+                )
+                vals = np.exp(-tau_arr * (w_r @ r_pil))
+                mask_l = tau_arr <= t_min
+                if np.any(mask_l):
+                    if left_flat:
+                        vals[mask_l] = self._y_pillars[0]
+                    else:
+                        slope_l = (self._y_pillars[1] - self._y_pillars[0]) / (self._tenors[1] - t_min)
+                        vals[mask_l] = self._y_pillars[0] + slope_l * (tau_arr[mask_l] - t_min)
+                mask_r = tau_arr >= t_max
+                if np.any(mask_r):
+                    if right_flat:
+                        vals[mask_r] = self._y_pillars[-1]
+                    else:
+                        slope_r = (self._y_pillars[-1] - self._y_pillars[-2]) / (t_max - self._tenors[-2])
+                        vals[mask_r] = self._y_pillars[-1] + slope_r * (tau_arr[mask_r] - t_max)
+                return np.asarray(vals, dtype=np.float64)
+
         w = self._spline_weights_interior_and_extrap(tau_arr)
         return np.asarray(w @ self._y_pillars, dtype=np.float64)
 
@@ -1361,12 +1532,17 @@ class ClampedYieldCurve:
 
 # ── RepoCurve ─────────────────────────────────────────────────────────────────
 
+_ISO_DATE_PREFIX_RE = re.compile(r"^\s*\d{4}-\d{1,2}-\d{1,2}")
+
 
 def _parse_repo_periods_days(periods: Sequence[Any]) -> npt.NDArray[np.float64]:
     days: list[float] = []
     for p in periods:
-        if isinstance(p, (int, float)):
-            days.append(float(p))
+        if isinstance(p, (int, float, np.integer, np.floating)) and not isinstance(p, bool):
+            val = float(p)
+            if not np.isfinite(val):
+                raise ValueError(f"Non-finite repo period value {p!r}")
+            days.append(val)
             continue
         m = _REPO_PERIOD_RE.match(str(p))
         if m is None:
@@ -1402,6 +1578,9 @@ class RepoCurve:
     ) -> None:
         self.as_of_date = _normalize_datetime(as_of_date) if as_of_date is not None else None
         if isinstance(spec, RepoSpreadCurveSpec):
+            raw_as_of = getattr(spec, "AsOfDate", None)
+            if self.as_of_date is None and raw_as_of is not None:
+                self.as_of_date = _normalize_datetime(raw_as_of)
             self.identifier = spec.Identifier
             self.dcc = spec.InterpolationDayCountConvention.value
             self.interpolation_method = spec.InterpolationMethod.value
@@ -1424,6 +1603,9 @@ class RepoCurve:
                 identifier=self.identifier,
             )
         elif isinstance(spec, Mapping):
+            raw_as_of = _extract_curve_field(spec, "AsOfDate", "as_of_date", default=None)
+            if self.as_of_date is None and raw_as_of is not None:
+                self.as_of_date = _normalize_datetime(raw_as_of)
             self.identifier = str(_extract_curve_field(spec, "Identifier", "identifier", default=identifier))
             raw_dcc = _extract_curve_field(
                 spec, "InterpolationDayCountConvention", "DayCountConvention", "day_count_convention", "dcc", default=dcc
@@ -1446,29 +1628,28 @@ class RepoCurve:
             )
             self.quote_expression = str(getattr(raw_qe, "value", raw_qe))
             sched = _extract_curve_field(spec, "RatesSchedule", "rates_schedule", default=spec)
-            if isinstance(sched, Mapping):
-                raw_periods = _extract_curve_field(sched, "Periods", "periods_days", "Dates", "dates", default=[])
-                raw_rates = _extract_curve_field(sched, "Rates", "rates_pct", "rates", default=[])
-            else:
-                raw_periods = getattr(sched, "Periods", getattr(sched, "periods_days", getattr(sched, "Dates", [])))
-                raw_rates = getattr(sched, "Rates", getattr(sched, "rates_pct", getattr(sched, "rates", [])))
-            if len(raw_rates) == 0:
+            raw_periods = _extract_curve_field(sched, "Periods", "periods_days", "Dates", "dates", default=[])
+            raw_rates = _extract_curve_field(sched, "Rates", "rates_pct", "rates", default=[])
+            rates_arr = np.asarray(raw_rates, dtype=np.float64)
+            periods_list = list(raw_periods)
+            if rates_arr.size == 0:
                 self._is_flat_zero = True
                 self._inner_curve = None
             else:
-                if raw_periods and isinstance(raw_periods[0], (datetime.date, datetime.datetime, str)) and (
-                    isinstance(raw_periods[0], (datetime.date, datetime.datetime))
-                    or ("-" in str(raw_periods[0]) or ":" in str(raw_periods[0]))
-                ):
+                first_p = periods_list[0] if len(periods_list) > 0 else None
+                is_date_period = isinstance(first_p, (datetime.date, datetime.datetime)) or (
+                    isinstance(first_p, str)
+                    and (bool(_ISO_DATE_PREFIX_RE.match(first_p)) or ":" in first_p)
+                )
+                if is_date_period:
                     if self.as_of_date is None:
                         raise ValueError("RepoCurve requires `as_of_date` when Dates are provided.")
                     tenors_arr = year_fractions(
-                        self.as_of_date, [_normalize_datetime(d) for d in raw_periods], self.dcc
+                        self.as_of_date, [_normalize_datetime(d) for d in periods_list], self.dcc
                     )
                 else:
-                    days_arr = _parse_repo_periods_days(raw_periods)
+                    days_arr = _parse_repo_periods_days(periods_list)
                     tenors_arr = days_arr / dcc_denominator(self.dcc)
-                rates_arr = np.asarray(raw_rates, dtype=np.float64)
                 self._is_flat_zero = False
                 self._inner_curve = ClampedYieldCurve(
                     pillar_tenors=tenors_arr,
@@ -1530,31 +1711,12 @@ class RepoCurve:
     def _to_repo_tenors_and_scalar_flag(
         self, dates_or_tenors: Any
     ) -> Tuple[npt.NDArray[np.float64], bool]:
-        if isinstance(dates_or_tenors, np.ndarray):
-            if dates_or_tenors.ndim == 0:
-                return self._to_repo_tenors_and_scalar_flag(dates_or_tenors.item())
-            if dates_or_tenors.ndim == 1 and np.issubdtype(dates_or_tenors.dtype, np.number):
-                return dates_or_tenors.astype(np.float64, copy=False), False
-        if isinstance(dates_or_tenors, (datetime.date, datetime.datetime)):
-            if self.as_of_date is None:
-                raise ValueError(
-                    "RepoCurve requires `as_of_date` to evaluate `datetime.date` / `datetime.datetime` inputs."
-                )
-            t = year_fraction(self.as_of_date, dates_or_tenors, self.dcc)
-            return np.array([t], dtype=np.float64), True
-        if isinstance(dates_or_tenors, (int, float, np.floating, np.integer)):
-            return np.array([float(dates_or_tenors)], dtype=np.float64), True
-
-        seq = list(dates_or_tenors)
-        if len(seq) == 0:
-            return np.zeros(0, dtype=np.float64), False
-        if isinstance(seq[0], (datetime.date, datetime.datetime)):
-            if self.as_of_date is None:
-                raise ValueError(
-                    "RepoCurve requires `as_of_date` to evaluate `datetime.date` / `datetime.datetime` inputs."
-                )
-            return year_fractions(self.as_of_date, seq, self.dcc), False
-        return np.asarray(seq, dtype=np.float64), False
+        return _convert_dates_or_tenors(
+            dates_or_tenors,
+            as_of_date=self.as_of_date,
+            dcc=self.dcc,
+            caller_name="RepoCurve",
+        )
 
     def repo_rate(self, dates_or_tenors: Any) -> npt.NDArray[np.float64]:
         """Evaluates decimal repo spread rate q_repo(t) in float64."""

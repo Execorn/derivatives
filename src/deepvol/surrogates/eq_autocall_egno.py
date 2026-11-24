@@ -42,7 +42,44 @@ def _freeze_egno_layer_buffers(module: nn.Module, *_args: object) -> None:
 def _freeze_surrogate_buffers(module: nn.Module, *_args: object) -> None:
     if isinstance(module, MaskedEQAutocallSurrogate):
         module.freeze_eval_buffers()
-        module._zero_res_cache_key = None
+        module._zero_res_epoch += 1
+        module._zero_res_cache = None
+
+
+def _normalize_batch_vec(
+    val: object,
+    batch_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    t = torch.as_tensor(val, dtype=dtype, device=device)
+    if t.ndim == 0:
+        return t.expand(batch_size)
+    flat = t.squeeze(1) if (t.ndim == 2 and t.shape[1] == 1) else t.reshape(-1)
+    n_el = flat.numel()
+    if n_el == 1:
+        return flat.expand(batch_size)
+    if n_el == batch_size:
+        return flat
+    if n_el > batch_size:
+        return flat[:batch_size]
+    raise ValueError(
+        f"Expected scalar or batch-sized tensor of length {batch_size}, got shape {tuple(t.shape)}."
+    )
+
+
+def _resolve_is_diff_opt(global_feats: torch.Tensor) -> torch.Tensor:
+    batch_size = global_feats.shape[0]
+    if global_feats.shape[-1] <= int(AutocallGlobalCol.OPT_INDEX_ID):
+        return torch.zeros((batch_size,), dtype=torch.bool, device=global_feats.device)
+    opt_code = global_feats[:, int(AutocallGlobalCol.OPT_INDEX_ID)].detach().round().long()
+    return (
+        (opt_code == int(MonitoringIndexCode.DIFF_AB))
+        | (opt_code == int(MonitoringIndexCode.DIFF_BA))
+        | (opt_code == int(MonitoringIndexCode.DIFF_BEST_WORST))
+        | (opt_code == int(MonitoringIndexCode.DIFF_BEST_AVERAGE))
+        | (opt_code == int(MonitoringIndexCode.DIFF_AVERAGE_WORST))
+    )
 
 
 class MaskedEGNOLayer(nn.Module):
@@ -117,18 +154,20 @@ class MaskedEGNOLayer(nn.Module):
             w_e = lin0.weight[:, 2 * c :].detach().contiguous()
             w_agg = nlin0.weight[:, c:].detach().contiguous()
 
-            buf_w_h3 = self._eval_w_h3
-            buf_b_h3 = self._eval_b_h3
-            buf_w_e = self._eval_w_e
-            buf_w_agg = self._eval_w_agg
-            assert isinstance(buf_w_h3, torch.Tensor)
-            assert isinstance(buf_b_h3, torch.Tensor)
-            assert isinstance(buf_w_e, torch.Tensor)
-            assert isinstance(buf_w_agg, torch.Tensor)
-            buf_w_h3.copy_(w_h3.to(device=buf_w_h3.device, dtype=buf_w_h3.dtype))
-            buf_b_h3.copy_(b_h3.to(device=buf_b_h3.device, dtype=buf_b_h3.dtype))
-            buf_w_e.copy_(w_e.to(device=buf_w_e.device, dtype=buf_w_e.dtype))
-            buf_w_agg.copy_(w_agg.to(device=buf_w_agg.device, dtype=buf_w_agg.dtype))
+            for name, src in (
+                ("_eval_w_h3", w_h3),
+                ("_eval_b_h3", b_h3),
+                ("_eval_w_e", w_e),
+                ("_eval_w_agg", w_agg),
+            ):
+                buf = self._buffers.get(name)
+                assert isinstance(buf, torch.Tensor)
+                val = src.to(device=buf.device, dtype=buf.dtype).contiguous()
+                if buf.is_inference() or val.is_inference():
+                    # Rebind outside inference_mode rather than inplace copy_ on an inference tensor.
+                    self._buffers[name] = val.clone()
+                else:
+                    buf.copy_(val)
 
     def train(self, mode: bool = True) -> MaskedEGNOLayer:
         super().train(mode)
@@ -362,6 +401,8 @@ class ParallelScheduleTransformer(nn.Module):
         require_second_order_sdpa: bool = False,
     ) -> torch.Tensor:
         m_dim = x.shape[1]
+        if m_dim == 0:
+            return torch.zeros_like(x)
         active_sched = sched_mask > 0.5
         m_3d = active_sched.to(dtype=x.dtype).unsqueeze(-1)
         h = torch.where(active_sched.unsqueeze(-1), x, torch.zeros_like(x))
@@ -370,7 +411,8 @@ class ParallelScheduleTransformer(nn.Module):
         eye_m = torch.eye(m_dim, device=x.device, dtype=torch.bool).unsqueeze(0)
         allow_attn = active_sched.unsqueeze(1) | eye_m
         zero_bias = torch.zeros((), dtype=x.dtype, device=x.device)
-        neg_bias = torch.full((), -1e9, dtype=x.dtype, device=x.device)
+        # Use -1e4 instead of -1e9 so float16 softmax attention biases stay finite.
+        neg_bias = torch.full((), -1e4, dtype=x.dtype, device=x.device)
         attn_bias_4d = torch.where(allow_attn, zero_bias, neg_bias).unsqueeze(1)
 
         for layer in self.layers:
@@ -400,7 +442,7 @@ class MaskedEQAutocallSurrogate(nn.Module):
         d_sched: int = 12,
         d_global: int = 16,
         init_tau: float = 0.15,
-        n_func_codes: int = 15,
+        n_func_codes: int = 18,
         func_emb_dim: int = 16,
     ) -> None:
         super().__init__()
@@ -450,11 +492,33 @@ class MaskedEQAutocallSurrogate(nn.Module):
             nn.SiLU(),
             nn.Linear(self.d_model, 1),
         )
-        self._zero_res_cache_key: Optional[Tuple[int, int, int, int, int, int, int, int]] = None
-        self._zero_res_cache_val: bool = False
+        self._zero_res_epoch: int = 0
+        self._zero_res_cache: Optional[Tuple[Tuple[int, ...], bool]] = None
         self.zero_init_residual_heads(std=1e-3)
         self.freeze_eval_buffers()
         self.register_load_state_dict_post_hook(_freeze_surrogate_buffers)  # type: ignore[no-untyped-call]
+
+    def _normalize_feature_widths(
+        self,
+        node_feats: torch.Tensor,
+        edge_feats: torch.Tensor,
+        sched_feats: torch.Tensor,
+        global_feats: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        def _fit_last(t: torch.Tensor, target: int) -> torch.Tensor:
+            cur = t.shape[-1]
+            if cur > target:
+                return t[..., :target]
+            if cur < target:
+                return F.pad(t, (0, target - cur))
+            return t
+
+        return (
+            _fit_last(node_feats, self.d_node),
+            _fit_last(edge_feats, self.d_edge),
+            _fit_last(sched_feats, self.d_sched),
+            _fit_last(global_feats, self.d_global),
+        )
 
     def freeze_eval_buffers(self) -> None:
         """Freeze pooled tau and fused EGNO eval buffers safely outside inference_mode."""
@@ -477,7 +541,8 @@ class MaskedEQAutocallSurrogate(nn.Module):
         else:
             nn.init.normal_(last_period_linear.weight, mean=0.0, std=std)
             nn.init.normal_(last_put_linear.weight, mean=0.0, std=std)
-        self._zero_res_cache_key = None
+        self._zero_res_epoch += 1
+        self._zero_res_cache = None
 
     def is_zero_residual(self) -> bool:
         """Return True if the final residual heads are identically zero."""
@@ -485,18 +550,30 @@ class MaskedEQAutocallSurrogate(nn.Module):
         last_put_linear = self.put_head[-1]
         if not isinstance(last_period_linear, nn.Linear) or not isinstance(last_put_linear, nn.Linear):
             return False
-        key = (
-            id(last_period_linear.weight),
-            last_period_linear.weight._version,
-            id(last_period_linear.bias) if last_period_linear.bias is not None else 0,
-            last_period_linear.bias._version if last_period_linear.bias is not None else -1,
-            id(last_put_linear.weight),
-            last_put_linear.weight._version,
-            id(last_put_linear.bias) if last_put_linear.bias is not None else 0,
-            last_put_linear.bias._version if last_put_linear.bias is not None else -1,
+        heads = (
+            last_period_linear.weight,
+            last_period_linear.bias,
+            last_put_linear.weight,
+            last_put_linear.bias,
         )
-        if self._zero_res_cache_key == key:
-            return self._zero_res_cache_val
+        has_inf = any(t is not None and t.is_inference() for t in heads)
+        epoch = self._zero_res_epoch
+        key: Optional[Tuple[int, ...]] = None
+        if not has_inf:
+            cached = self._zero_res_cache
+            key = (
+                epoch,
+                id(last_period_linear.weight),
+                last_period_linear.weight._version,
+                id(last_period_linear.bias) if last_period_linear.bias is not None else 0,
+                last_period_linear.bias._version if last_period_linear.bias is not None else -1,
+                id(last_put_linear.weight),
+                last_put_linear.weight._version,
+                id(last_put_linear.bias) if last_put_linear.bias is not None else 0,
+                last_put_linear.bias._version if last_put_linear.bias is not None else -1,
+            )
+            if cached is not None and cached[0] == key:
+                return cached[1]
         with torch.no_grad():
             is_zero = bool(
                 (last_period_linear.weight == 0).all()
@@ -504,8 +581,8 @@ class MaskedEQAutocallSurrogate(nn.Module):
                 and (last_put_linear.weight == 0).all()
                 and (last_put_linear.bias is None or (last_put_linear.bias == 0).all())
             )
-        self._zero_res_cache_key = key
-        self._zero_res_cache_val = is_zero
+        if key is not None and self._zero_res_epoch == epoch:
+            self._zero_res_cache = (key, is_zero)
         return is_zero
 
     def train(self, mode: bool = True) -> MaskedEQAutocallSurrogate:
@@ -526,6 +603,9 @@ class MaskedEQAutocallSurrogate(nn.Module):
         detach_gate_weights: bool = False,
         require_second_order_sdpa: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        node_feats, edge_feats, sched_feats, global_feats = self._normalize_feature_widths(
+            node_feats, edge_feats, sched_feats, global_feats
+        )
         batch_size = node_feats.shape[0]
         d_dim = node_feats.shape[1]
         m_dim = sched_feats.shape[1]
@@ -609,6 +689,17 @@ class MaskedEQAutocallSurrogate(nn.Module):
                 .long()
                 .clamp(0, self.n_func_codes - 1)
             )
+            if (
+                self.d_global > int(AutocallGlobalCol.IS_LONG_BASKET)
+                and self.n_func_codes > int(MonitoringIndexCode.AVERAGE_OF)
+            ):
+                is_long = global_clean[:, int(AutocallGlobalCol.IS_LONG_BASKET)] > 0.5
+                opt_aligned = torch.where(
+                    is_long & (fc_tensor[:, 2] == int(MonitoringIndexCode.WORST_OF)),
+                    torch.full_like(fc_tensor[:, 2], int(MonitoringIndexCode.AVERAGE_OF)),
+                    fc_tensor[:, 2],
+                )
+                fc_tensor = torch.stack([fc_tensor[:, 0], fc_tensor[:, 1], opt_aligned], dim=1)
             func_codes: Optional[torch.Tensor] = fc_tensor
             func_emb_flat = torch.cat(
                 [
@@ -645,49 +736,69 @@ class MaskedEQAutocallSurrogate(nn.Module):
             all_active=False,
         )
 
-        z_exp = z_basket.unsqueeze(1).expand(batch_size, m_dim, -1)
-        g_exp = global_scaled.unsqueeze(1).expand(batch_size, m_dim, -1)
-        sched_in = torch.cat([sched_clean, z_exp, g_exp], dim=-1)
-        sched_tokens = F.silu(F.linear(sched_in, self.sched_proj.weight, self.sched_proj.bias))
-        sched_tokens = torch.where(
-            active_sched.unsqueeze(-1), sched_tokens, torch.zeros_like(sched_tokens)
-        )
-        seq_out = self.sched_transformer(
-            sched_tokens,
-            m_sched,
-            all_sched_active=False,
-            require_second_order_sdpa=require_second_order_sdpa,
-        )
+        if m_dim == 0:
+            delta_hazard = torch.zeros(
+                (batch_size, 0), device=node_feats.device, dtype=node_feats.dtype
+            )
+            delta_coupon = torch.zeros(
+                (batch_size, 0), device=node_feats.device, dtype=node_feats.dtype
+            )
+            h_sched_mean = torch.zeros(
+                (batch_size, self.d_model), device=node_feats.device, dtype=node_feats.dtype
+            )
+            h_sched_last = torch.zeros_like(h_sched_mean)
+            c_call_sum = torch.zeros(
+                (batch_size, 1), device=node_feats.device, dtype=node_feats.dtype
+            )
+        else:
+            z_exp = z_basket.unsqueeze(1).expand(batch_size, m_dim, -1)
+            g_exp = global_scaled.unsqueeze(1).expand(batch_size, m_dim, -1)
+            sched_in = torch.cat([sched_clean, z_exp, g_exp], dim=-1)
+            sched_tokens = F.silu(F.linear(sched_in, self.sched_proj.weight, self.sched_proj.bias))
+            sched_tokens = torch.where(
+                active_sched.unsqueeze(-1), sched_tokens, torch.zeros_like(sched_tokens)
+            )
+            seq_out = self.sched_transformer(
+                sched_tokens,
+                m_sched,
+                all_sched_active=False,
+                require_second_order_sdpa=require_second_order_sdpa,
+            )
 
-        plin0 = self.period_head[0]
-        plin2 = self.period_head[2]
-        assert isinstance(plin0, nn.Linear) and isinstance(plin2, nn.Linear)
-        period_logits = F.linear(
-            F.silu(F.linear(seq_out, plin0.weight, plin0.bias)),
-            plin2.weight,
-            plin2.bias,
-        )
-        delta_hazard = torch.where(
-            active_sched,
-            period_logits[:, :, 0],
-            torch.zeros_like(period_logits[:, :, 0]),
-        )
-        delta_coupon = torch.where(
-            active_sched,
-            period_logits[:, :, 1],
-            torch.zeros_like(period_logits[:, :, 1]),
-        )
+            plin0 = self.period_head[0]
+            plin2 = self.period_head[2]
+            assert isinstance(plin0, nn.Linear) and isinstance(plin2, nn.Linear)
+            period_logits = F.linear(
+                F.silu(F.linear(seq_out, plin0.weight, plin0.bias)),
+                plin2.weight,
+                plin2.bias,
+            )
+            delta_hazard = torch.where(
+                active_sched,
+                period_logits[:, :, 0],
+                torch.zeros_like(period_logits[:, :, 0]),
+            )
+            delta_coupon = torch.where(
+                active_sched,
+                period_logits[:, :, 1],
+                torch.zeros_like(period_logits[:, :, 1]),
+            )
 
-        c_call = (
-            sched_clean[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)].detach().clamp(0.0, 1.0)
-            * m_sched
-        )
-        sched_count = m_sched.sum(dim=1, keepdim=True).clamp(min=1.0)
-        h_sched_mean = seq_out.sum(dim=1) / sched_count
-        last_idx = (sched_count.long() - 1).clamp(min=0, max=m_dim - 1).unsqueeze(-1).expand(
-            batch_size, 1, self.d_model
-        )
-        h_sched_last = torch.gather(seq_out, dim=1, index=last_idx).squeeze(1)
+            c_call = (
+                sched_clean[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)].detach().clamp(0.0, 1.0)
+                * m_sched
+            )
+            c_call_sum = c_call.sum(dim=1, keepdim=True)
+            sched_count = m_sched.sum(dim=1, keepdim=True).clamp(min=1.0)
+            h_sched_mean = seq_out.sum(dim=1) / sched_count
+            idx_grid = torch.arange(m_dim, device=sched_feats.device).unsqueeze(0)
+            active_indices = torch.where(active_sched, idx_grid, torch.zeros_like(idx_grid))
+            last_pos = active_indices.argmax(dim=1, keepdim=True)
+            has_sched_any = active_sched.any(dim=1, keepdim=True)
+            last_idx = last_pos.unsqueeze(-1).expand(batch_size, 1, self.d_model)
+            h_sched_last = torch.gather(seq_out, dim=1, index=last_idx).squeeze(1) * has_sched_any.to(
+                dtype=seq_out.dtype
+            )
 
         put_in = torch.cat(
             [
@@ -697,7 +808,7 @@ class MaskedEQAutocallSurrogate(nn.Module):
                 global_scaled,
                 func_emb_flat,
                 h_disp.unsqueeze(-1),
-                c_call.sum(dim=1, keepdim=True),
+                c_call_sum,
             ],
             dim=-1,
         )
@@ -757,22 +868,22 @@ class MaskedEQAutocallSurrogate(nn.Module):
             if require_second_order_sdpa is None
             else bool(require_second_order_sdpa)
         )
-        batch_size, d_dim, n_feat = node_feats.shape
+        batch_size, d_dim, _ = node_feats.shape
         _, m_dim, _ = sched_feats.shape
 
-        node_in = (
-            F.pad(node_feats, (0, self.d_node - n_feat))
-            if n_feat < self.d_node
-            else node_feats
-        )
-        g_feat = global_feats.shape[-1]
-        global_in = (
-            F.pad(global_feats, (0, self.d_global - g_feat))
-            if g_feat < self.d_global
-            else global_feats
+        node_in, edge_in, sched_in, global_in = self._normalize_feature_widths(
+            node_feats, edge_feats, sched_feats, global_feats
         )
 
-        if not all_active and not torch.compiler.is_compiling():
+        # Skip host-syncing trailing-mask checks on CUDA tensors to preserve non-blocking/CUDAGraph capture.
+        if (
+            not all_active
+            and not node_feats.is_cuda
+            and batch_size > 0
+            and d_dim > 0
+            and m_dim > 0
+            and not torch.compiler.is_compiling()
+        ):
             active_asset_full = asset_mask > 0.5
             active_sched_full = sched_mask > 0.5
             if d_dim > 1 and not bool(active_asset_full[:, -1].all()):
@@ -786,16 +897,16 @@ class MaskedEQAutocallSurrogate(nn.Module):
             else:
                 m_act = m_dim
             node_sub = node_in[:, :d_act, :]
-            edge_sub = edge_feats[:, :d_act, :d_act, :]
+            edge_sub = edge_in[:, :d_act, :d_act, :]
             amask_sub = asset_mask[:, :d_act]
-            sched_sub = sched_feats[:, :m_act, :]
+            sched_sub = sched_in[:, :m_act, :]
             smask_sub = sched_mask[:, :m_act]
         else:
             m_act = m_dim
             node_sub = node_in
-            edge_sub = edge_feats
+            edge_sub = edge_in
             amask_sub = asset_mask
-            sched_sub = sched_feats
+            sched_sub = sched_in
             smask_sub = sched_mask
 
         delta_hazard_act, delta_coupon_act, delta_put_loss = self._forward_residuals_static(
@@ -823,10 +934,32 @@ class MaskedEQAutocallSurrogate(nn.Module):
                 delta_put_loss=delta_put_loss,
             )
 
+        if m_act == 0:
+            empty_m = torch.zeros(
+                (batch_size, 0), device=sched_feats.device, dtype=sched_feats.dtype
+            )
+            return AutocallSurrogateOutput(
+                stopping_probs=empty_m,
+                survival_probs=empty_m,
+                hazard_rates=empty_m,
+                coupon_probs=empty_m,
+                put_loss=torch.zeros_like(delta_put_loss),
+                delta_hazard_logits=delta_hazard_act,
+                delta_coupon_logits=delta_coupon_act,
+                delta_put_loss=delta_put_loss,
+            )
+
+        # Upcast reduced-precision dtypes to float32 so 1e-10/1e-6 clamping does not underflow or round to 1.0 in float16.
+        out_dtype = sched_feats.dtype
+        calc_dtype = torch.float64 if out_dtype == torch.float64 else torch.float32
         active_sched = smask_sub > 0.5
-        m_sched = active_sched.to(dtype=sched_sub.dtype)
+        has_sched_any = active_sched.any(dim=1)
+        has_sched_any_f = has_sched_any.to(dtype=calc_dtype)
+        m_sched = active_sched.to(dtype=calc_dtype)
         sched_clean = torch.where(
-            active_sched.unsqueeze(-1), sched_sub, torch.zeros_like(sched_sub)
+            active_sched.unsqueeze(-1),
+            sched_sub.to(dtype=calc_dtype),
+            torch.zeros((), dtype=calc_dtype, device=sched_sub.device),
         )
         c_call = (
             sched_clean[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)].detach().clamp(0.0, 1.0)
@@ -851,9 +984,9 @@ class MaskedEQAutocallSurrogate(nn.Module):
         logit_h_proxy = torch.log(h_proxy / (1.0 - h_proxy))
 
         hazard_act = (
-            c_call * m_sched * torch.sigmoid(logit_h_proxy + delta_hazard_act)
+            c_call * m_sched * torch.sigmoid(logit_h_proxy + delta_hazard_act.to(dtype=calc_dtype))
         )
-        survival_act = torch.cumprod(1.0 - hazard_act, dim=1)
+        survival_act = torch.cumprod(1.0 - hazard_act, dim=1) * has_sched_any_f.unsqueeze(1)
         surv_prev = torch.cat(
             [torch.ones_like(survival_act[:, :1]), survival_act[:, :-1]], dim=1
         )
@@ -862,11 +995,13 @@ class MaskedEQAutocallSurrogate(nn.Module):
         q_proxy_clamped = q_proxy.clamp(min=1e-6, max=1.0 - 1e-6)
         logit_q_proxy = torch.log(q_proxy_clamped / (1.0 - q_proxy_clamped))
         q_gate = (q_proxy * q_proxy) / (q_proxy * q_proxy + 1e-10)
-        q_pred = q_gate * torch.sigmoid(logit_q_proxy + delta_coupon_act)
+        q_pred = q_gate * torch.sigmoid(logit_q_proxy + delta_coupon_act.to(dtype=calc_dtype))
         coupon_act = m_sched * (g_cpn + (1.0 - g_cpn) * q_pred)
 
         # C-infinity logit-space put-spread head in float64 to avoid float32 1 - eps_r rounding.
-        k_put_64 = global_in[:, int(AutocallGlobalCol.K_PUT)].to(torch.float64).clamp(min=0.0)
+        is_diff_opt = _resolve_is_diff_opt(global_in)
+        k_put_raw_64 = global_in[:, int(AutocallGlobalCol.K_PUT)].to(torch.float64)
+        k_put_64 = torch.where(is_diff_opt, k_put_raw_64, k_put_raw_64.clamp(min=0.0))
         if self.d_global > int(AutocallGlobalCol.LOWER_STRIKE):
             k_low_64 = (
                 global_in[:, int(AutocallGlobalCol.LOWER_STRIKE)]
@@ -879,14 +1014,35 @@ class MaskedEQAutocallSurrogate(nn.Module):
         l_put_proxy_64 = (
             global_in[:, int(AutocallGlobalCol.L_PUT_PROXY)].to(torch.float64).clamp(min=0.0)
         )
-        surv_proxy_term_64 = (1.0 - p_proxy.sum(dim=1)).to(torch.float64).clamp(min=0.0)
+        surv_proxy_term_64 = (1.0 - p_proxy.to(torch.float64).sum(dim=1)).clamp(min=0.0)
         denom_64 = torch.clamp(k_eff_64 * surv_proxy_term_64, min=1e-12)
         eps_r = 1e-12
         r_proxy_64 = torch.clamp(l_put_proxy_64 / denom_64, min=eps_r, max=1.0 - eps_r)
         logit_r_64 = torch.log(r_proxy_64 / (1.0 - r_proxy_64))
-        u_put_64 = k_eff_64 * survival_act[:, -1].to(torch.float64)
-        put_loss_64 = u_put_64 * torch.sigmoid(logit_r_64 + delta_put_loss.to(torch.float64))
-        put_loss = put_loss_64.to(dtype=sched_feats.dtype)
+        surv_term_64 = survival_act[:, -1].to(torch.float64)
+        u_put_64 = k_eff_64 * surv_term_64
+        std_put_loss_64 = u_put_64 * torch.sigmoid(logit_r_64 + delta_put_loss.to(torch.float64))
+
+        # Diff payoffs allow negative strikes and losses above K*S, so parameterize in log-softplus space.
+        base_diff_64 = torch.where(
+            surv_proxy_term_64 > 1e-8,
+            l_put_proxy_64 * surv_term_64 / surv_proxy_term_64.clamp(min=1e-8),
+            l_put_proxy_64,
+        )
+        inv_sp_64 = torch.where(
+            base_diff_64 > 20.0,
+            base_diff_64,
+            torch.log(torch.expm1(base_diff_64.clamp(min=1e-12, max=20.0))),
+        )
+        diff_put_loss_64 = F.softplus(inv_sp_64 + delta_put_loss.to(torch.float64))
+        put_loss_64 = torch.where(is_diff_opt, diff_put_loss_64, std_put_loss_64)
+        put_loss_64 = torch.where(has_sched_any, put_loss_64, torch.zeros_like(put_loss_64))
+        put_loss = put_loss_64.to(dtype=out_dtype)
+
+        stopping_act = stopping_act.to(dtype=out_dtype)
+        survival_act = survival_act.to(dtype=out_dtype)
+        hazard_act = hazard_act.to(dtype=out_dtype)
+        coupon_act = coupon_act.to(dtype=out_dtype)
 
         if m_act < m_dim:
             pad_len = m_dim - m_act
@@ -981,13 +1137,13 @@ def assemble_surrogate_product_value(
     dtype = sched_feats.dtype
     device = sched_feats.device
 
+    pv_transit_t = _normalize_batch_vec(pv_in_transit, batch_size, dtype, device)
     if m_dim == 0:
-        pv_transit_t = torch.as_tensor(pv_in_transit, dtype=dtype, device=device)
-        return pv_transit_t.expand(batch_size) if pv_transit_t.ndim == 0 else pv_transit_t
+        return pv_transit_t
 
     if is_long_basket is None:
         if global_feats.shape[-1] > int(AutocallGlobalCol.IS_LONG_BASKET):
-            long_eff: bool | torch.Tensor = global_feats[:, int(AutocallGlobalCol.IS_LONG_BASKET)] > 0.5
+            long_eff: object = global_feats[:, int(AutocallGlobalCol.IS_LONG_BASKET)] > 0.5
         else:
             long_eff = False
     else:
@@ -999,20 +1155,21 @@ def assemble_surrogate_product_value(
         else:
             low_k_eff = None
     else:
-        low_k_eff = torch.as_tensor(lower_strike, dtype=dtype, device=device)
+        low_k_eff = _normalize_batch_vec(lower_strike, batch_size, dtype, device)
 
     active_sched = sched_mask > 0.5
     m_sched = active_sched.to(dtype=dtype)
     has_any = active_sched.any(dim=1)
-    if m_dim > 4 and not torch.compiler.is_compiling():
+    if (
+        m_dim > 4
+        and batch_size > 0
+        and not sched_feats.is_cuda
+        and not torch.compiler.is_compiling()
+    ):
         any_sched_col = active_sched.any(dim=0)
         m_act = int(any_sched_col.nonzero()[-1].item()) + 1 if any_sched_col.any() else 1
     else:
         m_act = m_dim
-
-    pv_transit_t = torch.as_tensor(pv_in_transit, dtype=dtype, device=device)
-    if pv_transit_t.ndim == 0:
-        pv_transit_t = pv_transit_t.expand(batch_size)
 
     sched_clean = torch.where(
         active_sched.unsqueeze(-1), sched_feats, torch.zeros_like(sched_feats)
@@ -1020,7 +1177,9 @@ def assemble_surrogate_product_value(
     df_pay = sched_clean[:, :, int(AutocallSchedCol.DF_PAY)]
     cpn_rate = sched_clean[:, :, int(AutocallSchedCol.COUPON_RATE)]
 
-    k_put = global_feats[:, int(AutocallGlobalCol.K_PUT)].clamp(min=0.0)
+    is_diff_opt = _resolve_is_diff_opt(global_feats)
+    k_put_raw = global_feats[:, int(AutocallGlobalCol.K_PUT)]
+    k_put = torch.where(is_diff_opt, k_put_raw, k_put_raw.clamp(min=0.0))
     g_put = global_feats[:, int(AutocallGlobalCol.G_PUT)]
     c_mem_0 = global_feats[:, int(AutocallGlobalCol.C_MEM_0)]
     is_memory = global_feats[:, int(AutocallGlobalCol.IS_MEMORY_FLAG)].clamp(0.0, 1.0)
@@ -1032,7 +1191,7 @@ def assemble_surrogate_product_value(
     df_term = torch.where(has_any, df_term, torch.zeros_like(df_term))
 
     surv_term = torch.gather(out.survival_probs, dim=1, index=last_active_idx).squeeze(1)
-    no_notional_t = torch.as_tensor(no_notional_repayment, dtype=dtype, device=device)
+    no_notional_t = _normalize_batch_vec(no_notional_repayment, batch_size, dtype, device)
     pv_notional = (1.0 - no_notional_t) * (
         (df_pay * out.stopping_probs * m_sched).sum(dim=1) + df_term * surv_term
     )
@@ -1042,8 +1201,8 @@ def assemble_surrogate_product_value(
     )
     mem_buf = c_mem_0 * is_memory
     pv_coupon = torch.zeros_like(pv_notional)
-    ac_cpn_t = torch.as_tensor(autocall_coupon, dtype=dtype, device=device)
-    force_cpn_t = torch.as_tensor(force_coupons_on_autocall, dtype=dtype, device=device)
+    ac_cpn_t = _normalize_batch_vec(autocall_coupon, batch_size, dtype, device)
+    force_cpn_t = _normalize_batch_vec(force_coupons_on_autocall, batch_size, dtype, device)
 
     for m in range(m_act):
         c_eff_m = cpn_rate[:, m] + mem_buf
@@ -1051,9 +1210,10 @@ def assemble_surrogate_product_value(
         if isinstance(force_coupons_on_autocall, bool) and not force_coupons_on_autocall:
             eff_q_m = q_m
         else:
-            q_forced = torch.maximum(
-                q_m, out.stopping_probs[:, m] / surv_prev[:, m].clamp(min=1e-12)
-            )
+            q_forced = (
+                out.stopping_probs[:, m].float() / surv_prev[:, m].float().clamp(min=1e-12)
+            ).to(dtype=dtype)
+            q_forced = torch.maximum(q_m, q_forced).clamp(0.0, 1.0)
             eff_q_m = q_m + force_cpn_t * (q_forced - q_m)
 
         cf_cpn_m = (
@@ -1071,18 +1231,23 @@ def assemble_surrogate_product_value(
     eff_put_loss = out.put_loss
     if low_k_eff is not None:
         k_eff = torch.clamp(k_put - torch.clamp(low_k_eff, min=0.0), min=0.0)
-        eff_put_loss = torch.minimum(eff_put_loss, k_eff * surv_term)
+        eff_put_loss = torch.where(
+            is_diff_opt,
+            eff_put_loss,
+            torch.minimum(eff_put_loss, k_eff * surv_term),
+        )
 
-    long_t = torch.as_tensor(long_eff, dtype=dtype, device=device)
+    long_t = _normalize_batch_vec(long_eff, batch_size, dtype, device)
+    # Keep unconditional put sign so long/short basket exposure stays governed by feature/payoff semantics.
     put_sign_t = -torch.ones_like(long_t, dtype=dtype, device=device)
     pv_option = put_sign_t * df_term * g_put * eff_put_loss
     pv_option = (
         pv_option
-        + torch.as_tensor(one_star_pv, dtype=dtype, device=device)
-        + torch.as_tensor(part_call_pv, dtype=dtype, device=device)
+        + _normalize_batch_vec(one_star_pv, batch_size, dtype, device)
+        + _normalize_batch_vec(part_call_pv, batch_size, dtype, device)
     )
 
-    fund_t = torch.as_tensor(funding_pv, dtype=dtype, device=device)
+    fund_t = _normalize_batch_vec(funding_pv, batch_size, dtype, device)
     if w_fund_per_period is not None:
         w_f = torch.as_tensor(w_fund_per_period, dtype=dtype, device=device)
         if w_f.ndim == 1:
@@ -1092,7 +1257,7 @@ def assemble_surrogate_product_value(
         fund_t = fund_t + period_fund_pv
 
     active_pv = pv_transit_t + pv_notional + pv_coupon + pv_option - fund_t
-    autocalled_t = torch.as_tensor(already_autocalled, dtype=torch.bool, device=device)
+    autocalled_t = _normalize_batch_vec(already_autocalled, batch_size, torch.bool, device)
     is_live = has_any & (~autocalled_t)
     res_pv: torch.Tensor = torch.where(is_live, active_pv, pv_transit_t)
     return res_pv

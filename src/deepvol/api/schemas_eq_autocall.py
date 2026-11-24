@@ -1,6 +1,6 @@
 """schemas_eq_autocall.py — Canonical Pydantic V2 schemas & Murex DAG parser for Multi-Asset Equity Autocallables.
 
-Implements Milestone M0 (Task 0.1) of SPEC-DEEPVOL-EQ-AUTOCALL-001:
+Provides canonical validation models and serialization helpers:
 - Strict Pydantic V2 models for EQAutocallableTradeRequest, AutoCallableProductSpec, DupireModelSpec,
   MarketDataSetSpec, DiscountFactorCurveSpec, RepoSpreadCurveSpec, DividendsSpec,
   EquityVolSmileCollectionSpec, FixingsSpec, CashFlowRow, and EQAutocallableTradeResponse.
@@ -13,12 +13,14 @@ Implements Milestone M0 (Task 0.1) of SPEC-DEEPVOL-EQ-AUTOCALL-001:
 
 from __future__ import annotations
 
+from collections.abc import Mapping as AbcMapping, Sequence as AbcSequence
 import datetime
 from enum import Enum
+import functools
 import math
 from pathlib import Path
 import re
-from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union, cast
+from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -71,6 +73,7 @@ class MonitoringIndexEnum(str, Enum):
     Spread = "Spread"
     Dispersion = "Dispersion"
     RatioAB = "RatioAB"
+    Ratio = "Ratio"
     RatioBA = "RatioBA"
     RatioBestWorst = "RatioBestWorst"
     RatioBestAverage = "RatioBestAverage"
@@ -78,8 +81,16 @@ class MonitoringIndexEnum(str, Enum):
     DiffAB = "DiffAB"
     DiffBA = "DiffBA"
     DiffBestWorst = "DiffBestWorst"
+    SpreadBestWorst = "SpreadBestWorst"
     DiffBestAverage = "DiffBestAverage"
+    SpreadBestAverage = "SpreadBestAverage"
     DiffAverageWorst = "DiffAverageWorst"
+    SpreadAverageWorst = "SpreadAverageWorst"
+    EquallyWeightedBasket = "EquallyWeightedBasket"
+    SecondWorstOf = "SecondWorstOf"
+    ThirdWorstOf = "ThirdWorstOf"
+    SecondBestOf = "SecondBestOf"
+    MultiPerf = "MultiPerf"
 
     # Uppercase aliases
     WORST_OF = "WorstOf"
@@ -93,6 +104,7 @@ class MonitoringIndexEnum(str, Enum):
     SPREAD = "Spread"
     DISPERSION = "Dispersion"
     RATIO_AB = "RatioAB"
+    RATIO = "Ratio"
     RATIO_BA = "RatioBA"
     RATIO_BEST_WORST = "RatioBestWorst"
     RATIO_BEST_AVERAGE = "RatioBestAverage"
@@ -100,8 +112,16 @@ class MonitoringIndexEnum(str, Enum):
     DIFF_AB = "DiffAB"
     DIFF_BA = "DiffBA"
     DIFF_BEST_WORST = "DiffBestWorst"
+    SPREAD_BEST_WORST = "SpreadBestWorst"
     DIFF_BEST_AVERAGE = "DiffBestAverage"
+    SPREAD_BEST_AVERAGE = "SpreadBestAverage"
     DIFF_AVERAGE_WORST = "DiffAverageWorst"
+    SPREAD_AVERAGE_WORST = "SpreadAverageWorst"
+    EQUALLY_WEIGHTED_BASKET = "EquallyWeightedBasket"
+    SECOND_WORST_OF = "SecondWorstOf"
+    THIRD_WORST_OF = "ThirdWorstOf"
+    SECOND_BEST_OF = "SecondBestOf"
+    MULTI_PERF = "MultiPerf"
 
 
 class DayCountConventionEnum(str, Enum):
@@ -280,29 +300,44 @@ _CURVE_TIER0_FIELDS: frozenset[str] = frozenset(
 )
 
 
+@functools.lru_cache(maxsize=4096)
+def _parse_datetime_str(val: str) -> datetime.datetime:
+    s = val.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.timezone.utc)
+    if dt.tzinfo is datetime.timezone.utc:
+        return dt
+    return dt.astimezone(datetime.timezone.utc)
+
+
 def _normalize_datetime(val: Any) -> datetime.datetime:
     """Normalizes a date, datetime, or ISO string to a UTC-aware datetime.datetime."""
+    if type(val) is str:
+        return _parse_datetime_str(val)
     if isinstance(val, datetime.datetime):
+        if val.tzinfo is datetime.timezone.utc:
+            return val
         if val.tzinfo is None:
             return val.replace(tzinfo=datetime.timezone.utc)
         return val.astimezone(datetime.timezone.utc)
     if isinstance(val, datetime.date):
         return datetime.datetime(val.year, val.month, val.day, 0, 0, tzinfo=datetime.timezone.utc)
     if isinstance(val, str):
-        s = val.strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=datetime.timezone.utc)
-        return dt.astimezone(datetime.timezone.utc)
+        return _parse_datetime_str(str(val))
     raise TypeError(f"Cannot convert {type(val).__name__} to datetime.datetime")
 
 
 def _normalize_datetime_list(vals: Any) -> List[datetime.datetime]:
-    if not isinstance(vals, Sequence) or isinstance(vals, (str, bytes)):
+    if not isinstance(vals, (list, tuple)) and (
+        isinstance(vals, (str, bytes)) or not isinstance(vals, AbcSequence)
+    ):
         raise TypeError("Expected a sequence of dates/datetimes")
-    return [_normalize_datetime(v) for v in vals]
+    parse_str = _parse_datetime_str
+    norm_dt = _normalize_datetime
+    return [parse_str(v) if type(v) is str else norm_dt(v) for v in vals]
 
 
 def _append_unique(target: List[str], items: Sequence[str]) -> None:
@@ -311,13 +346,66 @@ def _append_unique(target: List[str], items: Sequence[str]) -> None:
             target.append(item)
 
 
+_STRICT_CONFIG: ConfigDict = ConfigDict(extra="forbid", allow_inf_nan=False)
+_FLOAT_INT_TYPES: frozenset[type] = frozenset((float, int))
+
+
+def _coalesce_stripped_legacy_fields(raw_stripped: Any) -> Any:
+    if raw_stripped is None:
+        return []
+    if isinstance(raw_stripped, (list, tuple)):
+        return [str(x) for x in raw_stripped]
+    return raw_stripped
+
+
+def _check_finite_sequence(vals: Sequence[float], label: str) -> None:
+    if isinstance(vals, np.ndarray):
+        if vals.dtype == np.bool_ or not np.issubdtype(vals.dtype, np.number):
+            raise ValueError(f"{label} elements must be finite floats")
+        if vals.size > 0 and not bool(np.isfinite(vals).all()):
+            raise ValueError(f"{label} elements must be finite floats")
+        return
+    if not vals:
+        return
+    if set(map(type, vals)).issubset(_FLOAT_INT_TYPES):
+        if all(map(math.isfinite, vals)):
+            return
+        raise ValueError(f"{label} elements must be finite floats")
+    isfinite = math.isfinite
+    for x in vals:
+        if isinstance(x, bool):
+            raise ValueError(f"{label} elements must be finite floats")
+        try:
+            fx = float(x)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} elements must be finite floats") from exc
+        if not isfinite(fx):
+            raise ValueError(f"{label} elements must be finite floats")
+
+
+def _check_finite_nested(obj: Any, path: str = "response") -> None:
+    if obj is None or isinstance(obj, (str, bool)):
+        return
+    if isinstance(obj, (int, float)):
+        if not math.isfinite(float(obj)):
+            raise ValueError(f"{path} contains non-finite numeric value: {obj!r}")
+        return
+    if isinstance(obj, Mapping):
+        for k, v in obj.items():
+            _check_finite_nested(v, f"{path}.{k}")
+        return
+    if isinstance(obj, (list, tuple)):
+        for idx, item in enumerate(obj):
+            _check_finite_nested(item, f"{path}[{idx}]")
+
+
 # ── Market Data Leaf Specifications ───────────────────────────────────────────
 
 
 class RatesScheduleSpec(BaseModel):
     """Pillar dates, percentage/decimal zero rates, and optional basis spreads for a DiscountFactorCurve."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     Dates: List[datetime.datetime]
     Rates: List[float] = Field(default_factory=list)
@@ -332,23 +420,27 @@ class RatesScheduleSpec(BaseModel):
     def _validate_lengths(self) -> RatesScheduleSpec:
         if len(self.Dates) == 0:
             raise ValueError("RatesSchedule.Dates must not be empty")
-        if self.Rates and len(self.Rates) != len(self.Dates):
-            raise ValueError(
-                f"RatesSchedule.Rates length ({len(self.Rates)}) != Dates length ({len(self.Dates)})"
-            )
-        if self.Spreads is not None and len(self.Spreads) != len(self.Dates):
-            raise ValueError(
-                f"RatesSchedule.Spreads length ({len(self.Spreads)}) != Dates length ({len(self.Dates)})"
-            )
+        if self.Rates:
+            if len(self.Rates) != len(self.Dates):
+                raise ValueError(
+                    f"RatesSchedule.Rates length ({len(self.Rates)}) != Dates length ({len(self.Dates)})"
+                )
+            _check_finite_sequence(self.Rates, "RatesSchedule.Rates")
+        if self.Spreads is not None:
+            if len(self.Spreads) != len(self.Dates):
+                raise ValueError(
+                    f"RatesSchedule.Spreads length ({len(self.Spreads)}) != Dates length ({len(self.Dates)})"
+                )
+            _check_finite_sequence(self.Spreads, "RatesSchedule.Spreads")
         if not self.Rates and self.Spreads is None:
             raise ValueError("RatesSchedule requires either Rates or Spreads")
         return self
 
 
 class DiscountFactorCurveSpec(BaseModel):
-    """Discount factor / yield curve specification with Tier 0 basis-placeholder stripping."""
+    """Discount factor / yield curve specification with legacy field stripping."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     TypeName: Literal["DiscountFactorCurve"] = "DiscountFactorCurve"
     Identifier: str
@@ -367,16 +459,22 @@ class DiscountFactorCurveSpec(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _strip_tier0_curve_fields(cls, data: Any) -> Any:
-        if not isinstance(data, Mapping):
+        if not isinstance(data, (dict, AbcMapping)):
             return data
         out = dict(data)
-        stripped: List[str] = list(out.get("stripped_legacy_fields", []))
-        for field_name in _CURVE_TIER0_FIELDS:
-            if field_name in out:
-                out.pop(field_name)
-                _append_unique(stripped, [field_name])
+        stripped = _coalesce_stripped_legacy_fields(out.get("stripped_legacy_fields"))
+        if isinstance(stripped, list):
+            for field_name in _CURVE_TIER0_FIELDS:
+                if field_name in out:
+                    out.pop(field_name)
+                    _append_unique(stripped, [field_name])
         out["stripped_legacy_fields"] = stripped
         return out
+
+    @field_validator("InterpolationDayCountConvention", mode="before")
+    @classmethod
+    def _coalesce_dcc(cls, v: Any) -> Any:
+        return DayCountConventionEnum.Act365 if v is None else v
 
     @field_validator("AsOfDate", mode="before")
     @classmethod
@@ -387,10 +485,28 @@ class DiscountFactorCurveSpec(BaseModel):
 _PERIOD_DAYS_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([DWMYdwmy])\s*$")
 
 
+@functools.lru_cache(maxsize=512)
+def _parse_repo_period_days(p: str) -> float:
+    m = _PERIOD_DAYS_RE.match(p)
+    if m is None:
+        raise ValueError(f"Invalid repo period format '{p}'; expected '<n>D'")
+    val = float(m.group(1))
+    unit = m.group(2).upper()
+    if unit == "D":
+        return val
+    if unit == "W":
+        return val * 7.0
+    if unit == "M":
+        return val * 30.0
+    if unit == "Y":
+        return val * 365.0
+    raise ValueError(f"Invalid repo period format '{p}'; expected '<n>D'")
+
+
 class RepoScheduleSpec(BaseModel):
     """Pillar periods ('<n>D') and percentage repo spread rates for a RepoSpreadCurve."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     Periods: List[str]
     Rates: List[float]
@@ -403,33 +519,20 @@ class RepoScheduleSpec(BaseModel):
             )
         if len(self.Periods) == 0:
             raise ValueError("RepoSchedule.Periods must not be empty")
+        _check_finite_sequence(self.Rates, "RepoSchedule.Rates")
         _ = self.period_days()
         return self
 
     def period_days(self) -> List[float]:
         """Parses '<n>D' period strings into day counts in float64."""
-        days: List[float] = []
-        for p in self.Periods:
-            m = _PERIOD_DAYS_RE.match(p)
-            if m is None:
-                raise ValueError(f"Invalid repo period format '{p}'; expected '<n>D'")
-            val = float(m.group(1))
-            unit = m.group(2).upper()
-            if unit == "D":
-                days.append(val)
-            elif unit == "W":
-                days.append(val * 7.0)
-            elif unit == "M":
-                days.append(val * 30.0)
-            elif unit == "Y":
-                days.append(val * 365.0)
-        return days
+        parse_p = _parse_repo_period_days
+        return [parse_p(p) for p in self.Periods]
 
 
 class RepoSpreadCurveSpec(BaseModel):
     """Equity repo spread curve specification (`Act360`, `<n>D` pillar periods)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     TypeName: Literal["RepoSpreadCurve"] = "RepoSpreadCurve"
     Identifier: str
@@ -446,7 +549,7 @@ class RepoSpreadCurveSpec(BaseModel):
 class DividendItemSpec(BaseModel):
     """Single discrete cash dividend entry (`ExDate`, `PaymentDate`, `Amount`)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     ExDate: datetime.datetime
     PaymentDate: datetime.datetime
@@ -457,26 +560,37 @@ class DividendItemSpec(BaseModel):
     def _parse_dt(cls, v: Any) -> datetime.datetime:
         return _normalize_datetime(v)
 
+    @model_validator(mode="after")
+    def _validate_amount(self) -> DividendItemSpec:
+        if isinstance(self.Amount, bool) or not math.isfinite(self.Amount) or self.Amount < 0.0:
+            raise ValueError(f"DividendItem.Amount must be finite and non-negative, got {self.Amount!r}")
+        return self
+
 
 class DividendsSpec(BaseModel):
     """Discrete cash dividend schedule for a single equity underlying."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     TypeName: Literal["Dividends"] = "Dividends"
     Identifier: str
     CashDividendList: List[DividendItemSpec] = Field(default_factory=list)
-    Currency: Optional[str] = Field(default=None, exclude=True)
+    Currency: Optional[str] = None
+
+    @field_validator("CashDividendList", mode="before")
+    @classmethod
+    def _coalesce_cash_divs(cls, v: Any) -> Any:
+        return [] if v is None else v
 
 
 class PredefinedDividendsSpec(BaseModel):
     """Contract-level predefined dividend schedule (`ExDates`, `Amounts`) from the AUTOCALL PERF block."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     ExDates: List[datetime.datetime]
     Amounts: List[float]
-    Currency: Optional[str] = Field(default=None, exclude=True)
+    Currency: Optional[str] = None
 
     @field_validator("ExDates", mode="before")
     @classmethod
@@ -500,7 +614,7 @@ class PredefinedDividendsSpec(BaseModel):
 class EquityVolSmileCollectionSpec(BaseModel):
     """Implied volatility surface (`[maturity][strike]` decimal volatility quotes) for an equity underlying."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     Identifier: str
     TypeName: Literal["EquityVolatilitySmileCollection"] = "EquityVolatilitySmileCollection"
@@ -510,7 +624,12 @@ class EquityVolSmileCollectionSpec(BaseModel):
     ExpirationDates: List[datetime.datetime]
     Strikes: List[float]
     VolatilityQuotes: List[List[float]]
-    Currency: Optional[str] = Field(default=None, exclude=True)
+    Currency: Optional[str] = None
+
+    @field_validator("DayCountConvention", mode="before")
+    @classmethod
+    def _coalesce_dcc(cls, v: Any) -> Any:
+        return DayCountConventionEnum.Act365 if v is None else v
 
     @field_validator("ExpirationDates", mode="before")
     @classmethod
@@ -523,6 +642,7 @@ class EquityVolSmileCollectionSpec(BaseModel):
         n_str = len(self.Strikes)
         if n_exp == 0 or n_str == 0:
             raise ValueError("EquityVolatilitySmileCollection requires non-empty ExpirationDates and Strikes")
+        _check_finite_sequence(self.Strikes, "EquityVolatilitySmileCollection.Strikes")
         if len(self.VolatilityQuotes) != n_exp:
             raise ValueError(
                 f"VolatilityQuotes row count ({len(self.VolatilityQuotes)}) != ExpirationDates length ({n_exp})"
@@ -532,13 +652,14 @@ class EquityVolSmileCollectionSpec(BaseModel):
                 raise ValueError(
                     f"VolatilityQuotes[{row_idx}] length ({len(row)}) != Strikes length ({n_str})"
                 )
+            _check_finite_sequence(row, f"EquityVolatilitySmileCollection.VolatilityQuotes[{row_idx}]")
         return self
 
 
 class FXVolatilitySmileCollectionSpec(BaseModel):
     """FX implied volatility surface (`[maturity][delta]` volatility quotes) covering all 12 Murex FX surface fields."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     Identifier: str
     TypeName: Literal["FXVolatilitySmileCollection"] = "FXVolatilitySmileCollection"
@@ -552,6 +673,11 @@ class FXVolatilitySmileCollectionSpec(BaseModel):
     Deltas: List[str]
     Tenors: List[str]
     VolatilityQuotes: List[List[float]]
+
+    @field_validator("DayCountConvention", mode="before")
+    @classmethod
+    def _coalesce_dcc(cls, v: Any) -> Any:
+        return DayCountConventionEnum.Act365 if v is None else v
 
     @field_validator("AsOfDate", mode="before")
     @classmethod
@@ -573,6 +699,7 @@ class FXVolatilitySmileCollectionSpec(BaseModel):
                 raise ValueError(
                     f"VolatilityQuotes[{row_idx}] length ({len(row)}) != Deltas length ({n_del})"
                 )
+            _check_finite_sequence(row, f"FXVolatilitySmileCollection.VolatilityQuotes[{row_idx}]")
         return self
 
 
@@ -585,7 +712,7 @@ VolatilitySurfaceSpec = Annotated[
 class FixingsSpec(BaseModel):
     """Historical fixing dates and observed price/rate values for a seasoned underlying or rate index."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     TypeName: Literal["Fixings"] = "Fixings"
     Identifier: str
@@ -603,17 +730,24 @@ class FixingsSpec(BaseModel):
             raise ValueError(
                 f"Fixings Dates length ({len(self.Dates)}) != Values length ({len(self.Values)})"
             )
+        _check_finite_sequence(self.Values, "Fixings.Values")
         return self
 
 
 class CorrelationPairSpec(BaseModel):
     """Structured representation of a pairwise correlation entry `<asset_1>&<asset_2>`."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     asset_1: str
     asset_2: str
     correlation: float = Field(..., ge=-1.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _validate_finite_corr(self) -> CorrelationPairSpec:
+        if isinstance(self.correlation, bool) or not math.isfinite(self.correlation):
+            raise ValueError(f"Correlation must be finite, got {self.correlation!r}")
+        return self
 
     @property
     def key(self) -> str:
@@ -627,13 +761,18 @@ class CorrelationPairSpec(BaseModel):
         parts = pair_key.split("&")
         if len(parts) != 2 or not parts[0] or not parts[1]:
             raise ValueError(f"Invalid correlation key '{pair_key}'; expected '<asset_1>&<asset_2>'")
-        return cls(asset_1=parts[0], asset_2=parts[1], correlation=float(correlation))
+        if isinstance(correlation, bool):
+            raise ValueError(f"Correlation must be numeric, got {correlation!r}")
+        c_val = float(correlation)
+        if not math.isfinite(c_val):
+            raise ValueError(f"Correlation for {pair_key!r} must be finite, got {correlation!r}")
+        return cls(asset_1=parts[0], asset_2=parts[1], correlation=c_val)
 
 
 class MarketDataSetSpec(BaseModel):
     """Complete multi-asset market data bundle (`RatesCurvesBundles`, `VolatilitySurfaces`, `Spots`, `Correlations`, etc.)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     TypeName: Literal["MarketDataSet"] = "MarketDataSet"
     AsOfDate: datetime.datetime
@@ -644,6 +783,28 @@ class MarketDataSetSpec(BaseModel):
     RepoSpreadCurves: Dict[str, RepoSpreadCurveSpec] = Field(default_factory=dict)
     Dividends: Dict[str, DividendsSpec] = Field(default_factory=dict)
     Fixings: Dict[str, FixingsSpec] = Field(default_factory=dict)
+
+    @field_validator("Correlations", "RepoSpreadCurves", "Dividends", mode="before")
+    @classmethod
+    def _coalesce_none_dicts(cls, v: Any) -> Any:
+        return {} if v is None else v
+
+    @field_validator("Fixings", mode="before")
+    @classmethod
+    def _coalesce_and_enrich_fixings(cls, v: Any) -> Any:
+        if v is None:
+            return {}
+        if not isinstance(v, (dict, AbcMapping)):
+            return v
+        out_fix: Dict[str, Any] = {}
+        for ticker, item in v.items():
+            if isinstance(item, (dict, AbcMapping)) and not item.get("Identifier"):
+                item_copy = dict(item)
+                item_copy["Identifier"] = str(ticker)
+                out_fix[ticker] = item_copy
+            else:
+                out_fix[ticker] = item
+        return out_fix
 
     @field_validator("AsOfDate", mode="before")
     @classmethod
@@ -674,6 +835,8 @@ class MarketDataSetSpec(BaseModel):
         if len(v) == 0:
             raise ValueError("MarketDataSet.Spots must not be empty")
         for ticker, spot in v.items():
+            if isinstance(spot, bool):
+                raise ValueError(f"MarketDataSet.Spots[{ticker!r}] must be float, got bool")
             s_val = float(spot)
             if not math.isfinite(s_val) or s_val <= 0.0:
                 raise ValueError(
@@ -684,8 +847,20 @@ class MarketDataSetSpec(BaseModel):
     @field_validator("Correlations")
     @classmethod
     def _validate_correlations(cls, v: Dict[str, float]) -> Dict[str, float]:
+        seen_pairs: Dict[Tuple[str, str], float] = {}
         for k, corr in v.items():
-            _ = CorrelationPairSpec.from_key(k, corr)
+            pair = CorrelationPairSpec.from_key(k, corr)
+            if pair.asset_1 == pair.asset_2 and abs(pair.correlation - 1.0) > 1e-12:
+                raise ValueError(
+                    f"Self-correlation for '{pair.asset_1}' must equal 1.0, got {pair.correlation}"
+                )
+            canon = (pair.asset_1, pair.asset_2) if pair.asset_1 <= pair.asset_2 else (pair.asset_2, pair.asset_1)
+            prev = seen_pairs.get(canon)
+            if prev is not None and abs(prev - pair.correlation) > 1e-12:
+                raise ValueError(
+                    f"Contradictory correlation entries for '{canon[0]}&{canon[1]}': {prev} vs {pair.correlation}"
+                )
+            seen_pairs[canon] = pair.correlation
         return v
 
     def get_correlation_pairs(self) -> List[CorrelationPairSpec]:
@@ -720,26 +895,37 @@ class MarketDataSetSpec(BaseModel):
 
 
 class DupireModelSpec(BaseModel):
-    """Dupire local volatility model specification with Tier 0 cross-currency flag stripping."""
+    """Dupire local volatility model specification with cross-currency flag stripping."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     TypeName: Literal["DupireLocalVolatilityModel"] = "DupireLocalVolatilityModel"
     MarketDataSet: MarketDataSetSpec
     FinancingCurveIdentifiers: List[str] = Field(default_factory=list)
     stripped_legacy_fields: List[str] = Field(default_factory=list)
 
+    @field_validator("TypeName", mode="before")
+    @classmethod
+    def _coalesce_typename(cls, v: Any) -> Any:
+        return "DupireLocalVolatilityModel" if v is None else v
+
+    @field_validator("FinancingCurveIdentifiers", mode="before")
+    @classmethod
+    def _coalesce_fin_curves(cls, v: Any) -> Any:
+        return [] if v is None else v
+
     @model_validator(mode="before")
     @classmethod
     def _strip_tier0_model_fields(cls, data: Any) -> Any:
-        if not isinstance(data, Mapping):
+        if not isinstance(data, (dict, AbcMapping)):
             return data
         out = dict(data)
-        stripped: List[str] = list(out.get("stripped_legacy_fields", []))
-        for field_name in _MODEL_TIER0_FIELDS:
-            if field_name in out:
-                out.pop(field_name)
-                _append_unique(stripped, [field_name])
+        stripped = _coalesce_stripped_legacy_fields(out.get("stripped_legacy_fields"))
+        if isinstance(stripped, list):
+            for field_name in _MODEL_TIER0_FIELDS:
+                if field_name in out:
+                    out.pop(field_name)
+                    _append_unique(stripped, [field_name])
         out["stripped_legacy_fields"] = stripped
         return out
 
@@ -753,7 +939,7 @@ class DupireModelSpec(BaseModel):
 class AutoCallableProductSpec(BaseModel):
     """Multi-asset Equity Autocallable product specification covering all 34 Murex contract fields."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     TypeName: Literal["AutoCallableProduct"] = "AutoCallableProduct"
     PaymentCurrency: str
@@ -799,6 +985,16 @@ class AutoCallableProductSpec(BaseModel):
     AutoCallCoupon: Optional[float] = None
     PredefinedDividends: Optional[Dict[str, PredefinedDividendsSpec]] = None
 
+    @field_validator("DayCountConvention", mode="before")
+    @classmethod
+    def _coalesce_dcc(cls, v: Any) -> Any:
+        return DayCountConventionEnum.Act360 if v is None else v
+
+    @field_validator("CallabilityMonitoringIndex", mode="before")
+    @classmethod
+    def _coalesce_call_idx(cls, v: Any) -> Any:
+        return MonitoringIndexEnum.WorstOf if v is None else v
+
     @field_validator("StartDate", mode="before")
     @classmethod
     def _parse_start_date(cls, v: Any) -> datetime.datetime:
@@ -833,10 +1029,12 @@ class AutoCallableProductSpec(BaseModel):
             raise ValueError(
                 f"AutoCallTriggerLevels length ({len(self.AutoCallTriggerLevels)}) != ObservationDates length ({m_obs})"
             )
-        if self.CouponBarrierLevels is not None and len(self.CouponBarrierLevels) != m_obs:
-            raise ValueError(
-                f"CouponBarrierLevels length ({len(self.CouponBarrierLevels)}) != ObservationDates length ({m_obs})"
-            )
+        if self.CouponBarrierLevels is not None:
+            if len(self.CouponBarrierLevels) != m_obs:
+                raise ValueError(
+                    f"CouponBarrierLevels length ({len(self.CouponBarrierLevels)}) != ObservationDates length ({m_obs})"
+                )
+            _check_finite_sequence(self.CouponBarrierLevels, "CouponBarrierLevels")
         if len(self.UnderlyingIdentifiers) == 0:
             raise ValueError("UnderlyingIdentifiers must not be empty")
         if len(set(self.UnderlyingIdentifiers)) != len(self.UnderlyingIdentifiers):
@@ -848,7 +1046,7 @@ class AutoCallableProductSpec(BaseModel):
             )
         if any((not math.isfinite(s)) or s <= 0.0 for s in self.UnderlyingReferenceSpots):
             raise ValueError("UnderlyingReferenceSpots must all be strictly positive and finite")
-        pair_indices = {"RatioAB", "RatioBA", "DiffAB", "DiffBA", "Outperformance", "Spread"}
+        pair_indices = {"RatioAB", "Ratio", "RatioBA", "DiffAB", "DiffBA", "Outperformance", "Spread"}
         for idx_val in (
             self.CallabilityMonitoringIndex,
             self.CouponBarrierMonitoringIndex,
@@ -862,6 +1060,15 @@ class AutoCallableProductSpec(BaseModel):
             raise ValueError("AutoCallTriggerLevels must all be strictly positive and finite")
         if not math.isfinite(self.Strike) or self.Strike < 0.0:
             raise ValueError(f"Strike must be finite and non-negative, got {self.Strike!r}")
+        for spread_name, spread_val in (
+            ("AutoCallTriggerAbsoluteDigitalSpread", self.AutoCallTriggerAbsoluteDigitalSpread),
+            ("CouponBarrierAbsoluteDigitalSpread", self.CouponBarrierAbsoluteDigitalSpread),
+            ("OptionDownAndInBarrierAbsoluteDigitalSpread", self.OptionDownAndInBarrierAbsoluteDigitalSpread),
+            ("OptionDownAndInBarrierLevel", self.OptionDownAndInBarrierLevel),
+            ("FundingSpread", self.FundingSpread),
+        ):
+            if spread_val is not None and (isinstance(spread_val, bool) or not math.isfinite(spread_val)):
+                raise ValueError(f"{spread_name} must be finite, got {spread_val!r}")
         if self.LowerStrike is not None:
             if not math.isfinite(self.LowerStrike) or self.LowerStrike < 0.0:
                 raise ValueError(f"LowerStrike must be finite and non-negative, got {self.LowerStrike!r}")
@@ -929,7 +1136,7 @@ _DESCRIPTION_TO_SHORT_CODE: Dict[str, str] = {
 class CashFlowRow(BaseModel):
     """Single cash-flow table entry in `EQAutocallableTradeResponse`."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     Description: Union[
         Literal["FundingLeg", "Coupon", "Notional", "Option", "OneStarCoupon", "IsLongBasket"],
@@ -940,7 +1147,7 @@ class CashFlowRow(BaseModel):
     StandardError: float = 0.0
     Currency: str = "RUB"
     Leg: int = 0
-    StatusText: Union[Literal["Settled", "InTransit", "Estimate"], str] = "Estimate"
+    StatusText: Union[Literal["Settled", "In-Transit", "InTransit", "Estimate"], str] = "Estimate"
     ShortCode: Optional[
         Union[Literal["F", "C", "N", "O", "S", "B", "L"], str]
     ] = Field(default=None, exclude=True)
@@ -957,12 +1164,12 @@ class CashFlowRow(BaseModel):
                 out["Date"] = pay_dt
         if "ExpectedValue" in out:
             exp_val = out.pop("ExpectedValue")
-            if "Amount" not in out:
-                out["Amount"] = float(exp_val)
+            if "Amount" not in out and exp_val is not None:
+                out["Amount"] = exp_val
         if "PaymentValue" in out:
             pay_val = out.pop("PaymentValue")
-            if "Amount" not in out:
-                out["Amount"] = float(pay_val)
+            if "Amount" not in out and pay_val is not None:
+                out["Amount"] = pay_val
         if out.get("ShortCode") is None and "Description" in out:
             sc = _DESCRIPTION_TO_SHORT_CODE.get(str(out["Description"]))
             if sc is not None:
@@ -974,36 +1181,59 @@ class CashFlowRow(BaseModel):
     def _parse_date(cls, v: Any) -> datetime.datetime:
         return _normalize_datetime(v)
 
+    @model_validator(mode="after")
+    def _validate_finite_amounts(self) -> CashFlowRow:
+        if isinstance(self.Amount, bool) or not math.isfinite(self.Amount):
+            raise ValueError(f"CashFlowRow.Amount must be finite, got {self.Amount!r}")
+        if isinstance(self.StandardError, bool) or not math.isfinite(self.StandardError):
+            raise ValueError(f"CashFlowRow.StandardError must be finite, got {self.StandardError!r}")
+        return self
+
     @property
     def PaymentValue(self) -> float:
         """Alias for `Amount`."""
         return float(self.Amount)
 
 
-class EQAutocallableTradeRequest(BaseModel):
-    """Canonical top-level pricing request with Tier 0 legacy MC/engine parameter stripping."""
+_DEFAULT_AUTOCALL_QUERIES: Tuple[AutocallQueryMetric, ...] = (
+    AutocallQueryMetric.ProductValue,
+    AutocallQueryMetric.CashFlows,
+)
 
-    model_config = ConfigDict(extra="forbid")
+
+class EQAutocallableTradeRequest(BaseModel):
+    """Canonical top-level pricing request with legacy MC/engine parameter stripping."""
+
+    model_config = _STRICT_CONFIG
 
     Product: AutoCallableProductSpec
     Model: DupireModelSpec
     Queries: List[AutocallQueryMetric] = Field(
-        default_factory=lambda: [AutocallQueryMetric.ProductValue, AutocallQueryMetric.CashFlows]
+        default_factory=lambda: list(_DEFAULT_AUTOCALL_QUERIES)
     )
     TradeInfo: Optional[str] = None
     stripped_legacy_fields: List[str] = Field(default_factory=list)
     legacy_solver_config: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
+    @field_validator("Queries", mode="before")
+    @classmethod
+    def _coalesce_queries(cls, v: Any) -> Any:
+        if v is None:
+            return list(_DEFAULT_AUTOCALL_QUERIES)
+        return v
+
     @model_validator(mode="before")
     @classmethod
     def _strip_tier0_root_fields(cls, data: Any) -> Any:
-        if not isinstance(data, Mapping):
+        if not isinstance(data, (dict, AbcMapping)):
             return data
         out = dict(data)
-        stripped: List[str] = list(out.get("stripped_legacy_fields", []))
+        if "Queries" in out and out["Queries"] is None:
+            out["Queries"] = list(_DEFAULT_AUTOCALL_QUERIES)
+        stripped = _coalesce_stripped_legacy_fields(out.get("stripped_legacy_fields"))
         existing_solver_cfg = out.get("legacy_solver_config")
         solver_cfg: Dict[str, Any] = (
-            dict(existing_solver_cfg) if isinstance(existing_solver_cfg, Mapping) else {}
+            dict(existing_solver_cfg) if isinstance(existing_solver_cfg, (dict, AbcMapping)) else {}
         )
 
         for field_name in (
@@ -1017,7 +1247,8 @@ class EQAutocallableTradeRequest(BaseModel):
         ):
             if field_name in out:
                 val = out.pop(field_name)
-                _append_unique(stripped, [field_name])
+                if isinstance(stripped, list):
+                    _append_unique(stripped, [field_name])
                 if field_name in (
                     "CalculationMethod",
                     "NumberOfPaths",
@@ -1027,22 +1258,24 @@ class EQAutocallableTradeRequest(BaseModel):
                     "GreekMetricsSettings",
                 ):
                     solver_cfg[field_name] = val
-                if field_name == "GreekMetricsSettings" and isinstance(val, Mapping):
+                if field_name == "GreekMetricsSettings" and isinstance(val, (dict, AbcMapping)):
                     for gk_key, gk_val in val.items():
                         if gk_key not in _GREEK_SETTINGS_TIER0_FIELDS:
                             raise ValueError(
                                 f"Unknown field '{gk_key}' inside GreekMetricsSettings"
                             )
-                        _append_unique(stripped, [gk_key])
-                        if gk_key == "BumpParametersOverrides" and isinstance(gk_val, Mapping):
+                        if isinstance(stripped, list):
+                            _append_unique(stripped, [gk_key])
+                        if gk_key == "BumpParametersOverrides" and isinstance(gk_val, (dict, AbcMapping)):
                             for metric_name, bump_cfg in gk_val.items():
-                                if isinstance(bump_cfg, Mapping):
+                                if isinstance(bump_cfg, (dict, AbcMapping)):
                                     for b_key in bump_cfg:
                                         if b_key not in _BUMP_OVERRIDE_TIER0_FIELDS:
                                             raise ValueError(
                                                 f"Unknown field '{b_key}' in BumpParametersOverrides[{metric_name!r}]"
                                             )
-                                        _append_unique(stripped, [b_key])
+                                        if isinstance(stripped, list):
+                                            _append_unique(stripped, [b_key])
 
         out["stripped_legacy_fields"] = stripped
         if solver_cfg:
@@ -1053,11 +1286,24 @@ class EQAutocallableTradeRequest(BaseModel):
     def _collect_nested_stripped_fields(self) -> EQAutocallableTradeRequest:
         if len(self.Queries) == 0:
             raise ValueError("Queries must not be empty")
-        if (
-            len(self.Product.UnderlyingIdentifiers) >= 2
-            and len(self.Model.MarketDataSet.Correlations) == 0
-        ):
-            raise ValueError("MarketDataSet.Correlations must not be empty for multi-asset baskets")
+        mds = self.Model.MarketDataSet
+        uids = self.Product.UnderlyingIdentifiers
+        for uid in uids:
+            if uid not in mds.Spots:
+                raise ValueError(f"Missing spot for underlying '{uid}' in MarketDataSet.Spots")
+            if uid not in mds.VolatilitySurfaces:
+                raise ValueError(f"Missing volatility surface for underlying '{uid}' in MarketDataSet.VolatilitySurfaces")
+        if len(uids) >= 2:
+            if len(mds.Correlations) == 0:
+                raise ValueError("MarketDataSet.Correlations must not be empty for multi-asset baskets")
+            for i in range(len(uids)):
+                u_i = uids[i]
+                for j in range(i + 1, len(uids)):
+                    u_j = uids[j]
+                    if f"{u_i}&{u_j}" not in mds.Correlations and f"{u_j}&{u_i}" not in mds.Correlations:
+                        raise ValueError(
+                            f"Missing correlation pair for ({u_i!r}, {u_j!r}) in MarketDataSet.Correlations"
+                        )
         _append_unique(self.stripped_legacy_fields, self.Model.stripped_legacy_fields)
         return self
 
@@ -1065,7 +1311,7 @@ class EQAutocallableTradeRequest(BaseModel):
 class EQAutocallableTradeResponse(BaseModel):
     """Canonical top-level response containing `ProductValue`, `CashFlows`, Greeks, and SR 26-2 telemetry."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _STRICT_CONFIG
 
     ProductValue: float
     ReportingCurrency: str = "RUB"
@@ -1075,13 +1321,15 @@ class EQAutocallableTradeResponse(BaseModel):
 
     # Optional Greek sensitivity outputs
     Delta: Optional[Dict[str, float]] = None
-    Gamma: Optional[Union[Dict[str, float], List[List[float]]]] = None
+    Gamma: Optional[Union[Dict[str, Dict[str, float]], Dict[str, float], List[List[float]]]] = None
     MultivariateAggregatedCashGamma: Optional[Union[float, List[List[float]]]] = None
     Vega: Optional[Dict[str, List[List[float]]]] = None
     Rho: Optional[Dict[str, List[float]]] = None
+    RepoRho: Optional[Dict[str, List[float]]] = None
+    rho_unit_convention: Literal["quote", "decimal"] = "quote"
     DividendsSensitivities: Optional[Dict[str, List[float]]] = None
     Theta: Optional[float] = None
-    Cega: Optional[Union[Dict[str, float], List[List[float]]]] = None
+    Cega: Optional[Union[Dict[str, Dict[str, float]], Dict[str, float], List[List[float]]]] = None
 
     # Metadata & SR 11-7 / SR 26-2 governance telemetry
     TradeInfo: Optional[str] = None
@@ -1089,6 +1337,74 @@ class EQAutocallableTradeResponse(BaseModel):
     fallback_triggered: bool = False
     fallback_reason: Optional[str] = None
     latency_ms: float = 0.0
+
+    @model_validator(mode="after")
+    def _validate_finite_outputs(self) -> EQAutocallableTradeResponse:
+        for attr in ("ProductValue", "StandardError", "CashToSettleToday", "latency_ms", "Theta"):
+            val = getattr(self, attr)
+            if val is not None and (isinstance(val, bool) or not math.isfinite(float(val))):
+                raise ValueError(f"EQAutocallableTradeResponse.{attr} must be finite, got {val!r}")
+        for attr in (
+            "Delta",
+            "Gamma",
+            "MultivariateAggregatedCashGamma",
+            "Vega",
+            "Rho",
+            "RepoRho",
+            "DividendsSensitivities",
+            "Cega",
+        ):
+            _check_finite_nested(getattr(self, attr), attr)
+        return self
+
+
+def to_decimal_merged_rho(
+    response: Any,
+    quote_scales: Optional[Mapping[str, float]] = None,
+    *,
+    repo_quote_scales: Optional[Mapping[str, float]] = None,
+    merge_repo: bool = True,
+) -> Dict[str, List[float]]:
+    """Converts quote-unit Rho and optional RepoRho sensitivities to decimal dPV/dr_dec."""
+    out: Dict[str, List[float]] = {}
+    is_map = isinstance(response, Mapping)
+    conv = response.get("rho_unit_convention", "quote") if is_map else getattr(response, "rho_unit_convention", "quote")
+    rho_map = response.get("Rho") if is_map else getattr(response, "Rho", None)
+    scales = quote_scales or {}
+    if rho_map:
+        for cid, vec in rho_map.items():
+            raw_scale = scales.get(cid)
+            scale_val = 0.01 if raw_scale is None else float(raw_scale)
+            if not math.isfinite(scale_val):
+                raise ValueError(f"Non-finite quote scale for '{cid}': {raw_scale!r}")
+            scale = max(scale_val, 1e-12)
+            inv_s = 1.0 if conv == "decimal" else (1.0 / scale)
+            converted: List[float] = []
+            for v in vec:
+                v_f = float(v)
+                if not math.isfinite(v_f):
+                    raise ValueError(f"Non-finite Rho sensitivity for '{cid}': {v!r}")
+                converted.append(v_f * inv_s)
+            out[cid] = converted
+    repo_map = response.get("RepoRho") if is_map else getattr(response, "RepoRho", None)
+    if merge_repo and repo_map:
+        r_scales = repo_quote_scales or {}
+        for asset_id, vec in repo_map.items():
+            if asset_id not in out:
+                raw_r_scale = r_scales.get(asset_id)
+                r_scale_val = 0.01 if raw_r_scale is None else float(raw_r_scale)
+                if not math.isfinite(r_scale_val):
+                    raise ValueError(f"Non-finite repo quote scale for '{asset_id}': {raw_r_scale!r}")
+                r_scale = max(r_scale_val, 1e-12)
+                inv_rs = 1.0 if conv == "decimal" else (1.0 / r_scale)
+                converted_r: List[float] = []
+                for v in vec:
+                    v_f = float(v)
+                    if not math.isfinite(v_f):
+                        raise ValueError(f"Non-finite RepoRho sensitivity for '{asset_id}': {v!r}")
+                    converted_r.append(v_f * inv_rs)
+                out[asset_id] = converted_r
+    return out
 
 
 # ── Murex `ConstantMessageMap` DAG Tokenizer & Parser ─────────────────────────
@@ -1255,9 +1571,16 @@ def _parse_datetime_literal(text: str) -> datetime.datetime:
         else:
             int_args.append(int(p))
     if kind == "date":
-        return datetime.datetime(int_args[0], int_args[1], int_args[2], 0, 0, tzinfo=tz).astimezone(
-            datetime.timezone.utc
-        )
+        if not kw_int and len(int_args) < 3:
+            raise ValueError(f"Malformed date literal: {text!r}")
+        return datetime.datetime(
+            kw_int.get("year", int_args[0] if len(int_args) > 0 else 1),
+            kw_int.get("month", int_args[1] if len(int_args) > 1 else 1),
+            kw_int.get("day", int_args[2] if len(int_args) > 2 else 1),
+            0,
+            0,
+            tzinfo=tz,
+        ).astimezone(datetime.timezone.utc)
     while len(int_args) < 7:
         int_args.append(0)
     dt = datetime.datetime(
@@ -1390,26 +1713,25 @@ def _parse_str_dag_at(tokens: List[str], idx: int, n_toks: int) -> Tuple[Any, in
             if not stack or type(stack[-1]) is not list:
                 raise ValueError("Unexpected ']' in Murex DAG")
             parsed = stack.pop()
-        elif ch == "{":
-            stack.append(({}, None))
-            continue
-        elif ch == "[":
-            stack.append([])
-            continue
         elif stack and type(stack[-1]) is tuple and stack[-1][1] is None:
-            # Expect map key followed by ':'
+            if ch in "{[:" or ch == "}":
+                raise ValueError(f"Invalid map key token {val!r} in Murex DAG")
             if ch == "'" or ch == '"':
                 if len(val) < 2 or val[-1] != ch:
                     raise ValueError(f"Unclosed string key token {val!r}")
                 key_str = val[1:-1]
-            elif val == ":":
-                raise ValueError("Unexpected ':' as map key")
             else:
                 key_str = val
             if idx >= n_toks or tokens[idx] != ":":
                 raise ValueError("Expected token COLON after map key")
             idx += 1
             stack[-1] = (stack[-1][0], key_str)
+            continue
+        elif ch == "{":
+            stack.append(({}, None))
+            continue
+        elif ch == "[":
+            stack.append([])
             continue
         else:
             # Scalar token
@@ -1436,17 +1758,20 @@ def _parse_str_dag_at(tokens: List[str], idx: int, n_toks: int) -> Tuple[Any, in
                 if val.startswith("datetime.datetime(") and val.endswith(", tzinfo=datetime.timezone.utc)"):
                     nums = val[18:-31].split(",")
                     n_nums = len(nums)
-                    if n_nums == 5:
-                        parsed = dt_cls(
-                            int(nums[0]), int(nums[1]), int(nums[2]),
-                            int(nums[3]), int(nums[4]), tzinfo=utc_tz,
-                        )
-                    elif n_nums == 6:
-                        parsed = dt_cls(
-                            int(nums[0]), int(nums[1]), int(nums[2]),
-                            int(nums[3]), int(nums[4]), int(nums[5]), tzinfo=utc_tz,
-                        )
-                    else:
+                    try:
+                        if n_nums == 5:
+                            parsed = dt_cls(
+                                int(nums[0]), int(nums[1]), int(nums[2]),
+                                int(nums[3]), int(nums[4]), tzinfo=utc_tz,
+                            )
+                        elif n_nums == 6:
+                            parsed = dt_cls(
+                                int(nums[0]), int(nums[1]), int(nums[2]),
+                                int(nums[3]), int(nums[4]), int(nums[5]), tzinfo=utc_tz,
+                            )
+                        else:
+                            parsed = _parse_datetime_literal(val)
+                    except ValueError:
                         parsed = _parse_datetime_literal(val)
                 else:
                     parsed = _parse_datetime_literal(val)
@@ -1604,7 +1929,7 @@ def _resolve_dag_node(
             memo[ref_hash] = resolved
             return resolved
         return obj
-    if isinstance(obj, Mapping):
+    if isinstance(obj, (dict, AbcMapping)):
         out_m: Dict[str, Any] = {}
         for k, v in obj.items():
             if k in _EXTERNAL_OR_TIER0_ID_KEYS:
@@ -1625,8 +1950,14 @@ def _enrich_expected_result(
     enriched = dict(result_dict)
     if "Option" not in enriched and isinstance(enriched.get("CashFlows"), list):
         for cf in enriched["CashFlows"]:
-            if isinstance(cf, Mapping) and cf.get("Description") == "Option":
-                enriched["Option"] = float(cf["Amount"])
+            if isinstance(cf, (dict, AbcMapping)) and cf.get("Description") == "Option":
+                amt = cf.get("Amount")
+                if amt is None:
+                    amt = cf.get("ExpectedValue")
+                if amt is None:
+                    amt = cf.get("PaymentValue")
+                if amt is not None:
+                    enriched["Option"] = float(amt)
                 break
     if "TradeInfo" not in enriched and req.TradeInfo is not None:
         enriched["TradeInfo"] = req.TradeInfo
@@ -1634,33 +1965,30 @@ def _enrich_expected_result(
 
 
 def parse_murex_autocall_dag(
-    raw_text_or_dict: Union[str, Path, Dict[str, Any]],
+    raw_text_or_dict: Union[str, Path, Mapping[str, Any]],
+    *,
+    allow_file_path: bool = False,
 ) -> Tuple[EQAutocallableTradeRequest, Dict[str, Any]]:
-    """Parses a Murex `ConstantMessageMap` DAG text dump (or resolved Python dict) into a validated request and reference result dict.
-
-    Supports:
-    - Raw text dumps such as `eq_autocallable_request.txt` (with top or bottom `Result:` block,
-      `@<sha1>`, `'&<sha1>'`, or `'!<sha1>'` hash pointers, and `class: ConstantMessageMap` headers).
-    - File paths (`str` or `Path`) pointing to a Murex DAG file.
-    - Already-resolved Python dicts (either direct request dicts or `{sha1: node_dict}` maps).
-    """
-    if isinstance(raw_text_or_dict, Mapping):
+    """Parses a Murex `ConstantMessageMap` DAG text dump (or resolved Python dict) into a validated request and reference result dict."""
+    if isinstance(raw_text_or_dict, (dict, AbcMapping)):
         raw_map = dict(raw_text_or_dict)
         if "Product" in raw_map and "Model" in raw_map:
-            res_block = dict(cast(Mapping[str, Any], raw_map.pop("Result", {})))
+            raw_res = raw_map.pop("Result", None)
+            if raw_res is not None and not isinstance(raw_res, (dict, AbcMapping)):
+                raise ValueError("Murex DAG 'Result' entry must be a mapping or null")
+            res_block = dict(raw_res) if isinstance(raw_res, (dict, AbcMapping)) else {}
             req = EQAutocallableTradeRequest.model_validate(raw_map)
             return req, _enrich_expected_result(res_block, req)
 
-        # Otherwise treat as {sha1_or_key: node_dict}
         nodes_from_dict: Dict[str, Dict[str, Any]] = {}
         result_from_dict: Dict[str, Any] = {}
         root_hash_from_dict: Optional[str] = None
         for k, v in raw_map.items():
-            if k == "Result" and isinstance(v, Mapping):
+            if k == "Result" and isinstance(v, (dict, AbcMapping)):
                 result_from_dict = dict(v)
             elif k in ("Root", "root_id") and isinstance(v, str):
                 root_hash_from_dict = v.lstrip("@&!").lower()
-            elif isinstance(v, Mapping):
+            elif isinstance(v, (dict, AbcMapping)):
                 h_key = k.lstrip("@&!").lower()
                 nodes_from_dict[h_key] = dict(v)
                 if "Product" in v and "Model" in v:
@@ -1674,35 +2002,43 @@ def parse_murex_autocall_dag(
 
     if isinstance(raw_text_or_dict, Path):
         p = raw_text_or_dict
-        if not p.exists():
-            repo_root = Path(__file__).resolve().parents[3]
-            for candidate in [repo_root / "data" / "autocall" / p.name, repo_root / p.name]:
-                if candidate.exists():
-                    p = candidate
-                    break
-        text = p.read_text(encoding="utf-8")
-    elif isinstance(raw_text_or_dict, str):
-        if "\n" not in raw_text_or_dict and len(raw_text_or_dict) < 4096:
-            p = Path(raw_text_or_dict)
+        try:
             if not p.is_file():
                 repo_root = Path(__file__).resolve().parents[3]
                 for candidate in [repo_root / "data" / "autocall" / p.name, repo_root / p.name]:
                     if candidate.is_file():
                         p = candidate
                         break
-            if p.is_file():
-                text = p.read_text(encoding="utf-8")
-            else:
+            text = p.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"Failed to read Murex DAG file {raw_text_or_dict!r}: {exc}") from exc
+    elif isinstance(raw_text_or_dict, str):
+        text = raw_text_or_dict
+        if allow_file_path and "\n" not in raw_text_or_dict and 0 < len(raw_text_or_dict) <= 255:
+            try:
+                p = Path(raw_text_or_dict)
+                if not p.is_file():
+                    repo_root = Path(__file__).resolve().parents[3]
+                    for candidate in [repo_root / "data" / "autocall" / p.name, repo_root / p.name]:
+                        if candidate.is_file():
+                            p = candidate
+                            break
+                if p.is_file():
+                    text = p.read_text(encoding="utf-8")
+            except OSError:
                 text = raw_text_or_dict
-        else:
-            text = raw_text_or_dict
     else:
         raise TypeError(
             f"Unsupported input type for parse_murex_autocall_dag: {type(raw_text_or_dict).__name__}"
         )
 
+    if not text.strip():
+        raise ValueError("Empty Murex DAG input")
+
     tokens = _FAST_TOK_RE.findall(text)
     n_toks = len(tokens)
+    if n_toks == 0:
+        raise ValueError("No valid tokens found in Murex DAG input")
     idx = 0
     nodes: Dict[str, Dict[str, Any]] = {}
     result_dict: Dict[str, Any] = {}
@@ -1715,17 +2051,19 @@ def parse_murex_autocall_dag(
 
         if ch == "{":
             parsed_map, idx = _parse_str_dag_at(tokens, idx, n_toks)
-            if "ProductValue" in parsed_map or "CashFlows" in parsed_map:
-                result_dict = parsed_map
-            else:
-                anonymous_dicts.append(parsed_map)
+            if isinstance(parsed_map, (dict, AbcMapping)) and (
+                "ProductValue" in parsed_map or "CashFlows" in parsed_map
+            ):
+                result_dict = dict(parsed_map)
+            elif isinstance(parsed_map, (dict, AbcMapping)):
+                anonymous_dicts.append(dict(parsed_map))
         elif ch in ("@", "&", "!") and len(val) == 41 and _SHA1_RE.fullmatch(val[1:]) is not None:
             idx += 1
             root_hash = val[1:].lower()
         elif val == "Result" and idx + 1 < n_toks and tokens[idx + 1] == ":":
             idx += 2
             res_val, idx = _parse_str_dag_at(tokens, idx, n_toks)
-            if isinstance(res_val, Mapping):
+            if isinstance(res_val, (dict, AbcMapping)):
                 result_dict = dict(res_val)
         elif len(val) == 40 and _SHA1_RE.fullmatch(val) is not None:
             node_hash = val.lower()
@@ -1736,11 +2074,14 @@ def parse_murex_autocall_dag(
                     idx += 1
                     if idx >= n_toks or tokens[idx] != ":":
                         raise ValueError("Expected COLON after 'class' in Murex DAG header")
-                    idx += 2
+                    idx += 1
+                    if idx >= n_toks or tokens[idx] in ("{", "[", ":", "}", "]"):
+                        raise ValueError("Expected class identifier after 'class:' in Murex DAG header")
+                    idx += 1
                 elif nv == ":":
                     idx += 1
             node_body, idx = _parse_str_dag_at(tokens, idx, n_toks)
-            if not isinstance(node_body, Mapping):
+            if not isinstance(node_body, (dict, AbcMapping)):
                 raise ValueError(f"Expected map body for DAG node {node_hash}")
             nodes[node_hash] = dict(node_body)
         else:
@@ -1754,10 +2095,14 @@ def parse_murex_autocall_dag(
 
     if root_hash is not None:
         if root_hash not in nodes:
-            raise KeyError(f"Root hash {root_hash!r} not found in parsed ConstantMessageMap nodes")
+            raise ValueError(f"Root hash {root_hash!r} not found in parsed ConstantMessageMap nodes")
         resolved_req_dict = _resolve_dag_node(nodes[root_hash], nodes, {root_hash})
     elif anonymous_dicts:
-        resolved_req_dict = _resolve_dag_node(anonymous_dicts[0], nodes, set())
+        root_anon = next(
+            (d for d in anonymous_dicts if "Product" in d and "Model" in d),
+            anonymous_dicts[0],
+        )
+        resolved_req_dict = _resolve_dag_node(root_anon, nodes, set())
     else:
         raise ValueError("No root request node found in Murex DAG input")
 

@@ -50,6 +50,11 @@ _MONITORING_ALL = (
     ("SC-086", "DiffBestWorst"),
     ("SC-087", "DiffBestAverage"),
     ("SC-088", "DiffAverageWorst"),
+    ("SC-132", "EquallyWeightedBasket"),
+    ("SC-133", "SecondWorstOf"),
+    ("SC-134", "ThirdWorstOf"),
+    ("SC-135", "SecondBestOf"),
+    ("SC-136", "MultiPerf"),
 )
 _ALL_8_GREEK_QUERIES = [
     "Delta",
@@ -636,9 +641,9 @@ def _build_scenario_registry() -> Dict[str, _ScenarioCase]:
     reg(_ScenarioCase("SC-044", "Market", "Negative vol -0.10 -> SMILE_ARBITRAGE",
                       req=make_synthetic_request_dict(d_assets=3, vol_level=-0.10),
                       expect_runtime_reject=True, expected_reject_substr="SMILE_ARBITRAGE"))
-    reg(_ScenarioCase("SC-045", "Market", "NaN vol -> SMILE_ARBITRAGE",
+    reg(_ScenarioCase("SC-045", "Market", "NaN vol -> schema reject",
                       req=make_synthetic_request_dict(d_assets=3, vol_level=float("nan")),
-                      expect_runtime_reject=True, expected_reject_substr="SMILE_ARBITRAGE"))
+                      expect_schema_reject=True, expected_reject_substr="finite"))
 
     vg_inv = [[0.95] * 7, [0.60] * 7, [0.35] * 7, [0.20] * 7, [0.12] * 7]
     reg(_ScenarioCase("SC-046", "Market", "Inverted vol term structure -> projected",
@@ -719,10 +724,10 @@ def _build_scenario_registry() -> Dict[str, _ScenarioCase]:
                       expect_fallback=True, expected_fb_reasons=("CORRELATION_NOT_PSD",)))
     reg(_ScenarioCase("SC-068", "Market", "Rank-1 corr rho=1.0 D=3", req=make_synthetic_request_dict(d_assets=3, corr_val=1.0)))
 
-    # Group D: SC-069 .. SC-089 (Monitoring indices)
+    # Group D: SC-069 .. SC-089 and SC-132 .. SC-136 (All 18 monitoring indices & aliases)
     for sc_id, idx_name in _MONITORING_ALL:
         d_use = 2 if ("AB" in idx_name or "BA" in idx_name or idx_name in ("Outperformance", "Spread")) else 3
-        is_std = idx_name in ("WorstOf", "BestOf", "Average", "AverageOf")
+        is_std = idx_name in ("WorstOf", "BestOf", "Average", "AverageOf", "EquallyWeightedBasket", "MultiPerf")
         reg(_ScenarioCase(
             sc_id,
             "Index",
@@ -838,7 +843,7 @@ def _build_scenario_registry() -> Dict[str, _ScenarioCase]:
     reg(_ScenarioCase("SC-130", "Schedule", "FixedRate=0.16 Thirty360", req=make_synthetic_request_dict(d_assets=3, fixed_cpn_amt=None, fixed_rate=0.16, dcc="Thirty360")))
     reg(_ScenarioCase("SC-131", "Exotic", "List-valued FixedRate", req=make_synthetic_request_dict(d_assets=3, fixed_cpn_amt=None, fixed_rate=[0.08, 0.10, 0.12, 0.16])))
 
-    assert len(cases) == 131
+    assert len(cases) == 136
     return cases
 
 
@@ -871,7 +876,7 @@ def _assert_already_ko(state: AutocallPreprocState, pv: float, *, zero_pv: bool)
 
 
 _SCENARIO_CASES = _build_scenario_registry()
-_ALL_SC_IDS = [f"SC-{i:03d}" for i in range(1, 132)]
+_ALL_SC_IDS = [f"SC-{i:03d}" for i in range(1, 137)]
 
 
 @pytest.fixture(scope="module")
@@ -946,12 +951,36 @@ def test_extreme_scenario_matrix(sc_id: str, autocall_runtime: Any) -> None:
 
     rt_res = None
     if autocall_runtime is not None and hasattr(autocall_runtime, "price_trade"):
-        want_auto_greeks = sc_id in ("SC-001", "SC-016", "SC-019", "SC-027", "SC-080")
+        want_auto_greeks = sc_id in (
+            "SC-001",
+            "SC-006",
+            "SC-007",
+            "SC-016",
+            "SC-019",
+            "SC-025",
+            "SC-027",
+            "SC-080",
+            "SC-133",
+            "SC-134",
+            "SC-135",
+        )
         rt_res = autocall_runtime.price_trade(req_model, engine="auto", include_all_greeks=want_auto_greeks)
         grk_res = rt_res
         if not want_auto_greeks and state.d_assets <= 8 and state.m_rem <= 48:
             grk_res = autocall_runtime.price_trade(req_model, engine="surrogate", include_all_greeks=True)
         for check_res in (rt_res, grk_res):
+            if check_res is rt_res and want_auto_greeks and state.m_rem > 0:
+                for g_field in (
+                    "Delta",
+                    "Gamma",
+                    "MultivariateAggregatedCashGamma",
+                    "Vega",
+                    "Rho",
+                    "DividendsSensitivities",
+                    "Theta",
+                    "Cega",
+                ):
+                    assert getattr(check_res, g_field) is not None, f"{sc_id}: missing {g_field}"
             _assert_all_finite(
                 {
                     "pv": check_res.ProductValue,

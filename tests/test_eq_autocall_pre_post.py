@@ -947,9 +947,9 @@ def test_m1_escrowed_dividend_helpers_lazy_jacobian_and_state_aliases(
     assert ppp_mod._build_correlation_matrix(["A"], None, torch.device("cpu")).shape == (1, 1)
     assert ppp_mod._build_correlation_matrix(["A", "B"], torch.eye(2), torch.device("cpu")).shape == (2, 2)
     assert ppp_mod._build_correlation_matrix(["A", "B"], [[1.0, 0.2], [0.2, 1.0]], torch.device("cpu")).shape == (2, 2)
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError):
         ppp_mod._build_correlation_matrix(["A", "B"], None, torch.device("cpu"))
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError):
         ppp_mod._build_correlation_matrix(["A", "B"], {}, torch.device("cpu"))
 
     req_fund = copy.deepcopy(req_orig)
@@ -997,6 +997,179 @@ def test_m1_escrowed_dividend_helpers_lazy_jacobian_and_state_aliases(
     assert ppp_mod._lookup_funding_fixing(fix_list, as_of_c) == pytest.approx(0.08)
     assert ppp_mod._lookup_funding_fixing(fix_list, as_of_c + datetime.timedelta(days=1)) == pytest.approx(0.09)
     assert ppp_mod._extract_funding_fixings({"RATE_X": {}}, "RATE_X") == ()
+
+
+def test_pre_post_audit_blind_spots(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    import math
+    from deepvol.models.autocall import escrowed_dividend as ed
+    from deepvol.models.autocall.pre_post_processor import build_vol_surface_cache_key
+    from deepvol.models.autocall.seasoned_collapser import collapse_seasoned_schedule
+
+    req_orig, _ = parsed_dag
+
+    # In-Transit FundingLeg across m_rem > 0, m_rem == 0, and already_autocalled=True.
+    for make_m0, trigger_ko in ((False, False), (True, False), (False, True)):
+        req_no_fl = copy.deepcopy(req_orig)
+        as_of_fl = req_no_fl.Model.MarketDataSet.AsOfDate
+        # Shift Period 11 payment slightly after AsOfDate so Period 11 is strictly In-Transit.
+        req_no_fl.Product.PaymentDates[-2] = as_of_fl + datetime.timedelta(days=10)
+        if make_m0:
+            req_no_fl.Product.ObservationDates[-1] = as_of_fl - datetime.timedelta(days=1)
+            for tkr, ref_s in zip(
+                req_no_fl.Product.UnderlyingIdentifiers, req_no_fl.Product.UnderlyingReferenceSpots
+            ):
+                req_no_fl.Model.MarketDataSet.Fixings[tkr].Dates.append(req_no_fl.Product.ObservationDates[-1])
+                req_no_fl.Model.MarketDataSet.Fixings[tkr].Values.append(float(ref_s) * 0.85)
+        if trigger_ko:
+            for tkr, ref_s in zip(
+                req_no_fl.Product.UnderlyingIdentifiers, req_no_fl.Product.UnderlyingReferenceSpots
+            ):
+                req_no_fl.Model.MarketDataSet.Fixings[tkr].Values[-1] = float(ref_s) * 1.40
+        req_fl = copy.deepcopy(req_no_fl)
+        req_fl.Product.RateIdentifier = "RUB_RUONIA_OIS"
+        req_fl.Product.FundingSpread = 0.02
+        req_fl.Product.FundingLegPaymentDates = list(req_fl.Product.PaymentDates)
+
+        st_no_fl = preprocess_eq_autocall(req_no_fl)
+        st_fl = preprocess_eq_autocall(req_fl)
+        asm_fl = assemble_autocall_cashflows_and_pv(st_fl)
+        fund_rows = [
+            row
+            for row in asm_fl.cashflows
+            if row.Description == "FundingLeg" and abs(float(row.Amount)) > 0.0
+        ]
+        assert len(fund_rows) >= 1
+        assert any(float(row.Amount) < 0.0 for row in fund_rows)
+        assert st_fl.pv_in_transit < st_no_fl.pv_in_transit - 1e-4
+        assert math.isfinite(float(asm_fl.product_value.item()))
+
+    # obs_date == val_date: present same-day fixing overrides spots_t0; missing fixing falls back to spots_t0.
+    val_dt = datetime.datetime(2026, 6, 1, 0, 0, tzinfo=datetime.timezone.utc)
+    cs_same_hit = collapse_seasoned_schedule(
+        as_of_date=val_dt,
+        start_date=val_dt - datetime.timedelta(days=60),
+        observation_dates=[val_dt, val_dt + datetime.timedelta(days=30)],
+        payment_dates=[val_dt + datetime.timedelta(days=3), val_dt + datetime.timedelta(days=33)],
+        underlying_identifiers=["A"],
+        underlying_reference_spots=[100.0],
+        spots_t0=[90.0],
+        ko_barriers=[1.10, 500.0],
+        cpn_barriers=[0.75, 0.75],
+        fixed_coupon_amount=0.05,
+        fixings={"A": {val_dt.date().isoformat(): 120.0}},
+    )
+    assert cs_same_hit.already_autocalled is True
+
+    cs_same_miss = collapse_seasoned_schedule(
+        as_of_date=val_dt,
+        start_date=val_dt - datetime.timedelta(days=60),
+        observation_dates=[val_dt, val_dt + datetime.timedelta(days=30)],
+        payment_dates=[val_dt + datetime.timedelta(days=3), val_dt + datetime.timedelta(days=33)],
+        underlying_identifiers=["A"],
+        underlying_reference_spots=[100.0],
+        spots_t0=[90.0],
+        ko_barriers=[1.10, 500.0],
+        cpn_barriers=[0.75, 0.75],
+        fixed_coupon_amount=0.05,
+        fixings={},
+    )
+    assert cs_same_miss.already_autocalled is False and len(cs_same_miss.future_indices) == 1
+
+    # Canonical 5-tier currency resolution edges.
+    assert ed._infer_asset_currency("SBER_ETF", default_ccy="RUB") == "RUB"
+    assert ed._infer_asset_currency("SBER_ETF", default_ccy="USD") == "USD"
+    assert ed._infer_asset_currency("AAPL_US", default_ccy="RUB") == "RUB"
+    assert ed._infer_asset_currency("AAPL_US", default_ccy="RUB", rate_curve_ids=("USD_SOFR",)) == "USD"
+    assert ed._infer_asset_currency("AAPL_US", default_ccy="RUB", fx_smiles={"USDRUB": None}) == "USD"
+    assert ed._infer_asset_currency("MUSD", default_ccy="RUB") == "RUB"
+
+    # Surface digest and vol cache key must depend on Deltas and DayCountConvention.
+    fx_s1 = {
+        "Identifier": "USD/RUB",
+        "TypeName": "FXVolatilitySmileCollection",
+        "DayCountConvention": "Act365",
+        "Deltas": ["-25D", "ATM", "+25D"],
+        "Tenors": ["1M"],
+        "VolatilityQuotes": [[0.20, 0.21, 0.22]],
+    }
+    from deepvol.api.schemas_eq_autocall import DayCountConventionEnum
+    fx_s2 = {**fx_s1, "Deltas": ["-10D", "ATM", "+10D"]}
+    eq_s1 = copy.deepcopy(req_orig.Model.MarketDataSet.VolatilitySurfaces[req_orig.Product.UnderlyingIdentifiers[0]])
+    eq_s2 = eq_s1.model_copy(update={"DayCountConvention": DayCountConventionEnum.Act360})
+    assert build_vol_surface_cache_key(fx_s1, val_dt) != build_vol_surface_cache_key(fx_s2, val_dt)
+    assert build_vol_surface_cache_key(eq_s1, val_dt) != build_vol_surface_cache_key(eq_s2, val_dt)
+
+    # Bus252 v_perf scales with surface Bus252 clock sqrt(tau_surf) instead of Act365 sqrt(tau_obs).
+    from deepvol.market.eq_curves import year_fractions
+
+    req_bus = copy.deepcopy(req_orig)
+    t0_tkr = req_bus.Product.UnderlyingIdentifiers[0]
+    req_bus.Model.MarketDataSet.VolatilitySurfaces[t0_tkr].DayCountConvention = DayCountConventionEnum.Business252
+    st_act = preprocess_eq_autocall(req_orig)
+    st_bus = preprocess_eq_autocall(req_bus)
+    idx_bus = st_bus.sorted_identifiers.index(t0_tkr)
+    tau_bus = year_fractions(
+        req_bus.Model.MarketDataSet.AsOfDate,
+        st_bus.seasoned_state.future_obs_dates,
+        "Business252",
+    )
+    expected_v_perf_bus = st_bus.iv_at_fwd[idx_bus].detach().numpy() * np.sqrt(np.maximum(tau_bus, 1e-12))
+    np.testing.assert_allclose(st_bus.v_perf[idx_bus].detach().numpy(), expected_v_perf_bus, atol=1e-12)
+    assert abs(float(st_bus.v_perf[idx_bus, 0]) - float(st_act.v_perf[idx_bus, 0])) > 1e-3
+    assert st_act.state_digest != st_bus.state_digest and len(st_bus.state_digest) == 64
+
+    # Out / Down / Diff* zero coupon barrier must not become guaranteed coupon.
+    norm_out = normalize_sentinel_barriers(
+        [1.0, 500.0],
+        [0.0, 0.0],
+        coupon_barrier_type="Out",
+        coupon_barrier_direction="Down",
+    )
+    assert float(norm_out.is_guaranteed_cpn.sum()) == 0.0
+
+    # dividend_amount_overrides length mismatch must raise ValueError.
+    with pytest.raises(ValueError):
+        ed.compute_escrowed_dividend_forwards(
+            identifiers=["SBER_RUB"],
+            as_of_date=val_dt,
+            observation_dates=[val_dt + datetime.timedelta(days=180)],
+            spots_t0=[100.0],
+            ref_spots=[100.0],
+            discount_curve=next(iter(req_orig.Model.MarketDataSet.RatesCurvesBundles.values())),
+            market_dividends={
+                "SBER_RUB": [
+                    {"ExDate": val_dt + datetime.timedelta(days=30), "Amount": 2.0},
+                    {"ExDate": val_dt + datetime.timedelta(days=60), "Amount": 3.0},
+                ]
+            },
+            dividend_amount_overrides={"SBER_RUB": torch.tensor([1.0], dtype=torch.float64)},
+            payment_currency="RUB",
+        )
+
+    # Scalar custom curve with m_rem=2 and future dividends.
+    class _ScalarCurve2M:
+        DayCountConvention = "Act365"
+
+        def rate(self, _dt: Any) -> float:
+            return 0.06
+
+        def df(self, _dt: Any) -> float:
+            return 0.97
+
+    ed_2m = ed.compute_escrowed_dividend_forwards(
+        identifiers=["SBER_RUB"],
+        as_of_date=val_dt,
+        observation_dates=[val_dt + datetime.timedelta(days=90), val_dt + datetime.timedelta(days=180)],
+        spots_t0=[100.0],
+        ref_spots=[100.0],
+        discount_curve=_ScalarCurve2M(),
+        market_dividends={"SBER_RUB": [{"ExDate": val_dt + datetime.timedelta(days=45), "Amount": 2.0}]},
+        payment_currency="RUB",
+    )
+    assert ed_2m.forward_perf.shape == (1, 2) and torch.isfinite(ed_2m.forward_perf).all()
+
 
 
 

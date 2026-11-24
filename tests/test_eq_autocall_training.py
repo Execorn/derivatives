@@ -296,13 +296,20 @@ def test_G1_5_checkpoint_out_of_sample_mae_and_trainer_roundtrip(tmp_path: Path)
         device=dev_str,
         tau_desk_bps=60.0,
     )
-    assert float(recal_out["conformal_coverage"]) >= 0.0
+    assert float(recal_out["conformal_coverage"]) > 0.50
+    assert float(recal_out["conformal_coverage"]) <= 1.0
     assert "stats_payload" in recal_out
 
     raw_state_path = tmp_path / "raw_state.pt"
     torch.save(model.state_dict(), raw_state_path)
     loaded_raw, raw_metrics = load_eq_autocall_surrogate(raw_state_path, device="cpu")
     assert loaded_raw.d_max == model.d_max and raw_metrics == {}
+
+    # Saved state dict with config=None loads cleanly without AttributeError.
+    none_cfg_path = tmp_path / "none_cfg_ckpt.pt"
+    torch.save({"config": None, "state_dict": model.state_dict()}, none_cfg_path)
+    loaded_nc, nc_metrics = load_eq_autocall_surrogate(none_cfg_path, device="cpu")
+    assert loaded_nc.d_max == model.d_max and nc_metrics == {}
 
     with mock.patch.object(
         sys,
@@ -367,5 +374,59 @@ def test_G1_5_checkpoint_out_of_sample_mae_and_trainer_roundtrip(tmp_path: Path)
     ):
         train_main()
     assert tmp_cli_ckpt.exists() and tmp_cli_stats.exists()
+
+
+def test_training_and_sobol_audit_blind_spots(tmp_path: Path) -> None:
+    import numpy as np
+    from deepvol.calibration.autocall_sobol_generator import _SSVI_STRIKES, _SSVI_TENORS
+    from deepvol.models.autocall.feature_layout import AutocallNodeCol, AutocallSchedCol
+    from deepvol.mrm.eq_autocall_guardian import EQAutocallModelGuardian
+    from deepvol.training.train_eq_autocall import calibrate_guardian_stats
+
+    # Sobol carry/leverage/tau consistency and p_proxy_ko_bumped <= p_proxy across domain modes.
+    for dm in ("tier2_desk", "full_stress"):
+        batch = generate_synthetic_autocall_batch(
+            batch_size=32, d_max=8, m_max=48, m_rem_max=12, n_mc_paths=64, n_substeps=2, seed=31415, domain_mode=dm
+        )
+        assert torch.all(
+            torch.cumsum(batch.p_proxy_ko_bumped, dim=1) <= torch.cumsum(batch.p_proxy, dim=1) + 1e-6
+        )
+        assert torch.all(batch.p_proxy_ko_bumped[:, 0] <= batch.p_proxy[:, 0] + 1e-6)
+        assert torch.isfinite(batch.pv_mc).all() and torch.isfinite(batch.delta_mc).all()
+        assert torch.isfinite(batch.node_feats).all()
+
+        act_m = batch.sched_mask > 0.5
+        act_n = batch.asset_mask > 0.5
+        assert torch.isfinite(batch.node_feats[:, :, int(AutocallNodeCol.LOG_FWD_CARRY_1Y)][act_n]).all()
+        assert torch.isfinite(batch.sched_feats[:, :, int(AutocallSchedCol.DF_PAY)][act_m]).all()
+        assert torch.all(batch.node_feats[:, :, int(AutocallNodeCol.CASH_DIV_LEVERAGE)][act_n] >= 0.0)
+        tau_obs = batch.sched_feats[:, :, int(AutocallSchedCol.TAU_OBS)][act_m]
+        assert torch.all(tau_obs > 0.0)
+
+    assert len(_SSVI_TENORS) > 0 and len(_SSVI_STRIKES) > 0
+
+    # calibrate_guardian_stats n_cal >= 2048 coverage, Mondrian table without d0<=d1 clamp, and OAS parity.
+    base_32 = generate_synthetic_autocall_batch(
+        batch_size=32, d_max=8, m_max=48, m_rem_max=12, n_mc_paths=64, n_substeps=2, seed=909
+    )
+    idx_2048 = torch.arange(2048, dtype=torch.long) % 32
+    cal_2048 = base_32.index_select(idx_2048)
+    cal_2048.pv_mc = cal_2048.pv_mc + 0.002 * torch.randn(2048, dtype=torch.float64)
+    model = MaskedEQAutocallSurrogate(d_max=8, m_max=48, d_model=32, n_egno_layers=1, n_sched_layers=1).eval()
+    stats_path = tmp_path / "stats_2048.pt"
+    payload = calibrate_guardian_stats(
+        model,
+        base_32,
+        cal_2048,
+        device=torch.device("cpu"),
+        stats_path=stats_path,
+    )
+    assert int(payload["n_cal"]) == 2048
+    assert bool(payload.get("oas_standardized", False)) is True
+    guardian = EQAutocallModelGuardian(d_max=8, m_max=48, stats_path=stats_path)
+    np.testing.assert_allclose(
+        guardian.ref_cov_inv_16d, payload["ref_cov_inv_16d"].numpy(), rtol=1e-12, atol=1e-12
+    )
+
 
 

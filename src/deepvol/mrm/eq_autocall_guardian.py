@@ -16,7 +16,9 @@ in strict IEEE-754 double precision (`np.float64` / `torch.float64`):
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
+from collections.abc import Iterable, Mapping, Sequence
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
@@ -24,8 +26,9 @@ import hashlib
 import logging
 import math
 from pathlib import Path
+import struct
 import threading
-from typing import Any, Literal, Sequence
+from typing import Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -73,7 +76,14 @@ DEFAULT_GUARDIAN_STATS_PATH: Path = (
 )
 
 SUPPORTED_TIER2_INDICES: frozenset[str] = frozenset(
-    {"WorstOf", "BestOf", "Average", "AverageOf"}
+    {
+        "WorstOf",
+        "BestOf",
+        "Average",
+        "AverageOf",
+        "EquallyWeightedBasket",
+        "MultiPerf",
+    }
 )
 
 CHI2_16_0999: float = 39.25
@@ -305,6 +315,207 @@ class GuardianPricingResult:
         }
 
 
+_PSD_CORR_CACHE_LOCK = threading.RLock()
+_PSD_CORR_CACHE: OrderedDict[
+    tuple[int, bytes, float],
+    tuple[npt.NDArray[np.float64], float, float, bool],
+] = OrderedDict()
+_PSD_CORR_CACHE_MAXSIZE: int = 512
+
+_SHRUNK_BASELINE_CACHE_LOCK = threading.RLock()
+_SHRUNK_BASELINE_CACHE: OrderedDict[tuple[bytes, bytes, str], AutocallBaselineOutput] = OrderedDict()
+_SHRUNK_BASELINE_CACHE_MAXSIZE: int = 256
+
+
+def _as_f64_np(t: torch.Tensor) -> npt.NDArray[np.float64]:
+    arr = t.detach().numpy() if t.device.type == "cpu" else t.detach().cpu().numpy()
+    return np.asarray(arr, dtype=np.float64)
+
+
+def _tensor_to_c_bytes(t: torch.Tensor) -> memoryview:
+    arr_t = t.detach() if t.requires_grad else t
+    if arr_t.device.type != "cpu":
+        arr_t = arr_t.cpu()
+    if arr_t.dtype == torch.bfloat16:
+        arr_t = arr_t.contiguous().view(torch.int16)
+    arr = arr_t.numpy()
+    if not arr.flags.c_contiguous:
+        arr = np.ascontiguousarray(arr)
+    return arr.data
+
+
+def _feed_fp_value(h: Any, val: Any) -> tuple[Any, ...]:
+    if isinstance(val, torch.Tensor):
+        ver = -1 if val.is_inference() else int(val._version)
+        h.update(_tensor_to_c_bytes(val))
+        return tuple(val.shape), val.dtype, ver
+    if isinstance(val, np.ndarray):
+        arr = val if val.flags.c_contiguous else np.ascontiguousarray(val)
+        h.update(arr.data)
+        return val.shape, val.dtype
+    return (id(val),)
+
+
+def _tensor_sig(t: Any) -> tuple[Any, ...]:
+    if isinstance(t, torch.Tensor):
+        ver = -1 if t.is_inference() else int(t._version)
+        digest = hashlib.blake2b(_tensor_to_c_bytes(t), digest_size=8).digest()
+        return tuple(t.shape), str(t.dtype), ver, digest
+    if isinstance(t, np.ndarray):
+        arr = t if t.flags.c_contiguous else np.ascontiguousarray(t)
+        digest = hashlib.blake2b(arr.data, digest_size=8).digest()
+        return tuple(t.shape), str(t.dtype), digest
+    return id(t), -1
+
+
+def _freeze_fp_val(val: Any) -> Any:
+    if isinstance(val, (torch.Tensor, np.ndarray)):
+        return _tensor_sig(val)
+    if isinstance(val, (list, tuple)):
+        return tuple(_freeze_fp_val(x) for x in val)
+    if isinstance(val, Mapping):
+        return tuple((str(k), _freeze_fp_val(v)) for k, v in val.items())
+    return val
+
+
+def _resolve_baseline_out(
+    preproc_state: AutocallPreprocState,
+    baseline_out: AutocallBaselineOutput | None = None,
+    *,
+    warn_sink: list[str] | None = None,
+) -> AutocallBaselineOutput | None:
+    if baseline_out is not None:
+        return baseline_out
+    if preproc_state.baseline is not None:
+        return preproc_state.baseline
+    try:
+        spots = preproc_state.spots_t0
+        corr = preproc_state.corr_matrix
+        if (
+            isinstance(spots, torch.Tensor)
+            and isinstance(corr, torch.Tensor)
+            and torch.isfinite(spots).all()
+            and torch.isfinite(corr).all()
+            and torch.isfinite(preproc_state.sched_feats).all()
+        ):
+            return compute_analytical_autocall_baseline(preproc_state)
+    except Exception as exc:
+        msg = f"BASELINE_RESOLUTION_FAILED: {type(exc).__name__}: {exc}"
+        logger.warning(msg)
+        if warn_sink is not None and msg not in warn_sink:
+            warn_sink.append(msg)
+        return None
+    return None
+
+
+def _surface_exceeds_quote_ratio(surf_i: Any, f_i: float) -> bool:
+    strikes = getattr(surf_i, "strikes", None)
+    quotes = getattr(surf_i, "quotes", None)
+    if not isinstance(strikes, np.ndarray) or not isinstance(quotes, np.ndarray):
+        return False
+    if strikes.size == 0 or quotes.size == 0:
+        return False
+
+    bounds = getattr(surf_i, "_guardian_quote_bounds", None)
+    immutable = (not strikes.flags.writeable) and (not quotes.flags.writeable)
+    if bounds is not None and immutable:
+        k_min, k_max, q_min, q_max, is_sorted = bounds
+    else:
+        k_min = float(np.min(strikes))
+        k_max = float(np.max(strikes))
+        q_min = float(np.min(quotes))
+        q_max = float(np.max(quotes))
+        is_sorted = bool(strikes.ndim == 1 and (strikes.size <= 1 or np.all(strikes[:-1] <= strikes[1:])))
+        if immutable:
+            try:
+                setattr(surf_i, "_guardian_quote_bounds", (k_min, k_max, q_min, q_max, is_sorted))
+            except AttributeError:
+                pass
+
+    lo = 0.4 * f_i
+    hi = 2.0 * f_i
+    if k_max < lo or k_min > hi:
+        return False
+    # Global quote ratio <= 5 guarantees every strike subset satisfies the bound.
+    if q_max / max(q_min, 1e-12) <= 5.0:
+        return False
+
+    if is_sorted and strikes.ndim == 1:
+        i0 = int(np.searchsorted(strikes, lo, side="left"))
+        i1 = int(np.searchsorted(strikes, hi, side="right"))
+        if i1 <= i0:
+            return False
+        q_act = quotes[:, i0:i1]
+    else:
+        k_mask = (strikes >= lo) & (strikes <= hi)
+        if not np.any(k_mask):
+            return False
+        q_act = quotes[:, k_mask]
+    return (float(np.max(q_act)) / max(float(np.min(q_act)), 1e-12)) > 5.0
+
+
+def _compute_preproc_state_digest(preproc_state: AutocallPreprocState) -> str:
+    h = hashlib.sha256()
+    for name in (
+        "spots_t0",
+        "ref_spots",
+        "moneyness_t0",
+        "corr_matrix",
+        "node_feats",
+        "edge_feats",
+        "sched_feats",
+        "global_feats",
+        "tau_obs",
+        "df_pay",
+        "tau_pay",
+        "ko_barriers",
+        "is_callable",
+        "cpn_barriers",
+        "is_guaranteed_cpn",
+        "coupon_amounts",
+    ):
+        val = getattr(preproc_state, name, None)
+        if isinstance(val, torch.Tensor):
+            h.update(_as_f64_np(val).tobytes())
+    b_out = getattr(preproc_state, "baseline", None)
+    if b_out is not None and isinstance(b_out.product_value_proxy, torch.Tensor):
+        h.update(_as_f64_np(b_out.product_value_proxy).tobytes())
+    h.update(
+        struct.pack(
+            "!iiddddd",
+            int(preproc_state.d_assets),
+            int(preproc_state.m_rem),
+            float(preproc_state.strike),
+            float(preproc_state.option_gearing),
+            float(preproc_state.c_mem_0),
+            float(preproc_state.ko_spread),
+            float(preproc_state.one_star_coupon),
+        )
+    )
+    return h.hexdigest()
+
+
+def _extract_vec_m(val: Any, m_rem: int) -> npt.NDArray[np.float64]:
+    raw = _as_f64_np(val) if isinstance(val, torch.Tensor) else np.asarray(val, dtype=np.float64)
+    if raw.ndim >= 2:
+        raw = raw[0]
+    return raw.reshape(-1)[:m_rem]
+
+
+def _extract_scalar(val: Any) -> float | None:
+    if val is None:
+        return None
+    raw = _as_f64_np(val) if isinstance(val, torch.Tensor) else np.asarray(val, dtype=np.float64)
+    if raw.size == 0:
+        return float("nan")
+    return float(raw.reshape(-1)[0])
+
+
+def _first_non_none(mapping: Mapping[str, Any], primary: str, fallback: str) -> Any:
+    val = mapping.get(primary)
+    return val if val is not None else mapping.get(fallback)
+
+
 def project_correlation_to_psd(
     corr: npt.NDArray[np.float64] | torch.Tensor | Sequence[Sequence[float]],
     *,
@@ -318,82 +529,109 @@ def project_correlation_to_psd(
         min_eig_shrunk: Minimum eigenvalue of the returned R_PSD matrix.
         shrunk_applied: True if asymmetry, diagonal deviation, or non-PSD projection occurred.
     """
+    eps_f = float(eps_psd)
+    if not math.isfinite(eps_f) or eps_f <= 0.0 or eps_f > 1.0:
+        raise ValueError(f"eps_psd must be finite in (0, 1], got {eps_psd}.")
     if isinstance(corr, torch.Tensor):
-        r_in = corr.detach().cpu().numpy().astype(np.float64, copy=True)
+        r_view = _as_f64_np(corr)
     else:
-        r_in = np.asarray(corr, dtype=np.float64).copy()
+        r_view = np.asarray(corr, dtype=np.float64)
 
-    if r_in.ndim != 2 or r_in.shape[0] != r_in.shape[1]:
-        raise ValueError(f"Expected square 2D correlation matrix, got shape {r_in.shape}.")
+    if r_view.ndim != 2 or r_view.shape[0] != r_view.shape[1]:
+        raise ValueError(f"Expected square 2D correlation matrix, got shape {r_view.shape}.")
 
-    d = r_in.shape[0]
+    d = r_view.shape[0]
     if d == 0:
         return np.zeros((0, 0), dtype=np.float64), 1.0, 1.0, False
+
+    r_c = np.ascontiguousarray(r_view, dtype=np.float64)
+    cache_key = (d, r_c.tobytes(), eps_f)
+    with _PSD_CORR_CACHE_LOCK:
+        cached = _PSD_CORR_CACHE.get(cache_key)
+        if cached is not None:
+            _PSD_CORR_CACHE.move_to_end(cache_key)
+            r_cached, eig_raw_c, eig_shrunk_c, shrunk_c = cached
+            return r_cached.copy(), eig_raw_c, eig_shrunk_c, shrunk_c
+
+    r_in = r_c.copy()
     if d == 1:
         raw_val = float(r_in[0, 0]) if np.isfinite(r_in[0, 0]) else -1.0
         shrunk = abs(raw_val - 1.0) > 1e-12
-        return np.ones((1, 1), dtype=np.float64), raw_val, 1.0, shrunk
-
-    has_non_finite = not bool(np.all(np.isfinite(r_in)))
-    if has_non_finite:
-        r_clean = np.where(np.isfinite(r_in), r_in, 0.0)
-        np.fill_diagonal(r_clean, 1.0)
-        has_asymmetry = float(np.max(np.abs(r_clean - r_clean.T))) > 1e-10
-        r_sym = 0.5 * (r_clean + r_clean.T)
-        min_eig_raw = -1.0
+        r_out = np.ones((1, 1), dtype=np.float64)
+        min_eig_raw = raw_val
+        min_eig_shrunk = 1.0
     else:
-        has_asymmetry = float(np.max(np.abs(r_in - r_in.T))) > 1e-10
-        r_sym = 0.5 * (r_in + r_in.T)
-        eigvals_raw = np.linalg.eigvalsh(r_sym)
-        min_eig_raw = float(np.min(eigvals_raw))
+        has_non_finite = not bool(np.all(np.isfinite(r_in)))
+        if has_non_finite:
+            r_clean = np.where(np.isfinite(r_in), r_in, 0.0)
+            np.fill_diagonal(r_clean, 1.0)
+            r_sym = 0.5 * (r_clean + r_clean.T)
+            min_eig_raw = -1.0
+            has_asymmetry = True
+        else:
+            has_asymmetry = float(np.max(np.abs(r_in - r_in.T))) > 1e-10
+            r_sym = 0.5 * (r_in + r_in.T)
+            eigvals_raw = np.linalg.eigvalsh(r_sym)
+            min_eig_raw = float(np.min(eigvals_raw))
 
-    diag_dev = float(np.max(np.abs(np.diag(r_sym) - 1.0)))
-    off_mask = ~np.eye(d, dtype=bool)
-    max_off = float(np.max(np.abs(r_sym[off_mask]))) if np.any(off_mask) else 0.0
+        diag_dev = float(np.max(np.abs(np.diag(r_sym) - 1.0)))
+        off_mask = ~np.eye(d, dtype=bool)
+        max_off = float(np.max(np.abs(r_sym[off_mask]))) if np.any(off_mask) else 0.0
 
-    if (
-        not has_non_finite
-        and not has_asymmetry
-        and min_eig_raw >= eps_psd
-        and diag_dev <= 1e-10
-        and max_off <= 1.0 - 1e-12
-    ):
-        np.fill_diagonal(r_sym, 1.0)
-        return r_sym, min_eig_raw, min_eig_raw, False
+        if (
+            not has_non_finite
+            and not has_asymmetry
+            and min_eig_raw >= eps_f
+            and diag_dev <= 1e-10
+            and max_off <= 1.0 - 1e-12
+        ):
+            np.fill_diagonal(r_sym, 1.0)
+            r_out = r_sym
+            min_eig_shrunk = min_eig_raw
+            shrunk = False
+        else:
+            # Dykstra-Higham (2002) alternating projections onto {S >= eps_psd * I} \cap {diag(S) = 1}
+            y = r_sym.copy()
+            np.fill_diagonal(y, 1.0)
+            d_s = np.zeros_like(y)
+            for _ in range(50):
+                r_k = y - d_s
+                eigvals, eigvecs = np.linalg.eigh(0.5 * (r_k + r_k.T))
+                eigvals_clipped = np.maximum(eigvals, eps_f)
+                x_k = (eigvecs * eigvals_clipped[None, :]) @ eigvecs.T
+                x_k = 0.5 * (x_k + x_k.T)
+                d_s = x_k - r_k
+                y_next = x_k.copy()
+                np.fill_diagonal(y_next, 1.0)
+                step_diff = float(np.max(np.abs(y_next - y)))
+                y = y_next
+                if step_diff <= 1e-12:
+                    if float(np.min(np.linalg.eigvalsh(y))) >= eps_f - 1e-12:
+                        break
 
-    # Dykstra-Higham (2002) alternating projections onto {S >= eps_psd * I} \cap {diag(S) = 1}
-    y = r_sym.copy()
-    np.fill_diagonal(y, 1.0)
-    d_s = np.zeros_like(y)
-    for _ in range(50):
-        r_k = y - d_s
-        eigvals, eigvecs = np.linalg.eigh(0.5 * (r_k + r_k.T))
-        eigvals_clipped = np.maximum(eigvals, eps_psd)
-        x_k = (eigvecs * eigvals_clipped[None, :]) @ eigvecs.T
-        x_k = 0.5 * (x_k + x_k.T)
-        d_s = x_k - r_k
-        y_next = x_k.copy()
-        np.fill_diagonal(y_next, 1.0)
-        step_diff = float(np.max(np.abs(y_next - y)))
-        y = y_next
-        if step_diff <= 1e-12:
-            if float(np.min(np.linalg.eigvalsh(y))) >= eps_psd - 1e-12:
-                break
+            y = 0.5 * (y + y.T)
+            np.fill_diagonal(y, 1.0)
+            min_eig_shrunk = float(np.min(np.linalg.eigvalsh(y)))
+            if min_eig_shrunk < eps_f:
+                alpha_fix = min(
+                    max((eps_f - min_eig_shrunk + 1e-12) / max(1.0 - min_eig_shrunk, 1e-12), 0.0),
+                    1.0,
+                )
+                y = (1.0 - alpha_fix) * y + alpha_fix * np.eye(d, dtype=np.float64)
+                y = 0.5 * (y + y.T)
+                np.fill_diagonal(y, 1.0)
+                min_eig_shrunk = float(np.min(np.linalg.eigvalsh(y)))
+            r_out = y
+            shrunk = True
 
-    y = 0.5 * (y + y.T)
-    np.fill_diagonal(y, 1.0)
-    min_eig_shrunk = float(np.min(np.linalg.eigvalsh(y)))
-    if min_eig_shrunk < eps_psd:
-        alpha_fix = min(
-            max((eps_psd - min_eig_shrunk + 1e-12) / max(1.0 - min_eig_shrunk, 1e-12), 0.0),
-            1.0,
-        )
-        y = (1.0 - alpha_fix) * y + alpha_fix * np.eye(d, dtype=np.float64)
-        y = 0.5 * (y + y.T)
-        np.fill_diagonal(y, 1.0)
-        min_eig_shrunk = float(np.min(np.linalg.eigvalsh(y)))
-
-    return y, min_eig_raw, min_eig_shrunk, True
+    r_ro = r_out.copy()
+    r_ro.setflags(write=False)
+    with _PSD_CORR_CACHE_LOCK:
+        _PSD_CORR_CACHE[cache_key] = (r_ro, min_eig_raw, min_eig_shrunk, shrunk)
+        _PSD_CORR_CACHE.move_to_end(cache_key)
+        while len(_PSD_CORR_CACHE) > _PSD_CORR_CACHE_MAXSIZE:
+            _PSD_CORR_CACHE.popitem(last=False)
+    return r_out, min_eig_raw, min_eig_shrunk, shrunk
 
 
 def extract_16d_basket_summary(
@@ -422,20 +660,18 @@ def extract_16d_basket_summary(
     """
     d = int(preproc_state.d_assets)
     m_rem = int(preproc_state.m_rem)
-    b_out = baseline_out if baseline_out is not None else preproc_state.baseline
+    b_out = _resolve_baseline_out(preproc_state, baseline_out)
 
     x = np.zeros(16, dtype=np.float64)
 
     if d > 0:
-        m0_np = preproc_state.moneyness_t0.detach().cpu().numpy().astype(np.float64)
-        log_m0 = np.log(np.maximum(m0_np, 1e-12))
+        m0_np = _as_f64_np(preproc_state.moneyness_t0)[:d]
+        log_m0 = np.log(np.maximum(m0_np, 1e-12)) if m0_np.size > 0 else np.zeros(1, dtype=np.float64)
         x[AutocallSummaryCol.MEAN_LOG_MONEYNESS] = float(np.mean(log_m0))
         x[AutocallSummaryCol.MIN_LOG_MONEYNESS] = float(np.min(log_m0))
         x[AutocallSummaryCol.MAX_LOG_MONEYNESS] = float(np.max(log_m0))
 
-        node_np = (
-            preproc_state.node_feats[0, :d, :].detach().cpu().numpy().astype(np.float64)
-        )
+        node_np = _as_f64_np(preproc_state.node_feats)[0, :d, :]
         iv_short = node_np[:, int(AutocallNodeCol.IV_SHORT_ATM)]
         iv_term = node_np[:, int(AutocallNodeCol.IV_TERM_ATM)]
         x[AutocallSummaryCol.MEAN_ATM_VOL] = float(np.mean(iv_term))
@@ -446,9 +682,10 @@ def extract_16d_basket_summary(
     else:
         log_m0 = np.zeros(1, dtype=np.float64)
 
-    corr_np = preproc_state.corr_matrix.detach().cpu().numpy().astype(np.float64)
-    if d >= 2 and corr_np.shape == (d, d):
-        off_vals = corr_np[~np.eye(d, dtype=bool)]
+    corr_np = _as_f64_np(preproc_state.corr_matrix)
+    if d >= 2 and corr_np.shape[0] >= d and corr_np.shape[1] >= d:
+        corr_act = corr_np[:d, :d]
+        off_vals = corr_act[~np.eye(d, dtype=bool)]
         x[AutocallSummaryCol.MEAN_CORR] = float(np.mean(off_vals))
         x[AutocallSummaryCol.MIN_CORR] = float(np.min(off_vals))
     else:
@@ -456,16 +693,10 @@ def extract_16d_basket_summary(
         x[AutocallSummaryCol.MIN_CORR] = 0.25
 
     if m_rem > 0:
-        tau_np = preproc_state.tau_obs.detach().cpu().numpy().astype(np.float64)
-        x[AutocallSummaryCol.TERM_MATURITY] = float(tau_np[-1])
+        tau_np = _as_f64_np(preproc_state.tau_obs)[:m_rem]
+        x[AutocallSummaryCol.TERM_MATURITY] = float(tau_np[-1]) if tau_np.size > 0 else 0.0
 
-        sched_np = (
-            preproc_state.sched_feats[0, :m_rem, :]
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.float64)
-        )
+        sched_np = _as_f64_np(preproc_state.sched_feats)[0, :m_rem, :]
         call_mask = sched_np[:, int(AutocallSchedCol.IS_CALLABLE_FLAG)] > 0.5
         if np.any(call_mask):
             x[AutocallSummaryCol.LOG_KO_BARRIER] = float(
@@ -488,8 +719,8 @@ def extract_16d_basket_summary(
     x[AutocallSummaryCol.PUT_STRIKE] = float(preproc_state.strike)
 
     if b_out is not None and m_rem > 0 and b_out.f_w.numel() > 0:
-        fw_val = float(b_out.f_w[-1].detach().cpu().item())
-        vw_val = float(b_out.v_w[-1].detach().cpu().item())
+        fw_val = float(_as_f64_np(b_out.f_w)[-1])
+        vw_val = float(_as_f64_np(b_out.v_w)[-1])
         x[AutocallSummaryCol.STULZ_LOG_FWD_W] = (
             math.log(max(fw_val, 1e-12)) if np.isfinite(fw_val) else float("nan")
         )
@@ -624,6 +855,8 @@ class EQAutocallModelGuardian:
         self.mahalanobis_chi2_threshold = float(mahalanobis_chi2_threshold)
         self.psi_warning_threshold = float(psi_warning_threshold)
         self.psi_fallback_threshold = float(psi_fallback_threshold)
+        if int(psi_window_size) < 0:
+            raise ValueError(f"psi_window_size must be >= 0, got {psi_window_size}.")
         self.psi_window_size = int(psi_window_size)
         self.psi_min_samples = int(psi_min_samples)
         self.residual_threshold: float | None = (
@@ -634,6 +867,10 @@ class EQAutocallModelGuardian:
         self.tau_desk_bps = float(tau_desk_bps)
         self.conformal_alpha = float(conformal_alpha)
         self.use_gpu_qmc = use_gpu_qmc
+        self._config_epoch: int = 0
+        self._psi_epoch: int = 0
+        self._psi_cache: tuple[int, float, dict[str, float]] | None = None
+        self._pre_eval_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
         self.ref_mean_16d: npt.NDArray[np.float64] = (
             np.asarray(ref_mean_16d, dtype=np.float64).copy()
@@ -745,6 +982,10 @@ class EQAutocallModelGuardian:
             self._conformal_calibrated = True
             self.stats_loaded = True
             self.stats_path = p
+            self._config_epoch += 1
+            self._psi_epoch += 1
+            self._psi_cache = None
+            self._pre_eval_cache.clear()
 
         return {
             "schema_version": str(raw.get("schema_version", "2.0")),
@@ -809,6 +1050,10 @@ class EQAutocallModelGuardian:
             self.ref_marginal_std_16d = marg_std
             self.psi_bin_edges = bin_edges
             self.psi_ref_probs = ref_probs
+            self._config_epoch += 1
+            self._psi_epoch += 1
+            self._psi_cache = None
+            self._pre_eval_cache.clear()
 
     def reset_drift_history(self) -> None:
         """Clears the rolling feature history window and PSI deduplication caches."""
@@ -816,6 +1061,8 @@ class EQAutocallModelGuardian:
             self.feature_history.clear()
             self._recent_psi_trade_ids.clear()
             self._recent_psi_batch_hashes.clear()
+            self._psi_epoch += 1
+            self._psi_cache = None
 
     def record_feature_vector(
         self,
@@ -828,10 +1075,14 @@ class EQAutocallModelGuardian:
                 raise ValueError(f"Expected 16D feature vector, got shape {arr.shape}.")
             with self._lock:
                 self.feature_history.append(arr.copy())
+                self._psi_epoch += 1
+                self._psi_cache = None
         elif arr.ndim == 2 and arr.shape[1] == 16:
             with self._lock:
                 for row in arr:
                     self.feature_history.append(row.copy())
+                self._psi_epoch += 1
+                self._psi_cache = None
         else:
             raise ValueError(f"Expected shape (16,) or (N, 16), got {arr.shape}.")
 
@@ -878,47 +1129,54 @@ class EQAutocallModelGuardian:
     ) -> tuple[float, dict[str, float]]:
         """Computes the 10-decile PSI on `observed_batch` or the rolling `self.feature_history` window."""
         with self._lock:
-            bin_edges = self.psi_bin_edges.copy()
-            ref_probs = self.psi_ref_probs.copy()
-            if observed_batch is not None:
-                obs = np.asarray(observed_batch, dtype=np.float64)
-            else:
+            if observed_batch is None:
                 if len(self.feature_history) < self.psi_min_samples:
                     return 0.0, {name: 0.0 for name in FEATURE_NAMES_16D}
+                if self._psi_cache is not None and self._psi_cache[0] == self._psi_epoch:
+                    return float(self._psi_cache[1]), dict(self._psi_cache[2])
                 obs = np.stack(list(self.feature_history), axis=0)
-        return compute_psi_10_decile(obs, bin_edges, ref_probs)
+            else:
+                obs = np.asarray(observed_batch, dtype=np.float64)
+            bin_edges = self.psi_bin_edges
+            ref_probs = self.psi_ref_probs
+            psi_epoch_snap = self._psi_epoch
+        max_psi, psi_map = compute_psi_10_decile(obs, bin_edges, ref_probs)
+        if observed_batch is None:
+            with self._lock:
+                if self._psi_epoch == psi_epoch_snap:
+                    self._psi_cache = (psi_epoch_snap, float(max_psi), dict(psi_map))
+        return max_psi, psi_map
 
-    def compute_conformal_half_width_bps(
+    def _compute_conformal_from_views(
         self,
         preproc_state: AutocallPreprocState,
-        baseline_out: AutocallBaselineOutput | None = None,
+        b_out: AutocallBaselineOutput | None,
+        *,
+        q_err: float,
+        w5: npt.NDArray[np.float64],
+        mondrian_tbl: dict[str, float],
     ) -> float:
-        """Computes 5D locally-weighted split/Mondrian-conformal error half-width in bps."""
-        with self._lock:
-            if not self._conformal_calibrated:
-                return 0.0
-            q_err = self.q_err_conformal
-            w5 = self.scale_weights_5d.copy()
-            mondrian_tbl = dict(self.mondrian_q_err_table)
-
-        b_out = baseline_out if baseline_out is not None else preproc_state.baseline
-        w_np = b_out.proxy_delta_weights.detach().cpu().numpy().astype(np.float64)
-        w_abs = np.abs(w_np)
-        w_sum = float(np.sum(w_abs))
-        if w_sum > 1e-6:
-            w_norm = w_abs / w_sum
-            h_disp = float(np.clip(1.0 - np.sum(w_norm * w_norm), 0.0, 1.0))
+        m_rem = int(preproc_state.m_rem)
+        if b_out is not None:
+            w_np = _as_f64_np(b_out.proxy_delta_weights)
+            w_abs = np.abs(w_np)
+            w_sum = float(np.sum(w_abs))
+            if w_sum > 1e-6:
+                w_norm = w_abs / w_sum
+                h_disp = float(np.clip(1.0 - np.sum(w_norm * w_norm), 0.0, 1.0))
+            else:
+                h_disp = 0.0
+            vw_np = (
+                _as_f64_np(b_out.v_w)
+                if m_rem > 0 and b_out.v_w.numel() > 0
+                else np.zeros(0, dtype=np.float64)
+            )
+            v_bar = float(np.mean(vw_np[:m_rem])) if (m_rem > 0 and vw_np.size >= m_rem) else 0.0
+            v_last = float(vw_np[m_rem - 1]) if (m_rem > 0 and vw_np.size >= m_rem) else 0.0
         else:
             h_disp = 0.0
-
-        m_rem = int(preproc_state.m_rem)
-        vw_np = (
-            b_out.v_w.detach().cpu().numpy().astype(np.float64)
-            if m_rem > 0 and b_out.v_w.numel() > 0
-            else np.zeros(0, dtype=np.float64)
-        )
-        v_bar = float(np.mean(vw_np[:m_rem])) if (m_rem > 0 and vw_np.size >= m_rem) else 0.0
-        v_last = float(vw_np[m_rem - 1]) if (m_rem > 0 and vw_np.size >= m_rem) else 0.0
+            v_bar = 0.0
+            v_last = 0.0
 
         call_code = monitoring_index_to_code(preproc_state.callability_index)
         opt_code = monitoring_index_to_code(
@@ -955,8 +1213,25 @@ class EQAutocallModelGuardian:
             ],
             dtype=np.float64,
         )
-        scale = float(np.dot(w5, phi))
-        return float(max(q_err * scale * 1e4, 0.0))
+        hw = float(q_err * float(np.dot(w5, phi)) * 1e4)
+        return float(max(hw, 0.0)) if math.isfinite(hw) else float("nan")
+
+    def compute_conformal_half_width_bps(
+        self,
+        preproc_state: AutocallPreprocState,
+        baseline_out: AutocallBaselineOutput | None = None,
+    ) -> float:
+        """Computes 5D locally-weighted split/Mondrian-conformal error half-width in bps."""
+        with self._lock:
+            if not self._conformal_calibrated:
+                return 0.0
+            q_err = self.q_err_conformal
+            w5 = self.scale_weights_5d.copy()
+            mondrian_tbl = dict(self.mondrian_q_err_table)
+        b_out = _resolve_baseline_out(preproc_state, baseline_out)
+        return self._compute_conformal_from_views(
+            preproc_state, b_out, q_err=q_err, w5=w5, mondrian_tbl=mondrian_tbl
+        )
 
     @staticmethod
     def _eval_spot_basket_perf(
@@ -971,26 +1246,38 @@ class EQAutocallModelGuardian:
         res_arr = np.asarray(evaluate_monitoring_index_np(arr[None, :], idx), dtype=np.float64).reshape(-1)
         return float(res_arr[0])
 
-    def compute_min_pin_risk_z(
+    def _compute_pin_risk_from_views(
         self,
         preproc_state: AutocallPreprocState,
-        baseline_out: AutocallBaselineOutput | None = None,
+        b_out: AutocallBaselineOutput | None,
+        *,
+        tau_np: npt.NDArray[np.float64],
+        m0_np: npt.NDArray[np.float64],
+        call_np: npt.NDArray[np.float64],
     ) -> tuple[float, bool]:
-        """Computes imminent log-space barrier pin-risk z-score across short-dated active periods."""
         m_rem = int(preproc_state.m_rem)
-        if m_rem == 0 or preproc_state.already_autocalled:
+        if m_rem <= 0 or preproc_state.already_autocalled:
             return 100.0, False
 
-        b_out = baseline_out if baseline_out is not None else preproc_state.baseline
-        tau_np = preproc_state.tau_obs.detach().cpu().numpy().astype(np.float64)
-        ko_np = preproc_state.ko_barriers.detach().cpu().numpy().astype(np.float64)
-        call_np = preproc_state.is_callable.detach().cpu().numpy().astype(np.float64)
-        cpn_np = preproc_state.cpn_barriers.detach().cpu().numpy().astype(np.float64)
-        guar_np = preproc_state.is_guaranteed_cpn.detach().cpu().numpy().astype(np.float64)
-        fw_np = b_out.f_w.detach().cpu().numpy().astype(np.float64)
-        vw_np = b_out.v_w.detach().cpu().numpy().astype(np.float64)
+        # Short-circuit before resolving baseline or basket functionals when every observation is long-dated.
+        if (
+            tau_np.size >= m_rem
+            and float(tau_np[0]) > self.pin_risk_tau_max
+            and bool(np.all(tau_np[:m_rem] > self.pin_risk_tau_max))
+        ):
+            return 100.0, False
 
-        m0_np = preproc_state.moneyness_t0.detach().cpu().numpy().astype(np.float64)
+        if b_out is None:
+            return 100.0, False
+        fw_np = _as_f64_np(b_out.f_w)
+        vw_np = _as_f64_np(b_out.v_w)
+        if fw_np.size < m_rem or vw_np.size < m_rem:
+            return 100.0, False
+
+        ko_np = _as_f64_np(preproc_state.ko_barriers)
+        cpn_np = _as_f64_np(preproc_state.cpn_barriers)
+        guar_np = _as_f64_np(preproc_state.is_guaranteed_cpn)
+
         inv_perm_raw = getattr(preproc_state, "inv_lex_perm", None)
         inv_perm = np.asarray(inv_perm_raw, dtype=np.int64) if inv_perm_raw is not None else None
         w0_call = max(
@@ -1010,7 +1297,6 @@ class EQAutocallModelGuardian:
             denom = max(float(vw_np[m]), 1e-12)
             fw_m = max(float(fw_np[m]), 1e-12)
 
-            # 1. Active AutoCall barrier (AND guard prevents false positives on non-callable periods)
             if (call_np[m] > 0.5) and (1e-4 < float(ko_np[m]) < 10.0):
                 has_imminent = True
                 b_ko = float(ko_np[m])
@@ -1020,7 +1306,6 @@ class EQAutocallModelGuardian:
                 if z_ko < min_imminent_z:
                     min_imminent_z = z_ko
 
-            # 2. Active non-guaranteed Coupon barrier
             if guar_np[m] < 0.5 and 1e-4 < float(cpn_np[m]) < 10.0:
                 has_imminent = True
                 b_cpn = float(cpn_np[m])
@@ -1030,7 +1315,6 @@ class EQAutocallModelGuardian:
                 if z_cpn < min_imminent_z:
                     min_imminent_z = z_cpn
 
-            # 3. Active terminal barriers (KnockIn, Put Strike, LowerStrike) on final observation
             if m == m_rem - 1:
                 if (
                     preproc_state.ki_barrier is not None
@@ -1073,6 +1357,199 @@ class EQAutocallModelGuardian:
 
         return 100.0, False
 
+    def compute_min_pin_risk_z(
+        self,
+        preproc_state: AutocallPreprocState,
+        baseline_out: AutocallBaselineOutput | None = None,
+    ) -> tuple[float, bool]:
+        """Computes imminent log-space barrier pin-risk z-score across short-dated active periods."""
+        m_rem = int(preproc_state.m_rem)
+        if m_rem <= 0 or preproc_state.already_autocalled:
+            return 100.0, False
+        tau_np = _as_f64_np(preproc_state.tau_obs)
+        if (
+            tau_np.size >= m_rem
+            and float(tau_np[0]) > self.pin_risk_tau_max
+            and bool(np.all(tau_np[:m_rem] > self.pin_risk_tau_max))
+        ):
+            return 100.0, False
+        b_out = _resolve_baseline_out(preproc_state, baseline_out)
+        m0_np = _as_f64_np(preproc_state.moneyness_t0)
+        call_np = _as_f64_np(preproc_state.is_callable)
+        return self._compute_pin_risk_from_views(
+            preproc_state, b_out, tau_np=tau_np, m0_np=m0_np, call_np=call_np
+        )
+
+    @staticmethod
+    def _pre_live_fingerprint(
+        preproc_state: AutocallPreprocState,
+        baseline_out: AutocallBaselineOutput | None,
+    ) -> tuple[Any, ...]:
+        div_sched = getattr(preproc_state, "dividend_schedule", None)
+        fwd_p = getattr(div_sched, "forward_price", None) if div_sched is not None else None
+        surfs = getattr(preproc_state, "vol_surfaces", {}) or {}
+        quanto_raw = getattr(preproc_state, "quanto_meta", None) or {}
+        # Hash cloned state tensor contents/versions because _shallow_clone_preproc_state allocates fresh tensor views.
+        b_eff = baseline_out if baseline_out is not None else preproc_state.baseline
+        h = hashlib.blake2b(digest_size=16)
+        meta = [
+            _feed_fp_value(h, val)
+            for val in (
+                preproc_state.spots_t0,
+                preproc_state.ref_spots,
+                preproc_state.moneyness_t0,
+                preproc_state.corr_matrix,
+                preproc_state.node_feats,
+                preproc_state.edge_feats,
+                preproc_state.sched_feats,
+                preproc_state.global_feats,
+                preproc_state.tau_obs,
+                preproc_state.df_pay,
+                preproc_state.tau_pay,
+                preproc_state.ko_barriers,
+                preproc_state.is_callable,
+                preproc_state.cpn_barriers,
+                preproc_state.is_guaranteed_cpn,
+                preproc_state.iv_at_fwd,
+                getattr(preproc_state, "forward_perf", None),
+                getattr(preproc_state, "v_perf", None),
+                getattr(preproc_state, "coupon_amounts", None),
+                fwd_p,
+            )
+        ]
+        if b_eff is not None:
+            meta.extend(
+                _feed_fp_value(h, b_val)
+                for b_val in (
+                    b_eff.f_w,
+                    b_eff.v_w,
+                    b_eff.proxy_delta_weights,
+                    b_eff.p_proxy,
+                    b_eff.q_proxy,
+                    b_eff.l_put_proxy,
+                    b_eff.product_value_proxy,
+                )
+            )
+        return (
+            h.digest(),
+            tuple(meta),
+            preproc_state.baseline is not None,
+            tuple((str(k), id(v)) for k, v in surfs.items()),
+            tuple((str(k), _freeze_fp_val(v)) for k, v in quanto_raw.items()) if quanto_raw else (),
+            int(preproc_state.d_assets),
+            int(preproc_state.m_rem),
+            float(preproc_state.strike),
+            preproc_state.lower_strike,
+            preproc_state.ki_barrier,
+            float(preproc_state.i_ki_past),
+            float(preproc_state.option_gearing),
+            float(preproc_state.one_star_coupon),
+            preproc_state.one_star_strike,
+            float(preproc_state.participation_call_rate),
+            str(preproc_state.coupon_barrier_type),
+            str(preproc_state.coupon_barrier_direction),
+            bool(preproc_state.is_long_basket),
+            bool(preproc_state.allow_autocall_on_expiry),
+            bool(preproc_state.already_autocalled),
+            str(preproc_state.callability_index),
+            preproc_state.coupon_index,
+            preproc_state.option_index,
+            float(preproc_state.ko_spread),
+            float(preproc_state.c_mem_0),
+        )
+
+    def _guardian_config_sig(self) -> tuple[Any, ...]:
+        return (
+            self._config_epoch,
+            self.d_max,
+            self.m_max,
+            self.eps_psd,
+            self.severe_psd_threshold,
+            self.pin_risk_tau_max,
+            self.pin_risk_z_min,
+            self.mahalanobis_chi2_threshold,
+            self.tau_desk_bps,
+            self._conformal_calibrated,
+            self.q_ood_conformal,
+            self.q_err_conformal,
+        )
+
+    @staticmethod
+    def _extract_summary_from_views(
+        preproc_state: AutocallPreprocState,
+        b_out: AutocallBaselineOutput | None,
+        *,
+        d_assets: int,
+        m_rem: int,
+        m0_np: npt.NDArray[np.float64],
+        raw_corr_np: npt.NDArray[np.float64],
+        node_act_np: npt.NDArray[np.float64],
+        sched_act_np: npt.NDArray[np.float64],
+        tau_np: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        x = np.zeros(16, dtype=np.float64)
+        if d_assets > 0 and node_act_np.shape[0] > 0:
+            m0_act = m0_np[:d_assets]
+            log_m0 = np.log(np.maximum(m0_act, 1e-12)) if m0_act.size > 0 else np.zeros(1, dtype=np.float64)
+            x[AutocallSummaryCol.MEAN_LOG_MONEYNESS] = float(np.mean(log_m0))
+            x[AutocallSummaryCol.MIN_LOG_MONEYNESS] = float(np.min(log_m0))
+            x[AutocallSummaryCol.MAX_LOG_MONEYNESS] = float(np.max(log_m0))
+            iv_short = node_act_np[:, int(AutocallNodeCol.IV_SHORT_ATM)]
+            iv_term = node_act_np[:, int(AutocallNodeCol.IV_TERM_ATM)]
+            x[AutocallSummaryCol.MEAN_ATM_VOL] = float(np.mean(iv_term))
+            x[AutocallSummaryCol.MAX_ATM_VOL] = float(np.max(np.maximum(iv_short, iv_term)))
+            x[AutocallSummaryCol.MAX_CASH_DIV_LEVERAGE] = float(
+                np.max(node_act_np[:, int(AutocallNodeCol.CASH_DIV_LEVERAGE)])
+            )
+        else:
+            log_m0 = np.zeros(1, dtype=np.float64)
+
+        if d_assets >= 2 and raw_corr_np.shape[0] >= d_assets and raw_corr_np.shape[1] >= d_assets:
+            corr_act = raw_corr_np[:d_assets, :d_assets]
+            off_vals = corr_act[~np.eye(d_assets, dtype=bool)]
+            x[AutocallSummaryCol.MEAN_CORR] = float(np.mean(off_vals))
+            x[AutocallSummaryCol.MIN_CORR] = float(np.min(off_vals))
+        else:
+            x[AutocallSummaryCol.MEAN_CORR] = 0.45
+            x[AutocallSummaryCol.MIN_CORR] = 0.25
+
+        if m_rem > 0 and sched_act_np.shape[0] > 0:
+            tau_act = tau_np[:m_rem]
+            x[AutocallSummaryCol.TERM_MATURITY] = float(tau_act[-1]) if tau_act.size > 0 else 0.0
+            call_mask = sched_act_np[:, int(AutocallSchedCol.IS_CALLABLE_FLAG)] > 0.5
+            if np.any(call_mask):
+                x[AutocallSummaryCol.LOG_KO_BARRIER] = float(
+                    np.mean(sched_act_np[call_mask, int(AutocallSchedCol.LOG_KO_BARRIER)])
+                )
+            else:
+                x[AutocallSummaryCol.LOG_KO_BARRIER] = 0.05
+            log_cpn_col = sched_act_np[:, int(AutocallSchedCol.LOG_CPN_BARRIER)]
+            guar_col = sched_act_np[:, int(AutocallSchedCol.IS_GUARANTEED_CPN)]
+            cpn_active_mask = (guar_col < 0.5) & (log_cpn_col > math.log(1e-4) + 1e-4)
+            if np.any(cpn_active_mask):
+                x[AutocallSummaryCol.LOG_CPN_BARRIER] = float(np.mean(log_cpn_col[cpn_active_mask]))
+            else:
+                x[AutocallSummaryCol.LOG_CPN_BARRIER] = -0.50
+        else:
+            x[AutocallSummaryCol.TERM_MATURITY] = 0.0
+            x[AutocallSummaryCol.LOG_KO_BARRIER] = 0.05
+            x[AutocallSummaryCol.LOG_CPN_BARRIER] = -0.50
+
+        x[AutocallSummaryCol.PUT_STRIKE] = float(preproc_state.strike)
+        if b_out is not None and m_rem > 0 and b_out.f_w.numel() > 0:
+            fw_val = float(_as_f64_np(b_out.f_w)[-1])
+            vw_val = float(_as_f64_np(b_out.v_w)[-1])
+            x[AutocallSummaryCol.STULZ_LOG_FWD_W] = (
+                math.log(max(fw_val, 1e-12)) if np.isfinite(fw_val) else float("nan")
+            )
+            x[AutocallSummaryCol.STULZ_VOL_W] = vw_val
+        else:
+            x[AutocallSummaryCol.STULZ_LOG_FWD_W] = float(np.min(log_m0))
+            x[AutocallSummaryCol.STULZ_VOL_W] = 0.25
+        x[AutocallSummaryCol.MEMORY_COUPON_BUFFER] = float(preproc_state.c_mem_0)
+        x[AutocallSummaryCol.ABS_DIGITAL_SPREAD] = abs(float(preproc_state.ko_spread))
+        return x
+
     def evaluate_pre_inference(
         self,
         preproc_state: AutocallPreprocState,
@@ -1086,242 +1563,455 @@ class EQAutocallModelGuardian:
         dict[str, Any],
     ]:
         """Executes the Tier 3 Pre-Inference Structural, PSD, Pin-Risk, OOD, Conformal & PSI Gate."""
-        b_out = baseline_out if baseline_out is not None else preproc_state.baseline
-        reasons: list[AutocallFallbackReason] = []
-        warnings: list[str] = []
-        for w_s in getattr(getattr(preproc_state, "seasoned_state", None), "warnings", ()):
-            if str(w_s) not in warnings:
-                warnings.append(str(w_s))
-        for _tk, surf_obj in getattr(preproc_state, "vol_surfaces", {}).items():
-            for w_v in getattr(surf_obj, "warnings", ()):
-                if str(w_v) not in warnings:
-                    warnings.append(str(w_v))
-
-        d_assets = int(preproc_state.d_assets)
-        m_rem = int(preproc_state.m_rem)
-
-        # 1. Non-finite input tensor check
-        input_tensors = [
-            preproc_state.spots_t0,
-            preproc_state.ref_spots,
-            preproc_state.moneyness_t0,
-            preproc_state.corr_matrix,
-            preproc_state.node_feats,
-            preproc_state.edge_feats,
-            preproc_state.sched_feats,
-            preproc_state.global_feats,
-        ]
-        has_non_finite_input = any(
-            not bool(torch.isfinite(t).all().item()) for t in input_tensors
-        )
-        if has_non_finite_input:
-            reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
-
-        # 2. Basket cardinality & schedule horizon gates
-        if d_assets < 1 or d_assets > self.d_max:
-            reasons.append(AutocallFallbackReason.BASKET_CARDINALITY_EXCEEDED)
-
-        if m_rem > self.m_max:
-            reasons.append(AutocallFallbackReason.SCHEDULE_HORIZON_EXCEEDED)
-
-        if m_rem == 0 or preproc_state.already_autocalled:
-            reasons.append(AutocallFallbackReason.ZERO_FUTURE_PERIODS)
-
-        # 3. Exotic monitoring index (incl. mixed-leg indices) & exotic terminal modifier gates
-        call_idx_str = str(preproc_state.callability_index).strip()
-        cpn_idx_str = (
-            str(preproc_state.coupon_index).strip()
-            if preproc_state.coupon_index is not None
-            else call_idx_str
-        )
-        opt_idx_str = (
-            str(preproc_state.option_index).strip()
-            if preproc_state.option_index is not None
-            else call_idx_str
-        )
-        indices_to_check = (call_idx_str, cpn_idx_str, opt_idx_str)
-        call_code = monitoring_index_to_code(call_idx_str)
-        mixed_index = (
-            monitoring_index_to_code(cpn_idx_str) != call_code
-            or monitoring_index_to_code(opt_idx_str) != call_code
-        )
-        if mixed_index or any(idx_name not in SUPPORTED_TIER2_INDICES for idx_name in indices_to_check):
-            reasons.append(AutocallFallbackReason.EXOTIC_MONITORING_INDEX)
-
-        has_lower_strike = (
-            preproc_state.lower_strike is not None and float(preproc_state.lower_strike) > 0.0
-        )
-        allow_ac_expiry_active = (
-            bool(preproc_state.allow_autocall_on_expiry)
-            and m_rem > 0
-            and preproc_state.is_callable.numel() > 0
-            and float(preproc_state.is_callable[-1].item()) > 0.5
-        )
+        state_digest = getattr(preproc_state, "state_digest", None)
+        cache_hit: dict[str, Any] | None = None
+        live_fp: tuple[Any, ...] | None = None
+        cfg_sig = self._guardian_config_sig()
         if (
-            float(preproc_state.participation_call_rate) > 0.0
-            or float(preproc_state.one_star_coupon) > 0.0
-            or (preproc_state.one_star_strike is not None and float(preproc_state.one_star_strike) > 0.0)
-            or str(preproc_state.coupon_barrier_type).strip() != "In"
-            or str(preproc_state.coupon_barrier_direction).strip() != "Up"
-            or has_lower_strike
-            or bool(preproc_state.is_long_basket)
-            or allow_ac_expiry_active
+            isinstance(state_digest, str)
+            and len(state_digest) > 0
+            and (baseline_out is None or baseline_out is preproc_state.baseline)
         ):
-            reasons.append(AutocallFallbackReason.EXOTIC_TERMINAL_MODIFIER_ROUTED)
+            live_fp = self._pre_live_fingerprint(preproc_state, baseline_out)
+            with self._lock:
+                entry = self._pre_eval_cache.get(state_digest)
+                if entry is not None and entry["live_fp"] == live_fp and entry["cfg_sig"] == cfg_sig:
+                    self._pre_eval_cache.move_to_end(state_digest)
+                    cache_hit = entry
 
-        # 4. Correlation PSD & Dykstra-Higham projection gate
-        r_psd, min_eig_raw, min_eig_shrunk, shrunk_applied = project_correlation_to_psd(
-            preproc_state.corr_matrix,
-            eps_psd=self.eps_psd,
-        )
-        raw_corr_np = preproc_state.corr_matrix.detach().cpu().numpy().astype(np.float64)
-        off_mask = (
-            ~np.eye(d_assets, dtype=bool)
-            if d_assets >= 2
-            else np.zeros((d_assets, d_assets), dtype=bool)
-        )
-        has_invalid_corr_entry = (
-            not bool(np.all(np.isfinite(raw_corr_np)))
-            or (bool(np.any(off_mask)) and float(np.max(np.abs(raw_corr_np[off_mask]))) > 1.0 + 1e-6)
-        )
-        if min_eig_raw < self.severe_psd_threshold or has_invalid_corr_entry:
-            reasons.append(AutocallFallbackReason.CORRELATION_NOT_PSD)
-            warnings.append(
-                f"CORRELATION_SEVERE_NON_PSD: min_eig_raw={min_eig_raw:.6e} < {self.severe_psd_threshold:.6e}; "
-                f"projected to R_PSD with min_eig_shrunk={min_eig_shrunk:.6e}."
-            )
-        elif shrunk_applied:
-            warnings.append(
-                f"CORRELATION_SHRUNK_TO_PSD: min_eig_raw={min_eig_raw:.6e} -> min_eig_shrunk={min_eig_shrunk:.6e}."
-            )
-
-        # 5. Imminent log-space barrier pin-risk gate
-        min_pin_z, pin_breached = self.compute_min_pin_risk_z(preproc_state, b_out)
-        if pin_breached:
-            reasons.append(AutocallFallbackReason.IMMINENT_BARRIER_PIN_RISK)
-
-        # 6. 16D Basket Summary Feature Extraction, Mahalanobis OOD, Active Smile/Domain Box & Conformal Gate
-        summary_16d = extract_16d_basket_summary(preproc_state, b_out)
-        conformal_hw_bps = self.compute_conformal_half_width_bps(preproc_state, b_out)
-        with self._lock:
-            eff_ood_thresh = (
-                float(self.q_ood_conformal)
-                if self._conformal_calibrated
-                else float(self.mahalanobis_chi2_threshold)
-            )
-            conformal_active = bool(self._conformal_calibrated)
-            tau_desk_bps = float(self.tau_desk_bps)
-
-        if not bool(np.all(np.isfinite(summary_16d))):
-            if AutocallFallbackReason.NON_FINITE_OUTPUT not in reasons:
-                reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
-            mahalanobis_d2 = 1e6
+        if cache_hit is not None:
+            core_reasons: list[AutocallFallbackReason] = list(cache_hit["reasons"])
+            core_warnings: list[str] = list(cache_hit["warnings"])
+            r_psd_out = cache_hit["r_psd"].copy()
+            summary_16d = cache_hit["summary_16d"].copy()
+            min_eig_raw = float(cache_hit["min_eig_raw"])
+            min_eig_shrunk = float(cache_hit["min_eig_shrunk"])
+            shrunk_applied = bool(cache_hit["shrunk_applied"])
+            mahalanobis_d2 = float(cache_hit["mahalanobis_d2"])
+            min_pin_z = float(cache_hit["min_pin_z"])
+            conformal_hw_bps = float(cache_hit["conformal_hw_bps"])
         else:
-            mahalanobis_d2 = self.compute_mahalanobis_d2(summary_16d, d_assets=d_assets)
-            max_vol_val = float(summary_16d[AutocallSummaryCol.MAX_ATM_VOL])
-            max_div_lev = float(summary_16d[AutocallSummaryCol.MAX_CASH_DIV_LEVERAGE])
-            min_log_m = float(summary_16d[AutocallSummaryCol.MIN_LOG_MONEYNESS])
-            max_log_m = float(summary_16d[AutocallSummaryCol.MAX_LOG_MONEYNESS])
+            core_reasons = []
+            core_warnings = []
+            b_out = _resolve_baseline_out(preproc_state, baseline_out, warn_sink=core_warnings)
+            for w_s in getattr(getattr(preproc_state, "seasoned_state", None), "warnings", ()) or ():
+                w_str = str(w_s)
+                if w_str not in core_warnings:
+                    core_warnings.append(w_str)
+            for _tk, surf_obj in (getattr(preproc_state, "vol_surfaces", None) or {}).items():
+                for w_v in getattr(surf_obj, "warnings", ()) or ():
+                    w_str = str(w_v)
+                    if w_str not in core_warnings:
+                        core_warnings.append(w_str)
 
-            domain_box_ood = (
-                max_vol_val > 1.00
-                or max_div_lev > math.log(1.0 / (1.0 - 0.35))
-                or min_log_m < math.log(0.15)
-                or max_log_m > math.log(2.50)
-                or float(preproc_state.option_gearing) > 2.0
+            d_assets = int(preproc_state.d_assets)
+            m_rem = int(preproc_state.m_rem)
+
+            # Extract active float64 slices once to avoid redundant tensor conversions and padding scans.
+            spots_np = _as_f64_np(preproc_state.spots_t0)
+            ref_spots_np = _as_f64_np(preproc_state.ref_spots)
+            m0_np = _as_f64_np(preproc_state.moneyness_t0)
+            raw_corr_np = _as_f64_np(preproc_state.corr_matrix)
+            node_full_np = _as_f64_np(preproc_state.node_feats)
+            edge_full_np = _as_f64_np(preproc_state.edge_feats)
+            sched_full_np = _as_f64_np(preproc_state.sched_feats)
+            glob_full_np = _as_f64_np(preproc_state.global_feats)
+            is_callable_np = _as_f64_np(preproc_state.is_callable)
+            tau_np = _as_f64_np(preproc_state.tau_obs)
+
+            d_act = min(max(d_assets, 0), node_full_np.shape[1]) if node_full_np.ndim >= 2 else 0
+            m_act = min(max(m_rem, 0), sched_full_np.shape[1]) if sched_full_np.ndim >= 2 else 0
+            node_act_np = node_full_np[0, :d_act, :] if (node_full_np.ndim >= 3 and node_full_np.shape[0] > 0) else node_full_np
+            edge_act_np = edge_full_np[0, :d_act, :d_act, :] if (edge_full_np.ndim >= 4 and edge_full_np.shape[0] > 0) else edge_full_np
+            sched_act_np = sched_full_np[0, :m_act, :] if (sched_full_np.ndim >= 3 and sched_full_np.shape[0] > 0) else sched_full_np
+            if node_act_np.ndim >= 2:
+                d_act = min(d_act, int(node_act_np.shape[0]))
+            if sched_act_np.ndim >= 2:
+                m_act = min(m_act, int(sched_act_np.shape[0]))
+
+            has_non_finite_input = not (
+                bool(np.isfinite(spots_np[:d_act] if d_act > 0 else spots_np).all())
+                and bool(np.isfinite(ref_spots_np[:d_act] if d_act > 0 else ref_spots_np).all())
+                and bool(np.isfinite(m0_np[:d_act] if d_act > 0 else m0_np).all())
+                and bool(np.isfinite(raw_corr_np).all())
+                and bool(np.isfinite(node_act_np).all())
+                and bool(np.isfinite(edge_act_np).all())
+                and bool(np.isfinite(sched_act_np).all())
+                and bool(np.isfinite(glob_full_np).all())
+            )
+            if b_out is not None:
+                b_finite = (
+                    bool(torch.isfinite(b_out.proxy_delta_weights).all())
+                    and bool(torch.isfinite(b_out.f_w).all())
+                    and bool(torch.isfinite(b_out.v_w).all())
+                    and bool(torch.isfinite(b_out.l_put_proxy).all())
+                    and bool(torch.isfinite(b_out.product_value_proxy).all())
+                )
+                if not b_finite:
+                    has_non_finite_input = True
+            elif (
+                not has_non_finite_input
+                and 1 <= d_assets <= self.d_max
+                and m_rem > 0
+                and not preproc_state.already_autocalled
+            ):
+                has_non_finite_input = True
+                if not any(w.startswith("BASELINE_RESOLUTION_FAILED:") for w in core_warnings):
+                    core_warnings.append(
+                        "BASELINE_RESOLUTION_UNAVAILABLE: analytical baseline returned None."
+                    )
+            if has_non_finite_input:
+                core_reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
+
+            if d_assets < 1 or d_assets > self.d_max:
+                core_reasons.append(AutocallFallbackReason.BASKET_CARDINALITY_EXCEEDED)
+
+            if m_rem > self.m_max:
+                core_reasons.append(AutocallFallbackReason.SCHEDULE_HORIZON_EXCEEDED)
+
+            if m_rem <= 0 or preproc_state.already_autocalled:
+                core_reasons.append(AutocallFallbackReason.ZERO_FUTURE_PERIODS)
+
+            call_idx_str = str(preproc_state.callability_index).strip()
+            cpn_idx_str = (
+                str(preproc_state.coupon_index).strip()
+                if preproc_state.coupon_index is not None
+                else call_idx_str
+            )
+            opt_idx_str = (
+                str(preproc_state.option_index).strip()
+                if preproc_state.option_index is not None
+                else call_idx_str
+            )
+            indices_to_check = (call_idx_str, cpn_idx_str, opt_idx_str)
+            call_code = monitoring_index_to_code(call_idx_str)
+            mixed_index = (
+                monitoring_index_to_code(cpn_idx_str) != call_code
+                or monitoring_index_to_code(opt_idx_str) != call_code
+            )
+            if mixed_index or any(idx_name not in SUPPORTED_TIER2_INDICES for idx_name in indices_to_check):
+                core_reasons.append(AutocallFallbackReason.EXOTIC_MONITORING_INDEX)
+
+            has_lower_strike = (
+                preproc_state.lower_strike is not None and float(preproc_state.lower_strike) > 0.0
+            )
+            allow_ac_expiry_active = (
+                bool(preproc_state.allow_autocall_on_expiry)
+                and m_rem > 0
+                and is_callable_np.size > 0
+                and float(is_callable_np[-1]) > 0.5
+            )
+            d1_untriggered_ki = (
+                d_assets == 1
+                and preproc_state.ki_barrier is not None
+                and float(preproc_state.i_ki_past) < 0.5
+            )
+            if (
+                float(preproc_state.participation_call_rate) != 0.0
+                or float(preproc_state.one_star_coupon) != 0.0
+                or (preproc_state.one_star_strike is not None and float(preproc_state.one_star_strike) > 0.0)
+                or str(preproc_state.coupon_barrier_type).strip() != "In"
+                or str(preproc_state.coupon_barrier_direction).strip() != "Up"
+                or has_lower_strike
+                or bool(preproc_state.is_long_basket)
+                or allow_ac_expiry_active
+                or d1_untriggered_ki
+            ):
+                core_reasons.append(AutocallFallbackReason.EXOTIC_TERMINAL_MODIFIER_ROUTED)
+
+            corr_shape_ok = raw_corr_np.ndim == 2 and raw_corr_np.shape[0] == raw_corr_np.shape[1]
+            corr_dim_mismatch = (not corr_shape_ok) or (d_assets >= 0 and raw_corr_np.shape[0] != d_assets)
+            if corr_shape_ok:
+                r_psd_out, min_eig_raw, min_eig_shrunk, shrunk_applied = project_correlation_to_psd(
+                    raw_corr_np,
+                    eps_psd=self.eps_psd,
+                )
+                d_corr = raw_corr_np.shape[0]
+                off_mask = (
+                    ~np.eye(d_corr, dtype=bool)
+                    if d_corr >= 2
+                    else np.zeros((d_corr, d_corr), dtype=bool)
+                )
+                has_invalid_corr_entry = (
+                    not bool(np.all(np.isfinite(raw_corr_np)))
+                    or (bool(np.any(off_mask)) and float(np.max(np.abs(raw_corr_np[off_mask]))) > 1.0 + 1e-6)
+                )
+            else:
+                r_psd_out = np.eye(max(d_assets, 0), dtype=np.float64)
+                min_eig_raw = -1.0
+                min_eig_shrunk = 1.0
+                shrunk_applied = False
+                has_invalid_corr_entry = True
+            if min_eig_raw < self.severe_psd_threshold or has_invalid_corr_entry or corr_dim_mismatch:
+                core_reasons.append(AutocallFallbackReason.CORRELATION_NOT_PSD)
+                if corr_dim_mismatch:
+                    core_warnings.append(
+                        f"CORRELATION_DIM_MISMATCH: d_assets={d_assets}, corr_shape={raw_corr_np.shape}."
+                    )
+                else:
+                    core_warnings.append(
+                        f"CORRELATION_SEVERE_NON_PSD: min_eig_raw={min_eig_raw:.6e} < {self.severe_psd_threshold:.6e}; "
+                        f"projected to R_PSD with min_eig_shrunk={min_eig_shrunk:.6e}."
+                    )
+            elif shrunk_applied:
+                core_warnings.append(
+                    f"CORRELATION_SHRUNK_TO_PSD: min_eig_raw={min_eig_raw:.6e} -> min_eig_shrunk={min_eig_shrunk:.6e}."
+                )
+
+            eval_state = preproc_state
+            eval_b_out = b_out
+            corr_for_summary = raw_corr_np
+            if shrunk_applied or (AutocallFallbackReason.CORRELATION_NOT_PSD in core_reasons):
+                eval_state = copy.copy(preproc_state)
+                can_apply_shrunk = (
+                    not has_non_finite_input
+                    and not corr_dim_mismatch
+                    and d_assets >= 1
+                    and d_act == d_assets
+                    and m_act == m_rem
+                    and eval_state.edge_feats.ndim == 4
+                    and eval_state.edge_feats.shape[0] > 0
+                    and eval_state.edge_feats.shape[1] >= d_assets
+                    and eval_state.edge_feats.shape[2] >= d_assets
+                )
+                if can_apply_shrunk:
+                    eval_b_out = self._apply_shrunk_correlation_to_state(eval_state, r_psd_out)
+                    node_ev = _as_f64_np(eval_state.node_feats)
+                    sched_ev = _as_f64_np(eval_state.sched_feats)
+                    node_act_np = node_ev[0, :d_act, :] if (node_ev.ndim >= 3 and node_ev.shape[0] > 0) else node_ev
+                    sched_act_np = sched_ev[0, :m_act, :] if (sched_ev.ndim >= 3 and sched_ev.shape[0] > 0) else sched_ev
+                else:
+                    eval_state.corr_matrix = torch.as_tensor(
+                        r_psd_out, dtype=torch.float64, device=preproc_state.spots_t0.device
+                    )
+                corr_for_summary = r_psd_out
+
+            min_pin_z, pin_breached = self._compute_pin_risk_from_views(
+                eval_state, eval_b_out, tau_np=tau_np, m0_np=m0_np, call_np=is_callable_np
+            )
+            if pin_breached:
+                core_reasons.append(AutocallFallbackReason.IMMINENT_BARRIER_PIN_RISK)
+
+            summary_16d = self._extract_summary_from_views(
+                eval_state,
+                eval_b_out,
+                d_assets=d_assets,
+                m_rem=m_rem,
+                m0_np=m0_np,
+                raw_corr_np=corr_for_summary,
+                node_act_np=node_act_np,
+                sched_act_np=sched_act_np,
+                tau_np=tau_np,
             )
 
-            # Check active-asset smile box bounds (scoped to |w_proxy_i| > 1e-3 & K in [0.4 F_i, 2.0 F_i])
-            if not domain_box_ood and d_assets > 0:
-                w_proxy_np = b_out.proxy_delta_weights.detach().cpu().numpy().astype(np.float64)
-                node_np = preproc_state.node_feats[0, :d_assets, :].detach().cpu().numpy().astype(np.float64)
-                if float(np.max(np.abs(node_np[:, int(AutocallNodeCol.REPO_SPREAD_AVG)]))) > 0.15:
-                    domain_box_ood = True
-
-                fwd_np = (
-                    preproc_state.dividend_schedule.forward_price.detach().cpu().numpy().astype(np.float64)
-                    if preproc_state.dividend_schedule.forward_price.numel() > 0
-                    else None
+            with self._lock:
+                eff_ood_thresh = (
+                    float(self.q_ood_conformal)
+                    if self._conformal_calibrated
+                    else float(self.mahalanobis_chi2_threshold)
                 )
-                for i in range(d_assets):
-                    if abs(float(w_proxy_np[i])) <= 1e-3:
-                        continue
-                    skew_rho = abs(float(node_np[i, int(AutocallNodeCol.SSVI_SKEW_RHO)]))
-                    curv_eta = float(node_np[i, int(AutocallNodeCol.SSVI_CURV_ETA)])
-                    pc1 = abs(float(node_np[i, int(AutocallNodeCol.SMILE_RESIDUAL_PC1)]))
-                    pc2 = abs(float(node_np[i, int(AutocallNodeCol.SMILE_RESIDUAL_PC2)]))
-                    if skew_rho > 0.52 or curv_eta > 3.5 or pc1 > 0.25 or pc2 > 0.25:
+                conformal_active = bool(self._conformal_calibrated)
+                q_err = self.q_err_conformal
+                w5 = self.scale_weights_5d.copy()
+                mondrian_tbl = dict(self.mondrian_q_err_table)
+                tau_desk_bps = float(self.tau_desk_bps)
+
+            conformal_hw_bps = (
+                self._compute_conformal_from_views(
+                    eval_state, eval_b_out, q_err=q_err, w5=w5, mondrian_tbl=mondrian_tbl
+                )
+                if conformal_active
+                else 0.0
+            )
+
+            if not bool(np.all(np.isfinite(summary_16d))):
+                if AutocallFallbackReason.NON_FINITE_OUTPUT not in core_reasons:
+                    core_reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
+                mahalanobis_d2 = 1e6
+            else:
+                mahalanobis_d2 = self.compute_mahalanobis_d2(summary_16d, d_assets=d_assets)
+                max_vol_val = float(summary_16d[AutocallSummaryCol.MAX_ATM_VOL])
+                max_div_lev = float(summary_16d[AutocallSummaryCol.MAX_CASH_DIV_LEVERAGE])
+                min_log_m = float(summary_16d[AutocallSummaryCol.MIN_LOG_MONEYNESS])
+                max_log_m = float(summary_16d[AutocallSummaryCol.MAX_LOG_MONEYNESS])
+
+                domain_box_ood = (
+                    max_vol_val > 1.00
+                    or max_div_lev > math.log(1.0 / (1.0 - 0.35))
+                    or min_log_m < math.log(0.15)
+                    or max_log_m > math.log(2.50)
+                    or float(eval_state.option_gearing) > 2.0
+                )
+
+                if not domain_box_ood and d_assets > 0 and d_act > 0 and node_act_np.ndim >= 2:
+                    w_proxy_np = (
+                        _as_f64_np(eval_b_out.proxy_delta_weights)
+                        if eval_b_out is not None
+                        else np.ones(d_act, dtype=np.float64) / float(d_act)
+                    )
+                    if float(np.max(np.abs(node_act_np[:d_act, int(AutocallNodeCol.REPO_SPREAD_AVG)]))) > 0.15:
                         domain_box_ood = True
-                        break
-                    ticker_i = preproc_state.sorted_identifiers[i]
-                    surf_i = preproc_state.vol_surfaces.get(ticker_i)
-                    if (
-                        surf_i is not None
-                        and fwd_np is not None
-                        and fwd_np.shape[0] > i
-                        and fwd_np.shape[1] > 0
-                    ):
-                        f_i = float(fwd_np[i, -1])
-                        k_mask = (surf_i.strikes >= 0.4 * f_i) & (surf_i.strikes <= 2.0 * f_i)
-                        if np.any(k_mask):
-                            q_act = surf_i.quotes[:, k_mask]
-                            q_ratio = float(np.max(q_act)) / max(float(np.min(q_act)), 1e-12)
-                            if q_ratio > 5.0:
+
+                    div_sched_ev = getattr(eval_state, "dividend_schedule", None)
+                    fwd_p_ev = getattr(div_sched_ev, "forward_price", None) if div_sched_ev is not None else None
+                    fwd_np = (
+                        _as_f64_np(fwd_p_ev)
+                        if isinstance(fwd_p_ev, torch.Tensor) and fwd_p_ev.numel() > 0
+                        else None
+                    )
+                    ids_ev = getattr(eval_state, "sorted_identifiers", ()) or ()
+                    surfs_ev = getattr(eval_state, "vol_surfaces", None) or {}
+                    for i in range(d_act):
+                        w_i = float(w_proxy_np[i]) if i < w_proxy_np.size else 0.0
+                        if abs(w_i) <= 1e-3:
+                            continue
+                        skew_rho = abs(float(node_act_np[i, int(AutocallNodeCol.SSVI_SKEW_RHO)]))
+                        curv_eta = float(node_act_np[i, int(AutocallNodeCol.SSVI_CURV_ETA)])
+                        pc1 = abs(float(node_act_np[i, int(AutocallNodeCol.SMILE_RESIDUAL_PC1)]))
+                        pc2 = abs(float(node_act_np[i, int(AutocallNodeCol.SMILE_RESIDUAL_PC2)]))
+                        if skew_rho > 0.52 or curv_eta > 3.5 or pc1 > 0.25 or pc2 > 0.25:
+                            domain_box_ood = True
+                            break
+                        if i < len(ids_ev):
+                            surf_i = surfs_ev.get(ids_ev[i])
+                            if (
+                                surf_i is not None
+                                and fwd_np is not None
+                                and fwd_np.ndim >= 2
+                                and fwd_np.shape[0] > i
+                                and fwd_np.shape[1] > 0
+                            ):
+                                f_i = float(fwd_np[i, -1])
+                                if _surface_exceeds_quote_ratio(surf_i, f_i):
+                                    domain_box_ood = True
+                                    break
+
+                if not domain_box_ood and m_rem > 0:
+                    df_pay_np = _as_f64_np(eval_state.df_pay)
+                    tau_pay_np = _as_f64_np(eval_state.tau_pay)
+                    for m_idx in range(min(m_rem, tau_pay_np.size, df_pay_np.size)):
+                        t_p = float(tau_pay_np[m_idx])
+                        if t_p >= 0.02:
+                            r_zero_m = -math.log(max(float(df_pay_np[m_idx]), 1e-12)) / t_p
+                            if r_zero_m < -0.01 or r_zero_m > 0.30:
                                 domain_box_ood = True
                                 break
 
-            # Check zero-rate bounds and quanto drift bounds
-            if not domain_box_ood and m_rem > 0:
-                df_pay_np = preproc_state.df_pay.detach().cpu().numpy().astype(np.float64)
-                tau_pay_np = preproc_state.tau_pay.detach().cpu().numpy().astype(np.float64)
-                for m_idx in range(m_rem):
-                    t_p = float(tau_pay_np[m_idx])
-                    if t_p >= 0.02:
-                        r_zero_m = -math.log(max(float(df_pay_np[m_idx]), 1e-12)) / t_p
-                        if r_zero_m < -0.01 or r_zero_m > 0.30:
+                if not domain_box_ood and eval_state.quanto_meta:
+                    iv_fwd_t = getattr(eval_state, "iv_at_fwd", None)
+                    iv_fwd_np = (
+                        _as_f64_np(iv_fwd_t)
+                        if isinstance(iv_fwd_t, torch.Tensor) and iv_fwd_t.numel() > 0
+                        else None
+                    )
+                    ids_q = getattr(eval_state, "sorted_identifiers", ()) or ()
+                    for q_ticker, q_meta in eval_state.quanto_meta.items():
+                        if q_ticker not in ids_q or not isinstance(q_meta, Mapping):
+                            continue
+                        idx_q = ids_q.index(q_ticker)
+                        raw_rho = q_meta.get("rho_s_fx", 0.0)
+                        rho_val = _extract_scalar(raw_rho)
+                        rho_fx = abs(rho_val) if rho_val is not None else 0.0
+                        raw_sig_fx = q_meta.get("sig_fx_obs")
+                        if raw_sig_fx is None:
+                            finite_sig_fx: list[float] = []
+                        elif isinstance(raw_sig_fx, torch.Tensor):
+                            finite_sig_fx = [abs(float(v)) for v in _as_f64_np(raw_sig_fx).reshape(-1).tolist()]
+                        elif isinstance(raw_sig_fx, np.ndarray):
+                            finite_sig_fx = [
+                                abs(float(v)) for v in np.asarray(raw_sig_fx, dtype=np.float64).reshape(-1).tolist()
+                            ]
+                        elif isinstance(raw_sig_fx, (int, float, np.number)):
+                            finite_sig_fx = [abs(float(raw_sig_fx))]
+                        elif isinstance(raw_sig_fx, Iterable) and not isinstance(raw_sig_fx, (str, bytes)):
+                            finite_sig_fx = [abs(float(v)) for v in raw_sig_fx if v is not None]
+                        else:
+                            finite_sig_fx = [abs(float(raw_sig_fx))]
+                        if (
+                            not math.isfinite(rho_fx)
+                            or any(not math.isfinite(v) for v in finite_sig_fx)
+                        ):
+                            domain_box_ood = True
+                            if AutocallFallbackReason.NON_FINITE_OUTPUT not in core_reasons:
+                                core_reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
+                            break
+                        sig_fx_max = max(finite_sig_fx, default=0.0)
+                        sig_eq_max = (
+                            float(np.max(iv_fwd_np[idx_q]))
+                            if (iv_fwd_np is not None and iv_fwd_np.shape[0] > idx_q)
+                            else 0.0
+                        )
+                        if not math.isfinite(sig_eq_max) or rho_fx * sig_fx_max * sig_eq_max > 0.10:
                             domain_box_ood = True
                             break
 
-            if not domain_box_ood and preproc_state.quanto_meta:
-                for q_ticker, q_meta in preproc_state.quanto_meta.items():
-                    if q_ticker not in preproc_state.sorted_identifiers:
-                        continue
-                    idx_q = preproc_state.sorted_identifiers.index(q_ticker)
-                    rho_fx = abs(float(q_meta.get("rho_s_fx", 0.0)))
-                    sig_fx_vals = q_meta.get("sig_fx_obs", ())
-                    sig_fx_max = max((abs(float(v)) for v in sig_fx_vals), default=0.0)
-                    sig_eq_max = (
-                        float(torch.max(preproc_state.iv_at_fwd[idx_q]).item())
-                        if preproc_state.iv_at_fwd.numel() > 0
-                        else 0.0
+                if domain_box_ood:
+                    mahalanobis_d2 = max(mahalanobis_d2, eff_ood_thresh + 10.0)
+
+            if mahalanobis_d2 > eff_ood_thresh:
+                core_reasons.append(AutocallFallbackReason.MAHALANOBIS_OOD)
+
+            if conformal_active:
+                if not math.isfinite(conformal_hw_bps):
+                    if AutocallFallbackReason.NON_FINITE_OUTPUT not in core_reasons:
+                        core_reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
+                    core_reasons.append(AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH)
+                    conformal_hw_bps = 1e6
+                    core_warnings.append(
+                        "CONFORMAL_UNCERTAINTY_BREACH: conformal_half_width_bps is non-finite."
                     )
-                    if rho_fx * sig_fx_max * sig_eq_max > 0.10:
-                        domain_box_ood = True
-                        break
+                elif conformal_hw_bps > tau_desk_bps:
+                    core_reasons.append(AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH)
+                    core_warnings.append(
+                        f"CONFORMAL_UNCERTAINTY_BREACH: conformal_half_width_bps={conformal_hw_bps:.2f} > {tau_desk_bps:.2f}."
+                    )
 
-            if domain_box_ood:
-                mahalanobis_d2 = max(mahalanobis_d2, eff_ood_thresh + 10.0)
+            if (
+                isinstance(state_digest, str)
+                and len(state_digest) > 0
+                and (baseline_out is None or baseline_out is preproc_state.baseline)
+            ):
+                live_fp = live_fp if live_fp is not None else self._pre_live_fingerprint(preproc_state, baseline_out)
+                with self._lock:
+                    self._pre_eval_cache[state_digest] = {
+                        "live_fp": live_fp,
+                        "cfg_sig": cfg_sig,
+                        "reasons": list(core_reasons),
+                        "warnings": list(core_warnings),
+                        "r_psd": r_psd_out.copy(),
+                        "summary_16d": summary_16d.copy(),
+                        "min_eig_raw": float(min_eig_raw),
+                        "min_eig_shrunk": float(min_eig_shrunk),
+                        "shrunk_applied": bool(shrunk_applied),
+                        "mahalanobis_d2": float(mahalanobis_d2),
+                        "min_pin_z": float(min_pin_z),
+                        "conformal_hw_bps": float(conformal_hw_bps),
+                    }
+                    self._pre_eval_cache.move_to_end(state_digest)
+                    while len(self._pre_eval_cache) > 256:
+                        self._pre_eval_cache.popitem(last=False)
 
-        if mahalanobis_d2 > eff_ood_thresh:
-            reasons.append(AutocallFallbackReason.MAHALANOBIS_OOD)
-
-        if conformal_active and conformal_hw_bps > tau_desk_bps:
-            reasons.append(AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH)
-            warnings.append(
-                f"CONFORMAL_UNCERTAINTY_BREACH: conformal_half_width_bps={conformal_hw_bps:.2f} > {tau_desk_bps:.2f}."
-            )
-
+        reasons = list(core_reasons)
+        warnings = list(core_warnings)
         do_record = (
             self.record_drift_by_default if record_drift is None else bool(record_drift)
         )
-        if do_record and bool(np.all(np.isfinite(summary_16d))):
+        if do_record and self.psi_window_size > 0 and bool(np.all(np.isfinite(summary_16d))):
             t_id = str(preproc_state.trade_info) if preproc_state.trade_info is not None else ""
+            feat_sig = hashlib.blake2b(np.round(summary_16d, 6).tobytes(), digest_size=8).hexdigest()
             should_push = True
             if t_id:
-                feat_sig = hashlib.blake2b(np.round(summary_16d, 6).tobytes(), digest_size=8).hexdigest()
                 dedup_id = f"{t_id}:{feat_sig}"
                 with self._lock:
                     if dedup_id in self._recent_psi_trade_ids or t_id in self._recent_psi_trade_ids:
+                        should_push = False
+                    else:
+                        self._recent_psi_trade_ids.append(dedup_id)
+            else:
+                digest_part = str(state_digest) if isinstance(state_digest, str) and state_digest else feat_sig
+                dedup_id = f"__anon__:{digest_part}:{feat_sig}"
+                with self._lock:
+                    if dedup_id in self._recent_psi_trade_ids:
                         should_push = False
                     else:
                         self._recent_psi_trade_ids.append(dedup_id)
@@ -1360,7 +2050,7 @@ class EQAutocallModelGuardian:
             "summary_features_16d": summary_16d,
             "warnings": warnings,
         }
-        return passed, reasons, r_psd, diagnostics
+        return passed, reasons, r_psd_out, diagnostics
 
     def evaluate_post_inference(
         self,
@@ -1372,102 +2062,62 @@ class EQAutocallModelGuardian:
         """Executes the Tier 3 Post-Inference Probability Simplex, Put-Spread Bound & Funded Residual Gate."""
         reasons: list[AutocallFallbackReason] = []
         m_rem = int(preproc_state.m_rem)
-        b_out = baseline_out if baseline_out is not None else preproc_state.baseline
+        b_out = _resolve_baseline_out(preproc_state, baseline_out)
 
         p_arr: npt.NDArray[np.float64] | None = None
         q_arr: npt.NDArray[np.float64] | None = None
+        s_arr: npt.NDArray[np.float64] | None = None
         l_put_val: float | None = None
         pv_surrogate: float | None = None
 
         if isinstance(surrogate_out, AutocallSurrogateOutput):
-            p_arr = (
-                surrogate_out.stopping_probs.detach()
-                .cpu()
-                .numpy()
-                .astype(np.float64)
-                .reshape(-1)[:m_rem]
-            )
-            q_arr = (
-                surrogate_out.coupon_probs.detach()
-                .cpu()
-                .numpy()
-                .astype(np.float64)
-                .reshape(-1)[:m_rem]
-            )
-            l_put_val = float(
-                surrogate_out.put_loss.detach().cpu().numpy().astype(np.float64).reshape(-1)[0]
-            )
+            p_arr = _extract_vec_m(surrogate_out.stopping_probs, m_rem)
+            q_arr = _extract_vec_m(surrogate_out.coupon_probs, m_rem)
+            l_put_val = _extract_scalar(surrogate_out.put_loss)
+            if m_rem > 0 and surrogate_out.survival_probs.numel() > 0:
+                s_arr = _extract_vec_m(surrogate_out.survival_probs, m_rem)
         elif isinstance(surrogate_out, dict):
-            if "stopping_probs" in surrogate_out or "p_stop" in surrogate_out:
-                raw_p = surrogate_out.get("stopping_probs", surrogate_out.get("p_stop"))
-                p_arr = np.asarray(
-                    raw_p.detach().cpu().numpy() if isinstance(raw_p, torch.Tensor) else raw_p,
-                    dtype=np.float64,
-                ).reshape(-1)[:m_rem]
-            if "coupon_probs" in surrogate_out or "q_cpn" in surrogate_out:
-                raw_q = surrogate_out.get("coupon_probs", surrogate_out.get("q_cpn"))
-                q_arr = np.asarray(
-                    raw_q.detach().cpu().numpy() if isinstance(raw_q, torch.Tensor) else raw_q,
-                    dtype=np.float64,
-                ).reshape(-1)[:m_rem]
-            if "put_loss" in surrogate_out or "l_put" in surrogate_out:
-                raw_l = surrogate_out.get("put_loss", surrogate_out.get("l_put"))
-                l_put_val = float(
-                    np.asarray(
-                        raw_l.detach().cpu().numpy() if isinstance(raw_l, torch.Tensor) else raw_l,
-                        dtype=np.float64,
-                    ).reshape(-1)[0]
-                )
+            raw_p = _first_non_none(surrogate_out, "stopping_probs", "p_stop")
+            if raw_p is not None:
+                p_arr = _extract_vec_m(raw_p, m_rem)
+            raw_q = _first_non_none(surrogate_out, "coupon_probs", "q_cpn")
+            if raw_q is not None:
+                q_arr = _extract_vec_m(raw_q, m_rem)
+            raw_l = _first_non_none(surrogate_out, "put_loss", "l_put")
+            if raw_l is not None:
+                l_put_val = _extract_scalar(raw_l)
+            raw_s = _first_non_none(surrogate_out, "survival_probs", "s_vec")
+            if raw_s is not None and m_rem > 0:
+                s_arr = _extract_vec_m(raw_s, m_rem)
 
         if isinstance(postproc_out, AutocallPostprocOutput):
-            pv_surrogate = float(postproc_out.product_value.detach().cpu().item())
+            pv_surrogate = _extract_scalar(postproc_out.product_value)
             if p_arr is None:
-                p_arr = (
-                    postproc_out.p_stop.detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float64)
-                    .reshape(-1)[:m_rem]
-                )
+                p_arr = _extract_vec_m(postproc_out.p_stop, m_rem)
             if q_arr is None:
-                q_arr = (
-                    postproc_out.q_cpn.detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float64)
-                    .reshape(-1)[:m_rem]
-                )
+                q_arr = _extract_vec_m(postproc_out.q_cpn, m_rem)
             if l_put_val is None:
-                l_put_val = float(postproc_out.l_put.detach().cpu().item())
+                l_put_val = _extract_scalar(postproc_out.l_put)
         elif isinstance(postproc_out, dict):
-            if "product_value" in postproc_out or "ProductValue" in postproc_out:
-                raw_pv = postproc_out.get("product_value", postproc_out.get("ProductValue"))
-                if raw_pv is not None:
-                    pv_surrogate = float(
-                        raw_pv.detach().cpu().item()
-                        if isinstance(raw_pv, torch.Tensor)
-                        else float(raw_pv)
-                    )
-            if p_arr is None and ("p_stop" in postproc_out or "stopping_probs" in postproc_out):
-                raw_p = postproc_out.get("p_stop", postproc_out.get("stopping_probs"))
-                p_arr = np.asarray(
-                    raw_p.detach().cpu().numpy() if isinstance(raw_p, torch.Tensor) else raw_p,
-                    dtype=np.float64,
-                ).reshape(-1)[:m_rem]
-            if q_arr is None and ("q_cpn" in postproc_out or "coupon_probs" in postproc_out):
-                raw_q = postproc_out.get("q_cpn", postproc_out.get("coupon_probs"))
-                q_arr = np.asarray(
-                    raw_q.detach().cpu().numpy() if isinstance(raw_q, torch.Tensor) else raw_q,
-                    dtype=np.float64,
-                ).reshape(-1)[:m_rem]
-            if l_put_val is None and ("l_put" in postproc_out or "put_loss" in postproc_out):
-                raw_l = postproc_out.get("l_put", postproc_out.get("put_loss"))
-                l_put_val = float(
-                    np.asarray(
-                        raw_l.detach().cpu().numpy() if isinstance(raw_l, torch.Tensor) else raw_l,
-                        dtype=np.float64,
-                    ).reshape(-1)[0]
-                )
+            raw_pv = _first_non_none(postproc_out, "product_value", "ProductValue")
+            if raw_pv is not None:
+                pv_surrogate = _extract_scalar(raw_pv)
+            if p_arr is None:
+                raw_p = _first_non_none(postproc_out, "p_stop", "stopping_probs")
+                if raw_p is not None:
+                    p_arr = _extract_vec_m(raw_p, m_rem)
+            if q_arr is None:
+                raw_q = _first_non_none(postproc_out, "q_cpn", "coupon_probs")
+                if raw_q is not None:
+                    q_arr = _extract_vec_m(raw_q, m_rem)
+            if l_put_val is None:
+                raw_l = _first_non_none(postproc_out, "l_put", "put_loss")
+                if raw_l is not None:
+                    l_put_val = _extract_scalar(raw_l)
+            if s_arr is None and m_rem > 0:
+                raw_s = _first_non_none(postproc_out, "survival_probs", "s_vec")
+                if raw_s is not None:
+                    s_arr = _extract_vec_m(raw_s, m_rem)
 
         if p_arr is None:
             p_arr = np.zeros(m_rem, dtype=np.float64)
@@ -1489,17 +2139,16 @@ class EQAutocallModelGuardian:
             else:
                 pv_surrogate = float("nan")
 
-        # 1. Non-finite check
         if (
             not bool(np.all(np.isfinite(p_arr)))
             or not bool(np.all(np.isfinite(q_arr)))
+            or (s_arr is not None and not bool(np.all(np.isfinite(s_arr))))
             or not np.isfinite(l_put_val)
             or not np.isfinite(pv_surrogate)
         ):
             reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
             return False, reasons
 
-        # 2. Simplex & probability bounds check
         sum_p = float(np.sum(p_arr)) if m_rem > 0 else 0.0
         p_out_of_bounds = m_rem > 0 and bool(
             np.any(p_arr < -1e-7) or np.any(p_arr > 1.0 + 1e-7)
@@ -1507,21 +2156,22 @@ class EQAutocallModelGuardian:
         q_out_of_bounds = m_rem > 0 and bool(
             np.any(q_arr < -1e-7) or np.any(q_arr > 1.0 + 1e-7)
         )
-        if sum_p > 1.0 + 1e-6 or p_out_of_bounds or q_out_of_bounds:
+        s_out_of_bounds = (
+            s_arr is not None
+            and s_arr.size > 0
+            and bool(np.any(s_arr < -1e-7) or np.any(s_arr > 1.0 + 1e-6))
+        )
+        s_non_monotone = (
+            s_arr is not None
+            and s_arr.size > 1
+            and bool(np.any(s_arr[1:] > s_arr[:-1] + 1e-6))
+        )
+        if sum_p > 1.0 + 1e-6 or p_out_of_bounds or q_out_of_bounds or s_out_of_bounds or s_non_monotone:
             reasons.append(AutocallFallbackReason.POST_INFERENCE_SIMPLEX_VIOLATION)
 
-        # 3. Terminal put-spread bound check: 0 <= L_put <= max(K_put - K_low, 0) * S_{M_rem}
         surv_term = max(1.0 - sum_p, 0.0)
-        if isinstance(surrogate_out, AutocallSurrogateOutput) and m_rem > 0:
-            surv_from_out = float(
-                surrogate_out.survival_probs.detach()
-                .cpu()
-                .numpy()
-                .astype(np.float64)
-                .reshape(-1)[min(m_rem - 1, surrogate_out.survival_probs.shape[-1] - 1)]
-            )
-            if np.isfinite(surv_from_out):
-                surv_term = max(min(surv_term, surv_from_out), 0.0)
+        if s_arr is not None and s_arr.size > 0:
+            surv_term = max(min(surv_term, float(s_arr[-1])), 0.0)
 
         k_put = max(float(preproc_state.strike), 0.0)
         k_low = (
@@ -1534,7 +2184,10 @@ class EQAutocallModelGuardian:
         if l_put_val < -1e-7 or l_put_val > max_put_bound:
             reasons.append(AutocallFallbackReason.POST_INFERENCE_PUT_BOUND_VIOLATION)
 
-        # 4. Funded-vs-funded proxy residual outlier check (EXT-012)
+        if b_out is None:
+            reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
+            return False, reasons
+
         pv_proxy_unfunded = float(b_out.product_value_proxy.detach().cpu().item())
         if preproc_state.funding_leg is not None:
             asm_proxy = assemble_autocall_cashflows_and_pv(
@@ -1545,26 +2198,36 @@ class EQAutocallModelGuardian:
         else:
             pv_proxy = pv_proxy_unfunded
 
+        if not math.isfinite(pv_proxy):
+            reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
+            return False, reasons
+
         if self.residual_threshold is None:
-            w_np = b_out.proxy_delta_weights.detach().cpu().numpy().astype(np.float64)
+            w_np = _as_f64_np(b_out.proxy_delta_weights)
             w_abs = np.abs(w_np)
             w_sum = max(float(np.sum(w_abs)), 1e-6)
             w_norm = w_abs / w_sum
             h_disp = float(np.clip(1.0 - np.sum(w_norm * w_norm), 0.0, 1.0))
             v_bar = (
-                float(np.mean(b_out.v_w.detach().cpu().numpy().astype(np.float64)))
-                if m_rem > 0
+                float(np.mean(_as_f64_np(b_out.v_w)[:m_rem]))
+                if (m_rem > 0 and b_out.v_w.numel() > 0)
                 else 0.0
             )
-            tau_res = min(
+            raw_tau = (
                 0.0050
                 + 0.0350 * h_disp * math.sqrt(max(v_bar, 1e-4))
                 + 0.0450 * max((m_rem - 10) / 38.0, 0.0)
-                + 0.0150 * max(int(preproc_state.d_assets) - 2, 0),
-                0.0750,
+                + 0.0150 * max(int(preproc_state.d_assets) - 2, 0)
             )
+            if not math.isfinite(raw_tau):
+                reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
+                return False, reasons
+            tau_res = min(raw_tau, 0.0750)
         else:
             tau_res = float(self.residual_threshold)
+            if not math.isfinite(tau_res):
+                reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
+                return False, reasons
         if abs(pv_surrogate - pv_proxy) > tau_res:
             reasons.append(AutocallFallbackReason.POST_INFERENCE_RESIDUAL_OUTLIER)
 
@@ -1577,48 +2240,160 @@ class EQAutocallModelGuardian:
     ) -> AutocallBaselineOutput:
         """Updates `preproc_state` in-place with the PSD-projected correlation matrix `r_psd` in float64."""
         d_assets = int(preproc_state.d_assets)
+        m_rem = int(preproc_state.m_rem)
         device = preproc_state.spots_t0.device
-        corr_t = torch.as_tensor(r_psd, dtype=torch.float64, device=device)
+        r_psd_c = np.ascontiguousarray(r_psd, dtype=np.float64)
+        corr_t = torch.as_tensor(r_psd_c, dtype=torch.float64, device=device)
         preproc_state.corr_matrix = corr_t
 
-        if d_assets > 0:
-            edge_clone = preproc_state.edge_feats.clone()
-            edge_clone[0, :d_assets, :d_assets, int(AutocallEdgeCol.CORR_RHO)] = corr_t
-            if preproc_state.m_rem > 0:
-                v_term = preproc_state.v_perf[:, -1]
-                cov_t = corr_t * v_term.unsqueeze(1) * v_term.unsqueeze(0)
-                edge_clone[0, :d_assets, :d_assets, int(AutocallEdgeCol.COVARIANCE_TERM)] = cov_t
-            preproc_state.edge_feats = edge_clone
+        if (
+            d_assets > 0
+            and preproc_state.edge_feats.ndim == 4
+            and preproc_state.edge_feats.shape[0] > 0
+        ):
+            d_edge = min(
+                d_assets,
+                int(preproc_state.edge_feats.shape[1]),
+                int(preproc_state.edge_feats.shape[2]),
+                int(corr_t.shape[0]) if corr_t.ndim == 2 else 0,
+                int(corr_t.shape[1]) if corr_t.ndim == 2 else 0,
+            )
+            if d_edge > 0:
+                edge_clone = preproc_state.edge_feats.clone()
+                edge_clone[0, :d_edge, :d_edge, int(AutocallEdgeCol.CORR_RHO)] = corr_t[:d_edge, :d_edge]
+                if (
+                    m_rem > 0
+                    and preproc_state.v_perf.ndim == 2
+                    and preproc_state.v_perf.shape[0] >= d_edge
+                    and preproc_state.v_perf.shape[1] > 0
+                ):
+                    v_term = preproc_state.v_perf[:d_edge, -1]
+                    cov_t = corr_t[:d_edge, :d_edge] * v_term.unsqueeze(1) * v_term.unsqueeze(0)
+                    edge_clone[0, :d_edge, :d_edge, int(AutocallEdgeCol.COVARIANCE_TERM)] = cov_t
+                preproc_state.edge_feats = edge_clone
 
-        new_baseline = compute_analytical_autocall_baseline(preproc_state)
-        preproc_state.baseline = new_baseline
-        if d_assets > 0:
-            node_clone = preproc_state.node_feats.clone()
-            node_clone[0, :d_assets, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)] = (
-                new_baseline.proxy_delta_weights.to(dtype=node_clone.dtype, device=device)
-            )
-            preproc_state.node_feats = node_clone
-        m_rem = int(preproc_state.m_rem)
-        if m_rem > 0:
-            sched_clone = preproc_state.sched_feats.clone()
-            sched_clone[0, :m_rem, int(AutocallSchedCol.STULZ_FWD_W)] = torch.log(
-                new_baseline.f_w.clamp(min=1e-12)
-            ).to(dtype=sched_clone.dtype, device=device)
-            sched_clone[0, :m_rem, int(AutocallSchedCol.STULZ_VOL_W)] = new_baseline.v_w.to(
-                dtype=sched_clone.dtype, device=device
-            )
-            sched_clone[0, :m_rem, int(AutocallSchedCol.PROXY_KO_PROB)] = new_baseline.p_proxy.to(
-                dtype=sched_clone.dtype, device=device
-            )
-            sched_clone[0, :m_rem, int(AutocallSchedCol.PROXY_CPN_PROB)] = new_baseline.q_proxy.to(
-                dtype=sched_clone.dtype, device=device
-            )
-            preproc_state.sched_feats = sched_clone
-        glob_clone = preproc_state.global_feats.clone()
-        glob_clone[0, int(AutocallGlobalCol.L_PUT_PROXY)] = new_baseline.l_put_proxy.to(
-            dtype=glob_clone.dtype, device=device
+        baseline_tensors = (
+            preproc_state.forward_perf,
+            preproc_state.v_perf,
+            preproc_state.df_pay,
+            preproc_state.ko_barriers,
+            preproc_state.is_callable,
+            preproc_state.cpn_barriers,
+            preproc_state.is_guaranteed_cpn,
+            preproc_state.coupon_amounts,
+            preproc_state.tau_obs,
         )
-        preproc_state.global_feats = glob_clone
+        can_cache = not any(t.requires_grad for t in baseline_tensors)
+        cache_key: tuple[bytes, bytes, str] | None = None
+        new_baseline: AutocallBaselineOutput | None = None
+        if can_cache:
+            h = hashlib.blake2b(digest_size=16)
+            for t in baseline_tensors:
+                h.update(_as_f64_np(t).tobytes())
+            inv_perm = getattr(preproc_state, "inv_lex_perm", None)
+            if inv_perm is not None:
+                h.update(np.ascontiguousarray(inv_perm, dtype=np.int64).tobytes())
+            h.update(
+                struct.pack(
+                    "!dddddddddd???",
+                    float(preproc_state.strike),
+                    float(preproc_state.option_gearing),
+                    float(preproc_state.lower_strike) if preproc_state.lower_strike is not None else -1.0,
+                    float(preproc_state.ki_barrier) if preproc_state.ki_barrier is not None else -1.0,
+                    float(preproc_state.i_ki_past),
+                    float(preproc_state.c_mem_0),
+                    float(preproc_state.ko_spread),
+                    float(preproc_state.cpn_spread),
+                    float(preproc_state.ki_spread),
+                    float(preproc_state.autocall_coupon),
+                    bool(preproc_state.is_memory),
+                    bool(preproc_state.no_notional_repayment),
+                    bool(preproc_state.force_coupons_on_autocall),
+                )
+            )
+            h.update(
+                struct.pack(
+                    "!dddd???",
+                    float(preproc_state.pv_in_transit),
+                    float(preproc_state.participation_call_strike) if preproc_state.participation_call_strike is not None else -1.0,
+                    float(preproc_state.participation_call_rate),
+                    float(preproc_state.one_star_strike) if preproc_state.one_star_strike is not None else -1.0,
+                    bool(preproc_state.allow_autocall_on_expiry),
+                    bool(preproc_state.is_long_basket),
+                    bool(preproc_state.already_autocalled),
+                )
+            )
+            h.update(
+                f"{preproc_state.one_star_coupon}|{preproc_state.coupon_barrier_type}|"
+                f"{preproc_state.coupon_barrier_direction}|{preproc_state.callability_index}|"
+                f"{preproc_state.coupon_index}|{preproc_state.option_index}".encode("utf-8")
+            )
+            cache_key = (r_psd_c.tobytes(), h.digest(), str(device))
+            with _SHRUNK_BASELINE_CACHE_LOCK:
+                cached_b = _SHRUNK_BASELINE_CACHE.get(cache_key)
+                if cached_b is not None:
+                    _SHRUNK_BASELINE_CACHE.move_to_end(cache_key)
+                    new_baseline = copy.copy(cached_b)
+
+        if new_baseline is None:
+            new_baseline = compute_analytical_autocall_baseline(preproc_state)
+            if cache_key is not None:
+                for v in vars(new_baseline).values():
+                    if isinstance(v, torch.Tensor) and v.requires_grad:
+                        v.requires_grad_(False)
+                with _SHRUNK_BASELINE_CACHE_LOCK:
+                    _SHRUNK_BASELINE_CACHE[cache_key] = copy.copy(new_baseline)
+                    _SHRUNK_BASELINE_CACHE.move_to_end(cache_key)
+                    while len(_SHRUNK_BASELINE_CACHE) > _SHRUNK_BASELINE_CACHE_MAXSIZE:
+                        _SHRUNK_BASELINE_CACHE.popitem(last=False)
+
+        preproc_state.baseline = new_baseline
+        if d_assets > 0 and preproc_state.node_feats.ndim >= 3 and preproc_state.node_feats.shape[0] > 0:
+            d_node = min(
+                d_assets,
+                int(preproc_state.node_feats.shape[1]),
+                int(new_baseline.proxy_delta_weights.numel()),
+            )
+            if d_node > 0:
+                node_clone = preproc_state.node_feats.clone()
+                node_clone[0, :d_node, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)] = (
+                    new_baseline.proxy_delta_weights.reshape(-1)[:d_node].to(
+                        dtype=node_clone.dtype, device=device
+                    )
+                )
+                preproc_state.node_feats = node_clone
+        if m_rem > 0 and preproc_state.sched_feats.ndim >= 3 and preproc_state.sched_feats.shape[0] > 0:
+            m_sched = min(
+                m_rem,
+                int(preproc_state.sched_feats.shape[1]),
+                int(new_baseline.f_w.numel()),
+                int(new_baseline.v_w.numel()),
+                int(new_baseline.p_proxy.numel()),
+                int(new_baseline.q_proxy.numel()),
+            )
+            if m_sched > 0:
+                sched_clone = preproc_state.sched_feats.clone()
+                sched_clone[0, :m_sched, int(AutocallSchedCol.STULZ_FWD_W)] = torch.log(
+                    new_baseline.f_w.reshape(-1)[:m_sched].clamp(min=1e-12)
+                ).to(dtype=sched_clone.dtype, device=device)
+                sched_clone[0, :m_sched, int(AutocallSchedCol.STULZ_VOL_W)] = (
+                    new_baseline.v_w.reshape(-1)[:m_sched].to(dtype=sched_clone.dtype, device=device)
+                )
+                sched_clone[0, :m_sched, int(AutocallSchedCol.PROXY_KO_PROB)] = (
+                    new_baseline.p_proxy.reshape(-1)[:m_sched].to(dtype=sched_clone.dtype, device=device)
+                )
+                sched_clone[0, :m_sched, int(AutocallSchedCol.PROXY_CPN_PROB)] = (
+                    new_baseline.q_proxy.reshape(-1)[:m_sched].to(dtype=sched_clone.dtype, device=device)
+                )
+                preproc_state.sched_feats = sched_clone
+        if preproc_state.global_feats.ndim >= 2 and preproc_state.global_feats.shape[0] > 0:
+            glob_clone = preproc_state.global_feats.clone()
+            glob_clone[0, int(AutocallGlobalCol.L_PUT_PROXY)] = new_baseline.l_put_proxy.to(
+                dtype=glob_clone.dtype, device=device
+            )
+            preproc_state.global_feats = glob_clone
+        if hasattr(preproc_state, "state_digest"):
+            preproc_state.state_digest = _compute_preproc_state_digest(preproc_state)
         return new_baseline
 
     def _extract_batch_16d_summary(
@@ -1639,43 +2414,47 @@ class EQAutocallModelGuardian:
         glob_np = global_feats.detach().cpu().numpy().astype(np.float64)
 
         b_sz = node_np.shape[0]
-        out = np.zeros((b_sz, 16), dtype=np.float64)
-        a_cnt = np.maximum(np.sum(amask_np, axis=1), 1).astype(np.float64)
-        log_m = node_np[:, :, int(AutocallNodeCol.LOG_MONEYNESS)]
-        log_m_masked_min = np.where(amask_np, log_m, np.inf)
-        log_m_masked_max = np.where(amask_np, log_m, -np.inf)
-        has_a = np.any(amask_np, axis=1)
-        out[:, 0] = np.where(has_a, np.sum(np.where(amask_np, log_m, 0.0), axis=1) / a_cnt, 0.0)
-        out[:, 1] = np.where(has_a, np.min(log_m_masked_min, axis=1), 0.0)
-        out[:, 2] = np.where(has_a, np.max(log_m_masked_max, axis=1), 0.0)
-
-        iv_s = node_np[:, :, int(AutocallNodeCol.IV_SHORT_ATM)]
-        iv_t = node_np[:, :, int(AutocallNodeCol.IV_TERM_ATM)]
-        out[:, 3] = np.where(has_a, np.sum(np.where(amask_np, iv_t, 0.0), axis=1) / a_cnt, 0.0)
-        out[:, 4] = np.where(
-            has_a,
-            np.max(np.where(amask_np, np.maximum(iv_s, iv_t), -np.inf), axis=1),
-            0.0,
-        )
-        div_l = node_np[:, :, int(AutocallNodeCol.CASH_DIV_LEVERAGE)]
-        out[:, 7] = np.where(has_a, np.max(np.where(amask_np, div_l, -np.inf), axis=1), 0.0)
-
         d_max = node_np.shape[1]
-        eye_d = np.eye(d_max, dtype=bool)[None, :, :]
-        pair_mask = amask_np[:, :, None] & amask_np[:, None, :] & (~eye_d)
-        pair_cnt = np.sum(pair_mask, axis=(1, 2))
-        has_pair = pair_cnt > 0
-        corr_mat = edge_np[:, :, :, int(AutocallEdgeCol.CORR_RHO)]
-        out[:, 5] = np.where(
-            has_pair,
-            np.sum(np.where(pair_mask, corr_mat, 0.0), axis=(1, 2)) / np.maximum(pair_cnt, 1),
-            0.45,
-        )
-        out[:, 6] = np.where(
-            has_pair,
-            np.min(np.where(pair_mask, corr_mat, np.inf), axis=(1, 2)),
-            0.25,
-        )
+        out = np.zeros((b_sz, 16), dtype=np.float64)
+        if d_max > 0:
+            a_cnt = np.maximum(np.sum(amask_np, axis=1), 1).astype(np.float64)
+            log_m = node_np[:, :, int(AutocallNodeCol.LOG_MONEYNESS)]
+            log_m_masked_min = np.where(amask_np, log_m, np.inf)
+            log_m_masked_max = np.where(amask_np, log_m, -np.inf)
+            has_a = np.any(amask_np, axis=1)
+            out[:, 0] = np.where(has_a, np.sum(np.where(amask_np, log_m, 0.0), axis=1) / a_cnt, 0.0)
+            out[:, 1] = np.where(has_a, np.min(log_m_masked_min, axis=1), 0.0)
+            out[:, 2] = np.where(has_a, np.max(log_m_masked_max, axis=1), 0.0)
+
+            iv_s = node_np[:, :, int(AutocallNodeCol.IV_SHORT_ATM)]
+            iv_t = node_np[:, :, int(AutocallNodeCol.IV_TERM_ATM)]
+            out[:, 3] = np.where(has_a, np.sum(np.where(amask_np, iv_t, 0.0), axis=1) / a_cnt, 0.0)
+            out[:, 4] = np.where(
+                has_a,
+                np.max(np.where(amask_np, np.maximum(iv_s, iv_t), -np.inf), axis=1),
+                0.0,
+            )
+            div_l = node_np[:, :, int(AutocallNodeCol.CASH_DIV_LEVERAGE)]
+            out[:, 7] = np.where(has_a, np.max(np.where(amask_np, div_l, -np.inf), axis=1), 0.0)
+
+            eye_d = np.eye(d_max, dtype=bool)[None, :, :]
+            pair_mask = amask_np[:, :, None] & amask_np[:, None, :] & (~eye_d)
+            pair_cnt = np.sum(pair_mask, axis=(1, 2))
+            has_pair = pair_cnt > 0
+            corr_mat = edge_np[:, :, :, int(AutocallEdgeCol.CORR_RHO)]
+            out[:, 5] = np.where(
+                has_pair,
+                np.sum(np.where(pair_mask, corr_mat, 0.0), axis=(1, 2)) / np.maximum(pair_cnt, 1),
+                0.45,
+            )
+            out[:, 6] = np.where(
+                has_pair,
+                np.min(np.where(pair_mask, corr_mat, np.inf), axis=(1, 2)),
+                0.25,
+            )
+        else:
+            out[:, 5] = 0.45
+            out[:, 6] = 0.25
 
         m_cnt = np.sum(smask_np, axis=1)
         has_m = m_cnt > 0
@@ -1856,12 +2635,15 @@ class EQAutocallModelGuardian:
                 )
             else:
                 q_err_vec = np.full(b_sz, q_err, dtype=np.float64)
-            conf_hw_vec = np.maximum(q_err_vec * (phi_mat @ w5) * 1e4, 0.0)
+            raw_conf_hw = np.maximum(q_err_vec * (phi_mat @ w5) * 1e4, 0.0)
+            conf_valid = finite_mask & np.isfinite(raw_conf_hw)
+            conf_hw_vec = np.where(conf_valid, raw_conf_hw, 1e6)
         else:
+            conf_valid = np.ones(b_sz, dtype=bool)
             conf_hw_vec = np.zeros(b_sz, dtype=np.float64)
 
         do_record = self.record_drift_by_default if record_drift is None else bool(record_drift)
-        if do_record and b_sz > 0:
+        if do_record and self.psi_window_size > 0 and b_sz > 0:
             finite_rows = summary_batch[finite_mask]
             if len(finite_rows) > 0:
                 if len(finite_rows) > 1 and bool(np.all(finite_rows == finite_rows[0])):
@@ -1893,7 +2675,11 @@ class EQAutocallModelGuardian:
             else float(self.psi_fallback_threshold)
         )
         ood_flags = d2_vec > eff_ood
-        conf_flags = conf_hw_vec > tau_desk if conformal_active else np.zeros(b_sz, dtype=bool)
+        conf_flags = (
+            ((~conf_valid) | (conf_hw_vec > tau_desk))
+            if conformal_active
+            else np.zeros(b_sz, dtype=bool)
+        )
         return {
             "batch_size": b_sz,
             "max_mahalanobis_d2": float(np.max(d2_vec)) if b_sz > 0 else 0.0,
@@ -1914,8 +2700,14 @@ class EQAutocallModelGuardian:
         product_value: torch.Tensor,
         sched_mask: torch.Tensor,
         global_feats: torch.Tensor,
+        *,
+        survival_probs: torch.Tensor | None = None,
+        sched_feats: torch.Tensor | None = None,
+        pv_proxy: torch.Tensor | None = None,
+        node_feats: torch.Tensor | None = None,
+        asset_mask: torch.Tensor | None = None,
     ) -> dict[str, Any]:
-        """Vectorized SR 26-2 post-inference simplex, put-spread & finiteness audit for batches."""
+        """Vectorized SR 26-2 post-inference simplex, survival, put-spread, outlier & finiteness audit."""
         with torch.no_grad():
             finite_ok = (
                 torch.isfinite(stopping_probs).all(dim=1)
@@ -1932,23 +2724,90 @@ class EQAutocallModelGuardian:
                 & ((p_act >= -1e-7) & (p_act <= 1.0 + 1e-7)).all(dim=1)
                 & ((q_act >= -1e-7) & (q_act <= 1.0 + 1e-7)).all(dim=1)
             )
+            surv_term = (1.0 - sum_p).clamp(min=0.0)
+
+            if survival_probs is not None:
+                finite_ok = finite_ok & torch.isfinite(survival_probs).all(dim=1)
+                s_bounds = torch.where(
+                    sm_b,
+                    (survival_probs >= -1e-7) & (survival_probs <= 1.0 + 1e-6),
+                    torch.ones_like(sm_b),
+                ).all(dim=1)
+                if survival_probs.shape[1] > 1:
+                    both_act = sm_b[:, 1:] & sm_b[:, :-1]
+                    s_mono = torch.where(
+                        both_act,
+                        survival_probs[:, 1:] <= survival_probs[:, :-1] + 1e-6,
+                        torch.ones_like(both_act),
+                    ).all(dim=1)
+                else:
+                    s_mono = torch.ones_like(finite_ok)
+                simplex_ok = simplex_ok & s_bounds & s_mono
+                if survival_probs.shape[1] > 0:
+                    has_sched = sm_b.any(dim=1)
+                    idx_grid = torch.arange(survival_probs.shape[1], device=survival_probs.device).unsqueeze(0)
+                    last_idx = torch.where(sm_b, idx_grid, torch.zeros_like(idx_grid)).argmax(dim=1, keepdim=True)
+                    s_last = torch.gather(survival_probs, dim=1, index=last_idx).squeeze(1)
+                    surv_term = torch.where(
+                        has_sched, torch.minimum(surv_term, s_last.clamp(min=0.0)), surv_term
+                    )
+
             k_put = global_feats[:, int(AutocallGlobalCol.K_PUT)].clamp(min=0.0)
             if global_feats.shape[1] > int(AutocallGlobalCol.LOWER_STRIKE):
                 k_low = global_feats[:, int(AutocallGlobalCol.LOWER_STRIKE)].clamp(min=0.0)
             else:
                 k_low = torch.zeros_like(k_put)
             k_eff = (k_put - k_low).clamp(min=0.0)
-            surv_term = (1.0 - sum_p).clamp(min=0.0)
             put_ok = (put_loss >= -1e-7) & (put_loss <= k_eff * surv_term + 1e-6)
+
+            if pv_proxy is not None:
+                finite_ok = finite_ok & torch.isfinite(pv_proxy)
+                zero_pv = torch.zeros((), dtype=pv_proxy.dtype, device=pv_proxy.device)
+                if self.residual_threshold is not None:
+                    tau_res_t = torch.full_like(pv_proxy, float(self.residual_threshold))
+                elif sched_feats is not None and node_feats is not None and asset_mask is not None:
+                    am_f = (asset_mask > 0.5).to(dtype=pv_proxy.dtype)
+                    w_raw = node_feats[:, :, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)].abs().to(dtype=pv_proxy.dtype)
+                    w_abs = torch.where(am_f > 0.5, w_raw, zero_pv)
+                    w_sum = w_abs.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                    w_norm = w_abs / w_sum
+                    h_disp_t = (1.0 - (w_norm * w_norm).sum(dim=1)).clamp(0.0, 1.0)
+                    sm_f = sm_b.to(dtype=pv_proxy.dtype)
+                    m_cnt = sm_f.sum(dim=1)
+                    v_raw = sched_feats[:, :, int(AutocallSchedCol.STULZ_VOL_W)].to(dtype=pv_proxy.dtype)
+                    v_bar_t = torch.where(sm_f > 0.5, v_raw, zero_pv).sum(dim=1) / m_cnt.clamp(min=1.0)
+                    d_cnt = am_f.sum(dim=1)
+                    tau_res_t = torch.clamp(
+                        0.0050
+                        + 0.0350 * h_disp_t * torch.sqrt(v_bar_t.clamp(min=1e-4))
+                        + 0.0450 * ((m_cnt - 10.0) / 38.0).clamp(min=0.0)
+                        + 0.0150 * (d_cnt - 2.0).clamp(min=0.0),
+                        max=0.0750,
+                    )
+                else:
+                    tau_res_t = torch.full_like(pv_proxy, 0.0750)
+                tau_finite = torch.isfinite(tau_res_t)
+                finite_ok = finite_ok & tau_finite
+                tau_safe = torch.where(tau_finite, tau_res_t, zero_pv)
+                res_bad = finite_ok & ((product_value - pv_proxy).abs() > tau_safe)
+            else:
+                res_bad = torch.zeros_like(finite_ok, dtype=torch.bool)
+
             counts = torch.stack(
-                [(~finite_ok).sum(), (~simplex_ok).sum(), (~put_ok).sum()]
+                [(~finite_ok).sum(), (~simplex_ok).sum(), (~put_ok).sum(), res_bad.sum()]
             ).tolist()
-        nf_cnt, sim_cnt, put_cnt = int(counts[0]), int(counts[1]), int(counts[2])
+        nf_cnt, sim_cnt, put_cnt, res_cnt = (
+            int(counts[0]),
+            int(counts[1]),
+            int(counts[2]),
+            int(counts[3]),
+        )
         return {
-            "all_passed": (nf_cnt == 0 and sim_cnt == 0 and put_cnt == 0),
+            "all_passed": (nf_cnt == 0 and sim_cnt == 0 and put_cnt == 0 and res_cnt == 0),
             "non_finite_count": nf_cnt,
             "simplex_violation_count": sim_cnt,
             "put_bound_violation_count": put_cnt,
+            "residual_outlier_count": res_cnt,
         }
 
     def record_batch_audit(
@@ -1975,6 +2834,8 @@ class EQAutocallModelGuardian:
             fb_reasons.append(AutocallFallbackReason.POST_INFERENCE_SIMPLEX_VIOLATION.value)
         if post_diag.get("put_bound_violation_count", 0) > 0:
             fb_reasons.append(AutocallFallbackReason.POST_INFERENCE_PUT_BOUND_VIOLATION.value)
+        if post_diag.get("residual_outlier_count", 0) > 0:
+            fb_reasons.append(AutocallFallbackReason.POST_INFERENCE_RESIDUAL_OUTLIER.value)
 
         rec = SR262AuditRecord(
             trade_id=trade_id,
@@ -1998,6 +2859,33 @@ class EQAutocallModelGuardian:
             self.audit_log.append(rec)
         return rec
 
+    def update_latest_audit_record(
+        self,
+        record: SR262AuditRecord | None = None,
+        *,
+        greeks_engine_used: str | None = None,
+        warnings: Sequence[str] | None = None,
+        fallback_reasons: Sequence[AutocallFallbackReason | str] | None = None,
+    ) -> SR262AuditRecord | None:
+        """Atomically updates `record` (or `self.audit_log[-1]`) in-place after downstream post-processing."""
+        with self._lock:
+            target = record if record is not None else (self.audit_log[-1] if self.audit_log else None)
+            if target is None:
+                return None
+            if greeks_engine_used is not None:
+                target.greeks_engine_used = str(greeks_engine_used)
+            if warnings:
+                for w_item in warnings:
+                    w_str = str(w_item)
+                    if w_str not in target.warnings:
+                        target.warnings.append(w_str)
+            if fallback_reasons:
+                for r_item in fallback_reasons:
+                    r_val = r_item.value if isinstance(r_item, AutocallFallbackReason) else str(r_item)
+                    if r_val not in target.fallback_reasons:
+                        target.fallback_reasons.append(r_val)
+            return target
+
     def price_with_guardian(
         self,
         req_or_state: Any,
@@ -2011,6 +2899,9 @@ class EQAutocallModelGuardian:
         seed: int | None = None,
         greeks_fn: Any = None,
         greeks_engine_used: str | None = None,
+        surrogate_forward_fn: Any = None,
+        qmc_greeks_fn: Any = None,
+        pre_gate_result: Any = None,
     ) -> GuardianPricingResult:
         """Executes the guarded 4-Tier pricing pipeline with deterministic failover to Dupire QMC."""
         if isinstance(req_or_state, AutocallPreprocState):
@@ -2028,16 +2919,23 @@ class EQAutocallModelGuardian:
             )
         )
 
-        pre_passed, pre_reasons, r_psd, diag = self.evaluate_pre_inference(
-            state,
-            state.baseline,
-            record_drift=record_drift,
-        )
+        if pre_gate_result is not None:
+            pre_passed, pre_reasons, r_psd, diag = pre_gate_result
+        else:
+            pre_passed, pre_reasons, r_psd, diag = self.evaluate_pre_inference(
+                state,
+                state.baseline,
+                record_drift=record_drift,
+            )
 
-        if diag["correlation_shrunk_applied"] or (
-            AutocallFallbackReason.CORRELATION_NOT_PSD in pre_reasons
+        if AutocallFallbackReason.NON_FINITE_OUTPUT not in pre_reasons and (
+            diag["correlation_shrunk_applied"]
+            or AutocallFallbackReason.CORRELATION_NOT_PSD in pre_reasons
         ):
-            self._apply_shrunk_correlation_to_state(state, r_psd)
+            r_psd_np = np.asarray(r_psd, dtype=np.float64)
+            corr_np = _as_f64_np(state.corr_matrix)
+            if corr_np.shape != r_psd_np.shape or not np.allclose(corr_np, r_psd_np, rtol=0.0, atol=1e-12):
+                self._apply_shrunk_correlation_to_state(state, r_psd)
 
         all_reasons: list[AutocallFallbackReason] = list(pre_reasons)
         warnings: list[str] = list(diag["warnings"])
@@ -2113,57 +3011,68 @@ class EQAutocallModelGuardian:
         post_surr: AutocallPostprocOutput | None = None
         greeks_res: Any = None
 
-        if pre_passed and not force_qmc and surrogate is not None:
-            if greeks_fn is not None and callable(greeks_fn):
-                greeks_res = greeks_fn(state, surrogate)
-                post_surr = greeks_res.postproc_output
-                assert post_surr is not None
-                p_stop_t = post_surr.p_stop
-                q_cpn_t = post_surr.q_cpn
-                l_put_t = post_surr.l_put
-            else:
-                tier2_inputs = state.to_tier2_float32_tensors()
-                surr_device = next(surrogate.parameters()).device
-                t2_dev = {k: v.to(device=surr_device) for k, v in tier2_inputs.items()}
-                with torch.no_grad():
-                    surrogate_out = surrogate(
-                        node_feats=t2_dev["node_feats"],
-                        edge_feats=t2_dev["edge_feats"],
-                        asset_mask=t2_dev["asset_mask"],
-                        sched_feats=t2_dev["sched_feats"],
-                        sched_mask=t2_dev["sched_mask"],
-                        global_feats=t2_dev["global_feats"],
-                    )
-
-                m_rem = state.m_rem
-                s_dev = state.spots_t0.device
-                p_stop_t = (
-                    surrogate_out.stopping_probs[0, :m_rem]
-                    .to(dtype=torch.float64, device=s_dev)
+        if pre_passed and not force_qmc and (surrogate is not None or surrogate_forward_fn is not None):
+            def _eval_surrogate_forward_post() -> tuple[Any, AutocallPostprocOutput, torch.Tensor, torch.Tensor, torch.Tensor]:
+                if surrogate_forward_fn is not None and callable(surrogate_forward_fn):
+                    s_out_loc = surrogate_forward_fn(state)
+                else:
+                    assert surrogate is not None
+                    tier2_inputs = state.to_tier2_float32_tensors()
+                    surr_param = next(surrogate.parameters(), None)
+                    if surr_param is not None:
+                        surr_device = surr_param.device
+                    else:
+                        surr_buf = next(surrogate.buffers(), None)
+                        surr_device = surr_buf.device if surr_buf is not None else state.spots_t0.device
+                    t2_dev = {k: v.to(device=surr_device) for k, v in tier2_inputs.items()}
+                    with torch.no_grad():
+                        s_out_loc = surrogate(
+                            node_feats=t2_dev["node_feats"],
+                            edge_feats=t2_dev["edge_feats"],
+                            asset_mask=t2_dev["asset_mask"],
+                            sched_feats=t2_dev["sched_feats"],
+                            sched_mask=t2_dev["sched_mask"],
+                            global_feats=t2_dev["global_feats"],
+                        )
+                m_rem_loc = state.m_rem
+                s_dev_loc = state.spots_t0.device
+                p_stop_loc = (
+                    s_out_loc.stopping_probs[0, :m_rem_loc]
+                    .to(dtype=torch.float64, device=s_dev_loc)
                     * state.is_callable
                 )
-                q_cpn_t = surrogate_out.coupon_probs[0, :m_rem].to(
-                    dtype=torch.float64, device=s_dev
+                q_cpn_loc = s_out_loc.coupon_probs[0, :m_rem_loc].to(
+                    dtype=torch.float64, device=s_dev_loc
                 )
-                l_put_t = surrogate_out.put_loss[0].to(dtype=torch.float64, device=s_dev)
-
-                post_surr = assemble_autocall_cashflows_and_pv(
+                l_put_loc = s_out_loc.put_loss[0].to(dtype=torch.float64, device=s_dev_loc)
+                post_loc = assemble_autocall_cashflows_and_pv(
                     state,
-                    p_stop=p_stop_t,
-                    q_cpn=q_cpn_t,
-                    l_put=l_put_t,
+                    p_stop=p_stop_loc,
+                    q_cpn=q_cpn_loc,
+                    l_put=l_put_loc,
                     option_se=0.0,
                 )
+                return s_out_loc, post_loc, p_stop_loc, q_cpn_loc, l_put_loc
 
+            surrogate_out, post_surr, p_stop_t, q_cpn_t, l_put_t = _eval_surrogate_forward_post()
             post_passed, post_reasons = self.evaluate_post_inference(
                 surrogate_out,
                 post_surr,
                 state,
                 state.baseline,
             )
+            if post_passed and greeks_fn is not None and callable(greeks_fn):
+                greeks_res = greeks_fn(state, surrogate)
             if post_passed:
+                greeks_res_eng = (
+                    greeks_res.get("greeks_engine_used")
+                    if isinstance(greeks_res, dict)
+                    else getattr(greeks_res, "greeks_engine_used", None)
+                )
                 eff_greeks_t2 = greeks_engine_used or (
-                    "Tier2_SingleVJP_AD" if greeks_res is not None else "None"
+                    str(greeks_res_eng)
+                    if greeks_res_eng is not None
+                    else ("Tier2_SingleVJP_AD" if greeks_res is not None else "None")
                 )
                 audit_t2 = SR262AuditRecord(
                     trade_id=trade_id,
@@ -2234,6 +3143,70 @@ class EQAutocallModelGuardian:
                 and ("TwinWin" not in idx_set)
             )
 
+        qmc_g_out: Any = None
+        if (
+            qmc_greeks_fn is not None
+            and callable(qmc_greeks_fn)
+            and state.m_rem > 0
+            and not state.already_autocalled
+        ):
+            qmc_g_out = qmc_greeks_fn(state)
+
+        if qmc_g_out is not None and getattr(qmc_g_out, "postproc_output", None) is not None:
+            post_qmc = qmc_g_out.postproc_output
+            eff_greeks_qmc = greeks_engine_used or str(
+                getattr(qmc_g_out, "greeks_engine_used", "Tier4_DupireQMC_CRN")
+            )
+            audit_fb = SR262AuditRecord(
+                trade_id=trade_id,
+                timestamp_utc=ts_utc,
+                pre_gate_passed=pre_passed,
+                post_gate_passed=post_passed,
+                fallback_triggered=True,
+                fallback_reasons=[r.value for r in all_reasons],
+                warnings=warnings,
+                min_corr_eigenvalue_raw=diag["min_corr_eigenvalue_raw"],
+                min_corr_eigenvalue_shrunk=diag["min_corr_eigenvalue_shrunk"],
+                correlation_shrunk_applied=diag["correlation_shrunk_applied"],
+                mahalanobis_d2=diag["mahalanobis_d2"],
+                max_psi_score=diag["max_psi_score"],
+                min_pin_risk_z=diag["min_pin_risk_z"],
+                engine_selected="Tier3_DupireQMC",
+                conformal_half_width_bps=conformal_hw_bps,
+                greeks_engine_used=eff_greeks_qmc,
+            )
+            with self._lock:
+                self.audit_log.append(audit_fb)
+
+            return GuardianPricingResult(
+                product_value=float(post_qmc.product_value.detach().cpu().item()),
+                standard_error=float(
+                    getattr(post_qmc, "standard_error", getattr(qmc_g_out, "standard_error", 0.0))
+                ),
+                notional_pv=float(post_qmc.notional_pv.detach().cpu().item()),
+                coupon_pv=float(post_qmc.coupon_pv.detach().cpu().item()),
+                option_pv=float(post_qmc.option_pv.detach().cpu().item()),
+                funding_pv=float(post_qmc.funding_pv.detach().cpu().item()),
+                pv_in_transit=float(post_qmc.pv_in_transit.detach().cpu().item()),
+                p_stop=post_qmc.p_stop.detach().cpu().numpy().astype(np.float64),
+                q_cpn=post_qmc.q_cpn.detach().cpu().numpy().astype(np.float64),
+                l_put=float(post_qmc.l_put.detach().cpu().item()),
+                l_call=float(post_qmc.l_call.detach().cpu().item()),
+                cashflows=post_qmc.cashflows,
+                reporting_currency=str(post_qmc.reporting_currency),
+                cash_to_settle_today=float(post_qmc.cash_to_settle_today),
+                engine_selected="Tier3_DupireQMC",
+                fallback_triggered=True,
+                fallback_reasons=all_reasons,
+                audit_record=audit_fb,
+                shrunk_corr_matrix=r_psd,
+                preproc_state=state,
+                postproc_out=post_qmc,
+                qmc_result=None,
+                surrogate_out=surrogate_out,
+                greeks_out=qmc_g_out,
+            )
+
         qmc_res = price_eq_autocall_dupire_qmc(
             state,
             n_paths=n_fallback_paths,
@@ -2241,6 +3214,7 @@ class EQAutocallModelGuardian:
             n_substeps_per_period=n_substeps_per_period,
             seed=seed,
             use_gpu=eff_use_gpu,
+            cv_mode="multifidelity_gbm" if eff_use_gpu else "bs1d_exact",
         )
 
         eff_greeks_qmc = greeks_engine_used or "None"

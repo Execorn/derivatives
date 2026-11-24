@@ -274,3 +274,121 @@ def test_async_rwlock_cross_loop_and_cancellation_wakeup() -> None:
     asyncio.run(_scenario())
     # Reusing the same AsyncReadWriteLock across a brand new event loop must succeed
     asyncio.run(_scenario())
+
+
+def test_greeks_engine_16_thread_market_diversity_and_cache_eviction(
+    base_request: EQAutocallableTradeRequest,
+) -> None:
+    from deepvol.models.autocall.greeks_engine import compute_eq_autocall_greeks
+    from deepvol.surrogates.eq_autocall_egno import MaskedEQAutocallSurrogate
+
+    surr = MaskedEQAutocallSurrogate(
+        d_max=8, m_max=48, d_model=32, n_egno_layers=1, n_sched_layers=1
+    ).eval()
+    surr.zero_init_residual_heads(std=1e-3)
+
+    requests: list[EQAutocallableTradeRequest] = []
+    ref_pvs: list[float] = []
+    tkr0 = base_request.Product.UnderlyingIdentifiers[0]
+    for i in range(24):
+        r_i = copy.deepcopy(base_request)
+        r_i.Model.MarketDataSet.Spots[tkr0] *= 0.80 + 0.02 * i
+        cid = next(iter(r_i.Model.MarketDataSet.RatesCurvesBundles))
+        r_i.Model.MarketDataSet.RatesCurvesBundles[cid].RatesSchedule.Rates[0] += 0.05 * i
+        requests.append(r_i)
+        res_ref = compute_eq_autocall_greeks(
+            r_i, queries=["ProductValue", "Delta", "Rho"], surrogate=surr
+        )
+        ref_pvs.append(float(res_ref.product_value))
+
+    def _thread_worker(idx: int) -> None:
+        for k in range(8):
+            m_idx = (idx + k * 3) % len(requests)
+            res = compute_eq_autocall_greeks(
+                requests[m_idx], queries=["ProductValue", "Delta", "Rho"], surrogate=surr
+            )
+            assert abs(float(res.product_value) - ref_pvs[m_idx]) < 1e-10
+            assert res.delta_tensor is not None and torch.isfinite(res.delta_tensor).all()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for fut in [pool.submit(_thread_worker, t_id) for t_id in range(16)]:
+            fut.result()
+
+    # Cache eviction thrashing across > 512 distinct surface/curve inputs preserves exact results.
+    state_0 = preprocess_eq_autocall(requests[0])
+    pv_0_before = float(compute_eq_autocall_greeks(state_0, queries=["ProductValue"]).product_value)
+    for j in range(520):
+        r_j = copy.deepcopy(base_request)
+        r_j.Model.MarketDataSet.Spots[tkr0] *= 0.70 + 1e-4 * j
+        _ = preprocess_eq_autocall(r_j).state_digest
+    pv_0_after = float(compute_eq_autocall_greeks(state_0, queries=["ProductValue"]).product_value)
+    assert pv_0_after == pytest.approx(pv_0_before, abs=1e-12)
+
+
+@pytest.mark.gpu
+def test_cuda_packed_surrogate_overlapping_forwards_and_tf32_restoration(
+    base_request: EQAutocallableTradeRequest,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for overlapping GPU surrogate & TF32 tests")
+
+    from deepvol.models.autocall.gpu_cache_manager import GLOBAL_GPU_CACHE_MANAGER
+    from deepvol.models.autocall.greeks_engine import evaluate_differentiable_pv
+    from deepvol.surrogates.eq_autocall_egno import MaskedEQAutocallSurrogate
+
+    dev = torch.device("cuda")
+    surr = MaskedEQAutocallSurrogate(
+        d_max=8, m_max=48, d_model=64, n_egno_layers=2, n_sched_layers=1
+    ).to(device=dev).eval()
+    surr.zero_init_residual_heads(std=1e-2)
+
+    prev_matmul_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
+    prev_cudnn_tf32 = bool(torch.backends.cudnn.allow_tf32)
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        with GLOBAL_GPU_CACHE_MANAGER.tf32_precision_guard(False):
+            assert bool(torch.backends.cuda.matmul.allow_tf32) is False
+        assert bool(torch.backends.cuda.matmul.allow_tf32) is True
+        assert bool(torch.backends.cudnn.allow_tf32) is True
+
+        # Overlapping forwards with distinct basket dimensions and masks must not corrupt backward graphs.
+        req_small = copy.deepcopy(base_request)
+        tks2 = req_small.Product.UnderlyingIdentifiers[:2]
+        req_small.Product.UnderlyingIdentifiers = tks2
+        req_small.Product.UnderlyingReferenceSpots = req_small.Product.UnderlyingReferenceSpots[:2]
+        req_small.Model.MarketDataSet.Spots = {k: req_small.Model.MarketDataSet.Spots[k] for k in tks2}
+        req_small.Model.MarketDataSet.VolatilitySurfaces = {
+            k: req_small.Model.MarketDataSet.VolatilitySurfaces[k] for k in tks2
+        }
+        req_small.Model.MarketDataSet.Dividends = {
+            k: req_small.Model.MarketDataSet.Dividends[k]
+            for k in tks2
+            if k in req_small.Model.MarketDataSet.Dividends
+        }
+        req_small.Model.MarketDataSet.Fixings = {
+            k: req_small.Model.MarketDataSet.Fixings[k]
+            for k in tks2
+            if k in req_small.Model.MarketDataSet.Fixings
+        }
+        req_small.Model.MarketDataSet.Correlations = {f"{tks2[0]}&{tks2[1]}": 0.4}
+
+        st1 = preprocess_eq_autocall(base_request)
+        st2 = preprocess_eq_autocall(req_small)
+        sp1 = st1.spots_t0.detach().to(device=dev).requires_grad_(True)
+        sp2 = st2.spots_t0.detach().to(device=dev).requires_grad_(True)
+        pv1 = evaluate_differentiable_pv(st1, spots_t0=sp1, surrogate=surr)
+        pv2 = evaluate_differentiable_pv(st2, spots_t0=sp2, surrogate=surr)
+        assert isinstance(pv1, torch.Tensor) and isinstance(pv2, torch.Tensor)
+        g1, g2 = torch.autograd.grad(pv1 + pv2, [sp1, sp2])
+
+        sp1_solo = st1.spots_t0.detach().to(device=dev).requires_grad_(True)
+        pv1_solo = evaluate_differentiable_pv(st1, spots_t0=sp1_solo, surrogate=surr)
+        assert isinstance(pv1_solo, torch.Tensor)
+        g1_solo = torch.autograd.grad(pv1_solo, sp1_solo)[0]
+        torch.testing.assert_close(g1, g1_solo, atol=1e-5, rtol=1e-5)
+        assert torch.isfinite(g2).all()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+

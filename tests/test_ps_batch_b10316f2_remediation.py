@@ -384,7 +384,6 @@ def test_I5a_I5b_currency_inference_quanto_fx_sign_and_fx_vega_cega() -> None:
     req_usd["Model"]["MarketDataSet"]["Correlations"]["SBER_RUB&USDRUB"] = -0.15
 
     state_usd = preprocess_eq_autocall(req_usd)
-    # Ensure quanto_meta is populated even if Shard 3 currency inference is pre-merge in worktree
     if "AAPLUS" not in state_usd.quanto_meta:
         state_usd.quanto_meta["AAPLUS"] = {
             "fx_id": "USDRUB",
@@ -792,3 +791,317 @@ def test_I7_irao_rub_7slice_splice_rejection_diagnostics_and_mild_noise_projecti
     assert batch_gen.node_feats.shape == (2, 4, 16)
     assert torch.all(torch.isfinite(batch_gen.l_put_mc))
     assert torch.all(torch.isfinite(batch_gen.pv_mc))
+
+
+def _dual_gate_group_cashflows(cf_rows: Any) -> dict[tuple[str, str], float]:
+    grouped: dict[tuple[str, str], float] = {}
+    for row in cf_rows or ():
+        dt_val = row.get("Date") if isinstance(row, dict) else getattr(row, "Date", "")
+        dt_str = dt_val.strftime("%Y-%m-%d") if isinstance(dt_val, (dt.datetime, dt.date)) else str(dt_val)[:10]
+        desc = str(row.get("Description") if isinstance(row, dict) else getattr(row, "Description", ""))
+        amt = float(row.get("Amount", 0.0) if isinstance(row, dict) else getattr(row, "Amount", 0.0))
+        grouped[(dt_str, desc)] = grouped.get((dt_str, desc), 0.0) + amt
+    return grouped
+
+
+def _dual_gate_assert_5bps_vs_oracle(
+    tid: str,
+    rt_res: Any,
+    oracle: Any,
+    mf_pv: float,
+    state: Any,
+    req_model: Any,
+) -> None:
+    from deepvol.api.eq_autocall_runtime import _merge_fx_vega_and_cega
+    from deepvol.api.schemas_eq_autocall import to_decimal_merged_rho
+
+    spots_map = {str(k): float(v) for k, v in req_model.Model.MarketDataSet.Spots.items()}
+    assert abs(float(rt_res.ProductValue) - float(oracle.product_value)) * 1e4 < 5.0, (
+        f"Deal {tid} PV vs 65k GPU AAD oracle diff "
+        f"{abs(float(rt_res.ProductValue) - float(oracle.product_value)) * 1e4:.2f} bps >= 5.0"
+    )
+    assert abs(float(rt_res.ProductValue) - mf_pv) * 1e4 < 5.0, (
+        f"Deal {tid} PV vs 65k MF-CV QMC oracle diff {abs(float(rt_res.ProductValue) - mf_pv) * 1e4:.2f} bps >= 5.0"
+    )
+
+    rt_cf = _dual_gate_group_cashflows(rt_res.CashFlows)
+    or_cf = _dual_gate_group_cashflows(oracle.cash_flows)
+    for k in sorted(set(rt_cf) | set(or_cf)):
+        assert abs(rt_cf.get(k, 0.0) - or_cf.get(k, 0.0)) * 1e4 < 5.0, (
+            f"Deal {tid} CF {k} diff >= 5.0 bps vs 65k oracle"
+        )
+
+    # Notional-impact bps: 1% (0.01) spot move on CashDelta and 0.5 * 0.01^2 on CashGamma/AggCG.
+    assert rt_res.Delta is not None and oracle.delta is not None
+    assert set(rt_res.Delta.keys()) == set(oracle.delta.keys())
+    for tk in rt_res.Delta:
+        s_tk = float(spots_map.get(tk, 1.0))
+        cash_delta_bps = abs((float(rt_res.Delta[tk]) - float(oracle.delta[tk])) * s_tk) * 0.01 * 1e4
+        assert cash_delta_bps < 5.0, f"Deal {tid} CashDelta {tk} diff {cash_delta_bps:.2f} bps >= 5.0"
+
+    assert rt_res.Gamma is not None and oracle.gamma is not None
+    for a in oracle.gamma:
+        s_a = float(spots_map.get(a, 1.0))
+        row_rt = rt_res.Gamma[a]
+        row_or = oracle.gamma[a]
+        for b in row_or:
+            s_b = float(spots_map.get(b, 1.0))
+            rv = float(row_rt[b]) if isinstance(row_rt, dict) else float(row_rt)
+            ov = float(row_or[b]) if isinstance(row_or, dict) else float(row_or)
+            cash_gamma_bps = 0.5 * (0.01**2) * abs((rv - ov) * s_a * s_b) * 1e4
+            assert cash_gamma_bps < 5.0, f"Deal {tid} CashGamma[{a}][{b}] diff {cash_gamma_bps:.2f} bps >= 5.0"
+
+    assert rt_res.MultivariateAggregatedCashGamma is not None
+    assert oracle.multivariate_aggregated_cash_gamma is not None
+    agg_cg_bps = (
+        0.5 * (0.01**2) * abs(float(rt_res.MultivariateAggregatedCashGamma) - float(oracle.multivariate_aggregated_cash_gamma)) * 1e4
+    )
+    assert agg_cg_bps < 5.0, f"Deal {tid} AggCashGamma diff {agg_cg_bps:.2f} bps >= 5.0"
+
+    # 1 vol point (0.01) shift on Vega; parallel sum + non-dipole per-tenor sum check.
+    or_vega, or_cega = _merge_fx_vega_and_cega(oracle, state, req_model)
+    assert rt_res.Vega is not None and or_vega is not None
+    assert set(rt_res.Vega.keys()) == set(or_vega.keys())
+    for tk in or_vega:
+        rt_vg = np.asarray(rt_res.Vega[tk], dtype=np.float64)
+        or_vg = np.asarray(or_vega[tk], dtype=np.float64)
+        vega_sum_bps = abs(float(np.sum(rt_vg)) - float(np.sum(or_vg))) * 0.01 * 1e4
+        assert vega_sum_bps < 5.0, f"Deal {tid} Vega {tk} diff {vega_sum_bps:.2f} bps >= 5.0"
+        if rt_vg.ndim == 2 and rt_vg.shape == or_vg.shape:
+            ten_diff_bps = float(np.max(np.abs(np.sum(rt_vg, axis=1) - np.sum(or_vg, axis=1)))) * 0.01 * 1e4
+            assert ten_diff_bps < 5.0, f"Deal {tid} Vega tenor {tk} diff {ten_diff_bps:.2f} bps >= 5.0"
+
+    # 10 bp (1e-3 decimal) rate shift on canonical decimal Rho (Rho + RepoRho).
+    rate_scales = {
+        str(cid): (0.01 if "Percentage" in str(getattr(c_spec, "RateQuoteExpression", "Percentage")) else 1.0)
+        for cid, c_spec in (req_model.Model.MarketDataSet.RatesCurvesBundles or {}).items()
+    }
+    repo_scales = {
+        str(tk): (0.01 if "Percentage" in str(getattr(r_spec, "RateQuoteExpression", "Percentage")) else 1.0)
+        for tk, r_spec in (req_model.Model.MarketDataSet.RepoSpreadCurves or {}).items()
+    }
+    assert rt_res.RepoRho and oracle.repo_rho and set(rt_res.RepoRho.keys()) == set(oracle.repo_rho.keys()), (
+        f"Deal {tid} RepoRho missing or mismatched: rt={rt_res.RepoRho!r}, oracle={oracle.repo_rho!r}"
+    )
+    rt_rho = to_decimal_merged_rho(rt_res, rate_scales, repo_quote_scales=repo_scales)
+    or_rho = to_decimal_merged_rho(
+        {"Rho": oracle.rho, "RepoRho": oracle.repo_rho, "rho_unit_convention": "quote"},
+        rate_scales,
+        repo_quote_scales=repo_scales,
+    )
+    assert len(or_rho) > 0 and set(rt_rho.keys()) == set(or_rho.keys())
+    for cid in or_rho:
+        rho_bps = abs(float(np.sum(rt_rho[cid])) - float(np.sum(or_rho[cid]))) * 1e-3 * 1e4
+        assert rho_bps < 5.0, f"Deal {tid} Rho {cid} diff {rho_bps:.2f} bps >= 5.0"
+
+    assert rt_res.DividendsSensitivities is not None and oracle.dividends_sensitivities is not None
+    for tk in oracle.dividends_sensitivities:
+        r_div = float(np.sum(rt_res.DividendsSensitivities[tk]))
+        o_div = float(np.sum(oracle.dividends_sensitivities[tk]))
+        assert abs(r_div - o_div) * 1e4 < 5.0, f"Deal {tid} DivSens {tk} diff >= 5.0 bps vs 65k oracle"
+
+    assert rt_res.Theta is not None and oracle.theta is not None
+    assert abs(float(rt_res.Theta) - float(oracle.theta)) * 1e4 < 5.0, (
+        f"Deal {tid} Theta diff >= 5.0 bps vs 65k oracle"
+    )
+
+    if or_cega:
+        assert rt_res.Cega is not None
+        for a, row_or_c in or_cega.items():
+            for b, ov in row_or_c.items():
+                rv = float(rt_res.Cega[a][b])
+                cega_bps = abs(rv - float(ov)) * 0.01 * 1e4
+                assert cega_bps < 5.0, f"Deal {tid} Cega[{a}][{b}] diff {cega_bps:.2f} bps >= 5.0"
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_ps_batch_dual_gate_murex_oracle_latency_and_vram() -> None:
+    import gc
+    import json
+    import os
+    from pathlib import Path
+    import re
+    import subprocess
+    import sys
+    import textwrap
+
+    from deepvol.api.eq_autocall_runtime import _attach_runtime_market_metadata
+    from deepvol.api.schemas_eq_autocall import EQAutocallableTradeRequest, parse_murex_autocall_dag
+    from deepvol.models.autocall.dupire_qmc_gpu import DupireQMCGpuSolver
+    from deepvol.models.autocall.gpu_cache_manager import GLOBAL_GPU_CACHE_MANAGER
+    from deepvol.models.autocall.qmc_aad_greeks import QmcAadGreeksConfig, compute_qmc_aad_crn_greeks
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU required for PS batch Dual-Gate SLA check")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    ps_root = repo_root / "ps_audit_b10316f2"
+    manifest_path = ps_root / "deals" / "manifest.json"
+    if not manifest_path.is_file():
+        pytest.skip("ps_audit_b10316f2/deals/manifest.json not present")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    runtime = EQAutocallRuntime(device="cuda")
+    mf_solver = DupireQMCGpuSolver(device="cuda", backend="triton")
+    cfg_65k = QmcAadGreeksConfig(n_paths=65536, n_replicates=8, n_substeps=4, lv_grid_nt=32, lv_grid_ny=64, seed=42)
+    cfg_mf = DupireQMCConfig(n_paths=65536, n_replicates=8, n_substeps=4, cv_mode="multifidelity_gbm")
+    oracle_queries = ["ProductValue", "CashFlows"] + list(ALL_8_GREEK_QUERIES)
+
+    GLOBAL_GPU_CACHE_MANAGER.clear_all(clear_canonical_models=True)
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base_res = torch.cuda.memory_reserved()
+    warm_latencies_ms: list[float] = []
+    all_sweep_ms: list[float] = []
+    priced_items: list[tuple[str, Any, Any, EQAutocallableTradeRequest]] = []
+
+    for deal in manifest["deals"]:
+        tid = str(deal["trade_id"])
+        req_path = ps_root / str(deal["paths"]["full_ps_request_drop_target"])
+        exp_path = ps_root / str(deal["paths"]["expected_murex"])
+        assert req_path.is_file() and exp_path.is_file(), f"Missing PS files for deal {tid}"
+        req_dict = json.loads(req_path.read_text(encoding="utf-8"))
+        exp_dict = json.loads(exp_path.read_text(encoding="utf-8"))
+
+        if deal["status"] == "rejected":
+            with pytest.raises(ValueError, match="SMILE_ARBITRAGE"):
+                runtime.price_trade(req_dict, engine="auto", include_all_greeks=True)
+            t0 = time.perf_counter()
+            with pytest.raises(ValueError, match="SMILE_ARBITRAGE"):
+                runtime.price_trade(req_dict, engine="auto", include_all_greeks=True)
+            if sys.gettrace() is None:
+                assert (time.perf_counter() - t0) * 1000.0 < 1.0
+            continue
+
+        req_dict["Queries"] = list(oracle_queries)
+        _ = runtime.price_trade(req_dict, engine="auto", include_all_greeks=True)
+        _ = runtime.price_trade(req_dict, engine="auto", include_all_greeks=True)
+        gc.collect()
+        torch.cuda.synchronize()
+
+        deal_ms: list[float] = []
+        rt_res = None
+        for _ in range(3):
+            t0 = time.perf_counter()
+            rt_res = runtime.price_trade(req_dict, engine="auto", include_all_greeks=True)
+            torch.cuda.synchronize()
+            deal_ms.append((time.perf_counter() - t0) * 1000.0)
+        assert rt_res is not None
+        warm_latencies_ms.append(float(np.median(deal_ms)))
+        all_sweep_ms.extend(deal_ms)
+        if sys.gettrace() is None:
+            assert max(deal_ms) < 10.0, f"Deal {tid} sweep latency {max(deal_ms):.2f} ms >= 10.0 ms ({deal_ms})"
+
+        murex_pv = float(exp_dict["ProductValue"])
+        murex_tol_bps = max(5.0, float(exp_dict.get("StandardError", 0.0)) * 1e4)
+        assert abs(rt_res.ProductValue - murex_pv) * 1e4 < murex_tol_bps, (
+            f"Deal {tid} vs Murex diff {abs(rt_res.ProductValue - murex_pv) * 1e4:.2f} bps >= {murex_tol_bps:.2f}"
+        )
+
+        req_m = EQAutocallableTradeRequest.model_validate(req_dict)
+        priced_items.append((tid, rt_res, req_m, req_m))
+
+    dag_path = repo_root / "data" / "autocall" / "eq_autocallable_request.txt"
+    if not dag_path.is_file():
+        dag_path = repo_root / "eq_autocallable_request.txt"
+    assert dag_path.is_file(), f"Missing reference DAG at {dag_path}"
+    dag_text = dag_path.read_text(encoding="utf-8")
+    m_ref = re.search(r"(?m)^@[0-9a-fA-F]{40}\s*$", dag_text)
+    header = dag_text[: m_ref.start()] if m_ref else dag_text
+    pv_m = re.search(r"ProductValue:\s*\n\s*([-+0-9.eE]+)", header)
+    assert pv_m is not None
+    mx_45_pv = float(pv_m.group(1))
+    cf_45_mx: dict[tuple[str, str], float] = {}
+    cf_blk = re.search(r"CashFlows:\s*\n\s*\[(.*?)\n\s*\]", header, flags=re.DOTALL)
+    if cf_blk is not None:
+        for obj_m in re.finditer(r"\{(.*?)\}", cf_blk.group(1), flags=re.DOTALL):
+            blk = obj_m.group(1)
+            dm = re.search(r"Description:\s*\n\s*'([^']+)'", blk)
+            dtm = re.search(r"Date:\s*\n\s*datetime\.datetime\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", blk)
+            am = re.search(r"Amount:\s*\n\s*([-+0-9.eE]+)", blk)
+            if dm and dtm and am:
+                k = (f"{int(dtm.group(1)):04d}-{int(dtm.group(2)):02d}-{int(dtm.group(3)):02d}", dm.group(1))
+                cf_45_mx[k] = cf_45_mx.get(k, 0.0) + float(am.group(1))
+
+    _ = runtime.price_murex_dag(dag_text, include_all_greeks=True)
+    _ = runtime.price_murex_dag(dag_text, include_all_greeks=True)
+    torch.cuda.synchronize()
+    deal_45_ms: list[float] = []
+    rt_45 = None
+    for _ in range(3):
+        t0 = time.perf_counter()
+        rt_45 = runtime.price_murex_dag(dag_text, include_all_greeks=True)
+        torch.cuda.synchronize()
+        deal_45_ms.append((time.perf_counter() - t0) * 1000.0)
+    assert rt_45 is not None
+    warm_latencies_ms.append(float(np.median(deal_45_ms)))
+    all_sweep_ms.extend(deal_45_ms)
+    if sys.gettrace() is None:
+        assert max(deal_45_ms) < 10.0, f"Deal 45476647 sweep latency {max(deal_45_ms):.2f} ms >= 10.0 ms ({deal_45_ms})"
+    assert abs(rt_45.ProductValue - mx_45_pv) * 1e4 < 5.0
+    cf_45_rt = _dual_gate_group_cashflows(rt_45.CashFlows)
+    for k in sorted(set(cf_45_rt) | set(cf_45_mx)):
+        assert abs(cf_45_rt.get(k, 0.0) - cf_45_mx.get(k, 0.0)) * 1e4 < 5.0
+    req_45, _ = parse_murex_autocall_dag(dag_text)
+    priced_items.append(("45476647", rt_45, req_45, req_45))
+
+    torch.cuda.synchronize()
+    max_res = torch.cuda.max_memory_reserved()
+    if base_res > 64 * 1024 * 1024 and os.environ.get("_DEEPVOL_VRAM_SUBPROC") != "1":
+        delta_vram_mb = (max_res - base_res) / (1024.0 * 1024.0)
+        assert delta_vram_mb <= 250.0, (
+            f"PS batch delta VRAM {delta_vram_mb:.1f} MB > 250.0 MB (base={base_res / (1024.0 * 1024.0):.1f} MB)"
+        )
+        sub_env = os.environ.copy()
+        sub_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        sub_env["_DEEPVOL_VRAM_SUBPROC"] = "1"
+        sub_env["PYTHONPATH"] = os.pathsep.join(
+            [str(repo_root), str(repo_root / "src")]
+            + ([sub_env["PYTHONPATH"]] if sub_env.get("PYTHONPATH") else [])
+        )
+        sub_code = textwrap.dedent(
+            f"""
+            import gc, json, torch
+            from pathlib import Path
+            from deepvol.api.eq_autocall_runtime import ALL_8_GREEK_QUERIES, EQAutocallRuntime
+            from deepvol.models.autocall.gpu_cache_manager import GLOBAL_GPU_CACHE_MANAGER
+            ps_root = Path({str(ps_root)!r})
+            manifest = json.loads((ps_root / "deals" / "manifest.json").read_text(encoding="utf-8"))
+            rt = EQAutocallRuntime(device="cuda")
+            qs = ["ProductValue", "CashFlows"] + list(ALL_8_GREEK_QUERIES)
+            GLOBAL_GPU_CACHE_MANAGER.clear_all(clear_canonical_models=True)
+            gc.collect(); torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+            for deal in manifest["deals"]:
+                if deal["status"] == "rejected":
+                    continue
+                req_d = json.loads((ps_root / str(deal["paths"]["full_ps_request_drop_target"])).read_text(encoding="utf-8"))
+                req_d["Queries"] = list(qs)
+                rt.price_trade(req_d, engine="auto", include_all_greeks=True)
+            dag_p = Path({str(dag_path)!r})
+            assert dag_p.is_file()
+            rt.price_murex_dag(dag_p.read_text(encoding="utf-8"), include_all_greeks=True)
+            torch.cuda.synchronize()
+            assert torch.cuda.max_memory_reserved() <= 250.0 * 1024 * 1024
+            """
+        )
+        subprocess.run([sys.executable, "-c", sub_code], env=sub_env, check=True, timeout=120)
+    else:
+        peak_vram_mb = max_res / (1024.0 * 1024.0)
+        assert peak_vram_mb <= 250.0, f"PS batch peak VRAM {peak_vram_mb:.1f} MB > 250.0 MB"
+    assert len(priced_items) == 13
+    if sys.gettrace() is None:
+        assert float(np.median(warm_latencies_ms)) <= 7.0
+        assert max(all_sweep_ms) < 10.0
+
+    for tid, rt_res, req_m, _ in priced_items:
+        st = preprocess_eq_autocall(req_m, d_max=12, m_max=64)
+        _attach_runtime_market_metadata(st, req_m)
+        oracle = compute_qmc_aad_crn_greeks(
+            st, request=req_m, queries=oracle_queries, config=cfg_65k, device=torch.device("cuda")
+        )
+        mf_res = mf_solver.simulate_and_price(st, config=cfg_mf)
+        _dual_gate_assert_5bps_vs_oracle(tid, rt_res, oracle, float(mf_res.product_value), st, req_m)
+

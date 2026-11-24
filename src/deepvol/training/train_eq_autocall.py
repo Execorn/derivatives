@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import logging
 import math
+import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,10 +34,31 @@ from deepvol.models.autocall.feature_layout import (
     AutocallSchedCol,
     MonitoringIndexCode,
 )
+from deepvol.mrm.eq_autocall_guardian import _regularize_cov_oas_correlation_space
 from deepvol.surrogates.eq_autocall_egno import (
     MaskedEQAutocallSurrogate,
     assemble_surrogate_product_value,
 )
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _atomic_torch_save(payload: Any, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dest.parent),
+        prefix=f".{dest.name}.tmp.",
+        suffix=".pt",
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, dest)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise
 
 DEFAULT_CHECKPOINT_PATH = (
     Path(__file__).resolve().parents[3] / "artifacts" / "checkpoints" / "eq_autocall_egno.pt"
@@ -175,15 +199,13 @@ class SpreadAttenuatedSobolevLoss(nn.Module):
             + 10.0 * F.mse_loss(pv_pred, pv_t)
         )
 
-        # 2. Component probability & put-loss supervision (mask dead-survival & is_memory q_mc slots)
+        # 2. Component probability & put-loss supervision on live survival periods
         p_err_sq = ((p_pred - p_t) ** 2) * m_sched
         surv_prev_t = torch.cat(
             [torch.ones_like(p_t[:, :1]), (1.0 - torch.cumsum(p_t, dim=1))[:, :-1]],
             dim=1,
         )
-        non_mem = (global_feats[:, int(AutocallGlobalCol.IS_MEMORY_FLAG)] < 0.5).unsqueeze(1)
-        single_period = m_count.unsqueeze(1) < 1.5
-        q_valid = m_sched * (surv_prev_t > 1e-4).to(dtype=dtype) * (non_mem | single_period).to(dtype=dtype)
+        q_valid = m_sched * (surv_prev_t > 1e-4).to(dtype=dtype)
         q_err_sq = ((q_pred - q_t) ** 2) * q_valid
         prob_mse = (
             (p_err_sq.sum(dim=1) / m_count)
@@ -461,15 +483,22 @@ def _compute_difficulty_basis_5d(batch: SyntheticAutocallBatch) -> npt.NDArray[n
     has_ki = batch.global_feats[:, int(AutocallGlobalCol.HAS_KI_FLAG)].to(torch.float64) > 0.5
     not_ki_past = batch.global_feats[:, int(AutocallGlobalCol.I_KI_PAST)].to(torch.float64) < 0.5
     g_put = batch.global_feats[:, int(AutocallGlobalCol.G_PUT)].to(torch.float64).clamp(min=0.0)
-    last_idx = (m_counts.long() - 1).clamp(min=0, max=max(int(batch.sched_feats.shape[1]) - 1, 0)).unsqueeze(1)
-    v_last = (
-        batch.sched_feats[:, :, int(AutocallSchedCol.STULZ_VOL_W)]
-        .to(torch.float64)
-        .clamp(min=0.0)
-        .gather(1, last_idx)
-        .squeeze(1)
-    )
-    v_last = torch.where(m_counts > 0.5, v_last, torch.zeros_like(v_last))
+    if batch.sched_feats.shape[1] > 0:
+        last_idx = (
+            (m_counts.long() - 1)
+            .clamp(min=0, max=int(batch.sched_feats.shape[1]) - 1)
+            .unsqueeze(1)
+        )
+        v_last = (
+            batch.sched_feats[:, :, int(AutocallSchedCol.STULZ_VOL_W)]
+            .to(torch.float64)
+            .clamp(min=0.0)
+            .gather(1, last_idx)
+            .squeeze(1)
+        )
+        v_last = torch.where(m_counts > 0.5, v_last, torch.zeros_like(v_last))
+    else:
+        v_last = torch.zeros((n_b,), dtype=torch.float64, device=h_disp.device)
     phi_4 = (has_ki & not_ki_past).to(dtype=torch.float64) * g_put * v_last
 
     return torch.stack([phi_0, phi_1, phi_2, phi_3, phi_4], dim=1).detach().cpu().numpy().astype(np.float64)
@@ -532,39 +561,43 @@ def _predict_batch_pv(
     batch_size: int = 256,
 ) -> torch.Tensor:
     """Evaluates predicted ProductValue on CPU in float64 across mini-batches."""
+    n = int(batch.node_feats.shape[0])
+    if n == 0:
+        return torch.empty((0,), dtype=torch.float64)
     was_training = model.training
     model.eval()
-    n = batch.node_feats.shape[0]
     preds: List[torch.Tensor] = []
-    with torch.no_grad():
-        for start in range(0, n, batch_size):
-            end = min(n, start + batch_size)
-            idx = torch.arange(start, end, dtype=torch.long)
-            sub = batch.index_select(idx).to(device=device, dtype=torch.float32)
-            out = model(
-                sub.node_feats,
-                sub.edge_feats,
-                sub.asset_mask,
-                sub.sched_feats,
-                sub.sched_mask,
-                sub.global_feats,
-                all_active=True,
-                require_second_order_sdpa=False,
-            )
-            pv = assemble_surrogate_product_value(
-                out,
-                sub.sched_feats,
-                sub.sched_mask,
-                sub.global_feats,
-                no_notional_repayment=sub.no_notional_repayment > 0.5,
-                autocall_coupon=sub.autocall_coupon,
-                force_coupons_on_autocall=sub.force_coupons_on_autocall > 0.5,
-                is_long_basket=sub.is_long_basket > 0.5,
-                lower_strike=sub.lower_strike,
-            )
-            preds.append(pv.detach().cpu().to(torch.float64))
-    if was_training:
-        model.train()
+    try:
+        with torch.no_grad():
+            for start in range(0, n, batch_size):
+                end = min(n, start + batch_size)
+                idx = torch.arange(start, end, dtype=torch.long)
+                sub = batch.index_select(idx).to(device=device, dtype=torch.float32)
+                out = model(
+                    sub.node_feats,
+                    sub.edge_feats,
+                    sub.asset_mask,
+                    sub.sched_feats,
+                    sub.sched_mask,
+                    sub.global_feats,
+                    all_active=True,
+                    require_second_order_sdpa=False,
+                )
+                pv = assemble_surrogate_product_value(
+                    out,
+                    sub.sched_feats,
+                    sub.sched_mask,
+                    sub.global_feats,
+                    no_notional_repayment=sub.no_notional_repayment > 0.5,
+                    autocall_coupon=sub.autocall_coupon,
+                    force_coupons_on_autocall=sub.force_coupons_on_autocall > 0.5,
+                    is_long_basket=sub.is_long_basket > 0.5,
+                    lower_strike=sub.lower_strike,
+                )
+                preds.append(pv.detach().cpu().to(torch.float64))
+    finally:
+        if was_training:
+            model.train()
     return torch.cat(preds, dim=0)
 
 
@@ -619,10 +652,14 @@ def calibrate_guardian_stats(
     x_fit = extract_16d_features_from_batch(train_batch)
     n_fit, p = x_fit.shape
     ref_mean = np.mean(x_fit, axis=0)
-    raw_std = np.sqrt(np.maximum(np.var(x_fit, axis=0), 1e-12))
+    centered = x_fit - ref_mean[None, :]
+    cov_sample = (centered.T @ centered) / float(max(n_fit - 1, 1))
+    diag_var = np.maximum(np.diag(cov_sample), 1e-12)
+    raw_std = np.sqrt(diag_var)
     marginal_std = np.maximum(raw_std, 1e-2)
-    z_fit = (x_fit - ref_mean[None, :]) / marginal_std[None, :]
-    r_sample = (z_fit.T @ z_fit) / float(max(n_fit, 1))
+    r_sample = cov_sample / np.outer(raw_std, raw_std)
+    r_sample = 0.5 * (r_sample + r_sample.T)
+    np.fill_diagonal(r_sample, 1.0)
     tr_r = float(np.trace(r_sample))
     tr_r2 = float(np.sum(r_sample * r_sample))
     denom = float(n_fit + 1 - 2.0 / p) * max(tr_r2 - (tr_r * tr_r) / p, 1e-12)
@@ -630,13 +667,10 @@ def calibrate_guardian_stats(
     rho_oas = min(1.0, max(0.05, numer / max(denom, 1e-12)))
     f_target = (tr_r / p) * np.eye(p, dtype=np.float64)
     r_oas = (1.0 - rho_oas) * r_sample + rho_oas * f_target
-    eigvals, eigvecs = np.linalg.eigh(0.5 * (r_oas + r_oas.T))
-    eigvals_floored = np.maximum(eigvals, 0.025)
-    r_oas_reg = (eigvecs * eigvals_floored[None, :]) @ eigvecs.T
-    r_oas_inv = (eigvecs * (1.0 / eigvals_floored)[None, :]) @ eigvecs.T
-    inv_std = 1.0 / marginal_std
-    cov_oas = (marginal_std[:, None] * r_oas_reg) * marginal_std[None, :]
-    cov_inv = (inv_std[:, None] * r_oas_inv) * inv_std[None, :]
+    r_oas = 0.5 * (r_oas + r_oas.T)
+    np.fill_diagonal(r_oas, 1.0)
+    cov_oas_in = (marginal_std[:, None] * r_oas) * marginal_std[None, :]
+    cov_oas, cov_inv, marginal_std, cov_inv_d1 = _regularize_cov_oas_correlation_space(cov_oas_in)
 
     psi_bin_edges = np.zeros((p, 11), dtype=np.float64)
     psi_ref_probs = np.full((p, 10), 0.10, dtype=np.float64)
@@ -660,6 +694,11 @@ def calibrate_guardian_stats(
     # Split-conformal calibration strictly on held-out Cal split (Cal-1 quantile fit, disjoint Cal-2 conformal quantile)
     x_cal = extract_16d_features_from_batch(cal_batch)
     n_cal = int(x_cal.shape[0])
+    if n_cal < 2048:
+        _LOGGER.warning(
+            "Calibrating Guardian conformal quantiles on n_cal=%d (< 2048 recommended for production stability).",
+            n_cal,
+        )
     diff_cal = x_cal - ref_mean[None, :]
     d2_cal = np.einsum("ni,ij,nj->n", diff_cal, cov_inv, diff_cal)
     q_ood_level = min(1.0, math.ceil((n_cal + 1) * 0.999) / float(max(n_cal, 1)))
@@ -709,17 +748,14 @@ def calibrate_guardian_stats(
                 else:
                     q_eff_c = q_err_conformal
                 mondrian_q_err_table[ck] = float(q_eff_c)
-            mondrian_q_err_table[f"ki{ki_b}_m{m_b}_d0"] = min(
-                mondrian_q_err_table[f"ki{ki_b}_m{m_b}_d0"],
-                mondrian_q_err_table[f"ki{ki_b}_m{m_b}_d1"],
-            )
 
     payload: Dict[str, Any] = {
         "schema_version": FEATURE_SCHEMA_VERSION,
         "feature_names_16d": list(FEATURE_NAMES_16D),
         "ref_mean_16d": torch.from_numpy(ref_mean).to(torch.float64),
-        "ref_cov_oas_16d": torch.from_numpy(cov_oas).to(torch.float64),
+        "ref_cov_oas_16d": torch.from_numpy(cov_oas_in).to(torch.float64),
         "ref_cov_inv_16d": torch.from_numpy(cov_inv).to(torch.float64),
+        "ref_cov_inv_d1_16d": torch.from_numpy(cov_inv_d1).to(torch.float64),
         "ref_marginal_std_16d": torch.from_numpy(marginal_std).to(torch.float64),
         "psi_bin_edges": torch.from_numpy(psi_bin_edges).to(torch.float64),
         "psi_ref_probs": torch.from_numpy(psi_ref_probs).to(torch.float64),
@@ -735,9 +771,7 @@ def calibrate_guardian_stats(
         "oas_standardized": True,
     }
     if stats_path is not None:
-        stats_path = Path(stats_path)
-        stats_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(payload, stats_path)
+        _atomic_torch_save(payload, Path(stats_path))
     return payload
 
 
@@ -778,6 +812,8 @@ def evaluate_surrogate_mae_bps(
     if test_batch is not None:
         pv_pred = _predict_batch_pv(model, test_batch, device=dev)
         pv_mc = test_batch.pv_mc.detach().cpu().to(torch.float64)
+        if pv_mc.numel() == 0:
+            return 0.0, 0.0, {}
         abs_err = (pv_pred - pv_mc).abs()
         d_counts = (test_batch.asset_mask.detach().cpu() > 0.5).sum(dim=1).to(torch.long)
         per_d_mae_bps: Dict[int, float] = {}
@@ -822,71 +858,75 @@ def _evaluate_delta_cos_sims(
     batch_size: int = 128,
 ) -> Tuple[float, float]:
     """Computes held-out OOS (total_delta_cos_sim, residual_delta_cos_sim) via exact AD contraction."""
+    n = int(batch.node_feats.shape[0])
+    if n == 0:
+        return 0.0, 0.0
     was_training = model.training
     model.eval()
-    n = batch.node_feats.shape[0]
     tot_pred_list: List[torch.Tensor] = []
     tot_tgt_list: List[torch.Tensor] = []
     res_pred_list: List[torch.Tensor] = []
     res_tgt_list: List[torch.Tensor] = []
 
-    for start in range(0, n, batch_size):
-        end = min(n, start + batch_size)
-        idx = torch.arange(start, end, dtype=torch.long)
-        sub = batch.index_select(idx).to(device=device, dtype=torch.float32)
-        node_in = sub.node_feats.detach().clone().requires_grad_(True)
-        edge_in = sub.edge_feats.detach().clone().requires_grad_(True)
-        sched_in = sub.sched_feats.detach().clone().requires_grad_(True)
-        glob_in = sub.global_feats.detach().clone().requires_grad_(True)
-        amask_in = sub.asset_mask
-        smask_in = sub.sched_mask
+    try:
+        with torch.enable_grad():  # type: ignore[no-untyped-call]
+            for start in range(0, n, batch_size):
+                end = min(n, start + batch_size)
+                idx = torch.arange(start, end, dtype=torch.long)
+                sub = batch.index_select(idx).to(device=device, dtype=torch.float32)
+                node_in = sub.node_feats.detach().clone().requires_grad_(True)
+                edge_in = sub.edge_feats.detach().clone().requires_grad_(True)
+                sched_in = sub.sched_feats.detach().clone().requires_grad_(True)
+                glob_in = sub.global_feats.detach().clone().requires_grad_(True)
+                amask_in = sub.asset_mask
+                smask_in = sub.sched_mask
 
-        surr_out = model(
-            node_feats=node_in,
-            edge_feats=edge_in,
-            asset_mask=amask_in,
-            sched_feats=sched_in,
-            sched_mask=smask_in,
-            global_feats=glob_in,
-            all_active=True,
-            require_second_order_sdpa=False,
-        )
-        pv_pred = assemble_surrogate_product_value(
-            surr_out,
-            sched_in,
-            smask_in,
-            glob_in,
-            no_notional_repayment=sub.no_notional_repayment > 0.5,
-            autocall_coupon=sub.autocall_coupon,
-            force_coupons_on_autocall=sub.force_coupons_on_autocall > 0.5,
-            is_long_basket=sub.is_long_basket > 0.5,
-            lower_strike=sub.lower_strike,
-        )
-        g_node, g_edge, g_sched, g_glob = torch.autograd.grad(
-            pv_pred.sum(),
-            (node_in, edge_in, sched_in, glob_in),
-            allow_unused=True,
-        )
-        g_node = torch.zeros_like(node_in) if g_node is None else g_node
-        g_edge = torch.zeros_like(edge_in) if g_edge is None else g_edge
-        g_sched = torch.zeros_like(sched_in) if g_sched is None else g_sched
-        g_glob = torch.zeros_like(glob_in) if g_glob is None else g_glob
-        g_edge_sym = g_edge[:, :, :, 1:3] + g_edge.transpose(1, 2)[:, :, :, 1:3]
-        delta_tot = (
-            torch.einsum("bjk,bijk->bi", g_node, sub.jac_node_logm)
-            + torch.einsum("bijc,bijc->bi", g_edge_sym, sub.jac_edge_self)
-            + torch.einsum("bmc,bimc->bi", g_sched[:, :, 8:12], sub.jac_sched_logm)
-            + g_glob[:, int(AutocallGlobalCol.L_PUT_PROXY)].unsqueeze(1) * sub.jac_lput_logm
-        ) * amask_in
-        d_px = sub.delta_proxy * amask_in
-        d_mc = sub.delta_mc * amask_in
-        tot_pred_list.append(delta_tot.detach().cpu())
-        tot_tgt_list.append(d_mc.detach().cpu())
-        res_pred_list.append((delta_tot - d_px).detach().cpu())
-        res_tgt_list.append((d_mc - d_px).detach().cpu())
-
-    if was_training:
-        model.train()
+                surr_out = model(
+                    node_feats=node_in,
+                    edge_feats=edge_in,
+                    asset_mask=amask_in,
+                    sched_feats=sched_in,
+                    sched_mask=smask_in,
+                    global_feats=glob_in,
+                    all_active=True,
+                    require_second_order_sdpa=False,
+                )
+                pv_pred = assemble_surrogate_product_value(
+                    surr_out,
+                    sched_in,
+                    smask_in,
+                    glob_in,
+                    no_notional_repayment=sub.no_notional_repayment > 0.5,
+                    autocall_coupon=sub.autocall_coupon,
+                    force_coupons_on_autocall=sub.force_coupons_on_autocall > 0.5,
+                    is_long_basket=sub.is_long_basket > 0.5,
+                    lower_strike=sub.lower_strike,
+                )
+                g_node, g_edge, g_sched, g_glob = torch.autograd.grad(
+                    pv_pred.sum(),
+                    (node_in, edge_in, sched_in, glob_in),
+                    allow_unused=True,
+                )
+                g_node = torch.zeros_like(node_in) if g_node is None else g_node
+                g_edge = torch.zeros_like(edge_in) if g_edge is None else g_edge
+                g_sched = torch.zeros_like(sched_in) if g_sched is None else g_sched
+                g_glob = torch.zeros_like(glob_in) if g_glob is None else g_glob
+                g_edge_sym = g_edge[:, :, :, 1:3] + g_edge.transpose(1, 2)[:, :, :, 1:3]
+                delta_tot = (
+                    torch.einsum("bjk,bijk->bi", g_node, sub.jac_node_logm)
+                    + torch.einsum("bijc,bijc->bi", g_edge_sym, sub.jac_edge_self)
+                    + torch.einsum("bmc,bimc->bi", g_sched[:, :, 8:12], sub.jac_sched_logm)
+                    + g_glob[:, int(AutocallGlobalCol.L_PUT_PROXY)].unsqueeze(1) * sub.jac_lput_logm
+                ) * amask_in
+                d_px = sub.delta_proxy * amask_in
+                d_mc = sub.delta_mc * amask_in
+                tot_pred_list.append(delta_tot.detach().cpu())
+                tot_tgt_list.append(d_mc.detach().cpu())
+                res_pred_list.append((delta_tot - d_px).detach().cpu())
+                res_tgt_list.append((d_mc - d_px).detach().cpu())
+    finally:
+        if was_training:
+            model.train()
 
     def _cos(a_list: List[torch.Tensor], b_list: List[torch.Tensor]) -> float:
         af = torch.cat(a_list, dim=0).reshape(-1)
@@ -935,7 +975,7 @@ def train_eq_autocall_surrogate(
     n_egno_layers: int = 3,
     n_sched_layers: int = 2,
     n_heads: int = 4,
-    n_func_codes: int = 15,
+    n_func_codes: int = 18,
     func_emb_dim: int = 16,
     seed: int = 2026,
     device: torch.device | str | None = None,
@@ -1193,7 +1233,7 @@ def train_eq_autocall_surrogate(
                 "per_d_mae_bps": {int(k): float(v) for k, v in per_d_mae_bps.items()},
             },
         }
-        torch.save(payload, ckpt_path_resolved)
+        _atomic_torch_save(payload, ckpt_path_resolved)
 
     return SurrogateTrainingResult(
         model=model,
@@ -1225,8 +1265,26 @@ def load_eq_autocall_surrogate(
     """Loads a trained `MaskedEQAutocallSurrogate` with weights_only=True and strict=True."""
     ckpt_path = Path(checkpoint_path)
     raw = torch.load(ckpt_path, map_location=device, weights_only=True)
-    if isinstance(raw, dict) and "model_state_dict" in raw:
-        cfg = raw.get("config", {})
+    if not isinstance(raw, dict):
+        raise ValueError(f"Expected dict checkpoint payload in {ckpt_path}, got {type(raw).__name__}.")
+
+    schema_ver = raw.get("schema_version")
+    if schema_ver is not None and str(schema_ver) not in ("1.0", "2.0", FEATURE_SCHEMA_VERSION):
+        raise ValueError(
+            f"Unsupported surrogate checkpoint schema_version={schema_ver!r} in {ckpt_path}."
+        )
+
+    if "model_state_dict" in raw or "state_dict" in raw:
+        state_dict = raw["model_state_dict"] if "model_state_dict" in raw else raw["state_dict"]
+        cfg_raw = raw.get("config")
+        cfg = cfg_raw if isinstance(cfg_raw, dict) else {}
+        cfg_schema = cfg.get("schema_version")
+        if cfg_schema is not None and str(cfg_schema) not in ("1.0", "2.0", FEATURE_SCHEMA_VERSION):
+            raise ValueError(
+                f"Unsupported config schema_version={cfg_schema!r} in {ckpt_path}."
+            )
+        emb_w = state_dict.get("pool.emb_call.weight") if isinstance(state_dict, dict) else None
+        inferred_codes = int(emb_w.shape[0]) if isinstance(emb_w, torch.Tensor) and emb_w.ndim == 2 else 18
         model = MaskedEQAutocallSurrogate(
             d_max=int(cfg.get("d_max", 8)),
             m_max=int(cfg.get("m_max", 48)),
@@ -1238,13 +1296,16 @@ def load_eq_autocall_surrogate(
             d_edge=int(cfg.get("d_edge", 4)),
             d_sched=int(cfg.get("d_sched", 12)),
             d_global=int(cfg.get("d_global", 16)),
-            n_func_codes=int(cfg.get("n_func_codes", 15)),
+            n_func_codes=int(cfg.get("n_func_codes", inferred_codes)),
             func_emb_dim=int(cfg.get("func_emb_dim", 16)),
         )
-        model.load_state_dict(raw["model_state_dict"], strict=True)
-        metrics = dict(raw.get("metrics", {}))
+        model.load_state_dict(state_dict, strict=True)
+        raw_metrics = raw.get("metrics")
+        metrics = dict(raw_metrics) if isinstance(raw_metrics, dict) else {}
     else:
-        model = MaskedEQAutocallSurrogate()
+        emb_w = raw.get("pool.emb_call.weight")
+        inferred_codes = int(emb_w.shape[0]) if isinstance(emb_w, torch.Tensor) and emb_w.ndim == 2 else 18
+        model = MaskedEQAutocallSurrogate(n_func_codes=inferred_codes)
         model.load_state_dict(raw, strict=True)
         metrics = {}
 
@@ -1381,7 +1442,7 @@ def recalibrate_guardian_stats_from_checkpoint(
             }
         )
         raw["metrics"] = metrics
-        torch.save(raw, ckpt_path)
+        _atomic_torch_save(raw, ckpt_path)
 
     return {
         "recal_wall_sec": time.perf_counter() - t0,

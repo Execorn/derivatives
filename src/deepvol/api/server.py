@@ -92,7 +92,8 @@ async def lifespan(app: FastAPI):
     yield
 
     try:
-        _shutdown_eq_autocall_state()
+        async with _EQ_AUTOCALL_RW_LOCK.writer():
+            await anyio.to_thread.run_sync(_shutdown_eq_autocall_state)
     except Exception as exc:
         logging.getLogger(__name__).warning("EQ Autocall runtime shutdown failed: %s", exc)
     try:
@@ -242,6 +243,7 @@ class CachedModel:
         self.last_loaded = time.time()
 
 
+_MODEL_CACHE_LOCK = threading.RLock()
 _MODEL_CACHE: Dict[str, CachedModel] = {}
 _MODEL_STATE: Dict[str, Any] = {
     "model": None,
@@ -266,7 +268,10 @@ _STRIKES = np.linspace(-0.5, 0.5, 11, dtype=np.float32)
 
 def _get_cached_container(model_name: str) -> CachedModel:
     model_name = model_name.lower()
-    if model_name not in _MODEL_CACHE:
+    with _MODEL_CACHE_LOCK:
+        if model_name in _MODEL_CACHE:
+            return _MODEL_CACHE[model_name]
+
         from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
         from deepvol.surrogates.normalizers import (
             IVSurfaceNormalizer,
@@ -360,7 +365,7 @@ def _get_cached_container(model_name: str) -> CachedModel:
                 model=wrapped_model, pn=pn, yn=yn, device=device, loaded=True
             )
 
-    return _MODEL_CACHE[model_name]
+        return container
 
 
 async def _hot_reload_model_weights(model_name: str):
@@ -369,10 +374,10 @@ async def _hot_reload_model_weights(model_name: str):
     This runs with ZERO server downtime.
     """
     model_name = model_name.lower()
-    if model_name not in _MODEL_CACHE:
-        return
-
-    cached_container = _MODEL_CACHE[model_name]
+    with _MODEL_CACHE_LOCK:
+        if model_name not in _MODEL_CACHE:
+            return
+        cached_container = _MODEL_CACHE[model_name]
 
     async with cached_container.rwlock.writer():
         from deepvol.surrogates.normalizers import (
@@ -433,6 +438,7 @@ def _load_model() -> None:
 
 # ── Autocall Model State & Cache ───────────────────────────────────────────────
 
+_AUTOCALL_CACHE_LOCK = threading.RLock()
 _AUTOCALL_CACHE: Dict[str, Any] = {
     "ensemble": None,
     "norm_in": None,
@@ -446,78 +452,79 @@ _AUTOCALL_CACHE: Dict[str, Any] = {
 
 
 def _get_autocall_state() -> Dict[str, Any]:
-    """Retrieve or lazy-load the Phase D Autocall CorrectionEnsemble and Guardian."""
-    if not _AUTOCALL_CACHE["loaded"]:
-        import json
-        from deepvol.utils.path_helpers import get_project_root
-        from deepvol.surrogates.correction_ensemble import CorrectionEnsemble
-        from deepvol.training.train_correction import (
-            CorrectionInputNormalizer,
-            CorrectionOutputNormalizer,
-        )
-        from deepvol.mrm.autocall_guardian import AutocallModelGuardian
+    """Retrieve or lazy-load the Autocall CorrectionEnsemble and Guardian."""
+    with _AUTOCALL_CACHE_LOCK:
+        if not _AUTOCALL_CACHE["loaded"]:
+            import json
+            from deepvol.utils.path_helpers import get_project_root
+            from deepvol.surrogates.correction_ensemble import CorrectionEnsemble
+            from deepvol.training.train_correction import (
+                CorrectionInputNormalizer,
+                CorrectionOutputNormalizer,
+            )
+            from deepvol.mrm.autocall_guardian import AutocallModelGuardian
 
-        root = get_project_root()
-        weights_dir = root / "artifacts" / "weights"
-        scalers_dir = root / "artifacts" / "scalers"
+            root = get_project_root()
+            weights_dir = root / "artifacts" / "weights"
+            scalers_dir = root / "artifacts" / "scalers"
 
-        member_paths = [
-            str(weights_dir / f"autocall_correction_mlp_member_{k}.pth")
-            for k in range(5)
-        ]
-        norm_in_path = str(scalers_dir / "correction_input_normalizer.npz")
-        norm_out_path = str(scalers_dir / "correction_output_normalizer.npz")
-        calib_path = str(weights_dir / "ensemble_calibration.json")
+            member_paths = [
+                str(weights_dir / f"autocall_correction_mlp_member_{k}.pth")
+                for k in range(5)
+            ]
+            norm_in_path = str(scalers_dir / "correction_input_normalizer.npz")
+            norm_out_path = str(scalers_dir / "correction_output_normalizer.npz")
+            calib_path = str(weights_dir / "ensemble_calibration.json")
 
-        for p in member_paths:
-            if not os.path.exists(p):
+            for p in member_paths:
+                if not os.path.exists(p):
+                    raise HTTPException(
+                        status_code=500, detail=f"Member weight not found: {p}"
+                    )
+            if not os.path.exists(norm_in_path) or not os.path.exists(norm_out_path):
                 raise HTTPException(
-                    status_code=500, detail=f"Member weight not found: {p}"
+                    status_code=500, detail="Correction normalizers not found"
                 )
-        if not os.path.exists(norm_in_path) or not os.path.exists(norm_out_path):
-            raise HTTPException(
-                status_code=500, detail="Correction normalizers not found"
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            norm_in = CorrectionInputNormalizer.load(norm_in_path)
+            norm_out = CorrectionOutputNormalizer.load(norm_out_path)
+
+            tau_ood = 2.17
+            calib = {}
+            if os.path.exists(calib_path):
+                with open(calib_path, "r", encoding="utf-8") as f:
+                    calib = json.load(f)
+                tau_ood = float(calib.get("tau_ood", calib.get("tau_ood_p99_bps", 2.17)))
+
+            ensemble = CorrectionEnsemble(
+                K=5, in_dim=19, hidden=256, n_layers=4, dropout=0.0
+            )
+            ensemble.load_members(member_paths, device=device)
+            ensemble.eval()
+
+            guardian = AutocallModelGuardian(
+                model=ensemble,
+                norm_in=norm_in,
+                norm_out=norm_out,
+                tau_ood=tau_ood,
+                device=str(device),
             )
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        norm_in = CorrectionInputNormalizer.load(norm_in_path)
-        norm_out = CorrectionOutputNormalizer.load(norm_out_path)
-
-        tau_ood = 2.17
-        calib = {}
-        if os.path.exists(calib_path):
-            with open(calib_path, "r", encoding="utf-8") as f:
-                calib = json.load(f)
-            tau_ood = float(calib.get("tau_ood", calib.get("tau_ood_p99_bps", 2.17)))
-
-        ensemble = CorrectionEnsemble(
-            K=5, in_dim=19, hidden=256, n_layers=4, dropout=0.0
-        )
-        ensemble.load_members(member_paths, device=device)
-        ensemble.eval()
-
-        guardian = AutocallModelGuardian(
-            model=ensemble,
-            norm_in=norm_in,
-            norm_out=norm_out,
-            tau_ood=tau_ood,
-            device=str(device),
-        )
-
-        _AUTOCALL_CACHE.update(
-            {
-                "ensemble": ensemble,
-                "norm_in": norm_in,
-                "norm_out": norm_out,
-                "guardian": guardian,
-                "tau_ood": tau_ood,
-                "calib": calib,
-                "device": device,
-                "loaded": True,
-            }
-        )
-    return _AUTOCALL_CACHE
+            _AUTOCALL_CACHE.update(
+                {
+                    "ensemble": ensemble,
+                    "norm_in": norm_in,
+                    "norm_out": norm_out,
+                    "guardian": guardian,
+                    "tau_ood": tau_ood,
+                    "calib": calib,
+                    "device": device,
+                    "loaded": True,
+                }
+            )
+        return _AUTOCALL_CACHE
 
 
 # ── Pydantic schemas ───────────────────────────────────────────────────────────
@@ -669,11 +676,14 @@ def _fno_forward(params: HestonParams) -> np.ndarray:
 @app.get("/health", response_model=HealthResponse, tags=["Infrastructure"])
 async def health() -> HealthResponse:
     """Liveness probe — always returns 200 even before model is loaded."""
-    loaded = "rough_heston" in _MODEL_CACHE
-    device_str = "not_loaded"
-    if loaded:
-        container = _MODEL_CACHE["rough_heston"]
-        device_str = str(next(container.model.parameters()).device)
+    with _MODEL_CACHE_LOCK:
+        container = _MODEL_CACHE.get("rough_heston")
+    loaded = container is not None
+    device_str = (
+        str(next(container.model.parameters()).device)
+        if container is not None
+        else "not_loaded"
+    )
     return HealthResponse(
         status="ok",
         model_loaded=loaded,
@@ -824,7 +834,8 @@ def _compute_greeks_from_surface(
             vanna_surf[i, j] = g["vanna"]
             volga_surf[i, j] = g["volga"]
 
-    gamma_max = np.percentile(np.abs(gamma_surf[np.isfinite(gamma_surf)]), 99.5)
+    finite_gamma = gamma_surf[np.isfinite(gamma_surf)]
+    gamma_max = float(np.percentile(np.abs(finite_gamma), 99.5)) if finite_gamma.size > 0 else 0.0
     if gamma_max > 1e6:
         gamma_surf = np.clip(gamma_surf, -1e6, 1e6)
 
@@ -1694,6 +1705,7 @@ async def hedge_simulate(req: HedgeSimulateRequest) -> HedgeSimulateResponse:
 
 # ── Process-Isolated Training Background Task Manager ─────────────────────────
 
+_TRAINING_TASKS_LOCK = threading.RLock()
 _TRAINING_TASKS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -1762,22 +1774,24 @@ async def _run_training_subprocess(task_id: str, model_name: str, req: TrainRequ
 
             exit_code = await process.wait()
 
+        with _TRAINING_TASKS_LOCK:
+            if exit_code == 0:
+                _TRAINING_TASKS[task_id]["status"] = "completed"
+                _TRAINING_TASKS[task_id]["completed_at"] = time.time()
+            else:
+                _TRAINING_TASKS[task_id]["status"] = "failed"
+                _TRAINING_TASKS[task_id]["completed_at"] = time.time()
+                _TRAINING_TASKS[task_id]["error_message"] = (
+                    f"Subprocess exited with code {exit_code}"
+                )
         if exit_code == 0:
-            _TRAINING_TASKS[task_id]["status"] = "completed"
-            _TRAINING_TASKS[task_id]["completed_at"] = time.time()
-            # Hot-reload hook: dynamically load new weights into API server
             await _hot_reload_model_weights(model_name)
-        else:
-            _TRAINING_TASKS[task_id]["status"] = "failed"
-            _TRAINING_TASKS[task_id]["completed_at"] = time.time()
-            _TRAINING_TASKS[task_id]["error_message"] = (
-                f"Subprocess exited with code {exit_code}"
-            )
 
     except Exception as exc:
-        _TRAINING_TASKS[task_id]["status"] = "failed"
-        _TRAINING_TASKS[task_id]["completed_at"] = time.time()
-        _TRAINING_TASKS[task_id]["error_message"] = str(exc)
+        with _TRAINING_TASKS_LOCK:
+            _TRAINING_TASKS[task_id]["status"] = "failed"
+            _TRAINING_TASKS[task_id]["completed_at"] = time.time()
+            _TRAINING_TASKS[task_id]["error_message"] = str(exc)
 
 
 @app.post("/train/{model_name}", response_model=TrainResponse, tags=["Training"])
@@ -1786,22 +1800,21 @@ async def trigger_training(model_name: str, req: TrainRequest) -> TrainResponse:
     if model_name not in ("heston", "sabr", "ssvi", "rbergomi"):
         raise HTTPException(status_code=400, detail=f"Unsupported model: {model_name}")
 
-    # Check for active training task of this model
-    for tid, tstate in _TRAINING_TASKS.items():
-        if tstate["model_name"] == model_name and tstate["status"] == "running":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Training for {model_name} is already in progress (Task ID: {tid})",
-            )
-
     task_id = str(uuid.uuid4())
-    _TRAINING_TASKS[task_id] = {
-        "model_name": model_name,
-        "status": "running",
-        "started_at": time.time(),
-        "completed_at": None,
-        "error_message": None,
-    }
+    with _TRAINING_TASKS_LOCK:
+        for tid, tstate in _TRAINING_TASKS.items():
+            if tstate["model_name"] == model_name and tstate["status"] == "running":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Training for {model_name} is already in progress (Task ID: {tid})",
+                )
+        _TRAINING_TASKS[task_id] = {
+            "model_name": model_name,
+            "status": "running",
+            "started_at": time.time(),
+            "completed_at": None,
+            "error_message": None,
+        }
 
     # Spawn training as a non-blocking background task
     asyncio.create_task(_run_training_subprocess(task_id, model_name, req))
@@ -1817,10 +1830,11 @@ async def trigger_training(model_name: str, req: TrainRequest) -> TrainResponse:
     "/train/status/{task_id}", response_model=TrainStatusResponse, tags=["Training"]
 )
 async def get_train_status(task_id: str) -> TrainStatusResponse:
-    if task_id not in _TRAINING_TASKS:
-        raise HTTPException(status_code=404, detail="Task not found")
+    with _TRAINING_TASKS_LOCK:
+        if task_id not in _TRAINING_TASKS:
+            raise HTTPException(status_code=404, detail="Task not found")
+        state = dict(_TRAINING_TASKS[task_id])
 
-    state = _TRAINING_TASKS[task_id]
     log_path = f"logs/train_{task_id}.log"
 
     recent_logs = []
@@ -1845,6 +1859,7 @@ async def get_train_status(task_id: str) -> TrainStatusResponse:
 # ── Session-Based Calibration Cache ───────────────────────────────────────────
 
 # Thread-safe in-memory session cache with 1-hour expiration
+_SESSION_CACHE_LOCK = threading.RLock()
 _SESSION_CACHE = TTLCache(maxsize=10000, ttl=3600)
 
 
@@ -1878,11 +1893,12 @@ async def session_calibrate(
     calib_res = await calibrate_route(model_name, req)
 
     session_id = str(uuid.uuid4())
-    _SESSION_CACHE[session_id] = {
-        "model_name": model_name,
-        "params": calib_res.params,
-        "last_accessed": time.time(),
-    }
+    with _SESSION_CACHE_LOCK:
+        _SESSION_CACHE[session_id] = {
+            "model_name": model_name,
+            "params": calib_res.params,
+            "last_accessed": time.time(),
+        }
 
     return SessionCalibrateResponse(
         session_id=session_id,
@@ -1899,14 +1915,14 @@ async def session_greeks(session_id: str, req: SessionGreeksRequest) -> GreeksRe
     """
     Compute Greeks surface using calibrated parameters saved under session_id.
     """
-    if session_id not in _SESSION_CACHE:
-        raise HTTPException(status_code=404, detail="Session expired or not found")
+    with _SESSION_CACHE_LOCK:
+        if session_id not in _SESSION_CACHE:
+            raise HTTPException(status_code=404, detail="Session expired or not found")
 
-    session_data = _SESSION_CACHE[session_id]
-    session_data["last_accessed"] = time.time()  # Update access time
-
-    model_name = session_data["model_name"]
-    params = session_data["params"]
+        session_data = _SESSION_CACHE[session_id]
+        session_data["last_accessed"] = time.time()
+        model_name = str(session_data["model_name"])
+        params = dict(session_data["params"])
 
     greeks_req = {"S": req.S, "r": req.r, "q": req.q}
 
@@ -2016,8 +2032,11 @@ async def autocall_price(req: AutocallPriceRequest) -> AutocallPriceResponse:
                 norm_out,
             )
             df_dB = float(df_dB_tensor.item())
-        except Exception:
-            df_dB = 0.0
+        except (ValueError, RuntimeError, TypeError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to compute barrier derivative: {exc}",
+            ) from exc
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -2156,59 +2175,63 @@ _FX_CROSS_STATE: Dict[str, Any] = {
     "canonicalizer": None,
     "model_version": "1326b33ce012+afc6d3f",
 }
+_FX_CROSS_STATE_LOCK = threading.RLock()
 _FX_CROSS_RW_LOCK = AsyncReadWriteLock()
 
 
 def _init_fx_cross_state() -> None:
     import sys
 
-    sys.setswitchinterval(0.0002)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    net = ResidualCrossVolNet(width=64, depth=3, members=1)
-    engine = CrossVolSurrogateEngine(net)
-    runtime = FXCrossRuntime(engine=engine, device=device)
-    executor = FXCrossGPUExecutor(runtime=runtime, window_us=200)
-    executor.start()
-    guardian = FXCrossGuardian()
-    canonicalizer = SmileCanonicalizer()
+    with _FX_CROSS_STATE_LOCK:
+        sys.setswitchinterval(0.0002)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        net = ResidualCrossVolNet(width=64, depth=3, members=1)
+        engine = CrossVolSurrogateEngine(net)
+        runtime = FXCrossRuntime(engine=engine, device=device)
+        executor = FXCrossGPUExecutor(runtime=runtime, window_us=200)
+        executor.start()
+        guardian = FXCrossGuardian()
+        canonicalizer = SmileCanonicalizer()
 
-    _FX_CROSS_STATE.update(
-        {
-            "engine": engine,
-            "runtime": runtime,
-            "executor": executor,
-            "guardian": guardian,
-            "canonicalizer": canonicalizer,
-            "device": device,
-        }
-    )
+        _FX_CROSS_STATE.update(
+            {
+                "engine": engine,
+                "runtime": runtime,
+                "executor": executor,
+                "guardian": guardian,
+                "canonicalizer": canonicalizer,
+                "device": device,
+            }
+        )
 
 
 def _shutdown_fx_cross_state() -> None:
-    executor = _FX_CROSS_STATE.get("executor")
-    if executor is not None:
-        executor.stop()
-    runtime = _FX_CROSS_STATE.get("runtime")
-    if runtime is not None:
-        runtime.quote_bucket = None
-        runtime.batch_buckets.clear()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    _FX_CROSS_STATE.update(
-        {
-            "engine": None,
-            "runtime": None,
-            "executor": None,
-            "guardian": None,
-            "canonicalizer": None,
-        }
-    )
+    with _FX_CROSS_STATE_LOCK:
+        executor = _FX_CROSS_STATE.get("executor")
+        if executor is not None:
+            executor.stop()
+        runtime = _FX_CROSS_STATE.get("runtime")
+        if runtime is not None:
+            runtime.quote_bucket = None
+            runtime.batch_buckets.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _FX_CROSS_STATE.update(
+            {
+                "engine": None,
+                "runtime": None,
+                "executor": None,
+                "guardian": None,
+                "canonicalizer": None,
+            }
+        )
 
 
 def _get_fx_cross_state() -> Dict[str, Any]:
-    if _FX_CROSS_STATE.get("executor") is None:
-        _init_fx_cross_state()
-    return _FX_CROSS_STATE
+    with _FX_CROSS_STATE_LOCK:
+        if _FX_CROSS_STATE.get("executor") is None:
+            _init_fx_cross_state()
+        return _FX_CROSS_STATE
 
 
 async def reload_fx_cross_weights(weights_path: Union[str, Path]) -> None:
@@ -2781,12 +2804,87 @@ from deepvol.api.eq_autocall_runtime import (  # noqa: E402
     EQAutocallRuntime,
     EQAutocallRuntimeResponse,
 )
+from deepvol.models.autocall.feature_layout import AutocallSchedCol  # noqa: E402
 
 _EQ_AUTOCALL_STATE: Dict[str, Optional[EQAutocallRuntime]] = {
     "runtime": None,
 }
 _RUNTIME_INIT_LOCK = threading.Lock()
 _EQ_AUTOCALL_RW_LOCK = AsyncReadWriteLock()
+EQ_AUTOCALL_MAX_PAYLOAD_BYTES = 50 * 1024 * 1024
+_VALID_EQ_AUTOCALL_ENGINES = frozenset({"auto", "surrogate", "proxy", "qmc"})
+
+
+def _parse_strict_bool(val: Any, field_name: str) -> bool:
+    if isinstance(val, bool):
+        return val
+    raise ValueError(f"Field '{field_name}' must be a boolean, got {val!r}.")
+
+
+def _parse_eq_autocall_engine(val: Any) -> EQAutocallEngineMode:
+    if not isinstance(val, str) or val not in _VALID_EQ_AUTOCALL_ENGINES:
+        raise ValueError(
+            f"Unsupported engine={val!r}; expected one of {sorted(_VALID_EQ_AUTOCALL_ENGINES)}."
+        )
+    if val == "surrogate":
+        return "surrogate"
+    if val == "proxy":
+        return "proxy"
+    if val == "qmc":
+        return "qmc"
+    return "auto"
+
+
+async def _read_bounded_eq_autocall_body(request: Request, *, empty_detail: str) -> bytes:
+    cl_raw = request.headers.get("content-length")
+    if cl_raw is not None:
+        try:
+            cl_val = int(cl_raw)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"Invalid Content-Length header: {cl_raw!r}"
+            ) from exc
+        if cl_val < 0:
+            raise HTTPException(
+                status_code=422, detail=f"Invalid Content-Length header: {cl_raw!r}"
+            )
+        if cl_val > EQ_AUTOCALL_MAX_PAYLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Payload size {cl_val} exceeds {EQ_AUTOCALL_MAX_PAYLOAD_BYTES} byte limit.",
+            )
+    body_bytes = await request.body()
+    if len(body_bytes) > EQ_AUTOCALL_MAX_PAYLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Payload size {len(body_bytes)} exceeds {EQ_AUTOCALL_MAX_PAYLOAD_BYTES} byte limit.",
+        )
+    if not body_bytes:
+        raise HTTPException(status_code=422, detail=empty_detail)
+    return body_bytes
+
+
+def _assert_finite_json_response(obj: Any, path: str = "response") -> None:
+    if obj is None or isinstance(obj, (str, bool)):
+        return
+    if isinstance(obj, (int, float, np.number)):
+        if not math.isfinite(float(obj)):
+            raise ValueError(f"Non-finite scalar in {path}: {obj!r}")
+        return
+    if isinstance(obj, np.ndarray):
+        if obj.dtype.kind in ("f", "c", "i", "u") and not bool(np.all(np.isfinite(obj))):
+            raise ValueError(f"Non-finite array values in {path}")
+        return
+    if isinstance(obj, BaseModel):
+        _assert_finite_json_response(obj.__dict__, path)
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _assert_finite_json_response(v, f"{path}.{k}")
+        return
+    if isinstance(obj, (list, tuple)):
+        for idx, item in enumerate(obj):
+            _assert_finite_json_response(item, f"{path}[{idx}]")
 
 
 def _init_eq_autocall_state() -> EQAutocallRuntime:
@@ -2810,13 +2908,18 @@ def _shutdown_eq_autocall_state() -> None:
 
 
 def _get_eq_autocall_runtime() -> EQAutocallRuntime:
-    rt = _EQ_AUTOCALL_STATE.get("runtime")
+    with _RUNTIME_INIT_LOCK:
+        rt = _EQ_AUTOCALL_STATE.get("runtime")
     if rt is not None:
         return rt
     return _init_eq_autocall_state()
 
 
-def _parse_json_tensor_batch_payload(payload: Dict[str, Any]) -> Tuple[
+def _parse_json_tensor_batch_payload(
+    payload: Dict[str, Any],
+    *,
+    default_compute_greeks: bool = True,
+) -> Tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -2825,7 +2928,7 @@ def _parse_json_tensor_batch_payload(payload: Dict[str, Any]) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
     Optional[torch.Tensor],
-    float,
+    Union[float, torch.Tensor],
     bool,
 ]:
     """Validates and converts a JSON tensor batch dict into strict finite `float64` CPU tensors."""
@@ -2860,8 +2963,22 @@ def _parse_json_tensor_batch_payload(payload: Dict[str, Any]) -> Tuple[
         raise ValueError("Invalid tensor ranks for sched_feats/sched_mask/global_feats.")
 
     b_sz = int(node_t.shape[0])
+    d_max = int(node_t.shape[1])
+    m_max = int(sched_t.shape[1])
     if b_sz < 1 or b_sz > EQ_AUTOCALL_MAX_BATCH_TRADES:
         raise ValueError(f"Tensor batch size {b_sz} out of bounds [1, {EQ_AUTOCALL_MAX_BATCH_TRADES}].")
+    if d_max < 1 or m_max < 1:
+        raise ValueError(f"Tensor dimensions (D={d_max}, M={m_max}) must be >= 1.")
+    if int(sched_t.shape[0]) != b_sz or int(sched_t.shape[2]) != len(AutocallSchedCol):
+        raise ValueError(
+            f"Expected sched_feats shape ({b_sz}, {m_max}, {len(AutocallSchedCol)}), got {tuple(sched_t.shape)}."
+        )
+    if edge_t.shape[:3] != (b_sz, d_max, d_max) or int(edge_t.shape[3]) < 4:
+        raise ValueError(
+            f"Expected edge_feats shape ({b_sz}, {d_max}, {d_max}, >=4), got {tuple(edge_t.shape)}."
+        )
+    if tuple(amask_t.shape) != (b_sz, d_max) or tuple(smask_t.shape) != (b_sz, m_max):
+        raise ValueError("asset_mask or sched_mask shape mismatch with node_feats/sched_feats.")
     for name, tens in (
         ("node_feats", node_t),
         ("edge_feats", edge_t),
@@ -2873,9 +2990,43 @@ def _parse_json_tensor_batch_payload(payload: Dict[str, Any]) -> Tuple[
         if int(tens.shape[0]) != b_sz or not bool(torch.isfinite(tens).all()):
             raise ValueError(f"Tensor {name} has mismatched batch dimension or non-finite entries.")
 
-    pvit = float(payload.get("pv_in_transit", 0.0))
-    if not math.isfinite(pvit):
-        raise ValueError("Non-finite pv_in_transit in tensor batch payload.")
+    for opt_name, opt_t in (("spots_t0", spots_t), ("ref_spots", refs_t)):
+        if opt_t is not None:
+            if opt_t.ndim != 2 or tuple(opt_t.shape) != (b_sz, d_max):
+                raise ValueError(
+                    f"Expected {opt_name} of shape {(b_sz, d_max)}, got {tuple(opt_t.shape)}."
+                )
+            if not bool(torch.isfinite(opt_t).all()):
+                raise ValueError(f"Tensor {opt_name} contains non-finite values.")
+
+    pvit_val: Union[float, torch.Tensor] = 0.0
+    if "pv_in_transit" in payload:
+        raw_pvit = payload["pv_in_transit"]
+        if raw_pvit is None or isinstance(raw_pvit, bool):
+            raise ValueError(f"Invalid pv_in_transit={raw_pvit!r}.")
+        if isinstance(raw_pvit, (int, float)):
+            pvit_f = float(raw_pvit)
+            if not math.isfinite(pvit_f):
+                raise ValueError("Non-finite pv_in_transit in tensor batch payload.")
+            pvit_val = pvit_f
+        else:
+            try:
+                pvit_t = torch.as_tensor(raw_pvit, dtype=torch.float64)
+            except (ValueError, TypeError, RuntimeError) as exc:
+                raise ValueError(f"Malformed pv_in_transit in tensor batch payload: {exc}") from exc
+            if pvit_t.ndim != 1 or tuple(pvit_t.shape) != (b_sz,):
+                raise ValueError(
+                    f"Expected pv_in_transit scalar or shape {(b_sz,)}, got {tuple(pvit_t.shape)}."
+                )
+            if not bool(torch.isfinite(pvit_t).all()):
+                raise ValueError("Non-finite pv_in_transit in tensor batch payload.")
+            pvit_val = pvit_t
+
+    eff_cg = (
+        _parse_strict_bool(payload["compute_greeks"], "compute_greeks")
+        if "compute_greeks" in payload
+        else bool(default_compute_greeks)
+    )
     return (
         node_t,
         edge_t,
@@ -2885,8 +3036,8 @@ def _parse_json_tensor_batch_payload(payload: Dict[str, Any]) -> Tuple[
         glob_t,
         spots_t,
         refs_t,
-        pvit,
-        bool(payload.get("compute_greeks", True)),
+        pvit_val,
+        eff_cg,
     )
 
 
@@ -2896,18 +3047,19 @@ eq_autocall_router = APIRouter(prefix="/eq_autocall", tags=["EQ Autocallable"])
 @eq_autocall_router.get("/health")
 async def eq_autocall_health() -> Dict[str, Any]:
     """Liveness and model readiness endpoint for the Multi-Asset Equity Autocallable runtime."""
-    rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
-    return {
-        "status": "ok",
-        "device": str(rt.device),
-        "model_version": rt.model_version,
-        "d_max": rt.d_max,
-        "m_max": rt.m_max,
-        "checkpoint_loaded": bool(rt.checkpoint_loaded),
-        "checkpoint_error": rt.checkpoint_error,
-        "guardian_stats_loaded": bool(rt.guardian_stats_loaded),
-        "checkpoint_metrics": rt.checkpoint_metrics,
-    }
+    async with _EQ_AUTOCALL_RW_LOCK.reader():
+        rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
+        return {
+            "status": "ok",
+            "device": str(rt.device),
+            "model_version": rt.model_version,
+            "d_max": rt.d_max,
+            "m_max": rt.m_max,
+            "checkpoint_loaded": bool(rt.checkpoint_loaded),
+            "checkpoint_error": rt.checkpoint_error,
+            "guardian_stats_loaded": bool(rt.guardian_stats_loaded),
+            "checkpoint_metrics": rt.checkpoint_metrics,
+        }
 
 
 @eq_autocall_router.post("/price", response_model=EQAutocallRuntimeResponse)
@@ -2921,24 +3073,27 @@ async def eq_autocall_price(
 ) -> EQAutocallRuntimeResponse:
     """Prices a single Multi-Asset Equity Autocallable trade from a JSON `EQAutocallableTradeRequest` payload."""
     async with _EQ_AUTOCALL_RW_LOCK.reader():
+        body_bytes = await _read_bounded_eq_autocall_body(
+            request, empty_detail="Empty request body"
+        )
         rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
-        body_bytes = await request.body()
-        if not body_bytes:
-            raise HTTPException(status_code=422, detail="Empty request body")
         try:
             payload = orjson.loads(body_bytes)
         except (orjson.JSONDecodeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=f"Invalid JSON payload: {exc}") from exc
 
         try:
-            return await anyio.to_thread.run_sync(
-                lambda: rt.price_trade(
+            def _run_price() -> EQAutocallRuntimeResponse:
+                res_obj = rt.price_trade(
                     payload,
                     engine,
                     include_all_greeks=include_all_greeks,
                 )
-            )
-        except (ValidationError, ValueError, TypeError) as exc:
+                _assert_finite_json_response(res_obj, "price")
+                return res_obj
+
+            return await anyio.to_thread.run_sync(_run_price)
+        except (ValidationError, ValueError, TypeError, KeyError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
@@ -2953,10 +3108,10 @@ async def eq_autocall_price_murex_dag(
 ) -> EQAutocallRuntimeResponse:
     """Ingests and prices a raw Murex `ConstantMessageMap` DAG payload (text/plain or JSON `{\"dag_text\": ...}`)."""
     async with _EQ_AUTOCALL_RW_LOCK.reader():
+        body_bytes = await _read_bounded_eq_autocall_body(
+            request, empty_detail="Empty Murex DAG request body"
+        )
         rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
-        body_bytes = await request.body()
-        if not body_bytes:
-            raise HTTPException(status_code=422, detail="Empty Murex DAG request body")
 
         content_type = request.headers.get("content-type", "text/plain").lower()
         dag_input: Union[str, Dict[str, Any]]
@@ -2969,7 +3124,13 @@ async def eq_autocall_price_murex_dag(
                     detail=f"Invalid JSON in Murex DAG request: {exc}",
                 ) from exc
             if isinstance(parsed_json, dict) and "dag_text" in parsed_json:
-                dag_input = str(parsed_json["dag_text"])
+                raw_dag_text = parsed_json["dag_text"]
+                if not isinstance(raw_dag_text, str):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="'dag_text' must be a string",
+                    )
+                dag_input = raw_dag_text
             elif isinstance(parsed_json, dict):
                 dag_input = parsed_json
             elif isinstance(parsed_json, str):
@@ -2986,14 +3147,17 @@ async def eq_autocall_price_murex_dag(
                 ) from exc
 
         try:
-            return await anyio.to_thread.run_sync(
-                lambda: rt.price_murex_dag(
+            def _run_murex_dag() -> EQAutocallRuntimeResponse:
+                res_obj = rt.price_murex_dag(
                     dag_input,
                     engine,
                     include_all_greeks=include_all_greeks,
                 )
-            )
-        except (ValidationError, ValueError, TypeError) as exc:
+                _assert_finite_json_response(res_obj, "price_murex_dag")
+                return res_obj
+
+            return await anyio.to_thread.run_sync(_run_murex_dag)
+        except (ValidationError, ValueError, TypeError, KeyError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
@@ -3004,10 +3168,10 @@ async def eq_autocall_price_arrow(
 ) -> Response:
     """Vectorized Apache Arrow IPC stream endpoint (`application/vnd.apache.arrow.stream`)."""
     async with _EQ_AUTOCALL_RW_LOCK.reader():
+        body_bytes = await _read_bounded_eq_autocall_body(
+            request, empty_detail="Empty Arrow IPC payload"
+        )
         rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
-        body_bytes = await request.body()
-        if not body_bytes:
-            raise HTTPException(status_code=422, detail="Empty Arrow IPC payload")
 
         try:
             out_bytes = await anyio.to_thread.run_sync(
@@ -3016,7 +3180,7 @@ async def eq_autocall_price_arrow(
                     compute_greeks,
                 )
             )
-        except (ValidationError, ValueError, TypeError) as exc:
+        except (ValidationError, ValueError, TypeError, KeyError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         return Response(content=out_bytes, media_type=EQ_AUTOCALL_ARROW_MIME)
@@ -3030,11 +3194,11 @@ async def eq_autocall_price_batch(
 ) -> Response:
     """Batched valuation and Greek evaluation supporting JSON trade lists, JSON tensor batches, and Apache Arrow IPC."""
     async with _EQ_AUTOCALL_RW_LOCK.reader():
-        rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
         content_type = request.headers.get("content-type", "application/json").lower()
-        body_bytes = await request.body()
-        if not body_bytes:
-            raise HTTPException(status_code=422, detail="Empty batch request body")
+        body_bytes = await _read_bounded_eq_autocall_body(
+            request, empty_detail="Empty batch request body"
+        )
+        rt = await anyio.to_thread.run_sync(_get_eq_autocall_runtime)
 
         if EQ_AUTOCALL_ARROW_MIME in content_type or "application/octet-stream" in content_type:
             try:
@@ -3044,7 +3208,7 @@ async def eq_autocall_price_batch(
                         compute_greeks,
                     )
                 )
-            except (ValidationError, ValueError, TypeError) as exc:
+            except (ValidationError, ValueError, TypeError, KeyError) as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             return Response(content=arrow_resp, media_type=EQ_AUTOCALL_ARROW_MIME)
 
@@ -3062,6 +3226,7 @@ async def eq_autocall_price_batch(
                     )
                 res_list = rt.price_batch_json(payload, compute_greeks=compute_greeks, engine=engine)
                 dumped = [r.model_dump(mode="json") for r in res_list]
+                _assert_finite_json_response(dumped, "price_batch")
                 return orjson.dumps(dumped)
 
             if isinstance(payload, dict):
@@ -3077,7 +3242,19 @@ async def eq_autocall_price_batch(
                         refs_t,
                         pvit,
                         eff_cg,
-                    ) = _parse_json_tensor_batch_payload(payload)
+                    ) = _parse_json_tensor_batch_payload(
+                        payload,
+                        default_compute_greeks=compute_greeks,
+                    )
+                    eff_eng = (
+                        _parse_eq_autocall_engine(payload["engine"])
+                        if "engine" in payload
+                        else engine
+                    )
+                    if eff_eng == "qmc":
+                        raise ValueError(
+                            "engine='qmc' is not supported for raw tensor batches; use JSON trade payloads."
+                        )
                     batch_out = rt.price_tensor_batch(
                         node_t,
                         edge_t,
@@ -3090,29 +3267,41 @@ async def eq_autocall_price_batch(
                         pv_in_transit=pvit,
                         compute_greeks=eff_cg,
                         compute_cash_gamma=eff_cg,
+                        proxy_only=(eff_eng == "proxy"),
                     )
                     lat_ms = (time.perf_counter() - t0) * 1e3
+                    resp_dict: Dict[str, Any] = {
+                        "status": "done",
+                        "batch_size": int(batch_out.product_value.shape[0]),
+                        "product_value": batch_out.product_value.detach().cpu().numpy(),
+                        "stopping_probs": batch_out.stopping_probs.detach().cpu().numpy(),
+                        "survival_probs": batch_out.survival_probs.detach().cpu().numpy(),
+                        "coupon_probs": batch_out.coupon_probs.detach().cpu().numpy(),
+                        "put_loss": batch_out.put_loss.detach().cpu().numpy(),
+                        "delta": batch_out.delta.detach().cpu().numpy(),
+                        "vega_atm": batch_out.vega_atm.detach().cpu().numpy(),
+                        "vega_surface_feats": batch_out.vega_surface_feats.detach().cpu().numpy(),
+                        "rho_df": batch_out.rho_df.detach().cpu().numpy(),
+                        "cega": batch_out.cega.detach().cpu().numpy(),
+                        "cash_gamma_euler": (
+                            batch_out.cash_gamma_euler.detach().cpu().numpy()
+                            if batch_out.cash_gamma_euler is not None
+                            else np.zeros(int(batch_out.product_value.shape[0]), dtype=np.float64)
+                        ),
+                        "engine_used": str(
+                            getattr(
+                                batch_out,
+                                "_engine_selected",
+                                "Tier1_AnalyticalProxy"
+                                if eff_eng == "proxy"
+                                else "MaskedEGNO_Surrogate",
+                            )
+                        ),
+                        "latency_ms": round(lat_ms, 4),
+                    }
+                    _assert_finite_json_response(resp_dict, "price_batch_tensor")
                     return orjson.dumps(
-                        {
-                            "status": "done",
-                            "batch_size": int(batch_out.product_value.shape[0]),
-                            "product_value": batch_out.product_value.detach().cpu().numpy(),
-                            "stopping_probs": batch_out.stopping_probs.detach().cpu().numpy(),
-                            "survival_probs": batch_out.survival_probs.detach().cpu().numpy(),
-                            "coupon_probs": batch_out.coupon_probs.detach().cpu().numpy(),
-                            "put_loss": batch_out.put_loss.detach().cpu().numpy(),
-                            "delta": batch_out.delta.detach().cpu().numpy(),
-                            "vega_atm": batch_out.vega_atm.detach().cpu().numpy(),
-                            "rho_df": batch_out.rho_df.detach().cpu().numpy(),
-                            "cega": batch_out.cega.detach().cpu().numpy(),
-                            "cash_gamma_euler": (
-                                batch_out.cash_gamma_euler.detach().cpu().numpy()
-                                if batch_out.cash_gamma_euler is not None
-                                else np.zeros(int(batch_out.product_value.shape[0]), dtype=np.float64)
-                            ),
-                            "engine_used": "MaskedEGNO_Surrogate",
-                            "latency_ms": round(lat_ms, 4),
-                        },
+                        resp_dict,
                         option=orjson.OPT_SERIALIZE_NUMPY,
                     )
 
@@ -3122,8 +3311,16 @@ async def eq_autocall_price_batch(
                         raise ValueError(
                             f"Batch trades count {len(trades_seq)} out of bounds [1, {EQ_AUTOCALL_MAX_BATCH_TRADES}]."
                         )
-                    eff_cg = bool(payload.get("compute_greeks", compute_greeks))
-                    eff_eng = str(payload.get("engine", engine))
+                    eff_cg = (
+                        _parse_strict_bool(payload["compute_greeks"], "compute_greeks")
+                        if "compute_greeks" in payload
+                        else bool(compute_greeks)
+                    )
+                    eff_eng = (
+                        _parse_eq_autocall_engine(payload["engine"])
+                        if "engine" in payload
+                        else engine
+                    )
                     res_list = rt.price_batch_json(
                         trades_seq,
                         compute_greeks=eff_cg,
@@ -3131,15 +3328,15 @@ async def eq_autocall_price_batch(
                     )
                     lat_ms = (time.perf_counter() - t0) * 1e3
                     dumped = [r.model_dump(mode="json") for r in res_list]
-                    return orjson.dumps(
-                        {
-                            "status": "done",
-                            "count": len(dumped),
-                            "results": dumped,
-                            "product_value": [r.ProductValue for r in res_list],
-                            "latency_ms": round(lat_ms, 4),
-                        }
-                    )
+                    batch_resp = {
+                        "status": "done",
+                        "count": len(dumped),
+                        "results": dumped,
+                        "product_value": [r.ProductValue for r in res_list],
+                        "latency_ms": round(lat_ms, 4),
+                    }
+                    _assert_finite_json_response(batch_resp, "price_batch_requests")
+                    return orjson.dumps(batch_resp)
 
             raise ValueError(
                 "JSON batch payload must be a list of trade requests, {'requests': [...]}, or tensor batch dict."
@@ -3147,7 +3344,7 @@ async def eq_autocall_price_batch(
 
         try:
             json_bytes = await anyio.to_thread.run_sync(_eval_json_batch)
-        except (ValidationError, ValueError, TypeError) as exc:
+        except (ValidationError, ValueError, TypeError, KeyError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         return Response(content=json_bytes, media_type="application/json")

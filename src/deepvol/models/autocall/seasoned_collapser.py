@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -168,6 +169,47 @@ class SeasonedScheduleState:
     sentinel_barriers: SentinelBarrierResult | None = None
     cash_to_settle_today: float = 0.0
     warnings: list[str] = field(default_factory=list)
+    time_day_count_convention: str = "Act365"
+    ki_monitored_past: bool = False
+
+
+_DIFF_MONITORING_INDICES = frozenset(
+    {
+        "DiffAB",
+        "Outperformance",
+        "Spread",
+        "DiffBA",
+        "DiffBestWorst",
+        "Rainbow",
+        "SpreadBestWorst",
+        "DiffBestAverage",
+        "SpreadBestAverage",
+        "DiffAverageWorst",
+        "SpreadAverageWorst",
+    }
+)
+
+
+def _eval_curve_df_scalar(curve_obj: Any, as_of_dt: datetime, target_dt: datetime) -> float:
+    """Evaluates scalar discount factor at target_dt without circular imports."""
+    if curve_obj is None:
+        return 1.0
+    if hasattr(curve_obj, "df"):
+        try:
+            if getattr(curve_obj, "as_of_date", None) is not None:
+                return float(np.asarray(curve_obj.df(target_dt), dtype=np.float64).reshape(-1)[0])
+        except (TypeError, ValueError):
+            pass
+        dcc = str(getattr(curve_obj, "dcc", "Act365"))
+        tau = _year_fraction(as_of_dt, target_dt, dcc)
+        return float(np.asarray(curve_obj.df(tau), dtype=np.float64).reshape(-1)[0])
+    if callable(curve_obj):
+        try:
+            return float(np.asarray(curve_obj(target_dt), dtype=np.float64).reshape(-1)[0])
+        except (TypeError, ValueError):
+            tau = _year_fraction(as_of_dt, target_dt, "Act365")
+            return float(np.asarray(curve_obj(tau), dtype=np.float64).reshape(-1)[0])
+    return 1.0
 
 
 def canonicalize_asset_order(
@@ -194,43 +236,55 @@ def evaluate_monitoring_index_np(
     scalar_input = p.ndim == 1
     if scalar_input:
         p = p[None, :]
+    d_assets = p.shape[-1]
+    if d_assets == 0:
+        raise ValueError("Performance tensor must have non-zero asset dimension.")
 
-    idx = index_name.strip()
+    idx = index_name.strip() or "WorstOf"
     if inv_lex_perm is not None and idx in PAIR_ORDER_DEPENDENT_INDICES:
         p = p[..., np.asarray(inv_lex_perm, dtype=np.int64)]
 
-    if idx == "WorstOf" or idx == "Lookback":
+    if idx in ("WorstOf", "Lookback"):
         out = np.min(p, axis=-1)
     elif idx == "BestOf":
         out = np.max(p, axis=-1)
-    elif idx in ("Average", "AverageOf", "MultiPerf"):
+    elif idx in ("Average", "AverageOf", "MultiPerf", "EquallyWeightedBasket"):
         out = np.mean(p, axis=-1)
     elif idx == "Dispersion":
         mean_p = np.mean(p, axis=-1, keepdims=True)
-        out = np.sqrt(np.mean((p - mean_p) ** 2, axis=-1))
+        out = np.sqrt(np.maximum(np.mean((p - mean_p) ** 2, axis=-1), 0.0))
     elif idx == "RatioBestWorst":
-        out = np.max(p, axis=-1) / np.maximum(np.min(p, axis=-1), 1e-12)
+        out = np.ones(p.shape[:-1], dtype=np.float64) if d_assets < 2 else np.max(p, axis=-1) / np.maximum(np.min(p, axis=-1), 1e-12)
     elif idx == "RatioBestAverage":
-        out = np.max(p, axis=-1) / np.maximum(np.mean(p, axis=-1), 1e-12)
+        out = np.ones(p.shape[:-1], dtype=np.float64) if d_assets < 2 else np.max(p, axis=-1) / np.maximum(np.mean(p, axis=-1), 1e-12)
     elif idx == "RatioAverageWorst":
-        out = np.mean(p, axis=-1) / np.maximum(np.min(p, axis=-1), 1e-12)
-    elif idx in ("DiffBestWorst", "Rainbow"):
-        out = np.max(p, axis=-1) - np.min(p, axis=-1)
-    elif idx == "DiffBestAverage":
-        out = np.max(p, axis=-1) - np.mean(p, axis=-1)
-    elif idx == "DiffAverageWorst":
-        out = np.mean(p, axis=-1) - np.min(p, axis=-1)
-    elif idx == "RatioAB":
-        out = p[..., 0] if p.shape[-1] < 2 else p[..., 0] / np.maximum(p[..., 1], 1e-12)
+        out = np.ones(p.shape[:-1], dtype=np.float64) if d_assets < 2 else np.mean(p, axis=-1) / np.maximum(np.min(p, axis=-1), 1e-12)
+    elif idx in ("DiffBestWorst", "Rainbow", "SpreadBestWorst"):
+        out = np.zeros(p.shape[:-1], dtype=np.float64) if d_assets < 2 else np.max(p, axis=-1) - np.min(p, axis=-1)
+    elif idx in ("DiffBestAverage", "SpreadBestAverage"):
+        out = np.zeros(p.shape[:-1], dtype=np.float64) if d_assets < 2 else np.max(p, axis=-1) - np.mean(p, axis=-1)
+    elif idx in ("DiffAverageWorst", "SpreadAverageWorst"):
+        out = np.zeros(p.shape[:-1], dtype=np.float64) if d_assets < 2 else np.mean(p, axis=-1) - np.min(p, axis=-1)
+    elif idx in ("RatioAB", "Ratio"):
+        out = p[..., 0] if d_assets < 2 else p[..., 0] / np.maximum(p[..., 1], 1e-12)
     elif idx == "RatioBA":
-        out = p[..., 0] if p.shape[-1] < 2 else p[..., 1] / np.maximum(p[..., 0], 1e-12)
+        out = p[..., 0] if d_assets < 2 else p[..., 1] / np.maximum(p[..., 0], 1e-12)
     elif idx in ("DiffAB", "Outperformance", "Spread"):
-        out = p[..., 0] if p.shape[-1] < 2 else p[..., 0] - p[..., 1]
+        out = np.zeros(p.shape[:-1], dtype=np.float64) if d_assets < 2 else p[..., 0] - p[..., 1]
     elif idx == "DiffBA":
-        out = p[..., 0] if p.shape[-1] < 2 else p[..., 1] - p[..., 0]
+        out = np.zeros(p.shape[:-1], dtype=np.float64) if d_assets < 2 else p[..., 1] - p[..., 0]
     elif idx == "TwinWin":
         w_min = np.min(p, axis=-1)
-        out = np.where(w_min < 1.0, 2.0 - w_min, w_min)
+        out = 1.0 + np.abs(w_min - 1.0)
+    elif idx == "SecondWorstOf":
+        k_idx = min(1, d_assets - 1)
+        out = np.partition(p, k_idx, axis=-1)[..., k_idx]
+    elif idx == "ThirdWorstOf":
+        k_idx = min(2, d_assets - 1)
+        out = np.partition(p, k_idx, axis=-1)[..., k_idx]
+    elif idx == "SecondBestOf":
+        k_idx = max(0, d_assets - 2)
+        out = np.partition(p, k_idx, axis=-1)[..., k_idx]
     else:
         raise ValueError(f"Unsupported MonitoringIndex: {index_name!r}")
 
@@ -248,7 +302,10 @@ def evaluate_monitoring_index_torch(
 ) -> torch.Tensor:
     """Differentiable torch.float64 evaluation of the Murex basket performance functionals."""
     p = perf.to(dtype=torch.float64)
-    idx = index_name.strip()
+    d_cols = p.shape[-1]
+    if d_cols == 0:
+        raise ValueError("Performance tensor must have non-zero asset dimension.")
+    idx = index_name.strip() or "WorstOf"
     if inv_lex_perm is not None and idx in PAIR_ORDER_DEPENDENT_INDICES:
         perm_t = torch.as_tensor(inv_lex_perm, dtype=torch.long, device=p.device)
         p = p.index_select(-1, perm_t)
@@ -261,6 +318,7 @@ def evaluate_monitoring_index_torch(
         mask = asset_mask.to(dtype=torch.float64, device=p.device)
 
     active_count = mask.sum(dim=-1).clamp(min=1.0)
+    is_multi = active_count >= 1.5
     p_for_min = torch.where(mask > 0.5, p, torch.full_like(p, 1e12))
     p_for_max = torch.where(mask > 0.5, p, torch.full_like(p, -1e12))
     p_mean = (p * mask).sum(dim=-1) / active_count
@@ -269,40 +327,75 @@ def evaluate_monitoring_index_torch(
         return torch.min(p_for_min, dim=-1).values
     if idx == "BestOf":
         return torch.max(p_for_max, dim=-1).values
-    if idx in ("Average", "AverageOf", "MultiPerf"):
+    if idx in ("Average", "AverageOf", "MultiPerf", "EquallyWeightedBasket"):
         return p_mean
     if idx == "Dispersion":
         diff_sq = ((p - p_mean.unsqueeze(-1)) ** 2) * mask
-        return torch.sqrt((diff_sq.sum(dim=-1) / active_count).clamp(min=1e-16))
+        var = (diff_sq.sum(dim=-1) / active_count).clamp(min=0.0)
+        # Keep exact 0.0 value and finite zero AD gradient when variance vanishes or d == 1.
+        safe_std = torch.sqrt(var.clamp(min=1e-30))
+        return torch.where(is_multi & (var > 1e-24), safe_std, torch.zeros_like(var))
     if idx == "RatioBestWorst":
-        return torch.max(p_for_max, dim=-1).values / torch.min(p_for_min, dim=-1).values.clamp(min=1e-12)
+        ratio = torch.max(p_for_max, dim=-1).values / torch.min(p_for_min, dim=-1).values.clamp(min=1e-12)
+        return torch.where(is_multi, ratio, torch.ones_like(p_mean))
     if idx == "RatioBestAverage":
-        return torch.max(p_for_max, dim=-1).values / p_mean.clamp(min=1e-12)
+        ratio = torch.max(p_for_max, dim=-1).values / p_mean.clamp(min=1e-12)
+        return torch.where(is_multi, ratio, torch.ones_like(p_mean))
     if idx == "RatioAverageWorst":
-        return p_mean / torch.min(p_for_min, dim=-1).values.clamp(min=1e-12)
-    if idx in ("DiffBestWorst", "Rainbow"):
-        return torch.max(p_for_max, dim=-1).values - torch.min(p_for_min, dim=-1).values
-    if idx == "DiffBestAverage":
-        return torch.max(p_for_max, dim=-1).values - p_mean
-    if idx == "DiffAverageWorst":
-        return p_mean - torch.min(p_for_min, dim=-1).values
-    if idx == "RatioAB":
-        return p[..., 0] / p[..., 1].clamp(min=1e-12) if p.shape[-1] >= 2 else p[..., 0]
+        ratio = p_mean / torch.min(p_for_min, dim=-1).values.clamp(min=1e-12)
+        return torch.where(is_multi, ratio, torch.ones_like(p_mean))
+    if idx in ("DiffBestWorst", "Rainbow", "SpreadBestWorst"):
+        diff = torch.max(p_for_max, dim=-1).values - torch.min(p_for_min, dim=-1).values
+        return torch.where(is_multi, diff, torch.zeros_like(p_mean))
+    if idx in ("DiffBestAverage", "SpreadBestAverage"):
+        diff = torch.max(p_for_max, dim=-1).values - p_mean
+        return torch.where(is_multi, diff, torch.zeros_like(p_mean))
+    if idx in ("DiffAverageWorst", "SpreadAverageWorst"):
+        diff = p_mean - torch.min(p_for_min, dim=-1).values
+        return torch.where(is_multi, diff, torch.zeros_like(p_mean))
+    if idx in ("RatioAB", "Ratio"):
+        if d_cols < 2:
+            return p[..., 0]
+        return torch.where(is_multi, p[..., 0] / p[..., 1].clamp(min=1e-12), p[..., 0])
     if idx == "RatioBA":
-        return p[..., 1] / p[..., 0].clamp(min=1e-12) if p.shape[-1] >= 2 else p[..., 0]
+        if d_cols < 2:
+            return p[..., 0]
+        return torch.where(is_multi, p[..., 1] / p[..., 0].clamp(min=1e-12), p[..., 0])
     if idx in ("DiffAB", "Outperformance", "Spread"):
-        return p[..., 0] - p[..., 1] if p.shape[-1] >= 2 else p[..., 0]
+        if d_cols < 2:
+            return torch.zeros_like(p_mean)
+        return torch.where(is_multi, p[..., 0] - p[..., 1], torch.zeros_like(p_mean))
     if idx == "DiffBA":
-        return p[..., 1] - p[..., 0] if p.shape[-1] >= 2 else p[..., 0]
+        if d_cols < 2:
+            return torch.zeros_like(p_mean)
+        return torch.where(is_multi, p[..., 1] - p[..., 0], torch.zeros_like(p_mean))
     if idx == "TwinWin":
         w_min = torch.min(p_for_min, dim=-1).values
-        return torch.where(w_min < 1.0, 2.0 - w_min, w_min)
+        return 1.0 + torch.abs(w_min - 1.0)
+    if idx == "SecondWorstOf":
+        sorted_asc = torch.sort(p_for_min, dim=-1).values
+        if d_cols < 2:
+            return sorted_asc[..., 0]
+        return torch.where(is_multi, sorted_asc[..., 1], sorted_asc[..., 0])
+    if idx == "ThirdWorstOf":
+        sorted_asc = torch.sort(p_for_min, dim=-1).values
+        if d_cols == 1:
+            return sorted_asc[..., 0]
+        if d_cols == 2:
+            return torch.where(is_multi, sorted_asc[..., 1], sorted_asc[..., 0])
+        k_t = (mask.sum(dim=-1).long() - 1).clamp(min=0, max=2).unsqueeze(-1)
+        return sorted_asc.gather(-1, k_t).squeeze(-1)
+    if idx == "SecondBestOf":
+        sorted_desc = torch.sort(p_for_max, dim=-1, descending=True).values
+        if d_cols < 2:
+            return sorted_desc[..., 0]
+        return torch.where(is_multi, sorted_desc[..., 1], sorted_desc[..., 0])
     raise ValueError(f"Unsupported MonitoringIndex: {index_name!r}")
 
 
 def normalize_sentinel_barriers(
     ko_barriers: Sequence[float] | npt.NDArray[np.float64],
-    cpn_barriers: Sequence[float] | npt.NDArray[np.float64],
+    cpn_barriers: Sequence[float] | npt.NDArray[np.float64] | None,
     *,
     allow_autocall_on_expiry: bool = False,
     includes_expiry_period: bool = True,
@@ -310,15 +403,24 @@ def normalize_sentinel_barriers(
     max_ko_feature_level: float = 3.0,
     guaranteed_cpn_threshold: float = 1e-3,
     min_cpn_feature_level: float = 0.05,
+    coupon_barrier_type: str = "In",
+    coupon_barrier_direction: str = "Up",
+    is_diff_index: bool = False,
 ) -> SentinelBarrierResult:
     """Normalizes sentinel lock-out autocall barriers and guaranteed coupon barriers."""
     ko_arr = np.asarray(ko_barriers, dtype=np.float64).copy()
-    cpn_arr = np.asarray(cpn_barriers, dtype=np.float64).copy()
     m_len = len(ko_arr)
+    cpn_missing = cpn_barriers is None
+    if cpn_missing:
+        cpn_arr = np.full(m_len, 1e-5, dtype=np.float64)
+    else:
+        cpn_arr = np.asarray(cpn_barriers, dtype=np.float64).copy()
     if len(cpn_arr) != m_len:
         raise ValueError(
             f"Length mismatch between ko_barriers ({m_len}) and cpn_barriers ({len(cpn_arr)})."
         )
+    if m_len > 0 and (not np.all(np.isfinite(ko_arr)) or not np.all(np.isfinite(cpn_arr))):
+        raise ValueError("Barrier levels must be finite float64 values.")
 
     is_callable = (ko_arr < sentinel_ko_threshold).astype(np.float64)
     if includes_expiry_period and m_len > 0 and not allow_autocall_on_expiry:
@@ -327,7 +429,15 @@ def normalize_sentinel_barriers(
     ko_clamped = np.clip(ko_arr, 1e-4, max_ko_feature_level)
     log_ko_feat = np.log(ko_clamped).astype(np.float64)
 
-    is_guaranteed = (cpn_arr <= guaranteed_cpn_threshold).astype(np.float64)
+    type_out = coupon_barrier_type.strip().lower() == "out"
+    dir_down = coupon_barrier_direction.strip().lower() == "down"
+    if cpn_missing:
+        is_guaranteed = np.ones(m_len, dtype=np.float64)
+    elif type_out or dir_down or is_diff_index:
+        # Zero/small thresholds on Out, Down, or signed spread indices are active triggers, not guaranteed.
+        is_guaranteed = np.zeros(m_len, dtype=np.float64)
+    else:
+        is_guaranteed = (cpn_arr <= guaranteed_cpn_threshold).astype(np.float64)
     cpn_clamped = np.maximum(cpn_arr, min_cpn_feature_level)
     log_cpn_feat = np.log(cpn_clamped).astype(np.float64)
 
@@ -345,11 +455,17 @@ _IndexedFixing = Tuple[dict[date, float], list[int], list[float]]
 
 
 def _build_fixing_index(raw_dates: Sequence[Any], raw_vals: Sequence[Any]) -> _IndexedFixing:
+    if len(raw_dates) != len(raw_vals):
+        raise ValueError(
+            f"Fixing dates ({len(raw_dates)}) and values ({len(raw_vals)}) length mismatch."
+        )
     date_map: dict[date, float] = {}
     pairs: list[Tuple[int, float]] = []
     for d, v in zip(raw_dates, raw_vals):
         d_date = _to_utc_datetime(d).date()
         f_val = float(v)
+        if not math.isfinite(f_val):
+            raise ValueError(f"Non-finite fixing value {v!r} on {d_date.isoformat()}.")
         if d_date not in date_map:
             date_map[d_date] = f_val
         pairs.append((d_date.toordinal(), f_val))
@@ -387,12 +503,20 @@ def _lookup_fixing_optional(indexed: _IndexedFixing | None, target_date: datetim
 
 def _extract_fixings_entry(f_obj: Any) -> _IndexedFixing:
     if isinstance(f_obj, Mapping):
-        raw_dates = f_obj.get("Dates", f_obj.get("dates", []))
-        raw_vals = f_obj.get("Values", f_obj.get("values", []))
+        if any(k in f_obj for k in ("Dates", "dates", "Values", "values")):
+            raw_dates = f_obj.get("Dates", f_obj.get("dates"))
+            raw_vals = f_obj.get("Values", f_obj.get("values"))
+            raw_dates_seq = [] if raw_dates is None else list(raw_dates)
+            raw_vals_seq = [] if raw_vals is None else list(raw_vals)
+        else:
+            raw_dates_seq = list(f_obj.keys())
+            raw_vals_seq = list(f_obj.values())
     else:
-        raw_dates = getattr(f_obj, "Dates", getattr(f_obj, "dates", []))
-        raw_vals = getattr(f_obj, "Values", getattr(f_obj, "values", []))
-    return _build_fixing_index(raw_dates, raw_vals)
+        raw_dates = getattr(f_obj, "Dates", getattr(f_obj, "dates", None))
+        raw_vals = getattr(f_obj, "Values", getattr(f_obj, "values", None))
+        raw_dates_seq = [] if raw_dates is None else list(raw_dates)
+        raw_vals_seq = [] if raw_vals is None else list(raw_vals)
+    return _build_fixing_index(raw_dates_seq, raw_vals_seq)
 
 
 def _eval_terminal_option_payoff(
@@ -409,13 +533,15 @@ def _eval_terminal_option_payoff(
     participation_call_rate: float,
     one_star_strike: float | None,
     one_star_coupon: float,
+    is_diff_opt: bool = False,
 ) -> float:
     """Evaluates deterministic terminal Option payoff from observed expiry performances."""
+    del is_long_basket
     opt_paid = 0.0
-    eff_w_opt = float(evaluate_monitoring_index_np(perf_m, "AverageOf")) if is_long_basket else float(w_opt)
-    if strike > 1e-6 and option_gearing > 0.0:
+    eff_w_opt = float(w_opt)
+    if (strike > 1e-6 or is_diff_opt) and option_gearing > 0.0:
         put_intrinsic = max(float(strike) - eff_w_opt, 0.0)
-        if lower_strike is not None and float(lower_strike) > 0.0:
+        if lower_strike is not None and (float(lower_strike) > 0.0 or is_diff_opt):
             put_intrinsic = min(put_intrinsic, max(float(strike) - float(lower_strike), 0.0))
         if ki_barrier is not None and float(ki_barrier) > 0.0 and i_ki_past < 0.5:
             if eff_w_opt >= float(ki_barrier):
@@ -427,7 +553,7 @@ def _eval_terminal_option_payoff(
         put_sign = -1.0
         opt_paid += put_sign * float(option_gearing) * put_intrinsic
 
-    if participation_call_strike is not None and float(participation_call_rate) > 0.0:
+    if participation_call_strike is not None and float(participation_call_rate) != 0.0:
         opt_paid += float(participation_call_rate) * max(
             eff_w_opt - float(participation_call_strike), 0.0
         )
@@ -496,27 +622,50 @@ def collapse_seasoned_schedule(
     ref_spots_orig = np.asarray(underlying_reference_spots, dtype=np.float64)
     if len(ref_spots_orig) != d_assets:
         raise ValueError("UnderlyingReferenceSpots length must match UnderlyingIdentifiers.")
+    if not np.all(np.isfinite(ref_spots_orig)) or np.any(ref_spots_orig <= 0.0):
+        raise ValueError("UnderlyingReferenceSpots must be strictly positive and finite.")
     ref_spots_sorted = ref_spots_orig[lex_perm]
     ref_spots_t = torch.as_tensor(ref_spots_sorted, dtype=torch.float64)
 
     if isinstance(spots_t0, torch.Tensor):
+        if spots_t0.ndim != 1 or spots_t0.shape[0] != d_assets:
+            raise ValueError(f"spots_t0 tensor must have shape ({d_assets},), got {tuple(spots_t0.shape)}.")
+        if not bool(torch.all(torch.isfinite(spots_t0)).item()):
+            raise ValueError("spots_t0 contains non-finite values.")
         if spots_t0.dtype != torch.float64:
             spots_t0 = spots_t0.to(dtype=torch.float64)
         perm_t = torch.as_tensor(lex_perm, dtype=torch.long, device=spots_t0.device)
         spots_sorted_t = spots_t0.index_select(0, perm_t)
         ref_spots_t = ref_spots_t.to(device=spots_t0.device)
     elif isinstance(spots_t0, Mapping):
-        spots_list = [float(spots_t0[ticker]) for ticker in sorted_ids]
+        spots_list: list[float] = []
+        for ticker in sorted_ids:
+            if ticker not in spots_t0:
+                raise ValueError(f"Missing spot for underlying {ticker!r} in spots_t0.")
+            s_val = float(spots_t0[ticker])
+            if not math.isfinite(s_val):
+                raise ValueError(f"Non-finite spot {spots_t0[ticker]!r} for underlying {ticker!r}.")
+            spots_list.append(s_val)
         spots_sorted_t = torch.tensor(spots_list, dtype=torch.float64)
     else:
-        spots_arr = np.asarray(spots_t0, dtype=np.float64)[lex_perm]
+        spots_raw = np.asarray(spots_t0, dtype=np.float64)
+        if spots_raw.ndim != 1 or len(spots_raw) != d_assets:
+            raise ValueError(f"spots_t0 sequence must have length {d_assets}.")
+        if not np.all(np.isfinite(spots_raw)):
+            raise ValueError("spots_t0 contains non-finite values.")
+        spots_arr = spots_raw[lex_perm]
         spots_sorted_t = torch.as_tensor(spots_arr, dtype=torch.float64)
 
+    spots_sorted_cpu = [float(x) for x in spots_sorted_t.detach().cpu().tolist()]
     moneyness_t0 = spots_sorted_t / ref_spots_t.clamp(min=1e-12)
 
     # Build per-period coupon amounts c_m supporting scalar and sequence inputs
     if coupon_amounts is not None:
         cpn_rates = np.asarray(coupon_amounts, dtype=np.float64)
+        if len(cpn_rates) != m_total:
+            raise ValueError(
+                f"coupon_amounts length ({len(cpn_rates)}) != number of periods ({m_total})."
+            )
     elif fixed_coupon_amount is not None:
         if isinstance(fixed_coupon_amount, Sequence) and not isinstance(fixed_coupon_amount, (str, bytes)):
             if len(fixed_coupon_amount) != m_total:
@@ -545,20 +694,39 @@ def collapse_seasoned_schedule(
             prev_d = pay_dts[m]
     else:
         cpn_rates = np.zeros(m_total, dtype=np.float64)
+    if m_total > 0 and not np.all(np.isfinite(cpn_rates)):
+        raise ValueError("Period coupon rates must be finite.")
 
     ko_arr = np.asarray(ko_barriers, dtype=np.float64)
-    if cpn_barriers is not None and len(cpn_barriers) > 0:
+    if len(ko_arr) != m_total:
+        raise ValueError(f"ko_barriers length ({len(ko_arr)}) != number of periods ({m_total}).")
+    if m_total > 0 and not np.all(np.isfinite(ko_arr)):
+        raise ValueError("ko_barriers must be finite.")
+    has_explicit_cpn_barriers = cpn_barriers is not None and len(cpn_barriers) > 0
+    if has_explicit_cpn_barriers:
         cpn_arr = np.asarray(cpn_barriers, dtype=np.float64)
+        if len(cpn_arr) != m_total:
+            raise ValueError(f"cpn_barriers length ({len(cpn_arr)}) != number of periods ({m_total}).")
+        if m_total > 0 and not np.all(np.isfinite(cpn_arr)):
+            raise ValueError("cpn_barriers must be finite.")
     else:
         cpn_arr = np.full(m_total, 1e-5, dtype=np.float64)
 
-    eff_cpn_index = coupon_index if coupon_index else callability_index
-    raw_opt_index = option_index if option_index else callability_index
-    eff_opt_index = (
-        "AverageOf"
-        if (is_long_basket and (option_index is None or raw_opt_index == "WorstOf"))
-        else raw_opt_index
+    eff_call_index = (callability_index or "WorstOf").strip() or "WorstOf"
+    eff_cpn_index = (
+        coupon_index.strip()
+        if (coupon_index is not None and coupon_index.strip())
+        else eff_call_index
     )
+    opt_stripped = option_index.strip() if option_index is not None else ""
+    if is_long_basket and (option_index is None or opt_stripped == "" or opt_stripped == "WorstOf"):
+        eff_opt_index = "AverageOf"
+    elif opt_stripped:
+        eff_opt_index = opt_stripped
+    else:
+        eff_opt_index = eff_call_index
+    is_diff_cpn = eff_cpn_index in _DIFF_MONITORING_INDICES
+    is_diff_opt = eff_opt_index in _DIFF_MONITORING_INDICES
     type_out = coupon_barrier_type.strip().lower() == "out"
     dir_down = coupon_barrier_direction.strip().lower() == "down"
 
@@ -569,35 +737,96 @@ def collapse_seasoned_schedule(
             if ticker in fixings:
                 indexed_fixings[ticker] = _extract_fixings_entry(fixings[ticker])
 
-    # Precompute past/in-transit FundingLeg amounts mapped to product periods
-    past_funding_by_period: dict[int, float] = {}
+    # Precompute settled vs in-transit FundingLeg amounts mapped to product periods
+    settled_funding_by_period: dict[int, float] = {}
+    in_transit_funding_by_period: dict[int, float] = {}
+    in_transit_settled_funding_rows: dict[int, list[Tuple[datetime, float]]] = {}
     if funding_leg is not None and m_total > 0:
-        f_rid = funding_leg.get("rate_identifier")
+        raw_f_rid = funding_leg.get("rate_identifier")
+        f_rid = str(raw_f_rid).strip() if raw_f_rid is not None else ""
         f_spread = float(funding_leg.get("funding_spread", 0.0) or 0.0)
-        f_dates = [_to_utc_datetime(d) for d in funding_leg.get("payment_dates", [])]
+        f_dates = [_to_utc_datetime(d) for d in (funding_leg.get("payment_dates") or [])]
         rate_fix_idx: _IndexedFixing | None = None
-        if f_rid is not None and fixings and f_rid in fixings:
+        if f_rid and fixings and f_rid in fixings:
             rate_fix_idx = _extract_fixings_entry(fixings[f_rid])
+        if rate_fix_idx is None:
+            raw_ff = funding_leg.get("funding_fixings")
+            if raw_ff:
+                if isinstance(raw_ff, Mapping) or hasattr(raw_ff, "Dates"):
+                    rate_fix_idx = _extract_fixings_entry(raw_ff)
+                else:
+                    ff_pairs = list(raw_ff)
+                    rate_fix_idx = _build_fixing_index(
+                        [d for d, _ in ff_pairs],
+                        [v for _, v in ff_pairs],
+                    )
         f_curve = funding_leg.get("funding_curve")
+        df_fwd_override = funding_leg.get("df_fwd_fn")
         prev_f_dt = start_dt
         for f_dt in f_dates:
-            if f_dt > pay_dts[-1] and f_dt > t0_dt:
-                break
+            if f_dt > pay_dts[-1]:
+                prev_f_dt = f_dt
+                continue
+            m_idx = m_total - 1
+            for m_cand in range(m_total):
+                if pay_dts[m_cand] >= f_dt:
+                    m_idx = m_cand
+                    break
+            alpha_j = _year_fraction(prev_f_dt, f_dt, day_count_convention)
+            is_period_settled = pay_dts[m_idx] <= t0_dt
+            is_period_in_transit = obs_dts[m_idx] <= t0_dt < pay_dts[m_idx]
             if f_dt <= t0_dt:
-                alpha_j = _year_fraction(prev_f_dt, f_dt, day_count_convention)
-                r_fix = _lookup_fixing_optional(rate_fix_idx, prev_f_dt) if f_rid is not None else 0.0
-                if r_fix is None and f_rid is not None:
-                    r_fix = _lookup_fixing_optional(rate_fix_idx, f_dt)
-                if r_fix is None and f_rid is not None and f_curve is not None and hasattr(f_curve, "zero_rate"):
-                    r_fix = float(f_curve.zero_rate(f_dt)) if f_dt > t0_dt else 0.0
-                r_val = float(r_fix or 0.0)
+                if is_period_settled or is_period_in_transit:
+                    if not f_rid:
+                        r_val = 0.0
+                    else:
+                        r_fix = _lookup_fixing_optional(rate_fix_idx, prev_f_dt)
+                        if r_fix is None:
+                            r_fix = _lookup_fixing_optional(rate_fix_idx, f_dt)
+                        r_val = float(r_fix or 0.0)
+                    amt_j = (r_val + f_spread) * alpha_j
+                    if is_period_settled:
+                        settled_funding_by_period[m_idx] = (
+                            settled_funding_by_period.get(m_idx, 0.0) + amt_j
+                        )
+                    else:
+                        in_transit_settled_funding_rows.setdefault(m_idx, []).append((f_dt, amt_j))
+            elif is_period_in_transit:
+                if not f_rid:
+                    r_val = 0.0
+                else:
+                    r_fix = (
+                        _lookup_fixing_optional(rate_fix_idx, prev_f_dt)
+                        if prev_f_dt <= t0_dt
+                        else None
+                    )
+                    if r_fix is not None:
+                        r_val = float(r_fix)
+                    else:
+                        stub_start = t0_dt if prev_f_dt <= t0_dt else prev_f_dt
+                        alpha_rem = max(_year_fraction(stub_start, f_dt, day_count_convention), 1e-8)
+                        if callable(df_fwd_override):
+                            df_s = 1.0 if stub_start <= t0_dt else float(df_fwd_override(stub_start))
+                            df_e = max(float(df_fwd_override(f_dt)), 1e-12)
+                        elif f_curve is not None:
+                            df_s = (
+                                1.0
+                                if stub_start <= t0_dt
+                                else _eval_curve_df_scalar(f_curve, t0_dt, stub_start)
+                            )
+                            df_e = max(_eval_curve_df_scalar(f_curve, t0_dt, f_dt), 1e-12)
+                        elif df_pay_fn is not None:
+                            df_s = 1.0 if stub_start <= t0_dt else float(df_pay_fn(stub_start))
+                            df_e = max(float(df_pay_fn(f_dt)), 1e-12)
+                        else:
+                            df_s = 1.0
+                            df_e = 1.0
+                        r_val = (df_s / df_e - 1.0) / alpha_rem
                 amt_j = (r_val + f_spread) * alpha_j
-                m_idx = m_total - 1
-                for m_cand in range(m_total):
-                    if pay_dts[m_cand] >= f_dt:
-                        m_idx = m_cand
-                        break
-                past_funding_by_period[m_idx] = past_funding_by_period.get(m_idx, 0.0) + amt_j
+                df_fund_j = float(df_pay_fn(f_dt)) if df_pay_fn is not None else 1.0
+                in_transit_funding_by_period[m_idx] = (
+                    in_transit_funding_by_period.get(m_idx, 0.0) + df_fund_j * amt_j
+                )
             prev_f_dt = f_dt
 
     settled_indices: list[int] = []
@@ -629,48 +858,58 @@ def collapse_seasoned_schedule(
             future_indices.append(m)
             continue
 
-        # Reconstruct fixing performances at t_m for all D assets in sorted_ids order
-        perf_m = np.empty(d_assets, dtype=np.float64)
-        for i, ticker in enumerate(sorted_ids):
-            idx_fix = indexed_fixings.get(ticker)
-            if idx_fix is not None and idx_fix[1]:
-                fix_val = _lookup_fixing_indexed(idx_fix, t_m)
-            elif t_m.date() == t0_dt.date():
-                fix_val = float(spots_sorted_t[i].detach().cpu().item())
-            else:
-                raise KeyError(
-                    f"Fixings missing for asset {ticker!r} on past observation date {t_m.date().isoformat()}."
-                )
-            perf_m[i] = fix_val / ref_spots_sorted[i]
-
-        w_call = float(evaluate_monitoring_index_np(perf_m, callability_index, inv_lex_perm=inv_lex_perm))
-        w_cpn = float(evaluate_monitoring_index_np(perf_m, eff_cpn_index, inv_lex_perm=inv_lex_perm))
-        w_opt = float(evaluate_monitoring_index_np(perf_m, eff_opt_index, inv_lex_perm=inv_lex_perm))
-
-        if ki_monitored_past and ki_barrier is not None and w_opt < float(ki_barrier):
-            i_ki_past = 1.0
-
         b_ko = float(ko_arr[m])
         b_cpn = float(cpn_arr[m])
         c_m = float(cpn_rates[m])
 
         is_callable_m = (b_ko < 10.0) and (m < m_total - 1 or allow_autocall_on_expiry)
         df_m = float(df_pay_fn(T_m)) if (period_status == "In-Transit" and df_pay_fn is not None) else 1.0
-        fund_amt_m = float(past_funding_by_period.get(m, 0.0))
 
         opt_paid = 0.0
         stopped_before_m = already_autocalled
-        if already_autocalled:
+        if stopped_before_m:
+            # Once historical autocall fires, later fixings may not exist and KI is no longer live.
+            perf_m = np.zeros(d_assets, dtype=np.float64)
+            w_call = 0.0
+            w_cpn = 0.0
+            w_opt = 0.0
             cpn_trig = False
             ko_trig = False
             cpn_paid = 0.0
             notional_paid = 0.0
-            fund_amt_m = 0.0
+            cf_cpn_amt = 0.0
+            cf_notional_amt = 0.0
+            cf_opt_amt = 0.0
+            cf_fund_amt = 0.0
         else:
+            perf_m = np.empty(d_assets, dtype=np.float64)
+            is_val_day_obs = t_m.date() == t0_dt.date()
+            for i, ticker in enumerate(sorted_ids):
+                idx_fix = indexed_fixings.get(ticker)
+                if is_val_day_obs:
+                    exact_today = idx_fix[0].get(t_m.date()) if idx_fix is not None else None
+                    fix_val = exact_today if exact_today is not None else spots_sorted_cpu[i]
+                elif idx_fix is not None and idx_fix[1]:
+                    fix_val = _lookup_fixing_indexed(idx_fix, t_m)
+                else:
+                    raise KeyError(
+                        f"Fixings missing for asset {ticker!r} on past observation date {t_m.date().isoformat()}."
+                    )
+                perf_m[i] = fix_val / ref_spots_sorted[i]
+
+            w_call = float(evaluate_monitoring_index_np(perf_m, eff_call_index, inv_lex_perm=inv_lex_perm))
+            w_cpn = float(evaluate_monitoring_index_np(perf_m, eff_cpn_index, inv_lex_perm=inv_lex_perm))
+            w_opt = float(evaluate_monitoring_index_np(perf_m, eff_opt_index, inv_lex_perm=inv_lex_perm))
+
+            if ki_monitored_past and ki_barrier is not None and w_opt < float(ki_barrier):
+                i_ki_past = 1.0
+
             ko_trig = bool(is_callable_m and (w_call >= b_ko))
             hit_dir = (w_cpn <= b_cpn) if dir_down else (w_cpn >= b_cpn)
             base_cpn = (not hit_dir) if type_out else hit_dir
-            is_guaranteed_m = (b_cpn <= 1e-3) and (not type_out) and (not dir_down)
+            is_guaranteed_m = (not has_explicit_cpn_barriers) or (
+                (b_cpn <= 1e-3) and (not type_out) and (not dir_down) and (not is_diff_cpn)
+            )
             cpn_trig = bool(is_guaranteed_m or base_cpn or (ko_trig and force_coupons_on_autocall))
 
             if cpn_trig:
@@ -701,25 +940,27 @@ def collapse_seasoned_schedule(
                     participation_call_rate=participation_call_rate,
                     one_star_strike=one_star_strike,
                     one_star_coupon=one_star_coupon,
+                    is_diff_opt=is_diff_opt,
                 )
             else:
                 notional_paid = 0.0
 
-        if period_status == "In-Transit":
-            disc_cpn = float(df_m * cpn_paid)
-            disc_notional = float(df_m * notional_paid)
-            disc_opt = float(df_m * opt_paid)
-            disc_fund = float(df_m * fund_amt_m)
-            pv_in_transit = float(pv_in_transit + disc_cpn + disc_notional + disc_opt - disc_fund)
-            cf_cpn_amt = disc_cpn
-            cf_notional_amt = disc_notional
-            cf_opt_amt = disc_opt
-            cf_fund_amt = -disc_fund if disc_fund != 0.0 else 0.0
-        else:
-            cf_cpn_amt = float(cpn_paid)
-            cf_notional_amt = float(notional_paid)
-            cf_opt_amt = float(opt_paid)
-            cf_fund_amt = -float(fund_amt_m) if fund_amt_m != 0.0 else 0.0
+            if period_status == "In-Transit":
+                disc_cpn = float(df_m * cpn_paid)
+                disc_notional = float(df_m * notional_paid)
+                disc_opt = float(df_m * opt_paid)
+                disc_fund = float(in_transit_funding_by_period.get(m, 0.0))
+                pv_in_transit = float(pv_in_transit + disc_cpn + disc_notional + disc_opt - disc_fund)
+                cf_cpn_amt = disc_cpn
+                cf_notional_amt = disc_notional
+                cf_opt_amt = disc_opt
+                cf_fund_amt = -disc_fund if disc_fund != 0.0 else 0.0
+            else:
+                settled_fund = float(settled_funding_by_period.get(m, 0.0))
+                cf_cpn_amt = float(cpn_paid)
+                cf_notional_amt = float(notional_paid)
+                cf_opt_amt = float(opt_paid)
+                cf_fund_amt = -settled_fund if settled_fund != 0.0 else 0.0
 
         historical_records.append(
             HistoricalPeriodRecord(
@@ -741,6 +982,20 @@ def collapse_seasoned_schedule(
                 discount_factor=df_m,
             )
         )
+
+        if period_status == "In-Transit" and not stopped_before_m:
+            for sf_dt, sf_amt in in_transit_settled_funding_rows.get(m, ()):
+                past_cashflows.append(
+                    CashFlowItem(
+                        Description="FundingLeg",
+                        Date=sf_dt,
+                        Amount=-float(sf_amt) if sf_amt != 0.0 else 0.0,
+                        StandardError=0.0,
+                        Currency=payment_currency,
+                        Leg=0,
+                        StatusText="Settled",
+                    )
+                )
 
         past_cashflows.append(
             CashFlowItem(
@@ -808,8 +1063,10 @@ def collapse_seasoned_schedule(
                 continue
 
             if one_star_strike is not None and float(one_star_strike) > 0.0:
-                w_best_m = float(
-                    evaluate_monitoring_index_np(perf_m, "BestOf", inv_lex_perm=inv_lex_perm)
+                w_best_m = (
+                    float(evaluate_monitoring_index_np(perf_m, "BestOf", inv_lex_perm=inv_lex_perm))
+                    if not stopped_before_m
+                    else 0.0
                 )
                 if not stopped_before_m and not ko_trig and w_best_m >= float(one_star_strike):
                     onestar_bonus_cf = float(df_m * float(one_star_coupon))
@@ -879,7 +1136,11 @@ def collapse_seasoned_schedule(
         )
 
     cash_to_settle_today = float(
-        sum(cf.Amount for cf in past_cashflows if cf.Date.date() == t0_dt.date())
+        sum(
+            cf.Amount
+            for cf in past_cashflows
+            if cf.Date.date() == t0_dt.date() and cf.StatusText == "Settled"
+        )
     )
 
     future_obs_dates = [obs_dts[m] for m in future_indices]
@@ -908,9 +1169,12 @@ def collapse_seasoned_schedule(
 
     sentinel_res = normalize_sentinel_barriers(
         future_ko,
-        future_cpn_bar,
+        future_cpn_bar if has_explicit_cpn_barriers else None,
         allow_autocall_on_expiry=allow_autocall_on_expiry,
         includes_expiry_period=(m_rem > 0 and future_indices[-1] == m_total - 1),
+        coupon_barrier_type=coupon_barrier_type,
+        coupon_barrier_direction=coupon_barrier_direction,
+        is_diff_index=is_diff_cpn,
     )
 
     return SeasonedScheduleState(
@@ -943,6 +1207,8 @@ def collapse_seasoned_schedule(
         future_coupon_rates=future_cpn_rates,
         sentinel_barriers=sentinel_res,
         cash_to_settle_today=cash_to_settle_today,
+        time_day_count_convention=time_day_count_convention,
+        ki_monitored_past=bool(ki_monitored_past),
     )
 
 

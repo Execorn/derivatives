@@ -40,16 +40,89 @@ from deepvol.market.eq_curves import (
     fast_clamped_cubic_coeffs,
     year_fraction as eq_year_fraction,
 )
+from deepvol.models.autocall.feature_layout import (
+    PAIR_ORDER_DEPENDENT_INDICES,
+    MonitoringIndexCode,
+    monitoring_index_to_code,
+)
 from deepvol.models.autocall.seasoned_collapser import (
     CashFlowItem,
     _to_utc_datetime,
-    evaluate_monitoring_index_np,
 )
 
 _SOBOL_MAX_DIM: int = 21201
-_ASYMMETRIC_PAIR_INDICES = frozenset(
-    {"RatioAB", "RatioBA", "DiffAB", "DiffBA", "Outperformance", "Spread"}
+_ASYMMETRIC_PAIR_INDICES = PAIR_ORDER_DEPENDENT_INDICES
+_DIFF_INDEX_CODES = frozenset(
+    {
+        int(MonitoringIndexCode.DIFF_AB),
+        int(MonitoringIndexCode.DIFF_BA),
+        int(MonitoringIndexCode.DIFF_BEST_WORST),
+        int(MonitoringIndexCode.DIFF_BEST_AVERAGE),
+        int(MonitoringIndexCode.DIFF_AVERAGE_WORST),
+    }
 )
+_PAIR_ORDER_INDEX_CODES = frozenset(
+    {
+        int(MonitoringIndexCode.RATIO_AB),
+        int(MonitoringIndexCode.RATIO_BA),
+        int(MonitoringIndexCode.DIFF_AB),
+        int(MonitoringIndexCode.DIFF_BA),
+    }
+)
+_INDEX_NORM_ALIAS_MAP: dict[str, int] = {
+    "worst": int(MonitoringIndexCode.WORST_OF),
+    "worstof": int(MonitoringIndexCode.WORST_OF),
+    "lookback": int(MonitoringIndexCode.WORST_OF),
+    "min": int(MonitoringIndexCode.WORST_OF),
+    "best": int(MonitoringIndexCode.BEST_OF),
+    "bestof": int(MonitoringIndexCode.BEST_OF),
+    "max": int(MonitoringIndexCode.BEST_OF),
+    "average": int(MonitoringIndexCode.AVERAGE_OF),
+    "averageof": int(MonitoringIndexCode.AVERAGE_OF),
+    "multiperf": int(MonitoringIndexCode.AVERAGE_OF),
+    "equallyweightedbasket": int(MonitoringIndexCode.AVERAGE_OF),
+    "mean": int(MonitoringIndexCode.AVERAGE_OF),
+    "dispersion": int(MonitoringIndexCode.DISPERSION),
+    "ratioab": int(MonitoringIndexCode.RATIO_AB),
+    "ratio": int(MonitoringIndexCode.RATIO_AB),
+    "ratioba": int(MonitoringIndexCode.RATIO_BA),
+    "ratiobestworst": int(MonitoringIndexCode.RATIO_BEST_WORST),
+    "ratiobestaverage": int(MonitoringIndexCode.RATIO_BEST_AVERAGE),
+    "ratioaverageworst": int(MonitoringIndexCode.RATIO_AVERAGE_WORST),
+    "diffab": int(MonitoringIndexCode.DIFF_AB),
+    "outperformance": int(MonitoringIndexCode.DIFF_AB),
+    "spread": int(MonitoringIndexCode.DIFF_AB),
+    "diffba": int(MonitoringIndexCode.DIFF_BA),
+    "diffbestworst": int(MonitoringIndexCode.DIFF_BEST_WORST),
+    "rainbow": int(MonitoringIndexCode.DIFF_BEST_WORST),
+    "spreadbestworst": int(MonitoringIndexCode.DIFF_BEST_WORST),
+    "diffbestaverage": int(MonitoringIndexCode.DIFF_BEST_AVERAGE),
+    "spreadbestaverage": int(MonitoringIndexCode.DIFF_BEST_AVERAGE),
+    "diffaverageworst": int(MonitoringIndexCode.DIFF_AVERAGE_WORST),
+    "spreadaverageworst": int(MonitoringIndexCode.DIFF_AVERAGE_WORST),
+    "twinwin": int(MonitoringIndexCode.TWIN_WIN),
+    "secondworstof": int(MonitoringIndexCode.SECOND_WORST_OF),
+    "2ndworstof": int(MonitoringIndexCode.SECOND_WORST_OF),
+    "thirdworstof": int(MonitoringIndexCode.THIRD_WORST_OF),
+    "3rdworstof": int(MonitoringIndexCode.THIRD_WORST_OF),
+    "secondbestof": int(MonitoringIndexCode.SECOND_BEST_OF),
+    "secondbest": int(MonitoringIndexCode.SECOND_BEST_OF),
+    "2ndbestof": int(MonitoringIndexCode.SECOND_BEST_OF),
+}
+
+
+def resolve_monitoring_index_code(index_name: Optional[str]) -> int:
+    """Resolves any canonical monitoring index name or alias to code 0..17."""
+    if not index_name:
+        return int(MonitoringIndexCode.WORST_OF)
+    cleaned = str(index_name).strip()
+    if not cleaned:
+        return int(MonitoringIndexCode.WORST_OF)
+    norm = cleaned.lower().replace("_", "").replace("-", "").replace(" ", "")
+    mapped = _INDEX_NORM_ALIAS_MAP.get(norm)
+    if mapped is not None:
+        return mapped
+    return monitoring_index_to_code(cleaned)
 
 _ASM_ACCEPTS_COUPON_CF: Optional[bool] = None
 
@@ -156,19 +229,22 @@ def _project_wing_calls_convex(
 ) -> npt.NDArray[np.float64]:
     """Projects offending wing call prices onto the monotone decreasing convex hull."""
     n = len(strikes)
-    # Andrew's lower convex hull over (strikes, calls) keeping interior core nodes anchored when convex
+    # Normalize strikes by K_ref so slope/convexity checks are invariant to asset price units.
+    k_scale = max(float(k_ref), 1e-12)
+    x_norm = strikes / k_scale
+    intrinsic = np.maximum(1.0 - x_norm, 0.0)
+    calls_floored = np.maximum(calls, intrinsic)
     pts_idx = np.arange(n, dtype=np.int64)
-    # Build lower convex envelope of (strikes, calls)
     hull: List[int] = []
     for idx in pts_idx:
-        k_i = float(strikes[idx])
-        c_i = max(float(calls[idx]), max(1.0 - k_i / k_ref, 0.0))
+        x_i = float(x_norm[idx])
+        c_i = float(calls_floored[idx])
         while len(hull) >= 2:
             i1, i2 = hull[-2], hull[-1]
-            k1, k2 = float(strikes[i1]), float(strikes[i2])
-            c1, c2 = float(calls[i1]), float(calls[i2])
-            slope_12 = (c2 - c1) / max(k2 - k1, 1e-12)
-            slope_23 = (c_i - c2) / max(k_i - k2, 1e-12)
+            x1, x2 = float(x_norm[i1]), float(x_norm[i2])
+            c1, c2 = float(calls_floored[i1]), float(calls_floored[i2])
+            slope_12 = (c2 - c1) / max(x2 - x1, 1e-12)
+            slope_23 = (c_i - c2) / max(x_i - x2, 1e-12)
             if slope_23 < slope_12 - 1e-12:
                 hull.pop()
             else:
@@ -176,10 +252,8 @@ def _project_wing_calls_convex(
         hull.append(int(idx))
 
     k_hull = strikes[hull]
-    c_hull = calls[hull]
+    c_hull = calls_floored[hull]
     c_proj = np.interp(strikes, k_hull, c_hull)
-    # Enforce monotone decreasing -1/K_ref <= dc/dK <= 0 and intrinsic floor
-    intrinsic = np.maximum(1.0 - strikes / k_ref, 0.0)
     c_proj = np.maximum(c_proj, intrinsic)
     # Preserve core strikes if core was already convex and consistent
     out = np.where(core_mask, calls, c_proj)
@@ -415,7 +489,8 @@ def enforce_no_arbitrage_projection_with_jacobian(
         calls_mat_all = _b76_norm_call(y_u[None, :], w_all_init)
         core_eval_mask = (y_eval >= math.log(0.5)) & (y_eval <= math.log(1.5))
         has_core_eval = bool(np.any(core_eval_mask))
-        dk_step = np.maximum(np.diff(unique_strikes), 1e-12)
+        k_scale = max(float(k_ref), 1e-12)
+        dk_step = np.maximum(np.diff(unique_strikes) / k_scale, 1e-12)
 
         def _compute_surface_worst_metrics() -> Tuple[float, float]:
             w_chk_all = (projected_quotes * projected_quotes) * t_arr[:, None]
@@ -496,7 +571,7 @@ def enforce_no_arbitrage_projection_with_jacobian(
                 )
 
             if min_d2c_core < -1e-4:
-                # Two-tier C2 ruling: mild numerical quote noise (-1e-3 <= min_d2c_core < -1e-4
+                # Mild numerical quote noise (-1e-3 <= min_d2c_core < -1e-4
                 # and min_g_core >= -10.0) is projected onto convex call prices with warning.
                 all_wing_mask = np.zeros_like(core_strike_mask)
                 calls_proj = _project_wing_calls_convex(unique_strikes, calls_m, k_ref, all_wing_mask)
@@ -513,7 +588,7 @@ def enforce_no_arbitrage_projection_with_jacobian(
                 for _ in range(16):
                     w_chk = (projected_quotes[m] * projected_quotes[m]) * t_m
                     c_chk = _b76_norm_call(y_u, w_chk)
-                    sl_chk = np.diff(c_chk) / np.maximum(np.diff(unique_strikes), 1e-12)
+                    sl_chk = np.diff(c_chk) / dk_step
                     d2_chk = np.diff(sl_chk)
                     fixed_any = False
                     for j_c in range(1, n_u - 1):
@@ -566,6 +641,50 @@ def enforce_no_arbitrage_projection_with_jacobian(
                         cal_ancestor[m, u] = cal_ancestor[m - 1, u]
                         cal_scale[m, u] = cal_scale[m - 1, u] * (
                             (t_arr[m - 1] * sig_prev_u) / max(t_arr[m] * sig_new, 1e-12)
+                        )
+
+        if was_projected:
+            w_post = (projected_quotes * projected_quotes) * t_arr[:, None]
+            _, g_post_all = _eval_durrleman_batch(y_u, w_post)
+            c_post_all = _b76_norm_call(y_u[None, :], w_post)
+            for m in range(n_exp):
+                t_m = float(t_arr[m])
+                g_post = g_post_all[m]
+                min_g_post_core = float(np.min(g_post[core_eval_mask])) if has_core_eval else float(np.min(g_post))
+                min_g_post_all = float(np.min(g_post))
+                sl_post = np.diff(c_post_all[m]) / dk_step
+                d2_post = np.diff(sl_post)
+                core_d2_post = d2_post[core_strike_mask[1:-1]] if np.any(core_strike_mask[1:-1]) else d2_post
+                min_d2_post_core = float(np.min(core_d2_post)) if len(core_d2_post) > 0 else 0.0
+                if min_d2_post_core < -1e-3 or min_g_post_core < -10.0 or min_g_post_all < -25.0:
+                    surf_min_d2c, surf_min_g = _compute_surface_worst_metrics()
+                    raise ValueError(
+                        f"SMILE_ARBITRAGE: Post-projection slice {m} fails convexity: "
+                        f"surface={surface_id}, slice={m} (T={t_m:.4f}Y), "
+                        f"min_d2c={min(min_d2_post_core, surf_min_d2c):.6f}, "
+                        f"min_g={min(min_g_post_core, surf_min_g):.4f}."
+                    )
+                if min_d2_post_core < -1e-4:
+                    for j_c in range(1, n_u - 1):
+                        if core_strike_mask[j_c] and float(d2_post[j_c - 1]) < -1e-4:
+                            w_interp = (unique_strikes[j_c] - unique_strikes[j_c - 1]) / max(
+                                unique_strikes[j_c + 1] - unique_strikes[j_c - 1], 1e-12
+                            )
+                            v_sec = (1.0 - w_interp) * projected_quotes[m, j_c - 1] + w_interp * projected_quotes[m, j_c + 1]
+                            projected_quotes[m, j_c] = 0.5 * (projected_quotes[m, j_c] + v_sec)
+                            cal_ancestor[m, j_c] = -1
+                            cal_scale[m, j_c] = 0.0
+                    if warnings_out is not None and "SMILE_ARBITRAGE_PROJECTED" not in warnings_out:
+                        warnings_out.append("SMILE_ARBITRAGE_PROJECTED")
+                    c_post_chk = _b76_norm_call(y_u, (projected_quotes[m] * projected_quotes[m]) * t_m)
+                    d2_post_chk = np.diff(np.diff(c_post_chk) / dk_step)
+                    core_chk = d2_post_chk[core_strike_mask[1:-1]] if np.any(core_strike_mask[1:-1]) else d2_post_chk
+                    if len(core_chk) > 0 and float(np.min(core_chk)) < -1e-3:
+                        surf_min_d2c, surf_min_g = _compute_surface_worst_metrics()
+                        raise ValueError(
+                            f"SMILE_ARBITRAGE: Post-projection slice {m} remains non-convex: "
+                            f"surface={surface_id}, slice={m} (T={t_m:.4f}Y), "
+                            f"min_d2c={min(float(np.min(core_chk)), surf_min_d2c):.6f}, min_g={surf_min_g:.4f}."
                         )
 
     cal_jacobian = np.zeros((n_exp, n_exp, n_u), dtype=np.float64)
@@ -692,8 +811,9 @@ class RegularizedVolSurface:
                 "ExpirationDates",
                 surf_spec.get("expiration_dates", surf_spec.get("exp_dates")),
             )
-            if "tenors" in surf_spec and surf_spec["tenors"] is not None:
-                raw_tenors = np.asarray(surf_spec["tenors"], dtype=np.float64)
+            raw_tenors_in = surf_spec.get("Tenors", surf_spec.get("tenors"))
+            if raw_tenors_in is not None:
+                raw_tenors = np.asarray(raw_tenors_in, dtype=np.float64)
                 raw_tenors_365 = raw_tenors.copy()
             else:
                 if raw_as_of is None:
@@ -760,8 +880,9 @@ class RegularizedVolSurface:
                 "ExpirationDates",
                 getattr(surf_spec, "expiration_dates", None),
             )
-            if hasattr(surf_spec, "tenors") and getattr(surf_spec, "tenors") is not None:
-                raw_tenors = np.asarray(getattr(surf_spec, "tenors"), dtype=np.float64)
+            raw_tenors_in = getattr(surf_spec, "Tenors", getattr(surf_spec, "tenors", None))
+            if raw_tenors_in is not None:
+                raw_tenors = np.asarray(raw_tenors_in, dtype=np.float64)
                 raw_tenors_365 = raw_tenors.copy()
             else:
                 if raw_as_of is None:
@@ -826,6 +947,9 @@ class RegularizedVolSurface:
         self._fast_basis_coeffs: Optional[npt.NDArray[np.float64]] = None
         self._basis_slope_left: Optional[npt.NDArray[np.float64]] = None
         self._basis_slope_right: Optional[npt.NDArray[np.float64]] = None
+        self._fast_basis_coeffs_per_slice: Optional[npt.NDArray[np.float64]] = None
+        self._basis_slope_left_per_slice: Optional[npt.NDArray[np.float64]] = None
+        self._basis_slope_right_per_slice: Optional[npt.NDArray[np.float64]] = None
 
         interp_norm = self.smile_interp.strip().lower()
         extrap_norm = self.smile_extrap.strip().lower()
@@ -882,6 +1006,13 @@ class RegularizedVolSurface:
 
         self._ensure_basis_spline()
         self._freeze_arrays()
+        h_surf = hashlib.blake2b(digest_size=16)
+        h_surf.update(self.quotes.tobytes())
+        h_surf.update(self.strikes.tobytes())
+        h_surf.update(self.tenors.tobytes())
+        h_surf.update(self.tenors_act365.tobytes())
+        h_surf.update(repr((self.dcc, self.smile_interp, self.smile_extrap, self.bc_type, float(self.min_vol))).encode("utf-8"))
+        self.content_digest: str = h_surf.hexdigest()
 
     def _freeze_arrays(self) -> None:
         """Marks all internal NumPy arrays read-only (`CHR-010`)."""
@@ -902,6 +1033,9 @@ class RegularizedVolSurface:
             self._fast_basis_coeffs,
             self._basis_slope_left,
             self._basis_slope_right,
+            self._fast_basis_coeffs_per_slice,
+            self._basis_slope_left_per_slice,
+            self._basis_slope_right_per_slice,
         ]
         for arr in arrays:
             if arr is not None:
@@ -914,7 +1048,11 @@ class RegularizedVolSurface:
     def _ensure_basis_spline(self) -> None:
         """Initializes and freezes the strike basis spline weights thread-safely."""
         with self._basis_lock:
-            if self._fast_basis_coeffs is not None or self._basis_cs is not None:
+            if (
+                self._fast_basis_coeffs is not None
+                and self._basis_slope_left is not None
+                and self._basis_slope_right is not None
+            ):
                 return
             eye_u = np.eye(self.n_unique_strikes, dtype=np.float64)
             interp_norm = self.smile_interp.strip().lower()
@@ -935,7 +1073,51 @@ class RegularizedVolSurface:
                 else:
                     self._basis_slope_left = np.zeros(self.n_unique_strikes, dtype=np.float64)
                     self._basis_slope_right = np.zeros(self.n_unique_strikes, dtype=np.float64)
-            elif self.bc_type == "clamped" and interp_norm in ("cubicspline", "spline", "", "pchip", "monotonecubic"):
+            elif interp_norm in ("pchip", "monotonecubic"):
+                # PCHIP derivatives are nonlinear in quote levels, so compute central FD basis
+                # weights per maturity slice for exact Jacobian propagation alongside the mean basis.
+                eps_fd = 1e-6
+                q_plus = self.quotes[:, None, :] + eps_fd * eye_u[None, :, :]
+                q_minus = self.quotes[:, None, :] - eps_fd * eye_u[None, :, :]
+                q_both = np.concatenate([q_plus, q_minus], axis=1).reshape(
+                    self.n_exp * 2 * self.n_unique_strikes, self.n_unique_strikes
+                )
+                pchip_fd = scipy.interpolate.PchipInterpolator(self.strikes, q_both, axis=1)
+                c_both = np.asarray(pchip_fd.c, dtype=np.float64).reshape(
+                    4, max(self.n_unique_strikes - 1, 1), self.n_exp, 2, self.n_unique_strikes
+                )
+                basis_per_slice = np.ascontiguousarray(
+                    np.transpose(
+                        (c_both[:, :, :, 0, :] - c_both[:, :, :, 1, :]) / (2.0 * eps_fd),
+                        (2, 0, 1, 3),
+                    ),
+                    dtype=np.float64,
+                )
+                self._fast_basis_coeffs_per_slice = basis_per_slice
+                self._fast_basis_coeffs = np.ascontiguousarray(
+                    np.mean(basis_per_slice, axis=0), dtype=np.float64
+                )
+                if use_linear_extrap:
+                    sl_both = np.asarray(pchip_fd(self.strikes[0], 1), dtype=np.float64).reshape(
+                        self.n_exp, 2, self.n_unique_strikes
+                    )
+                    sr_both = np.asarray(pchip_fd(self.strikes[-1], 1), dtype=np.float64).reshape(
+                        self.n_exp, 2, self.n_unique_strikes
+                    )
+                    sl_per = np.ascontiguousarray(
+                        (sl_both[:, 0, :] - sl_both[:, 1, :]) / (2.0 * eps_fd), dtype=np.float64
+                    )
+                    sr_per = np.ascontiguousarray(
+                        (sr_both[:, 0, :] - sr_both[:, 1, :]) / (2.0 * eps_fd), dtype=np.float64
+                    )
+                else:
+                    sl_per = np.zeros((self.n_exp, self.n_unique_strikes), dtype=np.float64)
+                    sr_per = np.zeros((self.n_exp, self.n_unique_strikes), dtype=np.float64)
+                self._basis_slope_left_per_slice = sl_per
+                self._basis_slope_right_per_slice = sr_per
+                self._basis_slope_left = np.ascontiguousarray(np.mean(sl_per, axis=0), dtype=np.float64)
+                self._basis_slope_right = np.ascontiguousarray(np.mean(sr_per, axis=0), dtype=np.float64)
+            elif self.bc_type == "clamped" and interp_norm in ("cubicspline", "spline", ""):
                 self._fast_basis_coeffs = fast_clamped_cubic_coeffs(self.strikes, eye_u)
                 if use_linear_extrap:
                     sl = np.zeros(self.n_unique_strikes, dtype=np.float64)
@@ -950,29 +1132,44 @@ class RegularizedVolSurface:
                     self._basis_slope_left = np.zeros(self.n_unique_strikes, dtype=np.float64)
                     self._basis_slope_right = np.zeros(self.n_unique_strikes, dtype=np.float64)
             else:
-                eff_bc = self.bc_type
-                if interp_norm == "naturalcubicspline":
-                    eff_bc = "natural"
-                elif interp_norm in ("notaknot", "notaknotcubicspline", "polynomial", "lme"):
-                    eff_bc = "not-a-knot"
-                self._basis_cs = scipy.interpolate.CubicSpline(
-                    self.strikes, eye_u, bc_type=eff_bc, axis=0
-                )
-                self._fast_basis_coeffs = np.asarray(self._basis_cs.c, dtype=np.float64).copy()
+                if self._basis_cs is None:
+                    eff_bc = self.bc_type
+                    if interp_norm == "naturalcubicspline":
+                        eff_bc = "natural"
+                    elif interp_norm in ("notaknot", "notaknotcubicspline", "polynomial", "lme"):
+                        eff_bc = "not-a-knot"
+                    self._basis_cs = scipy.interpolate.CubicSpline(
+                        self.strikes, eye_u, bc_type=eff_bc, axis=0
+                    )
+                self._fast_basis_coeffs = np.ascontiguousarray(self._basis_cs.c, dtype=np.float64)
                 if use_linear_extrap:
-                    self._basis_slope_left = np.asarray(
+                    self._basis_slope_left = np.ascontiguousarray(
                         self._basis_cs(self.strikes[0], 1), dtype=np.float64
-                    ).copy()
-                    self._basis_slope_right = np.asarray(
+                    )
+                    self._basis_slope_right = np.ascontiguousarray(
                         self._basis_cs(self.strikes[-1], 1), dtype=np.float64
-                    ).copy()
+                    )
                 else:
                     self._basis_slope_left = np.zeros(self.n_unique_strikes, dtype=np.float64)
                     self._basis_slope_right = np.zeros(self.n_unique_strikes, dtype=np.float64)
 
-            for arr in (self._fast_basis_coeffs, self._basis_slope_left, self._basis_slope_right):
+            for arr in (
+                self._fast_basis_coeffs,
+                self._basis_slope_left,
+                self._basis_slope_right,
+                self._fast_basis_coeffs_per_slice,
+                self._basis_slope_left_per_slice,
+                self._basis_slope_right_per_slice,
+            ):
                 if arr is not None:
                     arr.setflags(write=False)
+
+    def ensure_basis_spline_coeffs(self) -> npt.NDArray[np.float64]:
+        """Thread-safely initializes and returns frozen `(4, n_unique - 1, n_unique)` basis coeffs."""
+        self._ensure_basis_spline()
+        if self._fast_basis_coeffs is None:
+            raise RuntimeError("RegularizedVolSurface basis spline failed to initialize.")
+        return self._fast_basis_coeffs
 
     def tenor_from_date(self, dt: Union[datetime, date, str]) -> float:
         """Converts an observation date to the surface's DayCountConvention year fraction."""
@@ -1077,17 +1274,11 @@ class RegularizedVolSurface:
             d2val = np.where(clamped_low, 0.0, d2val)
         return val, dval, d2val
 
-    def eval_slice(
+    def _eval_slice_raw(
         self,
         slice_idx: int,
-        k_query: Union[float, npt.NDArray[np.float64]],
-    ) -> Union[npt.NDArray[np.float64], float]:
-        """Evaluates implied volatility on maturity slice `slice_idx` at strike(s) `k_query`."""
-        k_arr = np.asarray(k_query, dtype=np.float64)
-        scalar_in = k_arr.ndim == 0
-        if scalar_in:
-            k_arr = k_arr[None]
-
+        k_arr: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
         k_min = float(self.strikes[0])
         k_max = float(self.strikes[-1])
         k_clip = np.clip(k_arr, k_min, k_max)
@@ -1112,8 +1303,19 @@ class RegularizedVolSurface:
                 self.quotes[slice_idx, -1] + self._slopes_right[slice_idx] * (k_arr - k_max),
                 val,
             )
+        return val
 
-        out = np.maximum(val, self.min_vol)
+    def eval_slice(
+        self,
+        slice_idx: int,
+        k_query: Union[float, npt.NDArray[np.float64]],
+    ) -> Union[npt.NDArray[np.float64], float]:
+        """Evaluates implied volatility on maturity slice `slice_idx` at strike(s) `k_query`."""
+        k_arr = np.asarray(k_query, dtype=np.float64)
+        scalar_in = k_arr.ndim == 0
+        if scalar_in:
+            k_arr = k_arr[None]
+        out = np.maximum(self._eval_slice_raw(slice_idx, k_arr), self.min_vol)
         if scalar_in:
             return float(out[0])
         return out
@@ -1225,6 +1427,46 @@ class RegularizedVolSurface:
         res = np.where(t_flat >= float(self.tenors[-1]), vals_all[:, -1], res)
         return res.reshape(orig_shape)
 
+    def _eval_basis_u_vec(
+        self,
+        k_val: float,
+        slice_idx: Optional[int] = None,
+    ) -> npt.NDArray[np.float64]:
+        """Evaluates strike basis weights in unique strike space for optional slice index."""
+        self._ensure_basis_spline()
+        k_arr = np.array([k_val], dtype=np.float64)
+        k_min = float(self.strikes[0])
+        k_max = float(self.strikes[-1])
+        k_clip = np.clip(k_arr, k_min, k_max)
+
+        coeffs = self._fast_basis_coeffs
+        sl_left = self._basis_slope_left
+        sl_right = self._basis_slope_right
+        if (
+            slice_idx is not None
+            and self._fast_basis_coeffs_per_slice is not None
+            and self._basis_slope_left_per_slice is not None
+            and self._basis_slope_right_per_slice is not None
+        ):
+            coeffs = self._fast_basis_coeffs_per_slice[slice_idx]
+            sl_left = self._basis_slope_left_per_slice[slice_idx]
+            sl_right = self._basis_slope_right_per_slice[slice_idx]
+
+        if coeffs is not None:
+            w_u_vec = eval_clamped_cubic_coeffs(self.strikes, coeffs, k_clip)[0]
+        else:
+            w_u_vec = np.asarray(self._basis_cs(k_clip)[0], dtype=np.float64)
+
+        if k_val < k_min and sl_left is not None:
+            w_u_vec = np.zeros(self.n_unique_strikes, dtype=np.float64)
+            w_u_vec[0] = 1.0
+            w_u_vec = w_u_vec + (k_val - k_min) * sl_left
+        elif k_val > k_max and sl_right is not None:
+            w_u_vec = np.zeros(self.n_unique_strikes, dtype=np.float64)
+            w_u_vec[-1] = 1.0
+            w_u_vec = w_u_vec + (k_val - k_max) * sl_right
+        return np.asarray(w_u_vec, dtype=np.float64)
+
     def iv_and_d_iv_d_quotes(
         self,
         t: Union[float, datetime, date],
@@ -1237,55 +1479,46 @@ class RegularizedVolSurface:
             t_raw = float(t)
         t_val = max(t_raw, 1e-8)
         k_val = float(k_query)
-        w_k = self.strike_basis_weights(k_val)  # (N_raw_strikes,)
-        w_u = self.dedup_matrix @ w_k
-        # Actually w_k = w_u_raw @ dedup_matrix, so compute directly in unique strike space then contract
         jac_u = np.zeros((self.n_exp, self.n_unique_strikes), dtype=np.float64)
 
-        # Obtain exact basis weights in unique strike space
-        k_arr = np.array([k_val], dtype=np.float64)
-        k_min = float(self.strikes[0])
-        k_max = float(self.strikes[-1])
-        k_clip = np.clip(k_arr, k_min, k_max)
-        self._ensure_basis_spline()
-        if self._fast_basis_coeffs is not None:
-            w_u_vec = eval_clamped_cubic_coeffs(self.strikes, self._fast_basis_coeffs, k_clip)[0]
-        else:
-            w_u_vec = np.asarray(self._basis_cs(k_clip)[0], dtype=np.float64)
-        if k_val < k_min and self._basis_slope_left is not None:
-            w_u_vec = np.zeros(self.n_unique_strikes, dtype=np.float64)
-            w_u_vec[0] = 1.0
-            w_u_vec = w_u_vec + (k_val - k_min) * self._basis_slope_left
-        elif k_val > k_max and self._basis_slope_right is not None:
-            w_u_vec = np.zeros(self.n_unique_strikes, dtype=np.float64)
-            w_u_vec[-1] = 1.0
-            w_u_vec = w_u_vec + (k_val - k_max) * self._basis_slope_right
-        _ = w_u
+        k_arr_1 = np.array([k_val], dtype=np.float64)
+        min_var_floor = self.min_vol * self.min_vol
 
         if t_val <= float(self.tenors[0]):
-            sig = float(self.eval_slice(0, k_val))
-            jac_u[0, :] = w_u_vec
+            v_raw = float(self._eval_slice_raw(0, k_arr_1)[0])
+            sig = max(v_raw, self.min_vol)
+            if v_raw > self.min_vol:
+                jac_u[0, :] = self._eval_basis_u_vec(k_val, slice_idx=0)
         elif t_val >= float(self.tenors[-1]):
-            sig = float(self.eval_slice(self.n_exp - 1, k_val))
-            jac_u[self.n_exp - 1, :] = w_u_vec
+            last_idx = self.n_exp - 1
+            v_raw = float(self._eval_slice_raw(last_idx, k_arr_1)[0])
+            sig = max(v_raw, self.min_vol)
+            if v_raw > self.min_vol:
+                jac_u[last_idx, :] = self._eval_basis_u_vec(k_val, slice_idx=last_idx)
         else:
             idx = int(np.searchsorted(self.tenors, t_val, side="right")) - 1
             idx = max(0, min(idx, self.n_exp - 2))
             t0 = float(self.tenors[idx])
             t1 = float(self.tenors[idx + 1])
-            v0 = float(self.eval_slice(idx, k_val))
-            v1 = float(self.eval_slice(idx + 1, k_val))
+            v0_raw = float(self._eval_slice_raw(idx, k_arr_1)[0])
+            v1_raw = float(self._eval_slice_raw(idx + 1, k_arr_1)[0])
+            v0 = max(v0_raw, self.min_vol)
+            v1 = max(v1_raw, self.min_vol)
 
             alpha = (t_val - t0) / max(t1 - t0, 1e-12)
             w0 = (v0 * v0) * t0
             w1 = (v1 * v1) * t1
             w = (1.0 - alpha) * w0 + alpha * w1
-            sig = math.sqrt(max(w / t_val, self.min_vol * self.min_vol))
+            w_over_t = w / t_val
+            sig = math.sqrt(max(w_over_t, min_var_floor))
 
-            d_sig_dv0 = (1.0 - alpha) * t0 * v0 / max(t_val * sig, 1e-12)
-            d_sig_dv1 = alpha * t1 * v1 / max(t_val * sig, 1e-12)
-            jac_u[idx, :] = d_sig_dv0 * w_u_vec
-            jac_u[idx + 1, :] = d_sig_dv1 * w_u_vec
+            if w_over_t > min_var_floor:
+                if v0_raw > self.min_vol:
+                    d_sig_dv0 = (1.0 - alpha) * t0 * v0 / max(t_val * sig, 1e-12)
+                    jac_u[idx, :] = d_sig_dv0 * self._eval_basis_u_vec(k_val, slice_idx=idx)
+                if v1_raw > self.min_vol:
+                    d_sig_dv1 = alpha * t1 * v1 / max(t_val * sig, 1e-12)
+                    jac_u[idx + 1, :] = d_sig_dv1 * self._eval_basis_u_vec(k_val, slice_idx=idx + 1)
 
         # Contract through calendar-projection + min-vol floor Jacobian (T1M-013)
         jac_dedup = np.einsum("mu,mnu->nu", jac_u, self.calendar_proj_jacobian)
@@ -1490,6 +1723,18 @@ class RegularizedVolSurface:
         return feats, jac
 
 
+def ensure_basis_spline_coeffs(surface: Any) -> npt.NDArray[np.float64]:
+    """Thread-safe RegularizedVolSurface._ensure_basis_spline() accessor (clamped, _basis_cs & PCHIP)."""
+    if hasattr(surface, "ensure_basis_spline_coeffs") and callable(surface.ensure_basis_spline_coeffs):
+        return cast(npt.NDArray[np.float64], surface.ensure_basis_spline_coeffs())
+    if hasattr(surface, "_ensure_basis_spline") and callable(surface._ensure_basis_spline):
+        surface._ensure_basis_spline()
+        coeffs = getattr(surface, "_fast_basis_coeffs", None)
+        if coeffs is not None:
+            return cast(npt.NDArray[np.float64], coeffs)
+    raise RuntimeError("Surface does not provide basis spline initialization.")
+
+
 @dataclass
 class DupireQMCResult:
     """Output of the multi-asset Dupire Local Volatility / Terminal IV Sobol QMC solver."""
@@ -1589,6 +1834,23 @@ def _generate_sobol_normals(
     return np.concatenate([z_sobol, z_anti], axis=1)
 
 
+def _lookup_funding_fixing_utc(
+    fixings_pairs: Sequence[Tuple[datetime, float]],
+    target_dt: datetime,
+) -> Optional[float]:
+    """Finds an exact or same-calendar-day UTC fixing for a funding reset date."""
+    if not fixings_pairs:
+        return None
+    target_date = target_dt.date()
+    fallback: Optional[float] = None
+    for f_dt, f_val in fixings_pairs:
+        if f_dt == target_dt:
+            return float(f_val)
+        if f_dt.date() == target_date:
+            fallback = float(f_val)
+    return fallback
+
+
 def _compute_funding_weights_np(state: Any) -> npt.NDArray[np.float64]:
     """Computes deterministic per-period discounted FundingLeg weights w_fund[m] in float64."""
     m_rem = int(state.m_rem)
@@ -1599,16 +1861,23 @@ def _compute_funding_weights_np(state: Any) -> npt.NDArray[np.float64]:
     from deepvol.models.autocall.escrowed_dividend import build_discount_rate_evaluator
 
     f_leg = state.funding_leg
-    f_rid = f_leg.get("rate_identifier")
+    raw_f_rid = f_leg.get("rate_identifier")
+    f_rid = str(raw_f_rid).strip() if raw_f_rid is not None else ""
     f_curve = f_leg.get("funding_curve")
-    as_of_dt = state.seasoned_state.as_of_date
-    dcc = state.seasoned_state.day_count_convention
+    as_of_dt = _to_utc_datetime(state.seasoned_state.as_of_date)
+    dcc_raw = f_leg.get(
+        "day_count",
+        f_leg.get("day_count_convention", state.seasoned_state.day_count_convention),
+    )
+    dcc = str(getattr(dcc_raw, "value", dcc_raw) or state.seasoned_state.day_count_convention)
 
     _, df_fin_fn = build_discount_rate_evaluator(state.discount_curve, as_of_dt)
-    disc_id = getattr(state.discount_curve, "identifier", None)
-    f_curve_id = getattr(f_curve, "identifier", None)
+    disc_id = getattr(state, "discount_curve_id", None) or getattr(
+        state.discount_curve, "identifier", None
+    )
+    f_curve_id = f_leg.get("funding_curve_id") or getattr(f_curve, "identifier", None)
     if (
-        f_rid is not None
+        bool(f_rid)
         and f_curve is not None
         and (f_curve is not state.discount_curve)
         and (disc_id is None or f_curve_id is None or f_curve_id != disc_id)
@@ -1617,25 +1886,55 @@ def _compute_funding_weights_np(state: Any) -> npt.NDArray[np.float64]:
     else:
         df_fwd_fn = df_fin_fn
 
-    f_spread = float(f_leg.get("funding_spread", 0.0))
-    f_dates = f_leg.get("payment_dates", [])
-    prev_f_dt = getattr(state.seasoned_state, "start_date", as_of_dt)
-    for f_dt in f_dates:
+    raw_spread = f_leg.get("funding_spread", 0.0)
+    f_spread = 0.0 if raw_spread is None else float(raw_spread)
+    f_dates = f_leg.get("payment_dates") or ()
+    f_fixings_raw = f_leg.get("funding_fixings") or ()
+    if isinstance(f_fixings_raw, Mapping):
+        f_fixings = [(_to_utc_datetime(dt_r), float(val_r)) for dt_r, val_r in f_fixings_raw.items()]
+    else:
+        f_fixings = [(_to_utc_datetime(dt_r), float(val_r)) for dt_r, val_r in f_fixings_raw]
+    pay_dates_utc = [_to_utc_datetime(p_dt) for p_dt in state.seasoned_state.future_pay_dates[:m_rem]]
+    if not pay_dates_utc:
+        return w_fund
+    max_future_pay_dt = pay_dates_utc[-1]
+    hist_recs = getattr(state.seasoned_state, "historical_records", ()) or ()
+    max_past_pay_dt = max((_to_utc_datetime(r.payment_date) for r in hist_recs), default=None)
+    prev_f_dt = _to_utc_datetime(getattr(state.seasoned_state, "start_date", as_of_dt) or as_of_dt)
+
+    for f_dt_raw in f_dates:
+        f_dt = _to_utc_datetime(f_dt_raw)
         if f_dt <= as_of_dt:
+            prev_f_dt = f_dt
+            continue
+        if max_past_pay_dt is not None and f_dt <= max_past_pay_dt:
+            prev_f_dt = f_dt
+            continue
+        if f_dt > max_future_pay_dt:
             prev_f_dt = f_dt
             continue
         alpha_j = _surface_year_fraction(prev_f_dt, f_dt, dcc)
         df_curr = float(df_fin_fn(f_dt))
-        if f_rid is None:
+        if not f_rid:
             r_fwd_j = 0.0
         else:
-            df_prev_fwd = float(df_fwd_fn(prev_f_dt))
-            df_curr_fwd = float(df_fwd_fn(f_dt))
-            r_fwd_j = (df_prev_fwd / max(df_curr_fwd, 1e-12) - 1.0) / max(alpha_j, 1e-8)
+            fixed_reset = (
+                _lookup_funding_fixing_utc(f_fixings, prev_f_dt) if prev_f_dt < as_of_dt else None
+            )
+            if fixed_reset is not None:
+                r_fwd_j = fixed_reset
+            elif prev_f_dt < as_of_dt:
+                alpha_rem = max(_surface_year_fraction(as_of_dt, f_dt, dcc), 1e-8)
+                df_curr_fwd = float(df_fwd_fn(f_dt))
+                r_fwd_j = (1.0 / max(df_curr_fwd, 1e-12) - 1.0) / alpha_rem
+            else:
+                df_prev_fwd = float(df_fwd_fn(prev_f_dt))
+                df_curr_fwd = float(df_fwd_fn(f_dt))
+                r_fwd_j = (df_prev_fwd / max(df_curr_fwd, 1e-12) - 1.0) / max(alpha_j, 1e-8)
 
         m_idx = m_rem - 1
-        for m in range(m_rem):
-            if state.seasoned_state.future_pay_dates[m] >= f_dt:
+        for m, pay_dt in enumerate(pay_dates_utc):
+            if pay_dt >= f_dt:
                 m_idx = m
                 break
         w_fund[m_idx] += df_curr * (r_fwd_j + f_spread) * alpha_j
@@ -1643,18 +1942,72 @@ def _compute_funding_weights_np(state: Any) -> npt.NDArray[np.float64]:
     return w_fund
 
 
+def _eval_index_by_code_np(
+    perf_sorted: npt.NDArray[np.float64],
+    code: int,
+    inv_lex_perm: Optional[npt.NDArray[np.int64]],
+) -> npt.NDArray[np.float64]:
+    """Evaluates any of the 18 canonical monitoring functionals on sorted paths in float64."""
+    if code in _PAIR_ORDER_INDEX_CODES and inv_lex_perm is not None:
+        p = perf_sorted[..., inv_lex_perm]
+    else:
+        p = perf_sorted
+    d = p.shape[-1]
+
+    if code == int(MonitoringIndexCode.WORST_OF):
+        return np.asarray(np.min(p, axis=-1), dtype=np.float64)
+    if code == int(MonitoringIndexCode.BEST_OF):
+        return np.asarray(np.max(p, axis=-1), dtype=np.float64)
+    if code == int(MonitoringIndexCode.AVERAGE_OF):
+        return np.asarray(np.mean(p, axis=-1), dtype=np.float64)
+    if code == int(MonitoringIndexCode.DISPERSION):
+        if d <= 1:
+            return np.zeros(p.shape[:-1], dtype=np.float64)
+        mu = np.mean(p, axis=-1, keepdims=True)
+        return np.asarray(np.sqrt(np.maximum(np.mean((p - mu) ** 2, axis=-1), 0.0)), dtype=np.float64)
+    if code == int(MonitoringIndexCode.RATIO_AB):
+        return np.asarray(p[..., 0] if d < 2 else p[..., 0] / np.maximum(p[..., 1], 1e-12), dtype=np.float64)
+    if code == int(MonitoringIndexCode.RATIO_BA):
+        return np.asarray(p[..., 0] if d < 2 else p[..., 1] / np.maximum(p[..., 0], 1e-12), dtype=np.float64)
+    if code == int(MonitoringIndexCode.RATIO_BEST_WORST):
+        return np.asarray(np.max(p, axis=-1) / np.maximum(np.min(p, axis=-1), 1e-12), dtype=np.float64)
+    if code == int(MonitoringIndexCode.RATIO_BEST_AVERAGE):
+        return np.asarray(np.max(p, axis=-1) / np.maximum(np.mean(p, axis=-1), 1e-12), dtype=np.float64)
+    if code == int(MonitoringIndexCode.RATIO_AVERAGE_WORST):
+        return np.asarray(np.mean(p, axis=-1) / np.maximum(np.min(p, axis=-1), 1e-12), dtype=np.float64)
+    if code == int(MonitoringIndexCode.DIFF_AB):
+        return np.zeros(p.shape[:-1], dtype=np.float64) if d < 2 else np.asarray(p[..., 0] - p[..., 1], dtype=np.float64)
+    if code == int(MonitoringIndexCode.DIFF_BA):
+        return np.zeros(p.shape[:-1], dtype=np.float64) if d < 2 else np.asarray(p[..., 1] - p[..., 0], dtype=np.float64)
+    if code == int(MonitoringIndexCode.DIFF_BEST_WORST):
+        return np.asarray(np.max(p, axis=-1) - np.min(p, axis=-1), dtype=np.float64)
+    if code == int(MonitoringIndexCode.DIFF_BEST_AVERAGE):
+        return np.asarray(np.max(p, axis=-1) - np.mean(p, axis=-1), dtype=np.float64)
+    if code == int(MonitoringIndexCode.DIFF_AVERAGE_WORST):
+        return np.asarray(np.mean(p, axis=-1) - np.min(p, axis=-1), dtype=np.float64)
+    if code == int(MonitoringIndexCode.TWIN_WIN):
+        w_min = np.min(p, axis=-1)
+        return np.asarray(np.where(w_min < 1.0, 2.0 - w_min, w_min), dtype=np.float64)
+    if code == int(MonitoringIndexCode.SECOND_WORST_OF):
+        k = min(1, max(d - 1, 0))
+        return np.asarray(np.partition(p, k, axis=-1)[..., k], dtype=np.float64)
+    if code == int(MonitoringIndexCode.THIRD_WORST_OF):
+        k = min(2, max(d - 1, 0))
+        return np.asarray(np.partition(p, k, axis=-1)[..., k], dtype=np.float64)
+    if code == int(MonitoringIndexCode.SECOND_BEST_OF):
+        k = max(0, d - 2)
+        return np.asarray(np.partition(p, k, axis=-1)[..., k], dtype=np.float64)
+    return np.asarray(np.min(p, axis=-1), dtype=np.float64)
+
+
 def _evaluate_index_with_unperm_np(
     perf_sorted: npt.NDArray[np.float64],
     index_name: str,
     inv_lex_perm: Optional[npt.NDArray[np.int64]],
 ) -> npt.NDArray[np.float64]:
-    """Evaluates monitoring functional, restoring original caller ordering for asymmetric pair indices."""
-    idx_clean = str(index_name).strip()
-    if idx_clean in _ASYMMETRIC_PAIR_INDICES and inv_lex_perm is not None:
-        perf_in = perf_sorted[..., inv_lex_perm]
-    else:
-        perf_in = perf_sorted
-    return np.asarray(evaluate_monitoring_index_np(perf_in, idx_clean), dtype=np.float64)
+    """Evaluates monitoring functional, restoring caller ordering for pair indices."""
+    code = resolve_monitoring_index_code(index_name)
+    return _eval_index_by_code_np(perf_sorted, code, inv_lex_perm)
 
 
 def _compute_forward_at_time_np(
@@ -1769,6 +2122,477 @@ def _assemble_qmc_postproc(
     return asm
 
 
+def _black76_put_np(f: float, k: float, total_vol: float) -> float:
+    """Exact undiscounted Black-76 put price E[max(K - F*exp(-0.5 v^2 + v Z), 0)]."""
+    if k <= 0.0:
+        return 0.0
+    if f <= 0.0:
+        return k
+    if total_vol <= 1e-12:
+        return max(k - f, 0.0)
+    d1 = (math.log(f / k) + 0.5 * total_vol * total_vol) / total_vol
+    d2 = d1 - total_vol
+    return k * float(ndtr(-d2)) - f * float(ndtr(-d1))
+
+
+def _apply_loo_control_variate_np(
+    y_paths: npt.NDArray[np.float64],
+    x_paths: npt.NDArray[np.float64],
+    mu_x: float,
+) -> Tuple[float, float]:
+    """Leave-one-replicate-out unbiased RQMC control variate estimator."""
+    eff_r, n_rep = y_paths.shape
+    y_bar = np.mean(y_paths, axis=1)
+    if eff_r < 2:
+        raw_mean = float(np.mean(y_bar))
+        raw_se = float(np.std(y_paths.reshape(-1), ddof=1) / math.sqrt(max(n_rep, 1)))
+        return raw_mean, raw_se
+
+    x_bar = np.mean(x_paths, axis=1)
+    # Estimate slopes from (R - 1) * n_rep path deviations, then shrink on held-out
+    # replicate means so CV never amplifies RQMC replicate variance on tail-heavy payoffs.
+    dy = y_paths - y_bar[:, None]
+    dx = x_paths - x_bar[:, None]
+    cov_xy_r = np.sum(dy * dx, axis=1)
+    var_xx_r = np.sum(dx * dx, axis=1)
+    var_yy_r = np.sum(dy * dy, axis=1)
+    tot_cov = float(np.sum(cov_xy_r))
+    tot_var = float(np.sum(var_xx_r))
+    tot_yvar = float(np.sum(var_yy_r))
+
+    loo_cov = tot_cov - cov_xy_r
+    loo_var = tot_var - var_xx_r
+    loo_yvar = tot_yvar - var_yy_r
+    var_thresh = 1e-18 * max(1.0, tot_var)
+    beta_path = np.where(loo_var > var_thresh, loo_cov / np.maximum(loo_var, var_thresh), 0.0)
+
+    if eff_r >= 3:
+        tot_y = float(np.sum(y_bar))
+        tot_x = float(np.sum(x_bar))
+        sum_yy = float(np.sum(y_bar * y_bar))
+        sum_yx = float(np.sum(y_bar * x_bar))
+        sum_xx = float(np.sum(x_bar * x_bar))
+        rm1 = float(eff_r - 1)
+        my = (tot_y - y_bar) / rm1
+        mx = (tot_x - x_bar) / rm1
+        s_yy = np.maximum((sum_yy - y_bar * y_bar) - rm1 * my * my, 0.0)
+        s_yx = (sum_yx - y_bar * x_bar) - rm1 * my * mx
+        s_xx = np.maximum((sum_xx - x_bar * x_bar) - rm1 * mx * mx, 0.0)
+        var_cv_path = s_yy - 2.0 * beta_path * s_yx + beta_path * beta_path * s_xx
+        denom_bx = beta_path * s_xx
+        safe_denom = np.where(np.abs(denom_bx) > 1e-30, denom_bx, 1.0)
+        alpha = np.where(
+            var_cv_path <= s_yy,
+            1.0,
+            np.where(
+                (beta_path * s_yx > 0.0) & (s_xx > 1e-24 * max(1.0, sum_xx)),
+                np.clip(s_yx / safe_denom, 0.0, 1.0),
+                0.0,
+            ),
+        )
+        beta_loo = alpha * beta_path
+    else:
+        y_thresh = 1e-18 * max(1.0, tot_yvar)
+        r2_path = np.where(
+            (loo_var > var_thresh) & (loo_yvar > y_thresh),
+            (loo_cov * loo_cov) / np.maximum(loo_var * loo_yvar, 1e-30),
+            0.0,
+        )
+        beta_loo = np.where(r2_path >= 0.1, beta_path, 0.0)
+
+    z_rep = y_bar - beta_loo * (x_bar - mu_x)
+    est = float(np.mean(z_rep))
+    se = float(np.std(z_rep, ddof=1) / math.sqrt(float(eff_r)))
+    return est, se
+
+
+def _eval_index_log_weights_np(
+    perf: npt.NDArray[np.float64],
+    code: int,
+    inv_lex_perm: Optional[npt.NDArray[np.int64]],
+) -> npt.NDArray[np.float64]:
+    """Returns approximate dW/d(log S_i) sensitivity weights along last axis for BB KI variance."""
+    d = perf.shape[-1]
+    if code in _PAIR_ORDER_INDEX_CODES and inv_lex_perm is not None:
+        p = perf[..., inv_lex_perm]
+    else:
+        p = perf
+    w = np.zeros_like(p, dtype=np.float64)
+
+    def _set_onehot(idx_arr: npt.NDArray[np.intp], val: Union[float, npt.NDArray[np.float64]]) -> None:
+        np.put_along_axis(w, idx_arr[..., None], np.asarray(val, dtype=np.float64)[..., None], axis=-1)
+
+    if code == int(MonitoringIndexCode.WORST_OF):
+        _set_onehot(np.argmin(p, axis=-1), np.min(p, axis=-1))
+    elif code == int(MonitoringIndexCode.BEST_OF):
+        _set_onehot(np.argmax(p, axis=-1), np.max(p, axis=-1))
+    elif code == int(MonitoringIndexCode.AVERAGE_OF):
+        w = p / float(max(d, 1))
+    elif code == int(MonitoringIndexCode.RATIO_AB):
+        if d >= 2:
+            r_val = p[..., 0] / np.maximum(p[..., 1], 1e-12)
+            w[..., 0] = r_val
+            w[..., 1] = -r_val
+        else:
+            w[..., 0] = p[..., 0]
+    elif code == int(MonitoringIndexCode.RATIO_BA):
+        if d >= 2:
+            r_val = p[..., 1] / np.maximum(p[..., 0], 1e-12)
+            w[..., 1] = r_val
+            w[..., 0] = -r_val
+        else:
+            w[..., 0] = p[..., 0]
+    elif code == int(MonitoringIndexCode.RATIO_BEST_WORST):
+        r_val = np.max(p, axis=-1) / np.maximum(np.min(p, axis=-1), 1e-12)
+        np.put_along_axis(w, np.argmax(p, axis=-1)[..., None], r_val[..., None], axis=-1)
+        cur_min = np.take_along_axis(w, np.argmin(p, axis=-1)[..., None], axis=-1)
+        np.put_along_axis(w, np.argmin(p, axis=-1)[..., None], cur_min - r_val[..., None], axis=-1)
+    elif code == int(MonitoringIndexCode.RATIO_BEST_AVERAGE):
+        mean_p = np.maximum(np.mean(p, axis=-1), 1e-12)
+        max_p = np.max(p, axis=-1)
+        r_val = max_p / mean_p
+        w = -(r_val[..., None] * p) / (float(max(d, 1)) * mean_p[..., None])
+        cur_max = np.take_along_axis(w, np.argmax(p, axis=-1)[..., None], axis=-1)
+        np.put_along_axis(w, np.argmax(p, axis=-1)[..., None], cur_max + r_val[..., None], axis=-1)
+    elif code == int(MonitoringIndexCode.RATIO_AVERAGE_WORST):
+        min_p = np.maximum(np.min(p, axis=-1), 1e-12)
+        mean_p = np.mean(p, axis=-1)
+        r_val = mean_p / min_p
+        w = p / (float(max(d, 1)) * min_p[..., None])
+        cur_min = np.take_along_axis(w, np.argmin(p, axis=-1)[..., None], axis=-1)
+        np.put_along_axis(w, np.argmin(p, axis=-1)[..., None], cur_min - r_val[..., None], axis=-1)
+    elif code == int(MonitoringIndexCode.DIFF_AB):
+        if d >= 2:
+            w[..., 0] = p[..., 0]
+            w[..., 1] = -p[..., 1]
+    elif code == int(MonitoringIndexCode.DIFF_BA):
+        if d >= 2:
+            w[..., 1] = p[..., 1]
+            w[..., 0] = -p[..., 0]
+    elif code == int(MonitoringIndexCode.DIFF_BEST_WORST):
+        np.put_along_axis(w, np.argmax(p, axis=-1)[..., None], np.max(p, axis=-1)[..., None], axis=-1)
+        cur_min = np.take_along_axis(w, np.argmin(p, axis=-1)[..., None], axis=-1)
+        np.put_along_axis(w, np.argmin(p, axis=-1)[..., None], cur_min - np.min(p, axis=-1)[..., None], axis=-1)
+    elif code == int(MonitoringIndexCode.DIFF_BEST_AVERAGE):
+        w = -p / float(max(d, 1))
+        cur_max = np.take_along_axis(w, np.argmax(p, axis=-1)[..., None], axis=-1)
+        np.put_along_axis(w, np.argmax(p, axis=-1)[..., None], cur_max + np.max(p, axis=-1)[..., None], axis=-1)
+    elif code == int(MonitoringIndexCode.DIFF_AVERAGE_WORST):
+        w = p / float(max(d, 1))
+        cur_min = np.take_along_axis(w, np.argmin(p, axis=-1)[..., None], axis=-1)
+        np.put_along_axis(w, np.argmin(p, axis=-1)[..., None], cur_min - np.min(p, axis=-1)[..., None], axis=-1)
+    elif code == int(MonitoringIndexCode.TWIN_WIN):
+        w_min = np.min(p, axis=-1)
+        sgn = np.where(w_min < 1.0, -w_min, w_min)
+        _set_onehot(np.argmin(p, axis=-1), sgn)
+    elif code == int(MonitoringIndexCode.SECOND_WORST_OF):
+        order = np.argsort(p, axis=-1)
+        idx = order[..., min(1, max(d - 1, 0))]
+        _set_onehot(idx, np.take_along_axis(p, idx[..., None], axis=-1)[..., 0])
+    elif code == int(MonitoringIndexCode.THIRD_WORST_OF):
+        order = np.argsort(p, axis=-1)
+        idx = order[..., min(2, max(d - 1, 0))]
+        _set_onehot(idx, np.take_along_axis(p, idx[..., None], axis=-1)[..., 0])
+    elif code == int(MonitoringIndexCode.SECOND_BEST_OF):
+        order = np.argsort(p, axis=-1)
+        idx = order[..., max(0, d - 2)]
+        _set_onehot(idx, np.take_along_axis(p, idx[..., None], axis=-1)[..., 0])
+    elif code == int(MonitoringIndexCode.DISPERSION) and d > 1:
+        mu = np.mean(p, axis=-1, keepdims=True)
+        disp = np.maximum(np.sqrt(np.maximum(np.mean((p - mu) ** 2, axis=-1, keepdims=True), 0.0)), 1e-6)
+        w = ((p - mu) / (float(d) * disp)) * p
+
+    if code in _PAIR_ORDER_INDEX_CODES and inv_lex_perm is not None:
+        w_out = np.empty_like(w)
+        w_out[..., inv_lex_perm] = w
+        return w_out
+    return w
+
+
+def _eval_continuous_ki_step_survival_np(
+    perf_prev: npt.NDArray[np.float64],
+    perf_curr: npt.NDArray[np.float64],
+    corr_np: npt.NDArray[np.float64],
+    lv_step: npt.NDArray[np.float64],
+    dt_step: float,
+    opt_code: int,
+    ki_barrier: float,
+    inv_lex_perm: Optional[npt.NDArray[np.int64]],
+) -> npt.NDArray[np.float64]:
+    """Brownian-bridge non-knock-in survival probability over one step [t0, t1]."""
+    w_prev = _eval_index_by_code_np(perf_prev, opt_code, inv_lex_perm)
+    w_curr = _eval_index_by_code_np(perf_curr, opt_code, inv_lex_perm)
+    alive_pair = (w_prev > ki_barrier) & (w_curr > ki_barrier)
+    if not np.any(alive_pair):
+        return np.zeros_like(w_curr, dtype=np.float64)
+
+    perf_mid = 0.5 * (perf_prev + perf_curr)
+    dw_dlog = _eval_index_log_weights_np(perf_mid, opt_code, inv_lex_perm)
+    weighted = dw_dlog * lv_step
+    var_abs = np.einsum("...i,ij,...j->...", weighted, corr_np, weighted)
+
+    if opt_code in _DIFF_INDEX_CODES or ki_barrier <= 0.0:
+        eta = (
+            2.0
+            * np.maximum(w_prev - ki_barrier, 0.0)
+            * np.maximum(w_curr - ki_barrier, 0.0)
+            / np.maximum(var_abs * max(dt_step, 1e-12), 1e-12)
+        )
+    else:
+        w_mid = np.maximum(_eval_index_by_code_np(perf_mid, opt_code, inv_lex_perm), 1e-12)
+        var_log = var_abs / (w_mid * w_mid)
+        w_p_s = np.where(alive_pair, np.maximum(w_prev, ki_barrier + 1e-12), ki_barrier + 0.1)
+        w_c_s = np.where(alive_pair, np.maximum(w_curr, ki_barrier + 1e-12), ki_barrier + 0.1)
+        eta = (
+            2.0
+            * np.log(w_p_s / ki_barrier)
+            * np.log(w_c_s / ki_barrier)
+            / np.maximum(var_log * max(dt_step, 1e-12), 1e-12)
+        )
+    return np.where(alive_pair, 1.0 - np.exp(-np.maximum(eta, 0.0)), 0.0)
+
+
+def _evaluate_autocall_payoff_np(
+    state: Any,
+    perf_paths: npt.NDArray[np.float64],
+    *,
+    df_pay: npt.NDArray[np.float64],
+    ko_barriers: npt.NDArray[np.float64],
+    is_callable: npt.NDArray[np.float64],
+    cpn_barriers: npt.NDArray[np.float64],
+    is_guaranteed_cpn: npt.NDArray[np.float64],
+    coupon_amounts: npt.NDArray[np.float64],
+    w_fund: npt.NDArray[np.float64],
+    inv_lex_perm: Optional[npt.NDArray[np.int64]],
+    ki_ind_override: Optional[npt.NDArray[np.float64]] = None,
+    ki_mode: str = "European",
+) -> Tuple[
+    npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
+    float,
+    float,
+    float,
+    float,
+]:
+    """Evaluates pathwise autocall cashflows and terminal option payoff in float64."""
+    n_total_paths, m_rem, _ = perf_paths.shape
+    alive = np.ones(n_total_paths, dtype=np.float64)
+    unpaid_mem = np.full(n_total_paths, float(state.seasoned_state.c_mem_0), dtype=np.float64)
+    total_pv_paths = np.zeros(n_total_paths, dtype=np.float64)
+
+    p_stop_arr = np.zeros(m_rem, dtype=np.float64)
+    q_cpn_arr = np.zeros(m_rem, dtype=np.float64)
+    cpn_cf_expected = np.zeros(m_rem, dtype=np.float64)
+
+    call_code = resolve_monitoring_index_code(state.callability_index)
+    eff_cpn_idx = state.coupon_index if state.coupon_index else state.callability_index
+    cpn_code = resolve_monitoring_index_code(eff_cpn_idx)
+    raw_opt_idx = state.option_index
+    is_long_flag = bool(getattr(state, "is_long_basket", False))
+    eff_opt_idx = (
+        "AverageOf"
+        if (is_long_flag and (raw_opt_idx is None or str(raw_opt_idx).strip() in ("", "WorstOf")))
+        else (raw_opt_idx if raw_opt_idx else state.callability_index)
+    )
+    opt_code = resolve_monitoring_index_code(eff_opt_idx)
+    is_diff_opt = opt_code in _DIFF_INDEX_CODES
+
+    cpn_dir = str(getattr(state, "coupon_barrier_direction", "Up") or "Up").strip().lower()
+    cpn_type = str(getattr(state, "coupon_barrier_type", "In") or "In").strip().lower()
+
+    has_ki = (
+        state.ki_barrier is not None
+        and (float(state.ki_barrier) > 1e-6 or (is_diff_opt and float(state.ki_barrier) < -1e-6))
+        and float(state.seasoned_state.i_ki_past) < 0.5
+    )
+    discrete_ki_active = has_ki and ki_ind_override is None and ki_mode in ("Discrete", "Daily")
+    not_ki_disc = np.ones(n_total_paths, dtype=np.float64)
+
+    for m in range(m_rem):
+        perf_m = perf_paths[:, m, :]
+        w_call = _eval_index_by_code_np(perf_m, call_code, inv_lex_perm)
+        w_cpn = (
+            w_call if cpn_code == call_code else _eval_index_by_code_np(perf_m, cpn_code, inv_lex_perm)
+        )
+        if discrete_ki_active and state.ki_barrier is not None:
+            w_opt_m = _eval_index_by_code_np(perf_m, opt_code, inv_lex_perm)
+            not_ki_disc *= _digital_ramp_np(w_opt_m, float(state.ki_barrier), float(state.ki_spread))
+
+        if is_callable[m] > 0.5:
+            ko_ind = _digital_ramp_np(w_call, float(ko_barriers[m]), float(state.ko_spread))
+        else:
+            ko_ind = np.zeros(n_total_paths, dtype=np.float64)
+
+        if is_guaranteed_cpn[m] > 0.5:
+            cpn_ind = np.ones(n_total_paths, dtype=np.float64)
+        else:
+            b_cpn_m = float(cpn_barriers[m])
+            s_cpn = float(state.cpn_spread)
+            if cpn_dir == "down":
+                base_cpn_ind = 1.0 - _digital_ramp_np(w_cpn, b_cpn_m, -s_cpn)
+            else:
+                base_cpn_ind = _digital_ramp_np(w_cpn, b_cpn_m, s_cpn)
+            cpn_ind = (1.0 - base_cpn_ind) if cpn_type == "out" else base_cpn_ind
+
+        if state.force_coupons_on_autocall:
+            cpn_ind = np.maximum(cpn_ind, ko_ind)
+
+        if w_fund[m] != 0.0:
+            total_pv_paths -= alive * w_fund[m]
+
+        stop_m = alive * ko_ind
+        p_stop_arr[m] = float(np.mean(stop_m))
+
+        surv_before_m = float(np.mean(alive))
+        if surv_before_m > 1e-12:
+            q_cpn_arr[m] = float(np.mean(alive * cpn_ind) / surv_before_m)
+        else:
+            q_cpn_arr[m] = 0.0
+
+        eff_c_paths = (
+            (float(coupon_amounts[m]) + unpaid_mem) if state.is_memory else float(coupon_amounts[m])
+        )
+        cpn_undisc_m = alive * cpn_ind * eff_c_paths + stop_m * float(state.autocall_coupon)
+        cpn_cf_expected[m] = float(np.mean(cpn_undisc_m))
+        total_pv_paths += df_pay[m] * cpn_undisc_m
+
+        if state.is_memory:
+            unpaid_mem = (unpaid_mem + float(coupon_amounts[m])) * (1.0 - cpn_ind)
+
+        alive = alive * (1.0 - ko_ind)
+        if not state.no_notional_repayment:
+            if m < m_rem - 1:
+                total_pv_paths += df_pay[m] * stop_m
+            else:
+                total_pv_paths += df_pay[m] * (stop_m + alive)
+
+    perf_term = perf_paths[:, -1, :]
+    w_opt = _eval_index_by_code_np(perf_term, opt_code, inv_lex_perm)
+    star_ind: Optional[npt.NDArray[np.float64]] = None
+    if state.one_star_strike is not None and float(state.one_star_strike) > 0.0:
+        w_best = _eval_index_by_code_np(perf_term, int(MonitoringIndexCode.BEST_OF), inv_lex_perm)
+        k_os = float(state.one_star_strike)
+        eps_os = 0.02
+        star_ind = np.clip((w_best - (k_os - 0.5 * eps_os)) / eps_os, 0.0, 1.0)
+
+    k_put = float(state.strike)
+    gearing = float(state.option_gearing)
+    has_put = ((k_put > 1e-6) or (is_diff_opt and k_put < -1e-6)) and gearing != 0.0
+    if has_put:
+        put_intrinsic = np.maximum(k_put - w_opt, 0.0)
+        lk = state.lower_strike
+        has_lower_strike = lk is not None and (
+            float(lk) > 1e-6 or (is_diff_opt and float(lk) < -1e-6)
+        )
+        if has_lower_strike and lk is not None:
+            put_intrinsic = np.minimum(put_intrinsic, max(k_put - float(lk), 0.0))
+
+        if has_ki and state.ki_barrier is not None:
+            if ki_ind_override is not None:
+                ki_ind = ki_ind_override
+            elif discrete_ki_active:
+                ki_ind = 1.0 - not_ki_disc
+            else:
+                ki_ind = 1.0 - _digital_ramp_np(w_opt, float(state.ki_barrier), float(state.ki_spread))
+            put_intrinsic = put_intrinsic * ki_ind
+
+        if star_ind is not None:
+            put_intrinsic = put_intrinsic * (1.0 - star_ind)
+
+        unit_put_paths = alive * put_intrinsic
+    else:
+        unit_put_paths = np.zeros(n_total_paths, dtype=np.float64)
+
+    pcall_rate = float(state.participation_call_rate)
+    if state.participation_call_strike is not None and pcall_rate != 0.0:
+        call_intrinsic = np.maximum(w_opt - float(state.participation_call_strike), 0.0)
+        unit_call_paths = alive * call_intrinsic
+    else:
+        unit_call_paths = np.zeros(n_total_paths, dtype=np.float64)
+
+    l_put_val = float(np.mean(unit_put_paths))
+    l_call_val = float(np.mean(unit_call_paths))
+    l_onestar_val = 0.0
+    p_onestar_val = float(np.mean(alive * star_ind)) if star_ind is not None else 0.0
+
+    put_sign = -1.0
+    opt_payoff_paths = df_pay[-1] * (
+        put_sign * gearing * unit_put_paths + pcall_rate * unit_call_paths
+    )
+    os_cpn = float(state.one_star_coupon)
+    if star_ind is not None and os_cpn != 0.0:
+        onestar_paths = alive * star_ind * os_cpn
+        opt_payoff_paths = opt_payoff_paths + df_pay[-1] * onestar_paths
+        l_onestar_val = float(np.mean(onestar_paths))
+
+    total_pv_paths = total_pv_paths + opt_payoff_paths
+    return (
+        total_pv_paths,
+        opt_payoff_paths,
+        p_stop_arr,
+        q_cpn_arr,
+        cpn_cf_expected,
+        l_put_val,
+        l_call_val,
+        l_onestar_val,
+        p_onestar_val,
+    )
+
+
+def _eval_cheap_gbm_expectation_np(
+    state: Any,
+    *,
+    chol_l: npt.NDArray[np.float64],
+    d_var_gbm: npt.NDArray[np.float64],
+    fwd_rel: npt.NDArray[np.float64],
+    df_pay: npt.NDArray[np.float64],
+    ko_barriers: npt.NDArray[np.float64],
+    is_callable: npt.NDArray[np.float64],
+    cpn_barriers: npt.NDArray[np.float64],
+    is_guaranteed_cpn: npt.NDArray[np.float64],
+    coupon_amounts: npt.NDArray[np.float64],
+    w_fund: npt.NDArray[np.float64],
+    inv_lex_perm: Optional[npt.NDArray[np.int64]],
+    ki_mode: str,
+    n_cheap: int,
+    seed: int,
+) -> float:
+    """Evaluates independent cheap M_cheap=4*N scrambled-Sobol flat-ATM GBM expectation on CPU."""
+    d_assets, m_rem = fwd_rel.shape
+    n_rep_mf = _next_power_of_two(min(max(n_cheap // 4, 512), 4096))
+    r_mf = max(1, (n_cheap + n_rep_mf - 1) // n_rep_mf)
+    sqrt_dv = np.sqrt(d_var_gbm)
+    pv_sum = 0.0
+    total_cnt = 0
+    for r_idx in range(r_mf):
+        z_raw = _generate_sobol_normals(
+            n_rep_mf, m_rem * d_assets, scramble=True, seed=seed + r_idx * 997
+        ).reshape(n_rep_mf, m_rem, d_assets)
+        z_corr = z_raw @ chol_l.T
+        d_log = -0.5 * d_var_gbm.T[None, :, :] + sqrt_dv.T[None, :, :] * z_corr
+        log_x_mf = np.cumsum(d_log, axis=1)
+        perf_mf = fwd_rel.T[None, :, :] * np.exp(log_x_mf)
+        pv_r, *_ = _evaluate_autocall_payoff_np(
+            state,
+            perf_mf,
+            df_pay=df_pay,
+            ko_barriers=ko_barriers,
+            is_callable=is_callable,
+            cpn_barriers=cpn_barriers,
+            is_guaranteed_cpn=is_guaranteed_cpn,
+            coupon_amounts=coupon_amounts,
+            w_fund=w_fund,
+            inv_lex_perm=inv_lex_perm,
+            ki_mode="Discrete" if ki_mode == "Continuous" else ki_mode,
+        )
+        pv_sum += float(np.sum(pv_r))
+        total_cnt += n_rep_mf
+    return pv_sum / float(max(total_cnt, 1))
+
+
 def price_eq_autocall_dupire_qmc(
     state_or_request: Any,
     *,
@@ -1809,6 +2633,9 @@ def price_eq_autocall_dupire_qmc(
     if not (np.all(np.isfinite(ref_np_chk)) and np.all(ref_np_chk > 0.0)):
         raise ValueError("UnderlyingReferenceSpots must be strictly positive and finite.")
 
+    explicit_cpu = (use_gpu is False) or (
+        device is not None and not str(device).startswith("cuda") and use_gpu is not True
+    )
     want_gpu = False
     if use_gpu is True:
         want_gpu = True
@@ -1817,7 +2644,7 @@ def price_eq_autocall_dupire_qmc(
     elif use_gpu is None and device is None and state.spots_t0.is_cuda:
         want_gpu = True
 
-    if precision != "fp64_audit" and (
+    if precision != "fp64_audit" and not explicit_cpu and (
         (want_gpu and torch.cuda.is_available()) or int(n_paths) >= 32768
     ):
         from deepvol.models.autocall.dupire_qmc_gpu import (
@@ -1845,7 +2672,7 @@ def price_eq_autocall_dupire_qmc(
     d_assets = state.d_assets
     m_rem = state.m_rem
 
-    if m_rem == 0 or state.seasoned_state.already_autocalled:
+    if m_rem == 0 or bool(getattr(state, "already_autocalled", False)) or state.seasoned_state.already_autocalled:
         z_m = np.zeros(m_rem, dtype=np.float64)
         asm = assemble_autocall_cashflows_and_pv(
             state,
@@ -1882,6 +2709,8 @@ def price_eq_autocall_dupire_qmc(
         n_total_paths = n_rep
 
     corr_np = state.corr_matrix.detach().cpu().numpy().astype(np.float64)
+    if not np.all(np.isfinite(corr_np)):
+        raise ValueError("Correlation matrix contains non-finite values.")
     corr_sym = 0.5 * (corr_np + corr_np.T)
     eigvals, eigvecs = np.linalg.eigh(corr_sym)
     if np.min(eigvals) < 1e-8:
@@ -1904,7 +2733,7 @@ def price_eq_autocall_dupire_qmc(
     ref_spots = ref_np_chk
     spots_t0 = spots_np_chk
 
-    base_seed = 42 if seed is None else int(seed)
+    base_seed = (42 if seed is None else int(seed)) & 0x7FFFFFFF
     total_dim = m_rem * d_assets
     eff_mode = "dupire_lv" if mode == "auto" else mode
     n_sub = max(int(n_substeps_per_period), 1)
@@ -1917,15 +2746,9 @@ def price_eq_autocall_dupire_qmc(
     r_tot_obs_np = state.dividend_schedule.r_tot_obs.detach().cpu().numpy()
     r_native_obs_np = _resolve_r_native_obs_tensor(state).detach().cpu().numpy().astype(np.float64)
     has_quanto_diff = not bool(np.allclose(r_native_obs_np, r_tot_obs_np, rtol=1e-14, atol=1e-14))
-    escrowed_spot_t = getattr(state.dividend_schedule, "escrowed_spot", None)
-    escrowed_spot_np = (
-        escrowed_spot_t.detach().cpu().numpy().astype(np.float64)
-        if escrowed_spot_t is not None
-        else None
-    )
     future_obs_dates = getattr(state.seasoned_state, "future_obs_dates", [])
 
-    # Precompute surface DCC tenors and Act365-to-DCC variance-time scale factors (T1M-012)
+    # Precompute surface DCC tenors and Act365-to-DCC variance-time scale factors.
     tau_surf_obs = np.empty((d_assets, m_rem), dtype=np.float64)
     for i, surf_i in enumerate(surfs_ordered):
         if surf_i.as_of_date is not None and len(future_obs_dates) == m_rem:
@@ -1933,38 +2756,104 @@ def price_eq_autocall_dupire_qmc(
         else:
             tau_surf_obs[i, :] = [surf_i.map_act365_to_surface_tenor(float(t_m)) for t_m in tau_obs]
 
+    inv_lex_perm_raw = getattr(state, "inv_lex_perm", None)
+    inv_lex_perm = np.asarray(inv_lex_perm_raw, dtype=np.int64) if inv_lex_perm_raw is not None else None
+    raw_opt_idx = state.option_index
+    is_long_flag = bool(getattr(state, "is_long_basket", False))
+    eff_opt_idx = (
+        "AverageOf"
+        if (is_long_flag and (raw_opt_idx is None or str(raw_opt_idx).strip() in ("", "WorstOf")))
+        else (raw_opt_idx if raw_opt_idx else state.callability_index)
+    )
+    opt_code = resolve_monitoring_index_code(eff_opt_idx)
+    is_diff_opt = opt_code in _DIFF_INDEX_CODES
+
+    ki_obs_raw = getattr(state, "ki_obs_type", None) or getattr(state.seasoned_state, "ki_obs_type", None)
+    ki_mode = str(getattr(ki_obs_raw, "value", ki_obs_raw) or "European").strip()
+    if ki_mode not in ("European", "Discrete", "Daily", "Continuous"):
+        ki_mode = "Discrete" if bool(getattr(state.seasoned_state, "ki_monitored_past", False)) else "European"
+    has_ki = (
+        state.ki_barrier is not None
+        and (float(state.ki_barrier) > 1e-6 or (is_diff_opt and float(state.ki_barrier) < -1e-6))
+        and float(state.seasoned_state.i_ki_past) < 0.5
+    )
+    cont_ki_active = bool(has_ki and ki_mode == "Continuous" and state.ki_barrier is not None)
+    p_noki_cont = np.ones((eff_r, n_rep), dtype=np.float64) if cont_ki_active else None
+    ki_bar_val = float(state.ki_barrier) if state.ki_barrier is not None else 0.0
+
     # Generate Owen-scrambled Sobol nets for all replicates and diffuse vectorized across (eff_r, n_rep)
     z_sobol_all = np.empty((eff_r, n_rep, total_dim), dtype=np.float64)
     for rep_idx in range(eff_r):
-        rep_seed = base_seed + rep_idx * 1009
+        rep_seed = (base_seed + rep_idx * 1009) & 0x7FFFFFFF
         z_sobol_all[rep_idx] = _generate_sobol_normals(
             n_rep, total_dim, scramble=scramble, seed=rep_seed
         )
 
+    # Precompute cumulative and incremental terminal/GBM variances honoring surface DCC.
+    var_cum_gbm = np.empty((d_assets, m_rem), dtype=np.float64)
+    for i, surf_i in enumerate(surfs_ordered):
+        non_365 = surf_i.dcc.strip().lower() not in ("act365", "act365f", "act_365", "act_365f")
+        for m in range(m_rem):
+            if non_365:
+                iv_i_m = float(surf_i.iv(float(tau_surf_obs[i, m]), float(fwd_prices[i, m])))
+                var_cum_gbm[i, m] = (iv_i_m * iv_i_m) * float(tau_surf_obs[i, m])
+            else:
+                var_cum_gbm[i, m] = (iv_at_fwd[i, m] ** 2) * tau_obs[m]
+    d_var_gbm = np.empty((d_assets, m_rem), dtype=np.float64)
+    var_run = np.zeros(d_assets, dtype=np.float64)
+    for m in range(m_rem):
+        dv_col = np.maximum(var_cum_gbm[:, m] - var_run, 1e-12)
+        d_var_gbm[:, m] = dv_col
+        var_run = var_run + dv_col
+
+    dom_idx = int(np.argmax(var_cum_gbm[:, -1]))
+    sqrt_dvar_dom_np = np.sqrt(d_var_gbm[dom_idx, :])
+    z_flat_cum = np.zeros((eff_r, n_rep), dtype=np.float64)
+
+    need_gbm_fine = eff_mode == "dupire_lv" and cv_mode == "multifidelity_gbm"
+    log_x_gbm = np.zeros((eff_r, n_rep, d_assets), dtype=np.float64) if need_gbm_fine else None
+    perf_gbm_fine = np.empty((n_total_paths, m_rem, d_assets), dtype=np.float64) if need_gbm_fine else None
+
     if eff_mode == "terminal_iv":
         log_x_prev = np.zeros((eff_r, n_rep, d_assets), dtype=np.float64)
-        var_prev = np.zeros(d_assets, dtype=np.float64)
+        perf_step_prev = np.broadcast_to((spots_t0 / ref_spots)[None, None, :], (eff_r, n_rep, d_assets)).copy()
+        t_prev_ti = 0.0
         for m in range(m_rem):
+            t_curr_ti = float(tau_obs[m])
+            dt_ti = max(t_curr_ti - t_prev_ti, 1e-8)
             z_m = z_sobol_all[:, :, m * d_assets : (m + 1) * d_assets] @ chol_l.T
-            var_curr = np.empty(d_assets, dtype=np.float64)
-            for i, surf_i in enumerate(surfs_ordered):
-                if surf_i.dcc.strip().lower() not in ("act365", "act365f", "act_365", "act_365f"):
-                    iv_i_m = float(surf_i.iv(float(tau_surf_obs[i, m]), float(fwd_prices[i, m])))
-                    var_curr[i] = (iv_i_m * iv_i_m) * float(tau_surf_obs[i, m])
-                else:
-                    var_curr[i] = (iv_at_fwd[i, m] ** 2) * tau_obs[m]
-            d_var = np.maximum(var_curr - var_prev, 1e-12)
+            z_flat_cum += sqrt_dvar_dom_np[m] * z_m[:, :, dom_idx]
+            d_var = d_var_gbm[:, m]
             std_step = np.sqrt(d_var)
             log_x_curr = log_x_prev - 0.5 * d_var[None, None, :] + std_step[None, None, :] * z_m
             s_m = fwd_prices[:, m][None, None, :] * np.exp(log_x_curr)
-            perf_paths[:, m, :] = (s_m / ref_spots[None, None, :]).reshape(n_total_paths, d_assets)
+            perf_step_curr = s_m / ref_spots[None, None, :]
+            if p_noki_cont is not None:
+                lv_ti = np.broadcast_to(np.sqrt(d_var / dt_ti)[None, None, :], (eff_r, n_rep, d_assets))
+                p_noki_cont *= _eval_continuous_ki_step_survival_np(
+                    perf_step_prev,
+                    perf_step_curr,
+                    corr_sym,
+                    lv_ti,
+                    dt_ti,
+                    opt_code,
+                    ki_bar_val,
+                    inv_lex_perm,
+                )
+            perf_paths[:, m, :] = perf_step_curr.reshape(n_total_paths, d_assets)
+            perf_step_prev = perf_step_curr
             log_x_prev = log_x_curr
-            var_prev = var_prev + d_var  # T1M-011: monotone running max cumulative variance
+            t_prev_ti = t_curr_ti
     else:
         rng_bridges = [
-            np.random.default_rng(base_seed + rep_idx * 1009 + 777) for rep_idx in range(eff_r)
+            np.random.default_rng((base_seed + rep_idx * 1009 + 777) & 0x7FFFFFFF) for rep_idx in range(eff_r)
         ]
         log_x = np.zeros((eff_r, n_rep, d_assets), dtype=np.float64)
+        perf_sub_prev = (
+            np.broadcast_to((spots_t0 / ref_spots)[None, None, :], (eff_r, n_rep, d_assets)).copy()
+            if p_noki_cont is not None
+            else None
+        )
         t_prev = 0.0
         has_div_events = len(div_events_ordered) == d_assets and any(
             len(ev) > 0 for ev in div_events_ordered
@@ -1988,28 +2877,26 @@ def price_eq_autocall_dupire_qmc(
                 np.zeros(d_assets, dtype=np.float64) if m == 0 else r_native_obs_np[:, m - 1]
             )
             r_nat_curr = r_native_obs_np[:, m]
-            esc_prev = (
-                spots_t0
-                if (m == 0 or escrowed_spot_np is None or escrowed_spot_np.ndim < 2)
-                else escrowed_spot_np[:, m - 1]
-            )
-            esc_curr = (
-                spots_t0
-                if (escrowed_spot_np is None or escrowed_spot_np.ndim < 2)
-                else escrowed_spot_np[:, m]
-            )
-            q_div_m = (
-                -np.log(np.maximum(esc_curr / np.maximum(esc_prev, 1e-12), 1e-12))
-                / dt_period
-            )
+            # Buhler pure-jump forward: between ex-dates the forward grows at continuous native drift.
             r_zero_m = (
                 -np.log(np.maximum(df_fin_curr / np.maximum(df_fin_prev, 1e-15), 1e-15))
                 / dt_period
             )
-            drift_net_m = (r_nat_curr - r_nat_prev) / dt_period - q_div_m
-            q_repo_m = r_zero_m - drift_net_m
+            q_repo_m = r_zero_m - (r_nat_curr - r_nat_prev) / dt_period
 
             z_coarse = z_sobol_all[:, :, m * d_assets : (m + 1) * d_assets] @ chol_l.T
+            z_flat_cum += sqrt_dvar_dom_np[m] * z_coarse[:, :, dom_idx]
+            if log_x_gbm is not None and perf_gbm_fine is not None:
+                dv_m = d_var_gbm[:, m]
+                log_x_gbm = (
+                    log_x_gbm
+                    - 0.5 * dv_m[None, None, :]
+                    + np.sqrt(dv_m)[None, None, :] * z_coarse
+                )
+                perf_gbm_fine[:, m, :] = (
+                    (fwd_prices[:, m][None, None, :] * np.exp(log_x_gbm)) / ref_spots[None, None, :]
+                ).reshape(n_total_paths, d_assets)
+
             if n_sub == 1:
                 z_steps = z_coarse[None, :, :, :]
             else:
@@ -2024,47 +2911,114 @@ def price_eq_autocall_dupire_qmc(
 
             f_curr = fwd_prices[:, m]
             f_prev = spots_t0 if m == 0 else fwd_prices[:, m - 1]
+            log_f_ratio = np.log(np.maximum(f_curr / np.maximum(f_prev, 1e-12), 1e-12))
+
+            lv_step_ki = (
+                np.empty((eff_r, n_rep, d_assets), dtype=np.float64)
+                if p_noki_cont is not None
+                else None
+            )
 
             for s_idx in range(n_sub):
-                alpha_s = (s_idx + 0.5) / float(n_sub)
-                t_step = t_prev + alpha_s * dt_period
+                alpha_s0 = float(s_idx) / float(n_sub)
+                alpha_s1 = float(s_idx + 1) / float(n_sub)
+                t_s0 = t_prev + alpha_s0 * dt_period
+                t_s1 = t_prev + alpha_s1 * dt_period
                 if has_div_events:
-                    f_step = _compute_forward_at_time_np(
-                        spots_t0, r_tot_obs_np, tau_obs, div_events_ordered, t_step, m
+                    f_s0 = _compute_forward_at_time_np(
+                        spots_t0, r_tot_obs_np, tau_obs, div_events_ordered, t_s0, m
+                    )
+                    f_s1 = _compute_forward_at_time_np(
+                        spots_t0, r_tot_obs_np, tau_obs, div_events_ordered, t_s1, m
                     )
                 else:
-                    f_step = f_prev + alpha_s * (f_curr - f_prev)
-                s_curr_est = np.exp(log_x) * f_step[None, None, :]
+                    f_s0 = f_prev * np.exp(alpha_s0 * log_f_ratio)
+                    f_s1 = f_prev * np.exp(alpha_s1 * log_f_ratio)
+
                 if has_quanto_diff:
-                    r_tot_step = r_tot_prev + alpha_s * (r_tot_curr - r_tot_prev)
-                    r_nat_step = r_nat_prev + alpha_s * (r_nat_curr - r_nat_prev)
-                    f_step_native = f_step * np.exp(r_nat_step - r_tot_step)
+                    r_tot_s0 = r_tot_prev + alpha_s0 * (r_tot_curr - r_tot_prev)
+                    r_nat_s0 = r_nat_prev + alpha_s0 * (r_nat_curr - r_nat_prev)
+                    f_s0_native = f_s0 * np.exp(r_nat_s0 - r_tot_s0)
+                    r_tot_s1 = r_tot_prev + alpha_s1 * (r_tot_curr - r_tot_prev)
+                    r_nat_s1 = r_nat_prev + alpha_s1 * (r_nat_curr - r_nat_prev)
+                    f_s1_native = f_s1 * np.exp(r_nat_s1 - r_tot_s1)
                 else:
-                    f_step_native = f_step
+                    f_s0_native = f_s0
+                    f_s1_native = f_s1
 
                 for i in range(d_assets):
                     t_surf_prev = 0.0 if m == 0 else float(tau_surf_obs[i, m - 1])
                     t_surf_curr = float(tau_surf_obs[i, m])
-                    dt_surf_ratio = (t_surf_curr - t_surf_prev) / dt_period
-                    t_surf_step = t_surf_prev + alpha_s * (
-                        t_surf_curr - t_surf_prev
-                    )
-                    lv_dcc = np.asarray(
+                    dt_surf = t_surf_curr - t_surf_prev
+                    dt_surf_ratio = dt_surf / dt_period
+                    scale_i = math.sqrt(max(dt_surf_ratio, 1e-12))
+                    t_surf_s0 = t_surf_prev + alpha_s0 * dt_surf
+                    t_surf_s1 = t_surf_prev + alpha_s1 * dt_surf
+
+                    lx_i = log_x[:, :, i]
+                    lv0 = np.asarray(
                         surfs_ordered[i].local_vol(
-                            t_surf_step,
-                            s_curr_est[:, :, i].reshape(-1),
-                            forward_at_t=float(f_step_native[i]),
+                            t_surf_s0,
+                            (f_s0[i] * np.exp(lx_i)).reshape(-1),
+                            forward_at_t=float(f_s0_native[i]),
                             r_zero=float(r_zero_m[i]),
                             q_repo=float(q_repo_m[i]),
-                            cash_div_leverage=1.0,  # T1M-001: never double-count dividend leverage
+                            cash_div_leverage=1.0,
                         ),
                         dtype=np.float64,
-                    ).reshape(eff_r, n_rep)
-                    lv_i = lv_dcc * math.sqrt(max(dt_surf_ratio, 1e-12))
-                    log_x[:, :, i] += (
-                        -0.5 * (lv_i * lv_i) * dt_sub
-                        + lv_i * sqrt_dt_sub * z_steps[s_idx, :, :, i]
+                    ).reshape(eff_r, n_rep) * scale_i
+                    if lv_step_ki is not None:
+                        lv_step_ki[:, :, i] = lv0
+
+                    # Componentwise Derivative-Free Platen Weak-Order-2.0 update in log-relative coordinates.
+                    mu0 = -0.5 * (lv0 * lv0)
+                    y_h = lx_i + mu0 * dt_sub
+                    sig_step = lv0 * sqrt_dt_sub
+                    lv_p = np.asarray(
+                        surfs_ordered[i].local_vol(
+                            t_surf_s1,
+                            (f_s1[i] * np.exp(y_h + sig_step)).reshape(-1),
+                            forward_at_t=float(f_s1_native[i]),
+                            r_zero=float(r_zero_m[i]),
+                            q_repo=float(q_repo_m[i]),
+                            cash_div_leverage=1.0,
+                        ),
+                        dtype=np.float64,
+                    ).reshape(eff_r, n_rep) * scale_i
+                    lv_m = np.asarray(
+                        surfs_ordered[i].local_vol(
+                            t_surf_s1,
+                            (f_s1[i] * np.exp(y_h - sig_step)).reshape(-1),
+                            forward_at_t=float(f_s1_native[i]),
+                            r_zero=float(r_zero_m[i]),
+                            q_repo=float(q_repo_m[i]),
+                            cash_div_leverage=1.0,
+                        ),
+                        dtype=np.float64,
+                    ).reshape(eff_r, n_rep) * scale_i
+                    mu_p = -0.5 * (lv_p * lv_p)
+                    mu_m = -0.5 * (lv_m * lv_m)
+                    z_i = z_steps[s_idx, :, :, i]
+                    log_x[:, :, i] = lx_i + (
+                        0.5 * (mu0 + 0.5 * (mu_p + mu_m)) * dt_sub
+                        + 0.25 * (mu_p - mu_m) * dt_sub * z_i
+                        + 0.25 * (lv_p + lv_m + 2.0 * lv0) * sqrt_dt_sub * z_i
+                        + 0.25 * (lv_p - lv_m) * (z_i * z_i - 1.0) * sqrt_dt_sub
                     )
+
+                if p_noki_cont is not None and perf_sub_prev is not None and lv_step_ki is not None:
+                    perf_sub_curr = (f_s1[None, None, :] * np.exp(log_x)) / ref_spots[None, None, :]
+                    p_noki_cont *= _eval_continuous_ki_step_survival_np(
+                        perf_sub_prev,
+                        perf_sub_curr,
+                        corr_sym,
+                        lv_step_ki,
+                        dt_sub,
+                        opt_code,
+                        ki_bar_val,
+                        inv_lex_perm,
+                    )
+                    perf_sub_prev = perf_sub_curr
 
             # Martingale drift enforcement per replicate
             mean_x = np.mean(np.exp(log_x), axis=1, keepdims=True)
@@ -2074,144 +3028,100 @@ def price_eq_autocall_dupire_qmc(
             perf_paths[:, m, :] = (s_m / ref_spots[None, None, :]).reshape(n_total_paths, d_assets)
             t_prev = t_curr
 
-    # Pathwise payoff & cashflow evaluation
-    alive = np.ones(n_total_paths, dtype=np.float64)
-    unpaid_mem = np.full(n_total_paths, float(state.seasoned_state.c_mem_0), dtype=np.float64)
-    total_pv_paths = np.zeros(n_total_paths, dtype=np.float64)
-
-    p_stop_arr = np.zeros(m_rem, dtype=np.float64)
-    q_cpn_arr = np.zeros(m_rem, dtype=np.float64)
-    cpn_cf_expected = np.zeros(m_rem, dtype=np.float64)
-
-    eff_cpn_idx = state.coupon_index if state.coupon_index else state.callability_index
-    eff_opt_idx = (
-        "AverageOf"
-        if bool(getattr(state, "is_long_basket", False))
-        else (state.option_index if state.option_index else state.callability_index)
-    )
-    cpn_dir = str(getattr(state, "coupon_barrier_direction", "Up") or "Up").strip().lower()
-    cpn_type = str(getattr(state, "coupon_barrier_type", "In") or "In").strip().lower()
-    inv_lex_perm_raw = getattr(state, "inv_lex_perm", None)
-    inv_lex_perm = np.asarray(inv_lex_perm_raw, dtype=np.int64) if inv_lex_perm_raw is not None else None
     w_fund = _compute_funding_weights_np(state)
-
-    for m in range(m_rem):
-        perf_m = perf_paths[:, m, :]
-        w_call = _evaluate_index_with_unperm_np(perf_m, state.callability_index, inv_lex_perm)
-        w_cpn = _evaluate_index_with_unperm_np(perf_m, eff_cpn_idx, inv_lex_perm)
-
-        if is_callable[m] > 0.5:
-            ko_ind = _digital_ramp_np(w_call, float(ko_barriers[m]), float(state.ko_spread))
-        else:
-            ko_ind = np.zeros(n_total_paths, dtype=np.float64)
-
-        if is_guaranteed_cpn[m] > 0.5:
-            cpn_ind = np.ones(n_total_paths, dtype=np.float64)
-        else:
-            b_cpn_m = float(cpn_barriers[m])
-            s_cpn = float(state.cpn_spread)
-            if cpn_dir == "down":
-                base_cpn_ind = 1.0 - _digital_ramp_np(w_cpn, b_cpn_m, -s_cpn)
-            else:
-                base_cpn_ind = _digital_ramp_np(w_cpn, b_cpn_m, s_cpn)
-            cpn_ind = (1.0 - base_cpn_ind) if cpn_type == "out" else base_cpn_ind
-
-        if state.force_coupons_on_autocall:
-            cpn_ind = np.maximum(cpn_ind, ko_ind)
-
-        # Pathwise funding leg cashflow before period m autocall exit (T1M-009)
-        if w_fund[m] != 0.0:
-            total_pv_paths -= alive * w_fund[m]
-
-        stop_m = alive * ko_ind
-        p_stop_arr[m] = float(np.mean(stop_m))
-
-        surv_before_m = float(np.mean(alive))
-        if surv_before_m > 1e-12:
-            q_cpn_arr[m] = float(np.mean(alive * cpn_ind) / surv_before_m)
-        else:
-            q_cpn_arr[m] = 0.0
-
-        eff_c_paths = (
-            (float(coupon_amounts[m]) + unpaid_mem) if state.is_memory else float(coupon_amounts[m])
-        )
-        cpn_undisc_m = alive * cpn_ind * eff_c_paths + stop_m * float(state.autocall_coupon)
-        cpn_cf_expected[m] = float(np.mean(cpn_undisc_m))
-        total_pv_paths += df_pay[m] * cpn_undisc_m
-
-        if state.is_memory:
-            unpaid_mem = (unpaid_mem + float(coupon_amounts[m])) * (1.0 - cpn_ind)
-
-        alive = alive * (1.0 - ko_ind)
-        if not state.no_notional_repayment:
-            if m < m_rem - 1:
-                total_pv_paths += df_pay[m] * stop_m
-            else:
-                total_pv_paths += df_pay[m] * (stop_m + alive)
-
-    # Terminal option evaluation at m = M_rem - 1
-    perf_term = perf_paths[:, -1, :]
-    w_opt = _evaluate_index_with_unperm_np(perf_term, eff_opt_idx, inv_lex_perm)
-    w_best: Optional[npt.NDArray[np.float64]] = None
-    star_ind: Optional[npt.NDArray[np.float64]] = None
-    if state.one_star_strike is not None and float(state.one_star_strike) > 0.0:
-        w_best = _evaluate_index_with_unperm_np(perf_term, "BestOf", inv_lex_perm)
-        star_ind = (w_best >= float(state.one_star_strike)).astype(np.float64)
-
-    if state.strike > 1e-6 and state.option_gearing > 0.0:
-        put_intrinsic = np.maximum(float(state.strike) - w_opt, 0.0)
-        if state.lower_strike is not None and float(state.lower_strike) > 0.0:
-            put_intrinsic = np.minimum(
-                put_intrinsic, max(float(state.strike) - float(state.lower_strike), 0.0)
-            )
-
-        if (
-            state.ki_barrier is not None
-            and float(state.ki_barrier) > 0.0
-            and state.seasoned_state.i_ki_past < 0.5
-        ):
-            ki_up = _digital_ramp_np(w_opt, float(state.ki_barrier), float(state.ki_spread))
-            ki_ind = 1.0 - ki_up
-            put_intrinsic = put_intrinsic * ki_ind
-
-        if star_ind is not None:
-            put_intrinsic = put_intrinsic * (1.0 - star_ind)
-
-        unit_put_paths = alive * put_intrinsic
-    else:
-        unit_put_paths = np.zeros(n_total_paths, dtype=np.float64)
-
-    if state.participation_call_strike is not None and float(state.participation_call_rate) > 0.0:
-        call_intrinsic = np.maximum(w_opt - float(state.participation_call_strike), 0.0)
-        unit_call_paths = alive * call_intrinsic
-    else:
-        unit_call_paths = np.zeros(n_total_paths, dtype=np.float64)
-
-    l_put_val = float(np.mean(unit_put_paths))
-    l_call_val = float(np.mean(unit_call_paths))
-    l_onestar_val = 0.0
-    p_onestar_val = float(np.mean(alive * star_ind)) if star_ind is not None else 0.0
-
-    put_sign = -1.0
-    opt_payoff_paths = df_pay[-1] * (
-        put_sign * float(state.option_gearing) * unit_put_paths
-        + float(state.participation_call_rate) * unit_call_paths
+    ki_ind_override = (1.0 - p_noki_cont).reshape(n_total_paths) if p_noki_cont is not None else None
+    (
+        total_pv_paths,
+        opt_payoff_paths,
+        p_stop_arr,
+        q_cpn_arr,
+        cpn_cf_expected,
+        l_put_val,
+        l_call_val,
+        l_onestar_val,
+        p_onestar_val,
+    ) = _evaluate_autocall_payoff_np(
+        state,
+        perf_paths,
+        df_pay=df_pay,
+        ko_barriers=ko_barriers,
+        is_callable=is_callable,
+        cpn_barriers=cpn_barriers,
+        is_guaranteed_cpn=is_guaranteed_cpn,
+        coupon_amounts=coupon_amounts,
+        w_fund=w_fund,
+        inv_lex_perm=inv_lex_perm,
+        ki_ind_override=ki_ind_override,
+        ki_mode=ki_mode,
     )
-    if star_ind is not None and float(state.one_star_coupon) > 0.0:
-        onestar_paths = alive * star_ind * float(state.one_star_coupon)
-        opt_payoff_paths = opt_payoff_paths + df_pay[-1] * onestar_paths
-        l_onestar_val = float(np.mean(onestar_paths))
-
-    total_pv_paths += opt_payoff_paths
 
     if eff_r > 1:
-        rep_pv = total_pv_paths.reshape(eff_r, n_rep).mean(axis=1)
         rep_opt = opt_payoff_paths.reshape(eff_r, n_rep).mean(axis=1)
-        total_se = float(np.std(rep_pv, ddof=1) / math.sqrt(float(eff_r)))
         option_se = float(np.std(rep_opt, ddof=1) / math.sqrt(float(eff_r)))
     else:
-        total_se = float(np.std(total_pv_paths, ddof=1) / math.sqrt(float(n_total_paths)))
         option_se = float(np.std(opt_payoff_paths, ddof=1) / math.sqrt(float(n_total_paths)))
+
+    raw_pv_mean = float(np.mean(total_pv_paths))
+    total_pv_mat = total_pv_paths.reshape(eff_r, n_rep)
+    if cv_mode == "bs1d_exact" and eff_r > 1:
+        v_dom_term = math.sqrt(max(float(np.sum(sqrt_dvar_dom_np * sqrt_dvar_dom_np)), 1e-12))
+        f_dom = float(fwd_prices[dom_idx, -1] / max(ref_spots[dom_idx], 1e-12))
+        k_cv = float(state.strike) if float(state.strike) > 1e-6 else 1.0
+        k_low = (
+            float(state.lower_strike)
+            if (state.lower_strike is not None and float(state.lower_strike) > 0.0 and float(state.strike) > 1e-6)
+            else -1.0
+        )
+        df_term = float(df_pay[-1])
+        mu_cv = df_term * _black76_put_np(f_dom, k_cv, v_dom_term)
+        if k_low > 0.0:
+            mu_cv -= df_term * _black76_put_np(f_dom, k_low, v_dom_term)
+        p_dom = f_dom * np.exp(-0.5 * (v_dom_term * v_dom_term) + z_flat_cum)
+        x_cv = df_term * np.maximum(k_cv - p_dom, 0.0)
+        if k_low > 0.0:
+            x_cv = x_cv - df_term * np.maximum(k_low - p_dom, 0.0)
+        cv_pv_est, total_se = _apply_loo_control_variate_np(total_pv_mat, x_cv, mu_cv)
+    elif cv_mode == "multifidelity_gbm" and eff_r > 1 and perf_gbm_fine is not None:
+        pv_gbm_fine, *_ = _evaluate_autocall_payoff_np(
+            state,
+            perf_gbm_fine,
+            df_pay=df_pay,
+            ko_barriers=ko_barriers,
+            is_callable=is_callable,
+            cpn_barriers=cpn_barriers,
+            is_guaranteed_cpn=is_guaranteed_cpn,
+            coupon_amounts=coupon_amounts,
+            w_fund=w_fund,
+            inv_lex_perm=inv_lex_perm,
+            ki_mode="Discrete" if ki_mode == "Continuous" else ki_mode,
+        )
+        mu_mf = _eval_cheap_gbm_expectation_np(
+            state,
+            chol_l=chol_l,
+            d_var_gbm=d_var_gbm,
+            fwd_rel=fwd_prices / ref_spots[:, None],
+            df_pay=df_pay,
+            ko_barriers=ko_barriers,
+            is_callable=is_callable,
+            cpn_barriers=cpn_barriers,
+            is_guaranteed_cpn=is_guaranteed_cpn,
+            coupon_amounts=coupon_amounts,
+            w_fund=w_fund,
+            inv_lex_perm=inv_lex_perm,
+            ki_mode=ki_mode,
+            n_cheap=4 * n_total_paths,
+            seed=base_seed + 88888,
+        )
+        cv_pv_est, total_se = _apply_loo_control_variate_np(
+            total_pv_mat, pv_gbm_fine.reshape(eff_r, n_rep), mu_mf
+        )
+    else:
+        cv_pv_est = raw_pv_mean
+        if eff_r > 1:
+            rep_pv = np.mean(total_pv_mat, axis=1)
+            total_se = float(np.std(rep_pv, ddof=1) / math.sqrt(float(eff_r)))
+        else:
+            total_se = float(np.std(total_pv_paths, ddof=1) / math.sqrt(float(n_total_paths)))
 
     asm = _assemble_qmc_postproc(
         state,
@@ -2228,12 +3138,56 @@ def price_eq_autocall_dupire_qmc(
         assemble_fn=assemble_autocall_cashflows_and_pv,
     )
 
+    cv_shift = cv_pv_est - raw_pv_mean
+    adj_prod = float(asm.product_value.item()) + cv_shift
+    has_onestar_bonus = (
+        getattr(state, "one_star_strike", None) is not None
+        and float(getattr(state, "one_star_strike", 0.0) or 0.0) > 0.0
+        and float(getattr(state, "one_star_coupon", 0.0) or 0.0) != 0.0
+    )
+    has_zero_opt = (
+        float(getattr(state, "option_gearing", 1.0)) == 0.0
+        and float(getattr(state, "participation_call_rate", 0.0)) == 0.0
+        and not is_long_flag
+        and not has_onestar_bonus
+    )
+    no_notional = bool(getattr(state, "no_notional_repayment", False))
+    shift_to_notional = has_zero_opt and not no_notional
+    adj_opt = float(asm.option_pv.item()) if shift_to_notional else (float(asm.option_pv.item()) + cv_shift)
+    adj_notional = (float(asm.notional_pv.item()) + cv_shift) if shift_to_notional else float(asm.notional_pv.item())
+    if cv_shift != 0.0 and asm.cashflows:
+        target_order: Tuple[str, ...]
+        if is_long_flag:
+            target_order = ("IsLongBasket", "Option", "Notional")
+        elif shift_to_notional:
+            target_order = ("Notional", "Option", "Coupon")
+        else:
+            target_order = ("Option", "OneStarCoupon", "Coupon", "Notional")
+        for target_desc in target_order:
+            replaced = False
+            for idx_cf in range(len(asm.cashflows) - 1, -1, -1):
+                cf = asm.cashflows[idx_cf]
+                if cf.Description == target_desc and cf.StatusText == "Estimate":
+                    asm.cashflows[idx_cf] = CashFlowItem(
+                        Description=cf.Description,
+                        Date=cf.Date,
+                        Amount=float(cf.Amount + cv_shift),
+                        StandardError=float(option_se),
+                        Currency=cf.Currency,
+                        Leg=cf.Leg,
+                        StatusText=cf.StatusText,
+                    )
+                    replaced = True
+                    break
+            if replaced:
+                break
+
     return DupireQMCResult(
-        product_value=float(asm.product_value.item()),
+        product_value=adj_prod,
         standard_error=total_se,
-        option_pv=float(asm.option_pv.item()),
+        option_pv=adj_opt,
         option_se=option_se,
-        notional_pv=float(asm.notional_pv.item()),
+        notional_pv=adj_notional,
         coupon_pv=float(asm.coupon_pv.item()),
         funding_pv=float(asm.funding_pv.item()),
         p_stop=p_stop_arr,
@@ -2254,6 +3208,7 @@ price_autocall_dupire_qmc = price_eq_autocall_dupire_qmc
 
 __all__ = [
     "RegularizedVolSurface",
+    "ensure_basis_spline_coeffs",
     "DupireQMCResult",
     "DupireQMCOutput",
     "enforce_no_arbitrage_projection",

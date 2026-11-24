@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -14,18 +16,18 @@ import torch
 
 from deepvol.models.autocall.analytical_baseline import (
     AutocallBaselineOutput,
-    _digital_call_spread_prob_torch,
     compute_analytical_autocall_baseline,
 )
 from deepvol.models.autocall.dupire_qmc_gpu import DupireQMCConfig, DupireQMCGpuSolver
 from deepvol.models.autocall.dupire_qmc_solver import RegularizedVolSurface
-from deepvol.models.autocall.escrowed_dividend import EscrowedDividendOutput
+from deepvol.models.autocall.escrowed_dividend import EscrowedDividendOutput, ParsedDividendEvent
 from deepvol.models.autocall.feature_layout import (
     D_MAX_DEFAULT,
     FEATURE_SCHEMA_VERSION,
     M_MAX_DEFAULT,
     PAIR_ORDER_DEPENDENT_INDICES,
     AutocallNodeCol,
+    MonitoringIndexCode,
     monitoring_index_to_code,
 )
 from deepvol.models.autocall.pre_post_processor import AutocallPreprocState
@@ -48,12 +50,37 @@ _CALL_FUNCTIONAL_CHOICES: Tuple[str, ...] = (
     "WorstOf",
     "BestOf",
     "AverageOf",
+    "EquallyWeightedBasket",
     "Dispersion",
     "RatioAB",
     "RatioBA",
+    "RatioBestWorst",
+    "RatioBestAverage",
+    "RatioAverageWorst",
     "DiffAB",
     "DiffBA",
+    "DiffBestWorst",
+    "DiffBestAverage",
+    "DiffAverageWorst",
+    "TwinWin",
+    "SecondWorstOf",
+    "ThirdWorstOf",
+    "SecondBestOf",
 )
+
+_DIFF_CODES: frozenset[int] = frozenset(
+    {
+        int(MonitoringIndexCode.DIFF_AB),
+        int(MonitoringIndexCode.DIFF_BA),
+        int(MonitoringIndexCode.DIFF_BEST_WORST),
+        int(MonitoringIndexCode.DIFF_BEST_AVERAGE),
+        int(MonitoringIndexCode.DIFF_AVERAGE_WORST),
+    }
+)
+
+
+def _is_diff_index(idx_name: str) -> bool:
+    return monitoring_index_to_code(idx_name) in _DIFF_CODES
 
 
 @dataclass
@@ -94,10 +121,17 @@ class SyntheticAutocallBatch:
     jac_sched_logm: torch.Tensor            # (B, D_max, M_max, 4) for cols [8..11]
     jac_lput_logm: torch.Tensor             # (B, D_max)
 
-    def to(self, *, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> SyntheticAutocallBatch:
+    def to(
+        self,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+        copy: bool = False,
+    ) -> SyntheticAutocallBatch:
         """Move all tensors in the batch to `device` and/or floating `dtype`."""
         def _mv(t: torch.Tensor) -> torch.Tensor:
-            return t.to(device=device if device is not None else t.device, dtype=dtype if dtype is not None else t.dtype)
+            out = t.to(device=device if device is not None else t.device, dtype=dtype if dtype is not None else t.dtype)
+            return out.clone() if (copy and out is t) else out
 
         return SyntheticAutocallBatch(
             node_feats=_mv(self.node_feats),
@@ -292,30 +326,33 @@ class _LazySSVIBank:
         n_pow = 1 << max(1, (self.n_bank - 1).bit_length())
         self._u_bank = eng.random(n=n_pow)[: self.n_bank]
         self._items: Dict[int, RegularizedVolSurface] = {}
+        self._lock = threading.RLock()
 
     def __len__(self) -> int:
         return self.n_bank
 
     def __getitem__(self, idx: int) -> RegularizedVolSurface:
         k = int(idx)
-        surf = self._items.get(k)
-        if surf is not None:
+        with self._lock:
+            surf = self._items.get(k)
+            if surf is not None:
+                return surf
+            if self.domain_mode == "core_desk":
+                iv_s = 0.15 + 0.27 * float(self._u_bank[k, 0])
+                iv_sl = -0.04 + 0.09 * float(self._u_bank[k, 1])
+                rho_k = -0.55 + 0.65 * float(self._u_bank[k, 2])
+                eta_k = 0.15 + 0.30 * float(self._u_bank[k, 3])
+            else:
+                iv_s = 0.14 + 0.41 * float(self._u_bank[k, 0])
+                iv_sl = -0.07 + 0.16 * float(self._u_bank[k, 1])
+                rho_k = -0.65 + 0.90 * float(self._u_bank[k, 2])
+                eta_k = 0.15 + 0.55 * float(self._u_bank[k, 3])
+            surf = _build_ssvi_surface(f"BANK_{self.domain_mode}_{k:04d}", iv_s, iv_sl, rho_k, eta_k)
+            self._items[k] = surf
             return surf
-        if self.domain_mode == "core_desk":
-            iv_s = 0.15 + 0.27 * float(self._u_bank[k, 0])
-            iv_sl = -0.04 + 0.09 * float(self._u_bank[k, 1])
-            rho_k = -0.55 + 0.65 * float(self._u_bank[k, 2])
-            eta_k = 0.15 + 0.30 * float(self._u_bank[k, 3])
-        else:
-            iv_s = 0.14 + 0.41 * float(self._u_bank[k, 0])
-            iv_sl = -0.07 + 0.16 * float(self._u_bank[k, 1])
-            rho_k = -0.65 + 0.90 * float(self._u_bank[k, 2])
-            eta_k = 0.15 + 0.55 * float(self._u_bank[k, 3])
-        surf = _build_ssvi_surface(f"BANK_{self.domain_mode}_{k:04d}", iv_s, iv_sl, rho_k, eta_k)
-        self._items[k] = surf
-        return surf
 
 
+_SSVI_BANK_CACHE_LOCK = threading.RLock()
 _SSVI_BANK_CACHE: Dict[Tuple[int, str], Any] = {}
 
 
@@ -326,16 +363,19 @@ def _get_ssvi_bank(
 ) -> Any:
     """Lazily builds and caches a per-process Sobol-stratified SSVI surface bank."""
     key = (int(n_bank), str(domain_mode))
-    cached = _SSVI_BANK_CACHE.get(key)
-    if cached is not None:
-        return cached
-    bank = _LazySSVIBank(int(n_bank), str(domain_mode))
-    _SSVI_BANK_CACHE[key] = bank
-    return bank
+    with _SSVI_BANK_CACHE_LOCK:
+        cached = _SSVI_BANK_CACHE.get(key)
+        if cached is not None:
+            return cached
+        bank = _LazySSVIBank(int(n_bank), str(domain_mode))
+        _SSVI_BANK_CACHE[key] = bank
+        return bank
 
 
 def _sample_owen_sobol_matrix(n_samples: int, dim: int, seed: int) -> npt.NDArray[np.float64]:
     """Draws (n_samples, dim) independent Owen-scrambled Sobol uniforms in (0, 1)."""
+    if n_samples <= 0:
+        return np.zeros((0, dim), dtype=np.float64)
     eng = qmc.Sobol(d=dim, scramble=True, seed=seed)
     n_pow = 1 << max(1, (n_samples - 1).bit_length())
     draws = eng.random(n=n_pow)[:n_samples]
@@ -487,39 +527,64 @@ def _build_contract_state_and_jacs(
         cpn_idx = call_idx
         opt_idx = call_idx
     elif d_active < 2:
+        call_idx = "TwinWin" if u_fn >= 0.88 else "WorstOf"
+        cpn_idx = call_idx
+        opt_idx = call_idx
+    elif u_fn < 0.36:
         call_idx = "WorstOf"
         cpn_idx = "WorstOf"
         opt_idx = "WorstOf"
-    elif u_fn < 0.50:
-        call_idx = "WorstOf"
-        cpn_idx = "WorstOf"
-        opt_idx = "WorstOf"
-    elif u_fn < 0.62:
+    elif u_fn < 0.45:
         call_idx = "BestOf"
         cpn_idx = "BestOf"
         opt_idx = "BestOf"
-    elif u_fn < 0.74:
-        call_idx = "AverageOf"
-        cpn_idx = "AverageOf"
-        opt_idx = "AverageOf"
-    elif u_fn < 0.82:
+    elif u_fn < 0.54:
+        call_idx = "AverageOf" if float(u_row[5]) < 0.5 else "EquallyWeightedBasket"
+        cpn_idx = call_idx
+        opt_idx = call_idx
+    elif u_fn < 0.60:
         call_idx = "Dispersion"
         cpn_idx = "Dispersion"
         opt_idx = "WorstOf" if float(u_row[5]) < 0.5 else "Dispersion"
-    elif u_fn < 0.88 and d_active == 2:
-        call_idx = "RatioAB" if float(u_row[5]) < 0.5 else "RatioBA"
+    elif u_fn < 0.70:
+        order_pool = (
+            ("SecondWorstOf", "ThirdWorstOf", "SecondBestOf")
+            if d_active >= 3
+            else ("SecondWorstOf", "SecondBestOf")
+        )
+        call_idx = order_pool[int(rng.integers(0, len(order_pool)))]
         cpn_idx = call_idx
         opt_idx = call_idx
-    elif u_fn < 0.94 and d_active == 2:
-        call_idx = "DiffAB" if float(u_row[5]) < 0.5 else "DiffBA"
+    elif u_fn < 0.78:
+        ratio_pool = (
+            ("RatioAB", "RatioBA", "RatioBestWorst", "RatioBestAverage", "RatioAverageWorst")
+            if d_active == 2
+            else ("RatioBestWorst", "RatioBestAverage", "RatioAverageWorst")
+        )
+        call_idx = ratio_pool[int(rng.integers(0, len(ratio_pool)))]
         cpn_idx = call_idx
-        # Signed differences can go negative and exceed K_put; WorstOf put keeps the upper cap U_put exact.
-        opt_idx = "WorstOf"
+        opt_idx = call_idx
+    elif u_fn < 0.88:
+        diff_pool = (
+            ("DiffAB", "DiffBA", "DiffBestWorst", "DiffBestAverage", "DiffAverageWorst")
+            if d_active == 2
+            else ("DiffBestWorst", "DiffBestAverage", "DiffAverageWorst")
+        )
+        call_idx = diff_pool[int(rng.integers(0, len(diff_pool)))]
+        cpn_idx = call_idx
+        opt_idx = call_idx if float(rng.random()) < 0.5 else "WorstOf"
+    elif u_fn < 0.94:
+        call_idx = "TwinWin"
+        cpn_idx = "TwinWin"
+        opt_idx = "TwinWin"
     else:
-        pool_3 = ("WorstOf", "BestOf", "AverageOf")
-        call_idx = pool_3[int(rng.integers(0, 3))]
-        cpn_idx = pool_3[int(rng.integers(0, 3))]
-        opt_idx = pool_3[int(rng.integers(0, 3))]
+        call_idx = _CALL_FUNCTIONAL_CHOICES[int(rng.integers(0, len(_CALL_FUNCTIONAL_CHOICES)))]
+        if d_active < 3 and call_idx == "ThirdWorstOf":
+            call_idx = "SecondWorstOf"
+        if d_active != 2 and call_idx in ("RatioAB", "RatioBA", "DiffAB", "DiffBA"):
+            call_idx = "DiffBestWorst" if _is_diff_index(call_idx) else "RatioBestWorst"
+        cpn_idx = call_idx
+        opt_idx = ("WorstOf", "BestOf", "AverageOf", call_idx)[int(rng.integers(0, 4))]
 
     sorted_ids = [f"SYN_{i:02d}" for i in range(d_active)]
     lex_perm_np = np.arange(d_active, dtype=np.int64)
@@ -556,8 +621,11 @@ def _build_contract_state_and_jacs(
         corr_t.diagonal().fill_(1.0)
 
     # Contract payoff terms & independent digital spreads
+    is_diff_opt = _is_diff_index(opt_idx)
     if opt_idx == "Dispersion":
         k_put = 0.05 + 0.20 * float(u_row[7])
+    elif is_diff_opt:
+        k_put = -0.20 + 0.45 * float(u_row[7])
     else:
         k_put = 0.65 + 0.35 * float(u_row[7])
     has_lower = float(u_row[8]) < 0.25 and k_put > 0.12
@@ -570,6 +638,8 @@ def _build_contract_state_and_jacs(
     has_ki = float(u_row[9]) < 0.65
     if opt_idx == "Dispersion":
         b_ki = (0.03 + 0.12 * float(rng.random())) if has_ki else k_put
+    elif is_diff_opt:
+        b_ki = (-0.30 + 0.30 * float(rng.random())) if has_ki else k_put
     else:
         b_ki = (0.45 + 0.35 * float(rng.random())) if has_ki else k_put
     i_ki_past = 1.0 if (has_ki and float(u_row[10]) < 0.10) else 0.0
@@ -581,7 +651,7 @@ def _build_contract_state_and_jacs(
         )
     else:
         g_put = (
-            min(2.0, 1.0 / max(k_put, 1e-4))
+            min(2.0, 1.0 / max(abs(k_put), 0.25))
             if float(u_row[11]) < 0.50
             else (0.5 + 1.2 * float(rng.random()))
         )
@@ -593,6 +663,24 @@ def _build_contract_state_and_jacs(
     ac_cpn = (0.02 + 0.10 * float(rng.random())) if float(u_row[14]) < 0.12 else 0.0
     force_cpn = float(u_row[15]) < 0.18
     is_long_basket = False if domain_mode == "tier2_desk" else (float(u_row[16]) < 0.10)
+    if is_long_basket and monitoring_index_to_code(opt_idx) == int(MonitoringIndexCode.WORST_OF):
+        opt_idx = "AverageOf"
+        is_diff_opt = False
+
+    if domain_mode == "full_stress" and float(rng.random()) < 0.08:
+        one_star_strike_val: Optional[float] = round(0.85 + 0.35 * float(rng.random()), 4)
+        os_sign = -1.0 if float(rng.random()) < 0.25 else 1.0
+        one_star_coupon_val = round(os_sign * (0.02 + 0.10 * float(rng.random())), 4)
+    else:
+        one_star_strike_val = None
+        one_star_coupon_val = 0.0
+
+    if domain_mode == "full_stress" and float(rng.random()) < 0.08:
+        part_call_strike_val: Optional[float] = round(0.85 + 0.30 * float(rng.random()), 4)
+        part_call_rate_val = round(0.25 + 1.00 * float(rng.random()), 4)
+    else:
+        part_call_strike_val = None
+        part_call_rate_val = 0.0
 
     def _draw_spread() -> float:
         if domain_mode == "tier2_desk":
@@ -607,13 +695,18 @@ def _build_contract_state_and_jacs(
     cpn_spread = _draw_spread()
     ki_spread = _draw_spread()
 
-    # Scale barriers appropriately for Dispersion / Diff* / Ratio* vs standard level functionals.
     def _barrier_scale(idx_name: str, is_ko: bool) -> Tuple[float, float]:
         if idx_name == "Dispersion":
             return (0.18 + 0.25 * float(rng.random()), 0.005) if is_ko else (0.08 + 0.15 * float(rng.random()), 0.0)
-        if idx_name in ("DiffAB", "DiffBA"):
-            return (0.10 + 0.25 * float(rng.random()), 0.005) if is_ko else (-0.15 + 0.20 * float(rng.random()), 0.0)
-        if idx_name in ("RatioAB", "RatioBA"):
+        if _is_diff_index(idx_name):
+            return (0.05 + 0.25 * float(rng.random()), 0.01) if is_ko else (-0.20 + 0.35 * float(rng.random()), 0.0)
+        if monitoring_index_to_code(idx_name) in (
+            int(MonitoringIndexCode.RATIO_AB),
+            int(MonitoringIndexCode.RATIO_BA),
+            int(MonitoringIndexCode.RATIO_BEST_WORST),
+            int(MonitoringIndexCode.RATIO_BEST_AVERAGE),
+            int(MonitoringIndexCode.RATIO_AVERAGE_WORST),
+        ):
             return (1.05 + 0.20 * float(rng.random()), 0.01) if is_ko else (0.75 + 0.20 * float(rng.random()), 0.0)
         return (0.95 + 0.15 * float(rng.random()), 0.015 * float(rng.random())) if is_ko else (0.65 + 0.20 * float(rng.random()), 0.0)
 
@@ -635,27 +728,35 @@ def _build_contract_state_and_jacs(
 
     lockout_len = int(rng.integers(1, min(4, m_rem))) if (m_rem > 1 and float(u_row[17]) < 0.25) else 0
     has_guar_0 = float(u_row[18]) < 0.20
+    call_is_diff = _is_diff_index(call_idx)
+    cpn_is_diff = _is_diff_index(cpn_idx)
     for m in range(m_rem):
         # allow_autocall_on_expiry=False requires final expiry date m == m_rem - 1 to be non-callable
         # so Tier-1 proxy does not double-discount L_put by (1 - p[-1]).
         if m < lockout_len or m == (m_rem - 1):
             ko_barriers_np[m] = 500.0
             is_callable_np[m] = 0.0
-            log_ko_feat_np[m] = math.log(3.0)
+            log_ko_feat_np[m] = math.asinh(3.0) if call_is_diff else math.log(3.0)
         else:
-            b_k = max(base_ko - step_ko * m, 0.50 if call_idx not in ("Dispersion", "DiffAB", "DiffBA") else 0.05)
+            if call_is_diff:
+                b_k = max(base_ko - step_ko * m, -0.35)
+                log_ko_feat_np[m] = math.asinh(b_k)
+            else:
+                b_k = max(base_ko - step_ko * m, 0.50 if call_idx != "Dispersion" else 0.05)
+                log_ko_feat_np[m] = math.log(min(max(b_k, 1e-4), 3.0))
             ko_barriers_np[m] = b_k
             is_callable_np[m] = 1.0
-            log_ko_feat_np[m] = math.log(min(max(b_k, 1e-4), 3.0))
 
         if m == 0 and has_guar_0:
             cpn_barriers_np[m] = 1e-5
             is_guar_np[m] = 1.0
-            log_cpn_feat_np[m] = math.log(0.05)
+            log_cpn_feat_np[m] = math.asinh(0.05) if cpn_is_diff else math.log(0.05)
         else:
             cpn_barriers_np[m] = base_cpn_b
             is_guar_np[m] = 0.0
-            log_cpn_feat_np[m] = math.log(max(base_cpn_b, 0.05))
+            log_cpn_feat_np[m] = (
+                math.asinh(base_cpn_b) if cpn_is_diff else math.log(max(base_cpn_b, 0.05))
+            )
 
     # Draw arbitrage-free SSVI RegularizedVolSurfaces from cached bank and precompute linearizations
     bank_mode = "full_stress" if (domain_mode != "tier2_desk" or is_distressed) else "core_desk"
@@ -668,8 +769,15 @@ def _build_contract_state_and_jacs(
     d_surf_df_short_np = np.zeros((d_active, 7), dtype=np.float64)
     d_surf_df_term_np = np.zeros((d_active, 7), dtype=np.float64)
 
+    div_lev_cap = (0.30 if float(u_row[16]) < 0.25 else 0.06) if domain_mode == "tier2_desk" else 0.06
+    div_lev_np = np.where(rng.random(d_active) < 0.35, 0.0, div_lev_cap * rng.random(d_active))
+    escrowed_scale_np = np.exp(-div_lev_np)
+    escrowed_spot_np = spots_np * escrowed_scale_np
+    div_pv_np = spots_np - escrowed_spot_np
+    escrowed_div_frac_np = 1.0 - escrowed_scale_np
+
     fwd_rel_np = np.exp(carry_1y_np[:, None] * tau_obs_np[None, :])
-    fwd_0_np = spots_np[:, None] * fwd_rel_np
+    fwd_0_np = escrowed_spot_np[:, None] * fwd_rel_np
 
     for i, ticker in enumerate(sorted_ids):
         surf_i = ssvi_bank[surf_indices[i]]
@@ -713,8 +821,7 @@ def _build_contract_state_and_jacs(
 
     carry_t = torch.tensor(carry_1y_np, dtype=torch.float64)
     repo_t = torch.tensor(repo_avg_np, dtype=torch.float64)
-    div_lev_cap = (0.30 if float(u_row[16]) < 0.25 else 0.06) if domain_mode == "tier2_desk" else 0.06
-    div_lev_np = np.where(rng.random(d_active) < 0.35, 0.0, div_lev_cap * rng.random(d_active))
+    escrowed_scale_t = torch.tensor(escrowed_scale_np, dtype=torch.float64)
     div_lev_log_t = torch.tensor(div_lev_np, dtype=torch.float64)
     cash_lev_t = torch.exp(div_lev_log_t).unsqueeze(1).expand(d_active, m_rem).clone()
     role_a_t = torch.tensor(role_leg_a, dtype=torch.float64)
@@ -777,8 +884,8 @@ def _build_contract_state_and_jacs(
         torch.Tensor,  # v_w (M,)
     ]:
         spots_v = ref_t * m0_vec
-        fwd_price_v = spots_v.unsqueeze(1) * fwd_rel_t
-        fwd_perf_v = m0_vec.unsqueeze(1) * fwd_rel_t
+        fwd_price_v = (spots_v * escrowed_scale_t).unsqueeze(1) * fwd_rel_t
+        fwd_perf_v = (m0_vec * escrowed_scale_t).unsqueeze(1) * fwd_rel_t
         iv_v = (iv_0_t + d_iv_dk_t * (fwd_price_v - fwd_0_t)).clamp(min=0.01)
         v_perf_v = iv_v * sqrt_tau_t.unsqueeze(0) * cash_lev_t
 
@@ -811,6 +918,10 @@ def _build_contract_state_and_jacs(
             "force_coupons_on_autocall": force_cpn,
             "allow_autocall_on_expiry": False,
             "is_long_basket": is_long_basket,
+            "participation_call_strike": part_call_strike_val,
+            "participation_call_rate": part_call_rate_val,
+            "one_star_strike": one_star_strike_val,
+            "one_star_coupon": one_star_coupon_val,
             "pv_in_transit": 0.0,
             "already_autocalled": False,
             "callability_index": call_idx,
@@ -824,7 +935,10 @@ def _build_contract_state_and_jacs(
         log_m0_v = torch.log(m0_vec.clamp(min=1e-12))
         f_p_term = fwd_perf_v[:, -1].clamp(min=1e-12)
         v_term_v = v_perf_v[:, -1].clamp(min=1e-6)
-        dist_put = torch.log(f_p_term / k_eff_put) / v_term_v
+        if is_diff_opt:
+            dist_put = torch.asinh(f_p_term - k_put) / v_term_v
+        else:
+            dist_put = torch.log(f_p_term / k_eff_put) / v_term_v
 
         node_v = torch.stack(
             [
@@ -879,19 +993,22 @@ def _build_contract_state_and_jacs(
         glob_v = glob_base.clone()
         glob_v[9] = b_out.l_put_proxy
 
-        pv_p = _assemble_w1_pv_torch(
-            b_out,
-            df_pay_t,
-            cpn_r_t,
-            strike=k_put,
-            option_gearing=g_put,
-            c_mem_0=c_mem_0,
-            is_memory=is_memory,
-            no_notional_repayment=no_notional,
-            autocall_coupon=ac_cpn,
-            force_coupons_on_autocall=force_cpn,
-            is_long_basket=is_long_basket,
-        )
+        if one_star_coupon_val != 0.0 or part_call_rate_val != 0.0:
+            pv_p = b_out.product_value_proxy
+        else:
+            pv_p = _assemble_w1_pv_torch(
+                b_out,
+                df_pay_t,
+                cpn_r_t,
+                strike=k_put,
+                option_gearing=g_put,
+                c_mem_0=c_mem_0,
+                is_memory=is_memory,
+                no_notional_repayment=no_notional,
+                autocall_coupon=ac_cpn,
+                force_coupons_on_autocall=force_cpn,
+                is_long_basket=is_long_basket,
+            )
         return (
             node_v,
             edge_v,
@@ -944,17 +1061,56 @@ def _build_contract_state_and_jacs(
                 jac_lput_act[i] = (lp_u - lp_d) * inv_2h
                 delta_proxy_act[i] = (pv_u - pv_d) * inv_2h
 
-    # Precompute analytically bumped PROXY_KO_PROB at B_KO * exp(ko_bump_delta)
+    # Precompute bumped PROXY_KO_PROB via analytical baseline so hazard monotonicity matches Stulz proxy.
     ko_bumped = torch.where(
         is_call_t > 0.5,
-        ko_t * math.exp(ko_bump_delta),
+        ko_t + ko_bump_delta if call_is_diff else ko_t * math.exp(ko_bump_delta),
         ko_t,
     )
-    ko_prob_b = _digital_call_spread_prob_torch(f_w_v, v_w_v, ko_bumped, ko_spread)
-    h_b = is_call_t * ko_prob_b.clamp(0.0, 1.0 - 1e-7)
-    surv_b = torch.cumprod(1.0 - h_b, dim=0)
-    surv_prev_b = torch.cat([torch.ones(1, dtype=torch.float64), surv_b[:-1]], dim=0)
-    p_proxy_ko_bumped_act = surv_prev_b * h_b
+    with torch.no_grad():
+        fwd_perf_base = (m0_t * escrowed_scale_t).unsqueeze(1) * fwd_rel_t
+        iv_base = (iv_0_t + d_iv_dk_t * (fwd_perf_base * ref_t.unsqueeze(1) - fwd_0_t)).clamp(min=0.01)
+        v_perf_base = iv_base * sqrt_tau_t.unsqueeze(0) * cash_lev_t
+        bumped_in = {
+            "forward_perf": fwd_perf_base,
+            "v_perf": v_perf_base,
+            "corr_matrix": corr_t,
+            "df_pay": df_pay_t,
+            "ko_barriers": ko_bumped,
+            "is_callable": is_call_t,
+            "cpn_barriers": cpn_b_t,
+            "is_guaranteed_cpn": is_guar_t,
+            "coupon_amounts": cpn_r_t,
+            "strike": k_put,
+            "option_gearing": g_put,
+            "lower_strike": lower_strike_val if lower_strike_val > 0.0 else None,
+            "ki_barrier": b_ki if has_ki else None,
+            "i_ki_past": i_ki_past,
+            "c_mem_0": c_mem_0,
+            "is_memory": is_memory,
+            "ko_spread": ko_spread,
+            "cpn_spread": cpn_spread,
+            "ki_spread": ki_spread,
+            "no_notional_repayment": no_notional,
+            "autocall_coupon": ac_cpn,
+            "force_coupons_on_autocall": force_cpn,
+            "allow_autocall_on_expiry": False,
+            "is_long_basket": is_long_basket,
+            "participation_call_strike": part_call_strike_val,
+            "participation_call_rate": part_call_rate_val,
+            "one_star_strike": one_star_strike_val,
+            "one_star_coupon": one_star_coupon_val,
+            "pv_in_transit": 0.0,
+            "already_autocalled": False,
+            "callability_index": call_idx,
+            "coupon_index": cpn_idx,
+            "option_index": opt_idx,
+            "inv_lex_perm": inv_lex_perm_np,
+            "tau_obs": tau_obs_t,
+        }
+        p_proxy_ko_bumped_act = compute_analytical_autocall_baseline(
+            bumped_in, use_fast_cpu=True
+        ).p_proxy
 
     # Pad to (d_max, m_max) for AutocallPreprocState and batch tensors
     node_pad = torch.zeros((1, d_max, 16), dtype=torch.float64)
@@ -987,32 +1143,58 @@ def _build_contract_state_and_jacs(
     p_bumped_pad = torch.zeros((m_max,), dtype=torch.float64)
     p_bumped_pad[:m_rem] = p_proxy_ko_bumped_act
 
-    # Construct lightweight AutocallPreprocState for GPU Dupire QMC
+    # Construct lightweight AutocallPreprocState for GPU Dupire QMC with cumulative r_tot_obs and discrete dividends.
     obs_dates_dt = [_BASE_AS_OF + timedelta(days=int(round(t * 365.0))) for t in tau_obs_np]
-    r_tot_obs_t = torch.full((d_active, m_rem), r_disc, dtype=torch.float64)
+    r_tot_obs_t = torch.tensor(carry_1y_np[:, None] * tau_obs_np[None, :], dtype=torch.float64)
     df_fin_obs_t = df_pay_t.unsqueeze(0).expand(d_active, m_rem).clone()
     df_repo_obs_t = torch.exp(-torch.tensor(repo_avg_np[:, None] * tau_obs_np[None, :], dtype=torch.float64))
     fwd_price_t = torch.tensor(fwd_0_np, dtype=torch.float64)
-    fwd_perf_t = torch.tensor(m0_np[:, None] * fwd_rel_np, dtype=torch.float64)
+    fwd_perf_t = torch.tensor((m0_np * escrowed_scale_np)[:, None] * fwd_rel_np, dtype=torch.float64)
     iv_t = torch.tensor(iv_0_np, dtype=torch.float64)
     v_perf_t = iv_t * sqrt_tau_t.unsqueeze(0) * cash_lev_t
+
+    div_pv_mat_t = torch.tensor(div_pv_np[:, None], dtype=torch.float64).expand(d_active, m_rem).clone()
+    escrowed_spot_mat_t = torch.tensor(escrowed_spot_np[:, None], dtype=torch.float64).expand(d_active, m_rem).clone()
+    escrowed_div_frac_mat_t = (
+        torch.tensor(escrowed_div_frac_np[:, None], dtype=torch.float64).expand(d_active, m_rem).clone()
+    )
+    div_events_map: Dict[str, List[ParsedDividendEvent]] = {}
+    tau_ex_div = min(0.5 * float(tau_obs_np[0]), 0.02)
+    ex_dt_div = _BASE_AS_OF + timedelta(seconds=max(int(round(tau_ex_div * 365.0 * 86400.0)), 60))
+    for i_asset, tid_asset in enumerate(sorted_ids):
+        if div_lev_np[i_asset] > 1e-12:
+            w_ex = math.exp(-(r_disc - repo_avg_np[i_asset]) * tau_ex_div)
+            amt_ex = float(div_pv_np[i_asset]) / max(w_ex, 1e-12)
+            div_events_map[tid_asset] = [
+                ParsedDividendEvent(
+                    ex_date=ex_dt_div,
+                    payment_date=ex_dt_div,
+                    amount=amt_ex,
+                    tau_ex_act365=tau_ex_div,
+                    tau_pay_act365=tau_ex_div,
+                    tau_ex_act360=tau_ex_div,
+                    pv_discount_weight=w_ex,
+                )
+            ]
+        else:
+            div_events_map[tid_asset] = []
 
     div_out = EscrowedDividendOutput(
         identifiers=sorted_ids,
         as_of_date=_BASE_AS_OF,
         observation_dates=obs_dates_dt,
-        div_pv=torch.zeros(d_active, dtype=torch.float64),
-        escrowed_spot=torch.tensor(spots_np, dtype=torch.float64),
+        div_pv=div_pv_mat_t,
+        escrowed_spot=escrowed_spot_mat_t,
         forward_price=fwd_price_t,
         forward_rel=fwd_rel_t,
         forward_perf=fwd_perf_t,
         cash_div_leverage=cash_lev_t,
-        escrowed_div_fraction=torch.zeros(d_active, dtype=torch.float64),
+        escrowed_div_fraction=escrowed_div_frac_mat_t,
         df_fin_obs=df_fin_obs_t,
         df_repo_obs=df_repo_obs_t,
         r_tot_obs=r_tot_obs_t,
         repo_spread_avg=repo_t,
-        dividend_events={tid: [] for tid in sorted_ids},
+        dividend_events=div_events_map,
     )
 
     sentinel_res = SentinelBarrierResult(
@@ -1123,6 +1305,10 @@ def _build_contract_state_and_jacs(
         force_coupons_on_autocall=force_cpn,
         allow_autocall_on_expiry=False,
         is_long_basket=is_long_basket,
+        participation_call_strike=part_call_strike_val,
+        participation_call_rate=part_call_rate_val,
+        one_star_strike=one_star_strike_val,
+        one_star_coupon=one_star_coupon_val,
         payment_currency="RUB",
         callability_index=call_idx,
         coupon_index=cpn_idx,
@@ -1161,7 +1347,9 @@ def _build_contract_state_and_jacs(
     )
 
 
-_MINI_BATCH_CACHE: Dict[Tuple[Any, ...], SyntheticAutocallBatch] = {}
+_MINI_BATCH_CACHE_LOCK = threading.RLock()
+_MINI_BATCH_CACHE: OrderedDict[Tuple[Any, ...], SyntheticAutocallBatch] = OrderedDict()
+_MINI_BATCH_CACHE_MAXSIZE: int = 32
 
 
 def generate_synthetic_autocall_batch(
@@ -1186,9 +1374,45 @@ def generate_synthetic_autocall_batch(
 ) -> SyntheticAutocallBatch:
     """Generates stratified Owen-Sobol v2.0 autocallable contracts labeled by GPU Dupire LV QMC."""
     _ = eta_lkj, crisis_prob
+    if int(batch_size) < 0:
+        raise ValueError(f"batch_size must be >= 0, got {batch_size}.")
+    if int(d_max) < 0:
+        raise ValueError(f"d_max must be >= 0, got {d_max}.")
+    if int(m_max) < 0:
+        raise ValueError(f"m_max must be >= 0, got {m_max}.")
     if domain_mode not in ("tier2_desk", "full_stress"):
         raise ValueError(f"domain_mode must be 'tier2_desk' or 'full_stress', got {domain_mode!r}.")
     dev = torch.device(device)
+    if int(batch_size) == 0 or int(d_max) == 0 or int(m_max) == 0:
+        b0, d0, m0 = int(batch_size), int(d_max), int(m_max)
+        return SyntheticAutocallBatch(
+            node_feats=torch.zeros((b0, d0, 16), device=dev, dtype=dtype),
+            edge_feats=torch.zeros((b0, d0, d0, 4), device=dev, dtype=dtype),
+            asset_mask=torch.zeros((b0, d0), device=dev, dtype=dtype),
+            sched_feats=torch.zeros((b0, m0, 12), device=dev, dtype=dtype),
+            sched_mask=torch.zeros((b0, m0), device=dev, dtype=dtype),
+            global_feats=torch.zeros((b0, 16), device=dev, dtype=dtype),
+            p_proxy=torch.zeros((b0, m0), device=dev, dtype=dtype),
+            q_proxy=torch.zeros((b0, m0), device=dev, dtype=dtype),
+            l_put_proxy=torch.zeros((b0,), device=dev, dtype=dtype),
+            pv_proxy=torch.zeros((b0,), device=dev, dtype=dtype),
+            delta_proxy=torch.zeros((b0, d0), device=dev, dtype=dtype),
+            p_mc=torch.zeros((b0, m0), device=dev, dtype=dtype),
+            q_mc=torch.zeros((b0, m0), device=dev, dtype=dtype),
+            l_put_mc=torch.zeros((b0,), device=dev, dtype=dtype),
+            pv_mc=torch.zeros((b0,), device=dev, dtype=dtype),
+            delta_mc=torch.zeros((b0, d0), device=dev, dtype=dtype),
+            no_notional_repayment=torch.zeros((b0,), device=dev, dtype=dtype),
+            autocall_coupon=torch.zeros((b0,), device=dev, dtype=dtype),
+            force_coupons_on_autocall=torch.zeros((b0,), device=dev, dtype=dtype),
+            is_long_basket=torch.zeros((b0,), device=dev, dtype=dtype),
+            lower_strike=torch.zeros((b0,), device=dev, dtype=dtype),
+            p_proxy_ko_bumped=torch.zeros((b0, m0), device=dev, dtype=dtype),
+            jac_node_logm=torch.zeros((b0, d0, d0, 16), device=dev, dtype=dtype),
+            jac_edge_self=torch.zeros((b0, d0, d0, 2), device=dev, dtype=dtype),
+            jac_sched_logm=torch.zeros((b0, d0, m0, 4), device=dev, dtype=dtype),
+            jac_lput_logm=torch.zeros((b0, d0), device=dev, dtype=dtype),
+        )
     eff_qmc_dev = (
         torch.device(qmc_device)
         if qmc_device is not None
@@ -1212,10 +1436,17 @@ def generate_synthetic_autocall_batch(
             str(eff_qmc_dev),
         )
         cache_key = (*base_key, bool(compute_pathwise_delta))
-        if cache_key in _MINI_BATCH_CACHE:
-            return _MINI_BATCH_CACHE[cache_key].to(device=dev, dtype=dtype)
-        if not compute_pathwise_delta and (*base_key, True) in _MINI_BATCH_CACHE:
-            return _MINI_BATCH_CACHE[(*base_key, True)].to(device=dev, dtype=dtype)
+        with _MINI_BATCH_CACHE_LOCK:
+            cached = _MINI_BATCH_CACHE.get(cache_key)
+            if cached is not None:
+                _MINI_BATCH_CACHE.move_to_end(cache_key)
+                return cached.to(device=dev, dtype=dtype, copy=True)
+            if not compute_pathwise_delta:
+                alt_key = (*base_key, True)
+                cached_alt = _MINI_BATCH_CACHE.get(alt_key)
+                if cached_alt is not None:
+                    _MINI_BATCH_CACHE.move_to_end(alt_key)
+                    return cached_alt.to(device=dev, dtype=dtype, copy=True)
 
     # Independent stratified Owen-Sobol draws per contract (eliminates modulo-index coupling).
     u_mat = _sample_owen_sobol_matrix(batch_size, 21, seed=seed)
@@ -1353,9 +1584,13 @@ def generate_synthetic_autocall_batch(
         jac_sched_logm=torch.stack(js_list, dim=0),
         jac_lput_logm=torch.stack(jl_list, dim=0),
     )
-    if cache_key is not None and len(_MINI_BATCH_CACHE) < 32:
-        _MINI_BATCH_CACHE[cache_key] = batch.to(device="cpu", dtype=torch.float32)
-    return batch.to(device=dev, dtype=dtype)
+    if cache_key is not None:
+        with _MINI_BATCH_CACHE_LOCK:
+            _MINI_BATCH_CACHE[cache_key] = batch.to(device="cpu", dtype=torch.float32, copy=True)
+            _MINI_BATCH_CACHE.move_to_end(cache_key)
+            while len(_MINI_BATCH_CACHE) > _MINI_BATCH_CACHE_MAXSIZE:
+                _MINI_BATCH_CACHE.popitem(last=False)
+    return batch.to(device=dev, dtype=dtype, copy=True)
 
 
 def generate_dupire_autocall_dataset(

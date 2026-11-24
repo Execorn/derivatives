@@ -2,23 +2,39 @@
 
 from __future__ import annotations
 
+from array import array
+from bisect import bisect_left
 from collections import OrderedDict
+from collections.abc import Callable, Mapping, Sequence
+import copy
 from dataclasses import dataclass, field, fields as dc_fields, replace as dc_replace
 import datetime
 from enum import Enum
 import hashlib
 import inspect
+import math
 from pathlib import Path
+import re
 import struct
 import threading
-from typing import Any, Callable, Mapping, Sequence, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import numpy as np
 import numpy.typing as npt
-import orjson
+from pydantic import BaseModel
 import torch
 
-from deepvol.api.schemas_eq_autocall import parse_murex_autocall_dag
+from deepvol.api.schemas_eq_autocall import (
+    DiscountFactorCurveSpec,
+    DividendsSpec,
+    EQAutocallableTradeRequest,
+    EquityVolSmileCollectionSpec,
+    FixingsSpec,
+    FXVolatilitySmileCollectionSpec,
+    MarketDataSetSpec,
+    RepoSpreadCurveSpec,
+    parse_murex_autocall_dag,
+)
 from deepvol.market.eq_curves import (
     ClampedYieldCurve,
     RepoCurve,
@@ -34,6 +50,8 @@ from deepvol.models.autocall.escrowed_dividend import (
     EscrowedDividendOutput,
     build_discount_rate_evaluator,
     compute_escrowed_dividend_forwards,
+    equity_forward_curve_priority as _curve_ois_priority_rank,
+    infer_asset_currency_from_context,
 )
 from deepvol.models.autocall.feature_layout import (
     D_MAX_DEFAULT,
@@ -95,41 +113,49 @@ class _LazySurfaceJacobianDict(dict[str, npt.NDArray[np.float64]]):
             return cached.copy()
 
     def _populate_all(self) -> None:
-        for k in self._keys:
-            if not super().__contains__(k):
-                super().__setitem__(k, self._get_or_build(k))
+        with self._lock:
+            for k in self._keys:
+                if not super().__contains__(k):
+                    super().__setitem__(k, self._get_or_build(k))
 
     def __getitem__(self, key: str) -> npt.NDArray[np.float64]:
-        if not super().__contains__(key) and key in self._keys:
-            super().__setitem__(key, self._get_or_build(key))
-        return super().__getitem__(key)
+        with self._lock:
+            if not super().__contains__(key) and key in self._keys:
+                super().__setitem__(key, self._get_or_build(key))
+            return super().__getitem__(key)
 
     def get(self, key: str, default: Any = None) -> Any:
-        if key in self._keys:
-            return self[key]
-        return super().get(key, default)
+        with self._lock:
+            if key in self._keys:
+                return self[key]
+            return super().get(key, default)
 
     def __contains__(self, key: object) -> bool:
-        return key in self._keys or super().__contains__(key)
+        with self._lock:
+            return key in self._keys or super().__contains__(key)
 
     def __len__(self) -> int:
         return len(self._keys)
 
     def __iter__(self) -> Any:
-        self._populate_all()
-        return super().__iter__()
+        with self._lock:
+            self._populate_all()
+            return iter(list(super().__iter__()))
 
     def keys(self) -> Any:
-        self._populate_all()
-        return super().keys()
+        with self._lock:
+            self._populate_all()
+            return dict(super().items()).keys()
 
     def values(self) -> Any:
-        self._populate_all()
-        return super().values()
+        with self._lock:
+            self._populate_all()
+            return dict(super().items()).values()
 
     def items(self) -> Any:
-        self._populate_all()
-        return super().items()
+        with self._lock:
+            self._populate_all()
+            return dict(super().items()).items()
 
     def clone(self) -> _LazySurfaceJacobianDict:
         cloned = _LazySurfaceJacobianDict(
@@ -138,8 +164,9 @@ class _LazySurfaceJacobianDict(dict[str, npt.NDArray[np.float64]]):
             _shared_cache=self._shared_cache,
             _lock=self._lock,
         )
-        for k, v in dict.items(self):
-            dict.__setitem__(cloned, k, v.copy())
+        with self._lock:
+            for k, v in dict.items(self):
+                dict.__setitem__(cloned, k, v.copy())
         return cloned
 
     def __deepcopy__(self, memo: Any) -> _LazySurfaceJacobianDict:
@@ -237,6 +264,10 @@ class AutocallPreprocState:
     r_native_obs: torch.Tensor | None = None
     warnings: list[str] = field(default_factory=list)
     feature_schema_version: str = FEATURE_SCHEMA_VERSION
+    repo_curves_map: dict[str, Any] = field(default_factory=dict)
+    quanto_fx_specs: dict[str, Any] = field(default_factory=dict)
+    state_digest: str = ""
+    surface_digests: dict[str, str] = field(default_factory=dict)
 
     def to_tier2_float32_tensors(self) -> dict[str, torch.Tensor]:
         """Precision boundary segregation casting only the 6 padded neural input tensors."""
@@ -342,32 +373,40 @@ class ThreadSafeLRUCache:
         self._lock = threading.RLock()
         self._data: OrderedDict[Any, Any] = OrderedDict()
 
-    def get(self, key: Any, default: Any = None) -> Any:
+    def get(self, key: Any, default: Any = None, *, clone_return: bool = True) -> Any:
         with self._lock:
             if key not in self._data:
                 return default
             self._data.move_to_end(key)
             val = self._data[key]
-            return self._copy_fn(val) if self._copy_fn is not None else val
+            return self._copy_fn(val) if (clone_return and self._copy_fn is not None) else val
 
-    def put(self, key: Any, value: Any) -> Any:
+    def put(self, key: Any, value: Any, *, clone_return: bool = True) -> Any:
         with self._lock:
-            stored = self._copy_fn(value) if self._copy_fn is not None else value
-            self._data[key] = stored
+            if clone_return and self._copy_fn is not None:
+                stored = self._copy_fn(value)
+                self._data[key] = stored
+                self._data.move_to_end(key)
+                while len(self._data) > self._maxsize:
+                    self._data.popitem(last=False)
+                return self._copy_fn(stored)
+            self._data[key] = value
             self._data.move_to_end(key)
             while len(self._data) > self._maxsize:
                 self._data.popitem(last=False)
-            return self._copy_fn(stored) if self._copy_fn is not None else stored
+            return value
 
     def __contains__(self, key: object) -> bool:
         with self._lock:
             return key in self._data
 
     def __getitem__(self, key: Any) -> Any:
-        res = self.get(key)
-        if res is None and key not in self._data:
-            raise KeyError(key)
-        return res
+        with self._lock:
+            if key not in self._data:
+                raise KeyError(key)
+            self._data.move_to_end(key)
+            val = self._data[key]
+            return self._copy_fn(val) if self._copy_fn is not None else val
 
     def __setitem__(self, key: Any, value: Any) -> None:
         self.put(key, value)
@@ -381,178 +420,883 @@ class ThreadSafeLRUCache:
             self._data.clear()
 
 
-def _feed_canonical_bytes(hasher: Any, obj: Any, counter: list[int]) -> bool:
-    """Feeds deterministic canonical byte representation into a SHA-256 hasher.
+_UTC = datetime.timezone.utc
+_RAW_HEX_RE = re.compile(r"^[0-9a-fA-F]{32,128}$")
+_PACK_U32 = struct.Struct("!BI").pack
+_PACK_U64 = struct.Struct("!Q").pack
+_PACK_F64 = struct.Struct("!Bd").pack
+_PACK_I64 = struct.Struct("!Bq").pack
+_PACK_DT = struct.Struct("!BH5BI").pack
+_PACK_DA = struct.Struct("!BH2B").pack
+_PACK_CASH_DIV = struct.Struct("!H5BIH5BId").pack
+_PACK_ND_HDR = {
+    0: struct.Struct("!II").pack,
+    1: struct.Struct("!IQI").pack,
+    2: struct.Struct("!I2QI").pack,
+    3: struct.Struct("!I3QI").pack,
+}
+_INT64_MIN = -(1 << 63)
+_INT64_MAX = (1 << 63) - 1
+_MODEL_SORTED_FIELDS_CACHE: dict[type, tuple[tuple[str, bytes], ...]] = {}
 
-    Returns False if `obj` contains an active autograd tensor or unhashable transient
-    that must bypass caching.
-    """
+
+def _get_model_sorted_fields(cls: type) -> tuple[tuple[str, bytes], ...]:
+    """Caches pre-sorted `(field_name, framed_key_bytes)` pairs once per Pydantic class."""
+    cached = _MODEL_SORTED_FIELDS_CACHE.get(cls)
+    if cached is not None:
+        return cached
+    fields = getattr(cls, "model_fields", None)
+    if fields is None:
+        return ()
+    pack_u32 = _PACK_U32
+    pairs = tuple(
+        (k, pack_u32(0x53, len(kb)) + kb)
+        for k in sorted(fields)
+        for kb in (k.encode("utf-8"),)
+    )
+    _MODEL_SORTED_FIELDS_CACHE[cls] = pairs
+    return pairs
+
+
+def _flush_canonical_buf(
+    buf: bytearray,
+    upd: Callable[[Any], Any],
+    flushed: list[int],
+    extra: Any = None,
+) -> None:
+    if buf:
+        flushed[0] += len(buf)
+        upd(buf)
+        buf.clear()
+    if extra is not None:
+        flushed[0] += len(extra)
+        upd(extra)
+
+
+def _append_raw_mv(
+    buf: bytearray,
+    upd: Callable[[Any], Any],
+    flushed: list[int],
+    mv: memoryview,
+) -> None:
+    if len(mv) <= 4096 and len(buf) + len(mv) <= 65536:
+        buf.extend(mv)
+    else:
+        _flush_canonical_buf(buf, upd, flushed, mv)
+
+
+def _append_str_val(buf: bytearray, s: str) -> None:
+    b = s.encode("utf-8")
+    buf.extend(_PACK_U32(0x53, len(b)))
+    buf.extend(b)
+
+
+def _append_opt_str_val(buf: bytearray, s: str | None) -> None:
+    if s is None:
+        buf.append(0x4E)
+    else:
+        b = s.encode("utf-8")
+        buf.extend(_PACK_U32(0x53, len(b)))
+        buf.extend(b)
+
+
+def _append_dt_bytes(buf: bytearray, dt_obj: datetime.datetime) -> None:
+    dt_u = dt_obj if dt_obj.tzinfo is _UTC else _to_utc_datetime(dt_obj)
+    buf.extend(
+        _PACK_DT(
+            0x54,
+            dt_u.year,
+            dt_u.month,
+            dt_u.day,
+            dt_u.hour,
+            dt_u.minute,
+            dt_u.second,
+            dt_u.microsecond,
+        )
+    )
+
+
+def _append_dt_seq_fast(
+    buf: bytearray,
+    upd: Callable[[Any], Any],
+    flushed: list[int],
+    seq: Any,
+) -> bool:
+    if seq is None:
+        buf.append(0x4E)
+        return True
+    if not isinstance(seq, (list, tuple)):
+        return _stream_canonical_val(buf, upd, flushed, seq)
+    buf.extend(_PACK_U32(0x4C if isinstance(seq, list) else 0x55, len(seq)))
+    dt_cls = datetime.datetime
+    utc_tz = _UTC
+    pack_dt = _PACK_DT
+    for item in seq:
+        if type(item) is dt_cls and item.tzinfo is utc_tz:
+            buf.extend(
+                pack_dt(
+                    0x54,
+                    item.year,
+                    item.month,
+                    item.day,
+                    item.hour,
+                    item.minute,
+                    item.second,
+                    item.microsecond,
+                )
+            )
+        elif not _stream_canonical_val(buf, upd, flushed, item):
+            return False
+    if len(buf) > 65536:
+        _flush_canonical_buf(buf, upd, flushed)
+    return True
+
+
+def _append_float_seq_typed(
+    buf: bytearray,
+    upd: Callable[[Any], Any],
+    flushed: list[int],
+    seq: Any,
+) -> bool:
+    if seq is None:
+        buf.append(0x4E)
+        return True
+    if isinstance(seq, (list, tuple)):
+        n_seq = len(seq)
+        if n_seq == 0:
+            buf.extend(_PACK_U32(0x64, 0))
+            return True
+        try:
+            src = [0.0 if float(x) == 0.0 else float(x) for x in seq] if (0.0 in seq) else seq
+            arr_d = array("d", src)
+            buf.extend(_PACK_U32(0x64, n_seq))
+            _append_raw_mv(buf, upd, flushed, memoryview(arr_d).cast("B"))
+            return True
+        except (TypeError, OverflowError, ValueError):
+            pass
+    return _stream_canonical_val(buf, upd, flushed, seq)
+
+
+def _append_mapping_bytes(
+    buf: bytearray,
+    upd: Callable[[Any], Any],
+    flushed: list[int],
+    obj: Mapping[Any, Any],
+) -> bool:
+    buf.extend(_PACK_U32(0x4D, len(obj)))
+    if not obj:
+        return True
+    try:
+        keys = sorted(obj)
+    except TypeError:
+        keys = sorted(obj, key=lambda x: (str(type(x)), str(x)))
+    for k in keys:
+        if type(k) is str:
+            _append_str_val(buf, k)
+        elif not _stream_canonical_val(buf, upd, flushed, k):
+            return False
+        if not _stream_canonical_val(buf, upd, flushed, obj[k]):
+            return False
+    if len(buf) > 65536:
+        _flush_canonical_buf(buf, upd, flushed)
+    return True
+
+
+def _stream_canonical_val(
+    buf: bytearray,
+    upd: Callable[[Any], Any],
+    flushed: list[int],
+    obj: Any,
+) -> bool:
+    """Appends canonical collision-free binary bytes into `buf` (flushing large payloads)."""
     if obj is None:
-        hasher.update(b"N;")
-        counter[0] += 2
+        buf.append(0x4E)
         return True
-    if isinstance(obj, bool):
-        hasher.update(b"B1;" if obj else b"B0;")
-        counter[0] += 3
+
+    tp = type(obj)
+    if tp is str:
+        _append_str_val(buf, obj)
         return True
-    if isinstance(obj, int):
-        b = str(obj).encode("ascii")
-        hasher.update(b"I" + struct.pack("!I", len(b)) + b)
-        counter[0] += 5 + len(b)
+    if tp is float:
+        buf.extend(_PACK_F64(0x46, 0.0 if obj == 0.0 else obj))
         return True
-    if isinstance(obj, float):
-        # Canonicalize -0.0 to +0.0 while preserving NaN bit patterns explicitly.
-        val = 0.0 if obj == 0.0 else obj
-        packed = struct.pack("!d", val)
-        hasher.update(b"F" + packed)
-        counter[0] += 9
+    if tp is int:
+        if _INT64_MIN <= obj <= _INT64_MAX:
+            buf.extend(_PACK_I64(0x71, obj))
+        else:
+            b = str(obj).encode("ascii")
+            buf.extend(_PACK_U32(0x49, len(b)))
+            buf.extend(b)
         return True
+    if tp is bool:
+        buf.append(0x31 if obj else 0x30)
+        return True
+    if tp is datetime.datetime:
+        _append_dt_bytes(buf, obj)
+        return True
+    if tp is datetime.date:
+        buf.extend(_PACK_DA(0x44, obj.year, obj.month, obj.day))
+        return True
+    if tp is list:
+        n_items = len(obj)
+        if n_items > 0 and type(obj[0]) is float and all(type(x) is float for x in obj):
+            src = [0.0 if x == 0.0 else x for x in obj] if (0.0 in obj) else obj
+            arr_d = array("d", src)
+            buf.extend(_PACK_U32(0x64, n_items))
+            _append_raw_mv(buf, upd, flushed, memoryview(arr_d).cast("B"))
+            return True
+        buf.extend(_PACK_U32(0x4C, n_items))
+        for item in obj:
+            if not _stream_canonical_val(buf, upd, flushed, item):
+                return False
+        if len(buf) > 65536:
+            _flush_canonical_buf(buf, upd, flushed)
+        return True
+    if tp is tuple:
+        buf.extend(_PACK_U32(0x55, len(obj)))
+        for item in obj:
+            if not _stream_canonical_val(buf, upd, flushed, item):
+                return False
+        if len(buf) > 65536:
+            _flush_canonical_buf(buf, upd, flushed)
+        return True
+    if tp is dict:
+        return _append_mapping_bytes(buf, upd, flushed, obj)
+    if tp is bytes:
+        buf.extend(_PACK_U32(0x59, len(obj)))
+        _append_raw_mv(buf, upd, flushed, memoryview(obj))
+        return True
+
     if isinstance(obj, Enum):
-        return _feed_canonical_bytes(hasher, obj.value, counter)
-    if isinstance(obj, str):
-        b = obj.encode("utf-8")
-        hasher.update(b"S" + struct.pack("!I", len(b)) + b)
-        counter[0] += 5 + len(b)
+        return _stream_canonical_val(buf, upd, flushed, obj.value)
+    if isinstance(obj, (bool, np.bool_)):
+        buf.append(0x31 if bool(obj) else 0x30)
         return True
-    if isinstance(obj, (bytes, bytearray)):
-        hasher.update(b"Y" + struct.pack("!I", len(obj)) + bytes(obj))
-        counter[0] += 5 + len(obj)
+    if isinstance(obj, (float, np.floating)):
+        fv = float(obj)
+        buf.extend(_PACK_F64(0x46, 0.0 if fv == 0.0 else fv))
+        return True
+    if isinstance(obj, (int, np.integer)):
+        iv = int(obj)
+        if _INT64_MIN <= iv <= _INT64_MAX:
+            buf.extend(_PACK_I64(0x71, iv))
+        else:
+            b = str(iv).encode("ascii")
+            buf.extend(_PACK_U32(0x49, len(b)))
+            buf.extend(b)
         return True
     if isinstance(obj, datetime.datetime):
-        dt_utc = _to_utc_datetime(obj)
-        b = dt_utc.isoformat().encode("ascii")
-        hasher.update(b"DT" + struct.pack("!I", len(b)) + b)
-        counter[0] += 6 + len(b)
+        _append_dt_bytes(buf, obj)
         return True
     if isinstance(obj, datetime.date):
-        b = obj.isoformat().encode("ascii")
-        hasher.update(b"DA" + struct.pack("!I", len(b)) + b)
-        counter[0] += 6 + len(b)
+        buf.extend(_PACK_DA(0x44, obj.year, obj.month, obj.day))
+        return True
+    if isinstance(obj, (bytearray, memoryview)):
+        mv_raw = obj if isinstance(obj, memoryview) else memoryview(obj)
+        n_b = mv_raw.nbytes
+        buf.extend(_PACK_U32(0x59, n_b))
+        if n_b > 0:
+            try:
+                mv = mv_raw.cast("B")
+            except TypeError:
+                mv = memoryview(bytes(obj))
+            _append_raw_mv(buf, upd, flushed, mv)
         return True
     if isinstance(obj, np.ndarray):
-        arr = np.ascontiguousarray(obj)
-        shape_b = repr(arr.shape).encode("ascii")
+        if obj.dtype.hasobject:
+            return _stream_canonical_val(
+                buf, upd, flushed, ("__np_obj__", obj.shape, obj.dtype.str, obj.tolist())
+            )
+        arr = obj if obj.flags.c_contiguous else np.ascontiguousarray(obj)
+        ndim = arr.ndim
         dtype_b = arr.dtype.str.encode("ascii")
-        raw = arr.tobytes()
-        hasher.update(
-            b"NP"
-            + struct.pack("!II", len(shape_b), len(dtype_b))
-            + shape_b
-            + dtype_b
-            + struct.pack("!Q", len(raw))
-            + raw
-        )
-        counter[0] += 18 + len(shape_b) + len(dtype_b) + len(raw)
+        buf.append(0x4B)
+        hdr_packer = _PACK_ND_HDR.get(ndim)
+        if hdr_packer is not None:
+            buf.extend(hdr_packer(ndim, *arr.shape, len(dtype_b)))
+        else:
+            buf.extend(struct.pack(f"!I{ndim}QI", ndim, *arr.shape, len(dtype_b)))
+        buf.extend(dtype_b)
+        n_b = arr.nbytes
+        buf.extend(_PACK_U64(n_b))
+        if n_b > 0:
+            try:
+                mv = memoryview(cast(Any, arr)).cast("B")
+            except TypeError:
+                mv = memoryview(arr.tobytes())
+            _append_raw_mv(buf, upd, flushed, mv)
         return True
     if isinstance(obj, torch.Tensor):
         if obj.requires_grad:
             return False
-        arr = obj.detach().cpu().contiguous().numpy()
-        return _feed_canonical_bytes(hasher, arr, counter)
-    if hasattr(obj, "model_dump") and callable(obj.model_dump):
-        dumped = obj.model_dump(mode="python")
-        hasher.update(b"PM")
-        counter[0] += 2
-        return _feed_canonical_bytes(hasher, dumped, counter)
-    if isinstance(obj, Mapping):
-        hasher.update(b"M" + struct.pack("!I", len(obj)))
-        counter[0] += 5
-        for k in sorted(obj.keys(), key=lambda x: str(x)):
-            if not _feed_canonical_bytes(hasher, str(k), counter):
+        return _stream_canonical_val(buf, upd, flushed, obj.detach().cpu().numpy())
+    if isinstance(obj, (ClampedYieldCurve, RepoCurve, RegularizedVolSurface)):
+        return _stream_canonical_val(buf, upd, flushed, _canonical_market_obj_repr(obj))
+    if isinstance(obj, BaseModel):
+        field_pairs = _get_model_sorted_fields(tp)
+        cls_b = tp.__name__.encode("utf-8")
+        buf.extend(_PACK_U32(0x50, len(cls_b)))
+        buf.extend(cls_b)
+        obj_d = obj.__dict__
+        for k, k_hdr in field_pairs:
+            if k in obj_d:
+                buf.append(0x01)
+                buf.extend(k_hdr)
+                if not _stream_canonical_val(buf, upd, flushed, obj_d[k]):
+                    return False
+        buf.append(0x00)
+        extra = getattr(obj, "__pydantic_extra__", None)
+        if extra:
+            buf.append(0x01)
+            if not _append_mapping_bytes(buf, upd, flushed, extra):
                 return False
-            if not _feed_canonical_bytes(hasher, obj[k], counter):
-                return False
+        else:
+            buf.append(0x00)
+        if len(buf) > 65536:
+            _flush_canonical_buf(buf, upd, flushed)
         return True
+    if isinstance(obj, Mapping):
+        return _append_mapping_bytes(buf, upd, flushed, obj)
     if isinstance(obj, (list, tuple)):
-        hasher.update(b"L" + struct.pack("!I", len(obj)))
-        counter[0] += 5
+        buf.extend(_PACK_U32(0x4C if isinstance(obj, list) else 0x55, len(obj)))
         for item in obj:
-            if not _feed_canonical_bytes(hasher, item, counter):
+            if not _stream_canonical_val(buf, upd, flushed, item):
                 return False
         return True
     if isinstance(obj, (set, frozenset)):
-        items = sorted(obj, key=lambda x: str(x))
-        hasher.update(b"T" + struct.pack("!I", len(items)))
-        counter[0] += 5
+        items = sorted(obj, key=lambda x: (str(type(x)), str(x)))
+        buf.extend(_PACK_U32(0x5A if isinstance(obj, set) else 0x7A, len(items)))
         for item in items:
-            if not _feed_canonical_bytes(hasher, item, counter):
+            if not _stream_canonical_val(buf, upd, flushed, item):
                 return False
         return True
-    if isinstance(obj, (ClampedYieldCurve, RepoCurve, RegularizedVolSurface)):
-        return _feed_canonical_bytes(hasher, obj.__dict__, counter)
     if hasattr(obj, "__dict__"):
-        hasher.update(b"O")
-        counter[0] += 1
-        return _feed_canonical_bytes(hasher, vars(obj), counter)
+        cls_b = tp.__name__.encode("utf-8")
+        buf.extend(_PACK_U32(0x4F, len(cls_b)))
+        buf.extend(cls_b)
+        return _append_mapping_bytes(buf, upd, flushed, vars(obj))
     return False
+
+
+def _feed_canonical_bytes(hasher: Any, obj: Any, counter: list[int]) -> bool:
+    """Feeds deterministic canonical byte representation into a hasher."""
+    buf = bytearray()
+    flushed = [0]
+    upd = hasher.update
+    ok = _stream_canonical_val(buf, upd, flushed, obj)
+    if buf:
+        flushed[0] += len(buf)
+        upd(buf)
+    counter[0] += flushed[0]
+    return ok
+
+
+def _canonical_market_obj_repr(obj: Any) -> Any:
+    """Returns deterministic canonical tuple excluding runtime locks and spline caches."""
+    if isinstance(obj, ClampedYieldCurve):
+        return (
+            "ClampedYieldCurve",
+            obj.identifier,
+            obj.currency,
+            obj.as_of_date,
+            obj.dcc,
+            obj.interpolation_method,
+            obj.space_coords,
+            obj.extrapolation_method,
+            obj.quote_expression,
+            getattr(obj, "_input_mode", None),
+            obj.tenors,
+            obj.rates,
+        )
+    if isinstance(obj, RepoCurve):
+        inner = getattr(obj, "_inner_curve", None)
+        return (
+            "RepoCurve",
+            obj.identifier,
+            obj.as_of_date,
+            obj.dcc,
+            obj.interpolation_method,
+            obj.extrapolation_method,
+            obj.quote_expression,
+            obj.is_flat_zero,
+            _canonical_market_obj_repr(inner) if inner is not None else None,
+        )
+    if isinstance(obj, RegularizedVolSurface):
+        return (
+            "RegularizedVolSurface",
+            getattr(obj, "surface_id", None),
+            getattr(obj, "as_of_date", None),
+            getattr(obj, "dcc", None),
+            getattr(obj, "smile_interp", None),
+            getattr(obj, "smile_extrap", None),
+            getattr(obj, "bc_type", None),
+            float(getattr(obj, "min_vol", 0.0)),
+            float(getattr(obj, "max_local_vol", 0.0)),
+            getattr(obj, "tenors", None),
+            getattr(obj, "tenors_act365", None),
+            getattr(obj, "strikes", None),
+            getattr(obj, "quotes", None),
+            getattr(obj, "calendar_proj_digest", None),
+        )
+    return obj
 
 
 class _UncacheablePayloadError(Exception):
     """Raised when a payload contains an autograd-tracked tensor or unhashable object."""
 
 
-_ORJSON_CANONICAL_OPTS: int = (
-    orjson.OPT_SORT_KEYS
-    | orjson.OPT_SERIALIZE_NUMPY
-    | orjson.OPT_NON_STR_KEYS
-)
+def _append_vol_surface_to_buf(
+    buf: bytearray,
+    upd: Callable[[Any], Any],
+    flushed: list[int],
+    surf_spec: Any,
+    as_of_dt: datetime.datetime,
+    surface_id: str | None = None,
+    kwargs: Mapping[str, Any] | None = None,
+) -> bool:
+    """Streams volatility surface metadata and numeric arrays directly into `buf`."""
+    if isinstance(surf_spec, EquityVolSmileCollectionSpec):
+        t_name: Any = surf_spec.TypeName
+        eff_id: Any = surface_id or surf_spec.Identifier
+        dcc_raw: Any = surf_spec.DayCountConvention
+        interp_raw: Any = surf_spec.SmileInterpolationMethod
+        extrap_raw: Any = surf_spec.SmileExtrapolationMethod
+        ccy_raw: Any = surf_spec.Currency
+        exp_dates: Any = surf_spec.ExpirationDates
+        tenors_raw: Any = None
+        deltas_raw: Any = None
+        as_of_surf_raw: Any = None
+        fwd_obj_raw: Any = None
+        fin_curve_raw: Any = None
+        cal_raw: Any = None
+        min_vol_raw: Any = None
+        max_lv_raw: Any = None
+        bc_type_raw: Any = None
+        strikes: Any = surf_spec.Strikes
+        quotes: Any = surf_spec.VolatilityQuotes
+    elif isinstance(surf_spec, FXVolatilitySmileCollectionSpec):
+        t_name = surf_spec.TypeName
+        eff_id = surface_id or surf_spec.Identifier
+        dcc_raw = surf_spec.DayCountConvention
+        interp_raw = surf_spec.SmileInterpolationMethod
+        extrap_raw = surf_spec.SmileExtrapolationMethod
+        ccy_raw = None
+        exp_dates = None
+        tenors_raw = surf_spec.Tenors
+        deltas_raw = surf_spec.Deltas
+        as_of_surf_raw = surf_spec.AsOfDate
+        fwd_obj_raw = surf_spec.ForwardObject
+        fin_curve_raw = surf_spec.FinancingCurve
+        cal_raw = surf_spec.Calendar
+        min_vol_raw = None
+        max_lv_raw = None
+        bc_type_raw = None
+        strikes = None
+        quotes = surf_spec.VolatilityQuotes
+    else:
+        eff_id = surface_id or _extract_attr(surf_spec, "Identifier", "identifier", default="")
+        t_name = _extract_attr(surf_spec, "TypeName", "type_name", default="")
+        dcc_raw = _extract_attr(surf_spec, "DayCountConvention", "day_count_convention", "dcc", default="Act365")
+        interp_raw = _extract_attr(
+            surf_spec, "SmileInterpolationMethod", "smile_interpolation_method", "smile_interp", default="CubicSpline"
+        )
+        extrap_raw = _extract_attr(
+            surf_spec, "SmileExtrapolationMethod", "smile_extrapolation_method", "smile_extrap", default="Linear"
+        )
+        ccy_raw = _extract_attr(surf_spec, "Currency", "currency", default=None)
+        exp_dates = _extract_attr(surf_spec, "ExpirationDates", "expiration_dates", "exp_dates")
+        tenors_raw = _extract_attr(surf_spec, "tenors", "Tenors")
+        deltas_raw = _extract_attr(surf_spec, "Deltas", "deltas")
+        as_of_surf_raw = _extract_attr(surf_spec, "AsOfDate", "as_of_date")
+        fwd_obj_raw = _extract_attr(surf_spec, "ForwardObject", "forward_object")
+        fin_curve_raw = _extract_attr(surf_spec, "FinancingCurve", "financing_curve")
+        cal_raw = _extract_attr(surf_spec, "Calendar", "calendar", "calendar_proj_digest")
+        min_vol_raw = _extract_attr(surf_spec, "min_vol", "MinVol")
+        max_lv_raw = _extract_attr(surf_spec, "max_local_vol", "MaxLocalVol")
+        bc_type_raw = _extract_attr(surf_spec, "bc_type", "BcType")
+        strikes = _extract_attr(surf_spec, "Strikes", "strikes")
+        quotes = _extract_attr(surf_spec, "VolatilityQuotes", "volatility_quotes", "quotes")
+
+    buf.extend(b"VSF")
+    _append_str_val(buf, str(t_name))
+    _append_str_val(buf, str(eff_id))
+    _append_str_val(buf, str(getattr(dcc_raw, "value", dcc_raw)))
+    _append_str_val(buf, str(getattr(interp_raw, "value", interp_raw)))
+    _append_str_val(buf, str(getattr(extrap_raw, "value", extrap_raw)))
+    _append_opt_str_val(buf, str(ccy_raw) if ccy_raw is not None else None)
+    _append_dt_bytes(buf, as_of_dt)
+    if not _stream_canonical_val(buf, upd, flushed, as_of_surf_raw):
+        return False
+    if not _append_dt_seq_fast(buf, upd, flushed, exp_dates):
+        return False
+    for meta_field in (tenors_raw, deltas_raw, fwd_obj_raw, fin_curve_raw, cal_raw):
+        if not _stream_canonical_val(buf, upd, flushed, meta_field):
+            return False
+    if min_vol_raw is not None:
+        mv_f = float(min_vol_raw)
+        buf.extend(_PACK_F64(0x46, 0.0 if mv_f == 0.0 else mv_f))
+    else:
+        buf.append(0x4E)
+    if max_lv_raw is not None:
+        mlv_f = float(max_lv_raw)
+        buf.extend(_PACK_F64(0x46, 0.0 if mlv_f == 0.0 else mlv_f))
+    else:
+        buf.append(0x4E)
+    _append_opt_str_val(buf, str(bc_type_raw) if bc_type_raw is not None else None)
+    if kwargs is not None:
+        if not _append_mapping_bytes(buf, upd, flushed, kwargs):
+            return False
+    else:
+        buf.append(0x4E)
+
+    if strikes is None:
+        buf.append(0x4E)
+    elif isinstance(strikes, np.ndarray):
+        if not _stream_canonical_val(buf, upd, flushed, strikes):
+            return False
+    elif not _append_float_seq_typed(buf, upd, flushed, strikes):
+        return False
+
+    if quotes is None:
+        buf.append(0x4E)
+    elif isinstance(quotes, np.ndarray):
+        if not _stream_canonical_val(buf, upd, flushed, quotes):
+            return False
+    elif isinstance(quotes, (list, tuple)):
+        try:
+            row_lens: list[int] = []
+            q_arr = array("d")
+            for row in quotes:
+                if type(row) is list:
+                    row_lens.append(len(row))
+                    if 0.0 in row:
+                        q_arr.extend(0.0 if float(x) == 0.0 else float(x) for x in row)
+                    else:
+                        q_arr.fromlist(row)
+                elif isinstance(row, (list, tuple)):
+                    row_lens.append(len(row))
+                    if 0.0 in row:
+                        q_arr.extend(0.0 if float(x) == 0.0 else float(x) for x in row)
+                    else:
+                        q_arr.extend(row)
+                else:
+                    raise TypeError
+            buf.extend(_PACK_U32(0x51, len(row_lens)))
+            if row_lens:
+                len_arr = array("Q", row_lens)
+                _append_raw_mv(buf, upd, flushed, memoryview(len_arr).cast("B"))
+                if q_arr:
+                    _append_raw_mv(buf, upd, flushed, memoryview(q_arr).cast("B"))
+        except (TypeError, ValueError, OverflowError):
+            if not _stream_canonical_val(buf, upd, flushed, quotes):
+                return False
+    else:
+        if not _stream_canonical_val(buf, upd, flushed, quotes):
+            return False
+    return True
 
 
-def _orjson_canonical_default(obj: Any) -> Any:
-    if isinstance(obj, Enum):
-        return obj.value
-    if isinstance(obj, torch.Tensor):
-        if obj.requires_grad:
-            raise _UncacheablePayloadError()
-        arr = obj.detach().cpu().contiguous().numpy()
-        return ("__tensor__", arr.shape, arr.dtype.str, arr)
-    if isinstance(obj, np.ndarray):
-        arr = np.ascontiguousarray(obj)
-        return ("__ndarray__", arr.shape, arr.dtype.str, arr)
-    if hasattr(obj, "model_dump") and callable(obj.model_dump):
-        d = getattr(obj, "__dict__", None)
-        if isinstance(d, dict):
-            extra = getattr(obj, "__pydantic_extra__", None)
-            if extra:
-                return (obj.__class__.__name__, d, extra)
-            return (obj.__class__.__name__, d)
-        return obj.model_dump(mode="python")
-    if isinstance(obj, datetime.datetime):
-        return _to_utc_datetime(obj).isoformat()
-    if isinstance(obj, datetime.date):
-        return obj.isoformat()
-    if isinstance(obj, (set, frozenset)):
-        return ("__set__", sorted(obj, key=lambda x: str(x)))
-    if isinstance(obj, (bytes, bytearray)):
-        return ("__bytes__", bytes(obj).hex())
-    if isinstance(obj, Mapping):
-        return dict(obj)
-    if hasattr(obj, "__dict__"):
-        return (obj.__class__.__name__, vars(obj))
-    raise _UncacheablePayloadError()
+def _stream_vol_surface_bytes(
+    upd: Callable[[bytes], None],
+    surf_spec: Any,
+    as_of_dt: datetime.datetime,
+    surface_id: str | None = None,
+    kwargs: Mapping[str, Any] | None = None,
+) -> int:
+    """Streams live volatility surface fields into a hasher; returns streamed byte count."""
+    buf = bytearray()
+    flushed = [0]
+
+    def _emit_bytes(chunk: Any) -> None:
+        upd(bytes(chunk))
+
+    ok = _append_vol_surface_to_buf(
+        buf,
+        _emit_bytes,
+        flushed,
+        surf_spec,
+        as_of_dt,
+        surface_id=surface_id,
+        kwargs=kwargs,
+    )
+    if not ok:
+        raise _UncacheablePayloadError()
+    if buf:
+        flushed[0] += len(buf)
+        upd(bytes(buf))
+    return flushed[0]
+
+
+def build_vol_surface_cache_key(
+    surf_spec: Any,
+    as_of_dt: datetime.datetime,
+    surface_id: str | None = None,
+    kwargs: Mapping[str, Any] | None = None,
+) -> ContentDigestKey | None:
+    """Builds a blake2b ContentDigestKey for a volatility surface spec without full model_dump."""
+    try:
+        h = hashlib.blake2b(digest_size=16)
+        buf = bytearray()
+        flushed = [0]
+        ok = _append_vol_surface_to_buf(
+            buf,
+            h.update,
+            flushed,
+            surf_spec,
+            as_of_dt,
+            surface_id=surface_id,
+            kwargs=kwargs,
+        )
+        if not ok:
+            return None
+        if buf:
+            flushed[0] += len(buf)
+            h.update(buf)
+        return ContentDigestKey(
+            namespace="vol_surface",
+            digest_hex=h.hexdigest(),
+            payload_len=flushed[0],
+        )
+    except (TypeError, ValueError, AttributeError, _UncacheablePayloadError):
+        return digest_market_bytes(
+            "vol_surface",
+            (surf_spec, as_of_dt, dict(kwargs) if kwargs is not None else {"surface_id": surface_id}),
+        )
+
+
+def _append_market_dataset_to_buf(
+    buf: bytearray,
+    upd: Callable[[Any], Any],
+    flushed: list[int],
+    mkt: Any,
+    as_of_dt: datetime.datetime,
+) -> bool:
+    """Streams complete MarketDataSet interior state directly into `buf`."""
+    _append_dt_bytes(buf, as_of_dt)
+
+    spots = mkt.Spots
+    if spots:
+        s_keys = sorted(spots)
+        buf.extend(_PACK_U32(0x4D, len(s_keys)))
+        for k in s_keys:
+            _append_str_val(buf, k)
+            v = float(spots[k])
+            buf.extend(_PACK_F64(0x46, 0.0 if v == 0.0 else v))
+    else:
+        buf.extend(_PACK_U32(0x4D, 0))
+
+    corrs = mkt.Correlations
+    if corrs:
+        c_keys = sorted(corrs)
+        buf.extend(_PACK_U32(0x4D, len(c_keys)))
+        for k in c_keys:
+            _append_str_val(buf, k)
+            v = float(corrs[k])
+            buf.extend(_PACK_F64(0x46, 0.0 if v == 0.0 else v))
+    else:
+        buf.extend(_PACK_U32(0x4D, 0))
+
+    bundles = mkt.RatesCurvesBundles
+    buf.extend(_PACK_U32(0x52, len(bundles)))
+    for cid in sorted(bundles):
+        _append_str_val(buf, cid)
+        c = bundles[cid]
+        if isinstance(c, DiscountFactorCurveSpec):
+            _append_str_val(buf, c.Identifier)
+            _append_str_val(buf, c.Currency)
+            _append_dt_bytes(buf, c.AsOfDate)
+            _append_str_val(buf, c.InterpolationDayCountConvention.value)
+            _append_str_val(buf, c.InterpolationMethod.value)
+            _append_str_val(buf, c.InterpolationSpaceCoordinates.value)
+            _append_str_val(buf, c.ExtrapolationMethod.value)
+            _append_str_val(buf, c.RateQuoteExpression.value)
+            rs = c.RatesSchedule
+            if not _append_dt_seq_fast(buf, upd, flushed, rs.Dates):
+                return False
+            if not _append_float_seq_typed(buf, upd, flushed, rs.Rates):
+                return False
+            if not _append_float_seq_typed(buf, upd, flushed, rs.Spreads):
+                return False
+        elif not _stream_canonical_val(buf, upd, flushed, c):
+            return False
+
+    repos = mkt.RepoSpreadCurves
+    buf.extend(_PACK_U32(0x50, len(repos)))
+    for cid in sorted(repos):
+        _append_str_val(buf, cid)
+        c_repo = repos[cid]
+        if isinstance(c_repo, RepoSpreadCurveSpec):
+            _append_str_val(buf, c_repo.Identifier)
+            _append_str_val(buf, c_repo.InterpolationDayCountConvention.value)
+            _append_str_val(buf, c_repo.InterpolationMethod.value)
+            _append_str_val(buf, c_repo.ExtrapolationMethod.value)
+            _append_str_val(buf, c_repo.InterpolationSpaceCoordinates.value)
+            _append_str_val(buf, c_repo.RateQuoteExpression.value)
+            rs_r = c_repo.RatesSchedule
+            buf.extend(_PACK_U32(0x4C, len(rs_r.Periods)))
+            for p_str in rs_r.Periods:
+                _append_str_val(buf, p_str)
+            if not _append_float_seq_typed(buf, upd, flushed, rs_r.Rates):
+                return False
+        elif not _stream_canonical_val(buf, upd, flushed, c_repo):
+            return False
+
+    surfs = mkt.VolatilitySurfaces
+    buf.extend(_PACK_U32(0x56, len(surfs)))
+    for sid in sorted(surfs):
+        _append_str_val(buf, sid)
+        if not _append_vol_surface_to_buf(buf, upd, flushed, surfs[sid], as_of_dt, surface_id=sid):
+            return False
+
+    divs = mkt.Dividends
+    buf.extend(_PACK_U32(0x44, len(divs)))
+    utc_tz = _UTC
+    pack_div = _PACK_CASH_DIV
+    for tid in sorted(divs):
+        _append_str_val(buf, tid)
+        d_sp = divs[tid]
+        if isinstance(d_sp, DividendsSpec):
+            _append_str_val(buf, d_sp.Identifier)
+            _append_opt_str_val(buf, d_sp.Currency)
+            cdl = d_sp.CashDividendList
+            buf.extend(_PACK_U32(0x4C, len(cdl)))
+            for cd in cdl:
+                ex_dt = cd.ExDate
+                if ex_dt.tzinfo is not utc_tz:
+                    ex_dt = _to_utc_datetime(ex_dt)
+                pay_dt = cd.PaymentDate
+                if pay_dt.tzinfo is not utc_tz:
+                    pay_dt = _to_utc_datetime(pay_dt)
+                amt = float(cd.Amount)
+                buf.extend(
+                    pack_div(
+                        ex_dt.year,
+                        ex_dt.month,
+                        ex_dt.day,
+                        ex_dt.hour,
+                        ex_dt.minute,
+                        ex_dt.second,
+                        ex_dt.microsecond,
+                        pay_dt.year,
+                        pay_dt.month,
+                        pay_dt.day,
+                        pay_dt.hour,
+                        pay_dt.minute,
+                        pay_dt.second,
+                        pay_dt.microsecond,
+                        0.0 if amt == 0.0 else amt,
+                    )
+                )
+        elif not _stream_canonical_val(buf, upd, flushed, d_sp):
+            return False
+
+    fixings = mkt.Fixings
+    buf.extend(_PACK_U32(0x58, len(fixings)))
+    for tid in sorted(fixings):
+        _append_str_val(buf, tid)
+        f_sp = fixings[tid]
+        if isinstance(f_sp, FixingsSpec):
+            _append_str_val(buf, f_sp.Identifier)
+            if not _append_dt_seq_fast(buf, upd, flushed, f_sp.Dates):
+                return False
+            if not _append_float_seq_typed(buf, upd, flushed, f_sp.Values):
+                return False
+        elif not _stream_canonical_val(buf, upd, flushed, f_sp):
+            return False
+
+    return True
+
+
+def _stream_eq_request_live(
+    req_obj: Any,
+    *,
+    d_max: int,
+    m_max: int,
+    as_of_dt: datetime.datetime,
+) -> ContentDigestKey | None:
+    """Streams live EQAutocallableTradeRequest market and contract fields via struct+blake2b."""
+    try:
+        prod = req_obj.Product
+        mdl = req_obj.Model
+        mkt = mdl.MarketDataSet
+        h = hashlib.blake2b(digest_size=16)
+        buf = bytearray()
+        flushed = [0]
+        upd = h.update
+
+        ver_b = FEATURE_SCHEMA_VERSION.encode("ascii")
+        buf.extend(struct.pack("!2II", int(d_max), int(m_max), len(ver_b)))
+        buf.extend(ver_b)
+
+        if not _stream_canonical_val(buf, upd, flushed, prod):
+            return None
+
+        fin_ids = mdl.FinancingCurveIdentifiers
+        if fin_ids:
+            buf.extend(_PACK_U32(0x46, len(fin_ids)))
+            for x in fin_ids:
+                _append_str_val(buf, str(x))
+        else:
+            buf.extend(_PACK_U32(0x46, 0))
+
+        if not _append_market_dataset_to_buf(buf, upd, flushed, mkt, as_of_dt):
+            return None
+
+        if buf:
+            flushed[0] += len(buf)
+            upd(buf)
+        return ContentDigestKey(
+            namespace="preproc_state",
+            digest_hex=h.hexdigest(),
+            payload_len=flushed[0],
+        )
+    except (AttributeError, TypeError, ValueError, KeyError, _UncacheablePayloadError):
+        return None
 
 
 def digest_market_bytes(namespace: str, payload: Any) -> ContentDigestKey | None:
-    """Builds a SHA-256 ContentDigestKey covering 100% of interior values."""
-    try:
-        raw = orjson.dumps(
-            payload,
-            option=_ORJSON_CANONICAL_OPTS,
-            default=_orjson_canonical_default,
-        )
-        return ContentDigestKey(
-            namespace=namespace,
-            digest_hex=hashlib.sha256(raw).hexdigest(),
-            payload_len=len(raw),
-        )
-    except _UncacheablePayloadError:
+    """Builds a blake2b ContentDigestKey covering 100% of interior values."""
+    if isinstance(payload, EQAutocallableTradeRequest) or (
+        hasattr(payload, "Product")
+        and hasattr(payload, "Model")
+        and hasattr(getattr(payload, "Model"), "MarketDataSet")
+    ):
+        as_of_raw = getattr(payload.Model.MarketDataSet, "AsOfDate", None)
+        if as_of_raw is not None:
+            key_live = _stream_eq_request_live(
+                payload,
+                d_max=D_MAX_DEFAULT,
+                m_max=M_MAX_DEFAULT,
+                as_of_dt=_to_utc_datetime(as_of_raw),
+            )
+            if key_live is not None:
+                return ContentDigestKey(
+                    namespace=namespace,
+                    digest_hex=key_live.digest_hex,
+                    payload_len=key_live.payload_len,
+                )
+
+    h = hashlib.blake2b(digest_size=16)
+    buf = bytearray()
+    flushed = [0]
+    upd = h.update
+    if isinstance(payload, MarketDataSetSpec):
+        try:
+            ok = _append_market_dataset_to_buf(buf, upd, flushed, payload, _to_utc_datetime(payload.AsOfDate))
+        except (AttributeError, TypeError, ValueError, KeyError):
+            ok = False
+    else:
+        ok = _stream_canonical_val(buf, upd, flushed, payload)
+    if not ok:
         return None
-    except Exception:
-        h = hashlib.sha256()
-        counter = [0]
-        if not _feed_canonical_bytes(h, payload, counter):
-            return None
-        return ContentDigestKey(namespace=namespace, digest_hex=h.hexdigest(), payload_len=counter[0])
+    if buf:
+        flushed[0] += len(buf)
+        upd(buf)
+    return ContentDigestKey(
+        namespace=namespace,
+        digest_hex=h.hexdigest(),
+        payload_len=flushed[0],
+    )
 
 
 def _clone_dataclass_tensors(obj: Any) -> Any:
@@ -584,6 +1328,114 @@ def _clone_dataclass_fields(obj: Any) -> Any:
             if k not in field_names:
                 setattr(cloned, k, _clone_dataclass_tensors(v))
     return cloned
+
+
+def compute_surface_digest(surf: RegularizedVolSurface) -> str:
+    """Computes a 64-hex SHA-256 content digest for a regularized volatility surface."""
+    h = hashlib.sha256()
+    counter = [0]
+    _feed_canonical_bytes(h, _canonical_market_obj_repr(surf), counter)
+    return h.hexdigest()
+
+
+def _detach_for_digest(val: Any) -> Any:
+    if isinstance(val, torch.Tensor):
+        return val.detach().cpu().contiguous().numpy()
+    if isinstance(val, (ClampedYieldCurve, RepoCurve, RegularizedVolSurface)):
+        return _canonical_market_obj_repr(val)
+    if isinstance(val, Mapping):
+        return {str(k): _detach_for_digest(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [_detach_for_digest(x) for x in val]
+    return val
+
+
+def compute_preproc_state_digest(state: AutocallPreprocState) -> str:
+    """Computes an immutable 64-hex SHA-256 digest covering all market and contract state inputs."""
+    h = hashlib.sha256()
+    counter = [0]
+    surf_digests = (
+        dict(state.surface_digests)
+        if state.surface_digests
+        else {k: compute_surface_digest(v) for k, v in state.vol_surfaces.items()}
+    )
+    payload = (
+        state.feature_schema_version,
+        int(state.d_assets),
+        int(state.m_rem),
+        int(state.d_max),
+        int(state.m_max),
+        tuple(state.original_identifiers),
+        tuple(state.sorted_identifiers),
+        state.lex_perm,
+        state.inv_lex_perm,
+        _detach_for_digest(state.spots_t0),
+        _detach_for_digest(state.ref_spots),
+        _detach_for_digest(state.corr_matrix),
+        _detach_for_digest(state.tau_obs),
+        _detach_for_digest(state.delta_tau),
+        _detach_for_digest(state.tau_pay),
+        _detach_for_digest(state.df_obs),
+        _detach_for_digest(state.df_pay),
+        _detach_for_digest(state.ko_barriers),
+        _detach_for_digest(state.is_callable),
+        _detach_for_digest(state.cpn_barriers),
+        _detach_for_digest(state.is_guaranteed_cpn),
+        _detach_for_digest(state.coupon_amounts),
+        _detach_for_digest(state.forward_rel),
+        _detach_for_digest(state.forward_perf),
+        _detach_for_digest(state.cash_div_leverage),
+        _detach_for_digest(state.iv_at_fwd),
+        _detach_for_digest(state.v_perf),
+        _detach_for_digest(state.r_native_obs),
+        surf_digests,
+        _detach_for_digest(state.discount_curve),
+        state.discount_curve_id,
+        _detach_for_digest(state.asset_financing_curves),
+        _detach_for_digest(state.repo_curves_map),
+        _detach_for_digest(state.quanto_fx_specs),
+        _detach_for_digest(state.quanto_meta),
+        _detach_for_digest(state.funding_leg),
+        state.seasoned_state.as_of_date,
+        state.seasoned_state.start_date,
+        tuple(state.seasoned_state.future_obs_dates),
+        tuple(state.seasoned_state.future_pay_dates),
+        float(state.c_mem_0),
+        float(state.i_ki_past),
+        bool(state.already_autocalled),
+        float(state.pv_in_transit),
+        float(state.cash_to_settle_today),
+        float(state.strike),
+        float(state.option_gearing),
+        float(state.lower_strike) if state.lower_strike is not None else None,
+        float(state.ki_barrier) if state.ki_barrier is not None else None,
+        bool(state.is_memory),
+        float(state.ko_spread),
+        float(state.cpn_spread),
+        float(state.ki_spread),
+        bool(state.no_notional_repayment),
+        float(state.autocall_coupon),
+        bool(state.force_coupons_on_autocall),
+        bool(state.allow_autocall_on_expiry),
+        float(state.participation_call_strike) if state.participation_call_strike is not None else None,
+        float(state.participation_call_rate),
+        float(state.one_star_strike) if state.one_star_strike is not None else None,
+        float(state.one_star_coupon),
+        bool(state.is_long_basket),
+        state.payment_currency,
+        state.callability_index,
+        state.coupon_index,
+        state.option_index,
+        state.coupon_barrier_type,
+        state.coupon_barrier_direction,
+        {
+            str(k): [(ev.ex_date, ev.payment_date, float(ev.amount)) for ev in evs]
+            for k, evs in state.dividend_schedule.dividend_events.items()
+        },
+        _detach_for_digest(state.dividend_schedule.dividend_amount_tensors),
+    )
+    _feed_canonical_bytes(h, payload, counter)
+    return h.hexdigest()
 
 
 def _clone_preproc_state(state: AutocallPreprocState) -> AutocallPreprocState:
@@ -647,11 +1499,134 @@ def _clone_preproc_state(state: AutocallPreprocState) -> AutocallPreprocState:
         asset_financing_curves=dict(state.asset_financing_curves),
         r_native_obs=state.r_native_obs.clone() if state.r_native_obs is not None else None,
         warnings=list(state.warnings),
+        repo_curves_map=dict(state.repo_curves_map),
+        quanto_fx_specs=dict(state.quanto_fx_specs),
+        surface_digests=dict(state.surface_digests),
     )
+
+
+def _normalize_repo_curves_map(
+    raw_map: Any,
+    as_of_dt: Any,
+) -> dict[str, Any]:
+    """Converts raw `RepoSpreadCurves` entries into `RepoCurve` instances for AD/QMC Greeks."""
+    if not isinstance(raw_map, Mapping) or not raw_map:
+        return {}
+    eff_dt = _to_utc_datetime(as_of_dt) if as_of_dt is not None else None
+    out: dict[str, Any] = {}
+    for cid, spec in raw_map.items():
+        if spec is None:
+            continue
+        if callable(getattr(spec, "repo_df", None)) or callable(getattr(spec, "df", None)):
+            out[str(cid)] = spec
+        else:
+            out[str(cid)] = RepoCurve(spec, as_of_date=eff_dt)
+    return out
+
+
+def _freeze_obj_tensors(obj: Any) -> None:
+    if obj is None:
+        return
+    if hasattr(obj, "__dict__"):
+        for val in vars(obj).values():
+            if isinstance(val, torch.Tensor):
+                if val.requires_grad:
+                    val.requires_grad_(False)
+            elif isinstance(val, dict):
+                for inner in val.values():
+                    if isinstance(inner, torch.Tensor) and inner.requires_grad:
+                        inner.requires_grad_(False)
+
+
+def _freeze_preproc_state_tensors(state: AutocallPreprocState) -> None:
+    """Detaches tensor fields before storing shared read-only entries in _PREPROC_STATE_CACHE."""
+    _freeze_obj_tensors(state)
+    _freeze_obj_tensors(state.seasoned_state)
+    _freeze_obj_tensors(state.dividend_schedule)
+    _freeze_obj_tensors(state.baseline)
+
+
+def _shallow_clone_preproc_state(state: AutocallPreprocState) -> AutocallPreprocState:
+    """Clones mutable tensors and Python containers while sharing immutable market objects."""
+    cloned = copy.copy(state)
+    cloned.node_feats = state.node_feats.clone()
+    cloned.edge_feats = state.edge_feats.clone()
+    cloned.asset_mask = state.asset_mask.clone()
+    cloned.sched_feats = state.sched_feats.clone()
+    cloned.sched_mask = state.sched_mask.clone()
+    cloned.global_feats = state.global_feats.clone()
+    cloned.lex_perm = state.lex_perm.copy()
+    cloned.inv_lex_perm = state.inv_lex_perm.copy()
+    cloned.spots_t0 = state.spots_t0.clone()
+    cloned.ref_spots = state.ref_spots.clone()
+    cloned.moneyness_t0 = state.moneyness_t0.clone()
+    cloned.corr_matrix = state.corr_matrix.clone()
+    cloned.tau_obs = state.tau_obs.clone()
+    cloned.delta_tau = state.delta_tau.clone()
+    cloned.tau_pay = state.tau_pay.clone()
+    cloned.df_obs = state.df_obs.clone()
+    cloned.df_pay = state.df_pay.clone()
+    cloned.ko_barriers = state.ko_barriers.clone()
+    cloned.is_callable = state.is_callable.clone()
+    cloned.cpn_barriers = state.cpn_barriers.clone()
+    cloned.is_guaranteed_cpn = state.is_guaranteed_cpn.clone()
+    cloned.coupon_amounts = state.coupon_amounts.clone()
+    cloned.forward_rel = state.forward_rel.clone()
+    cloned.forward_perf = state.forward_perf.clone()
+    cloned.cash_div_leverage = state.cash_div_leverage.clone()
+    cloned.iv_at_fwd = state.iv_at_fwd.clone()
+    cloned.v_perf = state.v_perf.clone()
+    cloned.r_native_obs = state.r_native_obs.clone() if state.r_native_obs is not None else None
+    cloned.original_identifiers = list(state.original_identifiers)
+    cloned.sorted_identifiers = list(state.sorted_identifiers)
+    cloned.vol_surfaces = dict(state.vol_surfaces)
+    cloned.surface_feature_jacobians = (
+        state.surface_feature_jacobians.clone()
+        if isinstance(state.surface_feature_jacobians, _LazySurfaceJacobianDict)
+        else {k: v.copy() for k, v in state.surface_feature_jacobians.items()}
+    )
+    cloned.iv_at_fwd_jacobians = (
+        state.iv_at_fwd_jacobians.clone()
+        if isinstance(state.iv_at_fwd_jacobians, _LazySurfaceJacobianDict)
+        else {k: v.copy() for k, v in state.iv_at_fwd_jacobians.items()}
+    )
+    cloned.funding_leg = (
+        {k: (list(v) if isinstance(v, list) else v) for k, v in state.funding_leg.items()}
+        if state.funding_leg is not None
+        else None
+    )
+    cloned.queries = list(state.queries)
+    cloned.quanto_meta = {k: dict(v) for k, v in state.quanto_meta.items()}
+    cloned.asset_financing_curves = dict(state.asset_financing_curves)
+    cloned.warnings = list(state.warnings)
+    cloned.repo_curves_map = dict(state.repo_curves_map)
+    cloned.quanto_fx_specs = dict(state.quanto_fx_specs)
+    cloned.surface_digests = dict(state.surface_digests)
+
+    seasoned_copy = copy.copy(state.seasoned_state)
+    seasoned_copy.original_identifiers = list(state.seasoned_state.original_identifiers)
+    seasoned_copy.sorted_identifiers = list(state.seasoned_state.sorted_identifiers)
+    seasoned_copy.lex_perm = state.seasoned_state.lex_perm.copy()
+    seasoned_copy.inv_lex_perm = state.seasoned_state.inv_lex_perm.copy()
+    seasoned_copy.spots_t0 = state.seasoned_state.spots_t0.clone()
+    seasoned_copy.ref_spots = state.seasoned_state.ref_spots.clone()
+    seasoned_copy.moneyness_t0 = state.seasoned_state.moneyness_t0.clone()
+    seasoned_copy.tau_obs = state.seasoned_state.tau_obs.copy()
+    seasoned_copy.delta_tau = state.seasoned_state.delta_tau.copy()
+    seasoned_copy.tau_pay = state.seasoned_state.tau_pay.copy()
+    seasoned_copy.future_coupon_rates = state.seasoned_state.future_coupon_rates.copy()
+    seasoned_copy.historical_records = list(state.seasoned_state.historical_records)
+    seasoned_copy.past_cashflows = list(state.seasoned_state.past_cashflows)
+    seasoned_copy.future_obs_dates = list(state.seasoned_state.future_obs_dates)
+    seasoned_copy.future_pay_dates = list(state.seasoned_state.future_pay_dates)
+    seasoned_copy.warnings = list(state.seasoned_state.warnings)
+    cloned.seasoned_state = seasoned_copy
+    return cloned
 
 
 _MARKET_OBJECT_CACHE = ThreadSafeLRUCache(maxsize=512, copy_fn=None)
 _PREPROC_STATE_CACHE = ThreadSafeLRUCache(maxsize=512, copy_fn=_clone_preproc_state)
+_FUNDING_WEIGHTS_CACHE = ThreadSafeLRUCache(maxsize=256, copy_fn=None)
 
 
 def _extract_attr(obj: Any, *names: str, default: Any = None) -> Any:
@@ -692,113 +1667,13 @@ def _get_cached_yield_curve(spec: Any, as_of_dt: datetime.datetime) -> ClampedYi
         return spec
     key = digest_market_bytes("yield_curve", (spec, as_of_dt))
     if key is not None:
-        cached = _MARKET_OBJECT_CACHE.get(key)
+        cached = _MARKET_OBJECT_CACHE.get(key, clone_return=False)
         if cached is not None:
             return cast(ClampedYieldCurve, cached)
     curve = ClampedYieldCurve(spec, as_of_date=as_of_dt)
     if key is not None:
-        return cast(ClampedYieldCurve, _MARKET_OBJECT_CACHE.put(key, curve))
+        return cast(ClampedYieldCurve, _MARKET_OBJECT_CACHE.put(key, curve, clone_return=False))
     return curve
-
-
-_VERSION_STATUS_TAGS: frozenset[str] = frozenset(
-    {
-        "OLD",
-        "NEW",
-        "REG",
-        "PREF",
-        "P",
-        "DR",
-        "ADR",
-        "GDR",
-        "CLS",
-        "LOCAL",
-        "SHS",
-        "ORD",
-        "A",
-        "B",
-        "C",
-        "1",
-        "2",
-    }
-)
-_KNOWN_ISO_CURRENCIES: frozenset[str] = frozenset(
-    {
-        "RUB",
-        "USD",
-        "CNH",
-        "CNY",
-        "EUR",
-        "GBP",
-        "HKD",
-        "CHF",
-        "JPY",
-        "AED",
-        "KZT",
-        "BYN",
-        "TRY",
-        "INR",
-        "BRL",
-        "ZAR",
-        "CAD",
-        "AUD",
-        "SGD",
-        "NZD",
-        "SEK",
-        "NOK",
-        "DKK",
-        "PLN",
-        "MXN",
-        "KRW",
-        "TWD",
-    }
-)
-_COUNTRY_SUFFIX_TO_CCY: dict[str, str] = {
-    "US": "USD",
-    "HK": "HKD",
-    "CN": "CNH",
-    "EU": "EUR",
-    "LN": "GBP",
-    "GR": "EUR",
-    "FP": "EUR",
-    "GY": "EUR",
-    "SW": "CHF",
-    "JP": "JPY",
-    "KZ": "KZT",
-}
-_OIS_CURVE_TOKENS: tuple[str, ...] = (
-    "OIS",
-    "SOFR",
-    "RUONIA",
-    "ESTR",
-    "SONIA",
-    "TONAR",
-    "SARON",
-    "SHIBOR",
-)
-_FUNDING_CURVE_TOKENS: tuple[str, ...] = ("FUNDING", "FUND", "SECD")
-
-
-def _curve_ois_priority_rank(cid: str, fin_ids: Sequence[str] = ()) -> tuple[int, str]:
-    """Ranks candidate same-currency curves for equity forward growth (F-12).
-
-    Rank 0: OIS curves ('OIS', 'SOFR', 'RUONIA', 'ESTR', 'SONIA') without 'XCCY', 'FUNDING', 'SECD'.
-    Rank 1: Standard yield / FX curves not in fin_ids and without 'XCCY', 'FUNDING', 'SECD'.
-    Rank 2: 'XCCY' cross-currency basis curves.
-    Rank 3: Curves in fin_ids or containing 'FUNDING' / 'SECD'.
-    """
-    cid_u = str(cid).strip().upper()
-    fin_set = {str(f).strip().upper() for f in fin_ids}
-    has_xccy = "XCCY" in cid_u
-    has_funding = any(tok in cid_u for tok in _FUNDING_CURVE_TOKENS)
-    has_ois = any(tok in cid_u for tok in _OIS_CURVE_TOKENS)
-    if has_ois and not has_xccy and not has_funding:
-        return (0, cid_u)
-    if not has_xccy and not has_funding and cid_u not in fin_set:
-        return (1, cid_u)
-    if has_xccy:
-        return (2, cid_u)
-    return (3, cid_u)
 
 
 def _infer_asset_currency_5tier(
@@ -810,86 +1685,16 @@ def _infer_asset_currency_5tier(
     correlations_map: Mapping[str, float] | None = None,
     rates_bundles: Mapping[str, Any] | None = None,
 ) -> str:
-    """5-tier deterministic asset currency inference (I-5a)."""
-    pay_ccy_upper = str(payment_ccy).strip().upper()
-
-    # Tier 1: Explicit Currency metadata on div_src or vol_surfaces_map[ticker]
-    for src in (
-        div_src,
-        vol_surfaces_map.get(ticker) if isinstance(vol_surfaces_map, Mapping) else None,
-    ):
-        raw_ccy = _extract_attr(src, "Currency", "currency") if src is not None else None
-        if isinstance(raw_ccy, str):
-            c_up = raw_ccy.strip().upper()
-            if len(c_up) == 3 and c_up.isalpha() and c_up not in _VERSION_STATUS_TAGS:
-                return c_up
-
-    # Tier 2: Tokenized '_' scan after stripping version/status tags
-    tokens = [tok.strip().upper() for tok in str(ticker).split("_") if tok.strip()]
-    while len(tokens) > 1 and tokens[-1] in _VERSION_STATUS_TAGS:
-        tokens.pop()
-    if len(tokens) > 2 and tokens[-1] == "RX" and len(tokens[-2]) == 3 and tokens[-2].isalpha():
-        tokens.pop()
-    for tok in reversed(tokens[1:]):
-        if tok in _KNOWN_ISO_CURRENCIES:
-            return tok
-    if len(tokens) >= 2 and len(tokens[-1]) == 3 and tokens[-1].isalpha() and tokens[-1] not in _VERSION_STATUS_TAGS:
-        return tokens[-1]
-
-    # Tier 3: Correlations & FXVolatilitySmileCollection pair graph ('AAPLUS&USDRUB', 'MSFT&USDRUB' -> 'USD')
-    if isinstance(correlations_map, Mapping):
-        fx_candidates: list[str] = []
-        if isinstance(vol_surfaces_map, Mapping):
-            for sid, s_obj in vol_surfaces_map.items():
-                t_name = _extract_attr(s_obj, "TypeName", "type_name")
-                sid_clean = str(sid).strip().upper().replace("_", "").replace("/", "").replace("-", "")
-                if t_name == "FXVolatilitySmileCollection" or (
-                    len(sid_clean) == 6
-                    and sid_clean[:3] in _KNOWN_ISO_CURRENCIES
-                    and sid_clean[3:] in _KNOWN_ISO_CURRENCIES
-                ):
-                    fx_candidates.append(str(sid))
-        # Also scan correlation keys directly for 6-letter FX pairs paired with ticker
-        for corr_key in correlations_map:
-            if "&" in str(corr_key):
-                lhs, rhs = str(corr_key).split("&", 1)
-                other = rhs if lhs == ticker else (lhs if rhs == ticker else None)
-                if other is not None and other not in fx_candidates:
-                    other_clean = other.strip().upper().replace("_", "").replace("/", "").replace("-", "")
-                    if (
-                        len(other_clean) == 6
-                        and other_clean[:3] in _KNOWN_ISO_CURRENCIES
-                        and other_clean[3:] in _KNOWN_ISO_CURRENCIES
-                    ):
-                        fx_candidates.append(other)
-
-        for fx_id in fx_candidates:
-            if f"{ticker}&{fx_id}" in correlations_map or f"{fx_id}&{ticker}" in correlations_map:
-                fx_clean = fx_id.strip().upper().replace("_", "").replace("/", "").replace("-", "")
-                if len(fx_clean) == 6 and fx_clean[:3].isalpha() and fx_clean[3:].isalpha():
-                    c1, c2 = fx_clean[:3], fx_clean[3:]
-                    if c1 == pay_ccy_upper and c2 != pay_ccy_upper:
-                        return c2
-                    if c2 == pay_ccy_upper and c1 != pay_ccy_upper:
-                        return c1
-
-    # Tier 4: 2-letter country suffix ('AAPLUS', 'GOOGLUS' -> 'USD' when foreign curve/FX exists)
-    base_tok = tokens[0] if tokens else str(ticker).strip().upper()
-    if len(base_tok) >= 5 and base_tok[-2:] in _COUNTRY_SUFFIX_TO_CCY:
-        cand_ccy = _COUNTRY_SUFFIX_TO_CCY[base_tok[-2:]]
-        has_ccy_curve = isinstance(rates_bundles, Mapping) and any(
-            str(cid).strip().upper().startswith(cand_ccy)
-            or str(_extract_attr(spec_c, "Currency", "currency", default="")).strip().upper() == cand_ccy
-            for cid, spec_c in rates_bundles.items()
-        )
-        has_ccy_fx = isinstance(vol_surfaces_map, Mapping) and any(
-            cand_ccy in str(sid).strip().upper() for sid in vol_surfaces_map
-        )
-        if has_ccy_curve or has_ccy_fx or (not rates_bundles and not vol_surfaces_map):
-            return cand_ccy
-
-    # Tier 5: Default to payment_currency
-    return pay_ccy_upper
+    """Delegates asset currency resolution to the canonical 5-tier escrowed_dividend resolver."""
+    return infer_asset_currency_from_context(
+        ticker,
+        payment_ccy,
+        div_spec=div_src,
+        fx_smiles=vol_surfaces_map,
+        vol_surfaces=vol_surfaces_map,
+        correlations=correlations_map,
+        rates_bundles=rates_bundles,
+    )
 
 
 def _get_cached_vol_surface(
@@ -910,7 +1715,6 @@ def _get_cached_vol_surface(
         if s_interp is not None:
             kwargs["smile_interp"] = str(getattr(s_interp, "value", s_interp))
     if "smile_extrap" in _VOL_SURF_SIG_PARAMS:
-        s_extrap = _extract_attr(surf_spec, "SmileExtrapolationMethod", "smile_interpolation_method")
         s_extrap = _extract_attr(surf_spec, "SmileExtrapolationMethod", "smile_extrapolation_method")
         if s_extrap is not None:
             kwargs["smile_extrap"] = str(getattr(s_extrap, "value", s_extrap))
@@ -919,14 +1723,19 @@ def _get_cached_vol_surface(
         if eff_id is not None:
             kwargs["surface_id"] = str(eff_id)
 
-    key = digest_market_bytes("vol_surface", (surf_spec, as_of_dt, kwargs))
+    key = build_vol_surface_cache_key(
+        surf_spec,
+        as_of_dt,
+        surface_id=surface_id,
+        kwargs=kwargs,
+    )
     if key is not None:
-        cached = _MARKET_OBJECT_CACHE.get(key)
+        cached = _MARKET_OBJECT_CACHE.get(key, clone_return=False)
         if cached is not None:
             return cast(RegularizedVolSurface, cached)
     surf = RegularizedVolSurface(surf_spec, as_of_date=as_of_dt, **kwargs)
     if key is not None:
-        return cast(RegularizedVolSurface, _MARKET_OBJECT_CACHE.put(key, surf))
+        return cast(RegularizedVolSurface, _MARKET_OBJECT_CACHE.put(key, surf, clone_return=False))
     return surf
 
 
@@ -969,15 +1778,20 @@ def _resolve_curves_and_financing(
                     disc_curve_spec = rates_bundles[cid]
                     break
         if disc_curve_spec is None:
-            for cid, spec_c in rates_bundles.items():
-                spec_ccy = str(_extract_attr(spec_c, "Currency", "currency", default="")).upper()
-                if spec_ccy == payment_ccy.upper() or str(cid).upper().startswith(pay_prefix):
-                    disc_curve_id = str(cid)
-                    disc_curve_spec = spec_c
-                    break
-        if disc_curve_spec is None:
-            disc_curve_id = str(next(iter(rates_bundles.keys())))
-            disc_curve_spec = rates_bundles[disc_curve_id]
+            same_ccy_cands: list[tuple[tuple[int, str], int, str, Any]] = []
+            fallback_cands: list[tuple[tuple[int, str], int, str, Any]] = []
+            for idx, (cid, spec_c) in enumerate(rates_bundles.items()):
+                cid_str = str(cid)
+                spec_ccy = str(_extract_attr(spec_c, "Currency", "currency", default="")).strip().upper()
+                prio = _curve_ois_priority_rank(cid_str, fin_ids)
+                entry = (prio, idx, cid_str, spec_c)
+                if spec_ccy == payment_ccy.upper() or cid_str.upper().startswith(pay_prefix) or cid_str.upper() == payment_ccy.upper():
+                    same_ccy_cands.append(entry)
+                fallback_cands.append(entry)
+            chosen_list = same_ccy_cands if same_ccy_cands else fallback_cands
+            chosen_list.sort(key=lambda item: (item[0], item[1]))
+            disc_curve_id = chosen_list[0][2]
+            disc_curve_spec = chosen_list[0][3]
 
     disc_curve_obj = _get_cached_yield_curve(disc_curve_spec, as_of_dt) if disc_curve_spec is not None else None
 
@@ -1045,27 +1859,55 @@ def _build_correlation_matrix(
     if corr_input is None:
         if d_assets <= 1:
             return torch.eye(d_assets, dtype=torch.float64, device=device)
-        raise KeyError("Missing Correlations map for multi-asset basket.")
+        raise ValueError("Missing Correlations map for multi-asset basket.")
     if isinstance(corr_input, torch.Tensor):
-        return corr_input.to(dtype=torch.float64, device=device)
+        t_out = corr_input.to(dtype=torch.float64, device=device)
+        if t_out.shape != (d_assets, d_assets) or not bool(torch.all(torch.isfinite(t_out)).item()):
+            raise ValueError(f"Correlation tensor must be finite with shape ({d_assets}, {d_assets}).")
+        return t_out
     if not isinstance(corr_input, Mapping):
-        return torch.as_tensor(np.asarray(corr_input, dtype=np.float64), dtype=torch.float64, device=device)
+        arr = np.asarray(corr_input, dtype=np.float64)
+        if arr.shape != (d_assets, d_assets) or not np.all(np.isfinite(arr)):
+            raise ValueError(f"Correlation matrix must be finite with shape ({d_assets}, {d_assets}).")
+        return torch.as_tensor(arr, dtype=torch.float64, device=device)
+    if len(corr_input) == 0:
+        if d_assets <= 1:
+            return torch.eye(d_assets, dtype=torch.float64, device=device)
+        raise ValueError("Missing Correlations map for multi-asset basket.")
 
     mat = np.eye(d_assets, dtype=np.float64)
     for i in range(d_assets):
+        id_i = sorted_ids[i]
+        diag_key = f"{id_i}&{id_i}"
+        if diag_key in corr_input:
+            diag_val = float(corr_input[diag_key])
+            if not math.isfinite(diag_val) or abs(diag_val - 1.0) > 1e-6:
+                raise ValueError(f"Invalid self-correlation {diag_key!r}={diag_val!r}; expected 1.0.")
         for j in range(i + 1, d_assets):
-            id_i = sorted_ids[i]
             id_j = sorted_ids[j]
             k1 = f"{id_i}&{id_j}"
             k2 = f"{id_j}&{id_i}"
-            if k1 in corr_input:
+            in_1 = k1 in corr_input
+            in_2 = k2 in corr_input
+            if in_1 and in_2:
+                v1 = float(corr_input[k1])
+                v2 = float(corr_input[k2])
+                if not math.isfinite(v1) or not math.isfinite(v2):
+                    raise ValueError(f"Non-finite correlation for pair {k1!r}.")
+                if abs(v1 - v2) > 1e-6:
+                    raise ValueError(f"Contradictory correlations {k1!r}={v1} vs {k2!r}={v2}.")
+                c_val = v1
+            elif in_1:
                 c_val = float(corr_input[k1])
-            elif k2 in corr_input:
+            elif in_2:
                 c_val = float(corr_input[k2])
             else:
-                raise KeyError(f"Missing pairwise correlation for {k1!r}.")
-            mat[i, j] = c_val
-            mat[j, i] = c_val
+                raise ValueError(f"Missing pairwise correlation for {k1!r}.")
+            if not math.isfinite(c_val) or c_val < -1.0 - 1e-9 or c_val > 1.0 + 1e-9:
+                raise ValueError(f"Correlation for {k1!r}={c_val} is outside [-1, 1].")
+            c_clamped = max(-1.0, min(1.0, c_val))
+            mat[i, j] = c_clamped
+            mat[j, i] = c_clamped
     return torch.as_tensor(mat, dtype=torch.float64, device=device)
 
 
@@ -1079,11 +1921,30 @@ def _extract_funding_fixings(
     f_obj = fixings_map.get(rate_identifier)
     if f_obj is None:
         return ()
-    raw_dates = _extract_attr(f_obj, "Dates", "dates", default=())
-    raw_vals = _extract_attr(f_obj, "Values", "values", default=())
-    if not raw_dates or not raw_vals:
+    if isinstance(f_obj, Mapping) and not any(
+        k in f_obj for k in ("Dates", "dates", "Values", "values")
+    ):
+        raw_dates: Any = list(f_obj.keys())
+        raw_vals: Any = list(f_obj.values())
+    else:
+        raw_dates = _extract_attr(f_obj, "Dates", "dates")
+        raw_vals = _extract_attr(f_obj, "Values", "values")
+        if raw_dates is None or raw_vals is None:
+            return ()
+        raw_dates = list(raw_dates)
+        raw_vals = list(raw_vals)
+    if len(raw_dates) != len(raw_vals):
+        raise ValueError(
+            f"Funding fixings Dates ({len(raw_dates)}) and Values ({len(raw_vals)}) length mismatch."
+        )
+    if len(raw_dates) == 0:
         return ()
-    pairs = [(_to_utc_datetime(d), float(v)) for d, v in zip(raw_dates, raw_vals)]
+    pairs: list[tuple[datetime.datetime, float]] = []
+    for d, v in zip(raw_dates, raw_vals):
+        f_val = float(v)
+        if not math.isfinite(f_val):
+            raise ValueError(f"Non-finite funding fixing value {v!r} on {d!r}.")
+        pairs.append((_to_utc_datetime(d), f_val))
     pairs.sort(key=lambda item: item[0])
     return tuple(pairs)
 
@@ -1092,17 +1953,53 @@ def _lookup_funding_fixing(
     fixings_pairs: Sequence[tuple[datetime.datetime, float]],
     target_dt: datetime.datetime,
 ) -> float | None:
-    """Finds an exact or same-calendar-day UTC fixing for a funding reset date."""
+    """Finds an exact or up to 7-day prior UTC fixing for a funding reset date."""
     if not fixings_pairs:
         return None
     target_date = target_dt.date()
-    exact: float | None = None
+    best_prior_date: datetime.date | None = None
+    best_prior_val: float | None = None
     for f_dt, f_val in fixings_pairs:
         if f_dt == target_dt:
             return float(f_val)
-        if f_dt.date() == target_date:
-            exact = float(f_val)
-    return exact
+        f_date = f_dt.date()
+        if f_date == target_date:
+            return float(f_val)
+        delta_days = (target_date - f_date).days
+        if 0 < delta_days <= 7 and (best_prior_date is None or f_date >= best_prior_date):
+            best_prior_date = f_date
+            best_prior_val = float(f_val)
+    return best_prior_val
+
+
+def _apply_cached_request_metadata(
+    state: AutocallPreprocState,
+    queries: list[str],
+    trade_info: Any,
+) -> AutocallPreprocState:
+    state.queries = list(queries)
+    state.trade_info = str(trade_info) if trade_info is not None else None
+    return state
+
+
+def _lookup_preproc_cache(
+    cache_key: ContentDigestKey,
+    *,
+    fast_shallow_cache: bool,
+    queries: list[str],
+    trade_info: Any,
+) -> AutocallPreprocState | None:
+    if fast_shallow_cache:
+        cached_raw = _PREPROC_STATE_CACHE.get(cache_key, clone_return=False)
+        if cached_raw is None:
+            return None
+        cached_clone = _shallow_clone_preproc_state(cast(AutocallPreprocState, cached_raw))
+    else:
+        cached_opt = cast("AutocallPreprocState | None", _PREPROC_STATE_CACHE.get(cache_key))
+        if cached_opt is None:
+            return None
+        cached_clone = cached_opt
+    return _apply_cached_request_metadata(cached_clone, queries, trade_info)
 
 
 def preprocess_eq_autocall(
@@ -1115,6 +2012,7 @@ def preprocess_eq_autocall(
     as_of_date_override: datetime.datetime | datetime.date | str | None = None,
     d_max: int = D_MAX_DEFAULT,
     m_max: int = M_MAX_DEFAULT,
+    _fast_shallow_cache: bool = False,
 ) -> AutocallPreprocState:
     """Executes the Tier 1 deterministic `torch.float64` pre-processor on an Autocallable trade."""
     if isinstance(req_or_raw, (str, Path)):
@@ -1122,39 +2020,121 @@ def preprocess_eq_autocall(
     else:
         req_obj = req_or_raw
 
-    product = _extract_attr(req_obj, "Product", "product")
-    model = _extract_attr(req_obj, "Model", "model")
-    mkt = _extract_attr(model, "MarketDataSet", "market_data_set") if model is not None else None
-    if mkt is None:
-        mkt = _extract_attr(req_obj, "MarketDataSet", "market_data")
+    if isinstance(req_obj, EQAutocallableTradeRequest):
+        product: Any = req_obj.Product
+        model: Any = req_obj.Model
+        mkt: Any = model.MarketDataSet
+        trade_info = req_obj.TradeInfo
+        queries_raw = req_obj.Queries
+        as_of_raw = as_of_date_override if as_of_date_override is not None else mkt.AsOfDate
+    else:
+        product = _extract_attr(req_obj, "Product", "product")
+        model = _extract_attr(req_obj, "Model", "model")
+        mkt = _extract_attr(model, "MarketDataSet", "market_data_set") if model is not None else None
+        if mkt is None:
+            mkt = _extract_attr(req_obj, "MarketDataSet", "market_data")
+        if product is None or mkt is None:
+            raise ValueError("Request must contain Product and Model.MarketDataSet (or market_data).")
+        trade_info = _extract_attr(req_obj, "TradeInfo", "trade_info", "trade_id")
+        queries_raw = _extract_attr(req_obj, "Queries", "queries", default=["ProductValue", "CashFlows"])
+        as_of_raw = (
+            as_of_date_override
+            if as_of_date_override is not None
+            else _extract_attr(mkt, "AsOfDate", "as_of_date")
+        )
 
-    if product is None or mkt is None:
-        raise ValueError("Request must contain Product and Model.MarketDataSet (or market_data).")
-
-    trade_info = _extract_attr(req_obj, "TradeInfo", "trade_info", "trade_id")
-    queries_raw = _extract_attr(req_obj, "Queries", "queries", default=["ProductValue", "CashFlows"])
     queries = [str(getattr(q, "value", q)) for q in queries_raw]
-
-    as_of_raw = (
-        as_of_date_override
-        if as_of_date_override is not None
-        else _extract_attr(mkt, "AsOfDate", "as_of_date")
-    )
     as_of_dt = _to_utc_datetime(as_of_raw)
 
-    start_dt = _to_utc_datetime(_extract_attr(product, "StartDate", "start_date"))
+    cache_key: ContentDigestKey | None = None
+    can_cache = (
+        spots_override is None
+        and corr_override is None
+        and df_pay_override is None
+        and dividend_amount_overrides is None
+        and as_of_date_override is None
+    )
+    if can_cache and model is not None and isinstance(req_obj, BaseModel):
+        if _fast_shallow_cache:
+            req_d = getattr(req_obj, "__dict__", None)
+            raw_hex = req_d.get("_raw_payload_digest_hex") if isinstance(req_d, dict) else None
+            is_imm_raw = req_d.get("_immutable_cache_source") is not False if isinstance(req_d, dict) else True
+            if (
+                is_imm_raw
+                and isinstance(raw_hex, str)
+                and 32 <= len(raw_hex) <= 128
+                and (len(raw_hex) & 1) == 0
+                and _RAW_HEX_RE.match(raw_hex) is not None
+            ):
+                raw_key = ContentDigestKey(
+                    namespace="preproc_state_raw",
+                    digest_hex=f"{raw_hex}:{int(d_max)}:{int(m_max)}:{FEATURE_SCHEMA_VERSION}",
+                    payload_len=len(raw_hex),
+                )
+                cached_hit = _lookup_preproc_cache(
+                    raw_key,
+                    fast_shallow_cache=True,
+                    queries=queries,
+                    trade_info=trade_info,
+                )
+                if cached_hit is not None:
+                    return cached_hit
+                live_key = _stream_eq_request_live(
+                    req_obj,
+                    d_max=int(d_max),
+                    m_max=int(m_max),
+                    as_of_dt=as_of_dt,
+                )
+                if live_key is not None:
+                    live_raw = _PREPROC_STATE_CACHE.get(live_key, clone_return=False)
+                    if live_raw is not None:
+                        _PREPROC_STATE_CACHE.put(raw_key, live_raw, clone_return=False)
+                        return _apply_cached_request_metadata(
+                            _shallow_clone_preproc_state(cast(AutocallPreprocState, live_raw)),
+                            queries,
+                            trade_info,
+                        )
+                cache_key = raw_key
+        if cache_key is None:
+            cache_key = _stream_eq_request_live(
+                req_obj,
+                d_max=int(d_max),
+                m_max=int(m_max),
+                as_of_dt=as_of_dt,
+            )
+            if cache_key is not None:
+                cached_hit = _lookup_preproc_cache(
+                    cache_key,
+                    fast_shallow_cache=_fast_shallow_cache,
+                    queries=queries,
+                    trade_info=trade_info,
+                )
+                if cached_hit is not None:
+                    return cached_hit
+
+    raw_start = _extract_attr(product, "StartDate", "start_date")
+    if raw_start is None:
+        raise ValueError("Product missing StartDate.")
+    start_dt = _to_utc_datetime(raw_start)
     payment_ccy = str(_extract_attr(product, "PaymentCurrency", "payment_currency", default="RUB"))
     dcc_raw = _extract_attr(product, "DayCountConvention", "day_count_convention", default="Act360")
     dcc = str(getattr(dcc_raw, "value", dcc_raw))
 
-    underlying_ids = [
-        str(x) for x in _extract_attr(product, "UnderlyingIdentifiers", "underlying_identifiers")
-    ]
-    ref_spots = [
-        float(x) for x in _extract_attr(product, "UnderlyingReferenceSpots", "underlying_reference_spots")
-    ]
+    raw_uids = _extract_attr(product, "UnderlyingIdentifiers", "underlying_identifiers")
+    if not raw_uids:
+        raise ValueError("Product missing UnderlyingIdentifiers.")
+    underlying_ids = [str(x) for x in raw_uids]
+    raw_ref_spots = _extract_attr(product, "UnderlyingReferenceSpots", "underlying_reference_spots")
+    if raw_ref_spots is None:
+        raise ValueError("Product missing UnderlyingReferenceSpots.")
+    ref_spots = [float(x) for x in raw_ref_spots]
+    if len(ref_spots) != len(underlying_ids):
+        raise ValueError("UnderlyingReferenceSpots length must match UnderlyingIdentifiers.")
+    if any((not math.isfinite(r) or r <= 0.0) for r in ref_spots):
+        raise ValueError("UnderlyingReferenceSpots must be strictly positive and finite.")
 
     periods_obj = _extract_attr(product, "periods")
+    cpn_levels_for_collapser: list[float] | None
     if periods_obj is not None:
         obs_dates = [_extract_attr(p, "observation_date") for p in periods_obj]
         pay_dates = [_extract_attr(p, "payment_date") for p in periods_obj]
@@ -1162,17 +2142,26 @@ def preprocess_eq_autocall(
             float(_extract_attr(p, "autocall_barrier", default=500.0) or 500.0) for p in periods_obj
         ]
         cpn_levels = [float(_extract_attr(p, "coupon_barrier", default=1e-5)) for p in periods_obj]
+        cpn_levels_for_collapser = cpn_levels
         cpn_amounts: list[float] | None = [
             float(_extract_attr(p, "coupon_amount", default=0.0)) for p in periods_obj
         ]
         fixed_cpn_amt: float | list[float] | None = None
         fixed_rate: float | list[float] | None = None
     else:
-        obs_dates = list(_extract_attr(product, "ObservationDates", "observation_dates"))
-        pay_dates = list(_extract_attr(product, "PaymentDates", "payment_dates"))
-        ko_levels = [float(x) for x in _extract_attr(product, "AutoCallTriggerLevels", "autocall_trigger_levels")]
+        obs_dates = list(_extract_attr(product, "ObservationDates", "observation_dates") or ())
+        pay_dates = list(_extract_attr(product, "PaymentDates", "payment_dates") or ())
+        ko_levels = [
+            float(x)
+            for x in (_extract_attr(product, "AutoCallTriggerLevels", "autocall_trigger_levels") or ())
+        ]
         raw_cpn_levels = _extract_attr(product, "CouponBarrierLevels", "coupon_barrier_levels")
-        cpn_levels = [float(x) for x in raw_cpn_levels] if raw_cpn_levels is not None else [1e-5] * len(obs_dates)
+        if raw_cpn_levels is not None and len(raw_cpn_levels) > 0:
+            cpn_levels = [float(x) for x in raw_cpn_levels]
+            cpn_levels_for_collapser = cpn_levels
+        else:
+            cpn_levels = [1e-5] * len(obs_dates)
+            cpn_levels_for_collapser = None
         cpn_amounts = None
         fixed_cpn_amt = _normalize_coupon_param(
             _extract_attr(product, "FixedCouponAmount", "fixed_coupon_amount")
@@ -1180,6 +2169,11 @@ def preprocess_eq_autocall(
         fixed_rate = _normalize_coupon_param(
             _extract_attr(product, "FixedRate", "fixed_rate")
         )
+
+    if any(not math.isfinite(x) for x in ko_levels) or any(not math.isfinite(x) for x in cpn_levels):
+        raise ValueError("Barrier levels must be finite.")
+    if cpn_amounts is not None and any(not math.isfinite(x) for x in cpn_amounts):
+        raise ValueError("Coupon amounts must be finite.")
 
     is_memory = bool(_extract_attr(product, "IsMemory", "is_memory", default=False))
     call_idx_raw = _extract_attr(
@@ -1196,26 +2190,26 @@ def preprocess_eq_autocall(
     downside_put = _extract_attr(product, "downside_put")
     modifiers = _extract_attr(product, "modifiers")
 
+    dp_strike = _extract_attr(downside_put, "strike") if downside_put is not None else None
     strike = float(
-        _extract_attr(downside_put, "strike")
-        if downside_put is not None
-        else _extract_attr(product, "Strike", "strike", default=0.90)
+        dp_strike if dp_strike is not None else _extract_attr(product, "Strike", "strike", default=0.90)
     )
+    dp_gearing = _extract_attr(downside_put, "gearing") if downside_put is not None else None
     option_gearing = float(
-        _extract_attr(downside_put, "gearing")
-        if downside_put is not None
+        dp_gearing
+        if dp_gearing is not None
         else _extract_attr(product, "OptionGearing", "option_gearing", default=1.11111)
     )
+    dp_lower = _extract_attr(downside_put, "lower_strike") if downside_put is not None else None
     lower_strike_raw = (
-        _extract_attr(downside_put, "lower_strike")
-        if downside_put is not None
-        else _extract_attr(product, "LowerStrike", "lower_strike")
+        dp_lower if dp_lower is not None else _extract_attr(product, "LowerStrike", "lower_strike")
     )
     lower_strike = float(lower_strike_raw) if lower_strike_raw is not None else None
 
+    dp_ki = _extract_attr(downside_put, "knock_in_barrier") if downside_put is not None else None
     ki_barrier_raw = (
-        _extract_attr(downside_put, "knock_in_barrier")
-        if downside_put is not None
+        dp_ki
+        if dp_ki is not None
         else _extract_attr(product, "OptionDownAndInBarrierLevel", "knock_in_barrier")
     )
     ki_barrier = float(ki_barrier_raw) if ki_barrier_raw is not None else None
@@ -1229,7 +2223,7 @@ def preprocess_eq_autocall(
         ki_monitored_past = bool(ki_monitored_past_override)
     elif ki_barrier is None or ki_barrier <= 0.0:
         ki_monitored_past = False
-    elif ki_obs_type is None or ki_obs_type == "European":
+    elif ki_obs_type is None or ki_obs_type.strip().lower() == "european":
         ki_monitored_past = False
     else:
         ki_monitored_past = True
@@ -1249,9 +2243,12 @@ def preprocess_eq_autocall(
     )
     cpn_spread = float(cpn_spread_raw) if cpn_spread_raw is not None else ko_spread
 
+    dp_ki_spread = (
+        _extract_attr(downside_put, "knock_in_digital_spread") if downside_put is not None else None
+    )
     ki_spread_raw = (
-        _extract_attr(downside_put, "knock_in_digital_spread")
-        if downside_put is not None
+        dp_ki_spread
+        if dp_ki_spread is not None
         else _extract_attr(product, "OptionDownAndInBarrierAbsoluteDigitalSpread")
     )
     ki_spread = float(ki_spread_raw) if ki_spread_raw is not None else ko_spread
@@ -1266,9 +2263,12 @@ def preprocess_eq_autocall(
         if modifiers is not None
         else _extract_attr(product, "ForceCouponsOnAutocall", "force_coupons_on_autocall", default=False)
     )
+    ac_cpn_raw = (
+        _extract_attr(modifiers, "autocall_redemption_coupon") if modifiers is not None else None
+    )
     autocall_coupon = float(
-        _extract_attr(modifiers, "autocall_redemption_coupon", default=0.0)
-        if modifiers is not None
+        ac_cpn_raw
+        if ac_cpn_raw is not None
         else _extract_attr(product, "AutoCallCoupon", "autocall_coupon", default=0.0)
     )
     no_notional_repayment = bool(
@@ -1281,7 +2281,9 @@ def preprocess_eq_autocall(
         if modifiers is not None
         else _extract_attr(product, "IsLongBasket", "is_long_basket", default=False)
     )
-    if is_long_basket and option_index is None:
+    if is_long_basket and (
+        option_index is None or option_index.strip() == "" or option_index.strip() == "WorstOf"
+    ):
         option_index = "AverageOf"
     part_strike_raw = (
         _extract_attr(modifiers, "participation_call_strike")
@@ -1289,9 +2291,12 @@ def preprocess_eq_autocall(
         else _extract_attr(product, "ParticipationCallStrike", "participation_call_strike")
     )
     part_strike = float(part_strike_raw) if part_strike_raw is not None else None
+    part_rate_raw = (
+        _extract_attr(modifiers, "participation_call_rate") if modifiers is not None else None
+    )
     part_rate = float(
-        _extract_attr(modifiers, "participation_call_rate", default=0.0)
-        if modifiers is not None
+        part_rate_raw
+        if part_rate_raw is not None
         else _extract_attr(product, "ParticipationCallRate", "participation_call_rate", default=0.0)
     )
     one_star_strike_raw = (
@@ -1300,11 +2305,29 @@ def preprocess_eq_autocall(
         else _extract_attr(product, "OneStarStrike", "one_star_strike")
     )
     one_star_strike = float(one_star_strike_raw) if one_star_strike_raw is not None else None
+    os_cpn_raw = _extract_attr(modifiers, "one_star_coupon") if modifiers is not None else None
     one_star_coupon = float(
-        _extract_attr(modifiers, "one_star_coupon", default=0.0)
-        if modifiers is not None
+        os_cpn_raw
+        if os_cpn_raw is not None
         else _extract_attr(product, "OneStarCoupon", "one_star_coupon", default=0.0)
     )
+
+    for scalar_name, scalar_val in (
+        ("strike", strike),
+        ("option_gearing", option_gearing),
+        ("lower_strike", lower_strike),
+        ("ki_barrier", ki_barrier),
+        ("ko_spread", ko_spread),
+        ("cpn_spread", cpn_spread),
+        ("ki_spread", ki_spread),
+        ("autocall_coupon", autocall_coupon),
+        ("part_strike", part_strike),
+        ("part_rate", part_rate),
+        ("one_star_strike", one_star_strike),
+        ("one_star_coupon", one_star_coupon),
+    ):
+        if scalar_val is not None and not math.isfinite(float(scalar_val)):
+            raise ValueError(f"Non-finite contract parameter {scalar_name}={scalar_val!r}.")
 
     cpn_barrier_type_raw = _extract_attr(
         product, "CouponBarrierType", "coupon_barrier_type", default="In"
@@ -1330,49 +2353,51 @@ def preprocess_eq_autocall(
     rates_bundles = _extract_attr(mkt, "RatesCurvesBundles", "rates_curves_bundles")
     fin_ids_raw = _extract_attr(model, "FinancingCurveIdentifiers", "financing_curve_identifiers")
 
-    # FundingLeg extraction supporting explicit FundingLeg dates or Warrant PaymentDates fallback
+    # FundingLeg extraction supporting explicit empty FundingLegPaymentDates=[] suppression
     funding_leg_obj = _extract_attr(product, "funding_leg")
-    rate_id = _extract_attr(product, "RateIdentifier", "rate_identifier")
+    rate_id_raw = _extract_attr(product, "RateIdentifier", "rate_identifier")
+    rate_id = str(rate_id_raw).strip() if rate_id_raw is not None else ""
+    rate_id_clean: str | None = rate_id or None
     funding_leg_dates = _extract_attr(product, "FundingLegPaymentDates", "funding_leg_payment_dates")
-    funding_spread = float(_extract_attr(product, "FundingSpread", "funding_spread", default=0.0))
+    raw_fs = _extract_attr(product, "FundingSpread", "funding_spread", default=0.0)
+    funding_spread = float(raw_fs if raw_fs is not None else 0.0)
+    if not math.isfinite(funding_spread):
+        raise ValueError(f"Non-finite FundingSpread {raw_fs!r}.")
     funding_leg_dict: dict[str, Any] | None = None
     if funding_leg_obj is not None:
         raw_f_dates = _extract_attr(funding_leg_obj, "payment_dates", default=[])
         if raw_f_dates:
             raw_rid = _extract_attr(funding_leg_obj, "rate_identifier")
-            f_rid_str = str(raw_rid) if raw_rid is not None else None
+            f_rid_s = str(raw_rid).strip() if raw_rid is not None else ""
+            f_rid_str: str | None = f_rid_s or None
+            raw_obj_fs = _extract_attr(funding_leg_obj, "funding_spread", default=0.0)
+            obj_fs = float(raw_obj_fs if raw_obj_fs is not None else 0.0)
+            if not math.isfinite(obj_fs):
+                raise ValueError(f"Non-finite funding_leg spread {raw_obj_fs!r}.")
             funding_leg_dict = {
                 "rate_identifier": f_rid_str,
-                "funding_spread": float(_extract_attr(funding_leg_obj, "funding_spread", default=0.0)),
+                "funding_spread": obj_fs,
                 "payment_dates": [_to_utc_datetime(d) for d in raw_f_dates],
                 "funding_fixings": _extract_funding_fixings(fixings_map, f_rid_str),
             }
-    elif funding_leg_dates:
-        f_rid_str = str(rate_id) if rate_id is not None else None
+    elif funding_leg_dates is not None:
+        if len(funding_leg_dates) > 0:
+            funding_leg_dict = {
+                "rate_identifier": rate_id_clean,
+                "funding_spread": funding_spread,
+                "payment_dates": [_to_utc_datetime(d) for d in funding_leg_dates],
+                "funding_fixings": _extract_funding_fixings(fixings_map, rate_id_clean),
+            }
+    elif (rate_id_clean is not None or funding_spread != 0.0) and pay_dates:
         funding_leg_dict = {
-            "rate_identifier": f_rid_str,
-            "funding_spread": funding_spread,
-            "payment_dates": [_to_utc_datetime(d) for d in funding_leg_dates],
-            "funding_fixings": _extract_funding_fixings(fixings_map, f_rid_str),
-        }
-    elif (rate_id is not None or funding_spread != 0.0) and pay_dates:
-        f_rid_str = str(rate_id) if rate_id is not None else None
-        funding_leg_dict = {
-            "rate_identifier": f_rid_str,
+            "rate_identifier": rate_id_clean,
             "funding_spread": funding_spread,
             "payment_dates": [_to_utc_datetime(d) for d in pay_dates],
-            "funding_fixings": _extract_funding_fixings(fixings_map, f_rid_str),
+            "funding_fixings": _extract_funding_fixings(fixings_map, rate_id_clean),
         }
 
-    # Content-addressed cache lookup hashing 100% of market and contract inputs
-    cache_key: ContentDigestKey | None = None
-    if (
-        spots_override is None
-        and corr_override is None
-        and df_pay_override is None
-        and dividend_amount_overrides is None
-        and as_of_date_override is None
-    ):
+    # Content-addressed cache lookup hashing 100% of market and contract inputs (for dict/custom payloads)
+    if cache_key is None and can_cache:
         cache_payload = {
             "schema_ver": FEATURE_SCHEMA_VERSION,
             "d_max": int(d_max),
@@ -1428,11 +2453,14 @@ def preprocess_eq_autocall(
         }
         cache_key = digest_market_bytes("preproc_state", cache_payload)
         if cache_key is not None:
-            cached_clone = cast("AutocallPreprocState | None", _PREPROC_STATE_CACHE.get(cache_key))
-            if cached_clone is not None:
-                cached_clone.queries = list(queries)
-                cached_clone.trade_info = str(trade_info) if trade_info is not None else None
-                return cached_clone
+            cached_hit = _lookup_preproc_cache(
+                cache_key,
+                fast_shallow_cache=_fast_shallow_cache,
+                queries=queries,
+                trade_info=trade_info,
+            )
+            if cached_hit is not None:
+                return cached_hit
 
     # Canonical lexicographical sorting order needed to resolve asset financing curves
     sorted_preview_ids = sorted(underlying_ids)
@@ -1448,15 +2476,16 @@ def preprocess_eq_autocall(
 
     if funding_leg_dict is not None:
         f_rid = funding_leg_dict.get("rate_identifier")
+        f_rid_clean = str(f_rid).strip() if f_rid is not None else ""
         f_curve_obj: Any = None
         f_curve_id: str | None = disc_curve_id
-        if f_rid is not None:
-            f_curve_id = str(f_rid)
-            if isinstance(rates_bundles, Mapping) and f_rid in rates_bundles:
+        if f_rid_clean:
+            f_curve_id = f_rid_clean
+            if isinstance(rates_bundles, Mapping) and f_rid_clean in rates_bundles:
                 f_curve_obj = (
                     disc_curve_obj
-                    if (disc_curve_id is not None and f_rid == disc_curve_id)
-                    else _get_cached_yield_curve(rates_bundles[f_rid], as_of_dt)
+                    if (disc_curve_id is not None and f_rid_clean == disc_curve_id)
+                    else _get_cached_yield_curve(rates_bundles[f_rid_clean], as_of_dt)
                 )
             else:
                 f_curve_obj = disc_curve_obj
@@ -1468,6 +2497,9 @@ def preprocess_eq_autocall(
 
     _, df_fin_fn = build_discount_rate_evaluator(disc_curve_obj, as_of_dt)
 
+    if spots_override is None and not isinstance(spots_map, Mapping):
+        raise ValueError("Missing MarketDataSet.Spots mapping.")
+
     # 1. Seasoned Schedule Partitioning & Markovian Collapse
     seasoned = collapse_seasoned_schedule(
         as_of_date=as_of_dt,
@@ -1478,7 +2510,7 @@ def preprocess_eq_autocall(
         underlying_reference_spots=ref_spots,
         spots_t0=spots_override if spots_override is not None else spots_map,
         ko_barriers=ko_levels,
-        cpn_barriers=cpn_levels,
+        cpn_barriers=cpn_levels_for_collapser,
         fixed_coupon_amount=fixed_cpn_amt,
         fixed_rate=fixed_rate,
         coupon_amounts=cpn_amounts,
@@ -1546,27 +2578,34 @@ def preprocess_eq_autocall(
 
     # 3. Regularized Volatility Surfaces & Schedule Implied Volatilities
     reg_surfaces: dict[str, RegularizedVolSurface] = {}
+    surface_digests: dict[str, str] = {}
     iv_at_fwd_np = np.zeros((d_assets, m_rem), dtype=np.float64)
     d_iv_dk_np = np.zeros((d_assets, m_rem), dtype=np.float64)
     node_surf_feats_np = np.zeros((d_assets, 7), dtype=np.float64)
     surf_tau_obs_map: dict[str, npt.NDArray[np.float64]] = {}
+    surf_tau_obs_np = np.zeros((d_assets, m_rem), dtype=np.float64)
     fwd_price_np = div_out.forward_price.detach().cpu().numpy().astype(np.float64)
     fwd_req_grad = bool(div_out.forward_price.requires_grad)
 
     if m_rem > 0 and not seasoned.already_autocalled:
+        if not isinstance(vol_surfaces_map, Mapping):
+            raise ValueError("Missing MarketDataSet.VolatilitySurfaces mapping.")
         for i, ticker in enumerate(sorted_ids):
             if ticker not in vol_surfaces_map:
-                raise KeyError(f"Missing EquityVolatilitySmileCollection for underlying {ticker!r}.")
+                raise ValueError(f"Missing EquityVolatilitySmileCollection for underlying {ticker!r}.")
             surf_spec = vol_surfaces_map[ticker]
             surf_i = _get_cached_vol_surface(surf_spec, as_of_dt, surface_id=ticker)
             reg_surfaces[ticker] = surf_i
+            surface_digests[ticker] = compute_surface_digest(surf_i)
             surf_warns = getattr(surf_i, "warnings", None)
             if isinstance(surf_warns, Sequence) and not isinstance(surf_warns, (str, bytes)):
                 for w_msg in surf_warns:
                     if str(w_msg) not in seasoned_warnings:
                         seasoned_warnings.append(str(w_msg))
 
-            raw_surf_dcc = _extract_attr(surf_spec, "DayCountConvention", "day_count_convention", default="Act365")
+            raw_surf_dcc = getattr(surf_i, "dcc", None) or _extract_attr(
+                surf_spec, "DayCountConvention", "day_count_convention", default="Act365"
+            )
             surf_dcc = str(getattr(raw_surf_dcc, "value", raw_surf_dcc))
             tau_surf_obs = (
                 np.asarray(seasoned.tau_obs, dtype=np.float64)
@@ -1574,6 +2613,7 @@ def preprocess_eq_autocall(
                 else year_fractions(as_of_dt, seasoned.future_obs_dates, surf_dcc)
             )
             surf_tau_obs_map[ticker] = tau_surf_obs
+            surf_tau_obs_np[i, :] = tau_surf_obs
 
             f_row = fwd_price_np[i, :]
             if _HAS_IV_BATCH:
@@ -1680,7 +2720,8 @@ def preprocess_eq_autocall(
     else:
         df_pay_t = torch.empty(0, dtype=torch.float64, device=device)
 
-    v_perf_t = iv_at_fwd_t * torch.sqrt(tau_obs_t.clamp(min=1e-12)).unsqueeze(0)
+    surf_tau_obs_t = torch.as_tensor(surf_tau_obs_np, dtype=torch.float64, device=device)
+    v_perf_t = iv_at_fwd_t * torch.sqrt(surf_tau_obs_t.clamp(min=1e-12))
 
     if corr_override is not None:
         corr_t = corr_override.to(dtype=torch.float64, device=device)
@@ -1985,10 +3026,489 @@ def preprocess_eq_autocall(
         ),
         warnings=list(seasoned_warnings),
         feature_schema_version=FEATURE_SCHEMA_VERSION,
+        repo_curves_map=_normalize_repo_curves_map(repo_curves_map, as_of_dt),
+        surface_digests=surface_digests,
     )
+    state_out.state_digest = compute_preproc_state_digest(state_out)
     if cache_key is not None:
-        return cast(AutocallPreprocState, _PREPROC_STATE_CACHE.put(cache_key, state_out))
+        _freeze_preproc_state_tensors(state_out)
+        _PREPROC_STATE_CACHE.put(cache_key, state_out, clone_return=False)
+        if _fast_shallow_cache:
+            return _shallow_clone_preproc_state(state_out)
+        return _clone_preproc_state(state_out)
     return state_out
+
+
+def _batch_eval_curve_dfs(
+    curve_obj: Any,
+    df_fn: Callable[[datetime.datetime], Any],
+    as_of_dt: datetime.datetime,
+    target_dts: Sequence[datetime.datetime],
+) -> npt.NDArray[np.float64]:
+    """Evaluates discount factors for multiple future dates in a single vectorized curve call."""
+    n_dts = len(target_dts)
+    if n_dts == 0:
+        return np.zeros(0, dtype=np.float64)
+    if curve_obj is None:
+        return np.ones(n_dts, dtype=np.float64)
+    if isinstance(curve_obj, ClampedYieldCurve):
+        taus = (
+            year_fractions(as_of_dt, list(target_dts), curve_obj.dcc)
+            if curve_obj.as_of_date is None
+            else None
+        )
+        raw = curve_obj.df(list(target_dts) if taus is None else taus)
+        arr = np.asarray(raw, dtype=np.float64).reshape(-1)
+        return np.where(np.asarray([dt <= as_of_dt for dt in target_dts]), 1.0, arr)
+    eval_batch = getattr(df_fn, "_eval_tau_batch", None)
+    if callable(eval_batch):
+        raw_dcc = getattr(curve_obj, "dcc", "Act365")
+        taus = year_fractions(as_of_dt, list(target_dts), str(raw_dcc))
+        arr = np.asarray(eval_batch(taus), dtype=np.float64).reshape(-1)
+        return np.where(taus <= 0.0, 1.0, arr)
+    return np.asarray([float(df_fn(dt)) for dt in target_dts], dtype=np.float64)
+
+
+def _map_future_funding_intervals(
+    start_dt: datetime.datetime,
+    as_of_dt: datetime.datetime,
+    max_past_pay_dt: datetime.datetime | None,
+    f_dates: Sequence[datetime.datetime],
+    future_pay_dates: Sequence[datetime.datetime],
+) -> list[tuple[datetime.datetime, datetime.datetime, int]]:
+    """Map future funding accrual periods onto indices of `future_pay_dates`."""
+    m_pay = len(future_pay_dates)
+    if m_pay == 0:
+        return []
+    max_future_pay_dt = future_pay_dates[-1]
+    is_pay_sorted = all(
+        future_pay_dates[idx] <= future_pay_dates[idx + 1] for idx in range(m_pay - 1)
+    )
+    intervals: list[tuple[datetime.datetime, datetime.datetime, int]] = []
+    prev_f_dt = start_dt
+    for f_dt in f_dates:
+        if f_dt <= as_of_dt:
+            prev_f_dt = f_dt
+            continue
+        if max_past_pay_dt is not None and f_dt <= max_past_pay_dt:
+            prev_f_dt = f_dt
+            continue
+        if f_dt > max_future_pay_dt:
+            prev_f_dt = f_dt
+            continue
+        if is_pay_sorted:
+            m_idx = min(bisect_left(future_pay_dates, f_dt), m_pay - 1)
+        else:
+            m_idx = m_pay - 1
+            for m_cand in range(m_pay):
+                if future_pay_dates[m_cand] >= f_dt:
+                    m_idx = m_cand
+                    break
+        intervals.append((prev_f_dt, f_dt, m_idx))
+        prev_f_dt = f_dt
+    return intervals
+
+
+def _compute_funding_period_weights_np(
+    preproc_state: AutocallPreprocState,
+    m_rem: int,
+) -> npt.NDArray[np.float64]:
+    """Computes deterministic per-period FundingLeg weights (df_fin * (r_fwd + spread) * alpha)."""
+    if preproc_state.funding_leg is None or m_rem == 0:
+        return np.zeros(m_rem, dtype=np.float64)
+
+    f_leg = preproc_state.funding_leg
+    ss = preproc_state.seasoned_state
+    future_pay_dates = ss.future_pay_dates[:m_rem]
+    if not future_pay_dates:
+        return np.zeros(m_rem, dtype=np.float64)
+
+    raw_f_rid = f_leg.get("rate_identifier")
+    f_rid = str(raw_f_rid).strip() if raw_f_rid is not None else ""
+    f_curve = f_leg.get("funding_curve")
+    f_curve_id = f_leg.get("funding_curve_id")
+    disc_curve = preproc_state.discount_curve
+    disc_id = preproc_state.discount_curve_id
+    as_of_dt = ss.as_of_date
+    start_dt = ss.start_date
+    f_dcc = ss.day_count_convention
+    f_spread = float(f_leg.get("funding_spread") or 0.0)
+    f_dates = f_leg.get("payment_dates") or ()
+    f_fixings = f_leg.get("funding_fixings") or ()
+
+    can_cache_fw = (
+        isinstance(disc_curve, (ClampedYieldCurve, type(None)))
+        and isinstance(f_curve, (ClampedYieldCurve, type(None)))
+    )
+    fw_key: Any = None
+    max_past_pay_dt: datetime.datetime | None = None
+    has_max_past = False
+    if can_cache_fw:
+        f_fix_key = (
+            f_fixings
+            if isinstance(f_fixings, tuple)
+            else (tuple(f_fixings) if isinstance(f_fixings, list) else ())
+        )
+        state_dig = preproc_state.state_digest
+        if state_dig:
+            fw_key = (
+                state_dig,
+                disc_curve,
+                f_curve,
+                f_curve_id,
+                disc_id,
+                f_spread,
+                f_rid,
+                len(f_dates),
+                f_dates[0] if f_dates else None,
+                f_dates[-1] if f_dates else None,
+                f_fix_key,
+                m_rem,
+            )
+        else:
+            max_past_pay_dt = max((r.payment_date for r in ss.historical_records), default=None)
+            has_max_past = True
+            fw_key = (
+                disc_curve,
+                f_curve,
+                f_curve_id,
+                disc_id,
+                as_of_dt,
+                start_dt,
+                f_dcc,
+                f_spread,
+                f_rid,
+                tuple(f_dates),
+                f_fix_key,
+                tuple(future_pay_dates),
+                max_past_pay_dt,
+            )
+        cached_w = _FUNDING_WEIGHTS_CACHE.get(fw_key, clone_return=False)
+        if cached_w is not None:
+            return cast("npt.NDArray[np.float64]", cached_w)
+
+    if not has_max_past:
+        max_past_pay_dt = max((r.payment_date for r in ss.historical_records), default=None)
+
+    intervals = _map_future_funding_intervals(
+        start_dt, as_of_dt, max_past_pay_dt, f_dates, future_pay_dates
+    )
+
+    if not intervals:
+        out_zero = np.zeros(m_rem, dtype=np.float64)
+        if fw_key is not None:
+            _FUNDING_WEIGHTS_CACHE.put(fw_key, out_zero, clone_return=False)
+        return out_zero
+
+    n_iv = len(intervals)
+    same_curve = (
+        f_curve is None
+        or f_curve is preproc_state.discount_curve
+        or (f_curve_id is not None and disc_id is not None and f_curve_id == disc_id)
+    )
+
+    dcc_norm = (
+        str(getattr(f_dcc, "value", f_dcc))
+        .strip()
+        .upper()
+        .replace("/", "")
+        .replace("_", "")
+        .replace("-", "")
+        .replace(".", "")
+    )
+    is_additive_dcc = dcc_norm not in ("THIRTY360", "30360", "30360US", "30U360")
+    end_dts = [iv[1] for iv in intervals]
+    is_contig = n_iv > 1 and all(intervals[j][0] == intervals[j - 1][1] for j in range(1, n_iv))
+    if n_iv == 1 or (is_contig and is_additive_dcc):
+        alphas = year_fractions(intervals[0][0], end_dts, f_dcc)
+        if n_iv > 1:
+            alphas[1:] = np.diff(alphas)
+    else:
+        alphas = np.array([year_fraction(p_dt, e_dt, f_dcc) for p_dt, e_dt, _ in intervals], dtype=np.float64)
+
+    df_fin_arr = (
+        preproc_state.df_pay.detach().cpu().numpy().reshape(-1)[: len(future_pay_dates)]
+        if end_dts == future_pay_dates
+        else _batch_eval_curve_dfs(
+            preproc_state.discount_curve,
+            build_discount_rate_evaluator(preproc_state.discount_curve, as_of_dt)[1],
+            as_of_dt,
+            end_dts,
+        )
+    )
+
+    r_fwds = np.zeros(n_iv, dtype=np.float64)
+    if f_rid:
+        fwd_curve_obj = preproc_state.discount_curve if same_curve else f_curve
+        if same_curve:
+            df_fwd_end = df_fin_arr
+            df_fwd_fn = build_discount_rate_evaluator(fwd_curve_obj, as_of_dt)[1]
+        else:
+            _, df_fwd_fn = build_discount_rate_evaluator(fwd_curve_obj, as_of_dt)
+            df_fwd_end = _batch_eval_curve_dfs(fwd_curve_obj, df_fwd_fn, as_of_dt, end_dts)
+
+        end_df_by_dt = {e_dt: float(df_fwd_end[j]) for j, e_dt in enumerate(end_dts)}
+        prev_needed_idx: list[int] = []
+        prev_needed_dts: list[datetime.datetime] = []
+        fixed_vals: list[float | None] = [None] * n_iv
+        prev_cached_vals: dict[int, float] = {}
+        stub_needed = False
+        for j, (p_dt, _e_dt, _m) in enumerate(intervals):
+            if p_dt <= as_of_dt:
+                fv = _lookup_funding_fixing(f_fixings, p_dt)
+                fixed_vals[j] = fv
+                if fv is None:
+                    stub_needed = True
+            elif p_dt in end_df_by_dt:
+                prev_cached_vals[j] = end_df_by_dt[p_dt]
+            else:
+                prev_needed_idx.append(j)
+                prev_needed_dts.append(p_dt)
+
+        if prev_needed_dts:
+            df_fwd_prev_vals = _batch_eval_curve_dfs(
+                fwd_curve_obj, df_fwd_fn, as_of_dt, prev_needed_dts
+            )
+            for k, j in enumerate(prev_needed_idx):
+                prev_cached_vals[j] = float(df_fwd_prev_vals[k])
+
+        for j, (p_dt, e_dt, _m) in enumerate(intervals):
+            fix_val = fixed_vals[j]
+            if fix_val is not None:
+                r_fwds[j] = fix_val
+            elif p_dt <= as_of_dt:
+                alpha_rem = max(year_fraction(as_of_dt, e_dt, f_dcc), 1e-8) if stub_needed else 1.0
+                r_fwds[j] = (1.0 / max(float(df_fwd_end[j]), 1e-12) - 1.0) / alpha_rem
+            else:
+                df_p = prev_cached_vals[j]
+                r_fwds[j] = (df_p / max(float(df_fwd_end[j]), 1e-12) - 1.0) / max(float(alphas[j]), 1e-8)
+
+    weights = df_fin_arr * (r_fwds + f_spread) * alphas
+    period_undisc_np = np.zeros(m_rem, dtype=np.float64)
+    m_indices = np.asarray([iv[2] for iv in intervals], dtype=np.int64)
+    if n_iv == m_rem and np.array_equal(m_indices, np.arange(m_rem, dtype=np.int64)):
+        period_undisc_np = weights
+    else:
+        np.add.at(period_undisc_np, m_indices, weights)
+    if fw_key is not None:
+        _FUNDING_WEIGHTS_CACHE.put(fw_key, period_undisc_np, clone_return=False)
+    return period_undisc_np
+
+
+def _evaluate_future_funding_cf(
+    preproc_state: AutocallPreprocState,
+    surv_prev: torch.Tensor,
+    m_rem: int,
+    device: torch.device,
+    df_fin_fn_override: Callable[[datetime.datetime], torch.Tensor | float] | None,
+    df_fwd_fn_override: Callable[[datetime.datetime], torch.Tensor | float] | None,
+) -> torch.Tensor:
+    """Computes stateless future period FundingLeg PVs without touching settled or in-transit dates."""
+    if preproc_state.funding_leg is None or m_rem == 0:
+        return torch.zeros(m_rem, dtype=torch.float64, device=device)
+
+    if df_fin_fn_override is None and df_fwd_fn_override is None:
+        w_np = _compute_funding_period_weights_np(preproc_state, m_rem)
+        w_t = torch.as_tensor(w_np, dtype=torch.float64, device=device)
+        return surv_prev * w_t
+
+    f_leg = preproc_state.funding_leg
+    raw_f_rid = f_leg.get("rate_identifier")
+    f_rid = str(raw_f_rid).strip() if raw_f_rid is not None else ""
+    f_curve = f_leg.get("funding_curve")
+    f_curve_id = f_leg.get("funding_curve_id")
+    disc_id = preproc_state.discount_curve_id
+    as_of_dt = preproc_state.seasoned_state.as_of_date
+    start_dt = preproc_state.seasoned_state.start_date
+    f_dcc = preproc_state.seasoned_state.day_count_convention
+    f_spread = float(f_leg.get("funding_spread") or 0.0)
+    f_dates = f_leg.get("payment_dates") or ()
+    f_fixings = f_leg.get("funding_fixings") or ()
+
+    future_pay_dates = preproc_state.seasoned_state.future_pay_dates[:m_rem]
+    if not future_pay_dates:
+        return torch.zeros(m_rem, dtype=torch.float64, device=device)
+    hist_recs = preproc_state.seasoned_state.historical_records
+    max_past_pay_dt = max((r.payment_date for r in hist_recs), default=None)
+    intervals = _map_future_funding_intervals(
+        start_dt, as_of_dt, max_past_pay_dt, f_dates, future_pay_dates
+    )
+
+    if not intervals:
+        return torch.zeros(m_rem, dtype=torch.float64, device=device)
+
+    same_curve = (
+        f_curve is None
+        or f_curve is preproc_state.discount_curve
+        or (f_curve_id is not None and disc_id is not None and f_curve_id == disc_id)
+    )
+
+    eval_fin_fn: Callable[[datetime.datetime], torch.Tensor | float] = (
+        df_fin_fn_override
+        if df_fin_fn_override is not None
+        else build_discount_rate_evaluator(preproc_state.discount_curve, as_of_dt)[1]
+    )
+    eval_fwd_fn: Callable[[datetime.datetime], torch.Tensor | float]
+    if df_fwd_fn_override is not None:
+        eval_fwd_fn = df_fwd_fn_override
+    elif f_rid and not same_curve:
+        eval_fwd_fn = build_discount_rate_evaluator(f_curve, as_of_dt)[1]
+    else:
+        eval_fwd_fn = eval_fin_fn
+
+    period_tensors = [torch.tensor(0.0, dtype=torch.float64, device=device) for _ in range(m_rem)]
+    for p_dt, e_dt, m_idx in intervals:
+        alpha_j = year_fraction(p_dt, e_dt, f_dcc)
+        df_curr = eval_fin_fn(e_dt)
+        if not f_rid:
+            r_fwd_j: Any = 0.0
+        else:
+            fixed_reset = _lookup_funding_fixing(f_fixings, p_dt) if p_dt <= as_of_dt else None
+            if fixed_reset is not None:
+                r_fwd_j = fixed_reset
+            elif p_dt <= as_of_dt:
+                alpha_rem = max(year_fraction(as_of_dt, e_dt, f_dcc), 1e-8)
+                df_curr_fwd = eval_fwd_fn(e_dt)
+                if isinstance(df_curr_fwd, torch.Tensor):
+                    r_fwd_j = (1.0 / df_curr_fwd.clamp(min=1e-12) - 1.0) / alpha_rem
+                else:
+                    r_fwd_j = (1.0 / max(float(df_curr_fwd), 1e-12) - 1.0) / alpha_rem
+            else:
+                df_prev_fwd = eval_fwd_fn(p_dt)
+                df_curr_fwd = eval_fwd_fn(e_dt)
+                if isinstance(df_curr_fwd, torch.Tensor) or isinstance(df_prev_fwd, torch.Tensor):
+                    df_prev_t = (
+                        df_prev_fwd
+                        if isinstance(df_prev_fwd, torch.Tensor)
+                        else torch.tensor(float(df_prev_fwd), dtype=torch.float64, device=device)
+                    )
+                    df_curr_t = (
+                        df_curr_fwd
+                        if isinstance(df_curr_fwd, torch.Tensor)
+                        else torch.tensor(float(df_curr_fwd), dtype=torch.float64, device=device)
+                    )
+                    r_fwd_j = (df_prev_t / df_curr_t.clamp(min=1e-12) - 1.0) / max(alpha_j, 1e-8)
+                else:
+                    r_fwd_j = (float(df_prev_fwd) / max(float(df_curr_fwd), 1e-12) - 1.0) / max(alpha_j, 1e-8)
+        cf_j = surv_prev[m_idx] * df_curr * (r_fwd_j + f_spread) * alpha_j
+        period_tensors[m_idx] = period_tensors[m_idx] + cf_j
+    return torch.stack(period_tensors)
+
+
+def _append_future_cashflow_items(
+    cashflows: list[CashFlowItem],
+    *,
+    future_pay_dates: Sequence[datetime.datetime],
+    ccy: str,
+    fund_arr: npt.NDArray[np.float64],
+    cpn_arr: npt.NDArray[np.float64],
+    notional_arr: npt.NDArray[np.float64],
+    df_last: float,
+    p_last: float,
+    surv_last: float,
+    opt_amt: float,
+    opt_only_amt: float,
+    l_onestar_val: float,
+    p_star_val: float,
+    option_se: float,
+    preproc_state: AutocallPreprocState,
+) -> None:
+    """Appends future CashFlowItem rows from host float64 arrays without per-period D2H calls."""
+    m_eff = min(len(future_pay_dates), len(fund_arr), len(cpn_arr), len(notional_arr))
+    if m_eff <= 0:
+        return
+    pay_slice = future_pay_dates[:m_eff]
+    cf_new = object.__new__
+    cf_setattr = object.__setattr__
+    cf_cls = CashFlowItem
+
+    def _fast_cf(desc: Any, dt_val: datetime.datetime, amt: float, se: float) -> CashFlowItem:
+        obj = cf_new(cf_cls)
+        cf_setattr(
+            obj,
+            "__dict__",
+            {
+                "Description": desc,
+                "Date": dt_val,
+                "Amount": amt,
+                "StandardError": se,
+                "Currency": ccy,
+                "Leg": 0,
+                "StatusText": "Estimate",
+            },
+        )
+        return obj
+
+    add_cf = cashflows.append
+    fund_l = fund_arr[:m_eff].tolist()
+    cpn_l = cpn_arr[:m_eff].tolist()
+    not_l = notional_arr[:m_eff].tolist()
+    se_opt = float(option_se)
+    if m_eff > 1:
+        dt_0 = pay_slice[0]
+        cp_f = {"Description": "FundingLeg", "Date": dt_0, "Amount": 0.0, "StandardError": 0.0, "Currency": ccy, "Leg": 0, "StatusText": "Estimate"}.copy
+        cp_c = {"Description": "Coupon", "Date": dt_0, "Amount": 0.0, "StandardError": 0.0, "Currency": ccy, "Leg": 0, "StatusText": "Estimate"}.copy
+        cp_n = {"Description": "Notional", "Date": dt_0, "Amount": 0.0, "StandardError": 0.0, "Currency": ccy, "Leg": 0, "StatusText": "Estimate"}.copy
+        for idx in range(m_eff - 1):
+            pay_dt = pay_slice[idx]
+            fund_amt = fund_l[idx]
+            o1 = cf_new(cf_cls)
+            d1 = cp_f()
+            d1["Date"] = pay_dt
+            d1["Amount"] = -fund_amt if fund_amt != 0.0 else 0.0
+            cf_setattr(o1, "__dict__", d1)
+            add_cf(o1)
+
+            o2 = cf_new(cf_cls)
+            d2 = cp_c()
+            d2["Date"] = pay_dt
+            d2["Amount"] = cpn_l[idx]
+            cf_setattr(o2, "__dict__", d2)
+            add_cf(o2)
+
+            o3 = cf_new(cf_cls)
+            d3 = cp_n()
+            d3["Date"] = pay_dt
+            d3["Amount"] = not_l[idx]
+            cf_setattr(o3, "__dict__", d3)
+            add_cf(o3)
+
+    m_last = m_eff - 1
+    pay_dt = pay_slice[m_last]
+    fund_amt = fund_l[m_last]
+    cpn_amt = cpn_l[m_last]
+    notional_amt = not_l[m_last]
+    no_notional = preproc_state.no_notional_repayment
+    add_cf(_fast_cf("FundingLeg", pay_dt, -fund_amt if fund_amt != 0.0 else 0.0, 0.0))
+    add_cf(_fast_cf("Coupon", pay_dt, cpn_amt, 0.0))
+    if preproc_state.is_long_basket:
+        stop_notional_amt = 0.0 if no_notional else df_last * p_last
+        surv_notional_amt = 0.0 if no_notional else df_last * surv_last
+        add_cf(_fast_cf("IsLongBasket", pay_dt, surv_notional_amt + opt_amt, se_opt))
+        add_cf(_fast_cf("Option", pay_dt, 0.0, 0.0))
+        add_cf(_fast_cf("Notional", pay_dt, stop_notional_amt, 0.0))
+        return
+    os_strike = preproc_state.one_star_strike
+    if os_strike is not None and float(os_strike) > 0.0:
+        onestar_principal_amt = 0.0 if no_notional else df_last * p_star_val
+        onestar_bonus_amt = df_last * l_onestar_val
+        onestar_total_amt = onestar_principal_amt + onestar_bonus_amt
+        notional_rem_amt = max(notional_amt - onestar_principal_amt, 0.0)
+        add_cf(_fast_cf("OneStarCoupon", pay_dt, onestar_total_amt, 0.0))
+        add_cf(_fast_cf("Option", pay_dt, opt_only_amt, se_opt))
+        add_cf(_fast_cf("Notional", pay_dt, notional_rem_amt, 0.0))
+        return
+    add_cf(_fast_cf("Option", pay_dt, opt_amt, se_opt))
+    add_cf(_fast_cf("Notional", pay_dt, notional_amt, 0.0))
+
+
+def _to_host_f64_1d(tensor: torch.Tensor, m_rem: int) -> npt.NDArray[np.float64]:
+    arr = tensor.detach().cpu().numpy()
+    if arr.dtype != np.float64:
+        arr = arr.astype(np.float64, copy=False)
+    if arr.ndim != 1:
+        arr = arr.reshape(-1)
+    return arr if arr.shape[0] == m_rem else arr[:m_rem]
 
 
 def assemble_autocall_cashflows_and_pv(
@@ -2013,107 +3533,399 @@ def assemble_autocall_cashflows_and_pv(
     m_rem = preproc_state.m_rem
     device = preproc_state.spots_t0.device
     ccy = preproc_state.payment_currency
-    cash_today = float(
-        getattr(
-            preproc_state,
-            "cash_to_settle_today",
-            getattr(preproc_state.seasoned_state, "cash_to_settle_today", 0.0),
-        )
+    ss = preproc_state.seasoned_state
+    base = preproc_state.baseline
+    cash_today = float(preproc_state.cash_to_settle_today)
+
+    if q_cpn is None and q_prob is not None:
+        q_cpn = q_prob
+
+    raw_l_put: Any = base.l_put_proxy if l_put is None else l_put
+    if l_call is None:
+        try:
+            raw_l_call_cand: Any = base.l_call_proxy
+            raw_l_call: Any = 0.0 if raw_l_call_cand is None else raw_l_call_cand
+        except AttributeError:
+            raw_l_call = 0.0
+    else:
+        raw_l_call = l_call
+    if l_onestar is None:
+        try:
+            raw_l_os_cand: Any = base.l_onestar_proxy
+            raw_l_onestar: Any = 0.0 if raw_l_os_cand is None else raw_l_os_cand
+        except AttributeError:
+            raw_l_onestar = 0.0
+    else:
+        raw_l_onestar = l_onestar
+    if p_onestar is not None:
+        raw_p_onestar: Any = p_onestar
+    else:
+        try:
+            raw_p_onestar = base.p_onestar_proxy
+        except AttributeError:
+            raw_p_onestar = None
+
+    tensor_cls = torch.Tensor
+    p_src_check = base.p_proxy if p_stop is None else p_stop
+    q_src_check = base.q_proxy if q_cpn is None else q_cpn
+    is_callable_t = preproc_state.is_callable
+    df_pay_t = preproc_state.df_pay
+    cpn_amt_t = preproc_state.coupon_amounts
+    any_ad_input = (
+        df_fin_fn_override is not None
+        or df_fwd_fn_override is not None
+        or (p_stop is None and isinstance(h_prob, tensor_cls) and h_prob.requires_grad)
+        or (isinstance(p_src_check, tensor_cls) and p_src_check.requires_grad)
+        or (isinstance(q_src_check, tensor_cls) and q_src_check.requires_grad)
+        or (isinstance(raw_l_put, tensor_cls) and raw_l_put.requires_grad)
+        or (isinstance(raw_l_call, tensor_cls) and raw_l_call.requires_grad)
+        or (isinstance(raw_l_onestar, tensor_cls) and raw_l_onestar.requires_grad)
+        or (isinstance(raw_p_onestar, tensor_cls) and raw_p_onestar.requires_grad)
+        or (isinstance(coupon_cf_undisc, tensor_cls) and coupon_cf_undisc.requires_grad)
+        or df_pay_t.requires_grad
+        or cpn_amt_t.requires_grad
+        or is_callable_t.requires_grad
     )
 
+    if not any_ad_input and m_rem > 0 and not preproc_state.already_autocalled:
+        # Pure host NumPy vectorized fast path without intermediate PyTorch op dispatches.
+        is_cpu = device.type == "cpu"
+        is_call_np = _to_host_f64_1d(
+            is_callable_t if is_callable_t.device.type == "cpu" else is_callable_t.cpu(),
+            m_rem,
+        )
+        if is_cpu:
+            if p_stop is None and h_prob is not None:
+                h_src = _to_host_f64_1d(h_prob, m_rem)
+                h_np = np.clip(h_src, 0.0, 1.0) * is_call_np
+                surv_h_np = np.cumprod(1.0 - h_np)
+                surv_prev_h_np = np.empty(m_rem, dtype=np.float64)
+                surv_prev_h_np[0] = 1.0
+                if m_rem > 1:
+                    surv_prev_h_np[1:] = surv_h_np[:-1]
+                p_np = surv_prev_h_np * h_np
+            else:
+                p_src = _to_host_f64_1d(p_src_check, m_rem)
+                p_np = np.maximum(p_src, 0.0) * is_call_np
+
+            q_np = np.clip(_to_host_f64_1d(q_src_check, m_rem), 0.0, 1.0)
+            df_pay_np = _to_host_f64_1d(df_pay_t, m_rem)
+            cpn_np = _to_host_f64_1d(cpn_amt_t, m_rem)
+            if isinstance(coupon_cf_undisc, tensor_cls):
+                undisc_np: npt.NDArray[np.float64] | None = _to_host_f64_1d(coupon_cf_undisc, m_rem)
+            elif coupon_cf_undisc is not None:
+                undisc_raw = np.asarray(coupon_cf_undisc, dtype=np.float64)
+                if undisc_raw.ndim != 1:
+                    undisc_raw = undisc_raw.reshape(-1)
+                undisc_np = undisc_raw if undisc_raw.shape[0] == m_rem else undisc_raw[:m_rem]
+            else:
+                undisc_np = None
+            l_put_val = float(raw_l_put)
+            l_call_val = float(raw_l_call)
+            l_os_val = float(raw_l_onestar)
+            if raw_p_onestar is not None:
+                p_star_raw = float(raw_p_onestar)
+            elif preproc_state.one_star_coupon != 0.0:
+                p_star_raw = l_os_val / float(preproc_state.one_star_coupon)
+            else:
+                p_star_raw = 0.0
+        else:
+            # One batched D2H transfer for GPU inference tensors when AD is inactive.
+            p_raw_t = (
+                h_prob.to(dtype=torch.float64, device=device).reshape(-1)[:m_rem]
+                if (p_stop is None and h_prob is not None)
+                else (
+                    base.p_proxy.reshape(-1)[:m_rem]
+                    if p_stop is None
+                    else p_stop.to(dtype=torch.float64, device=device).reshape(-1)[:m_rem]
+                )
+            )
+            q_raw_t = (
+                base.q_proxy.reshape(-1)[:m_rem]
+                if q_cpn is None
+                else q_cpn.to(dtype=torch.float64, device=device).reshape(-1)[:m_rem]
+            )
+            vecs = [
+                p_raw_t,
+                q_raw_t,
+                df_pay_t.reshape(-1)[:m_rem],
+                cpn_amt_t.reshape(-1)[:m_rem],
+            ]
+            has_undisc_t = isinstance(coupon_cf_undisc, tensor_cls)
+            if has_undisc_t:
+                vecs.append(
+                    cast(torch.Tensor, coupon_cf_undisc).to(dtype=torch.float64, device=device).reshape(-1)[:m_rem]
+                )
+            sc_vals = [
+                torch.as_tensor(raw_l_put, dtype=torch.float64, device=device).reshape(()),
+                torch.as_tensor(raw_l_call, dtype=torch.float64, device=device).reshape(()),
+                torch.as_tensor(raw_l_onestar, dtype=torch.float64, device=device).reshape(()),
+                (
+                    torch.as_tensor(raw_p_onestar, dtype=torch.float64, device=device).reshape(())
+                    if raw_p_onestar is not None
+                    else torch.tensor(float("nan"), dtype=torch.float64, device=device)
+                ),
+            ]
+            packed_in = torch.cat([torch.stack(vecs).reshape(-1), torch.stack(sc_vals)], dim=0).detach().cpu().numpy()
+            v_block = packed_in[: len(vecs) * m_rem].reshape(len(vecs), m_rem)
+            p_src_gpu, q_src_gpu, df_pay_np, cpn_np = v_block[:4]
+            if has_undisc_t:
+                undisc_np = v_block[4]
+            elif coupon_cf_undisc is not None:
+                undisc_np = np.asarray(coupon_cf_undisc, dtype=np.float64).reshape(-1)[:m_rem]
+            else:
+                undisc_np = None
+            l_put_val, l_call_val, l_os_val, p_star_maybe = (float(x) for x in packed_in[len(vecs) * m_rem :])
+            if not math.isnan(p_star_maybe):
+                p_star_raw = p_star_maybe
+            elif preproc_state.one_star_coupon != 0.0:
+                p_star_raw = l_os_val / float(preproc_state.one_star_coupon)
+            else:
+                p_star_raw = 0.0
+            if p_stop is None and h_prob is not None:
+                h_np = np.clip(p_src_gpu, 0.0, 1.0) * is_call_np
+                surv_h_np = np.cumprod(1.0 - h_np)
+                surv_prev_h_np = np.empty(m_rem, dtype=np.float64)
+                surv_prev_h_np[0] = 1.0
+                if m_rem > 1:
+                    surv_prev_h_np[1:] = surv_h_np[:-1]
+                p_np = surv_prev_h_np * h_np
+            else:
+                p_np = np.maximum(p_src_gpu, 0.0) * is_call_np
+            q_np = np.clip(q_src_gpu, 0.0, 1.0)
+
+        surv_np = 1.0 - np.cumsum(p_np)
+        np.clip(surv_np, 0.0, None, out=surv_np)
+        surv_prev_np = np.empty(m_rem, dtype=np.float64)
+        surv_prev_np[0] = 1.0
+        if m_rem > 1:
+            surv_prev_np[1:] = surv_np[:-1]
+        surv_last_f = float(surv_np[-1])
+        p_star_val = 0.0 if p_star_raw <= 0.0 else (p_star_raw if p_star_raw <= surv_last_f else surv_last_f)
+
+        period_w_np = _compute_funding_period_weights_np(preproc_state, m_rem)
+        fund_np = surv_prev_np * period_w_np
+
+        if preproc_state.no_notional_repayment:
+            notional_cf_np = np.zeros(m_rem, dtype=np.float64)
+        else:
+            stop_plus_surv = p_np.copy()
+            stop_plus_surv[-1] += surv_last_f
+            notional_cf_np = df_pay_np * stop_plus_surv
+
+        ac_coupon = float(preproc_state.autocall_coupon)
+        if undisc_np is not None:
+            coupon_cf_np = df_pay_np * undisc_np
+        else:
+            if preproc_state.force_coupons_on_autocall:
+                eff_q_np = np.clip(
+                    np.maximum(q_np, p_np / np.maximum(surv_prev_np, 1e-12)),
+                    0.0,
+                    1.0,
+                )
+            else:
+                eff_q_np = q_np
+            if preproc_state.is_memory:
+                cpn_out = [0.0] * m_rem
+                mem_f = float(preproc_state.c_mem_0)
+                df_l = df_pay_np.tolist()
+                sp_l = surv_prev_np.tolist()
+                eq_l = eff_q_np.tolist()
+                cpn_l = cpn_np.tolist()
+                p_l = p_np.tolist()
+                for m in range(m_rem):
+                    eff_c_m = cpn_l[m] + mem_f
+                    eq_m = eq_l[m]
+                    cpn_out[m] = df_l[m] * (sp_l[m] * eq_m * eff_c_m + p_l[m] * ac_coupon)
+                    mem_f = eff_c_m * (1.0 - eq_m)
+                coupon_cf_np = np.array(cpn_out, dtype=np.float64)
+            else:
+                coupon_cf_np = df_pay_np * (
+                    surv_prev_np * eff_q_np * cpn_np + p_np * ac_coupon
+                )
+
+        df_last = float(df_pay_np[-1])
+        gearing = float(preproc_state.option_gearing)
+        part_rate = float(preproc_state.participation_call_rate)
+        opt_only_amt = df_last * (-gearing * l_put_val + part_rate * l_call_val)
+        opt_amt = opt_only_amt + df_last * l_os_val
+
+        notional_pv_s = float(notional_cf_np.sum())
+        coupon_pv_s = float(coupon_cf_np.sum())
+        funding_pv_s = float(fund_np.sum())
+        pv_it_s = float(preproc_state.pv_in_transit)
+        pv_total_s = pv_it_s + notional_pv_s + coupon_pv_s + opt_amt - funding_pv_s
+
+        cashflows_fast: list[CashFlowItem] = list(ss.past_cashflows) if build_cashflow_items else []
+        if build_cashflow_items:
+            _append_future_cashflow_items(
+                cashflows_fast,
+                future_pay_dates=ss.future_pay_dates[:m_rem],
+                ccy=ccy,
+                fund_arr=fund_np,
+                cpn_arr=coupon_cf_np,
+                notional_arr=notional_cf_np,
+                df_last=df_last,
+                p_last=float(p_np[-1]),
+                surv_last=surv_last_f,
+                opt_amt=opt_amt,
+                opt_only_amt=opt_only_amt,
+                l_onestar_val=l_os_val,
+                p_star_val=p_star_val,
+                option_se=option_se,
+                preproc_state=preproc_state,
+            )
+
+        out_sc = torch.tensor(
+            [pv_total_s, notional_pv_s, coupon_pv_s, opt_amt, funding_pv_s, pv_it_s, l_put_val, l_call_val, l_os_val, p_star_val],
+            dtype=torch.float64,
+            device=device,
+        )
+        pv_t, not_pv_t, cpn_pv_t, opt_pv_t, fund_pv_t, it_pv_t, lp_t, lc_t, los_t, pos_t = out_sc.unbind(0)
+        eff_total_se = float(total_se) if total_se is not None else float(option_se)
+        return AutocallPostprocOutput(
+            product_value=pv_t,
+            notional_pv=not_pv_t,
+            coupon_pv=cpn_pv_t,
+            option_pv=opt_pv_t,
+            funding_pv=fund_pv_t,
+            pv_in_transit=it_pv_t,
+            survival_probs=torch.from_numpy(surv_np) if is_cpu else torch.as_tensor(surv_np, dtype=torch.float64, device=device),
+            p_stop=torch.from_numpy(p_np) if is_cpu else torch.as_tensor(p_np, dtype=torch.float64, device=device),
+            q_cpn=torch.from_numpy(q_np) if is_cpu else torch.as_tensor(q_np, dtype=torch.float64, device=device),
+            l_put=lp_t,
+            l_call=lc_t,
+            cashflows=cashflows_fast,
+            standard_error=eff_total_se,
+            reporting_currency=ccy,
+            cash_to_settle_today=cash_today,
+            l_onestar=los_t,
+            p_onestar=pos_t,
+        )
+
+    is_call_t = is_callable_t.reshape(-1)[:m_rem]
     if p_stop is None and h_prob is not None:
         h_t = (
-            h_prob.to(dtype=torch.float64, device=device).reshape(-1)[:m_rem]
-            * preproc_state.is_callable
+            h_prob.to(dtype=torch.float64, device=device).reshape(-1)[:m_rem].clamp(0.0, 1.0)
+            * is_call_t
         )
-        one_minus_h = 1.0 - h_t.clamp(0.0, 1.0)
-        surv_h = torch.cumprod(one_minus_h, dim=0)
-        surv_prev_h = torch.cat(
-            [torch.ones(1, dtype=torch.float64, device=device), surv_h[:-1]],
-            dim=0,
-        )
-        p_stop = surv_prev_h * h_t
+        if m_rem > 0:
+            one_minus_h = 1.0 - h_t
+            surv_h = torch.cumprod(one_minus_h, dim=0)
+            surv_prev_h = torch.cat(
+                [torch.ones(1, dtype=torch.float64, device=device), surv_h[:-1]],
+                dim=0,
+            )
+            p_stop = surv_prev_h * h_t
+        else:
+            p_stop = h_t
     if q_cpn is None and q_prob is not None:
         q_cpn = q_prob
 
     p_t = (
-        preproc_state.baseline.p_proxy
-        if p_stop is None
-        else p_stop.to(dtype=torch.float64, device=device).reshape(-1)[:m_rem]
+        (
+            base.p_proxy.reshape(-1)[:m_rem]
+            if p_stop is None
+            else p_stop.to(dtype=torch.float64, device=device).reshape(-1)[:m_rem]
+        ).clamp(min=0.0)
+        * is_call_t
     )
     q_t = (
-        preproc_state.baseline.q_proxy
+        base.q_proxy.reshape(-1)[:m_rem]
         if q_cpn is None
         else q_cpn.to(dtype=torch.float64, device=device).reshape(-1)[:m_rem]
-    )
+    ).clamp(0.0, 1.0)
     l_put_t = (
-        preproc_state.baseline.l_put_proxy
+        base.l_put_proxy
         if l_put is None
         else l_put.to(dtype=torch.float64, device=device).reshape(())
     )
-    l_call_t = (
-        getattr(preproc_state.baseline, "l_call_proxy", torch.tensor(0.0, dtype=torch.float64, device=device))
-        if l_call is None
-        else l_call.to(dtype=torch.float64, device=device).reshape(())
-    )
-    l_onestar_t = (
-        getattr(preproc_state.baseline, "l_onestar_proxy", torch.tensor(0.0, dtype=torch.float64, device=device))
-        if l_onestar is None
-        else torch.as_tensor(l_onestar, dtype=torch.float64, device=device).reshape(())
-    )
+    if l_call is None:
+        raw_lc_ad = getattr(base, "l_call_proxy", None)
+        l_call_t = (
+            raw_lc_ad
+            if raw_lc_ad is not None
+            else torch.tensor(0.0, dtype=torch.float64, device=device)
+        )
+    else:
+        l_call_t = l_call.to(dtype=torch.float64, device=device).reshape(())
+    if l_onestar is None:
+        raw_los_ad = getattr(base, "l_onestar_proxy", None)
+        l_onestar_t = (
+            raw_los_ad
+            if raw_los_ad is not None
+            else torch.tensor(0.0, dtype=torch.float64, device=device)
+        )
+    else:
+        l_onestar_t = torch.as_tensor(l_onestar, dtype=torch.float64, device=device).reshape(())
 
     if p_onestar is not None:
         p_onestar_raw = torch.as_tensor(p_onestar, dtype=torch.float64, device=device).reshape(())
-    elif hasattr(preproc_state.baseline, "p_onestar_proxy") and getattr(preproc_state.baseline, "p_onestar_proxy") is not None:
-        p_onestar_raw = torch.as_tensor(
-            getattr(preproc_state.baseline, "p_onestar_proxy"), dtype=torch.float64, device=device
-        ).reshape(())
-    elif float(preproc_state.one_star_coupon) > 0.0:
-        p_onestar_raw = l_onestar_t / float(preproc_state.one_star_coupon)
     else:
-        p_onestar_raw = torch.tensor(0.0, dtype=torch.float64, device=device)
+        raw_pos_ad = getattr(base, "p_onestar_proxy", None)
+        if raw_pos_ad is not None:
+            p_onestar_raw = torch.as_tensor(raw_pos_ad, dtype=torch.float64, device=device).reshape(())
+        elif float(preproc_state.one_star_coupon) != 0.0:
+            p_onestar_raw = l_onestar_t / float(preproc_state.one_star_coupon)
+        else:
+            p_onestar_raw = torch.tensor(0.0, dtype=torch.float64, device=device)
 
-    p_t = p_t * preproc_state.is_callable
-
-    cashflows: list[CashFlowItem] = (
-        list(preproc_state.seasoned_state.past_cashflows) if build_cashflow_items else []
-    )
+    cashflows: list[CashFlowItem] = list(ss.past_cashflows) if build_cashflow_items else []
     pv_in_transit_t = torch.tensor(preproc_state.pv_in_transit, dtype=torch.float64, device=device)
 
     if m_rem == 0 or preproc_state.already_autocalled:
-        z_s = torch.tensor(0.0, dtype=torch.float64, device=device)
-        if build_cashflow_items:
-            for m in range(m_rem):
-                pay_dt = preproc_state.seasoned_state.future_pay_dates[m]
-                cashflows.append(CashFlowItem("FundingLeg", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
-                cashflows.append(CashFlowItem("Coupon", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
-                if m == m_rem - 1:
-                    if preproc_state.is_long_basket:
-                        cashflows.append(CashFlowItem("IsLongBasket", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
-                    elif (
-                        preproc_state.one_star_strike is not None
-                        and float(preproc_state.one_star_strike) > 0.0
-                    ):
-                        cashflows.append(CashFlowItem("OneStarCoupon", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
-                    cashflows.append(CashFlowItem("Option", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
-                cashflows.append(CashFlowItem("Notional", pay_dt, 0.0, 0.0, ccy, 0, "Estimate"))
+        zero_link = (
+            0.0 * p_t.sum()
+            + 0.0 * q_t.sum()
+            + 0.0 * l_put_t
+            + 0.0 * l_call_t
+            + 0.0 * l_onestar_t
+            + 0.0 * p_onestar_raw
+        )
+        need_grad_empty = bool(zero_link.requires_grad or pv_in_transit_t.requires_grad)
+        z_s = zero_link if need_grad_empty else torch.tensor(0.0, dtype=torch.float64, device=device)
+        pv_out_empty = pv_in_transit_t + zero_link if need_grad_empty else pv_in_transit_t
+        p_zero = 0.0 * p_t if need_grad_empty else torch.zeros(m_rem, dtype=torch.float64, device=device)
+        q_zero = 0.0 * q_t if need_grad_empty else torch.zeros(m_rem, dtype=torch.float64, device=device)
+        l_put_zero = 0.0 * l_put_t if need_grad_empty else torch.tensor(0.0, dtype=torch.float64, device=device)
+        l_call_zero = 0.0 * l_call_t if need_grad_empty else torch.tensor(0.0, dtype=torch.float64, device=device)
+        l_os_zero = 0.0 * l_onestar_t if need_grad_empty else torch.tensor(0.0, dtype=torch.float64, device=device)
+        if build_cashflow_items and m_rem > 0:
+            zeros_m = np.zeros(m_rem, dtype=np.float64)
+            _append_future_cashflow_items(
+                cashflows,
+                future_pay_dates=preproc_state.seasoned_state.future_pay_dates[:m_rem],
+                ccy=ccy,
+                fund_arr=zeros_m,
+                cpn_arr=zeros_m,
+                notional_arr=zeros_m,
+                df_last=0.0,
+                p_last=0.0,
+                surv_last=0.0,
+                opt_amt=0.0,
+                opt_only_amt=0.0,
+                l_onestar_val=0.0,
+                p_star_val=0.0,
+                option_se=0.0,
+                preproc_state=preproc_state,
+            )
         return AutocallPostprocOutput(
-            product_value=pv_in_transit_t,
+            product_value=pv_out_empty,
             notional_pv=z_s,
             coupon_pv=z_s,
             option_pv=z_s,
             funding_pv=z_s,
             pv_in_transit=pv_in_transit_t,
             survival_probs=torch.zeros(m_rem, dtype=torch.float64, device=device),
-            p_stop=p_t,
-            q_cpn=q_t,
-            l_put=l_put_t,
-            l_call=l_call_t,
+            p_stop=p_zero,
+            q_cpn=q_zero,
+            l_put=l_put_zero,
+            l_call=l_call_zero,
             cashflows=cashflows,
             standard_error=0.0,
             reporting_currency=ccy,
             cash_to_settle_today=cash_today,
-            l_onestar=l_onestar_t,
+            l_onestar=l_os_zero,
             p_onestar=z_s,
         )
 
@@ -2125,95 +3937,11 @@ def assemble_autocall_cashflows_and_pv(
     )
     p_onestar_t = torch.minimum(p_onestar_raw.clamp(min=0.0), survival_probs[-1])
 
-    df_pay = preproc_state.df_pay
-    cpn_rates = preproc_state.coupon_amounts
-
-    # Pure stateless FundingLeg evaluation without mutating preproc_state.funding_leg
-    funding_cf_per_period: list[torch.Tensor] = [
-        torch.tensor(0.0, dtype=torch.float64, device=device) for _ in range(m_rem)
-    ]
-    if preproc_state.funding_leg is not None:
-        f_leg = preproc_state.funding_leg
-        f_rid = f_leg.get("rate_identifier")
-        f_curve = f_leg.get("funding_curve")
-        f_curve_id = f_leg.get("funding_curve_id")
-        disc_id = preproc_state.discount_curve_id
-        as_of_dt = preproc_state.seasoned_state.as_of_date
-        start_dt = preproc_state.seasoned_state.start_date
-        f_dcc = preproc_state.seasoned_state.day_count_convention
-
-        df_fin_fn: Callable[[datetime.datetime], torch.Tensor | float]
-        if df_fin_fn_override is not None:
-            df_fin_fn = df_fin_fn_override
-        else:
-            _, df_fin_fn = build_discount_rate_evaluator(preproc_state.discount_curve, as_of_dt)
-
-        same_curve = (
-            f_curve is None
-            or f_curve is preproc_state.discount_curve
-            or (f_curve_id is not None and disc_id is not None and f_curve_id == disc_id)
-        )
-        df_fwd_fn: Callable[[datetime.datetime], torch.Tensor | float]
-        if df_fwd_fn_override is not None:
-            df_fwd_fn = df_fwd_fn_override
-        elif f_rid is not None and not same_curve:
-            _, df_fwd_fn = build_discount_rate_evaluator(f_curve, as_of_dt)
-        else:
-            df_fwd_fn = df_fin_fn
-
-        f_spread = float(f_leg.get("funding_spread", 0.0))
-        f_dates = f_leg.get("payment_dates", ())
-        f_fixings = f_leg.get("funding_fixings", ())
-
-        prev_f_dt = start_dt
-        for f_dt in f_dates:
-            if f_dt <= as_of_dt:
-                prev_f_dt = f_dt
-                continue
-            alpha_j = year_fraction(prev_f_dt, f_dt, f_dcc)
-            df_curr = df_fin_fn(f_dt)
-            if f_rid is None:
-                r_fwd_j: Any = 0.0
-            else:
-                fixed_reset = _lookup_funding_fixing(f_fixings, prev_f_dt) if prev_f_dt < as_of_dt else None
-                if fixed_reset is not None:
-                    r_fwd_j = fixed_reset
-                elif prev_f_dt < as_of_dt:
-                    # Stub forward rate from valuation date when historical reset fixing is absent.
-                    alpha_rem = max(year_fraction(as_of_dt, f_dt, f_dcc), 1e-8)
-                    df_curr_fwd = df_fwd_fn(f_dt)
-                    if isinstance(df_curr_fwd, torch.Tensor):
-                        r_fwd_j = (1.0 / df_curr_fwd.clamp(min=1e-12) - 1.0) / alpha_rem
-                    else:
-                        r_fwd_j = (1.0 / max(float(df_curr_fwd), 1e-12) - 1.0) / alpha_rem
-                else:
-                    df_prev_fwd = df_fwd_fn(prev_f_dt)
-                    df_curr_fwd = df_fwd_fn(f_dt)
-                    if isinstance(df_curr_fwd, torch.Tensor) or isinstance(df_prev_fwd, torch.Tensor):
-                        df_prev_t = (
-                            df_prev_fwd
-                            if isinstance(df_prev_fwd, torch.Tensor)
-                            else torch.tensor(float(df_prev_fwd), dtype=torch.float64, device=device)
-                        )
-                        df_curr_t = (
-                            df_curr_fwd
-                            if isinstance(df_curr_fwd, torch.Tensor)
-                            else torch.tensor(float(df_curr_fwd), dtype=torch.float64, device=device)
-                        )
-                        r_fwd_j = (df_prev_t / df_curr_t.clamp(min=1e-12) - 1.0) / max(alpha_j, 1e-8)
-                    else:
-                        r_fwd_j = (
-                            float(df_prev_fwd) / max(float(df_curr_fwd), 1e-12) - 1.0
-                        ) / max(alpha_j, 1e-8)
-
-            m_idx = m_rem - 1
-            for m in range(m_rem):
-                if preproc_state.seasoned_state.future_pay_dates[m] >= f_dt:
-                    m_idx = m
-                    break
-            cf_fund_j = surv_prev[m_idx] * df_curr * (r_fwd_j + f_spread) * alpha_j
-            funding_cf_per_period[m_idx] = funding_cf_per_period[m_idx] + cf_fund_j
-            prev_f_dt = f_dt
+    df_pay = preproc_state.df_pay.reshape(-1)[:m_rem]
+    cpn_rates = preproc_state.coupon_amounts.reshape(-1)[:m_rem]
+    funding_cf_t = _evaluate_future_funding_cf(
+        preproc_state, surv_prev, m_rem, device, df_fin_fn_override, df_fwd_fn_override
+    )
 
     coupon_cf_undisc_t = (
         torch.as_tensor(coupon_cf_undisc, dtype=torch.float64, device=device).reshape(-1)[:m_rem]
@@ -2221,204 +3949,204 @@ def assemble_autocall_cashflows_and_pv(
         else None
     )
 
-    notional_cf_list: list[torch.Tensor] = []
-    coupon_cf_list: list[torch.Tensor] = []
-    mem_acc = torch.tensor(preproc_state.c_mem_0, dtype=torch.float64, device=device)
-
-    for m in range(m_rem):
-        if preproc_state.no_notional_repayment:
-            cf_notional_m = torch.tensor(0.0, dtype=torch.float64, device=device)
-        elif m < m_rem - 1:
-            cf_notional_m = df_pay[m] * p_t[m]
-        else:
-            cf_notional_m = df_pay[m] * (p_t[m] + survival_probs[m])
-        notional_cf_list.append(cf_notional_m)
-
-        if coupon_cf_undisc_t is not None:
-            cf_cpn_m = df_pay[m] * coupon_cf_undisc_t[m]
-        else:
-            c_m = cpn_rates[m]
-            eff_c_m = (c_m + mem_acc) if preproc_state.is_memory else c_m
-            if preproc_state.force_coupons_on_autocall:
-                eff_q_m = torch.maximum(q_t[m], p_t[m] / surv_prev[m].clamp(min=1e-12))
-            else:
-                eff_q_m = q_t[m]
-            cf_cpn_m = df_pay[m] * (
-                surv_prev[m] * eff_q_m * eff_c_m + p_t[m] * float(preproc_state.autocall_coupon)
-            )
-            if preproc_state.is_memory:
-                mem_acc = eff_c_m * (1.0 - eff_q_m)
-        coupon_cf_list.append(cf_cpn_m)
-
     put_sign = -1.0
-    cf_option_term = df_pay[-1] * (
-        put_sign * float(preproc_state.option_gearing) * l_put_t
-        + float(preproc_state.participation_call_rate) * l_call_t
-        + l_onestar_t
+    gearing = float(preproc_state.option_gearing)
+    part_rate = float(preproc_state.participation_call_rate)
+    ac_coupon = float(preproc_state.autocall_coupon)
+
+    need_grad = bool(
+        p_t.requires_grad
+        or q_t.requires_grad
+        or l_put_t.requires_grad
+        or l_call_t.requires_grad
+        or l_onestar_t.requires_grad
+        or df_pay.requires_grad
+        or cpn_rates.requires_grad
+        or (coupon_cf_undisc_t is not None and coupon_cf_undisc_t.requires_grad)
+        or funding_cf_t.requires_grad
+        or p_onestar_t.requires_grad
+        or pv_in_transit_t.requires_grad
     )
 
-    notional_pv = torch.stack(notional_cf_list).sum()
-    coupon_pv = torch.stack(coupon_cf_list).sum()
-    funding_pv = torch.stack(funding_cf_per_period).sum()
-    option_pv = cf_option_term
+    if not need_grad:
+        if device.type == "cpu":
+            p_np = p_t.detach().numpy()
+            q_np = q_t.detach().numpy()
+            surv_np = survival_probs.detach().numpy()
+            surv_prev_np = surv_prev.detach().numpy()
+            df_pay_np = df_pay.detach().numpy()
+            cpn_np = cpn_rates.detach().numpy()
+            fund_np = funding_cf_t.detach().numpy()
+            undisc_np = coupon_cf_undisc_t.detach().numpy() if coupon_cf_undisc_t is not None else None
+            l_put_val = float(l_put_t)
+            l_call_val = float(l_call_t)
+            l_os_val = float(l_onestar_t)
+            p_star_val = float(p_onestar_t)
+        else:
+            # Single batched D2H transfer for fast host NumPy cashflow assembly when AD is inactive.
+            scalars_t = torch.stack([l_put_t, l_call_t, l_onestar_t, p_onestar_t])
+            vec_list = [p_t, q_t, survival_probs, surv_prev, df_pay, cpn_rates, funding_cf_t]
+            if coupon_cf_undisc_t is not None:
+                vec_list.append(coupon_cf_undisc_t)
+            packed = torch.cat([torch.stack(vec_list).reshape(-1), scalars_t], dim=0).detach().cpu().numpy()
+            n_vecs = len(vec_list)
+            vecs_np = packed[: n_vecs * m_rem].reshape(n_vecs, m_rem)
+            p_np, q_np, surv_np, surv_prev_np, df_pay_np, cpn_np, fund_np = vecs_np[:7]
+            undisc_np = vecs_np[7] if coupon_cf_undisc_t is not None else None
+            l_put_val, l_call_val, l_os_val, p_star_val = (float(x) for x in packed[n_vecs * m_rem :])
 
-    product_value = pv_in_transit_t + notional_pv + coupon_pv + option_pv - funding_pv
+        if preproc_state.no_notional_repayment:
+            notional_cf_np = np.zeros(m_rem, dtype=np.float64)
+        else:
+            stop_plus_surv = p_np.copy()
+            stop_plus_surv[-1] += surv_np[-1]
+            notional_cf_np = df_pay_np * stop_plus_surv
 
-    if build_cashflow_items:
-        for m in range(m_rem):
-            pay_dt = preproc_state.seasoned_state.future_pay_dates[m]
-            fund_amt = float(funding_cf_per_period[m].detach().cpu().item())
-            cpn_amt = float(coupon_cf_list[m].detach().cpu().item())
-            notional_amt = float(notional_cf_list[m].detach().cpu().item())
-
-            cashflows.append(
-                CashFlowItem(
-                    Description="FundingLeg",
-                    Date=pay_dt,
-                    Amount=-fund_amt if fund_amt != 0.0 else 0.0,
-                    StandardError=0.0,
-                    Currency=ccy,
-                    Leg=0,
-                    StatusText="Estimate",
+        if undisc_np is not None:
+            coupon_cf_np = df_pay_np * undisc_np
+        else:
+            if preproc_state.force_coupons_on_autocall:
+                eff_q_np = np.clip(
+                    np.maximum(q_np, p_np / np.maximum(surv_prev_np, 1e-12)),
+                    0.0,
+                    1.0,
                 )
+            else:
+                eff_q_np = q_np
+            if preproc_state.is_memory:
+                coupon_cf_np = np.empty(m_rem, dtype=np.float64)
+                mem_f = float(preproc_state.c_mem_0)
+                for m in range(m_rem):
+                    eff_c_m = float(cpn_np[m]) + mem_f
+                    eq_m = float(eff_q_np[m])
+                    coupon_cf_np[m] = float(df_pay_np[m]) * (
+                        float(surv_prev_np[m]) * eq_m * eff_c_m + float(p_np[m]) * ac_coupon
+                    )
+                    mem_f = eff_c_m * (1.0 - eq_m)
+            else:
+                coupon_cf_np = df_pay_np * (
+                    surv_prev_np * eff_q_np * cpn_np + p_np * ac_coupon
+                )
+
+        df_last = float(df_pay_np[-1])
+        opt_only_amt = df_last * (put_sign * gearing * l_put_val + part_rate * l_call_val)
+        opt_amt = opt_only_amt + df_last * l_os_val
+
+        notional_pv_s = float(notional_cf_np.sum())
+        coupon_pv_s = float(coupon_cf_np.sum())
+        funding_pv_s = float(fund_np.sum())
+        pv_total_s = float(preproc_state.pv_in_transit) + notional_pv_s + coupon_pv_s + opt_amt - funding_pv_s
+
+        out_scalars = torch.tensor(
+            [notional_pv_s, coupon_pv_s, opt_amt, funding_pv_s, pv_total_s],
+            dtype=torch.float64,
+            device=device,
+        )
+        notional_pv, coupon_pv, option_pv, funding_pv, product_value = (
+            out_scalars[0],
+            out_scalars[1],
+            out_scalars[2],
+            out_scalars[3],
+            out_scalars[4],
+        )
+
+        if build_cashflow_items:
+            _append_future_cashflow_items(
+                cashflows,
+                future_pay_dates=preproc_state.seasoned_state.future_pay_dates[:m_rem],
+                ccy=ccy,
+                fund_arr=fund_np,
+                cpn_arr=coupon_cf_np,
+                notional_arr=notional_cf_np,
+                df_last=df_last,
+                p_last=float(p_np[-1]),
+                surv_last=float(surv_np[-1]),
+                opt_amt=opt_amt,
+                opt_only_amt=opt_only_amt,
+                l_onestar_val=l_os_val,
+                p_star_val=p_star_val,
+                option_se=option_se,
+                preproc_state=preproc_state,
             )
-            cashflows.append(
-                CashFlowItem(
-                    Description="Coupon",
-                    Date=pay_dt,
-                    Amount=cpn_amt,
-                    StandardError=0.0,
-                    Currency=ccy,
-                    Leg=0,
-                    StatusText="Estimate",
-                )
+    else:
+        if preproc_state.no_notional_repayment:
+            notional_cf_t = torch.zeros(m_rem, dtype=torch.float64, device=device)
+        else:
+            last_extra = torch.zeros(m_rem, dtype=torch.float64, device=device)
+            last_extra[-1] = survival_probs[-1]
+            notional_cf_t = df_pay * (p_t + last_extra)
+
+        if coupon_cf_undisc_t is not None:
+            coupon_cf_t = df_pay * coupon_cf_undisc_t
+        else:
+            if preproc_state.force_coupons_on_autocall:
+                eff_q_all = torch.maximum(q_t, p_t / surv_prev.clamp(min=1e-12)).clamp(0.0, 1.0)
+            else:
+                eff_q_all = q_t
+            if preproc_state.is_memory:
+                coupon_cf_list: list[torch.Tensor] = []
+                mem_acc = torch.tensor(preproc_state.c_mem_0, dtype=torch.float64, device=device)
+                for m in range(m_rem):
+                    eff_c_m_t = cpn_rates[m] + mem_acc
+                    eff_q_m_t = eff_q_all[m]
+                    coupon_cf_list.append(
+                        df_pay[m] * (surv_prev[m] * eff_q_m_t * eff_c_m_t + p_t[m] * ac_coupon)
+                    )
+                    mem_acc = eff_c_m_t * (1.0 - eff_q_m_t)
+                coupon_cf_t = torch.stack(coupon_cf_list)
+            else:
+                coupon_cf_t = df_pay * (surv_prev * eff_q_all * cpn_rates + p_t * ac_coupon)
+
+        opt_only_term_t = df_pay[-1] * (put_sign * gearing * l_put_t + part_rate * l_call_t)
+        cf_option_term = opt_only_term_t + df_pay[-1] * l_onestar_t
+
+        notional_pv = notional_cf_t.sum()
+        coupon_pv = coupon_cf_t.sum()
+        funding_pv = funding_cf_t.sum()
+        option_pv = cf_option_term
+        product_value = pv_in_transit_t + notional_pv + coupon_pv + option_pv - funding_pv
+
+        if build_cashflow_items:
+            scalars_ad = torch.stack(
+                [
+                    df_pay[-1],
+                    p_t[-1],
+                    survival_probs[-1],
+                    cf_option_term,
+                    opt_only_term_t,
+                    l_onestar_t,
+                    p_onestar_t,
+                ]
             )
-            if m == m_rem - 1:
-                opt_amt = float(cf_option_term.detach().cpu().item())
-                if preproc_state.is_long_basket:
-                    stop_notional_amt = (
-                        0.0
-                        if preproc_state.no_notional_repayment
-                        else float((df_pay[-1] * p_t[-1]).detach().cpu().item())
-                    )
-                    surv_notional_amt = (
-                        0.0
-                        if preproc_state.no_notional_repayment
-                        else float((df_pay[-1] * survival_probs[-1]).detach().cpu().item())
-                    )
-                    cashflows.append(
-                        CashFlowItem(
-                            Description="IsLongBasket",
-                            Date=pay_dt,
-                            Amount=surv_notional_amt + opt_amt,
-                            StandardError=float(option_se),
-                            Currency=ccy,
-                            Leg=0,
-                            StatusText="Estimate",
-                        )
-                    )
-                    cashflows.append(
-                        CashFlowItem(
-                            Description="Option",
-                            Date=pay_dt,
-                            Amount=0.0,
-                            StandardError=0.0,
-                            Currency=ccy,
-                            Leg=0,
-                            StatusText="Estimate",
-                        )
-                    )
-                    cashflows.append(
-                        CashFlowItem(
-                            Description="Notional",
-                            Date=pay_dt,
-                            Amount=stop_notional_amt,
-                            StandardError=0.0,
-                            Currency=ccy,
-                            Leg=0,
-                            StatusText="Estimate",
-                        )
-                    )
-                    continue
-
-                if preproc_state.one_star_strike is not None and float(preproc_state.one_star_strike) > 0.0:
-                    p_star_val = float(p_onestar_t.detach().cpu().item())
-                    if p_star_val > 0.0 or float(preproc_state.one_star_strike) > 0.0:
-                        df_last = float(df_pay[-1].detach().cpu().item())
-                        onestar_principal_amt = (
-                            0.0 if preproc_state.no_notional_repayment else df_last * p_star_val
-                        )
-                        onestar_bonus_amt = df_last * float(l_onestar_t.detach().cpu().item())
-                        onestar_total_amt = onestar_principal_amt + onestar_bonus_amt
-                        notional_rem_amt = max(notional_amt - onestar_principal_amt, 0.0)
-                        opt_only_amt = float(
-                            (
-                                df_pay[-1]
-                                * (
-                                    put_sign * float(preproc_state.option_gearing) * l_put_t
-                                    + float(preproc_state.participation_call_rate) * l_call_t
-                                )
-                            )
-                            .detach()
-                            .cpu()
-                            .item()
-                        )
-                        cashflows.append(
-                            CashFlowItem(
-                                Description="OneStarCoupon",
-                                Date=pay_dt,
-                                Amount=onestar_total_amt,
-                                StandardError=0.0,
-                                Currency=ccy,
-                                Leg=0,
-                                StatusText="Estimate",
-                            )
-                        )
-                        cashflows.append(
-                            CashFlowItem(
-                                Description="Option",
-                                Date=pay_dt,
-                                Amount=opt_only_amt,
-                                StandardError=float(option_se),
-                                Currency=ccy,
-                                Leg=0,
-                                StatusText="Estimate",
-                            )
-                        )
-                        cashflows.append(
-                            CashFlowItem(
-                                Description="Notional",
-                                Date=pay_dt,
-                                Amount=notional_rem_amt,
-                                StandardError=0.0,
-                                Currency=ccy,
-                                Leg=0,
-                                StatusText="Estimate",
-                            )
-                        )
-                        continue
-
-                cashflows.append(
-                    CashFlowItem(
-                        Description="Option",
-                        Date=pay_dt,
-                        Amount=opt_amt,
-                        StandardError=float(option_se),
-                        Currency=ccy,
-                        Leg=0,
-                        StatusText="Estimate",
-                    )
+            packed_ad = (
+                torch.cat(
+                    [torch.stack([funding_cf_t, coupon_cf_t, notional_cf_t]).reshape(-1), scalars_ad],
+                    dim=0,
                 )
-            cashflows.append(
-                CashFlowItem(
-                    Description="Notional",
-                    Date=pay_dt,
-                    Amount=notional_amt,
-                    StandardError=0.0,
-                    Currency=ccy,
-                    Leg=0,
-                    StatusText="Estimate",
-                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            vecs_ad = packed_ad[: 3 * m_rem].reshape(3, m_rem)
+            df_last, p_last, surv_last, opt_amt, opt_only_amt, l_os_val, p_star_val = (
+                float(x) for x in packed_ad[3 * m_rem :]
+            )
+            _append_future_cashflow_items(
+                cashflows,
+                future_pay_dates=preproc_state.seasoned_state.future_pay_dates[:m_rem],
+                ccy=ccy,
+                fund_arr=vecs_ad[0],
+                cpn_arr=vecs_ad[1],
+                notional_arr=vecs_ad[2],
+                df_last=df_last,
+                p_last=p_last,
+                surv_last=surv_last,
+                opt_amt=opt_amt,
+                opt_only_amt=opt_only_amt,
+                l_onestar_val=l_os_val,
+                p_star_val=p_star_val,
+                option_se=option_se,
+                preproc_state=preproc_state,
             )
 
     eff_total_se = float(total_se) if total_se is not None else float(option_se)
@@ -2456,7 +4184,10 @@ __all__ = [
     "AutocallGlobalCol",
     "ContentDigestKey",
     "ThreadSafeLRUCache",
+    "build_vol_surface_cache_key",
     "digest_market_bytes",
+    "compute_surface_digest",
+    "compute_preproc_state_digest",
     "AutocallPreprocState",
     "AutocallPostprocOutput",
     "preprocess_eq_autocall",

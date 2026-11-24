@@ -20,17 +20,17 @@
 ## Core Engines
 
 ### 1. Multi-Asset Equity Autocallables (`EQAutocallable`)
-Prices seasoned worst-of memory Phoenix autocallables under Dupire local volatility (`D <= 8` equities, `M <= 48` observation periods, 113-field Murex `ConstantMessageMap` DAG schema) via a 3-tier hybrid architecture:
+Prices seasoned multi-asset memory Phoenix autocallables under Dupire local volatility (`D <= 12` equities, `M <= 60` observation periods, 113-field Murex `ConstantMessageMap` DAG schema) via a 3-layer hybrid architecture:
 
-1. **Tier 1 — Exact `float64` Pre/Post-Processing & Analytical Proxy (`< 35 us`)**:
+1. **Analytical Pre/Post-Processing & C++23 AVX2/OpenMP Proxy (`float64`, `~37 us` p50)**:
    - Parses `@<40-hex>` Murex DAG payloads, fits clamped cubic zero-rate (`ClampedYieldCurve`) and repo spread (`RepoCurve`) curves, and collapses historical fixings (`collapse_seasoned_schedule`) into Markovian sufficient statistics (`C_mem`, `I_KI_past`, `PV_in_transit`).
-   - Computes escrowed cash + proportional dividend forwards with cross-currency quanto adjustment and evaluates a closed-form **Stulz–Margrabe + 32-node Gauss–Hermite Markovian conditional survival proxy** (`compute_analytical_autocall_baseline`).
-2. **Tier 2 — Masked $S_D$-Equivariant Graph Neural Operator (`MaskedEQAutocallSurrogate`)**:
+   - Computes escrowed cash + proportional dividend forwards with cross-currency quanto adjustment and evaluates a closed-form **Stulz–Margrabe + 32-node Gauss–Hermite Markovian conditional survival proxy** (`compute_analytical_autocall_baseline`) accelerated by compiled C++23 AVX2/OpenMP kernels.
+2. **Masked $S_D$-Equivariant Graph Neural Operator (`MaskedEQAutocallSurrogate`)**:
    - Canonicalizes basket order ($\pi_{\text{lex}}$) and applies worst-of weight-gated `MaskedEGNOLayer` message passing, smooth `OrderStatisticPooling` (`LogMeanExp`), and a CuDNN-free `ParallelScheduleTransformer` (`SDPBackend.MATH`).
-   - Predicts dispersion-attenuated residual stopping hazards $\Delta z_{h,m}$, coupon logits $\Delta z_{q,m}$, and terminal knock-in put loss $\Delta L_{\text{put}}$ anchored on the Tier-1 proxy, guaranteeing exact $S_D$ permutation invariance (`0.00e+00`) and zero non-binding Greek leakage.
-3. **Hybrid Chain-Rule Greeks & SR 26-2 Guardian**:
-   - Computes all 8 Greeks (`Delta`, `Gamma`, `MultivariateAggregatedCashGamma`, `Vega`, `Vanna`, `Volga`, `Rho`, `DividendsSensitivities`, `CorrelationSensitivities`) by combining `float64` autograd through the Tier-1/Tier-2 graph with analytical surface/curve Jacobians.
-   - `EQAutocallModelGuardian` enforces Higham PSD projection, barrier pin-risk checks, 16-D Ledoit–Wolf Mahalanobis OOD gating, and dispersion-scaled residual bounds (`50–200 bps`), routing out-of-distribution or exotic (`OneStar`, `ParticipationCall`) trades to the 32,768-path Sobol Dupire QMC solver (`price_eq_autocall_dupire_qmc`).
+   - Predicts dispersion-attenuated residual stopping hazards $\Delta z_{h,m}$, coupon logits $\Delta z_{q,m}$, and terminal knock-in put loss $\Delta L_{\text{put}}$ anchored on the analytical proxy, guaranteeing exact $S_D$ permutation invariance (`0.00e+00`) and zero non-binding Greek leakage.
+3. **Hybrid Chain-Rule / QMC-AAD Greeks & SR 26-2 Guardian**:
+   - Computes all 8 canonical Greeks (`Delta`, `Gamma`, `MultivariateAggregatedCashGamma`, `Vega`, `Rho` + `RepoRho`, `DividendsSensitivities`, `Theta`, `Cega`) in `float64` by combining autograd/analytical curve Jacobians with Triton GPU QMC-AAD CRN pricing (`price_eq_autocall_dupire_qmc` / `compute_qmc_aad_crn_greeks`).
+   - `EQAutocallModelGuardian` enforces Higham PSD projection, barrier pin-risk checks, 16-D Ledoit–Wolf Mahalanobis OOD gating, dispersion-scaled residual bounds (`50–200 bps`), and bounded GPU caching via `GlobalGpuCacheManager` (`<= 250 MB` peak VRAM).
 
 ### 2. Triangulated FX & Commodity Cross Engine
 Prices synthetic cross options $S^\times = S_1 S_2$ (e.g., `XAU/RUB = XAU/USD × USD/RUB`) from two component leg smiles and correlation $\rho$:
@@ -51,9 +51,9 @@ Trains recurrent policy networks end-to-end through Jäckel's differentiable PIV
 
 | Engine / Task | Metric | Measured Result | Reference / Baseline |
 | :--- | :--- | :--- | :--- |
-| **`EQAutocallable` (Reference Trade)** | `ProductValue` / 37-Row `CashFlows` Diff | **`+1.05 bps` (`0.36 SE`) / `0 ULP` on 36 deterministic rows** | Murex `MonteCarloWithAAD` (`32,768` paths) |
+| **`EQAutocallable` (Reference Trade `45476647`)** | `ProductValue` / 65k Oracle Vega Diff | **`+0.11 bps` (`0.0098 bps` Vega vs 65k FP64 oracle)** | Murex `MonteCarloWithAAD` (`32,768` paths) |
 | **`EQAutocallable` Surrogate** | Out-of-Sample `ProductValue` MAE | **`2.14 bps`** (`<= 8.0 bps` target) | 32,768-path Sobol Dupire QMC |
-| **`EQAutocallable` Latency (`B = 1`)** | `PV` + All 8 Greeks + 37 `CashFlows` | **`1.40 ms` warm / `6.23 ms` cold** (`403x–1,794x` speedup) | `2,509.6 ms` Murex `MonteCarloWithAAD` |
+| **`EQAutocallable` Latency (`B = 1`)** | `PV` + All 8 Greeks + `CashFlows` (15 deals) | **`2.8–9.2 ms` warm GPU (`<= 188 MB` peak VRAM)** | `2,509.6 ms` Murex `MonteCarloWithAAD` |
 | **`EQAutocallable` Throughput** | Batched GPU valuation + Greeks (`B = 1024`) | **`0.0149 ms/trade`** (`67,114 trades/s`) | Pre-featurized Arrow / CUDA batch |
 | **FX/Commodity Cross Engine** | In-Distribution Price RMSE / MAE | **`0.35 bps` RMSE / `0.67 bps` MAE** | 2D Gaussian Copula ($\mathbb{Q}^B$) |
 | **FX/Commodity Cross Latency** | Single quote (GPU) / 10k Arrow batch | **`0.196 ms` p50 / `9.45 ms` p99** | Full price + 13 Taylor-jet Greeks |
