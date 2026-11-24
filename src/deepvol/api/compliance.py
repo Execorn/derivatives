@@ -79,7 +79,7 @@ class ComplianceMonitor:
 
         return T_clamped, K_clamped, is_ood
 
-    def track_query(self, T: float, k: float):
+    def track_query(self, T: float, k: float) -> None:
         """Track query (T, k) for PSI computation."""
         with self.lock:
             self.batch_T.append(T)
@@ -93,7 +93,7 @@ class ComplianceMonitor:
                 # Compute PSI in a background thread to prevent latency spikes
                 threading.Thread(target=self._compute_and_log_psi, args=(T_batch, k_batch), daemon=True).start()
 
-    def _compute_and_log_psi(self, T_batch: List[float], k_batch: List[float]):
+    def _compute_and_log_psi(self, T_batch: List[float], k_batch: List[float]) -> None:
         # T PSI
         T_counts = [0] * 8
         for t in T_batch:

@@ -25,12 +25,12 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Tuple, Union, cast
 import uuid
 
 import anyio
 
-from cachetools import TTLCache
+from cachetools import TTLCache  # type: ignore[import-untyped]
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
@@ -60,7 +60,7 @@ _START_TIME = time.time()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manages application lifecycle: preloads models, warms up CUDA graphs, and stops executor."""
     try:
         _load_model()
@@ -368,7 +368,7 @@ def _get_cached_container(model_name: str) -> CachedModel:
         return container
 
 
-async def _hot_reload_model_weights(model_name: str):
+async def _hot_reload_model_weights(model_name: str) -> None:
     """
     Acquires exclusive write lock and reloads the model parameters from disk.
     This runs with ZERO server downtime.
@@ -388,8 +388,9 @@ async def _hot_reload_model_weights(model_name: str):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         state = torch.load(cached_container.path, map_location=device, weights_only=True)
-        if hasattr(cached_container.model, "base_fno"):
-            cached_container.model.base_fno.load_state_dict(state)
+        base_fno = getattr(cached_container.model, "base_fno", None)
+        if isinstance(base_fno, torch.nn.Module):
+            base_fno.load_state_dict(state)
         else:
             cached_container.model.load_state_dict(state)
         cached_container.model.to(device)
@@ -637,7 +638,7 @@ def _make_spatial(device: torch.device) -> torch.Tensor:
     return spatial.to(device)
 
 
-def _fno_forward(params: HestonParams) -> np.ndarray:
+def _fno_forward(params: HestonParams) -> NDArray[Any]:
     """Run FNO forward pass, return (8,11) IV surface in decimal."""
     t0 = time.perf_counter()
     container = _get_cached_container("rough_heston")
@@ -667,7 +668,7 @@ def _fno_forward(params: HestonParams) -> np.ndarray:
     elapsed = time.perf_counter() - t0
     fno_pricing_latency_seconds.observe(elapsed)
 
-    return iv_surface
+    return cast(NDArray[Any], iv_surface)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -805,8 +806,8 @@ class RBergomiGreeksRequest(BaseGreeksRequest):
 
 
 def _compute_greeks_from_surface(
-    iv_surface: np.ndarray, S: float, r: float, q: float
-) -> dict:
+    iv_surface: NDArray[Any], S: float, r: float, q: float
+) -> Dict[str, Any]:
     from deepvol.greeks.portfolio_greeks import bs_greeks
 
     T_grid = _MATURITIES
@@ -856,6 +857,12 @@ async def compute_model_greeks(model_name: str, req: Dict[str, Any]) -> GreeksRe
     Supported models: heston, sabr, ssvi, rbergomi, rough_heston
     """
     model_name = model_name.lower()
+    parsed_req: Union[
+        HestonGreeksRequest,
+        SABRGreeksRequest,
+        SSVIGreeksRequest,
+        RBergomiGreeksRequest,
+    ]
     try:
         if model_name == "heston":
             parsed_req = HestonGreeksRequest(**req)
@@ -880,7 +887,9 @@ async def compute_model_greeks(model_name: str, req: Dict[str, Any]) -> GreeksRe
         async with cached_container.rwlock.reader():
             # Build the model parameter array/tensor
             if model_name in ("heston", "rough_heston", "default", "v2"):
-                actual_model = (
+                if not isinstance(parsed_req, HestonGreeksRequest):
+                    raise HTTPException(status_code=500, detail="Request type mismatch")
+                actual_model: Any = (
                     cached_container.model.base_fno
                     if hasattr(cached_container.model, "base_fno")
                     else cached_container.model
@@ -919,16 +928,22 @@ async def compute_model_greeks(model_name: str, req: Dict[str, Any]) -> GreeksRe
                         dtype=np.float32,
                     )
             elif model_name == "sabr":
+                if not isinstance(parsed_req, SABRGreeksRequest):
+                    raise HTTPException(status_code=500, detail="Request type mismatch")
                 theta_arr = np.array(
                     [parsed_req.alpha, parsed_req.rho, parsed_req.nu], dtype=np.float32
                 )
             elif model_name == "ssvi":
+                if not isinstance(parsed_req, SSVIGreeksRequest):
+                    raise HTTPException(status_code=500, detail="Request type mismatch")
                 theta_arr = np.array(
                     parsed_req.theta_atm
                     + [parsed_req.rho, parsed_req.eta, parsed_req.gamma],
                     dtype=np.float32,
                 )
             elif model_name == "rbergomi":
+                if not isinstance(parsed_req, RBergomiGreeksRequest):
+                    raise HTTPException(status_code=500, detail="Request type mismatch")
                 theta_arr = np.array(
                     [parsed_req.v0, parsed_req.H, parsed_req.eta, parsed_req.rho],
                     dtype=np.float32,
@@ -938,7 +953,7 @@ async def compute_model_greeks(model_name: str, req: Dict[str, Any]) -> GreeksRe
             theta_t = torch.tensor(theta_arr, dtype=torch.float32, device=device)
             spatial = _make_spatial(device)
 
-            def _run_forward():
+            def _run_forward() -> NDArray[Any]:
                 with torch.no_grad():
                     theta_norm = cached_container.pn.transform_tensor(
                         theta_t.unsqueeze(0)
@@ -947,7 +962,7 @@ async def compute_model_greeks(model_name: str, req: Dict[str, Any]) -> GreeksRe
                     iv_tensor = cached_container.yn.inverse_transform_tensor(
                         pred_norm
                     ).squeeze(0)
-                    return iv_tensor.clamp(min=0.01).cpu().numpy()
+                    return cast(NDArray[Any], iv_tensor.clamp(min=0.01).cpu().numpy())
 
             iv_surface = await asyncio.get_event_loop().run_in_executor(
                 None, _run_forward
@@ -1025,7 +1040,8 @@ async def deribit_snapshot(
     try:
         from deepvol.market.deribit_data import fetch_option_snapshot
 
-        df = await fetch_option_snapshot(currency)
+        coin: Literal["BTC", "ETH"] = "BTC" if currency == "BTC" else "ETH"
+        df = await fetch_option_snapshot(coin)
 
         spot: Optional[float] = None
         if "underlying_price" in df.columns and len(df) > 0:
@@ -1100,7 +1116,18 @@ class CalibrateResponse(BaseModel):
     )
 
 
-_GPU_CALIBRATION_SEMAPHORE = asyncio.Semaphore(1)
+_GPU_CALIBRATION_SEMAPHORE: Optional[asyncio.Semaphore] = None
+_GPU_CALIBRATION_SEMAPHORE_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _get_gpu_calibration_semaphore() -> asyncio.Semaphore:
+    """Return a loop-local GPU calibration semaphore initialized on the active loop."""
+    global _GPU_CALIBRATION_SEMAPHORE, _GPU_CALIBRATION_SEMAPHORE_LOOP
+    loop = asyncio.get_running_loop()
+    if _GPU_CALIBRATION_SEMAPHORE is None or _GPU_CALIBRATION_SEMAPHORE_LOOP is not loop:
+        _GPU_CALIBRATION_SEMAPHORE_LOOP = loop
+        _GPU_CALIBRATION_SEMAPHORE = asyncio.Semaphore(1)
+    return _GPU_CALIBRATION_SEMAPHORE
 
 
 @app.post(
@@ -1134,46 +1161,58 @@ async def calibrate_route(model_name: str, req: CalibrateRequest) -> CalibrateRe
         )
 
         # Acquire GPU semaphore to serialize calibration and avoid VRAM exhaustion
-        async with _GPU_CALIBRATION_SEMAPHORE:
+        async with _get_gpu_calibration_semaphore():
             # Acquire Read Lock on model weights to prevent reload crashes
             async with cached_container.rwlock.reader():
 
-                def _run():
+                def _run() -> Dict[str, Any]:
                     if model_name == "heston":
-                        return calibrate_heston(
-                            cached_container.model,
-                            iv_target,
-                            _MATURITIES,
-                            _STRIKES,
-                            max_iter=req.max_iter,
-                            n_starts=req.n_starts,
+                        return cast(
+                            Dict[str, Any],
+                            calibrate_heston(
+                                cached_container.model,
+                                iv_target,
+                                _MATURITIES,
+                                _STRIKES,
+                                max_iter=req.max_iter,
+                                n_starts=req.n_starts,
+                            ),
                         )
                     elif model_name == "sabr":
-                        return calibrate_sabr(
-                            cached_container.model,
-                            iv_target,
-                            _MATURITIES,
-                            _STRIKES,
-                            max_iter=req.max_iter,
-                            n_starts=req.n_starts,
+                        return cast(
+                            Dict[str, Any],
+                            calibrate_sabr(
+                                cached_container.model,
+                                iv_target,
+                                _MATURITIES,
+                                _STRIKES,
+                                max_iter=req.max_iter,
+                                n_starts=req.n_starts,
+                            ),
                         )
                     elif model_name == "ssvi":
-                        return calibrate_ssvi(
-                            cached_container.model,
-                            iv_target,
-                            _MATURITIES,
-                            _STRIKES,
-                            max_iter=req.max_iter,
-                            n_starts=req.n_starts,
+                        return cast(
+                            Dict[str, Any],
+                            calibrate_ssvi(
+                                cached_container.model,
+                                iv_target,
+                                _MATURITIES,
+                                _STRIKES,
+                                max_iter=req.max_iter,
+                                n_starts=req.n_starts,
+                            ),
                         )
-                    elif model_name == "rbergomi":
-                        return calibrate_rbergomi(
-                            cached_container.model,
-                            iv_target,
-                            _MATURITIES,
-                            _STRIKES,
-                            max_iter=req.max_iter,
-                            n_starts=req.n_starts,
+                    else:
+                        return cast(
+                            Dict[str, Any],
+                            calibrate_rbergomi(
+                                cached_container.model,
+                                iv_target,
+                                _MATURITIES,
+                                _STRIKES,
+                                max_iter=req.max_iter,
+                                n_starts=req.n_starts,
+                            ),
                         )
 
                 res = await asyncio.get_event_loop().run_in_executor(None, _run)
@@ -1311,37 +1350,58 @@ class HedgeSimulateResponse(BaseModel):
     final_loss: float
 
 
-def _pytorch_black_scholes_call(S0, K, T, sigma, r, q):
+def _pytorch_black_scholes_call(
+    S0: torch.Tensor,
+    K: torch.Tensor,
+    T: torch.Tensor,
+    sigma: torch.Tensor,
+    r: float,
+    q: float,
+) -> torch.Tensor:
     d1 = (torch.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (
         sigma * torch.sqrt(T) + 1e-8
     )
     d2 = d1 - sigma * torch.sqrt(T)
-    normal = torch.distributions.Normal(0.0, 1.0)
-    return S0 * torch.exp(-q * T) * normal.cdf(d1) - K * torch.exp(-r * T) * normal.cdf(
-        d2
+    return cast(
+        torch.Tensor,
+        S0 * torch.exp(-q * T) * torch.special.ndtr(d1)
+        - K * torch.exp(-r * T) * torch.special.ndtr(d2),
     )
 
 
-def _black_scholes_call_price_numpy(S0, K, T, sigma, r, q=0.0):
+def _black_scholes_call_price_numpy(
+    S0: float, K: float, T: float, sigma: float, r: float, q: float = 0.0
+) -> float:
     from scipy.stats import norm
 
     if T <= 0:
         return max(S0 - K, 0.0)
     d1 = (np.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T) + 1e-8)
     d2 = d1 - sigma * np.sqrt(T)
-    return S0 * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    return float(S0 * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2))
 
 
-def _black_scholes_vega_numpy(S0, K, T, sigma, r, q=0.0):
+def _black_scholes_vega_numpy(
+    S0: float, K: float, T: float, sigma: float, r: float, q: float = 0.0
+) -> float:
     from scipy.stats import norm
 
     if T <= 0:
         return 0.0
     d1 = (np.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T) + 1e-8)
-    return S0 * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
+    return float(S0 * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T))
 
 
-def _implied_volatility_newton(price, S0, K, T, r, q=0.0, max_iter=100, tol=1e-6):
+def _implied_volatility_newton(
+    price: float,
+    S0: float,
+    K: float,
+    T: float,
+    r: float,
+    q: float = 0.0,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+) -> float:
     intrinsic = max(S0 - K, 0.0)
     if price <= intrinsic + 1e-6:
         return 0.0
@@ -1356,7 +1416,7 @@ def _implied_volatility_newton(price, S0, K, T, r, q=0.0, max_iter=100, tol=1e-6
             sigma = sigma - 0.5 * diff / S0
         else:
             sigma = sigma - diff / vega
-        sigma = np.clip(sigma, 1e-4, 5.0)
+        sigma = float(np.clip(sigma, 1e-4, 5.0))
     return float(sigma)
 
 
@@ -1428,7 +1488,7 @@ async def calibrate_neural_sde(
         t0 = time.time()
 
         # Optimization Loop running asynchronously in threadpool to prevent blocking FastAPI main thread loop
-        def _run_optimization():
+        def _run_optimization() -> Tuple[float, float, float, List[List[float]]]:
             for epoch in range(req.epochs):
                 optimizer.zero_grad()
                 pred, ys = pricer.price_options(
@@ -1477,7 +1537,7 @@ async def calibrate_neural_sde(
                         price_val = float(pred_final_np[idx])
                         idx += 1
                         iv_val = _implied_volatility_newton(
-                            price_val, S0, strike_val, t, r, q
+                            price_val, S0, float(strike_val), float(t), r, q
                         )
                         row_iv.append(iv_val)
                     fitted_iv.append(row_iv)
@@ -1528,7 +1588,7 @@ async def predict_signature_vol(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ell_tensor = torch.tensor(req.ell, dtype=torch.float32, device=device)
 
-        def _run_pricing():
+        def _run_pricing() -> Tuple[List[float], List[float], List[List[float]], List[List[float]]]:
             S, V, _, _ = simulate_signature_vol_paths(
                 v0=torch.tensor(req.v0, dtype=torch.float32, device=device),
                 ell=ell_tensor,
@@ -1540,7 +1600,7 @@ async def predict_signature_vol(
                 r=req.r,
                 q=req.q,
                 antithetic=True,
-                device=device,
+                device=str(device),
             )
 
             S_T = S[:, -1].detach().cpu().numpy()
@@ -1653,6 +1713,7 @@ async def hedge_simulate(req: HedgeSimulateRequest) -> HedgeSimulateResponse:
         cost_coeffs = torch.tensor([req.cost_stock, req.cost_vol], device=device)
 
         # 3. Initialize Env
+        env: Union[DeepHedgingEnv, BarrierHedgingEnv]
         if option_type in ("european", "minimax"):
             payoff = torch.clamp(H[:, -1, 0] - req.strike, min=0.0)
             env = DeepHedgingEnv(
@@ -1682,7 +1743,10 @@ async def hedge_simulate(req: HedgeSimulateRequest) -> HedgeSimulateResponse:
             wealth, costs, deltas = env.simulate_hedging_episode(policy)
             loss = env.compute_loss(wealth).item()
 
-        pnl = (wealth - env.payoff).cpu().numpy()
+        payoff_t = env.payoff
+        if payoff_t is None:
+            raise HTTPException(status_code=500, detail="Hedging environment payoff is None")
+        pnl = (wealth - payoff_t).cpu().numpy()
         std_pnl = float(np.std(pnl))
 
         return HedgeSimulateResponse(
@@ -1692,7 +1756,7 @@ async def hedge_simulate(req: HedgeSimulateRequest) -> HedgeSimulateResponse:
             deltas_vol=deltas[:, :, 1].cpu().numpy().tolist(),
             costs=costs.cpu().numpy().tolist(),
             wealth=wealth.cpu().numpy().tolist(),
-            payoff=env.payoff.cpu().numpy().tolist(),
+            payoff=payoff_t.cpu().numpy().tolist(),
             pnl=pnl.tolist(),
             std_pnl=std_pnl,
             final_loss=loss,
@@ -1734,7 +1798,7 @@ class TrainStatusResponse(BaseModel):
     recent_logs: List[str]
 
 
-async def _run_training_subprocess(task_id: str, model_name: str, req: TrainRequest):
+async def _run_training_subprocess(task_id: str, model_name: str, req: TrainRequest) -> None:
     """Spawns scripts/train_fno_{model_name}.py in an isolated OS process."""
     os.makedirs("logs", exist_ok=True)
     log_path = f"logs/train_{task_id}.log"
@@ -1924,7 +1988,7 @@ async def session_greeks(session_id: str, req: SessionGreeksRequest) -> GreeksRe
         model_name = str(session_data["model_name"])
         params = dict(session_data["params"])
 
-    greeks_req = {"S": req.S, "r": req.r, "q": req.q}
+    greeks_req: Dict[str, Any] = {"S": req.S, "r": req.r, "q": req.q}
 
     if model_name == "ssvi":
         # Extract theta_atm_1...8 from params
@@ -2083,13 +2147,15 @@ router = JSONRouter(manager)
 
 
 @app.websocket("/ws/risk")
-async def websocket_risk_endpoint(websocket: WebSocket):
+async def websocket_risk_endpoint(websocket: WebSocket) -> None:
     await manager.connect(websocket)
     try:
         async with TaskGroup() as tg:
             conflated_queue = manager.get_queue(websocket)
 
-            async def socket_writer_consumer():
+            async def socket_writer_consumer() -> None:
+                if conflated_queue is None:
+                    return
                 try:
                     while manager.is_active(websocket):
                         batch = await conflated_queue.get()
@@ -2165,7 +2231,10 @@ from deepvol.models.fx_cross_surrogate import (  # noqa: E402
     CrossVolSurrogateEngine,
     ResidualCrossVolNet,
 )
-from deepvol.mrm.fx_cross_guardian import FXCrossGuardian  # noqa: E402
+from deepvol.mrm.fx_cross_guardian import (  # noqa: E402
+    FXCrossGuardian,
+    PricingEngineEnum as GuardianPricingEngineEnum,
+)
 
 _FX_CROSS_STATE: Dict[str, Any] = {
     "engine": None,
@@ -2309,7 +2378,6 @@ async def _fx_cross_price_impl(
     F = s1 * s2 * g
     K = req.contract.strike
 
-    ood_from_smile = False
     try:
         q1 = torch.tensor(
             [
@@ -2399,7 +2467,7 @@ async def _fx_cross_price_impl(
     X[0, Col.NN_GATE] = 1.0
 
     X_t = torch.from_numpy(X).to(dtype=torch.float64)
-    decision = guardian.route(X_t, engine=req.execution_options.engine)
+    decision = guardian.route(X_t, engine=GuardianPricingEngineEnum(req.execution_options.engine.value))
 
     sig_ref = math.sqrt(
         leg1.smile.atm_vol**2
@@ -2412,12 +2480,7 @@ async def _fx_cross_price_impl(
     fallback_reason: Optional[FallbackReasonEnum] = None
     engine_used = req.execution_options.engine
 
-    if ood_from_smile:
-        fallback_activated = True
-        fallback_reason = FallbackReasonEnum.OOD_MARKET_REGIME
-        engine_used = PricingEngineEnum.ANALYTIC_TRIANGULATED
-        X[0, Col.NN_GATE] = 0.0
-    elif abs(z) >= 7.0:
+    if abs(z) >= 7.0:
         fallback_activated = True
         fallback_reason = FallbackReasonEnum.EXTREME_MONEYNESS
         engine_used = PricingEngineEnum.ANALYTIC_TRIANGULATED
@@ -2480,10 +2543,10 @@ async def _fx_cross_price_impl(
         engine_used=engine_used,
         standardized_moneyness=float(z),
         mahalanobis_distance=float(decision.D_M[0].item()),
-        ood_threshold=float(guardian.ood_detector.threshold)
+        ood_threshold=float(guardian.ood_detector.q995)
         if guardian.ood_detector is not None
         else 5.35,
-        is_out_of_distribution=bool(decision.is_ood[0].item()) or ood_from_smile,
+        is_out_of_distribution=bool(decision.is_ood[0].item()),
         ensemble_epistemic_std_bps=0.0,
         fallback_activated=fallback_activated,
         fallback_reason=fallback_reason,
@@ -2502,11 +2565,18 @@ async def _fx_cross_price_impl(
             cross=cash_delta_val, leg1=cash_delta_val, leg2=cash_delta_val
         ),
         gamma=gamma_val,
-        vega=VegaLegs(cross=vega_cross, leg1=vega_l1, leg2=vega_l2),
+        vega=VegaLegs(
+            cross=vega_cross,
+            leg1=vega_l1,
+            leg2=vega_l2,
+            smile_matrix_leg1=None,
+            smile_matrix_leg2=None,
+        ),
         theta=theta_val,
         vanna=vanna_val,
         vomma=vomma_val,
         correlation_sensitivity=corr_sens,
+        model_reserve_bps=None,
         warnings=warnings,
         latency_ms=round(latency_ms, 3),
         telemetry=telemetry,
@@ -2548,7 +2618,7 @@ async def _fx_cross_price_batch_impl(request: Request) -> Response:
     def _prepare_inputs() -> Tuple[
         NDArray[np.float64],
         NDArray[np.bool_],
-        List[Optional[str]],
+        NDArray[Any],
         List[float],
         int,
         str,
@@ -2672,7 +2742,7 @@ async def _fx_cross_price_batch_impl(request: Request) -> Response:
         state_min_g = np.minimum(cs1.min_g.cpu().numpy(), cs2.min_g.cpu().numpy()).tolist()
 
         states_t = torch.from_numpy(state_table).to(dtype=torch.float64)
-        state_decision = guardian.route(states_t, engine=batch.options.engine)
+        state_decision = guardian.route(states_t, engine=GuardianPricingEngineEnum(batch.options.engine.value))
 
         N_cnt = len(batch.strike)
         X = np.zeros((N_cnt, N_COLS), dtype=np.float64)

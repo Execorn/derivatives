@@ -2,14 +2,11 @@
 Streamlit Dashboard Panel for Autocall Model Comparison (Heston vs LV vs SLV vs PDE).
 """
 
-import os
-
 import numpy as np
-import plotly.graph_objects as go
 import streamlit as st
 import torch
 
-from deepvol.models.autocall import price_autocall_mc, make_obs_indices
+from deepvol.models.autocall import make_obs_indices
 from deepvol.models.autocall_pde import price_autocall_pde_scalar
 from deepvol.models.autocall_slv import lv_vs_heston_comparison
 
@@ -50,6 +47,10 @@ svi_params = torch.tensor([
 ], dtype=torch.float64, device=DEVICE)
 
 # Run comparison
+def flat_sigma_func(_t: float, s: np.ndarray) -> np.ndarray:
+    return np.full_like(s, np.sqrt(v0), dtype=np.float64)
+
+
 try:
     pde_res = price_autocall_pde_scalar(
         S0_val=S0, r=r, T=T, N_S=300, N_T=N_steps, obs_indices=obs_indices,

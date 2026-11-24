@@ -124,7 +124,7 @@ with tab_setup:
 
         # Show model VIX from sidebar defaults
         try:
-            from deepvol.market.vix_pricing import model_vix, vix_futures_curve
+            from deepvol.market.vix_pricing import model_vix
             vix_model_preview = model_vix(
                 kappa=2.0, theta=0.05, sigma=0.3, rho=-0.6, v0=0.05, H=0.08
             )

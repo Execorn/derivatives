@@ -136,7 +136,6 @@ def parse_iv_sheet(uploaded_file) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         
     # Check if this is a flat table or pivot table
     # Flat tables usually have columns like Maturity/T, Strike/K, Vol/IV
-    cols = [str(c).lower().strip() for c in df.columns]
     
     # Try to find flat table columns
     t_col = None
@@ -196,11 +195,6 @@ def interpolate_to_model_grid(T_src, K_src, iv_src, S0=100.0) -> np.ndarray:
     Interpolates a source implied volatility surface onto the FNO model grid:
     MATURITIES (8,) and STRIKES (11,) [log-moneyness].
     """
-    # Create coordinate grid for source
-    T_mesh, K_mesh = np.meshgrid(T_src, K_src, indexing="ij")
-    
-    # Flatten the source coordinates and values
-    points = np.stack([T_mesh.ravel(), K_mesh.ravel()], axis=-1)
     values = iv_src.ravel()
     
     # If K_src looks like absolute strikes, map the target STRIKES (log-moneyness) to absolute strikes

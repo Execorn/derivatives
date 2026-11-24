@@ -7,7 +7,6 @@ import io
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import pandas as pd
-import numpy as np
 
 def generate_pdf_report(model_name, param_df, error_metrics, T_grid, K_grid, market_iv, reconstructed_iv):
     """

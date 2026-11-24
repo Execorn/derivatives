@@ -3,7 +3,6 @@ Streamlit Dashboard Panel for Phoenix Two-Barrier Autocallable Notes.
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -16,13 +15,13 @@ _SRC_DIR = Path(__file__).resolve().parents[3]
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from deepvol.utils.path_helpers import get_project_root
+from deepvol.utils.path_helpers import get_project_root  # noqa: E402
 _PROJECT_ROOT = get_project_root()
 
-from deepvol.models.phoenix import price_phoenix_mc, phoenix_decomposition
-from deepvol.models.autocall import price_autocall_mc, make_obs_indices
-from deepvol.hedging.d_xva import simulate_heston_paths
-from deepvol.surrogates.phoenix_mlp import PhoenixMLP, PhoenixInputNormalizer, PhoenixOutputNormalizer
+from deepvol.models.phoenix import price_phoenix_mc  # noqa: E402
+from deepvol.models.autocall import price_autocall_mc, make_obs_indices  # noqa: E402
+from deepvol.hedging.d_xva import simulate_heston_paths  # noqa: E402
+from deepvol.surrogates.phoenix_mlp import PhoenixMLP, PhoenixInputNormalizer, PhoenixOutputNormalizer  # noqa: E402
 
 st.set_page_config(page_title="Phoenix Autocall Valuation", layout="wide")
 st.title("Phoenix Autocallable Structured Note Valuation Engine")

@@ -13,9 +13,10 @@ import random
 import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set
+from types import TracebackType
+from typing import Any, Coroutine, Dict, List, Optional, Set, Type
 
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import WebSocket
 import numpy as np
 import orjson
 
@@ -50,10 +51,10 @@ class TaskGroup:
     Ensures no dangling tasks survive the lifespan of a WebSocket connection.
     """
     def __init__(self) -> None:
-        self._tasks: Set[asyncio.Task] = set()
+        self._tasks: Set[asyncio.Task[Any]] = set()
         self._exiting = False
 
-    def create_task(self, coro) -> asyncio.Task:
+    def create_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         if self._exiting:
             raise RuntimeError("TaskGroup has already exited or is exiting")
         task = asyncio.create_task(coro)
@@ -64,7 +65,12 @@ class TaskGroup:
     async def __aenter__(self) -> TaskGroup:
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> Optional[bool]:
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
         self._exiting = True
         # Cancel all managed tasks
         for task in list(self._tasks):
@@ -203,7 +209,7 @@ class ConnectionManager:
             self.message_timestamps[websocket].append(now)
             return True
 
-    async def send_binary(self, websocket: WebSocket, data: dict) -> None:
+    async def send_binary(self, websocket: WebSocket, data: Dict[str, Any]) -> None:
         """Sends binary (orjson) payload safely to a connection."""
         with self._lock:
             active = websocket in self.active_connections
@@ -306,7 +312,7 @@ class JSONRouter:
     def __init__(self, manager: ConnectionManager) -> None:
         self.manager = manager
         # Save reference to subscription tasks so they can be explicitly unsubscribed/cancelled
-        self.subscription_tasks: Dict[WebSocket, List[asyncio.Task]] = {}
+        self.subscription_tasks: Dict[WebSocket, List[asyncio.Task[Any]]] = {}
 
     async def handle_message(self, websocket: WebSocket, data: Dict[str, Any], tg: TaskGroup) -> None:
         """Parses action and routes to corresponding handler."""

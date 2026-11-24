@@ -382,9 +382,19 @@ def get_cached_grids():
 
 MATURITIES, STRIKES = get_cached_grids()
 
+_MODEL_NORM_KEYS = {
+    "Rough Heston": "v2",
+    "Classic Heston": "heston",
+    "SABR": "sabr",
+    "SSVI": "ssvi",
+    "Local Volatility": "localvol",
+    "Rough Bergomi": "rbergomi",
+}
+
+
 @st.cache_resource
-def load_model(model_name: str):
-    """Load the appropriate FNO surrogate and load corresponding normalizers."""
+def _load_model_cached(model_name: str):
+    """Load and cache the appropriate FNO surrogate."""
     if model_name in ("Neural SDE", "Signature Volatility", "Deep Hedging"):
         return None
         
@@ -425,13 +435,21 @@ def load_model(model_name: str):
     from deepvol.arbitrage.projection_layer import DifferentiableArbitrageFreeProjection, ArbitrageFreeFNO
     from deepvol.calibration.calibrate_bfgs import _iv_norm
     proj = DifferentiableArbitrageFreeProjection(
-        T_grid=torch.tensor(MATURITIES if "MATURITIES" in globals() else _MATURITIES, dtype=torch.float64),
-        K_grid=torch.tensor(STRIKES if "STRIKES" in globals() else _STRIKES, dtype=torch.float64),
+        T_grid=torch.tensor(MATURITIES, dtype=torch.float64),
+        K_grid=torch.tensor(STRIKES, dtype=torch.float64),
         S0=1.0,
         is_log_moneyness=True
     )
     wrapped_model = ArbitrageFreeFNO(base_fno=model, projection_layer=proj, normalizer=_iv_norm)
     return wrapped_model
+
+
+def load_model(model_name: str):
+    """Return cached FNO surrogate and ensure active model normalizers are loaded."""
+    norm_key = _MODEL_NORM_KEYS.get(model_name)
+    if norm_key is not None:
+        _load_normalizers(norm_key)
+    return _load_model_cached(model_name)
 
 # Helper functions for Greeks, OOD detection, clamping, PSI and arbitrage checks
 def compute_greeks_surface(iv_surface: np.ndarray, S: float, r: float, q: float) -> dict[str, np.ndarray]:
@@ -715,6 +733,7 @@ def render_live_console(model, model_name: str, true_params: np.ndarray):
         # 3. Generate IV surface on cached grid
         with torch.no_grad():
             if model_name == "Rough Heston":
+                _load_normalizers("v2")
                 spatial = _make_spatial_input(MATURITIES, STRIKES, device=device)
                 params_t = torch.tensor(clamped_params, dtype=torch.float32).unsqueeze(0).to(device)
                 iv_surface = _fno_predict_real_iv(model, params_t, spatial).cpu().numpy()
@@ -744,6 +763,7 @@ def render_live_console(model, model_name: str, true_params: np.ndarray):
             elif model_name == "Local Volatility":
                 iv_surface = compute_local_vol_surface(clamped_params, MATURITIES, STRIKES, use_fno=False)
             elif model_name == "Rough Bergomi":
+                _load_normalizers("rbergomi")
                 spatial = _make_spatial_input(MATURITIES, STRIKES, device=device)
                 params_t = torch.tensor(clamped_params, dtype=torch.float32).unsqueeze(0).to(device)
                 iv_surface = _fno_predict_real_iv(model, params_t, spatial).cpu().numpy()
@@ -956,6 +976,7 @@ with tab_sandbox:
         if st.sidebar.button("Generate Target Surface", use_container_width=True):
             with torch.no_grad():
                 if model_name == "Rough Heston":
+                    _load_normalizers("v2")
                     spatial = _make_spatial_input(MATURITIES, STRIKES, device=device)
                     params_t = torch.tensor(true_params, dtype=torch.float32).unsqueeze(0).to(device)
                     target_iv = _fno_predict_real_iv(model, params_t, spatial).cpu().numpy()
@@ -986,6 +1007,7 @@ with tab_sandbox:
                 elif model_name == "Local Volatility":
                     target_iv = compute_local_vol_surface(true_params, MATURITIES, STRIKES, use_fno=False)
                 elif model_name == "Rough Bergomi":
+                    _load_normalizers("rbergomi")
                     spatial = _make_spatial_input(MATURITIES, STRIKES, device=device)
                     params_t = torch.tensor(true_params, dtype=torch.float32).unsqueeze(0).to(device)
                     target_iv = _fno_predict_real_iv(model, params_t, spatial).cpu().numpy()

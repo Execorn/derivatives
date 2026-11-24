@@ -123,11 +123,15 @@ class SmileQuotes(BaseModel):
 
     @model_validator(mode="after")
     def pillar_vols_positive(self) -> SmileQuotes:
-        for bf, rr, tag in ((self.bf25, self.rr25, "25"), (self.bf10, self.rr10, "10")):
-            if self.atm_vol + bf - 0.5 * abs(rr) < 0.01:
-                raise ValueError(
-                    f"{tag}-delta wing vol below 1% floor: atm + bf{tag} - |rr{tag}|/2 < 0.01"
-                )
+        atm = self.atm_vol
+        if atm + self.bf25 - 0.5 * abs(self.rr25) < 0.01:
+            raise ValueError(
+                "25-delta wing vol below 1% floor: atm + bf25 - |rr25|/2 < 0.01"
+            )
+        if atm + self.bf10 - 0.5 * abs(self.rr10) < 0.01:
+            raise ValueError(
+                "10-delta wing vol below 1% floor: atm + bf10 - |rr10|/2 < 0.01"
+            )
         return self
 
 
@@ -193,11 +197,13 @@ class MarketData(BaseModel):
 
     @model_validator(mode="after")
     def triangle_consistency(self) -> MarketData:
-        if self.leg1.quote != self.leg2.base:
+        leg1 = self.leg1
+        leg2 = self.leg2
+        if leg1.pair[3:] != leg2.pair[:3]:
             raise ValueError(
-                f"leg1 quote ccy {self.leg1.quote} must equal leg2 base ccy {self.leg2.base}"
+                f"leg1 quote ccy {leg1.pair[3:]} must equal leg2 base ccy {leg2.pair[:3]}"
             )
-        d1, d2 = self.leg1.domestic_discount_factor, self.leg2.foreign_discount_factor
+        d1, d2 = leg1.domestic_discount_factor, leg2.foreign_discount_factor
         if abs(d1 - d2) > 1e-6 * max(d1, d2):
             raise ValueError(
                 "leg1.domestic_discount_factor and leg2.foreign_discount_factor are both D_B(T_exp) and must agree"
@@ -226,8 +232,13 @@ class InterestRates(BaseModel):
         return v
 
 
+_DEFAULT_QUERIES: Final[List[QueryEnum]] = [
+    q for q in QueryEnum if q is not QueryEnum.MODEL_RESERVE
+]
+
+
 def _default_queries() -> List[QueryEnum]:
-    return [q for q in QueryEnum if q is not QueryEnum.MODEL_RESERVE]
+    return list(_DEFAULT_QUERIES)
 
 
 class ExecutionOptions(BaseModel):
@@ -317,11 +328,11 @@ class TriangulatedFXOptionColumnarBatchRequest(BaseModel):
             md = st.market_data
             l1_pair = md.leg1.pair
             l2_pair = md.leg2.pair
-            if not (l1_pair.startswith(ident_base) and l2_pair.endswith(ident_quote)):
+            if l1_pair[:3] != ident_base or l2_pair[3:] != ident_quote:
                 raise ValueError(
                     f"state {st.state_id}: identifier != leg1 base + leg2 quote"
                 )
-            if not l2_pair.endswith(pay_ccy):
+            if l2_pair[3:] != pay_ccy:
                 raise ValueError(
                     f"state {st.state_id}: payment_currency must equal the cross quote ccy C"
                 )

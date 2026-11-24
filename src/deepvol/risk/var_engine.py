@@ -7,10 +7,8 @@ import numpy as np
 import torch
 from typing import List, Dict, Any, Optional, Tuple
 from deepvol.greeks.portfolio_greeks import (
-    _ensure_normalizers,
     _make_spatial,
     bs_call_price,
-    interpolate_bilinear,
     MATURITIES,
     STRIKES
 )

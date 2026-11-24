@@ -70,8 +70,10 @@ def simulate_heston_paths(
     else:
         r_t = float(r)
 
-    S = torch.empty(B, N_paths, N_steps + 1, dtype=torch.float64, device=device)
-    S[:, :, 0] = S0
+    S_curr = torch.full(
+        (B, N_paths), float(S0), dtype=torch.float64, device=device
+    )
+    S_steps = [S_curr]
     V_t = v0.expand(B, N_paths).to(torch.float64).clone()
 
     sqrt_dt = math.sqrt(dt)
@@ -80,7 +82,7 @@ def simulate_heston_paths(
     use_av = antithetic and (N_paths % 2 == 0)
     half_paths = N_paths // 2 if use_av else N_paths
 
-    for t in range(N_steps):
+    for _ in range(N_steps):
         if use_av:
             Z1_half = torch.randn(B, half_paths, device=device, dtype=torch.float64)
             Z2_half = torch.randn(B, half_paths, device=device, dtype=torch.float64)
@@ -100,12 +102,13 @@ def simulate_heston_paths(
             + sigma_v * sqrt_V * ZV * sqrt_dt
         ).clamp(min=1e-4)
 
-        S[:, :, t + 1] = S[:, :, t] * torch.exp(
+        S_curr = S_curr * torch.exp(
             (r_t - 0.5 * V_t) * dt + sqrt_V * Z1 * sqrt_dt
         )
+        S_steps.append(S_curr)
         V_t = V_next
 
-    return S
+    return torch.stack(S_steps, dim=-1)
 
 
 def simulate_heston_paths_sobol_bb(
@@ -194,8 +197,7 @@ def simulate_heston_paths_sobol_bb(
     sobol_dim = 2 * n_obs
 
     # Output: spot prices at observation dates only (compact SoA layout)
-    S_obs = torch.empty(B_batch, N_paths, n_obs + 1, dtype=dtype, device=device)
-    S_obs[:, :, 0] = S0
+    batch_obs_paths: List[torch.Tensor] = []
 
     for b in range(B_batch):
         # --- Sobol generation (CPU) with per-batch unique seed ---
@@ -228,6 +230,9 @@ def simulate_heston_paths_sobol_bb(
         log_S = torch.full(
             (N_paths,), math.log(S0), dtype=torch.float64, device=device
         )
+        b_steps: List[torch.Tensor] = [
+            torch.full((N_paths,), float(S0), dtype=dtype, device=device)
+        ]
 
         # --- Milstein stepping within each observation interval ---
         for k in range(n_obs):
@@ -282,8 +287,11 @@ def simulate_heston_paths_sobol_bb(
                 V_t = V_next
 
             # Store observation-date spot value (cast to output dtype)
-            S_obs[b, :, k + 1] = torch.exp(log_S).to(dtype)
+            b_steps.append(torch.exp(log_S).to(dtype))
 
+        batch_obs_paths.append(torch.stack(b_steps, dim=-1))
+
+    S_obs = torch.stack(batch_obs_paths, dim=0)
     obs_step_indices = list(range(1, n_obs + 1))
     return S_obs, obs_step_indices
 

@@ -4,12 +4,10 @@ Computes portfolio-level option Greeks (Delta, Vega, Theta, Gamma, Vanna, Volga)
 using PyTorch autograd through FNO surrogates.
 """
 
-import math
 import numpy as np
 import torch
 from typing import List, Dict, Any, Optional
 from deepvol.greeks.portfolio_greeks import (
-    _ensure_normalizers,
     _make_spatial,
     bs_call_price,
     interpolate_bilinear,

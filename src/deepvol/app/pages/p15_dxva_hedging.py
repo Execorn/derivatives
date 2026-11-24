@@ -91,8 +91,7 @@ def _run_simulation():
     """Run the full D-XVA pipeline and cache results."""
     try:
         model, pn, yn, policy, device = _load_dxva_components()
-        from deepvol.hedging.d_xva import simulate_heston_paths, DXVAPipeline
-        from deepvol.hedging.pivot_iv import pivot_implied_vol
+        from deepvol.hedging.d_xva import simulate_heston_paths
 
         theta_t = torch.tensor(
             [[kappa, theta, sigma, rho, v0]], dtype=torch.float32, device=device

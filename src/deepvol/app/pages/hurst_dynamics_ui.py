@@ -12,7 +12,7 @@ Features:
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 import numpy as np

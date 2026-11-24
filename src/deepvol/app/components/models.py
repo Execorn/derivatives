@@ -6,20 +6,17 @@ Supports FNO surrogate evaluation, direct simulation, and custom optimization.
 
 import time
 import os
-import sys
 import numpy as np
-import pandas as pd
 import torch
 import streamlit as st
 from scipy.stats import norm
-import scipy.optimize
 
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 from deepvol.calibration.calibrate_bfgs import _load_normalizers, _make_spatial_input, _fno_predict_real_iv
 from deepvol.calibration.calibrate_newton import (
-    calibrate_heston,
-    calibrate_sabr,
-    calibrate_rbergomi,
+    calibrate_heston as calibrate_heston,
+    calibrate_sabr as calibrate_sabr,
+    calibrate_rbergomi as calibrate_rbergomi,
 )
 from deepvol.models.heston import heston_iv_surface
 from deepvol.models.sabr import sabr_iv_surface
@@ -97,8 +94,8 @@ def load_fno_model(model_name: str):
     from deepvol.arbitrage.projection_layer import DifferentiableArbitrageFreeProjection, ArbitrageFreeFNO
     from deepvol.calibration.calibrate_bfgs import _iv_norm
     proj = DifferentiableArbitrageFreeProjection(
-        T_grid=torch.tensor(MATURITIES if "MATURITIES" in globals() else _MATURITIES, dtype=torch.float64),
-        K_grid=torch.tensor(STRIKES if "STRIKES" in globals() else _STRIKES, dtype=torch.float64),
+        T_grid=torch.tensor(MATURITIES, dtype=torch.float64),
+        K_grid=torch.tensor(STRIKES, dtype=torch.float64),
         S0=1.0,
         is_log_moneyness=True
     )
@@ -170,7 +167,9 @@ def reconstruct_schwartz_smith_surface(S0, r, chi_t, xi_t, kappa, sigma_chi, rho
 def reconstruct_mlsv_surface(S0, r, q, v0, kappa, theta, xi, rho, method="nadaraya_watson", N_paths=1000):
     """Simulate particle paths and reconstruct MLSV IV surface."""
     T_max = float(np.max(MATURITIES))
-    dup_vol_fn = lambda t, s: torch.full_like(s, 0.2)
+
+    def dup_vol_fn(_t, s):
+        return torch.full_like(s, 0.2)
     
     solver = MLSVSolverGPU(
         S0=S0, r=r, q=q, v0=v0, kappa=kappa, theta=theta, xi=xi, rho=rho,

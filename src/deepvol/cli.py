@@ -1,7 +1,6 @@
 import argparse
 import sys
 import numpy as np
-import torch
 from deepvol.calibration.interface import calibrate
 
 def main():

@@ -407,7 +407,7 @@ with tab_sweep:
         df_sweep = pd.DataFrame({
             "Inner Steps":     sr["steps"],
             "Time (ms)":       [f"{t:.1f}" for t in sr["times"]],
-            "Final PDE Loss":  [f"{l:.4e}" for l in sr["losses"]],
+            "Final PDE Loss":  [f"{loss_v:.4e}" for loss_v in sr["losses"]],
         })
         st.dataframe(df_sweep, use_container_width=True)
     else:

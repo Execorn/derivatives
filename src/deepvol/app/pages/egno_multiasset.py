@@ -14,7 +14,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import torch
@@ -39,7 +38,7 @@ _STKS = np.linspace(-0.5, 0.5, 11)
 st.sidebar.header("Asset Universe")
 n_assets = st.sidebar.slider("Number of Assets", 2, 6, 3)
 
-asset_names = [st.sidebar.text_input(f"Asset {i+1} Name", value=f"SPX" if i==0 else f"Asset{i+1}", key=f"aname_{i}") for i in range(n_assets)]
+asset_names = [st.sidebar.text_input(f"Asset {i+1} Name", value="SPX" if i==0 else f"Asset{i+1}", key=f"aname_{i}") for i in range(n_assets)]
 
 st.sidebar.header("Individual Vol Parameters")
 asset_params = []
@@ -152,7 +151,7 @@ def _load_egno():
         model = EGNO().to(device)
         model.eval()
         return model, device
-    except Exception as exc:
+    except Exception:
         return None, None
 
 if run_egno:

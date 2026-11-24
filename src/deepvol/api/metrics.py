@@ -1,13 +1,13 @@
-import os
 import time
 import asyncio
 import subprocess
 import logging
-from typing import Optional
+from typing import Any, Awaitable, Callable
 import torch
 
 from fastapi import APIRouter, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest, Histogram, Gauge
 
 logger = logging.getLogger("deepvol.api.metrics")
@@ -46,7 +46,7 @@ gpu_core_utilization_ratio = Gauge(
     "GPU core utilization ratio"
 )
 
-def update_gpu_metrics():
+def update_gpu_metrics() -> None:
     """Scrape GPU usage via nvidia-smi if available, falling back to PyTorch or 0."""
     if torch.cuda.is_available():
         try:
@@ -78,11 +78,15 @@ class RequestQueueMiddleware(BaseHTTPMiddleware):
     Middleware that enforces a max concurrency limit via a Semaphore,
     measuring the time requests spend waiting in the queue.
     """
-    def __init__(self, app, max_concurrent: int = 100):
+    def __init__(self, app: ASGIApp, max_concurrent: int = 100) -> None:
         super().__init__(app)
         self.semaphore = asyncio.Semaphore(max_concurrent)
 
-    async def dispatch(self, request: Request, call_next):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
         # Do not queue or measure metrics endpoint requests
         if request.url.path == "/metrics":
             return await call_next(request)
@@ -99,12 +103,12 @@ class RequestQueueMiddleware(BaseHTTPMiddleware):
 metrics_router = APIRouter()
 
 @metrics_router.get("/metrics")
-def metrics_endpoint():
+def metrics_endpoint() -> Response:
     update_gpu_metrics()
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-def setup_metrics(app, max_concurrent: int = 100):
+def setup_metrics(app: Any, max_concurrent: int = 100) -> None:
     """Register metrics endpoint and queue middleware on FastAPI application."""
     app.add_middleware(RequestQueueMiddleware, max_concurrent=max_concurrent)
     app.include_router(metrics_router)

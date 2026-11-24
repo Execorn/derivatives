@@ -7,7 +7,6 @@ import sys
 import numpy as np
 import scipy.stats as stats
 import scipy.optimize as optimize
-from typing import Optional
 from pathlib import Path
 
 # Add src/ to sys.path to enable imports of sibling modules

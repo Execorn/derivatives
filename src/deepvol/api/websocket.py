@@ -18,7 +18,8 @@ import time
 import math
 import random
 import socket
-from typing import Any, Dict, List, Set
+import threading
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -45,8 +46,6 @@ RATE_LIMIT_WINDOW = 10.0  # seconds
 MAX_MESSAGES_PER_WINDOW = 30
 
 
-
-import threading
 
 class ConflatedQueue:
     """
@@ -91,7 +90,7 @@ class ConnectionManager:
         self._lock = threading.Lock()
         self.active_connections: Set[WebSocket] = set()
         self.connection_queues: Dict[WebSocket, ConflatedQueue] = {}
-        self.connection_tasks: Dict[WebSocket, List[asyncio.Task]] = {}
+        self.connection_tasks: Dict[WebSocket, List[asyncio.Task[Any]]] = {}
         # Client rate limiting: websocket -> list of message timestamps
         self.message_timestamps: Dict[WebSocket, List[float]] = {}
 
@@ -110,13 +109,13 @@ class ConnectionManager:
         with self._lock:
             self.connection_queues[websocket] = queue
 
-    def add_task(self, websocket: WebSocket, task: asyncio.Task) -> None:
+    def add_task(self, websocket: WebSocket, task: asyncio.Task[Any]) -> None:
         """Adds async task to a connection."""
         with self._lock:
             if websocket in self.connection_tasks:
                 self.connection_tasks[websocket].append(task)
 
-    def clear_tasks(self, websocket: WebSocket) -> List[asyncio.Task]:
+    def clear_tasks(self, websocket: WebSocket) -> List[asyncio.Task[Any]]:
         """Clears and returns connection tasks."""
         with self._lock:
             tasks = self.connection_tasks.get(websocket, [])
@@ -195,7 +194,7 @@ class ConnectionManager:
             self.message_timestamps[websocket].append(now)
             return True
 
-    async def send_json(self, websocket: WebSocket, data: dict) -> None:
+    async def send_json(self, websocket: WebSocket, data: Dict[str, Any]) -> None:
         """Sends JSON payload safely to a single connection."""
         with self._lock:
             active = websocket in self.active_connections

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple, Union
 
 
 class HedgingPolicy(nn.Module):
@@ -581,7 +581,16 @@ def compute_cfvc_loss(returns, target_corr_matrix, scales=[5, 20, 60, 120]):
     return loss
 
 
-def simulate_gbm_paths(S0, mu, sigma, T, steps, N_paths, d=1, device="cpu"):
+def simulate_gbm_paths(
+    S0: float,
+    mu: float,
+    sigma: float,
+    T: float,
+    steps: int,
+    N_paths: int,
+    d: int = 1,
+    device: Union[str, torch.device] = "cpu",
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Simulates stock price and constant volatility paths under GBM.
     """

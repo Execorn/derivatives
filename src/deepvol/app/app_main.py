@@ -9,6 +9,7 @@ Pages registered under src/deepvol/app/pages/ are auto-discovered by Streamlit
 as additional navigation items when the app is launched from this entrypoint.
 """
 import streamlit as st
+import torch
 
 st.set_page_config(
     page_title="DeepVol — Quantitative Volatility Platform",
@@ -71,8 +72,6 @@ st.divider()
 
 # ── System Status ─────────────────────────────────────────────────────────────
 st.header("System Status")
-
-import torch
 
 col_a, col_b, col_c, col_d = st.columns(4)
 
