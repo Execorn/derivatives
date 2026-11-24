@@ -20,17 +20,19 @@ Implements SPEC-DEEPVOL-EQ-AUTOCALL-002 §5.5.1 in strict IEEE-754 float64 preci
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import hashlib
 import inspect
 import math
 import threading
-from typing import Any, Callable, List, Literal, Mapping, Optional, Sequence, Tuple, Union, cast
+from typing import Any, List, Literal, Optional, Tuple, Union, cast
 
 import numpy as np
 import numpy.typing as npt
 import scipy.interpolate
+from scipy.linalg import lapack as scipy_lapack
 from scipy.special import ndtr
 from scipy.stats import norm, qmc
 import torch
@@ -39,6 +41,7 @@ from deepvol.market.eq_curves import (
     eval_clamped_cubic_coeffs,
     fast_clamped_cubic_coeffs,
     year_fraction as eq_year_fraction,
+    year_fractions as eq_year_fractions,
 )
 from deepvol.models.autocall.feature_layout import (
     PAIR_ORDER_DEPENDENT_INDICES,
@@ -264,12 +267,79 @@ def _project_wing_calls_convex(
     return out
 
 
+def _surface_year_fractions_batch(
+    as_of: Union[datetime, date, str],
+    dates: Sequence[Union[datetime, date, str]],
+    dcc: str = "Act365",
+) -> npt.NDArray[np.float64]:
+    """Vectorized year fractions across surface expirations with Murex alias fallback."""
+    if len(dates) == 0:
+        return np.zeros(0, dtype=np.float64)
+    dt_cls = datetime
+    utc_tz = timezone.utc
+    dt1 = as_of if (type(as_of) is dt_cls and as_of.tzinfo is utc_tz) else _to_utc_datetime(as_of)
+    exp_dts = [
+        d if (type(d) is dt_cls and d.tzinfo is not None) else _to_utc_datetime(d)
+        for d in dates
+    ]
+    dcc_raw = str(dcc or "Act365").strip()
+    try:
+        return np.asarray(eq_year_fractions(dt1, exp_dts, dcc_raw), dtype=np.float64)
+    except ValueError:
+        return np.asarray(
+            [_surface_year_fraction(dt1, d, dcc_raw) for d in exp_dts],
+            dtype=np.float64,
+        )
+
+
+def _fast_clamped_cubic_coeffs_lapack(
+    x: npt.NDArray[np.float64],
+    y: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """Computes clamped cubic spline polynomial coefficients `(4, K - 1, ...)` via LAPACK dgtsv."""
+    k = len(x)
+    if k < 2:
+        raise ValueError("fast_clamped_cubic_coeffs requires at least 2 knots.")
+    h = x[1:] - x[:-1]
+    h_b = h.reshape((k - 1,) + (1,) * (y.ndim - 1))
+    s = (y[1:] - y[:-1]) / h_b
+    d = np.zeros_like(y, dtype=np.float64)
+    n_int = k - 2
+    if n_int > 0:
+        hp = h[:-1]
+        hn = h[1:]
+        diag = 2.0 * (hp + hn)
+        int_shape = (n_int,) + (1,) * (y.ndim - 1)
+        rhs = 3.0 * (hn.reshape(int_shape) * s[:-1] + hp.reshape(int_shape) * s[1:])
+        if n_int == 1:
+            d[1:-1] = rhs[0] / diag[0]
+        else:
+            _, _, _, x_sol, info = scipy_lapack.dgtsv(
+                hn[1:].copy(),
+                diag,
+                hp[:-1].copy(),
+                rhs,
+                overwrite_dl=1,
+                overwrite_d=1,
+                overwrite_du=1,
+                overwrite_b=1,
+            )
+            if info != 0:
+                return fast_clamped_cubic_coeffs(x, y)
+            d[1:-1] = x_sol
+    c3 = y[:-1]
+    c2 = d[:-1]
+    c1 = (3.0 * s - 2.0 * d[:-1] - d[1:]) / h_b
+    c0 = (d[:-1] + d[1:] - 2.0 * s) / (h_b * h_b)
+    return np.stack([c0, c1, c2, c3], axis=0)
+
+
 def _eval_durrleman_batch(
     y: npt.NDArray[np.float64],
     w_mat: npt.NDArray[np.float64],
 ) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """Vectorized Durrleman butterfly density g(y) across all slices using fast_clamped_cubic_coeffs."""
-    coeffs = fast_clamped_cubic_coeffs(y, w_mat.T)
+    """Vectorized Durrleman butterfly density g(y) across all slices using LAPACK tridiagonal solve."""
+    coeffs = _fast_clamped_cubic_coeffs_lapack(y, w_mat.T)
     c0 = coeffs[0].T
     c1 = coeffs[1].T
     c2 = coeffs[2].T
@@ -355,7 +425,20 @@ def enforce_no_arbitrage_projection_with_jacobian(
         raise ValueError(
             f"SMILE_ARBITRAGE: Quotes shape {q_arr.shape} does not match ({len(t_arr)}, {len(k_arr)}) on surface={surface_id}."
         )
-    if not (np.all(np.isfinite(t_arr)) and np.all(np.isfinite(k_arr)) and np.all(np.isfinite(q_arr))):
+    t_min = float(t_arr.min())
+    t_max = float(t_arr.max())
+    k_min = float(k_arr.min())
+    k_max = float(k_arr.max())
+    q_min = float(q_arr.min())
+    q_max = float(q_arr.max())
+    if not (
+        math.isfinite(t_min)
+        and math.isfinite(t_max)
+        and math.isfinite(k_min)
+        and math.isfinite(k_max)
+        and math.isfinite(q_min)
+        and math.isfinite(q_max)
+    ):
         bad_q = np.argwhere(~np.isfinite(q_arr))
         if len(bad_q) > 0:
             m_b, j_b = int(bad_q[0, 0]), int(bad_q[0, 1])
@@ -373,25 +456,29 @@ def enforce_no_arbitrage_projection_with_jacobian(
         raise ValueError(
             f"SMILE_ARBITRAGE: Non-finite (NaN/Inf) values in volatility surface={surface_id}."
         )
-    if np.any(t_arr <= 0.0):
+    if t_min <= 0.0:
         m_b = int(np.flatnonzero(t_arr <= 0.0)[0])
         raise ValueError(
             f"SMILE_ARBITRAGE: Expiration tenor must be strictly positive on surface={surface_id}, "
             f"slice={m_b} (T={float(t_arr[m_b]):.4f}Y)."
         )
-    if np.any(np.diff(t_arr) <= 0.0):
-        m_b = int(np.flatnonzero(np.diff(t_arr) <= 0.0)[0]) + 1
-        raise ValueError(
-            f"SMILE_ARBITRAGE: Expiration tenors must be strictly increasing on surface={surface_id}, "
-            f"slice={m_b} (prev_T={float(t_arr[m_b - 1]):.4f}Y -> T={float(t_arr[m_b]):.4f}Y)."
-        )
-    if np.any(k_arr <= 0.0):
+    if len(t_arr) >= 2:
+        t_diff = t_arr[1:] - t_arr[:-1]
+        if float(t_diff.min()) <= 0.0:
+            m_b = int(np.flatnonzero(t_diff <= 0.0)[0]) + 1
+            raise ValueError(
+                f"SMILE_ARBITRAGE: Expiration tenors must be strictly increasing on surface={surface_id}, "
+                f"slice={m_b} (prev_T={float(t_arr[m_b - 1]):.4f}Y -> T={float(t_arr[m_b]):.4f}Y)."
+            )
+    else:
+        t_diff = np.empty(0, dtype=np.float64)
+    if k_min <= 0.0:
         j_b = int(np.flatnonzero(k_arr <= 0.0)[0])
         raise ValueError(
             f"SMILE_ARBITRAGE: Strikes must be strictly positive on surface={surface_id}, "
             f"K={float(k_arr[j_b]):.4f}."
         )
-    if np.any(q_arr < 1e-4):
+    if q_min < 1e-4:
         bad_low = np.argwhere(q_arr < 1e-4)
         m_b, j_b = int(bad_low[0, 0]), int(bad_low[0, 1])
         j_p = max(j_b - 1, 0)
@@ -402,7 +489,7 @@ def enforce_no_arbitrage_projection_with_jacobian(
             f"vol_jump={float(q_arr[m_b, j_p]):.5f}->{float(q_arr[m_b, j_b]):.5f}), "
             f"min_d2c=0.000000, min_g=0.0000."
         )
-    if np.any(q_arr > max_vol):
+    if q_max > max_vol:
         bad_hi = np.argwhere(q_arr > max_vol)
         m_b, j_b = int(bad_hi[0, 0]), int(bad_hi[0, 1])
         j_p = max(j_b - 1, 0)
@@ -418,7 +505,7 @@ def enforce_no_arbitrage_projection_with_jacobian(
 
     # 1. Deduplicate identical or non-strictly-increasing strikes
     if len(k_arr) >= 2 and bool(
-        np.all(np.diff(k_arr) > 1e-9 * np.maximum(1.0, np.abs(k_arr[:-1])))
+        np.all((k_arr[1:] - k_arr[:-1]) > 1e-9 * np.maximum(1.0, np.abs(k_arr[:-1])))
     ):
         unique_strikes = k_arr.copy()
         dedup_matrix = np.eye(len(k_arr), dtype=np.float64)
@@ -457,40 +544,55 @@ def enforce_no_arbitrage_projection_with_jacobian(
 
     n_exp = len(t_arr)
     n_u = len(unique_strikes)
-    cal_ancestor = np.broadcast_to(np.arange(n_exp, dtype=np.int64)[:, None], (n_exp, n_u)).copy()
-    cal_scale = np.ones((n_exp, n_u), dtype=np.float64)
+    cal_ancestor: Optional[npt.NDArray[np.int64]] = None
+    cal_scale: Optional[npt.NDArray[np.float64]] = None
+
+    def _ensure_cal_state() -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.float64]]:
+        nonlocal cal_ancestor, cal_scale
+        if cal_ancestor is None or cal_scale is None:
+            cal_ancestor = np.broadcast_to(
+                np.arange(n_exp, dtype=np.int64)[:, None], (n_exp, n_u)
+            ).copy()
+            cal_scale = np.ones((n_exp, n_u), dtype=np.float64)
+        return cal_ancestor, cal_scale
 
     # 2. Floor implied volatility at min_vol
-    floor_mask = q_dedup < min_vol
-    if np.any(floor_mask):
+    if float(q_dedup.min()) < min_vol:
+        ca, cs = _ensure_cal_state()
+        floor_mask = q_dedup < min_vol
         q_dedup = np.maximum(q_dedup, min_vol)
-        cal_ancestor[floor_mask] = -1
-        cal_scale[floor_mask] = 0.0
+        ca[floor_mask] = -1
+        cs[floor_mask] = 0.0
         was_projected = True
 
     # 3. Enforce calendar total-variance monotonicity: w_m(K) >= w_{m-1}(K) + min_calendar_dvar_dt * dT
     w_mat = (q_dedup * q_dedup) * t_arr[:, None]
-    sig_curr = q_dedup.copy()
-    for m in range(1, n_exp):
-        dt_m = t_arr[m] - t_arr[m - 1]
-        min_w_m = w_mat[m - 1] + min_calendar_dvar_dt * dt_m
-        viol = w_mat[m] < min_w_m
-        if np.any(viol):
-            w_mat[m, viol] = min_w_m[viol]
-            was_projected = True
-            for u in np.flatnonzero(viol):
-                sig_new = math.sqrt(max(w_mat[m, u] / t_arr[m], min_vol * min_vol))
-                if w_mat[m, u] / t_arr[m] <= min_vol * min_vol or cal_ancestor[m - 1, u] < 0:
-                    cal_ancestor[m, u] = -1
-                    cal_scale[m, u] = 0.0
-                else:
-                    cal_ancestor[m, u] = cal_ancestor[m - 1, u]
-                    cal_scale[m, u] = cal_scale[m - 1, u] * (
-                        (t_arr[m - 1] * sig_curr[m - 1, u]) / max(t_arr[m] * sig_new, 1e-12)
-                    )
-                sig_curr[m, u] = sig_new
-
-    projected_quotes = np.sqrt(np.maximum(w_mat / t_arr[:, None], min_vol * min_vol))
+    if n_exp >= 2 and bool(np.any((w_mat[1:] - w_mat[:-1]) < (min_calendar_dvar_dt * t_diff)[:, None])):
+        ca, cs = _ensure_cal_state()
+        sig_curr = q_dedup.copy()
+        for m in range(1, n_exp):
+            dt_m = t_arr[m] - t_arr[m - 1]
+            min_w_m = w_mat[m - 1] + min_calendar_dvar_dt * dt_m
+            viol = w_mat[m] < min_w_m
+            if np.any(viol):
+                w_mat[m, viol] = min_w_m[viol]
+                was_projected = True
+                for u in np.flatnonzero(viol):
+                    sig_new = math.sqrt(max(w_mat[m, u] / t_arr[m], min_vol * min_vol))
+                    if w_mat[m, u] / t_arr[m] <= min_vol * min_vol or ca[m - 1, u] < 0:
+                        ca[m, u] = -1
+                        cs[m, u] = 0.0
+                    else:
+                        ca[m, u] = ca[m - 1, u]
+                        cs[m, u] = cs[m - 1, u] * (
+                            (t_arr[m - 1] * sig_curr[m - 1, u]) / max(t_arr[m] * sig_new, 1e-12)
+                        )
+                    sig_curr[m, u] = sig_new
+        projected_quotes = np.sqrt(np.maximum(w_mat / t_arr[:, None], min_vol * min_vol))
+        w_all_init = (projected_quotes * projected_quotes) * t_arr[:, None]
+    else:
+        projected_quotes = q_dedup
+        w_all_init = w_mat
 
     # 4. Spot-independent Durrleman butterfly convexity screening & localized wing projection
     if n_u >= 3:
@@ -498,13 +600,12 @@ def enforce_no_arbitrage_projection_with_jacobian(
         y_u = np.log(unique_strikes / k_ref)
         core_strike_mask = (unique_strikes >= 0.5 * k_ref) & (unique_strikes <= 1.5 * k_ref)
 
-        w_all_init = (projected_quotes * projected_quotes) * t_arr[:, None]
         y_eval, g_mat_all = _eval_durrleman_batch(y_u, w_all_init)
         calls_mat_all = _b76_norm_call(y_u[None, :], w_all_init)
         core_eval_mask = (y_eval >= math.log(0.5)) & (y_eval <= math.log(1.5))
         has_core_eval = bool(np.any(core_eval_mask))
         k_scale = max(float(k_ref), 1e-12)
-        dk_step = np.maximum(np.diff(unique_strikes) / k_scale, 1e-12)
+        dk_step = np.maximum((unique_strikes[1:] - unique_strikes[:-1]) / k_scale, 1e-12)
 
         def _compute_surface_worst_metrics() -> Tuple[float, float]:
             w_chk_all = (projected_quotes * projected_quotes) * t_arr[:, None]
@@ -514,8 +615,8 @@ def enforce_no_arbitrage_projection_with_jacobian(
             else:
                 surf_min_g = float(np.min(g_chk_all))
             c_chk_all = _b76_norm_call(y_u[None, :], w_chk_all)
-            sl_chk_all = np.diff(c_chk_all, axis=1) / dk_step[None, :]
-            d2_chk_all = np.diff(sl_chk_all, axis=1)
+            sl_chk_all = (c_chk_all[:, 1:] - c_chk_all[:, :-1]) / dk_step[None, :]
+            d2_chk_all = sl_chk_all[:, 1:] - sl_chk_all[:, :-1]
             core_int_mask = core_strike_mask[1:-1]
             if np.any(core_int_mask):
                 surf_min_d2c = float(np.min(d2_chk_all[:, core_int_mask]))
@@ -527,120 +628,142 @@ def enforce_no_arbitrage_projection_with_jacobian(
                 surf_min_g = 0.0
             return surf_min_d2c, surf_min_g
 
-        for m in range(n_exp):
-            t_m = float(t_arr[m])
-            g_eval = g_mat_all[m]
+        slopes_all = (calls_mat_all[:, 1:] - calls_mat_all[:, :-1]) / dk_step[None, :]
+        d2c_all = slopes_all[:, 1:] - slopes_all[:, :-1]
+        core_d2_mask = core_strike_mask[1:-1]
+        has_core_d2 = bool(np.any(core_d2_mask))
+        min_g_core_all = (
+            float(np.min(g_mat_all[:, core_eval_mask]))
+            if has_core_eval
+            else float(np.min(g_mat_all))
+        )
+        min_g_all_global = float(np.min(g_mat_all))
+        d2c_core_mat = d2c_all[:, core_d2_mask] if has_core_d2 else d2c_all
+        min_d2c_core_global = float(np.min(d2c_core_mat)) if d2c_core_mat.size > 0 else 0.0
+        needs_per_slice_pass = (
+            min_d2c_core_global < -1e-4
+            or min_g_core_all < -10.0
+            or min_g_all_global < -25.0
+            or bool(np.min(d2c_all) < -1e-9)
+            or bool(np.max(slopes_all) > 1e-9)
+        )
 
-            min_g_core = (
-                float(np.min(g_eval[core_eval_mask]))
-                if has_core_eval
-                else float(np.min(g_eval))
-            )
-            min_g_all = float(np.min(g_eval))
+        if needs_per_slice_pass:
+            ca, cs = _ensure_cal_state()
+            for m in range(n_exp):
+                t_m = float(t_arr[m])
+                g_eval = g_mat_all[m]
 
-            # Check discrete Black-76 normalized call convexity C''(K) >= 0 at F = K_ref
-            calls_m = calls_mat_all[m]
-            slopes_m = np.diff(calls_m) / dk_step
-            d2c_m = np.diff(slopes_m)
-
-            min_d2c_core = float("inf")
-            j_first_severe: Optional[int] = None
-            j_first_mild: Optional[int] = None
-            j_worst_core: int = 1
-            for j in range(1, n_u - 1):
-                if core_strike_mask[j]:
-                    val_d2c = float(d2c_m[j - 1])
-                    if val_d2c < min_d2c_core:
-                        min_d2c_core = val_d2c
-                        j_worst_core = j
-                    if val_d2c < -1e-3 and j_first_severe is None:
-                        j_first_severe = j
-                    elif val_d2c < -1e-4 and j_first_mild is None:
-                        j_first_mild = j
-            if not math.isfinite(min_d2c_core):
-                min_d2c_core = float(np.min(d2c_m)) if len(d2c_m) > 0 else 0.0
-                j_worst_core = int(np.argmin(d2c_m)) + 1 if len(d2c_m) > 0 else 1
-
-            if j_first_severe is not None:
-                j_off = j_first_severe
-            elif j_first_mild is not None:
-                j_off = j_first_mild
-            elif min_d2c_core < 0.0:
-                j_off = j_worst_core
-            elif (min_g_core < -10.0 or min_g_all < -25.0) and len(g_eval) > 0:
-                g_idx = int(np.argmin(g_eval))
-                j_off = g_idx if g_idx < n_u else min((g_idx - n_u) + 1, n_u - 1)
-            else:
-                j_off = j_worst_core
-            j_prev = max(j_off - 1, 0)
-            strike_val = float(unique_strikes[j_off])
-            prev_strike_val = float(unique_strikes[j_prev])
-            v_prev = float(projected_quotes[m, j_prev])
-            v_curr = float(projected_quotes[m, j_off])
-            min_slope_m = float(np.min(slopes_m)) if len(slopes_m) > 0 else 0.0
-            max_slope_m = float(np.max(slopes_m)) if len(slopes_m) > 0 else 0.0
-
-            if min_d2c_core < -1e-3 or min_g_core < -10.0 or min_g_all < -25.0:
-                surf_min_d2c, surf_min_g = _compute_surface_worst_metrics()
-                min_d2c_val = min(min_d2c_core, surf_min_d2c)
-                min_g_val = min(min_g_core, surf_min_g)
-                raise ValueError(
-                    f"SMILE_ARBITRAGE: Core call-price convexity violation at slice {m}: "
-                    f"surface={surface_id}, slice={m} (T={t_m:.4f}Y), "
-                    f"K={strike_val:.4f} (prev_K={prev_strike_val:.4f} -> K={strike_val:.4f}, "
-                    f"vol_jump={v_prev:.5f}->{v_curr:.5f}), "
-                    f"min_d2c={min_d2c_val:.6f}, min_g={min_g_val:.4f}, "
-                    f"slope_range=[{min_slope_m:.4f}, {max_slope_m:.4f}]."
+                min_g_core = (
+                    float(np.min(g_eval[core_eval_mask]))
+                    if has_core_eval
+                    else float(np.min(g_eval))
                 )
+                min_g_all = float(np.min(g_eval))
 
-            if min_d2c_core < -1e-4:
-                # Mild numerical quote noise (-1e-3 <= min_d2c_core < -1e-4
-                # and min_g_core >= -10.0) is projected onto convex call prices with warning.
-                all_wing_mask = np.zeros_like(core_strike_mask)
-                calls_proj = _project_wing_calls_convex(unique_strikes, calls_m, k_ref, all_wing_mask)
-                for u in range(n_u):
-                    if abs(calls_proj[u] - calls_m[u]) > 1e-11:
-                        sig_u = _invert_b76_norm_call_to_vol(
-                            float(y_u[u]), float(calls_proj[u]), t_m, min_vol, max_vol
-                        )
-                        projected_quotes[m, u] = sig_u
-                        cal_ancestor[m, u] = -1
-                        cal_scale[m, u] = 0.0
-                # If a downward quote dip left any residual d2c < -1e-4 after lower-hull projection,
-                # smooth offending interior vol wiggle iteratively until d2c >= -1e-4.
-                for _ in range(16):
-                    w_chk = (projected_quotes[m] * projected_quotes[m]) * t_m
-                    c_chk = _b76_norm_call(y_u, w_chk)
-                    sl_chk = np.diff(c_chk) / dk_step
-                    d2_chk = np.diff(sl_chk)
-                    fixed_any = False
-                    for j_c in range(1, n_u - 1):
-                        if core_strike_mask[j_c] and float(d2_chk[j_c - 1]) < -1e-4:
-                            w_interp = (unique_strikes[j_c] - unique_strikes[j_c - 1]) / max(
-                                unique_strikes[j_c + 1] - unique_strikes[j_c - 1], 1e-12
-                            )
-                            v_sec = (1.0 - w_interp) * projected_quotes[m, j_c - 1] + w_interp * projected_quotes[m, j_c + 1]
-                            projected_quotes[m, j_c] = 0.5 * (projected_quotes[m, j_c] + v_sec)
-                            cal_ancestor[m, j_c] = -1
-                            cal_scale[m, j_c] = 0.0
-                            fixed_any = True
-                    if not fixed_any:
-                        break
-                was_projected = True
-                if warnings_out is not None and "SMILE_ARBITRAGE_PROJECTED" not in warnings_out:
-                    warnings_out.append("SMILE_ARBITRAGE_PROJECTED")
-            elif np.min(d2c_m) < -1e-9 or np.max(slopes_m) > 1e-9:
-                calls_proj = _project_wing_calls_convex(unique_strikes, calls_m, k_ref, core_strike_mask)
-                if np.max(np.abs(calls_proj - calls_m)) > 1e-10:
+                # Check discrete Black-76 normalized call convexity C''(K) >= 0 at F = K_ref
+                calls_m = calls_mat_all[m]
+                slopes_m = slopes_all[m]
+                d2c_m = d2c_all[m]
+
+                min_d2c_core = float("inf")
+                j_first_severe: Optional[int] = None
+                j_first_mild: Optional[int] = None
+                j_worst_core: int = 1
+                for j in range(1, n_u - 1):
+                    if core_strike_mask[j]:
+                        val_d2c = float(d2c_m[j - 1])
+                        if val_d2c < min_d2c_core:
+                            min_d2c_core = val_d2c
+                            j_worst_core = j
+                        if val_d2c < -1e-3 and j_first_severe is None:
+                            j_first_severe = j
+                        elif val_d2c < -1e-4 and j_first_mild is None:
+                            j_first_mild = j
+                if not math.isfinite(min_d2c_core):
+                    min_d2c_core = float(np.min(d2c_m)) if len(d2c_m) > 0 else 0.0
+                    j_worst_core = int(np.argmin(d2c_m)) + 1 if len(d2c_m) > 0 else 1
+
+                if j_first_severe is not None:
+                    j_off = j_first_severe
+                elif j_first_mild is not None:
+                    j_off = j_first_mild
+                elif min_d2c_core < 0.0:
+                    j_off = j_worst_core
+                elif (min_g_core < -10.0 or min_g_all < -25.0) and len(g_eval) > 0:
+                    g_idx = int(np.argmin(g_eval))
+                    j_off = g_idx if g_idx < n_u else min((g_idx - n_u) + 1, n_u - 1)
+                else:
+                    j_off = j_worst_core
+                j_prev = max(j_off - 1, 0)
+                strike_val = float(unique_strikes[j_off])
+                prev_strike_val = float(unique_strikes[j_prev])
+                v_prev = float(projected_quotes[m, j_prev])
+                v_curr = float(projected_quotes[m, j_off])
+                min_slope_m = float(np.min(slopes_m)) if len(slopes_m) > 0 else 0.0
+                max_slope_m = float(np.max(slopes_m)) if len(slopes_m) > 0 else 0.0
+
+                if min_d2c_core < -1e-3 or min_g_core < -10.0 or min_g_all < -25.0:
+                    surf_min_d2c, surf_min_g = _compute_surface_worst_metrics()
+                    min_d2c_val = min(min_d2c_core, surf_min_d2c)
+                    min_g_val = min(min_g_core, surf_min_g)
+                    raise ValueError(
+                        f"SMILE_ARBITRAGE: Core call-price convexity violation at slice {m}: "
+                        f"surface={surface_id}, slice={m} (T={t_m:.4f}Y), "
+                        f"K={strike_val:.4f} (prev_K={prev_strike_val:.4f} -> K={strike_val:.4f}, "
+                        f"vol_jump={v_prev:.5f}->{v_curr:.5f}), "
+                        f"min_d2c={min_d2c_val:.6f}, min_g={min_g_val:.4f}, "
+                        f"slope_range=[{min_slope_m:.4f}, {max_slope_m:.4f}]."
+                    )
+
+                if min_d2c_core < -1e-4:
+                    # Mild numerical quote noise (-1e-3 <= min_d2c_core < -1e-4
+                    # and min_g_core >= -10.0) is projected onto convex call prices with warning.
+                    all_wing_mask = np.zeros_like(core_strike_mask)
+                    calls_proj = _project_wing_calls_convex(unique_strikes, calls_m, k_ref, all_wing_mask)
                     for u in range(n_u):
-                        if not core_strike_mask[u] and abs(calls_proj[u] - calls_m[u]) > 1e-11:
-                            sig_wing = _invert_b76_norm_call_to_vol(
+                        if abs(calls_proj[u] - calls_m[u]) > 1e-11:
+                            sig_u = _invert_b76_norm_call_to_vol(
                                 float(y_u[u]), float(calls_proj[u]), t_m, min_vol, max_vol
                             )
-                            projected_quotes[m, u] = sig_wing
-                            cal_ancestor[m, u] = -1
-                            cal_scale[m, u] = 0.0
+                            projected_quotes[m, u] = sig_u
+                            ca[m, u] = -1
+                            cs[m, u] = 0.0
+                    # If a downward quote dip left any residual d2c < -1e-4 after lower-hull projection,
+                    # smooth offending interior vol wiggle iteratively until d2c >= -1e-4.
+                    for _ in range(16):
+                        w_chk = (projected_quotes[m] * projected_quotes[m]) * t_m
+                        c_chk = _b76_norm_call(y_u, w_chk)
+                        sl_chk = (c_chk[1:] - c_chk[:-1]) / dk_step
+                        d2_chk = sl_chk[1:] - sl_chk[:-1]
+                        fixed_any = False
+                        for j_c in range(1, n_u - 1):
+                            if core_strike_mask[j_c] and float(d2_chk[j_c - 1]) < -1e-4:
+                                w_interp = (unique_strikes[j_c] - unique_strikes[j_c - 1]) / max(
+                                    unique_strikes[j_c + 1] - unique_strikes[j_c - 1], 1e-12
+                                )
+                                v_sec = (1.0 - w_interp) * projected_quotes[m, j_c - 1] + w_interp * projected_quotes[m, j_c + 1]
+                                projected_quotes[m, j_c] = 0.5 * (projected_quotes[m, j_c] + v_sec)
+                                ca[m, j_c] = -1
+                                cs[m, j_c] = 0.0
+                                fixed_any = True
+                        if not fixed_any:
+                            break
                     was_projected = True
+                    if warnings_out is not None and "SMILE_ARBITRAGE_PROJECTED" not in warnings_out:
+                        warnings_out.append("SMILE_ARBITRAGE_PROJECTED")
+                elif np.min(d2c_m) < -1e-9 or np.max(slopes_m) > 1e-9:
+                    calls_proj = _project_wing_calls_convex(unique_strikes, calls_m, k_ref, core_strike_mask)
+                    if np.max(np.abs(calls_proj - calls_m)) > 1e-10:
+                        for u in range(n_u):
+                            if not core_strike_mask[u] and abs(calls_proj[u] - calls_m[u]) > 1e-11:
+                                sig_wing = _invert_b76_norm_call_to_vol(
+                                    float(y_u[u]), float(calls_proj[u]), t_m, min_vol, max_vol
+                                )
+                                projected_quotes[m, u] = sig_wing
+                                ca[m, u] = -1
+                                cs[m, u] = 0.0
+                        was_projected = True
 
         # Re-enforce calendar monotonicity only when variance falls meaningfully below m-1
         # (ignore ~1e-16 round-trip noise from sqrt(w/t)**2 * t)
@@ -651,18 +774,19 @@ def enforce_no_arbitrage_projection_with_jacobian(
             tol_m = 1e-14 * np.maximum(1.0, np.abs(min_w_m))
             viol = w_re[m] < (min_w_m - tol_m)
             if np.any(viol):
+                ca_re, cs_re = _ensure_cal_state()
                 w_re[m, viol] = min_w_m[viol]
                 was_projected = True
                 for u in np.flatnonzero(viol):
                     sig_prev_u = float(projected_quotes[m - 1, u])
                     sig_new = math.sqrt(max(w_re[m, u] / t_arr[m], min_vol * min_vol))
                     projected_quotes[m, u] = sig_new
-                    if w_re[m, u] / t_arr[m] <= min_vol * min_vol or cal_ancestor[m - 1, u] < 0:
-                        cal_ancestor[m, u] = -1
-                        cal_scale[m, u] = 0.0
+                    if w_re[m, u] / t_arr[m] <= min_vol * min_vol or ca_re[m - 1, u] < 0:
+                        ca_re[m, u] = -1
+                        cs_re[m, u] = 0.0
                     else:
-                        cal_ancestor[m, u] = cal_ancestor[m - 1, u]
-                        cal_scale[m, u] = cal_scale[m - 1, u] * (
+                        ca_re[m, u] = ca_re[m - 1, u]
+                        cs_re[m, u] = cs_re[m - 1, u] * (
                             (t_arr[m - 1] * sig_prev_u) / max(t_arr[m] * sig_new, 1e-12)
                         )
 
@@ -675,8 +799,8 @@ def enforce_no_arbitrage_projection_with_jacobian(
                 g_post = g_post_all[m]
                 min_g_post_core = float(np.min(g_post[core_eval_mask])) if has_core_eval else float(np.min(g_post))
                 min_g_post_all = float(np.min(g_post))
-                sl_post = np.diff(c_post_all[m]) / dk_step
-                d2_post = np.diff(sl_post)
+                sl_post = (c_post_all[m, 1:] - c_post_all[m, :-1]) / dk_step
+                d2_post = sl_post[1:] - sl_post[:-1]
                 core_d2_post = d2_post[core_strike_mask[1:-1]] if np.any(core_strike_mask[1:-1]) else d2_post
                 min_d2_post_core = float(np.min(core_d2_post)) if len(core_d2_post) > 0 else 0.0
                 if min_d2_post_core < -1e-3 or min_g_post_core < -10.0 or min_g_post_all < -25.0:
@@ -693,6 +817,7 @@ def enforce_no_arbitrage_projection_with_jacobian(
                         f"slope_range=[{min_sl_p:.4f}, {max_sl_p:.4f}]."
                     )
                 if min_d2_post_core < -1e-4:
+                    ca_post, cs_post = _ensure_cal_state()
                     for j_c in range(1, n_u - 1):
                         if core_strike_mask[j_c] and float(d2_post[j_c - 1]) < -1e-4:
                             w_interp = (unique_strikes[j_c] - unique_strikes[j_c - 1]) / max(
@@ -700,13 +825,13 @@ def enforce_no_arbitrage_projection_with_jacobian(
                             )
                             v_sec = (1.0 - w_interp) * projected_quotes[m, j_c - 1] + w_interp * projected_quotes[m, j_c + 1]
                             projected_quotes[m, j_c] = 0.5 * (projected_quotes[m, j_c] + v_sec)
-                            cal_ancestor[m, j_c] = -1
-                            cal_scale[m, j_c] = 0.0
+                            ca_post[m, j_c] = -1
+                            cs_post[m, j_c] = 0.0
                     if warnings_out is not None and "SMILE_ARBITRAGE_PROJECTED" not in warnings_out:
                         warnings_out.append("SMILE_ARBITRAGE_PROJECTED")
                     c_post_chk = _b76_norm_call(y_u, (projected_quotes[m] * projected_quotes[m]) * t_m)
-                    sl_post_chk = np.diff(c_post_chk) / dk_step
-                    d2_post_chk = np.diff(sl_post_chk)
+                    sl_post_chk = (c_post_chk[1:] - c_post_chk[:-1]) / dk_step
+                    d2_post_chk = sl_post_chk[1:] - sl_post_chk[:-1]
                     core_chk = d2_post_chk[core_strike_mask[1:-1]] if np.any(core_strike_mask[1:-1]) else d2_post_chk
                     if len(core_chk) > 0 and float(np.min(core_chk)) < -1e-3:
                         surf_min_d2c, surf_min_g = _compute_surface_worst_metrics()
@@ -719,20 +844,23 @@ def enforce_no_arbitrage_projection_with_jacobian(
                             f"slope_range=[{float(np.min(sl_post_chk)):.4f}, {float(np.max(sl_post_chk)):.4f}]."
                         )
 
+    ca_out, cs_out = _ensure_cal_state()
+
     cal_jacobian = np.zeros((n_exp, n_exp, n_u), dtype=np.float64)
-    for m in range(n_exp):
-        for u in range(n_u):
-            src_m = int(cal_ancestor[m, u])
-            if src_m >= 0:
-                cal_jacobian[m, src_m, u] = cal_scale[m, u]
+    if not was_projected:
+        m_idx = np.arange(n_exp)
+        cal_jacobian[m_idx, m_idx, :] = 1.0
+    else:
+        m_grid, u_grid = np.nonzero(ca_out >= 0)
+        cal_jacobian[m_grid, ca_out[m_grid, u_grid], u_grid] = cs_out[m_grid, u_grid]
 
     return (
         unique_strikes,
         projected_quotes,
         dedup_matrix,
         was_projected,
-        cal_ancestor,
-        cal_scale,
+        ca_out,
+        cs_out,
         cal_jacobian,
     )
 
@@ -854,13 +982,11 @@ class RegularizedVolSurface:
                     )
                 if exp_dates is None:
                     exp_dates = []
-                raw_tenors = np.asarray(
-                    [_surface_year_fraction(raw_as_of, d, eff_dcc) for d in exp_dates],
-                    dtype=np.float64,
-                )
-                raw_tenors_365 = np.asarray(
-                    [_surface_year_fraction(raw_as_of, d, "Act365") for d in exp_dates],
-                    dtype=np.float64,
+                raw_tenors = _surface_year_fractions_batch(raw_as_of, exp_dates, eff_dcc)
+                raw_tenors_365 = (
+                    raw_tenors.copy()
+                    if eff_dcc.strip().upper().replace("/", "").replace("_", "") in ("ACT365", "ACT365F", "ACT365FIXED", "ACTUAL365")
+                    else _surface_year_fractions_batch(raw_as_of, exp_dates, "Act365")
                 )
         else:
             self.identifier = str(
@@ -923,13 +1049,11 @@ class RegularizedVolSurface:
                     )
                 if exp_dates is None:
                     exp_dates = []
-                raw_tenors = np.asarray(
-                    [_surface_year_fraction(raw_as_of, d, eff_dcc) for d in exp_dates],
-                    dtype=np.float64,
-                )
-                raw_tenors_365 = np.asarray(
-                    [_surface_year_fraction(raw_as_of, d, "Act365") for d in exp_dates],
-                    dtype=np.float64,
+                raw_tenors = _surface_year_fractions_batch(raw_as_of, exp_dates, eff_dcc)
+                raw_tenors_365 = (
+                    raw_tenors.copy()
+                    if eff_dcc.strip().upper().replace("/", "").replace("_", "") in ("ACT365", "ACT365F", "ACT365FIXED", "ACTUAL365")
+                    else _surface_year_fractions_batch(raw_as_of, exp_dates, "Act365")
                 )
 
         if surface_id is not None and str(surface_id).strip() and (
@@ -938,7 +1062,11 @@ class RegularizedVolSurface:
             self.identifier = str(surface_id).strip()
 
         self.dcc: str = eff_dcc
-        self.as_of_date: Optional[datetime] = _to_utc_datetime(raw_as_of) if raw_as_of is not None else None
+        self.as_of_date: Optional[datetime] = (
+            raw_as_of
+            if (type(raw_as_of) is datetime and raw_as_of.tzinfo is timezone.utc)
+            else (_to_utc_datetime(raw_as_of) if raw_as_of is not None else None)
+        )
         self.smile_interp: str = eff_interp
         self.interp_method: str = eff_interp
         self.smile_extrap: str = eff_extrap
@@ -1010,15 +1138,28 @@ class RegularizedVolSurface:
                 self._slopes_left = np.zeros(self.n_exp, dtype=np.float64)
                 self._slopes_right = np.zeros(self.n_exp, dtype=np.float64)
         elif self.bc_type == "clamped" and interp_norm in ("cubicspline", "spline", ""):
-            self._fast_slice_coeffs = fast_clamped_cubic_coeffs(self.strikes, self.quotes.T)
+            eye_u = np.eye(self.n_unique_strikes, dtype=np.float64)
+            both_c = _fast_clamped_cubic_coeffs_lapack(
+                self.strikes, np.hstack([self.quotes.T, eye_u])
+            )
+            self._fast_slice_coeffs = np.ascontiguousarray(both_c[:, :, : self.n_exp])
+            self._fast_basis_coeffs = np.ascontiguousarray(both_c[:, :, self.n_exp :])
             if use_linear_extrap:
                 h0 = max(float(self.strikes[1] - self.strikes[0]), 1e-12)
                 h1 = max(float(self.strikes[-1] - self.strikes[-2]), 1e-12)
                 self._slopes_left = (self.quotes[:, 1] - self.quotes[:, 0]) / h0
                 self._slopes_right = (self.quotes[:, -1] - self.quotes[:, -2]) / h1
+                bsl = np.zeros(self.n_unique_strikes, dtype=np.float64)
+                bsr = np.zeros(self.n_unique_strikes, dtype=np.float64)
+                bsl[0], bsl[1] = -1.0 / h0, 1.0 / h0
+                bsr[-2], bsr[-1] = -1.0 / h1, 1.0 / h1
+                self._basis_slope_left = bsl
+                self._basis_slope_right = bsr
             else:
                 self._slopes_left = np.zeros(self.n_exp, dtype=np.float64)
                 self._slopes_right = np.zeros(self.n_exp, dtype=np.float64)
+                self._basis_slope_left = np.zeros(self.n_unique_strikes, dtype=np.float64)
+                self._basis_slope_right = np.zeros(self.n_unique_strikes, dtype=np.float64)
         else:
             eff_bc = self.bc_type
             if interp_norm == "naturalcubicspline":
@@ -1150,7 +1291,7 @@ class RegularizedVolSurface:
                 self._basis_slope_left = np.ascontiguousarray(np.mean(sl_per, axis=0), dtype=np.float64)
                 self._basis_slope_right = np.ascontiguousarray(np.mean(sr_per, axis=0), dtype=np.float64)
             elif self.bc_type == "clamped" and interp_norm in ("cubicspline", "spline", ""):
-                self._fast_basis_coeffs = fast_clamped_cubic_coeffs(self.strikes, eye_u)
+                self._fast_basis_coeffs = _fast_clamped_cubic_coeffs_lapack(self.strikes, eye_u)
                 if use_linear_extrap:
                     sl = np.zeros(self.n_unique_strikes, dtype=np.float64)
                     sr = np.zeros(self.n_unique_strikes, dtype=np.float64)
@@ -1398,11 +1539,13 @@ class RegularizedVolSurface:
         time_interp: Literal["variance", "vol"] = "variance",
     ) -> npt.NDArray[np.float64]:
         """Vectorized float64 evaluation of sigma_IV(t_j, K_j) across arbitrary arrays."""
-        if isinstance(tenors, Sequence) and len(tenors) > 0 and isinstance(tenors[0], (datetime, date)):
+        if isinstance(tenors, np.ndarray):
+            t_arr = tenors if tenors.dtype == np.float64 else tenors.astype(np.float64)
+        elif isinstance(tenors, Sequence) and len(tenors) > 0 and isinstance(tenors[0], (datetime, date)):
             t_arr = np.asarray([self.tenor_from_date(d) for d in tenors], dtype=np.float64)  # type: ignore[arg-type]
         else:
             t_arr = np.asarray(tenors, dtype=np.float64)
-        k_arr = np.asarray(strikes, dtype=np.float64)
+        k_arr = strikes if (isinstance(strikes, np.ndarray) and strikes.dtype == np.float64) else np.asarray(strikes, dtype=np.float64)
         t_b, k_b = np.broadcast_arrays(t_arr, k_arr)
         orig_shape = t_b.shape
         t_flat = np.maximum(t_b.reshape(-1), 1e-8)
@@ -1413,7 +1556,10 @@ class RegularizedVolSurface:
 
         k_min = float(self.strikes[0])
         k_max = float(self.strikes[-1])
-        k_clip = np.clip(k_flat, k_min, k_max)
+        k_lo_val = float(k_flat.min())
+        k_hi_val = float(k_flat.max())
+        in_k_range = k_lo_val >= k_min and k_hi_val <= k_max
+        k_clip = k_flat if in_k_range else np.clip(k_flat, k_min, k_max)
         seg_idx = np.clip(
             np.searchsorted(self.strikes, k_clip, side="right") - 1,
             0,
@@ -1421,30 +1567,44 @@ class RegularizedVolSurface:
         )
         dx = k_clip - self.strikes[seg_idx]
 
-        # Evaluate all slices at k_flat in one vectorized gather
         assert self._fast_slice_coeffs is not None
-        c = self._fast_slice_coeffs[:, seg_idx, :]  # (4, N_q, N_exp)
-        dx_c = dx[:, None]
-        vals_all = ((c[0] * dx_c + c[1]) * dx_c + c[2]) * dx_c + c[3]  # (N_q, N_exp)
-
-        left_mask = k_flat < k_min
-        right_mask = k_flat > k_max
-        if np.any(left_mask):
-            vals_left = self.quotes[None, :, 0] + self._slopes_left[None, :] * (k_flat[:, None] - k_min)
-            vals_all = np.where(left_mask[:, None], vals_left, vals_all)
-        if np.any(right_mask):
-            vals_right = self.quotes[None, :, -1] + self._slopes_right[None, :] * (k_flat[:, None] - k_max)
-            vals_all = np.where(right_mask[:, None], vals_right, vals_all)
-        vals_all = np.maximum(vals_all, self.min_vol)
-
         if self.n_exp == 1:
-            return np.asarray(vals_all[:, 0].reshape(orig_shape), dtype=np.float64)
+            c = self._fast_slice_coeffs[:, seg_idx, 0]
+            v = np.maximum(((c[0] * dx + c[1]) * dx + c[2]) * dx + c[3], self.min_vol)
+            if not in_k_range:
+                if k_lo_val < k_min:
+                    v = np.where(
+                        k_flat < k_min,
+                        np.maximum(self.quotes[0, 0] + self._slopes_left[0] * (k_flat - k_min), self.min_vol),
+                        v,
+                    )
+                if k_hi_val > k_max:
+                    v = np.where(
+                        k_flat > k_max,
+                        np.maximum(self.quotes[0, -1] + self._slopes_right[0] * (k_flat - k_max), self.min_vol),
+                        v,
+                    )
+            return np.asarray(v.reshape(orig_shape), dtype=np.float64)
 
         idx0 = np.clip(np.searchsorted(self.tenors, t_flat, side="right") - 1, 0, self.n_exp - 2)
         idx1 = idx0 + 1
-        rows = np.arange(n_q, dtype=np.int64)
-        v0 = vals_all[rows, idx0]
-        v1 = vals_all[rows, idx1]
+        coeffs = self._fast_slice_coeffs
+        c0 = coeffs[:, seg_idx, idx0]
+        c1 = coeffs[:, seg_idx, idx1]
+        v0 = ((c0[0] * dx + c0[1]) * dx + c0[2]) * dx + c0[3]
+        v1 = ((c1[0] * dx + c1[1]) * dx + c1[2]) * dx + c1[3]
+        if not in_k_range:
+            if k_lo_val < k_min:
+                left_mask = k_flat < k_min
+                v0 = np.where(left_mask, self.quotes[idx0, 0] + self._slopes_left[idx0] * (k_flat - k_min), v0)
+                v1 = np.where(left_mask, self.quotes[idx1, 0] + self._slopes_left[idx1] * (k_flat - k_min), v1)
+            if k_hi_val > k_max:
+                right_mask = k_flat > k_max
+                v0 = np.where(right_mask, self.quotes[idx0, -1] + self._slopes_right[idx0] * (k_flat - k_max), v0)
+                v1 = np.where(right_mask, self.quotes[idx1, -1] + self._slopes_right[idx1] * (k_flat - k_max), v1)
+        v0 = np.maximum(v0, self.min_vol)
+        v1 = np.maximum(v1, self.min_vol)
+
         t0 = self.tenors[idx0]
         t1 = self.tenors[idx1]
         alpha = (t_flat - t0) / np.maximum(t1 - t0, 1e-12)
@@ -1455,9 +1615,13 @@ class RegularizedVolSurface:
         else:
             res = np.maximum((1.0 - alpha) * v0 + alpha * v1, self.min_vol)
 
-        res = np.where(t_flat <= float(self.tenors[0]), vals_all[:, 0], res)
-        res = np.where(t_flat >= float(self.tenors[-1]), vals_all[:, -1], res)
-        return res.reshape(orig_shape)
+        t_lo_val = float(t_flat.min())
+        t_hi_val = float(t_flat.max())
+        if t_lo_val <= float(self.tenors[0]):
+            res = np.where(t_flat <= float(self.tenors[0]), v0, res)
+        if t_hi_val >= float(self.tenors[-1]):
+            res = np.where(t_flat >= float(self.tenors[-1]), v1, res)
+        return np.asarray(res.reshape(orig_shape), dtype=np.float64)
 
     def _eval_basis_u_vec(
         self,
@@ -1658,6 +1822,7 @@ class RegularizedVolSurface:
         *,
         iv_short_val: Optional[float] = None,
         iv_term_val: Optional[float] = None,
+        iv_wing_vals: Optional[Sequence[float] | npt.NDArray[np.float64]] = None,
     ) -> npt.NDArray[np.float64]:
         """Fast value-only extraction of the 7 surface features for AutocallNodeCol (cols 4..10)."""
         iv_short = (
@@ -1665,12 +1830,19 @@ class RegularizedVolSurface:
             if iv_short_val is None
             else float(iv_short_val)
         )
-        if iv_term_val is None:
+        if iv_term_val is not None and iv_wing_vals is not None and len(iv_wing_vals) >= 4:
+            iv_term = float(iv_term_val)
+            iv_m10 = float(iv_wing_vals[0])
+            iv_p10 = float(iv_wing_vals[1])
+            iv_m20 = float(iv_wing_vals[2])
+            iv_p20 = float(iv_wing_vals[3])
+        elif iv_term_val is None:
+            t_vec = np.full(5, float(t_term), dtype=np.float64)
             k_term_vec = np.array(
                 [f_term, 0.90 * f_term, 1.10 * f_term, 0.80 * f_term, 1.20 * f_term],
                 dtype=np.float64,
             )
-            iv_term_vec = np.asarray(self.iv(t_term, k_term_vec), dtype=np.float64)
+            iv_term_vec = self.iv_batch(t_vec, k_term_vec)
             iv_term = float(iv_term_vec[0])
             iv_m10 = float(iv_term_vec[1])
             iv_p10 = float(iv_term_vec[2])
@@ -1678,11 +1850,12 @@ class RegularizedVolSurface:
             iv_p20 = float(iv_term_vec[4])
         else:
             iv_term = float(iv_term_val)
+            t_vec = np.full(4, float(t_term), dtype=np.float64)
             k_term_vec = np.array(
                 [0.90 * f_term, 1.10 * f_term, 0.80 * f_term, 1.20 * f_term],
                 dtype=np.float64,
             )
-            iv_term_vec = np.asarray(self.iv(t_term, k_term_vec), dtype=np.float64)
+            iv_term_vec = self.iv_batch(t_vec, k_term_vec)
             iv_m10 = float(iv_term_vec[0])
             iv_p10 = float(iv_term_vec[1])
             iv_m20 = float(iv_term_vec[2])

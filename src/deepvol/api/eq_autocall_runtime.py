@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from array import array
 from collections import OrderedDict
-from collections.abc import Mapping as AbcMapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
 import importlib
@@ -12,7 +13,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -62,6 +63,7 @@ from deepvol.models.autocall.pre_post_processor import (
     _get_cached_vol_surface,
     _lookup_funding_fixing,
     _normalize_repo_curves_map,
+    _resolve_vol_surface_kwargs,
     assemble_autocall_cashflows_and_pv,
     build_vol_surface_cache_key,
     digest_market_bytes,
@@ -444,7 +446,70 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
             _validate_fx_surface_quotes(str(ticker), surf, quotes_fx)
             continue
 
-        quotes = np.asarray(surf.VolatilityQuotes, dtype=np.float64)
+        n_exp = len(exp_dates_attr)
+        if n_exp == 0:
+            raise ValueError(f"SMILE_ARBITRAGE: Missing ExpirationDates on surface={ticker}.")
+
+        dt_cls = datetime
+        exp_utc_list = [
+            d if (type(d) is dt_cls and d.tzinfo is utc_tz) else _to_utc_datetime(d)
+            for d in exp_dates_attr
+        ]
+        dcc_attr = getattr(surf, "DayCountConvention", "Act365")
+        dcc_str = str(getattr(dcc_attr, "value", dcc_attr) or "Act365")
+        interp_attr = getattr(surf, "SmileInterpolationMethod", "CubicSpline")
+        interp_str = str(getattr(interp_attr, "value", interp_attr) or "CubicSpline")
+        extrap_attr = getattr(surf, "SmileExtrapolationMethod", "Linear")
+        extrap_str = str(getattr(extrap_attr, "value", extrap_attr) or "Linear")
+        surf_id = str(getattr(surf, "Identifier", ticker))
+
+        raw_q = surf.VolatilityQuotes
+        fast_arb_key: tuple[Any, ...] | None = None
+        if (
+            _SURFACE_ARB_FAST_CACHE
+            and isinstance(strikes_attr, (list, tuple))
+            and isinstance(raw_q, (list, tuple))
+            and len(strikes_attr) > 0
+            and len(raw_q) == n_exp
+        ):
+            n_s = len(strikes_attr)
+            try:
+                s_bytes = array("d", strikes_attr).tobytes()
+                q_arr_raw = array("d")
+                all_rows_match = True
+                for q_row in raw_q:
+                    if not isinstance(q_row, (list, tuple)) or len(q_row) != n_s:
+                        all_rows_match = False
+                        break
+                    q_arr_raw.fromlist(q_row) if type(q_row) is list else q_arr_raw.extend(q_row)
+                if all_rows_match:
+                    fast_arb_key = (
+                        str(ticker),
+                        surf_id,
+                        as_of_utc,
+                        dcc_str,
+                        interp_str,
+                        extrap_str,
+                        tuple(exp_utc_list),
+                        s_bytes,
+                        q_arr_raw.tobytes(),
+                    )
+                    with _SURFACE_ARB_CACHE_LOCK:
+                        fast_verdict = _SURFACE_ARB_FAST_CACHE.get(fast_arb_key)
+                        if fast_verdict is not None:
+                            _SURFACE_ARB_FAST_CACHE.move_to_end(fast_arb_key)
+                    if fast_verdict is not None:
+                        is_valid_f, cached_err_f = fast_verdict
+                        if not is_valid_f:
+                            raise ValueError(
+                                cached_err_f
+                                or f"SMILE_ARBITRAGE: Invalid volatility surface on surface={ticker}."
+                            )
+                        continue
+            except (TypeError, ValueError, OverflowError):
+                fast_arb_key = None
+
+        quotes = np.asarray(raw_q, dtype=np.float64)
         strikes = np.asarray(strikes_attr, dtype=np.float64)
         if quotes.size == 0 or quotes.ndim != 2:
             raise ValueError(
@@ -471,34 +536,20 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                 f"SMILE_ARBITRAGE: Non-finite volatility surface strike on surface={ticker}, "
                 f"strike_idx={j_b}, K={float(strikes.flat[j_b])!r}."
             )
-        n_exp = len(exp_dates_attr)
-        if n_exp == 0:
-            raise ValueError(f"SMILE_ARBITRAGE: Missing ExpirationDates on surface={ticker}.")
 
-        exp_utc_list = [
-            d if (isinstance(d, datetime) and d.tzinfo is utc_tz) else _to_utc_datetime(d)
-            for d in exp_dates_attr
-        ]
-        dcc_attr = getattr(surf, "DayCountConvention", "Act365")
-        dcc_str = str(getattr(dcc_attr, "value", dcc_attr) or "Act365")
-        interp_attr = getattr(surf, "SmileInterpolationMethod", "CubicSpline")
-        interp_str = str(getattr(interp_attr, "value", interp_attr) or "CubicSpline")
-        extrap_attr = getattr(surf, "SmileExtrapolationMethod", "Linear")
-        extrap_str = str(getattr(extrap_attr, "value", extrap_attr) or "Linear")
-        surf_id = str(getattr(surf, "Identifier", ticker))
-
-        fast_arb_key: tuple[Any, ...] = (
-            str(ticker),
-            surf_id,
-            as_of_utc,
-            dcc_str,
-            interp_str,
-            extrap_str,
-            tuple(exp_utc_list),
-            strikes.tobytes(),
-            quotes.tobytes(),
-        )
-        fast_verdict: tuple[bool, str | None] | None = None
+        if fast_arb_key is None:
+            fast_arb_key = (
+                str(ticker),
+                surf_id,
+                as_of_utc,
+                dcc_str,
+                interp_str,
+                extrap_str,
+                tuple(exp_utc_list),
+                strikes.tobytes(),
+                quotes.tobytes(),
+            )
+        fast_verdict = None
         if _SURFACE_ARB_FAST_CACHE:
             with _SURFACE_ARB_CACHE_LOCK:
                 fast_verdict = _SURFACE_ARB_FAST_CACHE.get(fast_arb_key)
@@ -527,13 +578,14 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                 raise ValueError(
                     f"SMILE_ARBITRAGE: Non-positive strike on surface={ticker}, K={float(strikes.flat[j_b]):.4f}."
                 )
-            if strikes.size >= 2 and bool(np.all(np.diff(strikes) > 1e-9)):
+            if strikes.size >= 2 and bool(np.all((strikes[1:] - strikes[:-1]) > 1e-9)):
                 u_s = strikes
                 already_sorted = True
             else:
                 order = np.argsort(strikes)
                 s_sorted = strikes[order]
-                keep = np.concatenate(([True], np.diff(np.round(s_sorted, 9)) > 0.0))
+                s_round = np.round(s_sorted, 9)
+                keep = np.concatenate(([True], (s_round[1:] - s_round[:-1]) > 0.0))
                 u_s = s_sorted[keep]
                 already_sorted = False
             if len(u_s) < 2:
@@ -571,8 +623,8 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                 d1 = -y / sqrt_w + 0.5 * sqrt_w
                 d2 = d1 - sqrt_w
                 calls = ndtr(d1) - k_norm[None, :] * ndtr(d2)
-                dk = np.diff(k_norm)
-                slopes = np.diff(calls, axis=1) / dk[None, :]
+                dk = k_norm[1:] - k_norm[:-1]
+                slopes = (calls[:, 1:] - calls[:, :-1]) / dk[None, :]
                 max_slope = float(slopes.max())
                 min_slope = float(slopes.min())
                 if max_slope > 1e-3 or min_slope < -1.0 - 1e-3:
@@ -584,7 +636,7 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                         off_slope = min_slope
                     j_prev = j_seg
                     j_curr = min(j_seg + 1, len(u_s) - 1)
-                    d2c_val = float(np.diff(slopes, axis=1).min()) if len(u_s) >= 3 else 0.0
+                    d2c_val = float((slopes[:, 1:] - slopes[:, :-1]).min()) if len(u_s) >= 3 else 0.0
                     raise ValueError(
                         f"SMILE_ARBITRAGE: Call-spread slope violation on surface={ticker}, "
                         f"slice={m_off} (T={t_vals[m_off]:.4f}Y), "
@@ -594,7 +646,7 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                         f"min_d2c={d2c_val:.6f}."
                     )
                 if len(u_s) >= 3:
-                    d2c = np.diff(slopes, axis=1)
+                    d2c = slopes[:, 1:] - slopes[:, :-1]
                     min_d2c = float(d2c.min())
                     if min_d2c < -1e-3:
                         m_off, j_d2 = map(int, np.unravel_index(int(np.argmin(d2c)), d2c.shape))
@@ -617,11 +669,12 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
         deferred_spline_checks.append((str(ticker), surf, fast_arb_key))
 
     for ticker, surf, fast_arb_key in deferred_spline_checks:
+        surf_kwargs = _resolve_vol_surface_kwargs(surf, surface_id=ticker)
         surf_key_obj = build_vol_surface_cache_key(
             surf,
             as_of_utc,
             surface_id=ticker,
-            kwargs={"bc_type": "clamped", "surface_id": ticker},
+            kwargs=surf_kwargs,
         )
         arb_key: tuple[str, str, int] | None = (
             (ticker, surf_key_obj.digest_hex, surf_key_obj.payload_len)
@@ -641,7 +694,7 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                 continue
 
         try:
-            _get_cached_vol_surface(surf, as_of_utc, surface_id=ticker)
+            _get_cached_vol_surface(surf, as_of_utc, surface_id=ticker, _cache_key=surf_key_obj)
         except ValueError as exc:
             err_msg = str(exc)
             if "SMILE_ARBITRAGE" in err_msg:
@@ -1383,7 +1436,7 @@ def _assert_finite_nested_floats(val: Any, label: str) -> None:
         for k, v in val.items():
             _assert_finite_nested_floats(v, f"{label}.{k}")
         return
-    if isinstance(val, AbcMapping):
+    if isinstance(val, Mapping):
         for k, v in val.items():
             _assert_finite_nested_floats(v, f"{label}.{k}")
 
@@ -1771,7 +1824,7 @@ class EQAutocallRuntime:
                     _PARSE_REQUEST_CACHE.popitem(last=False)
             return _clone_cached_request(parsed_req), True
 
-        if isinstance(req, (dict, AbcMapping)):
+        if isinstance(req, (dict, Mapping)):
             if "dag_text" in req:
                 raw_dag = req["dag_text"]
                 if not isinstance(raw_dag, str):
@@ -2036,6 +2089,7 @@ class EQAutocallRuntime:
         mds_digest_hex = _attach_runtime_market_metadata(
             state,
             req_model,
+            mds_digest_hex=getattr(state, "_mds_digest_hex", None),
             allow_cached=allow_cached_mds_digest,
         )
         if state.baseline is None:

@@ -23,6 +23,7 @@ import numpy as np
 import numpy.typing as npt
 from pydantic import BaseModel
 import torch
+import torch.nn.functional as F
 
 from deepvol.api.schemas_eq_autocall import (
     DiscountFactorCurveSpec,
@@ -80,6 +81,13 @@ _VOL_SURF_SIG_PARAMS: frozenset[str] = frozenset(
 )
 _HAS_IV_BATCH: bool = hasattr(RegularizedVolSurface, "iv_batch") and callable(
     getattr(RegularizedVolSurface, "iv_batch")
+)
+_HAS_IV_WING_PARAM: bool = (
+    hasattr(RegularizedVolSurface, "extract_node_surface_features_values_only")
+    and "iv_wing_vals"
+    in inspect.signature(
+        RegularizedVolSurface.extract_node_surface_features_values_only
+    ).parameters
 )
 
 
@@ -438,6 +446,11 @@ _PACK_ND_HDR = {
 _INT64_MIN = -(1 << 63)
 _INT64_MAX = (1 << 63) - 1
 _MODEL_SORTED_FIELDS_CACHE: dict[type, tuple[tuple[str, bytes], ...]] = {}
+_WIRE_CACHE_LOCK = threading.RLock()
+_STR_WIRE_CACHE: dict[str, bytes] = {}
+_ENUM_WIRE_CACHE: dict[tuple[type, int], bytes] = {}
+_F64_DTYPE_BYTES = np.dtype(np.float64).str.encode("ascii")
+_F64_DTYPE_LEN = len(_F64_DTYPE_BYTES)
 
 
 def _get_model_sorted_fields(cls: type) -> tuple[tuple[str, bytes], ...]:
@@ -486,9 +499,54 @@ def _append_raw_mv(
 
 
 def _append_str_val(buf: bytearray, s: str) -> None:
-    b = s.encode("utf-8")
+    if type(s) is str:
+        cached = _STR_WIRE_CACHE.get(s)
+        if cached is not None:
+            buf.extend(cached)
+            return
+        b = s.encode("utf-8")
+        wire = _PACK_U32(0x53, len(b)) + b
+        if len(s) <= 128:
+            with _WIRE_CACHE_LOCK:
+                if len(_STR_WIRE_CACHE) < 8192:
+                    _STR_WIRE_CACHE[s] = wire
+        buf.extend(wire)
+        return
+    b = str(s).encode("utf-8")
     buf.extend(_PACK_U32(0x53, len(b)))
     buf.extend(b)
+
+
+def _append_enum_or_str_val(buf: bytearray, raw: Any) -> None:
+    if isinstance(raw, Enum):
+        ekey = (type(raw), id(raw))
+        cached = _ENUM_WIRE_CACHE.get(ekey)
+        if cached is not None:
+            buf.extend(cached)
+            return
+        b = str(raw.value).encode("utf-8")
+        wire = _PACK_U32(0x53, len(b)) + b
+        with _WIRE_CACHE_LOCK:
+            if len(_ENUM_WIRE_CACHE) < 1024:
+                _ENUM_WIRE_CACHE[ekey] = wire
+        buf.extend(wire)
+        return
+    _append_str_val(buf, str(raw))
+
+
+def _update_sha256_f64_ndarray(h: Any, arr: npt.NDArray[np.float64]) -> None:
+    """Feeds canonical `_stream_canonical_val` bytes for a contiguous float64 ndarray into SHA-256."""
+    c_arr = arr if arr.flags.c_contiguous else np.ascontiguousarray(arr)
+    ndim = c_arr.ndim
+    hdr_packer = _PACK_ND_HDR.get(ndim)
+    hdr = (
+        hdr_packer(ndim, *c_arr.shape, _F64_DTYPE_LEN)
+        if hdr_packer is not None
+        else struct.pack(f"!I{ndim}QI", ndim, *c_arr.shape, _F64_DTYPE_LEN)
+    )
+    h.update(b"K" + hdr + _F64_DTYPE_BYTES + _PACK_U64(c_arr.nbytes))
+    if c_arr.nbytes > 0:
+        h.update(memoryview(cast(Any, c_arr)).cast("B"))
 
 
 def _append_opt_str_val(buf: bytearray, s: str | None) -> None:
@@ -639,12 +697,42 @@ def _stream_canonical_val(
         return True
     if tp is list:
         n_items = len(obj)
-        if n_items > 0 and type(obj[0]) is float and all(type(x) is float for x in obj):
-            src = [0.0 if x == 0.0 else x for x in obj] if (0.0 in obj) else obj
-            arr_d = array("d", src)
-            buf.extend(_PACK_U32(0x64, n_items))
-            _append_raw_mv(buf, upd, flushed, memoryview(arr_d).cast("B"))
-            return True
+        if n_items > 0:
+            elem0_tp = type(obj[0])
+            if elem0_tp is float and all(type(x) is float for x in obj):
+                src = [0.0 if x == 0.0 else x for x in obj] if (0.0 in obj) else obj
+                arr_d = array("d", src)
+                buf.extend(_PACK_U32(0x64, n_items))
+                _append_raw_mv(buf, upd, flushed, memoryview(arr_d).cast("B"))
+                return True
+            if elem0_tp is str and all(type(x) is str for x in obj):
+                buf.extend(_PACK_U32(0x4C, n_items))
+                for s_item in obj:
+                    _append_str_val(buf, s_item)
+                if len(buf) > 65536:
+                    _flush_canonical_buf(buf, upd, flushed)
+                return True
+            if elem0_tp is datetime.datetime and all(type(x) is datetime.datetime for x in obj):
+                buf.extend(_PACK_U32(0x4C, n_items))
+                utc_tz = _UTC
+                pack_dt = _PACK_DT
+                for dt_item in obj:
+                    dt_u = dt_item if dt_item.tzinfo is utc_tz else _to_utc_datetime(dt_item)
+                    buf.extend(
+                        pack_dt(
+                            0x54,
+                            dt_u.year,
+                            dt_u.month,
+                            dt_u.day,
+                            dt_u.hour,
+                            dt_u.minute,
+                            dt_u.second,
+                            dt_u.microsecond,
+                        )
+                    )
+                if len(buf) > 65536:
+                    _flush_canonical_buf(buf, upd, flushed)
+                return True
         buf.extend(_PACK_U32(0x4C, n_items))
         for item in obj:
             if not _stream_canonical_val(buf, upd, flushed, item):
@@ -853,6 +941,8 @@ def _append_vol_surface_to_buf(
     as_of_dt: datetime.datetime,
     surface_id: str | None = None,
     kwargs: Mapping[str, Any] | None = None,
+    *,
+    omit_identifier: bool = False,
 ) -> bool:
     """Streams volatility surface metadata and numeric arrays directly into `buf`."""
     if isinstance(surf_spec, EquityVolSmileCollectionSpec):
@@ -919,18 +1009,22 @@ def _append_vol_surface_to_buf(
 
     buf.extend(b"VSF")
     _append_str_val(buf, str(t_name))
-    _append_str_val(buf, str(eff_id))
-    _append_str_val(buf, str(getattr(dcc_raw, "value", dcc_raw)))
-    _append_str_val(buf, str(getattr(interp_raw, "value", interp_raw)))
-    _append_str_val(buf, str(getattr(extrap_raw, "value", extrap_raw)))
+    _append_str_val(buf, "" if omit_identifier else str(eff_id))
+    _append_enum_or_str_val(buf, dcc_raw)
+    _append_enum_or_str_val(buf, interp_raw)
+    _append_enum_or_str_val(buf, extrap_raw)
     _append_opt_str_val(buf, str(ccy_raw) if ccy_raw is not None else None)
     _append_dt_bytes(buf, as_of_dt)
-    if not _stream_canonical_val(buf, upd, flushed, as_of_surf_raw):
+    if as_of_surf_raw is None:
+        buf.append(0x4E)
+    elif not _stream_canonical_val(buf, upd, flushed, as_of_surf_raw):
         return False
     if not _append_dt_seq_fast(buf, upd, flushed, exp_dates):
         return False
     for meta_field in (tenors_raw, deltas_raw, fwd_obj_raw, fin_curve_raw, cal_raw):
-        if not _stream_canonical_val(buf, upd, flushed, meta_field):
+        if meta_field is None:
+            buf.append(0x4E)
+        elif not _stream_canonical_val(buf, upd, flushed, meta_field):
             return False
     if min_vol_raw is not None:
         mv_f = float(min_vol_raw)
@@ -1032,6 +1126,8 @@ def build_vol_surface_cache_key(
     as_of_dt: datetime.datetime,
     surface_id: str | None = None,
     kwargs: Mapping[str, Any] | None = None,
+    *,
+    omit_identifier: bool = False,
 ) -> ContentDigestKey | None:
     """Builds a blake2b ContentDigestKey for a volatility surface spec without full model_dump."""
     try:
@@ -1046,6 +1142,7 @@ def build_vol_surface_cache_key(
             as_of_dt,
             surface_id=surface_id,
             kwargs=kwargs,
+            omit_identifier=omit_identifier,
         )
         if not ok:
             return None
@@ -1053,15 +1150,62 @@ def build_vol_surface_cache_key(
             flushed[0] += len(buf)
             h.update(buf)
         return ContentDigestKey(
-            namespace="vol_surface",
+            namespace="vol_surface_geom" if omit_identifier else "vol_surface",
             digest_hex=h.hexdigest(),
             payload_len=flushed[0],
         )
     except (TypeError, ValueError, AttributeError, _UncacheablePayloadError):
+        if omit_identifier:
+            return None
         return digest_market_bytes(
             "vol_surface",
             (surf_spec, as_of_dt, dict(kwargs) if kwargs is not None else {"surface_id": surface_id}),
         )
+
+
+def _append_df_curve_spec_to_buf(
+    buf: bytearray,
+    upd: Callable[[Any], Any],
+    flushed: list[int],
+    c: DiscountFactorCurveSpec,
+) -> bool:
+    _append_str_val(buf, c.Identifier)
+    _append_str_val(buf, c.Currency)
+    _append_dt_bytes(buf, c.AsOfDate)
+    _append_enum_or_str_val(buf, c.InterpolationDayCountConvention)
+    _append_enum_or_str_val(buf, c.InterpolationMethod)
+    _append_enum_or_str_val(buf, c.InterpolationSpaceCoordinates)
+    _append_enum_or_str_val(buf, c.ExtrapolationMethod)
+    _append_enum_or_str_val(buf, c.RateQuoteExpression)
+    rs = c.RatesSchedule
+    if not _append_dt_seq_fast(buf, upd, flushed, rs.Dates):
+        return False
+    if not _append_float_seq_typed(buf, upd, flushed, rs.Rates):
+        return False
+    if not _append_float_seq_typed(buf, upd, flushed, rs.Spreads):
+        return False
+    return True
+
+
+def _append_repo_curve_spec_to_buf(
+    buf: bytearray,
+    upd: Callable[[Any], Any],
+    flushed: list[int],
+    c_repo: RepoSpreadCurveSpec,
+) -> bool:
+    _append_str_val(buf, c_repo.Identifier)
+    _append_enum_or_str_val(buf, c_repo.InterpolationDayCountConvention)
+    _append_enum_or_str_val(buf, c_repo.InterpolationMethod)
+    _append_enum_or_str_val(buf, c_repo.ExtrapolationMethod)
+    _append_enum_or_str_val(buf, c_repo.InterpolationSpaceCoordinates)
+    _append_enum_or_str_val(buf, c_repo.RateQuoteExpression)
+    rs_r = c_repo.RatesSchedule
+    buf.extend(_PACK_U32(0x4C, len(rs_r.Periods)))
+    for p_str in rs_r.Periods:
+        _append_str_val(buf, p_str)
+    if not _append_float_seq_typed(buf, upd, flushed, rs_r.Rates):
+        return False
+    return True
 
 
 def _append_market_dataset_to_buf(
@@ -1070,20 +1214,60 @@ def _append_market_dataset_to_buf(
     flushed: list[int],
     mkt: Any,
     as_of_dt: datetime.datetime,
+    *,
+    nonspot_upd: Callable[[Any], Any] | None = None,
+    nonspot_len: list[int] | None = None,
 ) -> bool:
     """Streams complete MarketDataSet interior state directly into `buf`."""
     _append_dt_bytes(buf, as_of_dt)
+
+    if nonspot_upd is not None:
+        if buf:
+            chunk = bytes(buf)
+            flushed[0] += len(chunk)
+            upd(chunk)
+            if nonspot_len is not None:
+                nonspot_len[0] += len(chunk)
+            nonspot_upd(chunk)
+            buf.clear()
+
+        def _upd_both(data: Any) -> Any:
+            upd(data)
+            if nonspot_len is not None:
+                nonspot_len[0] += len(data)
+            return nonspot_upd(data)
+
+        tail_upd: Callable[[Any], Any] = _upd_both
+    else:
+        tail_upd = upd
 
     spots = mkt.Spots
     if spots:
         s_keys = sorted(spots)
         buf.extend(_PACK_U32(0x4D, len(s_keys)))
+        if nonspot_upd is not None:
+            ns_buf = bytearray(_PACK_U32(0x73, len(s_keys)))
+            for k in s_keys:
+                _append_str_val(ns_buf, k)
+            if nonspot_len is not None:
+                nonspot_len[0] += len(ns_buf)
+            nonspot_upd(ns_buf)
         for k in s_keys:
             _append_str_val(buf, k)
             v = float(spots[k])
             buf.extend(_PACK_F64(0x46, 0.0 if v == 0.0 else v))
     else:
         buf.extend(_PACK_U32(0x4D, 0))
+        if nonspot_upd is not None:
+            ns_empty = _PACK_U32(0x73, 0)
+            if nonspot_len is not None:
+                nonspot_len[0] += len(ns_empty)
+            nonspot_upd(ns_empty)
+
+    if nonspot_upd is not None and buf:
+        flushed[0] += len(buf)
+        upd(buf)
+        buf.clear()
 
     corrs = mkt.Correlations
     if corrs:
@@ -1102,22 +1286,9 @@ def _append_market_dataset_to_buf(
         _append_str_val(buf, cid)
         c = bundles[cid]
         if isinstance(c, DiscountFactorCurveSpec):
-            _append_str_val(buf, c.Identifier)
-            _append_str_val(buf, c.Currency)
-            _append_dt_bytes(buf, c.AsOfDate)
-            _append_str_val(buf, c.InterpolationDayCountConvention.value)
-            _append_str_val(buf, c.InterpolationMethod.value)
-            _append_str_val(buf, c.InterpolationSpaceCoordinates.value)
-            _append_str_val(buf, c.ExtrapolationMethod.value)
-            _append_str_val(buf, c.RateQuoteExpression.value)
-            rs = c.RatesSchedule
-            if not _append_dt_seq_fast(buf, upd, flushed, rs.Dates):
+            if not _append_df_curve_spec_to_buf(buf, tail_upd, flushed, c):
                 return False
-            if not _append_float_seq_typed(buf, upd, flushed, rs.Rates):
-                return False
-            if not _append_float_seq_typed(buf, upd, flushed, rs.Spreads):
-                return False
-        elif not _stream_canonical_val(buf, upd, flushed, c):
+        elif not _stream_canonical_val(buf, tail_upd, flushed, c):
             return False
 
     repos = mkt.RepoSpreadCurves
@@ -1126,26 +1297,16 @@ def _append_market_dataset_to_buf(
         _append_str_val(buf, cid)
         c_repo = repos[cid]
         if isinstance(c_repo, RepoSpreadCurveSpec):
-            _append_str_val(buf, c_repo.Identifier)
-            _append_str_val(buf, c_repo.InterpolationDayCountConvention.value)
-            _append_str_val(buf, c_repo.InterpolationMethod.value)
-            _append_str_val(buf, c_repo.ExtrapolationMethod.value)
-            _append_str_val(buf, c_repo.InterpolationSpaceCoordinates.value)
-            _append_str_val(buf, c_repo.RateQuoteExpression.value)
-            rs_r = c_repo.RatesSchedule
-            buf.extend(_PACK_U32(0x4C, len(rs_r.Periods)))
-            for p_str in rs_r.Periods:
-                _append_str_val(buf, p_str)
-            if not _append_float_seq_typed(buf, upd, flushed, rs_r.Rates):
+            if not _append_repo_curve_spec_to_buf(buf, tail_upd, flushed, c_repo):
                 return False
-        elif not _stream_canonical_val(buf, upd, flushed, c_repo):
+        elif not _stream_canonical_val(buf, tail_upd, flushed, c_repo):
             return False
 
     surfs = mkt.VolatilitySurfaces
     buf.extend(_PACK_U32(0x56, len(surfs)))
     for sid in sorted(surfs):
         _append_str_val(buf, sid)
-        if not _append_vol_surface_to_buf(buf, upd, flushed, surfs[sid], as_of_dt, surface_id=sid):
+        if not _append_vol_surface_to_buf(buf, tail_upd, flushed, surfs[sid], as_of_dt, surface_id=sid):
             return False
 
     divs = mkt.Dividends
@@ -1187,7 +1348,7 @@ def _append_market_dataset_to_buf(
                         0.0 if amt == 0.0 else amt,
                     )
                 )
-        elif not _stream_canonical_val(buf, upd, flushed, d_sp):
+        elif not _stream_canonical_val(buf, tail_upd, flushed, d_sp):
             return False
 
     fixings = mkt.Fixings
@@ -1197,24 +1358,31 @@ def _append_market_dataset_to_buf(
         f_sp = fixings[tid]
         if isinstance(f_sp, FixingsSpec):
             _append_str_val(buf, f_sp.Identifier)
-            if not _append_dt_seq_fast(buf, upd, flushed, f_sp.Dates):
+            if not _append_dt_seq_fast(buf, tail_upd, flushed, f_sp.Dates):
                 return False
-            if not _append_float_seq_typed(buf, upd, flushed, f_sp.Values):
+            if not _append_float_seq_typed(buf, tail_upd, flushed, f_sp.Values):
                 return False
-        elif not _stream_canonical_val(buf, upd, flushed, f_sp):
+        elif not _stream_canonical_val(buf, tail_upd, flushed, f_sp):
             return False
+
+    if nonspot_upd is not None and buf:
+        tail_chunk = bytes(buf)
+        flushed[0] += len(tail_chunk)
+        tail_upd(tail_chunk)
+        buf.clear()
 
     return True
 
 
-def _stream_eq_request_live(
+def _stream_eq_request_bundle(
     req_obj: Any,
     *,
     d_max: int,
     m_max: int,
     as_of_dt: datetime.datetime,
-) -> ContentDigestKey | None:
-    """Streams live EQAutocallableTradeRequest market and contract fields via struct+blake2b."""
+    with_aux: bool = True,
+) -> tuple[ContentDigestKey, ContentDigestKey | None, str | None] | None:
+    """Streams an EQ request once, emitting full cache key plus optional non-spot and MDS digests."""
     try:
         prod = req_obj.Product
         mdl = req_obj.Model
@@ -1239,19 +1407,84 @@ def _stream_eq_request_live(
         else:
             buf.extend(_PACK_U32(0x46, 0))
 
-        if not _append_market_dataset_to_buf(buf, upd, flushed, mkt, as_of_dt):
-            return None
+        if not with_aux:
+            if not _append_market_dataset_to_buf(buf, upd, flushed, mkt, as_of_dt):
+                return None
+            if buf:
+                flushed[0] += len(buf)
+                upd(buf)
+            return (
+                ContentDigestKey(
+                    namespace="preproc_state",
+                    digest_hex=h.hexdigest(),
+                    payload_len=flushed[0],
+                ),
+                None,
+                None,
+            )
 
         if buf:
             flushed[0] += len(buf)
             upd(buf)
-        return ContentDigestKey(
-            namespace="preproc_state",
-            digest_hex=h.hexdigest(),
-            payload_len=flushed[0],
+            buf.clear()
+        h_ns = h.copy()
+        ns_len = [flushed[0]]
+        h_mds = hashlib.blake2b(digest_size=16) if isinstance(mkt, MarketDataSetSpec) else None
+
+        def _upd_full_and_mds(chunk: Any) -> None:
+            upd(chunk)
+            if h_mds is not None:
+                h_mds.update(chunk)
+
+        if not _append_market_dataset_to_buf(
+            buf,
+            _upd_full_and_mds,
+            flushed,
+            mkt,
+            as_of_dt,
+            nonspot_upd=h_ns.update,
+            nonspot_len=ns_len,
+        ):
+            return None
+        if buf:
+            chunk_rem = bytes(buf)
+            flushed[0] += len(chunk_rem)
+            _upd_full_and_mds(chunk_rem)
+            ns_len[0] += len(chunk_rem)
+            h_ns.update(chunk_rem)
+        return (
+            ContentDigestKey(
+                namespace="preproc_state",
+                digest_hex=h.hexdigest(),
+                payload_len=flushed[0],
+            ),
+            ContentDigestKey(
+                namespace="preproc_nonspot_template",
+                digest_hex=h_ns.hexdigest(),
+                payload_len=ns_len[0],
+            ),
+            h_mds.hexdigest() if h_mds is not None else None,
         )
     except (AttributeError, TypeError, ValueError, KeyError, _UncacheablePayloadError):
         return None
+
+
+def _stream_eq_request_live(
+    req_obj: Any,
+    *,
+    d_max: int,
+    m_max: int,
+    as_of_dt: datetime.datetime,
+) -> ContentDigestKey | None:
+    """Streams live EQAutocallableTradeRequest market and contract fields via struct+blake2b."""
+    res = _stream_eq_request_bundle(
+        req_obj,
+        d_max=d_max,
+        m_max=m_max,
+        as_of_dt=as_of_dt,
+        with_aux=False,
+    )
+    return res[0] if res is not None else None
 
 
 def digest_market_bytes(namespace: str, payload: Any) -> ContentDigestKey | None:
@@ -1332,10 +1565,24 @@ def _clone_dataclass_fields(obj: Any) -> Any:
 
 def compute_surface_digest(surf: RegularizedVolSurface) -> str:
     """Computes a 64-hex SHA-256 content digest for a regularized volatility surface."""
+    cached = getattr(surf, "_cached_surface_sha256", None)
+    q_arr = getattr(surf, "quotes", None)
+    if (
+        isinstance(cached, str)
+        and isinstance(q_arr, np.ndarray)
+        and not q_arr.flags.writeable
+    ):
+        return cached
     h = hashlib.sha256()
     counter = [0]
     _feed_canonical_bytes(h, _canonical_market_obj_repr(surf), counter)
-    return h.hexdigest()
+    digest = h.hexdigest()
+    if isinstance(q_arr, np.ndarray) and not q_arr.flags.writeable:
+        try:
+            object.__setattr__(surf, "_cached_surface_sha256", digest)
+        except (AttributeError, TypeError):
+            pass
+    return digest
 
 
 def _detach_for_digest(val: Any) -> Any:
@@ -1350,16 +1597,64 @@ def _detach_for_digest(val: Any) -> Any:
     return val
 
 
-def compute_preproc_state_digest(state: AutocallPreprocState) -> str:
-    """Computes an immutable 64-hex SHA-256 digest covering all market and contract state inputs."""
-    h = hashlib.sha256()
-    counter = [0]
+def _serialize_tuple_elements(
+    items: Sequence[Any],
+    *,
+    memo_market: dict[int, bytes] | None = None,
+) -> bytes:
+    buf = bytearray()
+    chunks: list[bytes] = []
+    flushed = [0]
+
+    def _collect(chunk: Any) -> None:
+        chunks.append(bytes(chunk))
+
+    for item in items:
+        if (
+            memo_market is not None
+            and isinstance(item, (ClampedYieldCurve, RepoCurve))
+        ):
+            obj_id = id(item)
+            cached_b = memo_market.get(obj_id)
+            if cached_b is None:
+                cached_b = _serialize_tuple_elements((_detach_for_digest(item),))
+                memo_market[obj_id] = cached_b
+            _append_raw_mv(buf, _collect, flushed, memoryview(cached_b))
+            continue
+        if (
+            memo_market is not None
+            and isinstance(item, dict)
+            and item
+            and all(isinstance(k, str) and isinstance(v, (ClampedYieldCurve, RepoCurve)) for k, v in item.items())
+        ):
+            buf.extend(_PACK_U32(0x4D, len(item)))
+            for k in sorted(item):
+                _append_str_val(buf, k)
+                v_obj = item[k]
+                obj_id = id(v_obj)
+                cached_b = memo_market.get(obj_id)
+                if cached_b is None:
+                    cached_b = _serialize_tuple_elements((_detach_for_digest(v_obj),))
+                    memo_market[obj_id] = cached_b
+                _append_raw_mv(buf, _collect, flushed, memoryview(cached_b))
+            continue
+        _stream_canonical_val(buf, _collect, flushed, item)
+    if buf:
+        chunks.append(bytes(buf))
+    return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+
+def _state_digest_sections(
+    state: AutocallPreprocState,
+    *,
+    keep_market_objects: bool = False,
+) -> tuple[tuple[Any, ...], Any, tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]:
     surf_digests = (
         dict(state.surface_digests)
         if state.surface_digests
         else {k: compute_surface_digest(v) for k, v in state.vol_surfaces.items()}
     )
-    payload = (
+    sec0 = (
         state.feature_schema_version,
         int(state.d_assets),
         int(state.m_rem),
@@ -1369,7 +1664,9 @@ def compute_preproc_state_digest(state: AutocallPreprocState) -> str:
         tuple(state.sorted_identifiers),
         state.lex_perm,
         state.inv_lex_perm,
-        _detach_for_digest(state.spots_t0),
+    )
+    spot0 = _detach_for_digest(state.spots_t0)
+    sec2 = (
         _detach_for_digest(state.ref_spots),
         _detach_for_digest(state.corr_matrix),
         _detach_for_digest(state.tau_obs),
@@ -1382,17 +1679,24 @@ def compute_preproc_state_digest(state: AutocallPreprocState) -> str:
         _detach_for_digest(state.cpn_barriers),
         _detach_for_digest(state.is_guaranteed_cpn),
         _detach_for_digest(state.coupon_amounts),
+    )
+    spot4 = (
         _detach_for_digest(state.forward_rel),
         _detach_for_digest(state.forward_perf),
         _detach_for_digest(state.cash_div_leverage),
         _detach_for_digest(state.iv_at_fwd),
         _detach_for_digest(state.v_perf),
+    )
+    disc_val = state.discount_curve if keep_market_objects else _detach_for_digest(state.discount_curve)
+    fin_val = state.asset_financing_curves if keep_market_objects else _detach_for_digest(state.asset_financing_curves)
+    repo_val = state.repo_curves_map if keep_market_objects else _detach_for_digest(state.repo_curves_map)
+    sec4 = (
         _detach_for_digest(state.r_native_obs),
         surf_digests,
-        _detach_for_digest(state.discount_curve),
+        disc_val,
         state.discount_curve_id,
-        _detach_for_digest(state.asset_financing_curves),
-        _detach_for_digest(state.repo_curves_map),
+        fin_val,
+        repo_val,
         _detach_for_digest(state.quanto_fx_specs),
         _detach_for_digest(state.quanto_meta),
         _detach_for_digest(state.funding_leg),
@@ -1434,8 +1738,36 @@ def compute_preproc_state_digest(state: AutocallPreprocState) -> str:
         },
         _detach_for_digest(state.dividend_schedule.dividend_amount_tensors),
     )
-    _feed_canonical_bytes(h, payload, counter)
-    return h.hexdigest()
+    return sec0, spot0, sec2, spot4, sec4
+
+
+def _compute_digest_and_slices(
+    state: AutocallPreprocState,
+) -> tuple[str, tuple[bytes, bytes, bytes]]:
+    memo_market: dict[int, bytes] = {}
+    sec0, spot0, sec2, spot4, sec4 = _state_digest_sections(state, keep_market_objects=True)
+    total_len = len(sec0) + 1 + len(sec2) + len(spot4) + len(sec4)
+    p0 = bytes(_PACK_U32(0x55, total_len)) + _serialize_tuple_elements(sec0)
+    p1 = _serialize_tuple_elements(sec2)
+    p2 = _serialize_tuple_elements(sec4, memo_market=memo_market)
+    h = hashlib.sha256()
+    h.update(p0)
+    h.update(_serialize_tuple_elements((spot0,)))
+    h.update(p1)
+    h.update(_serialize_tuple_elements(spot4))
+    h.update(p2)
+    return h.hexdigest(), (p0, p1, p2)
+
+
+def _compute_template_digest_slices(
+    state: AutocallPreprocState,
+) -> tuple[bytes, bytes, bytes]:
+    return _compute_digest_and_slices(state)[1]
+
+
+def compute_preproc_state_digest(state: AutocallPreprocState) -> str:
+    """Computes an immutable 64-hex SHA-256 digest covering all market and contract state inputs."""
+    return _compute_digest_and_slices(state)[0]
 
 
 def _clone_preproc_state(state: AutocallPreprocState) -> AutocallPreprocState:
@@ -1456,7 +1788,7 @@ def _clone_preproc_state(state: AutocallPreprocState) -> AutocallPreprocState:
             k: (list(v) if isinstance(v, list) else v)
             for k, v in state.funding_leg.items()
         }
-    return dc_replace(
+    cloned_state = dc_replace(
         state,
         node_feats=state.node_feats.clone(),
         edge_feats=state.edge_feats.clone(),
@@ -1503,24 +1835,54 @@ def _clone_preproc_state(state: AutocallPreprocState) -> AutocallPreprocState:
         quanto_fx_specs=dict(state.quanto_fx_specs),
         surface_digests=dict(state.surface_digests),
     )
+    mds_hex = getattr(state, "_mds_digest_hex", None)
+    if isinstance(mds_hex, str):
+        object.__setattr__(cloned_state, "_mds_digest_hex", mds_hex)
+    return cloned_state
+
+
+def _get_cached_repo_curve(spec: Any, as_of_dt: datetime.datetime) -> Any:
+    if spec is None or callable(getattr(spec, "repo_df", None)) or callable(getattr(spec, "df", None)):
+        return spec
+    key: ContentDigestKey | None = None
+    if isinstance(spec, RepoSpreadCurveSpec):
+        try:
+            h = hashlib.blake2b(digest_size=16)
+            buf = bytearray()
+            flushed = [0]
+            _append_dt_bytes(buf, as_of_dt)
+            if _append_repo_curve_spec_to_buf(buf, h.update, flushed, spec):
+                if buf:
+                    flushed[0] += len(buf)
+                    h.update(buf)
+                key = ContentDigestKey("repo_curve", h.hexdigest(), flushed[0])
+        except (TypeError, ValueError, AttributeError, _UncacheablePayloadError):
+            key = None
+    if key is None:
+        key = digest_market_bytes("repo_curve", (spec, as_of_dt))
+    if key is not None:
+        cached = _MARKET_OBJECT_CACHE.get(key, clone_return=False)
+        if cached is not None:
+            return cached
+    rc = RepoCurve(spec, as_of_date=as_of_dt)
+    if key is not None:
+        return _MARKET_OBJECT_CACHE.put(key, rc, clone_return=False)
+    return rc
 
 
 def _normalize_repo_curves_map(
     raw_map: Any,
     as_of_dt: Any,
 ) -> dict[str, Any]:
-    """Converts raw `RepoSpreadCurves` entries into `RepoCurve` instances for AD/QMC Greeks."""
+    """Converts raw `RepoSpreadCurves` entries into cached `RepoCurve` instances for AD/QMC Greeks."""
     if not isinstance(raw_map, Mapping) or not raw_map:
         return {}
-    eff_dt = _to_utc_datetime(as_of_dt) if as_of_dt is not None else None
+    eff_dt = _to_utc_datetime(as_of_dt) if as_of_dt is not None else datetime.datetime.now(_UTC)
     out: dict[str, Any] = {}
     for cid, spec in raw_map.items():
         if spec is None:
             continue
-        if callable(getattr(spec, "repo_df", None)) or callable(getattr(spec, "df", None)):
-            out[str(cid)] = spec
-        else:
-            out[str(cid)] = RepoCurve(spec, as_of_date=eff_dt)
+        out[str(cid)] = _get_cached_repo_curve(spec, eff_dt)
     return out
 
 
@@ -1532,7 +1894,7 @@ def _freeze_obj_tensors(obj: Any) -> None:
             if isinstance(val, torch.Tensor):
                 if val.requires_grad:
                     val.requires_grad_(False)
-            elif isinstance(val, dict):
+            elif isinstance(val, dict) and not isinstance(val, _LazySurfaceJacobianDict):
                 for inner in val.values():
                     if isinstance(inner, torch.Tensor) and inner.requires_grad:
                         inner.requires_grad_(False)
@@ -1665,7 +2027,22 @@ def _normalize_coupon_param(val: Any) -> float | list[float] | None:
 def _get_cached_yield_curve(spec: Any, as_of_dt: datetime.datetime) -> ClampedYieldCurve:
     if isinstance(spec, ClampedYieldCurve):
         return spec
-    key = digest_market_bytes("yield_curve", (spec, as_of_dt))
+    key: ContentDigestKey | None = None
+    if isinstance(spec, DiscountFactorCurveSpec):
+        try:
+            h = hashlib.blake2b(digest_size=16)
+            buf = bytearray()
+            flushed = [0]
+            _append_dt_bytes(buf, as_of_dt)
+            if _append_df_curve_spec_to_buf(buf, h.update, flushed, spec):
+                if buf:
+                    flushed[0] += len(buf)
+                    h.update(buf)
+                key = ContentDigestKey("yield_curve", h.hexdigest(), flushed[0])
+        except (TypeError, ValueError, AttributeError, _UncacheablePayloadError):
+            key = None
+    if key is None:
+        key = digest_market_bytes("yield_curve", (spec, as_of_dt))
     if key is not None:
         cached = _MARKET_OBJECT_CACHE.get(key, clone_return=False)
         if cached is not None:
@@ -1697,18 +2074,10 @@ def _infer_asset_currency_5tier(
     )
 
 
-def _get_cached_vol_surface(
+def _resolve_vol_surface_kwargs(
     surf_spec: Any,
-    as_of_dt: datetime.datetime,
     surface_id: str | None = None,
-) -> RegularizedVolSurface:
-    if (
-        isinstance(surf_spec, Mapping)
-        and surface_id is not None
-        and "Identifier" not in surf_spec
-        and "identifier" not in surf_spec
-    ):
-        surf_spec = {**surf_spec, "Identifier": str(surface_id)}
+) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"bc_type": "clamped"}
     if "smile_interp" in _VOL_SURF_SIG_PARAMS:
         s_interp = _extract_attr(surf_spec, "SmileInterpolationMethod", "smile_interpolation_method")
@@ -1722,18 +2091,71 @@ def _get_cached_vol_surface(
         eff_id = surface_id or _extract_attr(surf_spec, "Identifier", "identifier")
         if eff_id is not None:
             kwargs["surface_id"] = str(eff_id)
+    return kwargs
 
-    key = build_vol_surface_cache_key(
-        surf_spec,
-        as_of_dt,
-        surface_id=surface_id,
-        kwargs=kwargs,
+
+def _get_cached_vol_surface(
+    surf_spec: Any,
+    as_of_dt: datetime.datetime,
+    surface_id: str | None = None,
+    *,
+    _cache_key: ContentDigestKey | None = None,
+) -> RegularizedVolSurface:
+    if (
+        isinstance(surf_spec, Mapping)
+        and surface_id is not None
+        and "Identifier" not in surf_spec
+        and "identifier" not in surf_spec
+    ):
+        surf_spec = {**surf_spec, "Identifier": str(surface_id)}
+    kwargs = _resolve_vol_surface_kwargs(surf_spec, surface_id=surface_id)
+
+    key = (
+        _cache_key
+        if _cache_key is not None
+        else build_vol_surface_cache_key(
+            surf_spec,
+            as_of_dt,
+            surface_id=surface_id,
+            kwargs=kwargs,
+        )
     )
     if key is not None:
         cached = _MARKET_OBJECT_CACHE.get(key, clone_return=False)
         if cached is not None:
             return cast(RegularizedVolSurface, cached)
+    geom_kwargs = {k: v for k, v in kwargs.items() if k != "surface_id"}
+    geom_key = build_vol_surface_cache_key(
+        surf_spec,
+        as_of_dt,
+        surface_id=None,
+        kwargs=geom_kwargs,
+        omit_identifier=True,
+    )
+    if geom_key is not None:
+        cached_geom = _MARKET_OBJECT_CACHE.get(geom_key, clone_return=False)
+        if isinstance(cached_geom, RegularizedVolSurface):
+            raw_id = str(_extract_attr(surf_spec, "Identifier", "identifier", default="ASSET"))
+            if (
+                surface_id is not None
+                and str(surface_id).strip()
+                and (not raw_id or raw_id in ("ASSET", "UNKNOWN"))
+            ):
+                eff_id = str(surface_id).strip()
+            else:
+                eff_id = raw_id
+            surf_clone = copy.copy(cached_geom)
+            surf_clone.identifier = eff_id
+            surf_clone.__dict__.pop("_cached_surface_sha256", None)
+            if key is not None:
+                return cast(
+                    RegularizedVolSurface,
+                    _MARKET_OBJECT_CACHE.put(key, surf_clone, clone_return=False),
+                )
+            return surf_clone
     surf = RegularizedVolSurface(surf_spec, as_of_date=as_of_dt, **kwargs)
+    if geom_key is not None:
+        _MARKET_OBJECT_CACHE.put(geom_key, surf, clone_return=False)
     if key is not None:
         return cast(RegularizedVolSurface, _MARKET_OBJECT_CACHE.put(key, surf, clone_return=False))
     return surf
@@ -1982,6 +2404,477 @@ def _apply_cached_request_metadata(
     return state
 
 
+def _evaluate_surface_iv_and_feats(
+    sorted_ids: Sequence[str],
+    reg_surfaces: Mapping[str, RegularizedVolSurface],
+    surf_tau_obs_map: Mapping[str, npt.NDArray[np.float64]],
+    fwd_price_np: npt.NDArray[np.float64],
+    d_assets: int,
+    m_rem: int,
+    *,
+    fwd_req_grad: bool = False,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Evaluates implied vols at forwards and 7 node surface features using single-pass batched spline lookup."""
+    iv_at_fwd_np = np.zeros((d_assets, m_rem), dtype=np.float64)
+    d_iv_dk_np = np.zeros((d_assets, m_rem), dtype=np.float64)
+    node_surf_feats_np = np.zeros((d_assets, 7), dtype=np.float64)
+    if m_rem <= 0:
+        return iv_at_fwd_np, d_iv_dk_np, node_surf_feats_np
+
+    wing_mults = np.array([0.90, 1.10, 0.80, 1.20], dtype=np.float64)
+    for i, ticker in enumerate(sorted_ids):
+        surf_i = reg_surfaces[ticker]
+        tau_surf_obs = surf_tau_obs_map[ticker]
+        f_row = fwd_price_np[i, :]
+        t_short = float(tau_surf_obs[0])
+        f_short = float(f_row[0])
+        t_term = float(tau_surf_obs[-1])
+        f_term = float(f_row[-1])
+
+        if _HAS_IV_BATCH:
+            iv_batch_fn = getattr(surf_i, "iv_batch")
+            if _HAS_IV_WING_PARAM:
+                tau_all = np.empty(m_rem + 4, dtype=np.float64)
+                tau_all[:m_rem] = tau_surf_obs
+                tau_all[m_rem:] = t_term
+                k_all = np.empty(m_rem + 4, dtype=np.float64)
+                k_all[:m_rem] = f_row
+                k_all[m_rem:] = f_term * wing_mults
+                iv_all = np.asarray(iv_batch_fn(tau_all, k_all), dtype=np.float64)
+                iv_at_fwd_np[i, :] = iv_all[:m_rem]
+                node_surf_feats_np[i, :] = surf_i.extract_node_surface_features_values_only(
+                    t_short,
+                    f_short,
+                    t_term,
+                    f_term,
+                    iv_short_val=float(iv_all[0]),
+                    iv_term_val=float(iv_all[m_rem - 1]),
+                    iv_wing_vals=iv_all[m_rem:],
+                )
+            else:
+                iv_at_fwd_np[i, :] = np.asarray(
+                    iv_batch_fn(tau_surf_obs, f_row), dtype=np.float64
+                )
+                node_surf_feats_np[i, :] = surf_i.extract_node_surface_features_values_only(
+                    t_short,
+                    f_short,
+                    t_term,
+                    f_term,
+                    iv_short_val=float(iv_at_fwd_np[i, 0]),
+                    iv_term_val=float(iv_at_fwd_np[i, -1]),
+                )
+            if fwd_req_grad:
+                eps_k = np.maximum(1e-5 * f_row, 1e-6)
+                f_hi = f_row + eps_k
+                f_lo = np.maximum(f_row - eps_k, 1e-6)
+                tau_2 = np.concatenate([tau_surf_obs, tau_surf_obs])
+                k_2 = np.concatenate([f_hi, f_lo])
+                iv_2 = np.asarray(iv_batch_fn(tau_2, k_2), dtype=np.float64)
+                d_iv_dk_np[i, :] = (iv_2[:m_rem] - iv_2[m_rem:]) / (f_hi - f_lo)
+        else:
+            for m in range(m_rem):
+                t_m = float(tau_surf_obs[m])
+                f_im = float(f_row[m])
+                iv_at_fwd_np[i, m] = float(surf_i.iv(t_m, f_im))
+                if fwd_req_grad:
+                    eps_k_s = max(1e-5 * f_im, 1e-6)
+                    f_hi_s = f_im + eps_k_s
+                    f_lo_s = max(f_im - eps_k_s, 1e-6)
+                    iv_hi_s = float(surf_i.iv(t_m, f_hi_s))
+                    iv_lo_s = float(surf_i.iv(t_m, f_lo_s))
+                    d_iv_dk_np[i, m] = (iv_hi_s - iv_lo_s) / (f_hi_s - f_lo_s)
+            node_surf_feats_np[i, :] = surf_i.extract_node_surface_features_values_only(
+                t_short,
+                f_short,
+                t_term,
+                f_term,
+                iv_short_val=float(iv_at_fwd_np[i, 0]),
+                iv_term_val=float(iv_at_fwd_np[i, -1]),
+            )
+    return iv_at_fwd_np, d_iv_dk_np, node_surf_feats_np
+
+
+def _make_lazy_surface_jacobian_dicts(
+    reg_surfaces: dict[str, RegularizedVolSurface],
+    id_to_idx: dict[str, int],
+    surf_tau_obs_map: dict[str, npt.NDArray[np.float64]],
+    fwd_price_np: npt.NDArray[np.float64],
+    m_rem: int,
+) -> tuple[dict[str, npt.NDArray[np.float64]], dict[str, npt.NDArray[np.float64]]]:
+    def _build_surf_feat_jac(ticker: str) -> npt.NDArray[np.float64]:
+        if ticker not in reg_surfaces or m_rem == 0:
+            return np.zeros((7, 1, 1), dtype=np.float64)
+        surf_i = reg_surfaces[ticker]
+        idx = id_to_idx[ticker]
+        tau_s = surf_tau_obs_map[ticker]
+        _, jac_7d = surf_i.extract_node_surface_features(
+            float(tau_s[0]),
+            float(fwd_price_np[idx, 0]),
+            float(tau_s[-1]),
+            float(fwd_price_np[idx, -1]),
+        )
+        return jac_7d
+
+    def _build_iv_fwd_jac(ticker: str) -> npt.NDArray[np.float64]:
+        if ticker not in reg_surfaces or m_rem == 0:
+            return np.zeros((0, 1, 1), dtype=np.float64)
+        surf_i = reg_surfaces[ticker]
+        idx = id_to_idx[ticker]
+        tau_s = surf_tau_obs_map[ticker]
+        return np.stack(
+            [
+                surf_i.iv_and_d_iv_d_quotes(float(tau_s[m]), float(fwd_price_np[idx, m]))[1]
+                for m in range(m_rem)
+            ],
+            axis=0,
+        )
+
+    jac_keys = list(reg_surfaces.keys())
+    return (
+        _LazySurfaceJacobianDict(_build_surf_feat_jac, jac_keys),
+        _LazySurfaceJacobianDict(_build_iv_fwd_jac, jac_keys),
+    )
+
+
+@dataclass
+class _PreprocSpotInvariantTemplate:
+    """Spot-invariant preprocessed market, schedule, and SHA-256 slice template."""
+
+    base_state: AutocallPreprocState
+    id_to_idx: dict[str, int]
+    surf_tau_obs_map: dict[str, npt.NDArray[np.float64]]
+    sqrt_surf_tau_obs_t: torch.Tensor
+    tau_term: torch.Tensor
+    div_pv: torch.Tensor
+    growth_factor: torch.Tensor
+    has_quanto: bool
+    proxy_static_inputs: dict[str, Any]
+    digest_slices: tuple[bytes, bytes, bytes] | None
+    dividends_map: Any
+    predef_divs_map: Any
+    vol_surfaces_map: Any
+    correlations_map: Any
+    ref_spots_np: npt.NDArray[np.float64]
+    div_pv_np: npt.NDArray[np.float64]
+    growth_factor_np: npt.NDArray[np.float64]
+    sqrt_surf_tau_obs_np: npt.NDArray[np.float64]
+    corr_np: npt.NDArray[np.float64]
+    tau_term_val: float
+    base_node_feats_np: npt.NDArray[np.float64]
+    base_edge_feats_np: npt.NDArray[np.float64]
+    base_sched_feats_np: npt.NDArray[np.float64]
+    base_global_feats_np: npt.NDArray[np.float64]
+
+
+_NC_LOG_MONEYNESS = int(AutocallNodeCol.LOG_MONEYNESS)
+_NC_LOG_FWD_CARRY_1Y = int(AutocallNodeCol.LOG_FWD_CARRY_1Y)
+_NC_CASH_DIV_LEVERAGE = int(AutocallNodeCol.CASH_DIV_LEVERAGE)
+_NC_IV_SHORT_ATM = int(AutocallNodeCol.IV_SHORT_ATM)
+_NC_IV_TERM_ATM = int(AutocallNodeCol.IV_TERM_ATM)
+_NC_IV_TERM_SLOPE = int(AutocallNodeCol.IV_TERM_SLOPE)
+_NC_SSVI_SKEW_RHO = int(AutocallNodeCol.SSVI_SKEW_RHO)
+_NC_SSVI_CURV_ETA = int(AutocallNodeCol.SSVI_CURV_ETA)
+_NC_SMILE_RESIDUAL_PC1 = int(AutocallNodeCol.SMILE_RESIDUAL_PC1)
+_NC_SMILE_RESIDUAL_PC2 = int(AutocallNodeCol.SMILE_RESIDUAL_PC2)
+_NC_DIST_TO_PUT_STRIKE = int(AutocallNodeCol.DIST_TO_PUT_STRIKE)
+_NC_PROXY_DELTA_WEIGHT = int(AutocallNodeCol.PROXY_DELTA_WEIGHT)
+_EC_COVARIANCE_TERM = int(AutocallEdgeCol.COVARIANCE_TERM)
+_EC_LOG_PERF_DIFF = int(AutocallEdgeCol.LOG_PERF_DIFF)
+_SC_STULZ_FWD_W = int(AutocallSchedCol.STULZ_FWD_W)
+_SC_STULZ_VOL_W = int(AutocallSchedCol.STULZ_VOL_W)
+_SC_PROXY_KO_PROB = int(AutocallSchedCol.PROXY_KO_PROB)
+_SC_PROXY_CPN_PROB = int(AutocallSchedCol.PROXY_CPN_PROB)
+_GC_L_PUT_PROXY = int(AutocallGlobalCol.L_PUT_PROXY)
+
+
+def _apply_spot_invariant_template(
+    tmpl: _PreprocSpotInvariantTemplate,
+    spots_map: Any,
+    *,
+    queries: list[str],
+    trade_info: Any,
+    fast_shallow_cache: bool,
+    full_key: ContentDigestKey | None,
+    raw_key: ContentDigestKey | None,
+    mds_digest_hex: str | None,
+) -> AutocallPreprocState:
+    """Recomputes exact spot-dependent forwards, smile vols, features, and digest from a cached template."""
+    if not isinstance(spots_map, Mapping):
+        raise ValueError("Missing MarketDataSet.Spots mapping.")
+    base_state = tmpl.base_state
+    sorted_ids = base_state.sorted_identifiers
+    d_assets = int(base_state.d_assets)
+    m_rem = int(base_state.m_rem)
+    device = base_state.spots_t0.device
+
+    spots_list: list[float] = []
+    for ticker in sorted_ids:
+        if ticker not in spots_map:
+            raise ValueError(f"Missing spot for underlying {ticker!r} in spots_t0.")
+        s_val = float(spots_map[ticker])
+        if not math.isfinite(s_val):
+            raise ValueError(f"Non-finite spot {spots_map[ticker]!r} for underlying {ticker!r}.")
+        if s_val <= 0.0:
+            raise ValueError("Spots must be strictly positive and finite.")
+        spots_list.append(s_val)
+
+    use_fast_cpu_np = (not tmpl.has_quanto) and device.type == "cpu"
+    if use_fast_cpu_np:
+        spots_np = np.array(spots_list, dtype=np.float64)
+        moneyness_np = spots_np / np.maximum(tmpl.ref_spots_np, 1e-12)
+        spots_t = torch.from_numpy(spots_np)
+        moneyness_t0 = torch.from_numpy(moneyness_np)
+
+        spots_col_np = spots_np[:, None]
+        high_div_warn = bool(np.any(tmpl.div_pv_np >= 0.80 * spots_col_np))
+        floor_spot_np = 0.01 * spots_col_np
+        scale_sp_np = np.maximum(floor_spot_np, 1e-12)
+        z_np = (spots_col_np - tmpl.div_pv_np - floor_spot_np) / scale_sp_np
+        sp_np = np.where(z_np > 40.0, z_np, np.log1p(np.exp(np.minimum(z_np, 40.0))))
+        escrowed_spot_np = floor_spot_np + scale_sp_np * sp_np
+        fwd_price_np = escrowed_spot_np * tmpl.growth_factor_np
+        forward_rel_np = fwd_price_np / spots_col_np
+        forward_perf_np = fwd_price_np / tmpl.ref_spots_np[:, None]
+        cash_div_leverage_np = spots_col_np / escrowed_spot_np
+        escrowed_div_fraction_np = tmpl.div_pv_np / spots_col_np
+
+        div_out = copy.copy(base_state.dividend_schedule)
+        div_out.escrowed_spot = torch.from_numpy(escrowed_spot_np)
+        div_out.forward_price = torch.from_numpy(fwd_price_np)
+        div_out.forward_rel = torch.from_numpy(forward_rel_np)
+        div_out.forward_perf = torch.from_numpy(forward_perf_np)
+        div_out.cash_div_leverage = torch.from_numpy(cash_div_leverage_np)
+        div_out.escrowed_div_fraction = torch.from_numpy(escrowed_div_fraction_np)
+        div_out.high_dividend_warning = high_div_warn
+    else:
+        spots_t = torch.tensor(spots_list, dtype=torch.float64, device=device)
+        ref_spots_t = base_state.ref_spots
+        moneyness_t0 = spots_t / ref_spots_t.clamp(min=1e-12)
+        if not tmpl.has_quanto:
+            spots_col = spots_t.unsqueeze(1)
+            high_div_warn = bool(torch.any(tmpl.div_pv >= 0.80 * spots_col).item())
+            floor_spot = 0.01 * spots_col
+            scale_sp = (0.01 * spots_col).clamp(min=1e-12)
+            escrowed_spot = floor_spot + scale_sp * F.softplus(
+                (spots_col - tmpl.div_pv - floor_spot) / scale_sp, beta=1.0, threshold=40.0
+            )
+            forward_price = escrowed_spot * tmpl.growth_factor
+            forward_rel = forward_price / spots_col
+            forward_perf = forward_price / ref_spots_t.unsqueeze(1)
+            cash_div_leverage = spots_col / escrowed_spot
+            escrowed_div_fraction = tmpl.div_pv / spots_col
+
+            div_out = copy.copy(base_state.dividend_schedule)
+            div_out.escrowed_spot = escrowed_spot
+            div_out.forward_price = forward_price
+            div_out.forward_rel = forward_rel
+            div_out.forward_perf = forward_perf
+            div_out.cash_div_leverage = cash_div_leverage
+            div_out.escrowed_div_fraction = escrowed_div_fraction
+            div_out.high_dividend_warning = high_div_warn
+        else:
+            div_out = compute_escrowed_dividend_forwards(
+                identifiers=sorted_ids,
+                as_of_date=base_state.seasoned_state.as_of_date,
+                observation_dates=base_state.seasoned_state.future_obs_dates,
+                spots_t0=spots_t,
+                ref_spots=ref_spots_t,
+                discount_curve=base_state.discount_curve,
+                asset_financing_curves=base_state.asset_financing_curves,
+                repo_curves=base_state.repo_curves_map,
+                market_dividends=tmpl.dividends_map,
+                predefined_dividends=tmpl.predef_divs_map,
+                payment_currency=base_state.payment_currency,
+                vol_surfaces=tmpl.vol_surfaces_map,
+                correlations=tmpl.correlations_map,
+            )
+        fwd_price_np = div_out.forward_price.detach().cpu().numpy().astype(np.float64, copy=False)
+
+    iv_at_fwd_np, _, node_surf_feats_np = _evaluate_surface_iv_and_feats(
+        sorted_ids,
+        base_state.vol_surfaces,
+        tmpl.surf_tau_obs_map,
+        fwd_price_np,
+        d_assets,
+        m_rem,
+        fwd_req_grad=False,
+    )
+    if use_fast_cpu_np:
+        v_perf_np = iv_at_fwd_np * tmpl.sqrt_surf_tau_obs_np
+        iv_at_fwd_t = torch.from_numpy(iv_at_fwd_np)
+        v_perf_t = torch.from_numpy(v_perf_np)
+    else:
+        iv_at_fwd_t = torch.as_tensor(iv_at_fwd_np, dtype=torch.float64, device=device)
+        v_perf_t = iv_at_fwd_t * tmpl.sqrt_surf_tau_obs_t
+
+    proxy_inputs = dict(tmpl.proxy_static_inputs)
+    proxy_inputs["forward_perf"] = div_out.forward_perf
+    proxy_inputs["v_perf"] = v_perf_t
+    baseline_kwargs: dict[str, Any] = {}
+    if "use_fast_cpu" in _BASELINE_SIG_PARAMS:
+        baseline_kwargs["use_fast_cpu"] = None
+    baseline = compute_analytical_autocall_baseline(proxy_inputs, **baseline_kwargs)
+
+    cloned = copy.copy(base_state)
+    seasoned_copy = copy.copy(base_state.seasoned_state)
+    seasoned_copy.spots_t0 = spots_t
+    seasoned_copy.moneyness_t0 = moneyness_t0
+    cloned.seasoned_state = seasoned_copy
+    cloned.spots_t0 = spots_t
+    cloned.moneyness_t0 = moneyness_t0
+    cloned.forward_rel = div_out.forward_rel
+    cloned.forward_perf = div_out.forward_perf
+    cloned.cash_div_leverage = div_out.cash_div_leverage
+    cloned.iv_at_fwd = iv_at_fwd_t
+    cloned.v_perf = v_perf_t
+    cloned.dividend_schedule = div_out
+    cloned.baseline = baseline
+
+    surf_feat_jacs, iv_fwd_jacs = _make_lazy_surface_jacobian_dicts(
+        base_state.vol_surfaces,
+        tmpl.id_to_idx,
+        tmpl.surf_tau_obs_map,
+        fwd_price_np,
+        m_rem,
+    )
+    cloned.surface_feature_jacobians = surf_feat_jacs
+    cloned.iv_at_fwd_jacobians = iv_fwd_jacs
+
+    if use_fast_cpu_np:
+        nf_np = tmpl.base_node_feats_np.copy()
+        nf_view = nf_np[0, :d_assets]
+        f_p_term_np = np.maximum(forward_perf_np[:, -1], 1e-12)
+        v_term_np = v_perf_np[:, -1]
+        v_term_clamped = np.maximum(v_term_np, 1e-6)
+        k_eff = max(float(base_state.strike), 1e-4)
+        nf_view[:, _NC_LOG_MONEYNESS] = np.log(np.maximum(moneyness_np, 1e-12))
+        nf_view[:, _NC_LOG_FWD_CARRY_1Y] = (
+            np.log(np.maximum(forward_rel_np[:, -1], 1e-12)) / tmpl.tau_term_val
+        )
+        nf_view[:, _NC_CASH_DIV_LEVERAGE] = np.log(np.maximum(cash_div_leverage_np[:, -1], 1.0))
+        nf_view[:, _NC_IV_SHORT_ATM] = node_surf_feats_np[:, 0]
+        nf_view[:, _NC_IV_TERM_ATM] = node_surf_feats_np[:, 1]
+        nf_view[:, _NC_IV_TERM_SLOPE] = node_surf_feats_np[:, 2]
+        nf_view[:, _NC_SSVI_SKEW_RHO] = node_surf_feats_np[:, 3]
+        nf_view[:, _NC_SSVI_CURV_ETA] = node_surf_feats_np[:, 4]
+        nf_view[:, _NC_SMILE_RESIDUAL_PC1] = node_surf_feats_np[:, 5]
+        nf_view[:, _NC_SMILE_RESIDUAL_PC2] = node_surf_feats_np[:, 6]
+        nf_view[:, _NC_DIST_TO_PUT_STRIKE] = np.log(f_p_term_np / k_eff) / v_term_clamped
+        nf_view[:, _NC_PROXY_DELTA_WEIGHT] = baseline.proxy_delta_weights.detach().numpy()
+
+        ef_np = tmpl.base_edge_feats_np.copy()
+        ef_view = ef_np[0, :d_assets, :d_assets]
+        log_fp_term_np = np.log(f_p_term_np)
+        ef_view[:, :, _EC_COVARIANCE_TERM] = tmpl.corr_np * v_term_np[:, None] * v_term_np[None, :]
+        ef_view[:, :, _EC_LOG_PERF_DIFF] = np.abs(log_fp_term_np[:, None] - log_fp_term_np[None, :])
+
+        sf_np = tmpl.base_sched_feats_np.copy()
+        sf_view = sf_np[0, :m_rem]
+        sf_view[:, _SC_STULZ_FWD_W] = np.log(np.maximum(baseline.f_w.detach().numpy(), 1e-12))
+        sf_view[:, _SC_STULZ_VOL_W] = baseline.v_w.detach().numpy()
+        sf_view[:, _SC_PROXY_KO_PROB] = baseline.p_proxy.detach().numpy()
+        sf_view[:, _SC_PROXY_CPN_PROB] = baseline.q_proxy.detach().numpy()
+
+        gf_np = tmpl.base_global_feats_np.copy()
+        gf_np[0, _GC_L_PUT_PROXY] = float(baseline.l_put_proxy)
+
+        cloned.node_feats = torch.from_numpy(nf_np)
+        cloned.edge_feats = torch.from_numpy(ef_np)
+        cloned.sched_feats = torch.from_numpy(sf_np)
+        cloned.global_feats = torch.from_numpy(gf_np)
+    else:
+        cloned.node_feats = base_state.node_feats.clone()
+        cloned.edge_feats = base_state.edge_feats.clone()
+        cloned.sched_feats = base_state.sched_feats.clone()
+        cloned.global_feats = base_state.global_feats.clone()
+
+        surf_feats_t = torch.as_tensor(node_surf_feats_np, dtype=torch.float64, device=device)
+        log_m0 = torch.log(moneyness_t0.clamp(min=1e-12))
+        log_fwd_carry_1y = torch.log(div_out.forward_rel[:, -1].clamp(min=1e-12)) / tmpl.tau_term
+        log_div_lev = torch.log(div_out.cash_div_leverage[:, -1].clamp(min=1.0))
+        f_p_term = div_out.forward_perf[:, -1].clamp(min=1e-12)
+        v_term = v_perf_t[:, -1].clamp(min=1e-6)
+        k_eff = max(float(base_state.strike), 1e-4)
+        dist_to_put = torch.log(f_p_term / k_eff) / v_term
+
+        nf = cloned.node_feats
+        nf[0, :d_assets, _NC_LOG_MONEYNESS] = log_m0
+        nf[0, :d_assets, _NC_LOG_FWD_CARRY_1Y] = log_fwd_carry_1y
+        nf[0, :d_assets, _NC_CASH_DIV_LEVERAGE] = log_div_lev
+        nf[0, :d_assets, _NC_IV_SHORT_ATM] = surf_feats_t[:, 0]
+        nf[0, :d_assets, _NC_IV_TERM_ATM] = surf_feats_t[:, 1]
+        nf[0, :d_assets, _NC_IV_TERM_SLOPE] = surf_feats_t[:, 2]
+        nf[0, :d_assets, _NC_SSVI_SKEW_RHO] = surf_feats_t[:, 3]
+        nf[0, :d_assets, _NC_SSVI_CURV_ETA] = surf_feats_t[:, 4]
+        nf[0, :d_assets, _NC_SMILE_RESIDUAL_PC1] = surf_feats_t[:, 5]
+        nf[0, :d_assets, _NC_SMILE_RESIDUAL_PC2] = surf_feats_t[:, 6]
+        nf[0, :d_assets, _NC_DIST_TO_PUT_STRIKE] = dist_to_put
+        nf[0, :d_assets, _NC_PROXY_DELTA_WEIGHT] = baseline.proxy_delta_weights
+
+        v_term_vec = v_perf_t[:, -1]
+        log_fp_term = torch.log(f_p_term)
+        ef = cloned.edge_feats
+        ef[0, :d_assets, :d_assets, _EC_COVARIANCE_TERM] = (
+            base_state.corr_matrix * v_term_vec.unsqueeze(1) * v_term_vec.unsqueeze(0)
+        )
+        ef[0, :d_assets, :d_assets, _EC_LOG_PERF_DIFF] = torch.abs(
+            log_fp_term.unsqueeze(1) - log_fp_term.unsqueeze(0)
+        )
+
+        sf = cloned.sched_feats
+        sf[0, :m_rem, _SC_STULZ_FWD_W] = torch.log(baseline.f_w.clamp(min=1e-12))
+        sf[0, :m_rem, _SC_STULZ_VOL_W] = baseline.v_w
+        sf[0, :m_rem, _SC_PROXY_KO_PROB] = baseline.p_proxy
+        sf[0, :m_rem, _SC_PROXY_CPN_PROB] = baseline.q_proxy
+
+        cloned.global_feats[0, _GC_L_PUT_PROXY] = baseline.l_put_proxy
+
+    if tmpl.digest_slices is not None and not tmpl.has_quanto:
+        p0, p1, p2 = tmpl.digest_slices
+        h = hashlib.sha256()
+        h.update(p0)
+        if use_fast_cpu_np:
+            _update_sha256_f64_ndarray(h, spots_np)
+            h.update(p1)
+            _update_sha256_f64_ndarray(h, forward_rel_np)
+            _update_sha256_f64_ndarray(h, forward_perf_np)
+            _update_sha256_f64_ndarray(h, cash_div_leverage_np)
+            _update_sha256_f64_ndarray(h, iv_at_fwd_np)
+            _update_sha256_f64_ndarray(h, v_perf_np)
+        else:
+            h.update(_serialize_tuple_elements((_detach_for_digest(spots_t),)))
+            h.update(p1)
+            h.update(
+                _serialize_tuple_elements(
+                    (
+                        _detach_for_digest(cloned.forward_rel),
+                        _detach_for_digest(cloned.forward_perf),
+                        _detach_for_digest(cloned.cash_div_leverage),
+                        _detach_for_digest(cloned.iv_at_fwd),
+                        _detach_for_digest(cloned.v_perf),
+                    )
+                )
+            )
+        h.update(p2)
+        cloned.state_digest = h.hexdigest()
+    else:
+        cloned.state_digest = compute_preproc_state_digest(cloned)
+
+    if mds_digest_hex is not None:
+        object.__setattr__(cloned, "_mds_digest_hex", mds_digest_hex)
+    else:
+        cloned.__dict__.pop("_mds_digest_hex", None)
+
+    _freeze_preproc_state_tensors(cloned)
+    if full_key is not None:
+        _PREPROC_STATE_CACHE.put(full_key, cloned, clone_return=False)
+    if raw_key is not None:
+        _PREPROC_STATE_CACHE.put(raw_key, cloned, clone_return=False)
+
+    out = _shallow_clone_preproc_state(cloned) if fast_shallow_cache else _clone_preproc_state(cloned)
+    return _apply_cached_request_metadata(out, queries, trade_info)
+
+
 def _lookup_preproc_cache(
     cache_key: ContentDigestKey,
     *,
@@ -2047,6 +2940,9 @@ def preprocess_eq_autocall(
     as_of_dt = _to_utc_datetime(as_of_raw)
 
     cache_key: ContentDigestKey | None = None
+    non_spot_key: ContentDigestKey | None = None
+    raw_key: ContentDigestKey | None = None
+    mds_digest_hex: str | None = None
     can_cache = (
         spots_override is None
         and corr_override is None
@@ -2055,6 +2951,7 @@ def preprocess_eq_autocall(
         and as_of_date_override is None
     )
     if can_cache and model is not None and isinstance(req_obj, BaseModel):
+        use_raw_hex = False
         if _fast_shallow_cache:
             req_d = getattr(req_obj, "__dict__", None)
             raw_hex = req_d.get("_raw_payload_digest_hex") if isinstance(req_d, dict) else None
@@ -2066,6 +2963,7 @@ def preprocess_eq_autocall(
                 and (len(raw_hex) & 1) == 0
                 and _RAW_HEX_RE.match(raw_hex) is not None
             ):
+                use_raw_hex = True
                 raw_key = ContentDigestKey(
                     namespace="preproc_state_raw",
                     digest_hex=f"{raw_hex}:{int(d_max)}:{int(m_max)}:{FEATURE_SCHEMA_VERSION}",
@@ -2079,38 +2977,43 @@ def preprocess_eq_autocall(
                 )
                 if cached_hit is not None:
                     return cached_hit
-                live_key = _stream_eq_request_live(
-                    req_obj,
-                    d_max=int(d_max),
-                    m_max=int(m_max),
-                    as_of_dt=as_of_dt,
-                )
-                if live_key is not None:
-                    live_raw = _PREPROC_STATE_CACHE.get(live_key, clone_return=False)
-                    if live_raw is not None:
-                        _PREPROC_STATE_CACHE.put(raw_key, live_raw, clone_return=False)
-                        return _apply_cached_request_metadata(
-                            _shallow_clone_preproc_state(cast(AutocallPreprocState, live_raw)),
-                            queries,
-                            trade_info,
-                        )
-                cache_key = raw_key
-        if cache_key is None:
-            cache_key = _stream_eq_request_live(
-                req_obj,
-                d_max=int(d_max),
-                m_max=int(m_max),
-                as_of_dt=as_of_dt,
+
+        bundle = _stream_eq_request_bundle(
+            req_obj,
+            d_max=int(d_max),
+            m_max=int(m_max),
+            as_of_dt=as_of_dt,
+            with_aux=True,
+        )
+        if bundle is not None:
+            cache_key, non_spot_key, mds_digest_hex = bundle
+            cached_hit = _lookup_preproc_cache(
+                cache_key,
+                fast_shallow_cache=_fast_shallow_cache,
+                queries=queries,
+                trade_info=trade_info,
             )
-            if cache_key is not None:
-                cached_hit = _lookup_preproc_cache(
-                    cache_key,
-                    fast_shallow_cache=_fast_shallow_cache,
-                    queries=queries,
-                    trade_info=trade_info,
-                )
-                if cached_hit is not None:
-                    return cached_hit
+            if cached_hit is not None:
+                if raw_key is not None:
+                    cached_raw_src = _PREPROC_STATE_CACHE.get(cache_key, clone_return=False)
+                    if cached_raw_src is not None:
+                        _PREPROC_STATE_CACHE.put(raw_key, cached_raw_src, clone_return=False)
+                return cached_hit
+            if non_spot_key is not None:
+                tmpl_obj = _PREPROC_STATE_CACHE.get(non_spot_key, clone_return=False)
+                if isinstance(tmpl_obj, _PreprocSpotInvariantTemplate):
+                    return _apply_spot_invariant_template(
+                        tmpl_obj,
+                        _extract_attr(mkt, "Spots", "spots"),
+                        queries=queries,
+                        trade_info=trade_info,
+                        fast_shallow_cache=_fast_shallow_cache,
+                        full_key=cache_key,
+                        raw_key=raw_key,
+                        mds_digest_hex=mds_digest_hex,
+                    )
+        elif use_raw_hex and raw_key is not None:
+            cache_key = raw_key
 
     raw_start = _extract_attr(product, "StartDate", "start_date")
     if raw_start is None:
@@ -2559,6 +3462,7 @@ def preprocess_eq_autocall(
     device = seasoned.spots_t0.device
 
     # 2. Escrowed/Affine Cash Dividend Forward & Quanto Engine
+    norm_repo_curves_map = _normalize_repo_curves_map(repo_curves_map, as_of_dt)
     div_out = compute_escrowed_dividend_forwards(
         identifiers=sorted_ids,
         as_of_date=as_of_dt,
@@ -2567,7 +3471,7 @@ def preprocess_eq_autocall(
         ref_spots=seasoned.ref_spots,
         discount_curve=disc_curve_obj,
         asset_financing_curves=asset_fin_curves,
-        repo_curves=repo_curves_map,
+        repo_curves=norm_repo_curves_map,
         market_dividends=dividends_map,
         predefined_dividends=predef_divs_map,
         dividend_amount_overrides=dividend_amount_overrides,
@@ -2579,9 +3483,6 @@ def preprocess_eq_autocall(
     # 3. Regularized Volatility Surfaces & Schedule Implied Volatilities
     reg_surfaces: dict[str, RegularizedVolSurface] = {}
     surface_digests: dict[str, str] = {}
-    iv_at_fwd_np = np.zeros((d_assets, m_rem), dtype=np.float64)
-    d_iv_dk_np = np.zeros((d_assets, m_rem), dtype=np.float64)
-    node_surf_feats_np = np.zeros((d_assets, 7), dtype=np.float64)
     surf_tau_obs_map: dict[str, npt.NDArray[np.float64]] = {}
     surf_tau_obs_np = np.zeros((d_assets, m_rem), dtype=np.float64)
     fwd_price_np = div_out.forward_price.detach().cpu().numpy().astype(np.float64)
@@ -2615,81 +3516,27 @@ def preprocess_eq_autocall(
             surf_tau_obs_map[ticker] = tau_surf_obs
             surf_tau_obs_np[i, :] = tau_surf_obs
 
-            f_row = fwd_price_np[i, :]
-            if _HAS_IV_BATCH:
-                iv_batch_fn = getattr(surf_i, "iv_batch")
-                iv_at_fwd_np[i, :] = np.asarray(
-                    iv_batch_fn(tau_surf_obs, f_row), dtype=np.float64
-                )
-                if fwd_req_grad:
-                    eps_k = np.maximum(1e-5 * f_row, 1e-6)
-                    f_hi = f_row + eps_k
-                    f_lo = np.maximum(f_row - eps_k, 1e-6)
-                    iv_hi = np.asarray(iv_batch_fn(tau_surf_obs, f_hi), dtype=np.float64)
-                    iv_lo = np.asarray(iv_batch_fn(tau_surf_obs, f_lo), dtype=np.float64)
-                    d_iv_dk_np[i, :] = (iv_hi - iv_lo) / (f_hi - f_lo)
-            else:
-                for m in range(m_rem):
-                    t_m = float(tau_surf_obs[m])
-                    f_im = float(f_row[m])
-                    iv_at_fwd_np[i, m] = float(surf_i.iv(t_m, f_im))
-                    if fwd_req_grad:
-                        eps_k_s = max(1e-5 * f_im, 1e-6)
-                        f_hi_s = f_im + eps_k_s
-                        f_lo_s = max(f_im - eps_k_s, 1e-6)
-                        iv_hi_s = float(surf_i.iv(t_m, f_hi_s))
-                        iv_lo_s = float(surf_i.iv(t_m, f_lo_s))
-                        d_iv_dk_np[i, m] = (iv_hi_s - iv_lo_s) / (f_hi_s - f_lo_s)
-
-            t_short = float(tau_surf_obs[0])
-            f_short = float(f_row[0])
-            t_term = float(tau_surf_obs[-1])
-            f_term = float(f_row[-1])
-            node_surf_feats_np[i, :] = surf_i.extract_node_surface_features_values_only(
-                t_short,
-                f_short,
-                t_term,
-                f_term,
-                iv_short_val=float(iv_at_fwd_np[i, 0]),
-                iv_term_val=float(iv_at_fwd_np[i, -1]),
-            )
+        iv_at_fwd_np, d_iv_dk_np, node_surf_feats_np = _evaluate_surface_iv_and_feats(
+            sorted_ids,
+            reg_surfaces,
+            surf_tau_obs_map,
+            fwd_price_np,
+            d_assets,
+            m_rem,
+            fwd_req_grad=fwd_req_grad,
+        )
+    else:
+        iv_at_fwd_np = np.zeros((d_assets, m_rem), dtype=np.float64)
+        d_iv_dk_np = np.zeros((d_assets, m_rem), dtype=np.float64)
+        node_surf_feats_np = np.zeros((d_assets, 7), dtype=np.float64)
 
     id_to_idx = {ticker: idx for idx, ticker in enumerate(sorted_ids)}
-
-    def _build_surf_feat_jac(ticker: str) -> npt.NDArray[np.float64]:
-        if ticker not in reg_surfaces or m_rem == 0:
-            return np.zeros((7, 1, 1), dtype=np.float64)
-        surf_i = reg_surfaces[ticker]
-        idx = id_to_idx[ticker]
-        tau_s = surf_tau_obs_map[ticker]
-        _, jac_7d = surf_i.extract_node_surface_features(
-            float(tau_s[0]),
-            float(fwd_price_np[idx, 0]),
-            float(tau_s[-1]),
-            float(fwd_price_np[idx, -1]),
-        )
-        return jac_7d
-
-    def _build_iv_fwd_jac(ticker: str) -> npt.NDArray[np.float64]:
-        if ticker not in reg_surfaces or m_rem == 0:
-            return np.zeros((0, 1, 1), dtype=np.float64)
-        surf_i = reg_surfaces[ticker]
-        idx = id_to_idx[ticker]
-        tau_s = surf_tau_obs_map[ticker]
-        return np.stack(
-            [
-                surf_i.iv_and_d_iv_d_quotes(float(tau_s[m]), float(fwd_price_np[idx, m]))[1]
-                for m in range(m_rem)
-            ],
-            axis=0,
-        )
-
-    jac_keys = list(reg_surfaces.keys())
-    surf_feat_jacs: dict[str, npt.NDArray[np.float64]] = _LazySurfaceJacobianDict(
-        _build_surf_feat_jac, jac_keys
-    )
-    iv_fwd_jacs: dict[str, npt.NDArray[np.float64]] = _LazySurfaceJacobianDict(
-        _build_iv_fwd_jac, jac_keys
+    surf_feat_jacs, iv_fwd_jacs = _make_lazy_surface_jacobian_dicts(
+        reg_surfaces,
+        id_to_idx,
+        surf_tau_obs_map,
+        fwd_price_np,
+        m_rem,
     )
 
     iv_at_fwd_t = torch.as_tensor(iv_at_fwd_np, dtype=torch.float64, device=device)
@@ -2709,19 +3556,24 @@ def preprocess_eq_autocall(
     if all_use_disc_curve:
         df_obs_t = div_out.df_fin_obs[0]
     else:
-        df_obs_np = np.array([df_fin_fn(d) for d in seasoned.future_obs_dates], dtype=np.float64)
+        df_obs_np = _batch_eval_curve_dfs(
+            disc_curve_obj, df_fin_fn, as_of_dt, seasoned.future_obs_dates
+        )
         df_obs_t = torch.as_tensor(df_obs_np, dtype=torch.float64, device=device)
 
     if df_pay_override is not None:
         df_pay_t = df_pay_override.to(dtype=torch.float64, device=device)
     elif m_rem > 0:
-        df_pay_np = np.array([df_fin_fn(d) for d in seasoned.future_pay_dates], dtype=np.float64)
+        df_pay_np = _batch_eval_curve_dfs(
+            disc_curve_obj, df_fin_fn, as_of_dt, seasoned.future_pay_dates
+        )
         df_pay_t = torch.as_tensor(df_pay_np, dtype=torch.float64, device=device)
     else:
         df_pay_t = torch.empty(0, dtype=torch.float64, device=device)
 
     surf_tau_obs_t = torch.as_tensor(surf_tau_obs_np, dtype=torch.float64, device=device)
-    v_perf_t = iv_at_fwd_t * torch.sqrt(surf_tau_obs_t.clamp(min=1e-12))
+    sqrt_surf_tau_obs_t = torch.sqrt(surf_tau_obs_t.clamp(min=1e-12))
+    v_perf_t = iv_at_fwd_t * sqrt_surf_tau_obs_t
 
     if corr_override is not None:
         corr_t = corr_override.to(dtype=torch.float64, device=device)
@@ -2921,24 +3773,29 @@ def preprocess_eq_autocall(
     cpn_code = float(monitoring_index_to_code(coupon_index or callability_index))
     opt_code = float(monitoring_index_to_code(option_index or callability_index))
 
-    global_cols: list[torch.Tensor] = [torch.tensor(0.0, dtype=torch.float64, device=device)] * n_global_cols
-    global_cols[AutocallGlobalCol.K_PUT] = torch.tensor(float(strike), dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.B_KI] = torch.tensor(b_ki_val, dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.HAS_KI_FLAG] = torch.tensor(has_ki, dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.I_KI_PAST] = torch.tensor(float(seasoned.i_ki_past), dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.G_PUT] = torch.tensor(float(option_gearing), dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.C_MEM_0] = torch.tensor(float(seasoned.c_mem_0), dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.IS_MEMORY_FLAG] = torch.tensor(1.0 if is_memory else 0.0, dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.ABS_KO_SPREAD] = torch.tensor(abs(float(ko_spread)), dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.ABS_CPN_SPREAD] = torch.tensor(abs(float(cpn_spread)), dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.L_PUT_PROXY] = baseline.l_put_proxy
-    global_cols[AutocallGlobalCol.LOWER_STRIKE] = torch.tensor(lower_k_val, dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.CALL_INDEX_ID] = torch.tensor(call_code, dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.CPN_INDEX_ID] = torch.tensor(cpn_code, dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.OPT_INDEX_ID] = torch.tensor(opt_code, dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.IS_LONG_BASKET] = torch.tensor(1.0 if is_long_basket else 0.0, dtype=torch.float64, device=device)
-    global_cols[AutocallGlobalCol.ABS_KI_SPREAD] = torch.tensor(abs(float(ki_spread)), dtype=torch.float64, device=device)
-    global_vec = torch.stack(global_cols, dim=0).unsqueeze(0)
+    global_vals = [0.0] * n_global_cols
+    global_vals[int(AutocallGlobalCol.K_PUT)] = float(strike)
+    global_vals[int(AutocallGlobalCol.B_KI)] = b_ki_val
+    global_vals[int(AutocallGlobalCol.HAS_KI_FLAG)] = has_ki
+    global_vals[int(AutocallGlobalCol.I_KI_PAST)] = float(seasoned.i_ki_past)
+    global_vals[int(AutocallGlobalCol.G_PUT)] = float(option_gearing)
+    global_vals[int(AutocallGlobalCol.C_MEM_0)] = float(seasoned.c_mem_0)
+    global_vals[int(AutocallGlobalCol.IS_MEMORY_FLAG)] = 1.0 if is_memory else 0.0
+    global_vals[int(AutocallGlobalCol.ABS_KO_SPREAD)] = abs(float(ko_spread))
+    global_vals[int(AutocallGlobalCol.ABS_CPN_SPREAD)] = abs(float(cpn_spread))
+    global_vals[int(AutocallGlobalCol.LOWER_STRIKE)] = lower_k_val
+    global_vals[int(AutocallGlobalCol.CALL_INDEX_ID)] = call_code
+    global_vals[int(AutocallGlobalCol.CPN_INDEX_ID)] = cpn_code
+    global_vals[int(AutocallGlobalCol.OPT_INDEX_ID)] = opt_code
+    global_vals[int(AutocallGlobalCol.IS_LONG_BASKET)] = 1.0 if is_long_basket else 0.0
+    global_vals[int(AutocallGlobalCol.ABS_KI_SPREAD)] = abs(float(ki_spread))
+    if isinstance(baseline.l_put_proxy, torch.Tensor) and baseline.l_put_proxy.requires_grad:
+        global_row = torch.tensor(global_vals, dtype=torch.float64, device=device)
+        global_row[int(AutocallGlobalCol.L_PUT_PROXY)] = baseline.l_put_proxy
+        global_vec = global_row.unsqueeze(0)
+    else:
+        global_vals[int(AutocallGlobalCol.L_PUT_PROXY)] = float(baseline.l_put_proxy)
+        global_vec = torch.tensor([global_vals], dtype=torch.float64, device=device)
 
     state_out = AutocallPreprocState(
         node_feats=node_feats,
@@ -3026,13 +3883,61 @@ def preprocess_eq_autocall(
         ),
         warnings=list(seasoned_warnings),
         feature_schema_version=FEATURE_SCHEMA_VERSION,
-        repo_curves_map=_normalize_repo_curves_map(repo_curves_map, as_of_dt),
+        repo_curves_map=norm_repo_curves_map,
         surface_digests=surface_digests,
     )
-    state_out.state_digest = compute_preproc_state_digest(state_out)
+    build_tmpl = (
+        cache_key is not None
+        and non_spot_key is not None
+        and m_rem > 0
+        and not seasoned.already_autocalled
+        and not bool(div_out.forward_price.requires_grad)
+    )
+    if build_tmpl and not bool(div_out.quanto_meta):
+        state_digest_val, tmpl_slices = _compute_digest_and_slices(state_out)
+        state_out.state_digest = state_digest_val
+    else:
+        tmpl_slices = None
+        state_out.state_digest = compute_preproc_state_digest(state_out)
+    if mds_digest_hex is not None:
+        object.__setattr__(state_out, "_mds_digest_hex", mds_digest_hex)
     if cache_key is not None:
         _freeze_preproc_state_tensors(state_out)
         _PREPROC_STATE_CACHE.put(cache_key, state_out, clone_return=False)
+        if raw_key is not None:
+            _PREPROC_STATE_CACHE.put(raw_key, state_out, clone_return=False)
+        if build_tmpl and non_spot_key is not None:
+            has_quanto_flag = bool(div_out.quanto_meta)
+            proxy_static = {k: v for k, v in proxy_inputs.items() if k not in ("forward_perf", "v_perf")}
+            tmpl = _PreprocSpotInvariantTemplate(
+                base_state=state_out,
+                id_to_idx=id_to_idx,
+                surf_tau_obs_map=surf_tau_obs_map,
+                sqrt_surf_tau_obs_t=sqrt_surf_tau_obs_t.detach(),
+                tau_term=tau_term.detach(),
+                div_pv=div_out.div_pv.detach(),
+                growth_factor=torch.exp(div_out.r_tot_obs.detach()),
+                has_quanto=has_quanto_flag,
+                proxy_static_inputs=proxy_static,
+                digest_slices=tmpl_slices,
+                dividends_map=dividends_map,
+                predef_divs_map=predef_divs_map,
+                vol_surfaces_map=vol_surfaces_map,
+                correlations_map=correlations_map,
+                ref_spots_np=seasoned.ref_spots.detach().cpu().numpy().astype(np.float64, copy=True),
+                div_pv_np=div_out.div_pv.detach().cpu().numpy().astype(np.float64, copy=True),
+                growth_factor_np=np.exp(
+                    div_out.r_tot_obs.detach().cpu().numpy().astype(np.float64, copy=False)
+                ),
+                sqrt_surf_tau_obs_np=sqrt_surf_tau_obs_t.detach().cpu().numpy().astype(np.float64, copy=True),
+                corr_np=corr_t.detach().cpu().numpy().astype(np.float64, copy=True),
+                tau_term_val=float(tau_term.detach().cpu().item()),
+                base_node_feats_np=node_feats.detach().cpu().numpy().astype(np.float64, copy=True),
+                base_edge_feats_np=edge_feats.detach().cpu().numpy().astype(np.float64, copy=True),
+                base_sched_feats_np=sched_feats.detach().cpu().numpy().astype(np.float64, copy=True),
+                base_global_feats_np=global_vec.detach().cpu().numpy().astype(np.float64, copy=True),
+            )
+            _PREPROC_STATE_CACHE.put(non_spot_key, tmpl, clone_return=False)
         if _fast_shallow_cache:
             return _shallow_clone_preproc_state(state_out)
         return _clone_preproc_state(state_out)

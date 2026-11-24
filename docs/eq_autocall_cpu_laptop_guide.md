@@ -138,7 +138,7 @@ Checkpoint     : True | Guardian Stats: True
 ### A. Direct Python Valuation (`PV`, `37` CashFlows, All `8` Greeks & `RepoRho`)
 
 Instantiate `EQAutocallRuntime(device="cpu", n_fallback_paths=8192)` (or `n_fallback_paths=4096` for faster screening; default `32768`). In-domain trades run directly on the Masked EGNO surrogate in tens of milliseconds on CPU. When an out-of-distribution (`Tier3_DupireQMC`) fallback triggers:
-- **PV + CashFlows only**: runs IEEE-754 `float64` Owen-scrambled Dupire QMC (`n_replicates=8`, `n_substeps_per_period=16`) at `n_fallback_paths`.
+- **PV + CashFlows only**: runs IEEE-754 `float64` Owen-scrambled Dupire QMC (`n_replicates=8`, `n_substeps_per_period=16`) at `n_fallback_paths`, while keeping surface quote Jacobians lazy (`_LazySurfaceJacobianDict`) and reusing spot-invariant schedule/market templates with SHA-256 slice hashing across spot-shocked requests.
 - **All-8 Greeks requested on CPU**: routes single-pass CRN QMC Greeks through an adaptive CPU budget scaled by `n_fallback_paths` (`<= 1024` keeps tiny unit-test runs fast at `n_replicates=1, n_substeps=2, lv_grid=16x32`; `4096 <= n_fallback_paths < 8192` uses `n_paths=4096, n_replicates=1, lv_grid=32x64`; `n_fallback_paths >= 8192` uses `n_paths=8192, n_replicates=2, lv_grid=32x64`, with `n_substeps=4` when `m_rem * d_assets <= 48` and `2` on longer schedules) so long-maturity OOD deals achieve `< 5 bps` median PV/Greek accuracy in `< 2.5 s/deal`.
 
 ```bash
