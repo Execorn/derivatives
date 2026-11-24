@@ -3,7 +3,6 @@ import sys
 import time
 import torch
 import numpy as np
-from typing import Dict, Any
 
 # Ensure project root is in sys.path
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -12,16 +11,15 @@ if project_root not in sys.path:
 if os.path.join(project_root, "src") not in sys.path:
     sys.path.insert(0, os.path.join(project_root, "src"))
 
-from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
-from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
-from deepvol.models.lifted_heston import bs_call, bs_vega, implied_vol
-from deepvol.models.lifted_heston_gpu import price_batch_gpu
-from deepvol.greeks.portfolio_greeks import (
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d  # noqa: E402
+from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer  # noqa: E402
+from deepvol.models.lifted_heston import bs_call  # noqa: E402
+from deepvol.models.lifted_heston_gpu import price_batch_gpu  # noqa: E402
+from deepvol.greeks.portfolio_greeks import (  # noqa: E402
     bs_greeks,
     _make_spatial,
     interpolate_bilinear,
     bs_call_price,
-    _bilinear_interp
 )
 
 def price_iv_surface(params: dict, T_grid, K_grid, S0: float = 1.0,
@@ -257,7 +255,7 @@ def benchmark_greeks(n_positions: int = 100, S: float = 5000.0) -> dict:
                 "vanna": vanna_h.item(),
                 "volga": volga_h.item()
             })
-    except Exception as e:
+    except Exception:
         # Fallback to copy of BS-based if Heston-based fails
         fno_greeks_heston = fno_greeks_bs.copy()
     

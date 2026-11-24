@@ -7,8 +7,6 @@ import warnings
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
-from scipy.optimize import newton
-from typing import Dict, Tuple, Union, Optional
 
 # ── 1. Garman-Kohlhagen Option Pricing & Delta Conventions ──
 

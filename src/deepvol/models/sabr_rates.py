@@ -2,7 +2,7 @@
 sabr_rates.py — Displaced SABR pricing and calibration for Interest Rate Swaptions.
 """
 
-from typing import Union, Tuple
+from typing import Union
 import numpy as np
 import scipy.optimize as opt
 

@@ -3,14 +3,12 @@ backtest.py — Dynamic options portfolio backtesting, P&L attribution, and No-T
 All pricing and greeks computations are carried out strictly in torch.float64 (double precision) on GPU when available.
 """
 
-import os
 import math
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 from datetime import date
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple
 from deepvol.market.spx_data import download_spx_chain, clean_chain
 
 # Default grids matching FNO training data

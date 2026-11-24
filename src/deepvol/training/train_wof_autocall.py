@@ -10,7 +10,6 @@ import os
 import time
 from typing import Dict, Tuple, Optional
 
-logger = logging.getLogger(__name__)
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,6 +20,8 @@ from deepvol.surrogates.wof_autocall_egno import (
     WoFOutputNormalizer,
     WoFAutocallEGNO,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class WoFDataset(Dataset):

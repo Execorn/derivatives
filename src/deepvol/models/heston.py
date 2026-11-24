@@ -7,7 +7,7 @@ Implements:
   3. batch_heston_iv_surface: GPU-batched vectorized version using PyTorch.
 """
 
-from typing import Union, Dict, Any, Tuple, Optional
+from typing import Optional
 import numpy as np
 import torch
 from scipy.stats import norm
@@ -502,8 +502,6 @@ def batch_heston_iv_surface(
     params = params.to(device_obj)
     T_grid = torch.as_tensor(T_grid, dtype=torch.float64, device=device_obj)
     K_grid = torch.as_tensor(K_grid, dtype=torch.float64, device=device_obj)
-    
-    B = params.shape[0]
     
     a, b = _A, _B
     k = torch.arange(N_cos, dtype=torch.float64, device=device_obj)

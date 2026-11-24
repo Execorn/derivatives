@@ -1,4 +1,3 @@
-from __future__ import annotations
 """
 calibrate.py — L-BFGS calibration using the FiLM-conditioned FNO surrogate.
 
@@ -11,6 +10,7 @@ Interface change from previous version:
 
 Normalizer files are loaded once at module import and cached globally.
 """
+from __future__ import annotations
 
 import os
 import sys
@@ -20,7 +20,7 @@ import torch.optim as optim
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
+from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer  # noqa: E402
 
 # ─── Parameter bounds (must match LHS training distribution) ─────────────────
 _BOUNDS_LOWER = torch.tensor([0.1,  0.01, 0.1,  -0.9, 0.01, 0.02])
@@ -169,7 +169,6 @@ def _fno_predict_real_iv(model, params_raw: torch.Tensor,
     # otherwise reset them to v1/identity.
     if _param_norm is None or _iv_norm is None:
         _load_normalizers()   # lazy fallback — only if caller forgot
-    device = spatial.device
 
     if params_raw.dim() == 1:
         params_raw = params_raw.unsqueeze(0)   # (1, 6)

@@ -17,7 +17,7 @@ if project_root not in sys.path:
 if os.path.join(project_root, "src") not in sys.path:
     sys.path.insert(0, os.path.join(project_root, "src"))
 
-from deepvol.models.lifted_heston_gpu import price_batch_gpu
+from deepvol.models.lifted_heston_gpu import price_batch_gpu  # noqa: E402
 
 # Representative parameters for the study
 TEST_PARAMS = np.array([[1.5, 0.08, 0.5, -0.6, 0.08]], dtype=np.float64)

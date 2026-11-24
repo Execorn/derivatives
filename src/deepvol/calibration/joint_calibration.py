@@ -16,7 +16,6 @@ local minima.
 from __future__ import annotations
 
 import sys
-import time
 import warnings
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -31,7 +30,7 @@ _src = str(Path(__file__).parents[2])
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
-from deepvol.market.vix_pricing import model_vix, vix_futures_curve
+from deepvol.market.vix_pricing import model_vix, vix_futures_curve  # noqa: E402
 
 __all__ = [
     "calibrate_joint",

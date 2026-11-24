@@ -3,7 +3,6 @@ barrier_hedging.py — Custom Deep Hedging environment for Down-and-Out Barrier 
 Implements dynamic pathwise knockout conditions and boundary-aware state representations.
 """
 
-import numpy as np
 import torch
 import torch.nn as nn
 from typing import Tuple, Optional

@@ -11,9 +11,7 @@ Features:
 
 import logging
 import os
-import time
 from typing import Dict, Any, Tuple
-logger = logging.getLogger(__name__)
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,6 +22,8 @@ from deepvol.surrogates.autocall_normalizer import (
     AutocallOutputNormalizer,
 )
 from deepvol.surrogates.autocall_mlp import AutocallMLP
+
+logger = logging.getLogger(__name__)
 
 
 class AutocallDataset(Dataset):

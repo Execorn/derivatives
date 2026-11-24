@@ -33,7 +33,7 @@ _src_dir = str(Path(__file__).parents[2])
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
-from deepvol.models.lifted_heston import bernstein_factors  # Bernstein (xᵢ, cᵢ) factors
+from deepvol.models.lifted_heston import bernstein_factors  # noqa: E402  # Bernstein (xᵢ, cᵢ) factors
 
 
 # ---------------------------------------------------------------------------

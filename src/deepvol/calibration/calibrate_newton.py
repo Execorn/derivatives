@@ -30,8 +30,6 @@ from deepvol.calibration.calibrate_bfgs import (
     _load_normalizers,
     _make_spatial_input,
     _fno_predict_real_iv,
-    _BOUNDS_LOWER,
-    _BOUNDS_UPPER,
 )
 
 # Ghost parameter values (fixed in 3D reparameterized calibration)
@@ -322,7 +320,8 @@ def benchmark_jacobian_speed(model, T_grid, K_grid,
     _wp3 = torch.tensor(rng.uniform(lo + 0.01, hi - 0.01, 3).astype(np.float32),
                         device=device)
     fno_jacobian_autograd(model, _wp3, spatial)
-    if str(device) == 'cuda': torch.cuda.synchronize()
+    if str(device) == 'cuda':
+        torch.cuda.synchronize()
 
     for _ in range(n_trials):
         p3 = torch.tensor(
@@ -331,15 +330,18 @@ def benchmark_jacobian_speed(model, T_grid, K_grid,
         )
 
         # jacfwd timing (3 JVPs, one per input dim)
-        if str(device) == 'cuda': torch.cuda.synchronize()
+        if str(device) == 'cuda':
+            torch.cuda.synchronize()
         t0 = time.perf_counter()
         _  = fno_jacobian_autograd(model, p3, spatial)
-        if str(device) == 'cuda': torch.cuda.synchronize()
+        if str(device) == 'cuda':
+            torch.cuda.synchronize()
         t_autograd.append(time.perf_counter() - t0)
 
         # 5-point FD timing (4×3=12 forward passes)
         eps = np.array([5e-4, 5e-4, 5e-4])
-        if str(device) == 'cuda': torch.cuda.synchronize()
+        if str(device) == 'cuda':
+            torch.cuda.synchronize()
         t0  = time.perf_counter()
         for j in range(3):
             for delta in (-2, -1, 1, 2):
@@ -349,7 +351,8 @@ def benchmark_jacobian_speed(model, T_grid, K_grid,
                 p6 = _reparam_to_6d(pp[0:1], pp[1:2], pp[2:3], device)
                 with torch.no_grad():
                     _fno_predict_real_iv(model, p6, spatial)
-        if str(device) == 'cuda': torch.cuda.synchronize()
+        if str(device) == 'cuda':
+            torch.cuda.synchronize()
         t_fd.append(time.perf_counter() - t0)
 
     speedup = float(np.mean(t_fd) / np.mean(t_autograd))
@@ -410,7 +413,7 @@ if __name__ == "__main__":
     print("\nRunning Newton calibration (v2 model) ...")
     result = calibrate_newton(model, iv_target, T_GRID, K_GRID,
                               max_iter=15, verbose=True)
-    print(f"\nResult:")
+    print("\nResult:")
     print(f"  v0    : {result['v0']:.4f}  (true=0.0600)")
     print(f"  zeta  : {result['zeta']:.4f}  (true=-0.2000)")
     print(f"  lambda: {result['lambda']:.4f}  (true=0.4000)")

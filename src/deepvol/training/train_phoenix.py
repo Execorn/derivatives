@@ -11,7 +11,6 @@ import os
 import time
 from typing import Dict, Tuple
 
-logger = logging.getLogger(__name__)
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,6 +21,8 @@ from deepvol.surrogates.phoenix_mlp import (
     PhoenixOutputNormalizer,
     PhoenixMLP,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class PhoenixDataset(Dataset):

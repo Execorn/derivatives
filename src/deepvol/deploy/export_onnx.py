@@ -12,8 +12,7 @@ src_path = os.path.join(project_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
-from deepvol.utils.path_helpers import get_weights_path
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d  # noqa: E402
 
 def build_fft_matrices(H, W):
     """

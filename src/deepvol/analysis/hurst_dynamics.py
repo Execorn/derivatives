@@ -3,12 +3,11 @@ Hurst Exponent Dynamics Study analysis tools.
 """
 from __future__ import annotations
 
-import os
 import sys
 import json
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -19,7 +18,7 @@ src_dir = project_root / "src"
 if str(src_dir) not in sys.path:
     sys.path.insert(0, str(src_dir))
 
-from deepvol.calibration.batch_calibration import calibrate_batch, CalibrationResult, results_to_dataframe
+from deepvol.calibration.batch_calibration import calibrate_batch, CalibrationResult, results_to_dataframe  # noqa: E402
 
 
 def run_historical_study(

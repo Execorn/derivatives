@@ -7,7 +7,6 @@ for Phase 9 Milestone M1: Cross-Asset Roughness Study.
 
 from __future__ import annotations
 import gc
-import os
 import sys
 import json
 import hashlib
@@ -15,11 +14,12 @@ import warnings
 import threading
 from pathlib import Path
 from datetime import datetime, date
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 
 # Ensure parent and src are in path
 project_root = Path(__file__).resolve().parents[3]
@@ -35,12 +35,11 @@ if str(src_dir) not in sys.path:
 # the forward pass purely functional and vmap-compatible.
 # NOTE: Verified still required as of PyTorch 2.8.0+cu128 (Jun 2026).
 # Re-check when pytorch/functorch#667 is resolved in a future release.
-from deepvol.surrogates import fno_model
-import torch.nn.functional as F
+from deepvol.surrogates import fno_model  # noqa: E402
+
 
 def _spectral_conv2d_forward_patched(self, x):
     """vmap-compatible SpectralConv2d forward pass using pad+add instead of in-place scatter."""
-    B = x.shape[0]
     x_ft = torch.fft.rfft2(x)
     H, W = x.size(-2), x.size(-1)//2+1
     
@@ -59,12 +58,11 @@ fno_model.SpectralConv2d.forward = _spectral_conv2d_forward_patched
 
 
 
-from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
-from deepvol.calibration import calibrate_bfgs as _cal_mod
-from deepvol.calibration.batch_calibration import CalibrationResult, results_to_dataframe
-from deepvol.market.spx_data import clean_chain, to_iv_surface
-from deepvol.analysis.crypto_hurst import align_crypto_inputs
-from deepvol.market.deribit_data import build_iv_surface
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d  # noqa: E402
+from deepvol.calibration.batch_calibration import CalibrationResult, results_to_dataframe  # noqa: E402
+from deepvol.market.spx_data import clean_chain, to_iv_surface  # noqa: E402
+from deepvol.analysis.crypto_hurst import align_crypto_inputs  # noqa: E402
+from deepvol.market.deribit_data import build_iv_surface  # noqa: E402
 
 
 class ParameterTrajectoryGenerator:

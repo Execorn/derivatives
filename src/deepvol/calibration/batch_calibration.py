@@ -120,7 +120,6 @@ def _get_assets(device_str: str = "auto"):
         import torch.nn.functional as F
 
         def _spectral_conv2d_forward_patched(self, x):
-            B = x.shape[0]
             x_ft = torch.fft.rfft2(x)
             H, W = x.size(-2), x.size(-1)//2+1
             

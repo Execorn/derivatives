@@ -30,7 +30,6 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-import numpy as np
 import pandas as pd
 
 # ── path setup ────────────────────────────────────────────────────────────────
@@ -43,7 +42,7 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError("aiohttp is required: pip install aiohttp") from exc
 
-from deepvol.market.deribit_data import parse_instrument_name
+from deepvol.market.deribit_data import parse_instrument_name  # noqa: E402
 
 log = logging.getLogger(__name__)
 

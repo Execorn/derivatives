@@ -3,7 +3,6 @@ adversarial_market.py — Stylized Facts Alignment GAN (SFAG) and Minimax Robust
 Generates joint stock return and volatility paths, optimizing them against a hedging policy.
 """
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim

@@ -9,7 +9,7 @@ import warnings
 import numpy as np
 import torch
 import torch.func as func
-from typing import Optional, Any
+from typing import Optional
 from scipy.special import ndtr
 
 # Default grids matching FNO training data
@@ -129,8 +129,12 @@ def bs_greeks(S: float, K: float, T: float, r: float,
         "speed": 0.0, "zomma": 0.0, "ultima": 0.0,
     }
     try:
-        _S = float(S); _K = float(K); _T = float(T)
-        _r = float(r); _q = float(q); _sig = float(sigma_iv)
+        _S = float(S)
+        _K = float(K)
+        _T = float(T)
+        _r = float(r)
+        _q = float(q)
+        _sig = float(sigma_iv)
     except (TypeError, ValueError, OverflowError):
         return _ZERO_GREEKS
 
@@ -249,7 +253,6 @@ def fno_parameter_jacobian(model: torch.nn.Module,
     """
     device  = next(model.parameters()).device
     spatial = spatial.to(device)
-    nT, nK  = spatial.shape[1], spatial.shape[2]
 
     _ensure_normalizers(model)
     pn_mean = torch.tensor(_cached_pn.mean, dtype=torch.float32, device=device)
@@ -580,7 +583,6 @@ def portfolio_greeks(positions: list,
 
     # CDF values
     N_d1 = normal.cdf(d1)
-    N_d2 = normal.cdf(d2)
     N_minus_d1 = normal.cdf(-d1)
 
     phi_d1 = torch.exp(-0.5 * d1 ** 2) / math.sqrt(2.0 * math.pi)
@@ -597,7 +599,6 @@ def portfolio_greeks(positions: list,
 
     # Common Greeks: Vega, Gamma, Vanna, Volga
     sig_sqrt_T = torch.clamp(sig_t * torch.sqrt(T_t), min=5e-300)
-    sig_sq = torch.clamp(sig_t ** 2, min=5e-300)
     S_safe = torch.clamp(S_t, min=5e-300)
 
     vega_raw = S_t * exp_qT * torch.sqrt(T_t) * phi_d1

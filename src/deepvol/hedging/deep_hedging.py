@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple, Optional
 
 
 class HedgingPolicy(nn.Module):

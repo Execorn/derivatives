@@ -32,6 +32,7 @@ Architecture:
   - 50k samples generated in ~5-15 minutes on RTX 3060
 """
 
+from functools import lru_cache
 import numpy as np
 import torch
 
@@ -301,7 +302,8 @@ def solve_riccati_rk4(
     T_sorted = np.sort(T_grid)
 
     # Pre-expand params to (B, 1, 1) complex for broadcasting
-    to_c = lambda t: t.to(torch.complex128)
+    def to_c(t):
+        return t.to(torch.complex128)
     kappa_e = to_c(kappa)[:, None, None]
     sigma_e = to_c(sigma)[:, None, None]
     rho_e   = to_c(rho)[:, None, None]
@@ -674,8 +676,6 @@ class BS_IV_Implicit_Inverter(torch.autograd.Function):
 # Main batch pricing pipeline
 # ---------------------------------------------------------------------------
 
-from functools import lru_cache
-
 @lru_cache(maxsize=128)
 def _get_cos_payoff_coeffs_gpu_cached(N_cos: int, a: float = _A, b: float = _B, device_str: str = 'cuda', is_put: bool = False) -> torch.Tensor:
     device = torch.device(device_str)
@@ -743,7 +743,6 @@ def _price_batch_gpu_raw(
     O(unique_H) kernel-launch overhead from external H-grouping loops.
     """
     dev = torch.device(device)
-    B   = params_batch.shape[0]
 
     # ── Bernstein factors ────────────────────────────────────────────────────
     if H_batch is not None:
@@ -774,8 +773,11 @@ def _price_batch_gpu_raw(
 
     # ── Parameter tensors ────────────────────────────────────────────────────
     p     = torch.tensor(params_batch, dtype=torch.float64, device=dev)
-    kappa = p[:, 0]; theta = p[:, 1]
-    sigma = p[:, 2]; rho   = p[:, 3]; v0 = p[:, 4]
+    kappa = p[:, 0]
+    theta = p[:, 1]
+    sigma = p[:, 2]
+    rho   = p[:, 3]
+    v0 = p[:, 4]
 
     # 1. Riccati ODE  (mixed precision: complex64 state, complex128 accumulator)
     log_phi = solve_riccati_rk4_mixed(

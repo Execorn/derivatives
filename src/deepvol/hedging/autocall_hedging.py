@@ -12,12 +12,8 @@ Mathematical Formulation:
   - Sharma, A. et al. (2024). Hedging and Pricing Structured Products Featuring Multiple Underlying Assets. ACM ICAIF.
 """
 
-import sys
-
 import os
-import time
-from typing import Callable, Dict, List, Literal, Optional, Tuple, Union
-import numpy as np
+from typing import Callable, List, Literal, Optional, Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -104,7 +100,6 @@ class AutocallHedgingEnv(BarrierHedgingEnv):
           5: steps since last obs date / (T * 252)
           6: prev_delta (underlying delta)
         """
-        device = self.H.device
         dtype = self.H.dtype
         S_k = self.H[:, k, 0]
         log_m = torch.log(torch.clamp(S_k / self.S0, min=1e-6))

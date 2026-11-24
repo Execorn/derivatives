@@ -18,7 +18,6 @@ Mathematical References:
 from typing import Dict, List, Tuple
 import torch
 from torch import Tensor
-from deepvol.models.autocall import price_autocall_mc
 
 
 @torch.compile(mode="default", dynamic=True)

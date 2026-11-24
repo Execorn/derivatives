@@ -20,16 +20,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 import warnings
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 import aiohttp
 import numpy as np
 import pandas as pd
-from scipy.interpolate import RectBivariateSpline, griddata
+from scipy.interpolate import griddata
 from scipy.stats import linregress
 
 # ---------------------------------------------------------------------------
@@ -319,7 +318,6 @@ def build_iv_surface(df: pd.DataFrame,
 
         if len(T_unique) >= 4 and len(K_bins) >= 4:
             # Build a dense regular grid via nearest-neighbor binning
-            from scipy.interpolate import RectBivariateSpline
             # Create median-IV pivot using pandas cut
             tmp = work.copy()
             tmp["T_bin"] = pd.cut(tmp["T"], bins=min(len(T_unique), 15),
@@ -339,7 +337,6 @@ def build_iv_surface(df: pd.DataFrame,
                               .reindex(index=range(len(T_mids)),
                                        columns=range(len(K_mids))))
             # Fill small gaps with nearest
-            from scipy.interpolate import NearestNDInterpolator
             valid_mask = ~np.isnan(pivot_arr.values)
             if valid_mask.sum() < 4:
                 raise ValueError("Not enough non-NaN pivot cells")
@@ -450,19 +447,14 @@ def calibrate_crypto(currency: Literal["BTC", "ETH"] = "BTC",
     # Lazy imports to avoid circular deps at module load time
     import torch
     from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
-    from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
 
     project_root = Path(__file__).parents[3]
 
     # ── Load model ───────────────────────────────────────────────────────────
     if fix_H:
         weights_path = project_root / "artifacts/weights/fno_v2_final_prod.pth"
-        pn_path = project_root / "artifacts/models/param_normalizer_v2.npz"
-        yn_path = project_root / "artifacts/models/iv_normalizer_v2.npz"
     else:
         weights_path = project_root / "artifacts/weights/fno_v3_final_prod.pth"
-        pn_path = project_root / "artifacts/models/param_normalizer_v3.npz"
-        yn_path = project_root / "artifacts/models/iv_normalizer_v3.npz"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model  = MirrorPaddedFNO2d()

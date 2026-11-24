@@ -1,4 +1,3 @@
-import os
 import sys
 from datetime import date, datetime, timedelta
 import pandas as pd
@@ -10,7 +9,7 @@ src_dir = str(Path(__file__).parents[2])
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from deepvol.market.vix_pricing import vix_futures_curve
+from deepvol.market.vix_pricing import vix_futures_curve  # noqa: E402
 
 # Expose public API
 __all__ = ["fetch_vix_futures", "get_vix_expiry", "get_active_vix_months"]
@@ -82,7 +81,8 @@ def fetch_vix_futures(date_input) -> pd.DataFrame:
     # Try downloading via yfinance
     # Note: delisted VIX futures tickers print 404 errors to stderr before
     # returning empty DataFrames. Suppress that noise with redirect_stderr.
-    import io, contextlib
+    import contextlib
+    import io
     df = None
     try:
         import yfinance as yf

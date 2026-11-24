@@ -19,6 +19,7 @@ if not hasattr(np, 'bool'):
     np.bool = np.bool_  # type: ignore[attr-defined]
 
 import chaospy as cp
+import gpytorch
 
 from sklearn.linear_model import Ridge, RidgeCV, MultiTaskLassoCV
 
@@ -29,9 +30,8 @@ src_dir = os.path.abspath(os.path.join(current_dir, "..", ".."))
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from deepvol.surrogates.fno_model import MirrorPaddedFNO2d, arbitrage_free_regularization
-from deepvol.surrogates.normalizers import ParameterNormalizerHeston, IVSurfaceNormalizer
-import gpytorch
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d, arbitrage_free_regularization  # noqa: E402
+from deepvol.surrogates.normalizers import ParameterNormalizerHeston, IVSurfaceNormalizer  # noqa: E402
 
 
 # ─── GPyTorch Batch SVGP Model ───────────────────────────────────────────────
@@ -348,7 +348,8 @@ def main():
         if reg_type == 'ols':
             # Analytical OLS via np.linalg.lstsq
             coef = np.linalg.lstsq(design_matrix_tr, Y_tr_n_flat, rcond=None)[0]
-            predict_fn = lambda dm: dm @ coef
+            def predict_fn(dm):
+                return dm @ coef
         elif reg_type == 'ridge':
             if not use_cv:
                 print(f"  Warning: training samples ({X_tr_n.shape[0]}) < PCE terms ({len(pce_expansion)}) or cv_folds ({cv_folds}) < 2. Falling back to Ridge without CV.")
@@ -356,17 +357,20 @@ def main():
             else:
                 ridge_model = RidgeCV(cv=cv_folds)
             ridge_model.fit(design_matrix_tr, Y_tr_n_flat)
-            predict_fn = lambda dm: ridge_model.predict(dm)
+            def predict_fn(dm):
+                return ridge_model.predict(dm)
         elif reg_type == 'lasso':
             if not use_cv:
                 print(f"  Warning: training samples ({X_tr_n.shape[0]}) < PCE terms ({len(pce_expansion)}) or cv_folds ({cv_folds}) < 2. Falling back to Ridge without CV.")
                 fallback_model = Ridge(alpha=1.0)
                 fallback_model.fit(design_matrix_tr, Y_tr_n_flat)
-                predict_fn = lambda dm: fallback_model.predict(dm)
+                def predict_fn(dm):
+                    return fallback_model.predict(dm)
             else:
                 lasso_model = MultiTaskLassoCV(cv=cv_folds, max_iter=2000)
                 lasso_model.fit(design_matrix_tr, Y_tr_n_flat)
-                predict_fn = lambda dm: lasso_model.predict(dm)
+                def predict_fn(dm):
+                    return lasso_model.predict(dm)
         else:
             raise ValueError(f"Unsupported PCE regression method: {reg_type}")
             

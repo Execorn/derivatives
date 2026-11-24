@@ -162,9 +162,6 @@ def check_arbitrage_free_batch(
     is_arbitrage_free : np.ndarray
         Boolean array of shape (B,) indicating which batch items are arbitrage-free.
     """
-    B = svi_params.shape[0]
-    nT = len(T_grid)
-    
     k_min = min(K_grid.min(), -2.0)
     k_max = max(K_grid.max(), 2.0)
     K_dense = np.linspace(k_min, k_max, 400)
@@ -276,9 +273,7 @@ def svi_to_lv_surface(
     if not is_batched:
         svi_params_t = svi_params_t.unsqueeze(0)  # Shape: (1, nT, 5)
         
-    B = svi_params_t.shape[0]
     nT = len(T_t)
-    nK = len(K_t)
     
     # 2. Define fine uniform grids
     fine_T = torch.linspace(T_t[0].item(), T_t[-1].item(), fine_T_points, device=device)

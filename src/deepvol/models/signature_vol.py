@@ -154,9 +154,11 @@ def simulate_signature_vol_paths(
     
     # Select thresholding activation
     if positivity_func == "relu":
-        pos_fn = lambda val: torch.clamp(val, min=variance_floor)
+        def pos_fn(val):
+            return torch.clamp(val, min=variance_floor)
     elif positivity_func == "softplus":
-        pos_fn = lambda val: F.softplus(val) + variance_floor
+        def pos_fn(val):
+            return F.softplus(val) + variance_floor
     else:
         raise ValueError(f"Unknown positivity function: {positivity_func}")
         

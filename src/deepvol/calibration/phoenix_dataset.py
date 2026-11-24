@@ -21,7 +21,7 @@ sys.path.insert(0, "src")
 
 import os
 import time
-from typing import Dict, Optional
+from typing import Dict
 import numpy as np
 import pandas as pd
 from scipy.stats import qmc

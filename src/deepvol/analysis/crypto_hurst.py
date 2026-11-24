@@ -3,13 +3,12 @@ Crypto Hurst Exponent Dynamics Study analysis tools.
 """
 from __future__ import annotations
 
-import os
 import sys
 import json
 import warnings
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Literal
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -20,8 +19,8 @@ src_dir = project_root / "src"
 if str(src_dir) not in sys.path:
     sys.path.insert(0, str(src_dir))
 
-from deepvol.market.deribit_data import build_iv_surface, fetch_option_snapshot
-from deepvol.calibration.batch_calibration import calibrate_batch, CalibrationResult, results_to_dataframe
+from deepvol.market.deribit_data import build_iv_surface  # noqa: E402
+from deepvol.calibration.batch_calibration import calibrate_batch, CalibrationResult, results_to_dataframe  # noqa: E402
 
 
 def align_crypto_inputs(df: pd.DataFrame) -> pd.DataFrame:
@@ -41,10 +40,6 @@ def generate_mock_crypto_data(date_str: str, currency: str = "BTC") -> pd.DataFr
     """
     Generate mock options chain for crypto with expiry year 2027+ for test stability.
     """
-    import numpy as np
-    import pandas as pd
-    from datetime import datetime, timedelta
-    
     study_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     
     # FNO Grid values

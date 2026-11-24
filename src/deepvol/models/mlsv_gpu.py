@@ -553,9 +553,11 @@ class MLSVEngine:
                 vol_grid = np.array(self.dupire_grid["vol"])
             else:
                 vol_grid = np.array(self.dupire_grid)
-            dupire_vol_fn = lambda t, s: torch.full_like(s, float(vol_grid[0, 0]))
+            def dupire_vol_fn(t, s):
+                return torch.full_like(s, float(vol_grid[0, 0]))
         else:
-            dupire_vol_fn = lambda t, s: torch.full_like(s, vol)
+            def dupire_vol_fn(t, s):
+                return torch.full_like(s, vol)
             
         solver = MLSVSolverGPU(
             S0=spot,

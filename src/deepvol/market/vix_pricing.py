@@ -3,14 +3,12 @@
 """
 from __future__ import annotations
 import sys
-import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import torch
 from scipy.integrate import solve_ivp
-from scipy.stats import norm
 
 # Add src directory to PYTHONPATH dynamically if not present
 src_dir = str(Path(__file__).parents[2])
@@ -18,7 +16,7 @@ if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
 # Import Bernstein factors from pricing engine to ensure consistency
-from deepvol.models.lifted_heston import bernstein_factors
+from deepvol.models.lifted_heston import bernstein_factors  # noqa: E402
 
 CACHE_DIR = Path(__file__).parents[3] / "data" / "market" / "vix"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -167,7 +165,6 @@ def vix_futures_curve(kappa: float, theta: float, sigma: float,
     psi_delta = sol_vix.y[:N, -1]
     I_psi_delta = sol_vix.y[-1, -1]
     
-    a = (1.0 / delta) * c * psi_delta
     b = (kappa * theta / delta) * I_psi_delta
     
     # 2. Setup 30-point Gauss-Legendre quadrature on [0, y_max=20.0]

@@ -17,7 +17,6 @@ On SPX implied volatility surfaces for dates:
 - 2024-08-05
 """
 
-import os
 import math
 import time
 import json
@@ -25,7 +24,7 @@ import numpy as np
 import pandas as pd
 from datetime import date
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Union
+from typing import Dict, Any, Tuple
 
 import torch
 import py_vollib_vectorized

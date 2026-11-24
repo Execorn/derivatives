@@ -12,7 +12,7 @@ import json
 import signal
 import logging
 import time
-from typing import Dict, Any, List, Union
+from typing import Dict, Any
 
 import numpy as np
 import torch
@@ -24,8 +24,8 @@ _src = str(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
-from deepvol.calibration.interface import calibrate, CalibrationResult
-from deepvol.market.deribit_data import build_iv_surface
+from deepvol.calibration.interface import calibrate, CalibrationResult  # noqa: E402
+from deepvol.market.deribit_data import build_iv_surface  # noqa: E402
 
 # Configure logging
 logging.basicConfig(

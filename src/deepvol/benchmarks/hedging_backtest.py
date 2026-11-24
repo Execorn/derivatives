@@ -5,11 +5,9 @@ flat-vol Black-Scholes, and Deep Hedging policies under transaction costs.
 
 import os
 import sys
-import time
 import argparse
 import numpy as np
 import torch
-import torch.nn as nn
 from scipy.stats import norm
 
 # Ensure project root is in sys.path
@@ -19,10 +17,9 @@ if project_root not in sys.path:
 if os.path.join(project_root, "src") not in sys.path:
     sys.path.insert(0, os.path.join(project_root, "src"))
 
-from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
-from deepvol.calibration.calibrate_newton import calibrate_newton
-from deepvol.calibration.calibrate_bfgs import _load_normalizers, _make_spatial_input, _fno_predict_real_iv
-from deepvol.hedging.deep_hedging import HedgingPolicy, DeepHedgingEnv, train_deep_hedger
+from deepvol.surrogates.fno_model import MirrorPaddedFNO2d  # noqa: E402
+from deepvol.calibration.calibrate_bfgs import _load_normalizers, _make_spatial_input, _fno_predict_real_iv  # noqa: E402
+from deepvol.hedging.deep_hedging import HedgingPolicy, DeepHedgingEnv, train_deep_hedger  # noqa: E402
 
 # ─── Grids ─────────────────────────────────────────────────────────────────────
 T_GRID = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0], dtype=np.float32)

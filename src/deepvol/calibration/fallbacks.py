@@ -3,13 +3,12 @@ fallbacks.py — Fallback pricing engines, regularized Tikhonov calibration solv
 """
 
 import time
-import math
 import logging
 import numpy as np
 import scipy.optimize as optimize
 import scipy.stats as stats
 import torch
-from typing import Dict, Any, Union, Optional, List
+from typing import Dict, Any, Optional, List
 
 from deepvol.utils.strikes import resolve_strikes
 
@@ -19,7 +18,7 @@ from deepvol.calibration.calibrate_bfgs import (
     _make_spatial_input,
     _fno_predict_real_iv
 )
-from deepvol.models.heston import batch_heston_iv_surface, implied_vol_cpu
+from deepvol.models.heston import batch_heston_iv_surface
 from deepvol.models.mlsv_gpu import MLSVSolverGPU
 from deepvol.mrm.guardian import price_to_iv
 

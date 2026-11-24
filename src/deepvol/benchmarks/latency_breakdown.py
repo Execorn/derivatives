@@ -21,7 +21,7 @@ import argparse
 import platform
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, Any
 
 import numpy as np
 import torch
@@ -35,12 +35,12 @@ if str(REPO_ROOT / "src") not in sys.path:
 # Set working directory to repo root so all relative paths in deepvol work correctly
 os.chdir(str(REPO_ROOT))
 
-from deepvol.calibration.calibrate_bfgs import (
+from deepvol.calibration.calibrate_bfgs import (  # noqa: E402
     _load_normalizers,
     _make_spatial_input,
     _fno_predict_real_iv,
 )
-from deepvol.calibration.calibrate_newton import (
+from deepvol.calibration.calibrate_newton import (  # noqa: E402
     calibrate_newton,
     calibrate_newton_h,
     fno_jacobian_autograd,
@@ -51,9 +51,8 @@ from deepvol.calibration.calibrate_newton import (
     _reparam_to_6d,
     _reparam_to_6d_with_H,
 )
-from deepvol.calibration.batch_calibration import (
+from deepvol.calibration.batch_calibration import (  # noqa: E402
     calibrate_batch,
-    calibrate_newton_batch,
     _get_assets,
     _make_spatial,
 )

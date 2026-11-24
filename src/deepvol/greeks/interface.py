@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from typing import Dict, Union, Any
+from typing import Dict, Union
 from deepvol.utils.path_helpers import get_weights_path
 from deepvol.surrogates.fno_model import MirrorPaddedFNO2d
 
@@ -66,7 +66,6 @@ def compute_greeks(
 
     if model_name in ("fno", "rough_heston"):
         from deepvol.greeks.portfolio_greeks import fno_surface_greeks
-        from deepvol.surrogates.normalizers import ParameterNormalizer, IVSurfaceNormalizer
         
         model = kwargs.pop("model", None)
         if model is None:
@@ -77,7 +76,7 @@ def compute_greeks(
 
 
         # Load normalizers v2
-        from deepvol.calibration.calibrate_bfgs import _PARAM_NORM_PATH, _IV_NORM_PATH, _load_normalizers, _param_norm, _iv_norm
+        from deepvol.calibration.calibrate_bfgs import _load_normalizers, _param_norm, _iv_norm
         _load_normalizers(version="v2")
         pn = _param_norm
         yn = _iv_norm

@@ -9,12 +9,10 @@ Features:
   - AdamW + CosineAnnealingLR
 """
 
-import logging
 import os
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 from typing import Dict, Any, List, Optional, Tuple, Union
 
 from deepvol.surrogates.correction_mlp import CorrectionMLP
@@ -601,4 +599,4 @@ if __name__ == "__main__":
     if os.path.exists(DEFAULT_CORRECTION_CONFIG['train_path']) and os.path.exists(DEFAULT_CORRECTION_CONFIG['val_path']):
         train(DEFAULT_CORRECTION_CONFIG)
     else:
-        print(f"Train/Val data not found. Skipping training.")
+        print("Train/Val data not found. Skipping training.")

@@ -51,10 +51,14 @@ def sabr_iv_lognormal(F, K, T, alpha, beta, rho, nu):
     shape = F.shape
     
     # SABR parameter validation
-    if np.any(alpha <= 0): raise ValueError("alpha must be > 0")
-    if np.any((beta < 0) | (beta > 1)): raise ValueError("beta must be in [0, 1]")
-    if np.any(nu <= 0): raise ValueError("nu must be > 0")
-    if np.any(np.abs(rho) > 1.0): raise ValueError("|rho| must be <= 1")
+    if np.any(alpha <= 0):
+        raise ValueError("alpha must be > 0")
+    if np.any((beta < 0) | (beta > 1)):
+        raise ValueError("beta must be in [0, 1]")
+    if np.any(nu <= 0):
+        raise ValueError("nu must be > 0")
+    if np.any(np.abs(rho) > 1.0):
+        raise ValueError("|rho| must be <= 1")
     
     # Lognormal SABR requires F > 0, K > 0, and T > 0
     valid = (F > 0.0) & (K > 0.0) & (T > 0.0)
@@ -188,10 +192,14 @@ def sabr_iv_normal(F, K, T, alpha, beta, rho, nu):
     shape = F.shape
     
     # SABR parameter validation
-    if np.any(alpha <= 0): raise ValueError("alpha must be > 0")
-    if np.any((beta < 0) | (beta > 1)): raise ValueError("beta must be in [0, 1]")
-    if np.any(nu <= 0): raise ValueError("nu must be > 0")
-    if np.any(np.abs(rho) > 1.0): raise ValueError("|rho| must be <= 1")
+    if np.any(alpha <= 0):
+        raise ValueError("alpha must be > 0")
+    if np.any((beta < 0) | (beta > 1)):
+        raise ValueError("beta must be in [0, 1]")
+    if np.any(nu <= 0):
+        raise ValueError("nu must be > 0")
+    if np.any(np.abs(rho) > 1.0):
+        raise ValueError("|rho| must be <= 1")
     
     # Normal SABR allows negative rates/strikes only if beta == 0.
     # If beta > 0, we require F > 0, K > 0.

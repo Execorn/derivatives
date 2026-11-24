@@ -17,7 +17,6 @@ from scipy.stats import norm
 
 from deepvol.models.schwartz_smith import (
     schwartz_smith_price_black76,
-    conditional_variance,
     A_factor
 )
 
