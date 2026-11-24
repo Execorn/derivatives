@@ -8,16 +8,19 @@ and runs on CPU/GPU in under 1 ms.
 """
 
 from __future__ import annotations
+from typing import Any, Union
+import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn as nn
-import numpy as np
 from deepvol.surrogates.normalizers import IVSurfaceNormalizer
 
 
 # ─── Black-Scholes PyTorch Utilities (Double Precision) ───────────────────────
 
-@torch.compile(mode="reduce-overhead")
-def bs_call_price_pt(S: torch.Tensor, K: torch.Tensor, T: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+def _bs_call_price_pt_impl(
+    S: torch.Tensor, K: torch.Tensor, T: torch.Tensor, sigma: torch.Tensor
+) -> torch.Tensor:
     """
     Vectorized Black-Scholes call option pricing in PyTorch.
     Assumes r=0, q=0. Numerically safeguarded near boundary conditions.
@@ -55,8 +58,23 @@ def bs_call_price_pt(S: torch.Tensor, K: torch.Tensor, T: torch.Tensor, sigma: t
     return c.clone()
 
 
-@torch.compile(mode="reduce-overhead")
-def bs_iv_inversion_hybrid(
+_bs_call_price_pt_compiled = torch.compile(_bs_call_price_pt_impl, mode="reduce-overhead")
+
+
+def bs_call_price_pt(
+    S: torch.Tensor, K: torch.Tensor, T: torch.Tensor, sigma: torch.Tensor
+) -> torch.Tensor:
+    """Dispatch BS call pricing eagerly on CPU or autograd paths; compile CUDA inference."""
+    on_cuda = S.is_cuda or K.is_cuda or T.is_cuda or sigma.is_cuda
+    tracks_grad = torch.is_grad_enabled() and (
+        S.requires_grad or K.requires_grad or T.requires_grad or sigma.requires_grad
+    )
+    if on_cuda and not tracks_grad:
+        return _bs_call_price_pt_compiled(S, K, T, sigma)
+    return _bs_call_price_pt_impl(S, K, T, sigma)
+
+
+def _bs_iv_inversion_hybrid_impl(
     price: torch.Tensor,
     S: torch.Tensor,
     K: torch.Tensor,
@@ -86,17 +104,18 @@ def bs_iv_inversion_hybrid(
     K_safe = torch.clamp(K, min=1e-15)
     
     # 1. Bisection search starting from 0.01 to clamp minimum volatility to 0.01
-    low = torch.full_like(price, 0.01, dtype=torch.float64)
-    high = torch.full_like(price, 5.0, dtype=torch.float64)
-    
-    for _ in range(max_bisection_iter):
-        mid = 0.5 * (low + high)
-        p_mid = bs_call_price_pt(S, K, T, mid)
-        mask_too_high = p_mid >= price
-        high = torch.where(mask_too_high, mid, high)
-        low = torch.where(~mask_too_high, mid, low)
-        
-    sigma = 0.5 * (low + high)
+    with torch.no_grad():
+        low = torch.full_like(price, 0.01, dtype=torch.float64)
+        high = torch.full_like(price, 5.0, dtype=torch.float64)
+
+        for _ in range(max_bisection_iter):
+            mid = 0.5 * (low + high)
+            p_mid = _bs_call_price_pt_impl(S, K, T, mid)
+            mask_too_high = p_mid >= price
+            high = torch.where(mask_too_high, mid, high)
+            low = torch.where(~mask_too_high, mid, low)
+
+        sigma = 0.5 * (low + high)
     # Detach to avoid backpropagating through the non-differentiable bisection search steps
     sigma = sigma.detach()
     sigma = torch.clamp(sigma, min=0.01, max=5.0)
@@ -108,7 +127,7 @@ def bs_iv_inversion_hybrid(
         vol_std_clamped = torch.clamp(vol_std, min=1e-12)
         
         d1 = (torch.log(S_safe / K_safe) + 0.5 * vol_std_clamped**2) / vol_std_clamped
-        p_curr = bs_call_price_pt(S, K, T, sigma)
+        p_curr = _bs_call_price_pt_impl(S, K, T, sigma)
         
         # Vega = S * N'(d1) * sqrt(T)
         pdf_d1 = torch.exp(-0.5 * d1**2) / SQRT_2PI
@@ -129,6 +148,34 @@ def bs_iv_inversion_hybrid(
     return sigma.clone()
 
 
+_bs_iv_inversion_hybrid_compiled = torch.compile(
+    _bs_iv_inversion_hybrid_impl, mode="reduce-overhead"
+)
+
+
+def bs_iv_inversion_hybrid(
+    price: torch.Tensor,
+    S: torch.Tensor,
+    K: torch.Tensor,
+    T: torch.Tensor,
+    max_bisection_iter: int = 18,
+    max_newton_iter: int = 3,
+    tol: float = 1e-12,
+) -> torch.Tensor:
+    """Dispatch BS IV inversion eagerly on CPU or autograd paths; compile CUDA inference."""
+    on_cuda = price.is_cuda or S.is_cuda or K.is_cuda or T.is_cuda
+    tracks_grad = torch.is_grad_enabled() and (
+        price.requires_grad or S.requires_grad or K.requires_grad or T.requires_grad
+    )
+    if on_cuda and not tracks_grad:
+        return _bs_iv_inversion_hybrid_compiled(
+            price, S, K, T, max_bisection_iter, max_newton_iter, tol
+        )
+    return _bs_iv_inversion_hybrid_impl(
+        price, S, K, T, max_bisection_iter, max_newton_iter, tol
+    )
+
+
 # ─── Differentiable No-Arbitrage Projection Layer ────────────────────────────
 
 class DifferentiableArbitrageFreeProjection(nn.Module):
@@ -137,34 +184,41 @@ class DifferentiableArbitrageFreeProjection(nn.Module):
     onto the calendar and butterfly spread arbitrage-free subspace in a single,
     fully differentiable, GPU-accelerated forward pass.
     """
+
+    T_grid: torch.Tensor
+    K_grid: torch.Tensor
+    K_abs: torch.Tensor
+
     def __init__(
         self,
-        T_grid: np.ndarray | torch.Tensor,
-        K_grid: np.ndarray | torch.Tensor,
+        T_grid: Union[npt.NDArray[Any], torch.Tensor],
+        K_grid: Union[npt.NDArray[Any], torch.Tensor],
         S0: float = 1.0,
         is_log_moneyness: bool = True
-    ):
+    ) -> None:
         super().__init__()
         self.S0 = S0
         self.is_log_moneyness = is_log_moneyness
         
         # Convert grids to PyTorch tensors
         if isinstance(T_grid, np.ndarray):
-            self.register_buffer("T_grid", torch.tensor(T_grid, dtype=torch.float64))
+            t_grid_t = torch.tensor(T_grid, dtype=torch.float64)
         else:
-            self.register_buffer("T_grid", T_grid.clone().detach().to(torch.float64))
+            t_grid_t = T_grid.clone().detach().to(torch.float64)
+        self.register_buffer("T_grid", t_grid_t)
             
         if isinstance(K_grid, np.ndarray):
-            self.register_buffer("K_grid", torch.tensor(K_grid, dtype=torch.float64))
+            k_grid_t = torch.tensor(K_grid, dtype=torch.float64)
         else:
-            self.register_buffer("K_grid", K_grid.clone().detach().to(torch.float64))
+            k_grid_t = K_grid.clone().detach().to(torch.float64)
+        self.register_buffer("K_grid", k_grid_t)
 
         # Calculate absolute strikes
         if self.is_log_moneyness:
             # k = ln(K/S0) -> K = S0 * exp(k)
-            self.register_buffer("K_abs", self.S0 * torch.exp(self.K_grid))
+            self.register_buffer("K_abs", self.S0 * torch.exp(k_grid_t))
         else:
-            self.register_buffer("K_abs", self.K_grid)
+            self.register_buffer("K_abs", k_grid_t)
 
     def forward(self, iv_surface: torch.Tensor) -> torch.Tensor:
         """
