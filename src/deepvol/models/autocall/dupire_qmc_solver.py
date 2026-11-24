@@ -373,12 +373,24 @@ def enforce_no_arbitrage_projection_with_jacobian(
         raise ValueError(
             f"SMILE_ARBITRAGE: Non-finite (NaN/Inf) values in volatility surface={surface_id}."
         )
-    if np.any(t_arr <= 0.0) or np.any(np.diff(t_arr) <= 0.0):
+    if np.any(t_arr <= 0.0):
+        m_b = int(np.flatnonzero(t_arr <= 0.0)[0])
         raise ValueError(
-            f"SMILE_ARBITRAGE: Expiration tenors must be strictly positive and increasing on surface={surface_id}."
+            f"SMILE_ARBITRAGE: Expiration tenor must be strictly positive on surface={surface_id}, "
+            f"slice={m_b} (T={float(t_arr[m_b]):.4f}Y)."
+        )
+    if np.any(np.diff(t_arr) <= 0.0):
+        m_b = int(np.flatnonzero(np.diff(t_arr) <= 0.0)[0]) + 1
+        raise ValueError(
+            f"SMILE_ARBITRAGE: Expiration tenors must be strictly increasing on surface={surface_id}, "
+            f"slice={m_b} (prev_T={float(t_arr[m_b - 1]):.4f}Y -> T={float(t_arr[m_b]):.4f}Y)."
         )
     if np.any(k_arr <= 0.0):
-        raise ValueError(f"SMILE_ARBITRAGE: Strikes must be strictly positive on surface={surface_id}.")
+        j_b = int(np.flatnonzero(k_arr <= 0.0)[0])
+        raise ValueError(
+            f"SMILE_ARBITRAGE: Strikes must be strictly positive on surface={surface_id}, "
+            f"K={float(k_arr[j_b]):.4f}."
+        )
     if np.any(q_arr < 1e-4):
         bad_low = np.argwhere(q_arr < 1e-4)
         m_b, j_b = int(bad_low[0, 0]), int(bad_low[0, 1])
@@ -430,7 +442,9 @@ def enforce_no_arbitrage_projection_with_jacobian(
 
         n_unique = len(unique_k_list)
         if n_unique < 2:
-            raise ValueError("SMILE_ARBITRAGE: Fewer than 2 unique strikes after deduplication.")
+            raise ValueError(
+                f"SMILE_ARBITRAGE: Fewer than 2 unique strikes after deduplication on surface={surface_id}."
+            )
 
         dedup_matrix = np.zeros((n_unique, len(k_arr)), dtype=np.float64)
         for u_idx, g in enumerate(groups):
@@ -547,16 +561,24 @@ def enforce_no_arbitrage_projection_with_jacobian(
                 min_d2c_core = float(np.min(d2c_m)) if len(d2c_m) > 0 else 0.0
                 j_worst_core = int(np.argmin(d2c_m)) + 1 if len(d2c_m) > 0 else 1
 
-            j_off = (
-                j_first_severe
-                if j_first_severe is not None
-                else (j_first_mild if j_first_mild is not None else j_worst_core)
-            )
+            if j_first_severe is not None:
+                j_off = j_first_severe
+            elif j_first_mild is not None:
+                j_off = j_first_mild
+            elif min_d2c_core < 0.0:
+                j_off = j_worst_core
+            elif (min_g_core < -10.0 or min_g_all < -25.0) and len(g_eval) > 0:
+                g_idx = int(np.argmin(g_eval))
+                j_off = g_idx if g_idx < n_u else min((g_idx - n_u) + 1, n_u - 1)
+            else:
+                j_off = j_worst_core
             j_prev = max(j_off - 1, 0)
             strike_val = float(unique_strikes[j_off])
             prev_strike_val = float(unique_strikes[j_prev])
             v_prev = float(projected_quotes[m, j_prev])
             v_curr = float(projected_quotes[m, j_off])
+            min_slope_m = float(np.min(slopes_m)) if len(slopes_m) > 0 else 0.0
+            max_slope_m = float(np.max(slopes_m)) if len(slopes_m) > 0 else 0.0
 
             if min_d2c_core < -1e-3 or min_g_core < -10.0 or min_g_all < -25.0:
                 surf_min_d2c, surf_min_g = _compute_surface_worst_metrics()
@@ -567,7 +589,8 @@ def enforce_no_arbitrage_projection_with_jacobian(
                     f"surface={surface_id}, slice={m} (T={t_m:.4f}Y), "
                     f"K={strike_val:.4f} (prev_K={prev_strike_val:.4f} -> K={strike_val:.4f}, "
                     f"vol_jump={v_prev:.5f}->{v_curr:.5f}), "
-                    f"min_d2c={min_d2c_val:.6f}, min_g={min_g_val:.4f}."
+                    f"min_d2c={min_d2c_val:.6f}, min_g={min_g_val:.4f}, "
+                    f"slope_range=[{min_slope_m:.4f}, {max_slope_m:.4f}]."
                 )
 
             if min_d2c_core < -1e-4:
@@ -658,11 +681,16 @@ def enforce_no_arbitrage_projection_with_jacobian(
                 min_d2_post_core = float(np.min(core_d2_post)) if len(core_d2_post) > 0 else 0.0
                 if min_d2_post_core < -1e-3 or min_g_post_core < -10.0 or min_g_post_all < -25.0:
                     surf_min_d2c, surf_min_g = _compute_surface_worst_metrics()
+                    j_post = int(np.argmin(d2_post)) + 1 if len(d2_post) > 0 else 1
+                    k_post = float(unique_strikes[min(j_post, n_u - 1)])
+                    min_sl_p = float(np.min(sl_post)) if len(sl_post) > 0 else 0.0
+                    max_sl_p = float(np.max(sl_post)) if len(sl_post) > 0 else 0.0
                     raise ValueError(
                         f"SMILE_ARBITRAGE: Post-projection slice {m} fails convexity: "
-                        f"surface={surface_id}, slice={m} (T={t_m:.4f}Y), "
+                        f"surface={surface_id}, slice={m} (T={t_m:.4f}Y), K={k_post:.4f}, "
                         f"min_d2c={min(min_d2_post_core, surf_min_d2c):.6f}, "
-                        f"min_g={min(min_g_post_core, surf_min_g):.4f}."
+                        f"min_g={min(min_g_post_core, surf_min_g):.4f}, "
+                        f"slope_range=[{min_sl_p:.4f}, {max_sl_p:.4f}]."
                     )
                 if min_d2_post_core < -1e-4:
                     for j_c in range(1, n_u - 1):
@@ -677,14 +705,18 @@ def enforce_no_arbitrage_projection_with_jacobian(
                     if warnings_out is not None and "SMILE_ARBITRAGE_PROJECTED" not in warnings_out:
                         warnings_out.append("SMILE_ARBITRAGE_PROJECTED")
                     c_post_chk = _b76_norm_call(y_u, (projected_quotes[m] * projected_quotes[m]) * t_m)
-                    d2_post_chk = np.diff(np.diff(c_post_chk) / dk_step)
+                    sl_post_chk = np.diff(c_post_chk) / dk_step
+                    d2_post_chk = np.diff(sl_post_chk)
                     core_chk = d2_post_chk[core_strike_mask[1:-1]] if np.any(core_strike_mask[1:-1]) else d2_post_chk
                     if len(core_chk) > 0 and float(np.min(core_chk)) < -1e-3:
                         surf_min_d2c, surf_min_g = _compute_surface_worst_metrics()
+                        j_chk = int(np.argmin(d2_post_chk)) + 1 if len(d2_post_chk) > 0 else 1
+                        k_chk = float(unique_strikes[min(j_chk, n_u - 1)])
                         raise ValueError(
                             f"SMILE_ARBITRAGE: Post-projection slice {m} remains non-convex: "
-                            f"surface={surface_id}, slice={m} (T={t_m:.4f}Y), "
-                            f"min_d2c={min(float(np.min(core_chk)), surf_min_d2c):.6f}, min_g={surf_min_g:.4f}."
+                            f"surface={surface_id}, slice={m} (T={t_m:.4f}Y), K={k_chk:.4f}, "
+                            f"min_d2c={min(float(np.min(core_chk)), surf_min_d2c):.6f}, min_g={surf_min_g:.4f}, "
+                            f"slope_range=[{float(np.min(sl_post_chk)):.4f}, {float(np.max(sl_post_chk)):.4f}]."
                         )
 
     cal_jacobian = np.zeros((n_exp, n_exp, n_u), dtype=np.float64)

@@ -137,9 +137,9 @@ Checkpoint     : True | Guardian Stats: True
 
 ### A. Direct Python Valuation (`PV`, `37` CashFlows, All `8` Greeks & `RepoRho`)
 
-Instantiate `EQAutocallRuntime(device="cpu", n_fallback_paths=4096)` (or `16384` when running high-precision PV-only QMC checks on long schedules). In-domain trades run directly on the Masked EGNO surrogate in tens of milliseconds on CPU. When an out-of-distribution (`Tier3_DupireQMC`) fallback triggers:
+Instantiate `EQAutocallRuntime(device="cpu", n_fallback_paths=8192)` (or `n_fallback_paths=4096` for faster screening; default `32768`). In-domain trades run directly on the Masked EGNO surrogate in tens of milliseconds on CPU. When an out-of-distribution (`Tier3_DupireQMC`) fallback triggers:
 - **PV + CashFlows only**: runs IEEE-754 `float64` Owen-scrambled Dupire QMC (`n_replicates=8`, `n_substeps_per_period=16`) at `n_fallback_paths`.
-- **All-8 Greeks requested on CPU**: routes single-pass CRN QMC Greeks through a CPU-bounded budget (`n_paths <= 1024`, `n_replicates=1`, `n_substeps=2`, `lv_grid_nt=16`, `lv_grid_ny=32`) so CPU Greek sweeps complete quickly without hanging.
+- **All-8 Greeks requested on CPU**: routes single-pass CRN QMC Greeks through an adaptive CPU budget scaled by `n_fallback_paths` (`<= 1024` keeps tiny unit-test runs fast at `n_replicates=1, n_substeps=2, lv_grid=16x32`; `4096 <= n_fallback_paths < 8192` uses `n_paths=4096, n_replicates=1, lv_grid=32x64`; `n_fallback_paths >= 8192` uses `n_paths=8192, n_replicates=2, lv_grid=32x64`, with `n_substeps=4` when `m_rem * d_assets <= 48` and `2` on longer schedules) so long-maturity OOD deals achieve `< 5 bps` median PV/Greek accuracy in `< 2.5 s/deal`.
 
 ```bash
 .venv/bin/python - <<'PY'
@@ -281,9 +281,12 @@ Use this workflow to validate a full converted Production Shadow batch (`batch b
 
 1. **Always strip embedded `Queries` in PV-only mode**: Production Shadow JSON requests carry all Greek query names (`Delta`, `Gamma`, `Vega`, `Rho`, `DividendsSensitivities`, `Theta`, `Cega`, `MultivariateAggregatedCashGamma`) inside `payload["Queries"]`. Passing `include_all_greeks=False` alone does **not** remove queries already present in `payload["Queries"]`; replace `payload["Queries"] = ["ProductValue", "CashFlows"]` explicitly when running PV + CashFlows reconciliation.
 2. **Choose the right CPU mode (`pv_only` vs `all_greeks`)**:
-   - `--mode pv_only` (recommended for Murex PV reconciliation): OOD trades run IEEE-754 `float64` Dupire QMC (`n_substeps_per_period=16`, `n_replicates=8`) at `--n-paths`. Use `--n-paths 4096` for fast screening across all 106 deals, or `--n-paths 16384` for tighter convergence on long-maturity OOD structures (e.g. `M=60` deals such as `53391858`).
-   - `--mode all_greeks`: Passes `include_all_greeks=True` and validates that `ProductValue`, `CashFlows`, all `8` Greeks (`Delta`, `Gamma`, `MultivariateAggregatedCashGamma`, `Vega`, `Rho`, `DividendsSensitivities`, `Theta`, `Cega`), and `RepoRho` (when `RepoSpreadCurves` is present) are finite and free of `NaN`/`Inf`. On `device="cpu"`, OOD single-pass CRN QMC Greeks are internally bounded (`n_paths <= 1024`, `n_replicates=1`, `n_substeps=2`, `lv_grid_nt=16`, `lv_grid_ny=32`) so long-schedule OOD sweeps finish fast without hanging; expect higher Monte Carlo variance on `M=36..60` OOD PV values in `all_greeks` CPU mode than in `pv_only` at `--n-paths 16384`. *(For deep single-trade CPU CRN inspection at higher path counts, build `AutocallPreprocState` via `preprocess_eq_autocall(req)` and call `compute_qmc_crn_greeks(state, queries=..., config=DupireQMCConfig(...), device="cpu")` directly.)*
-3. **Catch expected `SMILE_ARBITRAGE` rejections per deal**: Batch `b10316f2` includes `8` deals whose input volatility smiles violate static no-arbitrage bounds (for example, `IRAO_RUB` call-spread slope violations on `51428866` and `64649478`). `EQAutocallRuntime.price_trade` intentionally raises `ValueError: SMILE_ARBITRAGE: ...` naming the offending ticker. Catch `ValueError` per file instead of aborting the batch.
+   - `--mode pv_only` (recommended for Murex PV reconciliation): OOD trades run IEEE-754 `float64` Dupire QMC (`n_substeps_per_period=16`, `n_replicates=8`) at `--n-paths`. Use `--n-paths 4096` for fast screening across all 106 deals, or `--n-paths 16384` / `32768` for tighter convergence on long-maturity OOD structures (e.g. `M=60` deals such as `53391858`).
+   - `--mode all_greeks`: Passes `include_all_greeks=True` and validates that `ProductValue`, `CashFlows`, all `8` Greeks (`Delta`, `Gamma`, `MultivariateAggregatedCashGamma`, `Vega`, `Rho`, `DividendsSensitivities`, `Theta`, `Cega`), and `RepoRho` (when `RepoSpreadCurves` is present) are finite and free of `NaN`/`Inf`. On `device="cpu"`, `_compute_qmc_crn_if_available` scales CPU CRN precision with `n_fallback_paths`:
+     - `--n-paths 4096`: runs a 4,096-point Sobol pass (`n_replicates=1`, `lv_grid=32x64`, `n_substeps=4` for `m_rem * d_assets <= 48`, `2` otherwise) — `12/12` PS sample deals achieve `2.24 bps` median `|PV diff|` vs Murex (`-2.56 bps` on `M=60` `53391858`, max `1.92 s/deal`).
+     - `--n-paths 8192` (or default `32768`): runs an 8,192-path, 2-replicate Owen-scrambled RQMC pass (`4,096` Sobol points per scramble, `lv_grid=32x64`) — `12/12` PS sample deals achieve `1.11 bps` median `|PV diff|` vs Murex (`-4.31 bps`, `SE=1.75 bps` on `M=60` `53391858`, max `13.17 bps`, `p50=0.59 s`, max `2.39 s/deal`) and `<= 3.32 bps` across all 8 Greeks vs a 32,768-path reference.
+     *(For deep single-trade CPU CRN inspection at custom path/substep counts, build `AutocallPreprocState` via `preprocess_eq_autocall(req)` and call `compute_qmc_crn_greeks(state, queries=..., config=DupireQMCConfig(...), device="cpu")` directly.)*
+3. **Catch expected `SMILE_ARBITRAGE` rejections per deal**: Batch `b10316f2` includes `8` deals whose input volatility smiles violate static no-arbitrage bounds (for example, `IRAO_RUB` call-spread slope violations on `51428866` and `64649478`). `EQAutocallRuntime.price_trade` intentionally raises `ValueError: SMILE_ARBITRAGE: ...` naming `surface=<ticker>`, `slice=<m>`, `K=<strike>`, `vol_jump=...`, `slope=...`, and `min_d2c=...` in `<= 0.4 ms` cold. Catch `ValueError` per file instead of aborting the batch.
 4. **Schema conversion checklist (when regenerating JSON requests from raw Murex messages)**:
    - Keep `"Cega"` as `"Cega"` inside `Queries` (never `"CorrelationSensitivities"`).
    - Route FX volatility matrices with `"TypeName": "FXVolatilitySmileCollection"` inside `MarketDataSet.VolatilitySurfaces`.
@@ -573,12 +576,12 @@ Point `--requests-dir` and `--expected-dir` at your extracted 106-deal Productio
   --n-paths 16384 \
   --out-csv /tmp/ps_106_pv16384_cpu.csv
 
-# 3. Full All-8 Greeks + RepoRho structural & finiteness sweep across all 106 deals
+# 3. Full All-8 Greeks + RepoRho structural, finiteness & accuracy sweep across all 106 (or 14 sample) deals
 .venv/bin/python /tmp/run_ps_batch_cpu.py \
   --requests-dir <batch_dir>/requests \
   --expected-dir <batch_dir>/expected_murex \
   --mode all_greeks \
-  --n-paths 4096 \
+  --n-paths 8192 \
   --out-csv /tmp/ps_106_allgreeks_cpu.csv
 ```
 
@@ -587,3 +590,12 @@ Expected pass criteria on the full 106-deal Production Shadow batch (`b10316f28c
 - `UnexpectedErrors = 0`, `NonFinite = 0`, `MissingGreeks = 0`.
 - `PSI_DRIFT_BREACH = 0` inside `Fallback Reasons`.
 - All `8` Greek fields plus `RepoRho` (when `RepoSpreadCurves` is provided) populated and finite across all `98` priced trades in `--mode all_greeks`.
+
+Observed 14-deal sample bundle (`ps_audit_b10316f2/deals/full_ps_requests`, `12` priced + `2` `SMILE_ARBITRAGE` rejections) CPU benchmarks:
+
+| Mode | `n_fallback_paths` | Median `|PV Diff|` | `53391858` (`M=60`) Diff | Max `|PV Diff|` | `p50` Latency | Max Latency |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `pv_only` | `4096` | `8.83 bps` | `-26.82 bps` | `55.73 bps` | `499.5 ms` | `4065.9 ms` |
+| `pv_only` | `32768` | `3.24 bps` | `-6.41 bps` | `20.03 bps` | `4053.6 ms` | `32852.7 ms` |
+| `all_greeks` | `4096` | `2.24 bps` | `-2.56 bps` | `15.78 bps` | `414.6 ms` | `1922.2 ms` |
+| `all_greeks` | `8192` / `32768` | `1.11 bps` | `-4.31 bps` | `13.17 bps` | `593.3 ms` | `2389.7 ms` |

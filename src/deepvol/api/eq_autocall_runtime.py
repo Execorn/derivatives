@@ -355,35 +355,50 @@ def _put_surface_arb_cache(
 
 def _validate_fx_surface_quotes(ticker: str, surf: Any, quotes: npt.NDArray[np.float64]) -> None:
     if quotes.size == 0 or quotes.ndim != 2:
-        raise ValueError(f"SMILE_ARBITRAGE: FX volatility quotes for {ticker} must be a non-empty 2D grid.")
+        raise ValueError(
+            f"SMILE_ARBITRAGE: FX volatility quotes on surface={ticker} must be a non-empty 2D grid."
+        )
     if not bool(np.all(np.isfinite(quotes))):
-        raise ValueError(f"SMILE_ARBITRAGE: Non-finite volatility surface quotes for {ticker}.")
+        bad_q = np.argwhere(~np.isfinite(quotes))
+        m_b, j_b = int(bad_q[0, 0]), int(bad_q[0, 1])
+        raise ValueError(
+            f"SMILE_ARBITRAGE: Non-finite volatility quote on surface={ticker}, "
+            f"slice={m_b}, col={j_b}, quote={float(quotes[m_b, j_b])!r}."
+        )
     tenors_attr = getattr(surf, "Tenors", None)
     if tenors_attr is not None and (len(tenors_attr) == 0 or quotes.shape[0] != len(tenors_attr)):
         raise ValueError(
-            f"SMILE_ARBITRAGE: FX Tenors count ({len(tenors_attr)}) != VolatilityQuotes rows ({quotes.shape[0]}) for {ticker}."
+            f"SMILE_ARBITRAGE: FX Tenors count ({len(tenors_attr)}) != VolatilityQuotes rows ({quotes.shape[0]}) on surface={ticker}."
         )
     deltas_attr = getattr(surf, "Deltas", None)
     if deltas_attr is not None:
         if len(deltas_attr) == 0 or quotes.shape[1] != len(deltas_attr):
             raise ValueError(
-                f"SMILE_ARBITRAGE: FX Deltas count ({len(deltas_attr)}) != VolatilityQuotes cols ({quotes.shape[1]}) for {ticker}."
+                f"SMILE_ARBITRAGE: FX Deltas count ({len(deltas_attr)}) != VolatilityQuotes cols ({quotes.shape[1]}) on surface={ticker}."
             )
         for col_idx, delta_tok in enumerate(deltas_attr):
             tok_u = str(delta_tok).strip().upper()
             col = quotes[:, col_idx]
             if "RR" in tok_u or "BF" in tok_u:
                 if bool(np.any(np.abs(col) > 5.00)):
+                    m_b = int(np.argmax(np.abs(col)))
                     raise ValueError(
-                        f"SMILE_ARBITRAGE: FX RR/BF quote for {ticker} col {delta_tok!r} exceeds |5.00|."
+                        f"SMILE_ARBITRAGE: FX RR/BF quote out of bounds on surface={ticker}, "
+                        f"slice={m_b}, col={delta_tok!r}, quote={float(col[m_b]):.5f} (exceeds |5.00|)."
                     )
             elif bool(np.any(col < 1e-4)) or bool(np.any(col > 5.00)):
+                bad_col = np.flatnonzero((col < 1e-4) | (col > 5.00))
+                m_b = int(bad_col[0])
                 raise ValueError(
-                    f"SMILE_ARBITRAGE: FX volatility quotes for {ticker} out of certifiable bounds [1e-4, 5.00]."
+                    f"SMILE_ARBITRAGE: FX volatility quote out of certifiable bounds [1e-4, 5.00] on surface={ticker}, "
+                    f"slice={m_b}, col={delta_tok!r}, quote={float(col[m_b]):.5f}."
                 )
     elif bool(np.any(quotes < 1e-4)) or bool(np.any(quotes > 5.00)):
+        bad_q = np.argwhere((quotes < 1e-4) | (quotes > 5.00))
+        m_b, j_b = int(bad_q[0, 0]), int(bad_q[0, 1])
         raise ValueError(
-            f"SMILE_ARBITRAGE: Volatility quotes for {ticker} out of certifiable bounds [1e-4, 5.00]."
+            f"SMILE_ARBITRAGE: FX volatility quote out of certifiable bounds [1e-4, 5.00] on surface={ticker}, "
+            f"slice={m_b}, col={j_b}, quote={float(quotes[m_b, j_b]):.5f}."
         )
 
 
@@ -432,20 +447,33 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
         quotes = np.asarray(surf.VolatilityQuotes, dtype=np.float64)
         strikes = np.asarray(strikes_attr, dtype=np.float64)
         if quotes.size == 0 or quotes.ndim != 2:
-            raise ValueError(f"SMILE_ARBITRAGE: VolatilityQuotes for {ticker} must be non-empty 2D.")
+            raise ValueError(
+                f"SMILE_ARBITRAGE: VolatilityQuotes on surface={ticker} must be non-empty 2D."
+            )
         q_min = float(quotes.min())
         q_max = float(quotes.max())
         if not (math.isfinite(q_min) and math.isfinite(q_max)):
-            raise ValueError(f"SMILE_ARBITRAGE: Non-finite volatility surface quotes for {ticker}.")
+            bad_q = np.argwhere(~np.isfinite(quotes))
+            m_b, j_b = int(bad_q[0, 0]), int(bad_q[0, 1])
+            k_b = float(strikes[j_b]) if (strikes.ndim == 1 and j_b < strikes.size) else float("nan")
+            raise ValueError(
+                f"SMILE_ARBITRAGE: Non-finite volatility surface quote on surface={ticker}, "
+                f"slice={m_b}, K={k_b:.4f}, quote={float(quotes[m_b, j_b])!r}."
+            )
         if strikes.size == 0:
-            raise ValueError(f"SMILE_ARBITRAGE: Non-finite volatility surface strikes for {ticker}.")
+            raise ValueError(f"SMILE_ARBITRAGE: Non-finite volatility surface strikes on surface={ticker}.")
         s_min = float(strikes.min())
         s_max = float(strikes.max())
         if not (math.isfinite(s_min) and math.isfinite(s_max)):
-            raise ValueError(f"SMILE_ARBITRAGE: Non-finite volatility surface strikes for {ticker}.")
+            bad_s = np.flatnonzero(~np.isfinite(strikes))
+            j_b = int(bad_s[0]) if bad_s.size > 0 else 0
+            raise ValueError(
+                f"SMILE_ARBITRAGE: Non-finite volatility surface strike on surface={ticker}, "
+                f"strike_idx={j_b}, K={float(strikes.flat[j_b])!r}."
+            )
         n_exp = len(exp_dates_attr)
         if n_exp == 0:
-            raise ValueError(f"SMILE_ARBITRAGE: Missing ExpirationDates for {ticker}.")
+            raise ValueError(f"SMILE_ARBITRAGE: Missing ExpirationDates on surface={ticker}.")
 
         exp_utc_list = [
             d if (isinstance(d, datetime) and d.tzinfo is utc_tz) else _to_utc_datetime(d)
@@ -479,16 +507,26 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
         if fast_verdict is not None:
             is_valid_f, cached_err_f = fast_verdict
             if not is_valid_f:
-                raise ValueError(cached_err_f or f"SMILE_ARBITRAGE: Invalid volatility surface for {ticker}.")
+                raise ValueError(
+                    cached_err_f or f"SMILE_ARBITRAGE: Invalid volatility surface on surface={ticker}."
+                )
             continue
 
         try:
             if q_min < 1e-4 or q_max > 5.00:
+                bad_q = np.argwhere((quotes < 1e-4) | (quotes > 5.00))
+                m_b, j_b = int(bad_q[0, 0]), int(bad_q[0, 1])
+                k_b = float(strikes[j_b]) if (strikes.ndim == 1 and j_b < strikes.size) else float("nan")
                 raise ValueError(
-                    f"SMILE_ARBITRAGE: Volatility quotes for {ticker} out of certifiable bounds [1e-4, 5.00]."
+                    f"SMILE_ARBITRAGE: Volatility quote out of certifiable bounds [1e-4, 5.00] on surface={ticker}, "
+                    f"slice={m_b}, K={k_b:.4f}, quote={float(quotes[m_b, j_b]):.5f}."
                 )
             if s_min <= 0.0:
-                raise ValueError(f"SMILE_ARBITRAGE: Non-positive strikes in surface for {ticker}.")
+                bad_k = np.flatnonzero(strikes <= 0.0)
+                j_b = int(bad_k[0]) if bad_k.size > 0 else 0
+                raise ValueError(
+                    f"SMILE_ARBITRAGE: Non-positive strike on surface={ticker}, K={float(strikes.flat[j_b]):.4f}."
+                )
             if strikes.size >= 2 and bool(np.all(np.diff(strikes) > 1e-9)):
                 u_s = strikes
                 already_sorted = True
@@ -499,50 +537,76 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                 u_s = s_sorted[keep]
                 already_sorted = False
             if len(u_s) < 2:
-                raise ValueError(f"SMILE_ARBITRAGE: Fewer than 2 distinct strikes in surface for {ticker}.")
+                raise ValueError(
+                    f"SMILE_ARBITRAGE: Fewer than 2 distinct strikes on surface={ticker}."
+                )
             prev_exp = as_of_utc
             t_vals: list[float] = []
             inv_sec_yr = 1.0 / 31536000.0
             for idx, exp_utc in enumerate(exp_utc_list):
                 if idx == 0 and exp_utc <= as_of_utc:
                     raise ValueError(
-                        f"SMILE_ARBITRAGE: ExpirationDate {exp_utc.isoformat()} <= AsOfDate for {ticker}."
+                        f"SMILE_ARBITRAGE: ExpirationDate {exp_utc.isoformat()} <= AsOfDate on surface={ticker}, slice=0."
                     )
                 if idx > 0 and exp_utc <= prev_exp:
                     raise ValueError(
-                        f"SMILE_ARBITRAGE: Non-increasing ExpirationDates in surface for {ticker}."
+                        f"SMILE_ARBITRAGE: Non-increasing ExpirationDates on surface={ticker}, slice={idx}."
                     )
                 t_vals.append(max((exp_utc - as_of_utc).total_seconds() * inv_sec_yr, 1e-8))
                 prev_exp = exp_utc
 
             if quotes.shape != (n_exp, strikes.size):
                 raise ValueError(
-                    f"SMILE_ARBITRAGE: Quotes shape {quotes.shape} != ({n_exp}, {strikes.size}) for {ticker}."
+                    f"SMILE_ARBITRAGE: Quotes shape {quotes.shape} != ({n_exp}, {strikes.size}) on surface={ticker}."
                 )
 
-            q_u = quotes if already_sorted else quotes[:, order][:, keep]
-            t_vec = np.asarray(t_vals, dtype=np.float64)[:, None]
-            k_ref = float(u_s[len(u_s) >> 1]) if already_sorted else float(np.median(u_s))
-            k_norm = u_s / k_ref
-            y = np.log(k_norm)[None, :]
-            sqrt_w = np.sqrt(np.maximum((q_u * q_u) * t_vec, 1e-12))
-            d1 = -y / sqrt_w + 0.5 * sqrt_w
-            d2 = d1 - sqrt_w
-            calls = ndtr(d1) - k_norm[None, :] * ndtr(d2)
-            dk = np.diff(k_norm)
-            slopes = np.diff(calls, axis=1) / dk[None, :]
-            max_slope = float(slopes.max())
-            min_slope = float(slopes.min())
-            if max_slope > 1e-3 or min_slope < -1.0 - 1e-3:
-                raise ValueError(
-                    f"SMILE_ARBITRAGE: Call-spread slope violation on {ticker} (range [{min_slope:.4f}, {max_slope:.4f}])."
-                )
-            if len(u_s) >= 3:
-                min_d2c = float(np.diff(slopes, axis=1).min())
-                if min_d2c < -1e-3:
+            # Constant-volatility Black-76 smiles are strictly decreasing and convex across positive strikes.
+            if q_max > q_min:
+                q_u = quotes if already_sorted else quotes[:, order][:, keep]
+                t_vec = np.asarray(t_vals, dtype=np.float64)[:, None]
+                k_ref = float(u_s[len(u_s) >> 1]) if already_sorted else float(np.median(u_s))
+                k_norm = u_s / k_ref
+                y = np.log(k_norm)[None, :]
+                sqrt_w = np.sqrt(np.maximum((q_u * q_u) * t_vec, 1e-12))
+                d1 = -y / sqrt_w + 0.5 * sqrt_w
+                d2 = d1 - sqrt_w
+                calls = ndtr(d1) - k_norm[None, :] * ndtr(d2)
+                dk = np.diff(k_norm)
+                slopes = np.diff(calls, axis=1) / dk[None, :]
+                max_slope = float(slopes.max())
+                min_slope = float(slopes.min())
+                if max_slope > 1e-3 or min_slope < -1.0 - 1e-3:
+                    if max_slope > 1e-3 and (min_slope >= -1.0 - 1e-3 or max_slope >= -1.0 - min_slope):
+                        m_off, j_seg = map(int, np.unravel_index(int(np.argmax(slopes)), slopes.shape))
+                        off_slope = max_slope
+                    else:
+                        m_off, j_seg = map(int, np.unravel_index(int(np.argmin(slopes)), slopes.shape))
+                        off_slope = min_slope
+                    j_prev = j_seg
+                    j_curr = min(j_seg + 1, len(u_s) - 1)
+                    d2c_val = float(np.diff(slopes, axis=1).min()) if len(u_s) >= 3 else 0.0
                     raise ValueError(
-                        f"SMILE_ARBITRAGE: Discrete call convexity violation on {ticker} (min_d2c={min_d2c:.6f})."
+                        f"SMILE_ARBITRAGE: Call-spread slope violation on surface={ticker}, "
+                        f"slice={m_off} (T={t_vals[m_off]:.4f}Y), "
+                        f"K={float(u_s[j_curr]):.4f} (prev_K={float(u_s[j_prev]):.4f} -> K={float(u_s[j_curr]):.4f}, "
+                        f"vol_jump={float(q_u[m_off, j_prev]):.5f}->{float(q_u[m_off, j_curr]):.5f}), "
+                        f"slope={off_slope:.6f} (range [{min_slope:.4f}, {max_slope:.4f}]), "
+                        f"min_d2c={d2c_val:.6f}."
                     )
+                if len(u_s) >= 3:
+                    d2c = np.diff(slopes, axis=1)
+                    min_d2c = float(d2c.min())
+                    if min_d2c < -1e-3:
+                        m_off, j_d2 = map(int, np.unravel_index(int(np.argmin(d2c)), d2c.shape))
+                        j_prev = j_d2
+                        j_curr = min(j_d2 + 1, len(u_s) - 1)
+                        raise ValueError(
+                            f"SMILE_ARBITRAGE: Discrete call convexity violation on surface={ticker}, "
+                            f"slice={m_off} (T={t_vals[m_off]:.4f}Y), "
+                            f"K={float(u_s[j_curr]):.4f} (prev_K={float(u_s[j_prev]):.4f} -> K={float(u_s[j_curr]):.4f}, "
+                            f"vol_jump={float(q_u[m_off, j_prev]):.5f}->{float(q_u[m_off, j_curr]):.5f}), "
+                            f"min_d2c={min_d2c:.6f}, slope_range=[{min_slope:.4f}, {max_slope:.4f}]."
+                        )
         except ValueError as exc:
             err_msg = str(exc)
             if "SMILE_ARBITRAGE" in err_msg:
@@ -1160,14 +1224,44 @@ def _compute_qmc_crn_if_available(
                     except ImportError:
                         continue
                 if cfg_cls is not None:
-                    # Keep explicit tiny test budgets and CPU fallbacks bounded so unit runs finish quickly.
-                    crn_kwargs["config"] = cfg_cls(
-                        n_paths=min(max(req_paths, 1), 1024),
-                        n_replicates=1,
-                        n_substeps=2,
-                        lv_grid_nt=16,
-                        lv_grid_ny=32,
-                    )
+                    if req_paths <= 1024 or eff_is_cuda:
+                        # Keep tiny unit-test budgets and small CUDA probes fast.
+                        crn_kwargs["config"] = cfg_cls(
+                            n_paths=min(max(req_paths, 1), 1024),
+                            n_replicates=1,
+                            n_substeps=2,
+                            lv_grid_nt=16,
+                            lv_grid_ny=32,
+                        )
+                    else:
+                        step_load = max(int(getattr(state, "m_rem", 1)), 1) * max(
+                            int(getattr(state, "d_assets", 1)), 1
+                        )
+                        cpu_substeps = 4 if step_load <= 48 else 2
+                        if req_paths >= 8192:
+                            crn_kwargs["config"] = cfg_cls(
+                                n_paths=8192,
+                                n_replicates=2,
+                                n_substeps=cpu_substeps,
+                                lv_grid_nt=32,
+                                lv_grid_ny=64,
+                            )
+                        elif req_paths >= 4096:
+                            crn_kwargs["config"] = cfg_cls(
+                                n_paths=4096,
+                                n_replicates=1,
+                                n_substeps=cpu_substeps,
+                                lv_grid_nt=32,
+                                lv_grid_ny=64,
+                            )
+                        else:
+                            crn_kwargs["config"] = cfg_cls(
+                                n_paths=min(max(req_paths, 1), 4096),
+                                n_replicates=1,
+                                n_substeps=2,
+                                lv_grid_nt=32,
+                                lv_grid_ny=64,
+                            )
             if request is not None and "request" in params:
                 crn_kwargs["request"] = request
             if device is not None and "device" in params:
