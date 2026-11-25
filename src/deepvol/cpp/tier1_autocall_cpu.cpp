@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,7 @@
 extern "C" {
 
 inline constexpr std::uint32_t kTier1AbiVersion = 20261124u;
+inline constexpr std::uint32_t kTier1AbiVersionV2 = 20261125u;
 
 struct Tier1AbiInfo {
     std::uint32_t abi_version;
@@ -22,6 +24,9 @@ struct Tier1AbiInfo {
     std::uint32_t crn_args_size;
     std::uint32_t crn_args_align;
 };
+
+static_assert(alignof(Tier1AbiInfo) == 4, "Tier1AbiInfo must be 4-byte aligned");
+static_assert(sizeof(Tier1AbiInfo) == 20, "Exact 20B Tier1AbiInfo ABI");
 
 struct CrnLooL2oBatchArgs {
     std::int64_t n_bumps;
@@ -72,6 +77,153 @@ struct CrnLooL2oBatchArgs {
 
 static_assert(alignof(CrnLooL2oBatchArgs) == 8, "Expected 8-byte natural alignment");
 static_assert(sizeof(CrnLooL2oBatchArgs) == 320, "Exact 320B CRN batch ABI");
+
+struct PlatenSdeAadArgs {
+    std::int64_t d_assets;
+    std::int64_t m_rem;
+    std::int64_t n_sub;
+    std::int64_t eff_r;
+    std::int64_t n_rep;
+    std::int64_t lv_nt;
+    std::int64_t lv_ny;
+    const double* lv_tables;
+    const double* z_indep;
+    const double* chol_base;
+    const double* tau_obs;
+    const double* r_native_obs;
+    const double* r_tot_obs;
+    const double* lv_t_grid;
+    const double* lv_y_min;
+    const double* lv_y_max;
+    const double* bar_lx_post;
+    const double* lx_norm_in;
+    const double* q_shift_sub;
+    double* lx_period_out;
+    double* norm_x_out;
+    double* bar_lv_out;
+    double* bar_chol_out;
+    double* bar_q_shift_out;
+    std::int32_t run_forward;
+    std::int32_t run_backward;
+    std::int32_t compute_lv_aad;
+    std::int32_t compute_chol_aad;
+    std::int32_t compute_q_aad;
+    std::int32_t has_q_shift_sub;
+};
+
+static_assert(alignof(PlatenSdeAadArgs) == 8, "PlatenSdeAadArgs must be 8-byte aligned");
+static_assert(sizeof(PlatenSdeAadArgs) == 216, "Exact 216B PlatenSdeAadArgs ABI");
+static_assert(offsetof(PlatenSdeAadArgs, lv_tables) == 56, "Pointer block at 56B");
+static_assert(offsetof(PlatenSdeAadArgs, run_forward) == 192, "Flag block at 192B");
+
+struct SobolGenArgs {
+    std::int64_t d_assets;
+    std::int64_t m_rem;
+    std::int64_t n_sub;
+    std::int64_t eff_r;
+    std::int64_t n_rep;
+    std::int64_t sobol_dim;
+    std::int64_t n_bits;
+    const std::uint32_t* dir_numbers;
+    const std::uint32_t* digital_shifts;
+    const double* bb_ortho_mat;
+    const double* chol_mat;
+    double* z_indep_out;
+    double* z_corr_out;
+    std::int32_t use_gray_code;
+    std::int32_t apply_bb_time;
+    std::int32_t apply_corr;
+    std::int32_t antithetic;
+    std::int32_t _reserved[2];
+};
+
+static_assert(alignof(SobolGenArgs) == 8, "SobolGenArgs must be 8-byte aligned");
+static_assert(sizeof(SobolGenArgs) == 128, "Exact 128B SobolGenArgs ABI");
+static_assert(offsetof(SobolGenArgs, dir_numbers) == 56, "Pointer block at 56B");
+static_assert(offsetof(SobolGenArgs, use_gray_code) == 104, "Flag block at 104B");
+
+struct VibratoGammaArgs {
+    std::int64_t d_assets;
+    std::int64_t m_rem;
+    std::int64_t n_paths_total;
+    std::int64_t vib_step_start;
+    std::int64_t vib_n_steps;
+    const double* perf_mat;
+    const double* lx_pre;
+    const double* j_pre;
+    const double* sig_pre;
+    const double* sv_vib;
+    const double* chol_mat;
+    const double* l_inv_t;
+    const double* c_inv;
+    const double* fwd_term;
+    const double* cdl_m;
+    const double* cdl2_last;
+    const double* ko_barriers;
+    const double* is_callable;
+    const double* cpn_barriers;
+    const double* is_guaranteed_cpn;
+    const double* coupon_rates;
+    const double* eps_vec;
+    const std::int64_t* inv_lex_perm;
+    double* frozen_term_out;
+    double* h_vib_out;
+    double df_last;
+    double h_vib;
+    double ko_spread;
+    double cpn_spread;
+    double ki_spread;
+    double one_star_strike;
+    double one_star_eps;
+    double strike;
+    double lower_strike;
+    double ki_barrier;
+    double option_gearing;
+    double autocall_coupon;
+    double c_mem_0;
+    double i_ki_past;
+    double part_call_strike;
+    double part_call_rate;
+    double one_star_coupon;
+    std::int32_t call_code;
+    std::int32_t cpn_code;
+    std::int32_t opt_code;
+    std::int32_t has_ki;
+    std::int32_t ki_active;
+    std::int32_t has_one_star;
+    std::int32_t is_memory;
+    std::int32_t is_long_basket;
+    std::int32_t no_notional;
+    std::int32_t force_cpn_ac;
+    std::int32_t cpn_dir_down;
+    std::int32_t cpn_type_out;
+    std::int32_t has_lower_strike;
+    std::int32_t has_part_call;
+};
+
+static_assert(alignof(VibratoGammaArgs) == 8, "VibratoGammaArgs must be 8-byte aligned");
+static_assert(sizeof(VibratoGammaArgs) == 392, "Exact 392B VibratoGammaArgs ABI");
+static_assert(offsetof(VibratoGammaArgs, perf_mat) == 40, "Pointer block at 40B");
+static_assert(offsetof(VibratoGammaArgs, df_last) == 200, "Scalar block at 200B");
+static_assert(offsetof(VibratoGammaArgs, call_code) == 336, "Flag block at 336B");
+
+struct Tier1AbiInfoV2 {
+    std::uint32_t abi_version;
+    std::uint32_t autocall_args_size;
+    std::uint32_t autocall_args_align;
+    std::uint32_t crn_args_size;
+    std::uint32_t crn_args_align;
+    std::uint32_t platen_sde_aad_args_size;
+    std::uint32_t platen_sde_aad_args_align;
+    std::uint32_t sobol_gen_args_size;
+    std::uint32_t sobol_gen_args_align;
+    std::uint32_t vibrato_gamma_args_size;
+    std::uint32_t vibrato_gamma_args_align;
+    std::uint32_t _pad0;
+};
+
+static_assert(alignof(Tier1AbiInfoV2) == 4, "Tier1AbiInfoV2 is 4-byte aligned");
+static_assert(sizeof(Tier1AbiInfoV2) == 48, "Exact 48B Tier1AbiInfoV2 ABI");
 
 }  // extern "C"
 
@@ -4143,6 +4295,23 @@ Tier1AbiInfo tier1_abi_info() noexcept {
     };
 }
 
+Tier1AbiInfoV2 tier1_abi_info_v2() noexcept {
+    return Tier1AbiInfoV2{
+        kTier1AbiVersionV2,
+        static_cast<std::uint32_t>(sizeof(Tier1AutocallArgs)),
+        static_cast<std::uint32_t>(alignof(Tier1AutocallArgs)),
+        static_cast<std::uint32_t>(sizeof(CrnLooL2oBatchArgs)),
+        static_cast<std::uint32_t>(alignof(CrnLooL2oBatchArgs)),
+        static_cast<std::uint32_t>(sizeof(PlatenSdeAadArgs)),
+        static_cast<std::uint32_t>(alignof(PlatenSdeAadArgs)),
+        static_cast<std::uint32_t>(sizeof(SobolGenArgs)),
+        static_cast<std::uint32_t>(alignof(SobolGenArgs)),
+        static_cast<std::uint32_t>(sizeof(VibratoGammaArgs)),
+        static_cast<std::uint32_t>(alignof(VibratoGammaArgs)),
+        0u,
+    };
+}
+
 void tier1_eval_autocall_struct_cpu(const Tier1AutocallArgs* a) noexcept {
     if (a == nullptr) {
         return;
@@ -4221,8 +4390,8 @@ void crn_step_1d_trajectories_cpp(
     const double t_max = lv_t_grid[lv_nt - 1];
     const double inv_dt_grid = (lv_nt > 1) ? (static_cast<double>(lv_nt - 1) / std::max(t_max, 1e-12)) : 0.0;
     const double inv_dy_grid = (lv_ny > 1) ? (static_cast<double>(lv_ny - 1) / std::max(lv_y_max - lv_y_min, 1e-12)) : 0.0;
-    const double max_u_t = std::max(0.0, static_cast<double>(lv_nt - 1) - 1e-9);
-    const double max_u_y = std::max(0.0, static_cast<double>(lv_ny - 1) - 1e-9);
+    const double max_u_t = std::max(0.0, static_cast<double>(lv_nt - 1) - 1e-6);
+    const double max_u_y = std::max(0.0, static_cast<double>(lv_ny - 1) - 1e-6);
 
     OmpCallGuard omp_guard(B * R >= 4);
     #pragma omp parallel if(omp_guard.active) num_threads(omp_guard.n_threads)
@@ -4236,7 +4405,26 @@ void crn_step_1d_trajectories_cpp(
         }
         double* log_x = big_rep ? dyn.log_x.data() : arena.log_x.data();
         double* ex_buf = big_rep ? dyn.ex_buf.data() : arena.ex_buf.data();
-        double* lv_slice = big_ny ? dyn.lv_slice.data() : arena.lv_slice.data();
+        double* lv_slice_start = big_ny ? dyn.lv_slice.data() : arena.lv_slice.data();
+        std::vector<double> lv_slice_end_vec(lv_ny_sz + 4, 0.0);
+        double* lv_slice_end = lv_slice_end_vec.data();
+
+        auto fill_lv_slice = [&](const double* lv_b, double t_val, double* dst_slice) noexcept {
+            const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+            const int it0 = static_cast<int>(u_t);
+            const int it1 = std::min(it0 + 1, lv_nt - 1);
+            const double wt = (lv_nt > 1) ? (u_t - static_cast<double>(it0)) : 0.0;
+            const double* row0 = lv_b + static_cast<std::size_t>(it0) * lv_ny_sz;
+            const double* row1 = lv_b + static_cast<std::size_t>(it1) * lv_ny_sz;
+            #pragma omp simd
+            for (int iy = 0; iy < lv_ny; ++iy) {
+                dst_slice[iy] = (1.0 - wt) * row0[iy] + wt * row1[iy];
+            }
+            const double top_sig = dst_slice[lv_ny - 1];
+            for (int pad = 0; pad < 4; ++pad) {
+                dst_slice[lv_ny + pad] = top_sig;
+            }
+        };
 
         #pragma omp for collapse(2) schedule(static)
         for (int b = 0; b < B; ++b) {
@@ -4266,22 +4454,12 @@ void crn_step_1d_trajectories_cpp(
                     for (int s = 0; s < n_sub; ++s) {
                         const double alpha_s = (static_cast<double>(s) + 0.5) / static_cast<double>(n_sub);
                         const double t_mid = t_prev + alpha_s * d_tau;
+                        const double t_start = std::max(t_mid - 0.5 * dt, 0.0);
+                        const double t_end = t_start + dt;
                         const double q_shift_mid = (rt_prev + alpha_s * drt) - (rn_prev + alpha_s * drn);
-                        const double u_t = (lv_nt > 1) ? std::clamp(t_mid * inv_dt_grid, 0.0, max_u_t) : 0.0;
-                        const int it0 = static_cast<int>(u_t);
-                        const int it1 = std::min(it0 + 1, lv_nt - 1);
-                        const double wt = (lv_nt > 1) ? (u_t - static_cast<double>(it0)) : 0.0;
-                        const double* row0 = lv_b + static_cast<std::size_t>(it0) * lv_ny_sz;
-                        const double* row1 = lv_b + static_cast<std::size_t>(it1) * lv_ny_sz;
 
-                        #pragma omp simd
-                        for (int iy = 0; iy < lv_ny; ++iy) {
-                            lv_slice[iy] = (1.0 - wt) * row0[iy] + wt * row1[iy];
-                        }
-                        const double top_sig = lv_slice[lv_ny - 1];
-                        for (int pad = 0; pad < 4; ++pad) {
-                            lv_slice[lv_ny + pad] = top_sig;
-                        }
+                        fill_lv_slice(lv_b, t_start, lv_slice_start);
+                        fill_lv_slice(lv_b, t_end, lv_slice_end);
 
                         const std::size_t z_step = (z_mode == 1)
                             ? ((static_cast<std::size_t>(b) * static_cast<std::size_t>(M) + static_cast<std::size_t>(m)) * static_cast<std::size_t>(n_sub) + static_cast<std::size_t>(s)) * n_tot_sz + rep_off
@@ -4296,42 +4474,86 @@ void crn_step_1d_trajectories_cpp(
                         const __m256d v_zero = _mm256_setzero_pd();
                         const __m256d v_max_uy = _mm256_set1_pd(max_u_y);
                         const __m256d v_q_mid = _mm256_set1_pd(has_q ? q_shift_mid : 0.0);
-                        const __m256d v_half_dt = _mm256_set1_pd(-0.5 * dt);
+                        const __m256d v_dt = _mm256_set1_pd(dt);
                         const __m256d v_sqrt_dt = _mm256_set1_pd(sqrt_dt);
-                        for (; n + 4 <= N_rep; n += 4) {
-                            __m256d lx = _mm256_loadu_pd(log_x + n);
-                            __m256d y_val = has_q ? _mm256_add_pd(lx, v_q_mid) : lx;
-                            __m256d uy_raw = _mm256_mul_pd(_mm256_sub_pd(y_val, v_y_min), v_inv_dy);
+                        const __m256d v_half = _mm256_set1_pd(0.5);
+                        const __m256d v_neg_half = _mm256_set1_pd(-0.5);
+                        const __m256d v_quarter = _mm256_set1_pd(0.25);
+                        const __m256d v_two = _mm256_set1_pd(2.0);
+                        const __m256d v_one = _mm256_set1_pd(1.0);
+
+                        auto lookup_slice_pd = [&](const double* slice_ptr, __m256d y_v) noexcept -> __m256d {
+                            __m256d uy_raw = _mm256_mul_pd(_mm256_sub_pd(y_v, v_y_min), v_inv_dy);
                             __m256d u_y = _mm256_min_pd(_mm256_max_pd(uy_raw, v_zero), v_max_uy);
                             __m256d u_floor = _mm256_floor_pd(u_y);
                             __m128i iy0 = _mm256_cvttpd_epi32(u_floor);
                             __m256d wy = _mm256_sub_pd(u_y, u_floor);
-                            __m256d s0 = _mm256_i32gather_pd(lv_slice, iy0, 8);
-                            __m256d s1 = _mm256_i32gather_pd(lv_slice + 1, iy0, 8);
-                            __m256d sig = _mm256_fmadd_pd(wy, _mm256_sub_pd(s1, s0), s0);
-                            __m256d drift = _mm256_mul_pd(v_half_dt, _mm256_mul_pd(sig, sig));
-                            __m256d diff = _mm256_mul_pd(_mm256_mul_pd(sig, v_sqrt_dt), _mm256_loadu_pd(z_ptr + n));
-                            _mm256_storeu_pd(log_x + n, _mm256_add_pd(lx, _mm256_add_pd(drift, diff)));
+                            __m256d s0 = _mm256_i32gather_pd(slice_ptr, iy0, 8);
+                            __m256d s1 = _mm256_i32gather_pd(slice_ptr + 1, iy0, 8);
+                            return _mm256_fmadd_pd(wy, _mm256_sub_pd(s1, s0), s0);
+                        };
+
+                        for (; n + 4 <= N_rep; n += 4) {
+                            __m256d lx = _mm256_loadu_pd(log_x + n);
+                            __m256d zd = _mm256_loadu_pd(z_ptr + n);
+                            __m256d y0 = has_q ? _mm256_add_pd(lx, v_q_mid) : lx;
+                            __m256d sig0 = lookup_slice_pd(lv_slice_start, y0);
+                            __m256d a0 = _mm256_mul_pd(v_neg_half, _mm256_mul_pd(sig0, sig0));
+                            __m256d dw = _mm256_mul_pd(v_sqrt_dt, zd);
+                            __m256d sig0_sdt = _mm256_mul_pd(sig0, v_sqrt_dt);
+                            __m256d base_y = _mm256_fmadd_pd(a0, v_dt, y0);
+                            __m256d sigh = lookup_slice_pd(lv_slice_end, _mm256_fmadd_pd(sig0, dw, base_y));
+                            __m256d sigp = lookup_slice_pd(lv_slice_end, _mm256_add_pd(base_y, sig0_sdt));
+                            __m256d sigm = lookup_slice_pd(lv_slice_end, _mm256_sub_pd(base_y, sig0_sdt));
+                            __m256d ah = _mm256_mul_pd(v_neg_half, _mm256_mul_pd(sigh, sigh));
+                            __m256d drift_term = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_add_pd(a0, ah), v_dt));
+                            __m256d sum_sig = _mm256_add_pd(_mm256_add_pd(sigp, sigm), _mm256_mul_pd(v_two, sig0));
+                            __m256d diff_term = _mm256_mul_pd(v_quarter, _mm256_mul_pd(sum_sig, dw));
+                            __m256d z2m1 = _mm256_fmsub_pd(zd, zd, v_one);
+                            __m256d mil_term = _mm256_mul_pd(
+                                v_quarter,
+                                _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_sqrt_dt, z2m1))
+                            );
+                            _mm256_storeu_pd(log_x + n, _mm256_add_pd(lx, _mm256_add_pd(drift_term, _mm256_add_pd(diff_term, mil_term))));
                         }
 #endif
                         for (; n < N_rep; ++n) {
-                            const double y_val = has_q ? (log_x[n] + q_shift_mid) : log_x[n];
-                            const double u_raw = (lv_ny > 1) ? ((y_val - lv_y_min) * inv_dy_grid) : 0.0;
-                            const double u_y = (u_raw > 0.0) ? ((u_raw < max_u_y) ? u_raw : max_u_y) : 0.0;
-                            const int iy0 = static_cast<int>(u_y);
-                            const int iy1 = std::min(iy0 + 1, lv_ny - 1);
-                            const double wy = u_y - static_cast<double>(iy0);
-                            const double sig = (1.0 - wy) * lv_slice[iy0] + wy * lv_slice[iy1];
-                            log_x[n] += -0.5 * (sig * sig) * dt + sig * sqrt_dt * z_ptr[n];
+                            const double lx = log_x[n];
+                            const double zd = z_ptr[n];
+                            auto lookup_scalar = [&](const double* slice_ptr, double y_val) noexcept -> double {
+                                const double u_raw = (lv_ny > 1) ? ((y_val - lv_y_min) * inv_dy_grid) : 0.0;
+                                const double u_y = (u_raw > 0.0) ? ((u_raw < max_u_y) ? u_raw : max_u_y) : 0.0;
+                                const int iy0 = static_cast<int>(u_y);
+                                const int iy1 = std::min(iy0 + 1, lv_ny - 1);
+                                const double wy = u_y - static_cast<double>(iy0);
+                                return (1.0 - wy) * slice_ptr[iy0] + wy * slice_ptr[iy1];
+                            };
+                            const double q_s = has_q ? q_shift_mid : 0.0;
+                            const double sig0 = lookup_scalar(lv_slice_start, lx + q_s);
+                            const double a0 = -0.5 * sig0 * sig0;
+                            const double dw = sqrt_dt * zd;
+                            const double base_y = lx + a0 * dt + q_s;
+                            const double sigh = lookup_scalar(lv_slice_end, base_y + sig0 * dw);
+                            const double sigp = lookup_scalar(lv_slice_end, base_y + sig0 * sqrt_dt);
+                            const double sigm = lookup_scalar(lv_slice_end, base_y - sig0 * sqrt_dt);
+                            const double ah = -0.5 * sigh * sigh;
+                            log_x[n] += 0.5 * (a0 + ah) * dt
+                                + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
+                                + 0.25 * (sigp - sigm) * sqrt_dt * (zd * zd - 1.0);
                         }
                     }
 
+                    double max_lx = -std::numeric_limits<double>::infinity();
+                    for (int n = 0; n < N_rep; ++n) {
+                        max_lx = std::max(max_lx, log_x[n]);
+                    }
                     double sum_ex = 0.0;
                     int n = 0;
 #if defined(__AVX2__) && defined(__FMA__)
+                    const __m256d v_max_lx = _mm256_set1_pd(max_lx);
                     __m256d v_sum = _mm256_setzero_pd();
                     for (; n + 4 <= N_rep; n += 4) {
-                        __m256d ex = v_exp_pd(_mm256_loadu_pd(log_x + n));
+                        __m256d ex = v_exp_pd(_mm256_sub_pd(_mm256_loadu_pd(log_x + n), v_max_lx));
                         _mm256_storeu_pd(ex_buf + n, ex);
                         v_sum = _mm256_add_pd(v_sum, ex);
                     }
@@ -4340,13 +4562,13 @@ void crn_step_1d_trajectories_cpp(
                     sum_ex = s4[0] + s4[1] + s4[2] + s4[3];
 #endif
                     for (; n < N_rep; ++n) {
-                        const double ex = std::exp(log_x[n]);
+                        const double ex = std::exp(log_x[n] - max_lx);
                         ex_buf[n] = ex;
                         sum_ex += ex;
                     }
-                    const double mean_rep = std::max(sum_ex / static_cast<double>(N_rep), 1e-12);
+                    const double mean_rep = std::max(sum_ex / static_cast<double>(N_rep), 1e-30);
                     const double inv_mean = 1.0 / mean_rep;
-                    const double log_mean = std::log(mean_rep);
+                    const double shift_log = max_lx + std::log(mean_rep);
                     double* out_ptr = out_norm_x
                         + (static_cast<std::size_t>(b) * static_cast<std::size_t>(M) + static_cast<std::size_t>(m)) * n_tot_sz
                         + rep_off;
@@ -4354,7 +4576,7 @@ void crn_step_1d_trajectories_cpp(
                     #pragma omp simd
                     for (int n_s = 0; n_s < N_rep; ++n_s) {
                         out_ptr[n_s] = ex_buf[n_s] * inv_mean;
-                        log_x[n_s] -= log_mean;
+                        log_x[n_s] -= shift_log;
                     }
 
                     t_prev = t_cur;
@@ -4808,6 +5030,256 @@ inline int canonicalize_tile_code(int code, int D) noexcept {
     return code;
 }
 
+inline double c2_s5(double t) noexcept {
+    const double u = std::clamp(t, 0.0, 1.0);
+    return u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
+}
+
+inline double c2_ds5(double t) noexcept {
+    if (t <= 0.0 || t >= 1.0) return 0.0;
+    const double u = t;
+    const double om = 1.0 - u;
+    return 30.0 * u * u * om * om;
+}
+
+struct BilinearLvEval {
+    double val;
+    double dy;
+    int it0;
+    int it1;
+    double wt;
+    int iy0;
+    int iy1;
+    double wy;
+};
+
+inline BilinearLvEval eval_lv_bilinear_with_deriv(
+    const double* lv_d,
+    int lv_nt,
+    int lv_ny,
+    double t_val,
+    double y_val,
+    double inv_dt_grid,
+    double y_min,
+    double inv_dy_grid,
+    double max_u_t,
+    double max_u_y
+) noexcept {
+    const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+    const int it0 = static_cast<int>(u_t);
+    const int it1 = std::min(it0 + 1, lv_nt - 1);
+    const double wt = u_t - static_cast<double>(it0);
+
+    const double u_y_raw = (lv_ny > 1) ? ((y_val - y_min) * inv_dy_grid) : 0.0;
+    const bool in_y = (lv_ny > 1) && (u_y_raw > 0.0) && (u_y_raw < max_u_y);
+    const double u_y = (lv_ny > 1) ? std::clamp(u_y_raw, 0.0, max_u_y) : 0.0;
+    const int iy0 = static_cast<int>(u_y);
+    const int iy1 = std::min(iy0 + 1, lv_ny - 1);
+    const double wy = u_y - static_cast<double>(iy0);
+
+    const std::size_t row0 = static_cast<std::size_t>(it0) * static_cast<std::size_t>(lv_ny);
+    const std::size_t row1 = static_cast<std::size_t>(it1) * static_cast<std::size_t>(lv_ny);
+    const double v00 = lv_d[row0 + static_cast<std::size_t>(iy0)];
+    const double v01 = lv_d[row0 + static_cast<std::size_t>(iy1)];
+    const double v10 = lv_d[row1 + static_cast<std::size_t>(iy0)];
+    const double v11 = lv_d[row1 + static_cast<std::size_t>(iy1)];
+
+    const double v0 = (1.0 - wt) * v00 + wt * v10;
+    const double v1 = (1.0 - wt) * v01 + wt * v11;
+    const double val = (1.0 - wy) * v0 + wy * v1;
+    const double dy = in_y ? ((v1 - v0) * inv_dy_grid) : 0.0;
+    return {val, dy, it0, it1, wt, iy0, iy1, wy};
+}
+
+inline double eval_lv_bilinear_val(
+    const double* lv_d,
+    int lv_nt,
+    int lv_ny,
+    double t_val,
+    double y_val,
+    double inv_dt_grid,
+    double y_min,
+    double inv_dy_grid,
+    double max_u_t,
+    double max_u_y
+) noexcept {
+    const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+    const int it0 = static_cast<int>(u_t);
+    const int it1 = std::min(it0 + 1, lv_nt - 1);
+    const double wt = u_t - static_cast<double>(it0);
+
+    const double u_y = (lv_ny > 1) ? std::clamp((y_val - y_min) * inv_dy_grid, 0.0, max_u_y) : 0.0;
+    const int iy0 = static_cast<int>(u_y);
+    const int iy1 = std::min(iy0 + 1, lv_ny - 1);
+    const double wy = u_y - static_cast<double>(iy0);
+
+    const std::size_t row0 = static_cast<std::size_t>(it0) * static_cast<std::size_t>(lv_ny);
+    const std::size_t row1 = static_cast<std::size_t>(it1) * static_cast<std::size_t>(lv_ny);
+    const double v0 = (1.0 - wt) * lv_d[row0 + static_cast<std::size_t>(iy0)]
+                    + wt * lv_d[row1 + static_cast<std::size_t>(iy0)];
+    const double v1 = (1.0 - wt) * lv_d[row0 + static_cast<std::size_t>(iy1)]
+                    + wt * lv_d[row1 + static_cast<std::size_t>(iy1)];
+    return (1.0 - wy) * v0 + wy * v1;
+}
+
+inline std::uint64_t splitmix64_next(std::uint64_t& state) noexcept {
+    state += 0x9E3779B97F4A7C15ULL;
+    std::uint64_t z = state;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+inline double u64_to_unit_open(std::uint64_t x) noexcept {
+    const double u = (static_cast<double>(x >> 11) + 0.5) * 0x1.0p-53;
+    return std::clamp(u, 1e-12, 1.0 - 1e-12);
+}
+
+struct IdxBaseStats {
+    double min1;
+    double min2;
+    double min3;
+    double max1;
+    double max2;
+    double s1;
+    double s2;
+    double pa;
+    double pb;
+    int idx_min1;
+    int idx_min2;
+    int idx_min3;
+    int idx_max1;
+    int idx_max2;
+};
+
+inline double select_idx_from_stats(
+    const IdxBaseStats& st,
+    double inv_d,
+    int d_assets,
+    int code
+) noexcept {
+    const double w_avg = st.s1 * inv_d;
+    switch (code) {
+        case 0: return st.min1;
+        case 1: return st.max1;
+        case 2: return w_avg;
+        case 3: return (d_assets <= 1) ? 0.0 : std::sqrt(std::max(st.s2 * inv_d - w_avg * w_avg, 0.0));
+        case 4: return (d_assets < 2) ? st.pa : (st.pa / std::max(st.pb, 1e-12));
+        case 5: return (d_assets < 2) ? st.pa : (st.pb / std::max(st.pa, 1e-12));
+        case 6: return st.max1 / std::max(st.min1, 1e-12);
+        case 7: return st.max1 / std::max(w_avg, 1e-12);
+        case 8: return w_avg / std::max(st.min1, 1e-12);
+        case 9: return (d_assets < 2) ? 0.0 : (st.pa - st.pb);
+        case 10: return (d_assets < 2) ? 0.0 : (st.pb - st.pa);
+        case 11: return st.max1 - st.min1;
+        case 12: return st.max1 - w_avg;
+        case 13: return w_avg - st.min1;
+        case 14: return (st.min1 < 1.0) ? (2.0 - st.min1) : st.min1;
+        case 15: return (d_assets > 1) ? st.min2 : st.min1;
+        case 16: return (d_assets >= 3) ? st.min3 : ((d_assets == 2) ? st.min2 : st.min1);
+        case 17: return (d_assets > 1) ? st.max2 : st.max1;
+        default: return st.min1;
+    }
+}
+
+inline double accum_idx_grad_scalar(
+    double bp,
+    double bar_w,
+    double pd,
+    int d,
+    int d_assets,
+    double inv_d,
+    int ia,
+    int ib,
+    const IdxBaseStats& st,
+    double w_avg,
+    double w_disp,
+    int code
+) noexcept {
+    constexpr double kTiny = 1e-12;
+    switch (code) {
+        case 0: return (d == st.idx_min1) ? (bp + bar_w) : bp;
+        case 1: return (d == st.idx_max1) ? (bp + bar_w) : bp;
+        case 2: return bp + bar_w * inv_d;
+        case 3:
+            if (d_assets > 1 && w_disp > kTiny) {
+                return bp + bar_w * (pd - w_avg) * inv_d / std::max(w_disp, kTiny);
+            }
+            return bp;
+        case 4: {
+            if (d_assets < 2) return (d == ia) ? (bp + bar_w) : bp;
+            const double vb_c = std::max(st.pb, kTiny);
+            if (d == ia) bp += bar_w / vb_c;
+            if (d == ib && st.pb > kTiny) bp -= bar_w * st.pa / (vb_c * vb_c);
+            return bp;
+        }
+        case 5: {
+            if (d_assets < 2) return (d == ia) ? (bp + bar_w) : bp;
+            const double va_c = std::max(st.pa, kTiny);
+            if (d == ib) bp += bar_w / va_c;
+            if (d == ia && st.pa > kTiny) bp -= bar_w * st.pb / (va_c * va_c);
+            return bp;
+        }
+        case 6: {
+            const double m_c = std::max(st.min1, kTiny);
+            if (d == st.idx_max1) bp += bar_w / m_c;
+            if (d == st.idx_min1 && st.min1 > kTiny) bp -= bar_w * st.max1 / (m_c * m_c);
+            return bp;
+        }
+        case 7: {
+            const double a_c = std::max(w_avg, kTiny);
+            if (w_avg > kTiny) bp -= bar_w * st.max1 * inv_d / (a_c * a_c);
+            if (d == st.idx_max1) bp += bar_w / a_c;
+            return bp;
+        }
+        case 8: {
+            const double m_c = std::max(st.min1, kTiny);
+            bp += bar_w * inv_d / m_c;
+            if (d == st.idx_min1 && st.min1 > kTiny) bp -= bar_w * w_avg / (m_c * m_c);
+            return bp;
+        }
+        case 9:
+            if (d_assets < 2) return bp;
+            if (d == ia) bp += bar_w;
+            if (d == ib) bp -= bar_w;
+            return bp;
+        case 10:
+            if (d_assets < 2) return bp;
+            if (d == ib) bp += bar_w;
+            if (d == ia) bp -= bar_w;
+            return bp;
+        case 11:
+            if (d == st.idx_max1) bp += bar_w;
+            if (d == st.idx_min1) bp -= bar_w;
+            return bp;
+        case 12:
+            if (d == st.idx_max1) bp += bar_w;
+            return bp - bar_w * inv_d;
+        case 13:
+            bp += bar_w * inv_d;
+            if (d == st.idx_min1) bp -= bar_w;
+            return bp;
+        case 14: {
+            const double s_tw = (st.min1 < 1.0) ? -1.0 : 1.0;
+            return (d == st.idx_min1) ? (bp + bar_w * s_tw) : bp;
+        }
+        case 15: {
+            const int t_idx = (d_assets > 1) ? st.idx_min2 : st.idx_min1;
+            return (d == t_idx) ? (bp + bar_w) : bp;
+        }
+        case 16: {
+            const int t_idx = (d_assets >= 3) ? st.idx_min3 : ((d_assets == 2) ? st.idx_min2 : st.idx_min1);
+            return (d == t_idx) ? (bp + bar_w) : bp;
+        }
+        case 17: {
+            const int t_idx = (d_assets > 1) ? st.idx_max2 : st.idx_max1;
+            return (d == t_idx) ? (bp + bar_w) : bp;
+        }
+        default:
+            return bp;
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -4858,7 +5330,8 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
 
     const int call_code = args->call_code;
     const int cpn_code = args->cpn_code;
-    const int opt_code = (args->is_long_basket != 0 && args->opt_code == 0) ? 2 : args->opt_code;
+    const bool is_long_basket = (args->is_long_basket != 0);
+    const int opt_code = (is_long_basket && args->opt_code == 0) ? 2 : args->opt_code;
     const int eff_call = canonicalize_tile_code(call_code, D);
     const int eff_cpn = canonicalize_tile_code(cpn_code, D);
     const int eff_opt = canonicalize_tile_code(opt_code, D);
@@ -4877,8 +5350,10 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
     const bool has_lower_strike = std::isfinite(args->lower_strike) && (args->lower_strike > 0.0);
     const double k_put = opt_is_normal ? args->strike : std::max(args->strike, 0.0);
     const double k_low = has_lower_strike ? args->lower_strike : 0.0;
-    const bool has_put = (args->option_gearing > 0.0) &&
-                         (opt_is_normal ? (!has_lower_strike || k_put > k_low) : (k_put > 0.0 && (!has_lower_strike || k_put > k_low)));
+    const bool has_put = is_long_basket || (
+        (args->option_gearing > 0.0) &&
+        (opt_is_normal ? (!has_lower_strike || k_put > k_low) : (k_put > 0.0 && (!has_lower_strike || k_put > k_low)))
+    );
     const bool has_part_call = std::isfinite(args->part_call_strike) && (args->part_call_rate != 0.0) &&
                                (opt_is_normal || args->part_call_strike >= 0.0);
     const bool has_w_fund = args->w_fund_mat != nullptr;
@@ -4891,6 +5366,9 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
     const double blo_ki = std::min(b_ki, b_ki + args->ki_spread);
     const double bhi_ki = std::max(b_ki, b_ki + args->ki_spread);
     const double inv_w_ki = 1.0 / std::max(bhi_ki - blo_ki, 1e-12);
+    const double blo_ki_islb = std::min(k_put, k_put + args->ki_spread);
+    const double bhi_ki_islb = std::max(k_put, k_put + args->ki_spread);
+    const double inv_w_ki_islb = 1.0 / std::max(bhi_ki_islb - blo_ki_islb, 1e-12);
     const double k_call = args->part_call_strike;
     const double k_os = args->one_star_strike;
     const double eps_os = args->one_star_eps;
@@ -4922,12 +5400,12 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
     auto uses_sum1 = [](int c) noexcept {
         return c == 2 || c == 3 || c == 7 || c == 8 || c == 12 || c == 13;
     };
-    const bool need_min3 = any_needs_base && (uses_min3(eff_call) || uses_min3(eff_cpn) || uses_min3(eff_opt));
+    const bool need_min3 = any_needs_base && (uses_min3(eff_call) || uses_min3(eff_cpn) || uses_min3(eff_opt) || is_long_basket);
     const bool need_min4 = any_needs_base && (uses_min4(eff_call) || uses_min4(eff_cpn) || uses_min4(eff_opt));
     const bool need_min5 = any_needs_base && (uses_min5(eff_call) || uses_min5(eff_cpn) || uses_min5(eff_opt));
     const bool need_max3 = any_needs_base && (uses_max3(eff_call) || uses_max3(eff_cpn) || uses_max3(eff_opt) || has_one_star);
     const bool need_max4 = any_needs_base && (uses_max4(eff_call) || uses_max4(eff_cpn) || uses_max4(eff_opt));
-    const bool need_sum1 = any_needs_base && (uses_sum1(eff_call) || uses_sum1(eff_cpn) || uses_sum1(eff_opt));
+    const bool need_sum1 = any_needs_base && (uses_sum1(eff_call) || uses_sum1(eff_cpn) || uses_sum1(eff_opt) || is_long_basket);
     const bool need_sum2 = any_needs_base && (eff_call == 3 || eff_cpn == 3 || eff_opt == 3);
     const bool need_any_base = need_min3 || need_max3 || need_sum1 || need_sum2;
 
@@ -4980,7 +5458,7 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
 
         alignas(64) std::array<std::array<double, kTile>, kBTile> surv_prev;
         alignas(64) std::array<std::array<double, kTile>, kBTile> c_mem;
-        alignas(64) std::array<double, kTile> w_call_buf{}, w_cpn_buf{}, w_opt_buf{}, w_best_buf{};
+        alignas(64) std::array<double, kTile> w_call_buf{}, w_cpn_buf{}, w_opt_buf{}, w_best_buf{}, w_avg_buf{}, w_wof_buf{};
 
         #pragma omp for schedule(static)
         for (std::size_t tile_idx = 0; tile_idx < n_tiles; ++tile_idx) {
@@ -5207,6 +5685,8 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
                             wcp_ptr = w_cpn_buf.data();
                         }
                         const double* wo_ptr = w_call_buf.data();
+                        const double* w_avg_ptr = w_avg_buf.data();
+                        const double* w_wof_ptr = w_wof_buf.data();
                         if (need_opt_m) {
                             if (eff_opt == eff_call) {
                                 wo_ptr = w_call_buf.data();
@@ -5228,6 +5708,35 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
                                     for (int t = 0; t < t_len; ++t) w_best_buf[static_cast<std::size_t>(t)] = wo_ptr[t];
                                 } else {
                                     eval_code_tile(1, w_best_buf.data());
+                                }
+                            }
+                            if (is_long_basket) {
+                                const bool call_computed_avg =
+                                    (eff_call == 2) && (is_call_m || (need_cpn_m && eff_cpn == 2) || (eff_opt == 2));
+                                const bool cpn_computed_avg = (eff_cpn == 2) && need_cpn_m;
+                                if (call_computed_avg) {
+                                    w_avg_ptr = wc_ptr;
+                                } else if (cpn_computed_avg) {
+                                    w_avg_ptr = wcp_ptr;
+                                } else if (eff_opt == 2) {
+                                    w_avg_ptr = wo_ptr;
+                                } else {
+                                    eval_code_tile(2, w_avg_buf.data());
+                                    w_avg_ptr = w_avg_buf.data();
+                                }
+
+                                const bool call_computed_wof =
+                                    (eff_call == 0) && (is_call_m || (need_cpn_m && eff_cpn == 0) || (eff_opt == 0));
+                                const bool cpn_computed_wof = (eff_cpn == 0) && need_cpn_m;
+                                if (call_computed_wof) {
+                                    w_wof_ptr = wc_ptr;
+                                } else if (cpn_computed_wof) {
+                                    w_wof_ptr = wcp_ptr;
+                                } else if (eff_opt == 0) {
+                                    w_wof_ptr = wo_ptr;
+                                } else {
+                                    eval_code_tile(0, w_wof_buf.data());
+                                    w_wof_ptr = w_wof_buf.data();
                                 }
                             }
                         }
@@ -5262,7 +5771,7 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
                             if (is_mem) {
                                 const double eff_c = c_rate + cmem_b[t];
                                 cpn_path = sp * eff_g_cpn * eff_c + p_m * ac_cpn;
-                                cmem_b[t] = eff_c * (1.0 - eff_g_cpn);
+                                cmem_b[t] = sp * eff_c * (1.0 - eff_g_cpn);
                             } else {
                                 cpn_path = sp * eff_g_cpn * c_rate + p_m * ac_cpn;
                             }
@@ -5287,23 +5796,36 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
                                 const double sp_term = surv_b[t];
                                 s_term += sp_term;
                                 const double wo = wo_ptr[t];
-                                double i_ki = i_ki_past;
-                                if (has_ki) {
-                                    const double g_ki = hard_ki
-                                        ? (wo < b_ki ? 1.0 : 0.0)
-                                        : std::clamp((bhi_ki - wo) * inv_w_ki, 0.0, 1.0);
-                                    i_ki = std::max(i_ki, g_ki);
-                                }
                                 const double star_ind = has_one_star
                                     ? centered_onestar_ramp(w_best_buf[static_cast<std::size_t>(t)], k_os, eps_os)
                                     : 0.0;
-                                if (has_put) {
-                                    double put_intr = std::max(k_put - wo, 0.0);
-                                    if (has_lower_strike) {
-                                        put_intr -= std::max(k_low - wo, 0.0);
+                                if (is_long_basket) {
+                                    const double avg_t = w_avg_ptr[t];
+                                    const double wof_t = w_wof_ptr[t];
+                                    double ki_wof_k = i_ki_past;
+                                    if (!has_ki || i_ki_past < 0.5) {
+                                        const double g_ki_k = hard_ki
+                                            ? (wof_t < k_put ? 1.0 : 0.0)
+                                            : std::clamp((bhi_ki_islb - wof_t) * inv_w_ki_islb, 0.0, 1.0);
+                                        ki_wof_k = has_ki ? std::max(i_ki_past, g_ki_k) : g_ki_k;
                                     }
-                                    const double ki_gate = has_ki ? i_ki : 1.0;
-                                    s_put += sp_term * ki_gate * (1.0 - star_ind) * put_intr;
+                                    s_put += sp_term * ki_wof_k * (1.0 - star_ind) * (1.0 - avg_t);
+                                } else {
+                                    double i_ki = i_ki_past;
+                                    if (has_ki) {
+                                        const double g_ki = hard_ki
+                                            ? (wo < b_ki ? 1.0 : 0.0)
+                                            : std::clamp((bhi_ki - wo) * inv_w_ki, 0.0, 1.0);
+                                        i_ki = std::max(i_ki, g_ki);
+                                    }
+                                    if (has_put) {
+                                        double put_intr = std::max(k_put - wo, 0.0);
+                                        if (has_lower_strike) {
+                                            put_intr -= std::max(k_low - wo, 0.0);
+                                        }
+                                        const double ki_gate = has_ki ? i_ki : 1.0;
+                                        s_put += sp_term * ki_gate * (1.0 - star_ind) * put_intr;
+                                    }
                                 }
                                 if (has_part_call) {
                                     s_call += sp_term * std::max(wo - k_call, 0.0);
@@ -5352,8 +5874,9 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
         for (int m = 0; m < M; ++m) {
             coupon_pv += df_b[m] * (b_cpn_sum[m] * inv_N);
         }
+        const double put_mult = is_long_basket ? -1.0 : -option_gearing;
         const double option_pv = df_b[M - 1] * (
-            -option_gearing * (l_put_sum * inv_N)
+            put_mult * (l_put_sum * inv_N)
             + part_call_rate * (l_call_sum * inv_N)
             + (l_onestar_sum * inv_N)
         );
@@ -5367,6 +5890,1240 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
         const double in_tr = (pv_in_tr != nullptr) ? pv_in_tr[b] : 0.0;
         args->pv_out[b] = notional_pv + coupon_pv + option_pv - funding_pv + in_tr;
     }
+}
+
+std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
+    if (args == nullptr) return -1;
+    if (args->d_assets <= 0 || args->m_rem <= 0 || args->n_sub <= 0 ||
+        args->eff_r <= 0 || args->n_rep <= 0 || args->lv_nt <= 0 || args->lv_ny <= 0) {
+        return -1;
+    }
+    const bool has_q_sub = (args->has_q_shift_sub != 0 && args->q_shift_sub != nullptr);
+    if (args->lv_tables == nullptr || args->z_indep == nullptr || args->chol_base == nullptr ||
+        args->tau_obs == nullptr || args->lv_t_grid == nullptr ||
+        args->lv_y_min == nullptr || args->lv_y_max == nullptr) {
+        return -1;
+    }
+    if (!has_q_sub && (args->r_native_obs == nullptr || args->r_tot_obs == nullptr)) {
+        return -1;
+    }
+    const bool run_fwd = args->run_forward != 0;
+    const bool run_bwd = args->run_backward != 0;
+    if (run_fwd && args->lx_period_out == nullptr) {
+        return -1;
+    }
+    const double* lx_norm = (args->lx_norm_in != nullptr) ? args->lx_norm_in : args->lx_period_out;
+    if (run_bwd && (args->bar_lx_post == nullptr || lx_norm == nullptr)) {
+        return -1;
+    }
+    const bool compute_lv = run_bwd && (args->compute_lv_aad != 0);
+    const bool compute_chol = run_bwd && (args->compute_chol_aad != 0);
+    const bool compute_q = run_bwd && (args->compute_q_aad != 0);
+    if ((compute_lv && args->bar_lv_out == nullptr) ||
+        (compute_chol && args->bar_chol_out == nullptr) ||
+        (compute_q && args->bar_q_shift_out == nullptr)) {
+        return -1;
+    }
+
+    const int D = static_cast<int>(args->d_assets);
+    const int M = static_cast<int>(args->m_rem);
+    const int n_sub = static_cast<int>(args->n_sub);
+    const int eff_r = static_cast<int>(args->eff_r);
+    const int n_rep = static_cast<int>(args->n_rep);
+    const int lv_nt = static_cast<int>(args->lv_nt);
+    const int lv_ny = static_cast<int>(args->lv_ny);
+
+    const std::size_t Du = static_cast<std::size_t>(D);
+    const std::size_t Mu = static_cast<std::size_t>(M);
+    const std::size_t Su = static_cast<std::size_t>(n_sub);
+    const std::size_t Ru = static_cast<std::size_t>(eff_r);
+    const std::size_t Nrep_u = static_cast<std::size_t>(n_rep);
+    const std::size_t Ntot_u = Ru * Nrep_u;
+    const std::size_t lv_nt_u = static_cast<std::size_t>(lv_nt);
+    const std::size_t lv_ny_u = static_cast<std::size_t>(lv_ny);
+    const std::size_t lv_asset_stride = lv_nt_u * lv_ny_u;
+
+    const double t_max = args->lv_t_grid[lv_nt - 1];
+    const double inv_dt_grid = (lv_nt > 1) ? (static_cast<double>(lv_nt - 1) / std::max(t_max, 1e-12)) : 0.0;
+    const double max_u_t = (lv_nt > 1) ? (static_cast<double>(lv_nt - 1) - 1e-6) : 0.0;
+    const double max_u_y = (lv_ny > 1) ? (static_cast<double>(lv_ny - 1) - 1e-6) : 0.0;
+
+    std::vector<double> inv_dy_vec(Du, 0.0);
+    for (int d = 0; d < D; ++d) {
+        if (lv_ny > 1) {
+            inv_dy_vec[static_cast<std::size_t>(d)] =
+                static_cast<double>(lv_ny - 1) / std::max(args->lv_y_max[d] - args->lv_y_min[d], 1e-12);
+        }
+    }
+
+    const std::size_t work_size = Mu * Su * Du * Ntot_u;
+    OmpCallGuard omp_guard(work_size >= 8192);
+    const int n_threads = omp_guard.active ? omp_guard.n_threads : 1;
+
+    // Precompute correlated normals [M, n_sub, D, eff_r, n_rep] so inner Platen step is unit-stride along n_rep.
+    std::vector<double> z_corr(work_size);
+    const double* z_indep = args->z_indep;
+    const double* chol_base = args->chol_base;
+    #pragma omp parallel for collapse(2) schedule(static) if(omp_guard.active) num_threads(n_threads)
+    for (int ms = 0; ms < M * n_sub; ++ms) {
+        for (int r = 0; r < eff_r; ++r) {
+            const std::size_t ms_u = static_cast<std::size_t>(ms);
+            const std::size_t r_u = static_cast<std::size_t>(r);
+            const std::size_t in_base = (ms_u * Ru + r_u) * Nrep_u * Du;
+            const std::size_t out_ms_base = ms_u * Du * Ntot_u + r_u * Nrep_u;
+            for (int d = 0; d < D; ++d) {
+                const double* c_row = chol_base + static_cast<std::size_t>(d) * Du;
+                double* dst = z_corr.data() + out_ms_base + static_cast<std::size_t>(d) * Ntot_u;
+                for (int n = 0; n < n_rep; ++n) {
+                    const double* zin = z_indep + in_base + static_cast<std::size_t>(n) * Du;
+                    double acc = 0.0;
+                    for (int k = 0; k < D; ++k) {
+                        acc += zin[k] * c_row[k];
+                    }
+                    dst[n] = acc;
+                }
+            }
+        }
+    }
+
+    if (run_fwd) {
+        #pragma omp parallel if(omp_guard.active) num_threads(n_threads)
+        {
+            std::vector<double> lx(Nrep_u);
+            std::vector<double> ex_s(Nrep_u);
+            std::vector<double> lv_slice_start(lv_ny_u);
+            std::vector<double> lv_slice_end(lv_ny_u);
+
+            #pragma omp for collapse(2) schedule(static)
+            for (int d = 0; d < D; ++d) {
+                for (int r = 0; r < eff_r; ++r) {
+                    const std::size_t du = static_cast<std::size_t>(d);
+                    const std::size_t ru = static_cast<std::size_t>(r);
+                    const double* lv_d = args->lv_tables + du * lv_asset_stride;
+                    const double y_min_d = args->lv_y_min[d];
+                    const double inv_dy_d = inv_dy_vec[du];
+
+                    auto fill_lv_slice = [&](double t_val, double* dst) noexcept {
+                        const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+                        const int it0 = static_cast<int>(u_t);
+                        const int it1 = std::min(it0 + 1, lv_nt - 1);
+                        const double wt = u_t - static_cast<double>(it0);
+                        const double omt = 1.0 - wt;
+                        const double* r0 = lv_d + static_cast<std::size_t>(it0) * lv_ny_u;
+                        const double* r1 = lv_d + static_cast<std::size_t>(it1) * lv_ny_u;
+                        for (int iy = 0; iy < lv_ny; ++iy) {
+                            dst[iy] = omt * r0[iy] + wt * r1[iy];
+                        }
+                    };
+
+                    std::fill(lx.begin(), lx.end(), 0.0);
+                    double t_prev = 0.0;
+                    double rt_prev = 0.0;
+                    double rn_prev = 0.0;
+
+                    for (int m = 0; m < M; ++m) {
+                        const std::size_t mu = static_cast<std::size_t>(m);
+                        const double t_cur = args->tau_obs[m];
+                        const double d_tau = std::max(t_cur - t_prev, 1e-10);
+                        const double dt = d_tau / static_cast<double>(n_sub);
+                        const double sqrt_dt = std::sqrt(dt);
+                        const double rt_cur = has_q_sub ? 0.0 : args->r_tot_obs[du * Mu + mu];
+                        const double rn_cur = has_q_sub ? 0.0 : args->r_native_obs[du * Mu + mu];
+                        const double drt = rt_cur - rt_prev;
+                        const double drn = rn_cur - rn_prev;
+
+                        for (int s = 0; s < n_sub; ++s) {
+                            const double alpha_s = (static_cast<double>(s) + 0.5) / static_cast<double>(n_sub);
+                            const double t_mid = t_prev + alpha_s * d_tau;
+                            const double t_start = std::max(t_mid - 0.5 * dt, 0.0);
+                            const double t_end = t_start + dt;
+                            const double q_mid = has_q_sub
+                                ? args->q_shift_sub[(du * Mu + mu) * Su + static_cast<std::size_t>(s)]
+                                : ((rt_prev + alpha_s * drt) - (rn_prev + alpha_s * drn));
+
+                            fill_lv_slice(t_start, lv_slice_start.data());
+                            fill_lv_slice(t_end, lv_slice_end.data());
+
+                            const double* zd_ptr = z_corr.data() +
+                                ((mu * Su + static_cast<std::size_t>(s)) * Du + du) * Ntot_u + ru * Nrep_u;
+
+                            int n = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                            const __m256d v_y_min = _mm256_set1_pd(y_min_d);
+                            const __m256d v_inv_dy = _mm256_set1_pd(inv_dy_d);
+                            const __m256d v_zero = _mm256_setzero_pd();
+                            const __m256d v_max_uy = _mm256_set1_pd(max_u_y);
+                            const __m256d v_q_mid = _mm256_set1_pd(q_mid);
+                            const __m256d v_dt = _mm256_set1_pd(dt);
+                            const __m256d v_sdt = _mm256_set1_pd(sqrt_dt);
+                            const __m256d v_half = _mm256_set1_pd(0.5);
+                            const __m256d v_nhalf = _mm256_set1_pd(-0.5);
+                            const __m256d v_quarter = _mm256_set1_pd(0.25);
+                            const __m256d v_two = _mm256_set1_pd(2.0);
+                            const __m256d v_one = _mm256_set1_pd(1.0);
+                            const double* sl0 = lv_slice_start.data();
+                            const double* sl1 = lv_slice_end.data();
+
+                            auto lookup_slice_pd = [&](const double* sl, __m256d y_v) noexcept -> __m256d {
+                                if (lv_ny <= 1) return _mm256_set1_pd(sl[0]);
+                                __m256d uy_raw = _mm256_mul_pd(_mm256_sub_pd(y_v, v_y_min), v_inv_dy);
+                                __m256d u_y = _mm256_min_pd(_mm256_max_pd(uy_raw, v_zero), v_max_uy);
+                                __m256d u_fl = _mm256_floor_pd(u_y);
+                                __m128i iy0 = _mm256_cvttpd_epi32(u_fl);
+                                __m256d wy = _mm256_sub_pd(u_y, u_fl);
+                                __m256d s0 = _mm256_i32gather_pd(sl, iy0, 8);
+                                __m256d s1 = _mm256_i32gather_pd(sl + 1, iy0, 8);
+                                return _mm256_fmadd_pd(wy, _mm256_sub_pd(s1, s0), s0);
+                            };
+
+                            for (; n + 4 <= n_rep; n += 4) {
+                                __m256d lx_v = _mm256_loadu_pd(lx.data() + n);
+                                __m256d zd = _mm256_loadu_pd(zd_ptr + n);
+                                __m256d y0 = _mm256_add_pd(lx_v, v_q_mid);
+                                __m256d sig0 = lookup_slice_pd(sl0, y0);
+                                __m256d a0 = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sig0, sig0));
+                                __m256d dw = _mm256_mul_pd(v_sdt, zd);
+                                __m256d sig0_sdt = _mm256_mul_pd(sig0, v_sdt);
+                                __m256d base_y = _mm256_fmadd_pd(a0, v_dt, y0);
+                                __m256d sigh = lookup_slice_pd(sl1, _mm256_fmadd_pd(sig0, dw, base_y));
+                                __m256d sigp = lookup_slice_pd(sl1, _mm256_add_pd(base_y, sig0_sdt));
+                                __m256d sigm = lookup_slice_pd(sl1, _mm256_sub_pd(base_y, sig0_sdt));
+                                __m256d ah = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sigh, sigh));
+                                __m256d drift = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_add_pd(a0, ah), v_dt));
+                                __m256d sum_sig = _mm256_add_pd(_mm256_add_pd(sigp, sigm), _mm256_mul_pd(v_two, sig0));
+                                __m256d diff = _mm256_mul_pd(v_quarter, _mm256_mul_pd(sum_sig, dw));
+                                __m256d mil = _mm256_mul_pd(
+                                    v_quarter,
+                                    _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_sdt, _mm256_fmsub_pd(zd, zd, v_one)))
+                                );
+                                _mm256_storeu_pd(lx.data() + n, _mm256_add_pd(lx_v, _mm256_add_pd(drift, _mm256_add_pd(diff, mil))));
+                            }
+#endif
+                            auto lookup_scalar = [&](const double* sl, double y_v) noexcept -> double {
+                                if (lv_ny <= 1) return sl[0];
+                                const double u_y = std::clamp((y_v - y_min_d) * inv_dy_d, 0.0, max_u_y);
+                                const int iy0 = static_cast<int>(u_y);
+                                const int iy1 = std::min(iy0 + 1, lv_ny - 1);
+                                const double wy = u_y - static_cast<double>(iy0);
+                                return (1.0 - wy) * sl[iy0] + wy * sl[iy1];
+                            };
+                            for (; n < n_rep; ++n) {
+                                const double zd = zd_ptr[n];
+                                const double lx_v = lx[static_cast<std::size_t>(n)];
+                                const double sig0 = lookup_scalar(lv_slice_start.data(), lx_v + q_mid);
+                                const double a0 = -0.5 * sig0 * sig0;
+                                const double dw = sqrt_dt * zd;
+                                const double base_y = lx_v + a0 * dt + q_mid;
+                                const double sigh = lookup_scalar(lv_slice_end.data(), base_y + sig0 * dw);
+                                const double sigp = lookup_scalar(lv_slice_end.data(), base_y + sig0 * sqrt_dt);
+                                const double sigm = lookup_scalar(lv_slice_end.data(), base_y - sig0 * sqrt_dt);
+                                const double ah = -0.5 * sigh * sigh;
+                                lx[static_cast<std::size_t>(n)] = lx_v
+                                    + 0.5 * (a0 + ah) * dt
+                                    + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
+                                    + 0.25 * (sigp - sigm) * sqrt_dt * (zd * zd - 1.0);
+                            }
+                        }
+
+                        double max_lx = -std::numeric_limits<double>::infinity();
+                        for (int n = 0; n < n_rep; ++n) {
+                            max_lx = std::max(max_lx, lx[static_cast<std::size_t>(n)]);
+                        }
+                        double sum_ex = 0.0;
+                        for (int n = 0; n < n_rep; ++n) {
+                            const double ev = std::exp(lx[static_cast<std::size_t>(n)] - max_lx);
+                            ex_s[static_cast<std::size_t>(n)] = ev;
+                            sum_ex += ev;
+                        }
+                        const double mean_rep = std::max(sum_ex / static_cast<double>(n_rep), 1e-30);
+                        const double shift = max_lx + std::log(mean_rep);
+                        const std::size_t out_off = (mu * Du + du) * Ntot_u + ru * Nrep_u;
+                        double* lp_dst = args->lx_period_out + out_off;
+                        double* nx_dst = (args->norm_x_out != nullptr) ? (args->norm_x_out + out_off) : nullptr;
+                        const double inv_mean = 1.0 / mean_rep;
+                        for (int n = 0; n < n_rep; ++n) {
+                            const double normed = lx[static_cast<std::size_t>(n)] - shift;
+                            lx[static_cast<std::size_t>(n)] = normed;
+                            lp_dst[n] = normed;
+                            if (nx_dst != nullptr) {
+                                nx_dst[n] = ex_s[static_cast<std::size_t>(n)] * inv_mean;
+                            }
+                        }
+                        t_prev = t_cur;
+                        rt_prev = rt_cur;
+                        rn_prev = rn_cur;
+                    }
+                }
+            }
+        }
+    }
+
+    if (run_bwd) {
+        const std::size_t n_lv_tot = Du * lv_asset_stride;
+        const std::size_t n_chol_tot = Du * Du;
+        const std::size_t n_q_tot = Du * Mu * Su;
+        std::vector<double> per_thr_lv(compute_lv ? (static_cast<std::size_t>(n_threads) * n_lv_tot) : 0u, 0.0);
+        std::vector<double> per_thr_chol(compute_chol ? (static_cast<std::size_t>(n_threads) * n_chol_tot) : 0u, 0.0);
+        std::vector<double> per_thr_q(compute_q ? (static_cast<std::size_t>(n_threads) * n_q_tot) : 0u, 0.0);
+
+        const double inv_n_rep = 1.0 / static_cast<double>(n_rep);
+
+        #pragma omp parallel if(omp_guard.active) num_threads(n_threads)
+        {
+#ifdef _OPENMP
+            const int tid = omp_guard.active ? omp_get_thread_num() : 0;
+#else
+            const int tid = 0;
+#endif
+            double* thr_lv = compute_lv ? (per_thr_lv.data() + static_cast<std::size_t>(tid) * n_lv_tot) : nullptr;
+            double* thr_chol = compute_chol ? (per_thr_chol.data() + static_cast<std::size_t>(tid) * n_chol_tot) : nullptr;
+            double* thr_q = compute_q ? (per_thr_q.data() + static_cast<std::size_t>(tid) * n_q_tot) : nullptr;
+
+            std::vector<double> bar_x(Nrep_u);
+            std::vector<double> bar_tot(Nrep_u);
+            std::vector<double> lx_sub_pre(Su * Nrep_u);
+            std::vector<double> lx_run(Nrep_u);
+
+            #pragma omp for collapse(2) schedule(static)
+            for (int d = 0; d < D; ++d) {
+                for (int r = 0; r < eff_r; ++r) {
+                    const std::size_t du = static_cast<std::size_t>(d);
+                    const std::size_t ru = static_cast<std::size_t>(r);
+                    const double* lv_d = args->lv_tables + du * lv_asset_stride;
+                    double* thr_lv_d = compute_lv ? (thr_lv + du * lv_asset_stride) : nullptr;
+                    const double y_min_d = args->lv_y_min[d];
+                    const double inv_dy_d = inv_dy_vec[du];
+
+                    std::fill(bar_x.begin(), bar_x.end(), 0.0);
+
+                    for (int m = M - 1; m >= 0; --m) {
+                        const std::size_t mu = static_cast<std::size_t>(m);
+                        const double t_prev = (m == 0) ? 0.0 : args->tau_obs[m - 1];
+                        const double t_cur = args->tau_obs[m];
+                        const double d_tau = std::max(t_cur - t_prev, 1e-10);
+                        const double dt = d_tau / static_cast<double>(n_sub);
+                        const double sqrt_dt = std::sqrt(dt);
+
+                        const double rt_prev = (has_q_sub || m == 0) ? 0.0 : args->r_tot_obs[du * Mu + static_cast<std::size_t>(m - 1)];
+                        const double rt_cur = has_q_sub ? 0.0 : args->r_tot_obs[du * Mu + mu];
+                        const double rn_prev = (has_q_sub || m == 0) ? 0.0 : args->r_native_obs[du * Mu + static_cast<std::size_t>(m - 1)];
+                        const double rn_cur = has_q_sub ? 0.0 : args->r_native_obs[du * Mu + mu];
+                        const double drt = rt_cur - rt_prev;
+                        const double drn = rn_cur - rn_prev;
+
+                        const std::size_t m_off = (mu * Du + du) * Ntot_u + ru * Nrep_u;
+                        const double* bar_post_p = args->bar_lx_post + m_off;
+                        const double* lx_norm_m = lx_norm + m_off;
+
+                        double sum_bar_tot = 0.0;
+                        for (int n = 0; n < n_rep; ++n) {
+                            const double bt = bar_post_p[n] + bar_x[static_cast<std::size_t>(n)];
+                            bar_tot[static_cast<std::size_t>(n)] = bt;
+                            sum_bar_tot += bt;
+                        }
+                        for (int n = 0; n < n_rep; ++n) {
+                            const double omega = std::exp(lx_norm_m[n]) * inv_n_rep;
+                            bar_x[static_cast<std::size_t>(n)] = bar_tot[static_cast<std::size_t>(n)] - omega * sum_bar_tot;
+                        }
+
+                        if (m == 0) {
+                            std::fill(lx_run.begin(), lx_run.end(), 0.0);
+                        } else {
+                            const double* prev_norm = lx_norm + (static_cast<std::size_t>(m - 1) * Du + du) * Ntot_u + ru * Nrep_u;
+                            std::copy(prev_norm, prev_norm + Nrep_u, lx_run.begin());
+                        }
+
+                        // Forward rematerialization of substep pre-states within period m.
+                        for (int s = 0; s < n_sub; ++s) {
+                            const std::size_t su = static_cast<std::size_t>(s);
+                            std::copy(lx_run.begin(), lx_run.end(), lx_sub_pre.data() + su * Nrep_u);
+                            const double alpha_s = (static_cast<double>(s) + 0.5) / static_cast<double>(n_sub);
+                            const double t_start = std::max(t_prev + alpha_s * d_tau - 0.5 * dt, 0.0);
+                            const double t_end = t_start + dt;
+                            const double q_mid = has_q_sub
+                                ? args->q_shift_sub[(du * Mu + mu) * Su + su]
+                                : ((rt_prev + alpha_s * drt) - (rn_prev + alpha_s * drn));
+                            const double* zd_ptr = z_corr.data() + ((mu * Su + su) * Du + du) * Ntot_u + ru * Nrep_u;
+                            for (int n = 0; n < n_rep; ++n) {
+                                const double lxv = lx_run[static_cast<std::size_t>(n)];
+                                const double zd = zd_ptr[n];
+                                const double dw = sqrt_dt * zd;
+                                const double sig0 = eval_lv_bilinear_val(lv_d, lv_nt, lv_ny, t_start, lxv + q_mid, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+                                const double a0 = -0.5 * sig0 * sig0;
+                                const double base_y = lxv + a0 * dt + q_mid;
+                                const double sigh = eval_lv_bilinear_val(lv_d, lv_nt, lv_ny, t_end, base_y + sig0 * dw, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+                                const double sigp = eval_lv_bilinear_val(lv_d, lv_nt, lv_ny, t_end, base_y + sig0 * sqrt_dt, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+                                const double sigm = eval_lv_bilinear_val(lv_d, lv_nt, lv_ny, t_end, base_y - sig0 * sqrt_dt, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+                                lx_run[static_cast<std::size_t>(n)] = lxv
+                                    + 0.5 * (a0 - 0.5 * sigh * sigh) * dt
+                                    + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
+                                    + 0.25 * (sigp - sigm) * sqrt_dt * (zd * zd - 1.0);
+                            }
+                        }
+
+                        // Reverse-mode substep adjoints.
+                        for (int s = n_sub - 1; s >= 0; --s) {
+                            const std::size_t su = static_cast<std::size_t>(s);
+                            const double* lx_pre = lx_sub_pre.data() + su * Nrep_u;
+                            const double alpha_s = (static_cast<double>(s) + 0.5) / static_cast<double>(n_sub);
+                            const double t_start = std::max(t_prev + alpha_s * d_tau - 0.5 * dt, 0.0);
+                            const double t_end = t_start + dt;
+                            const double q_mid = has_q_sub
+                                ? args->q_shift_sub[(du * Mu + mu) * Su + su]
+                                : ((rt_prev + alpha_s * drt) - (rn_prev + alpha_s * drn));
+                            const double* zd_ptr = z_corr.data() + ((mu * Su + su) * Du + du) * Ntot_u + ru * Nrep_u;
+                            const double* zin_step = z_indep + ((mu * Su + su) * Ru + ru) * Nrep_u * Du;
+
+                            double q_acc_step = 0.0;
+                            for (int n = 0; n < n_rep; ++n) {
+                                const double lxp = lx_pre[n];
+                                const double zd = zd_ptr[n];
+                                const double dw = sqrt_dt * zd;
+                                const BilinearLvEval e0 = eval_lv_bilinear_with_deriv(
+                                    lv_d, lv_nt, lv_ny, t_start, lxp + q_mid, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+                                const double sig0 = e0.val;
+                                const double a0 = -0.5 * sig0 * sig0;
+                                const double base_y = lxp + a0 * dt + q_mid;
+                                const BilinearLvEval eh = eval_lv_bilinear_with_deriv(
+                                    lv_d, lv_nt, lv_ny, t_end, base_y + sig0 * dw, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+                                const BilinearLvEval ep = eval_lv_bilinear_with_deriv(
+                                    lv_d, lv_nt, lv_ny, t_end, base_y + sig0 * sqrt_dt, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+                                const BilinearLvEval em = eval_lv_bilinear_with_deriv(
+                                    lv_d, lv_nt, lv_ny, t_end, base_y - sig0 * sqrt_dt, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+
+                                const double bx = bar_x[static_cast<std::size_t>(n)];
+                                const double zc2m1 = zd * zd - 1.0;
+                                const double bar_lvh = bx * (-0.5 * dt * eh.val);
+                                const double bar_lvp = bx * (0.25 * (dw + sqrt_dt * zc2m1));
+                                const double bar_lvm = bx * (0.25 * (dw - sqrt_dt * zc2m1));
+                                const double bar_lv0_dir = bx * (-0.5 * dt * sig0 + 0.5 * dw);
+
+                                const double bar_lx_hat = bar_lvh * eh.dy;
+                                const double bar_lx_p = bar_lvp * ep.dy;
+                                const double bar_lx_m = bar_lvm * em.dy;
+
+                                if (compute_chol) {
+                                    const double bar_zc =
+                                        bx * (0.25 * (ep.val + em.val + 2.0 * sig0) * sqrt_dt + 0.5 * (ep.val - em.val) * sqrt_dt * zd)
+                                        + bar_lx_hat * (sig0 * sqrt_dt);
+                                    const double* zin_n = zin_step + static_cast<std::size_t>(n) * Du;
+                                    double* chol_row = thr_chol + du * Du;
+                                    for (int j = 0; j < D; ++j) {
+                                        chol_row[j] += bar_zc * zin_n[j];
+                                    }
+                                }
+
+                                const double bar_a0 = dt * (bar_lx_hat + bar_lx_p + bar_lx_m);
+                                const double bar_lv0 = bar_lv0_dir + bar_a0 * (-sig0) + bar_lx_hat * dw + (bar_lx_p - bar_lx_m) * sqrt_dt;
+
+                                if (compute_lv) {
+                                    auto scatter_lv = [&](double bval, const BilinearLvEval& ev) noexcept {
+                                        const std::size_t r0 = static_cast<std::size_t>(ev.it0) * lv_ny_u;
+                                        const std::size_t r1 = static_cast<std::size_t>(ev.it1) * lv_ny_u;
+                                        const std::size_t c0 = static_cast<std::size_t>(ev.iy0);
+                                        const std::size_t c1 = static_cast<std::size_t>(ev.iy1);
+                                        const double omt = 1.0 - ev.wt;
+                                        const double omy = 1.0 - ev.wy;
+                                        thr_lv_d[r0 + c0] += bval * omt * omy;
+                                        thr_lv_d[r0 + c1] += bval * omt * ev.wy;
+                                        thr_lv_d[r1 + c0] += bval * ev.wt * omy;
+                                        thr_lv_d[r1 + c1] += bval * ev.wt * ev.wy;
+                                    };
+                                    scatter_lv(bar_lv0, e0);
+                                    scatter_lv(bar_lvh, eh);
+                                    scatter_lv(bar_lvp, ep);
+                                    scatter_lv(bar_lvm, em);
+                                }
+
+                                const double bar_y = bar_lv0 * e0.dy + bar_lx_hat + bar_lx_p + bar_lx_m;
+                                if (compute_q) {
+                                    q_acc_step += bar_y;
+                                }
+                                bar_x[static_cast<std::size_t>(n)] = bx + bar_y;
+                            }
+                            if (compute_q) {
+                                thr_q[(du * Mu + mu) * Su + su] += q_acc_step;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (compute_lv) {
+            std::fill(args->bar_lv_out, args->bar_lv_out + n_lv_tot, 0.0);
+            for (int tid = 0; tid < n_threads; ++tid) {
+                const double* src = per_thr_lv.data() + static_cast<std::size_t>(tid) * n_lv_tot;
+                for (std::size_t idx = 0; idx < n_lv_tot; ++idx) {
+                    args->bar_lv_out[idx] += src[idx];
+                }
+            }
+        }
+        if (compute_chol) {
+            std::fill(args->bar_chol_out, args->bar_chol_out + n_chol_tot, 0.0);
+            for (int tid = 0; tid < n_threads; ++tid) {
+                const double* src = per_thr_chol.data() + static_cast<std::size_t>(tid) * n_chol_tot;
+                for (std::size_t idx = 0; idx < n_chol_tot; ++idx) {
+                    args->bar_chol_out[idx] += src[idx];
+                }
+            }
+        }
+        if (compute_q) {
+            std::fill(args->bar_q_shift_out, args->bar_q_shift_out + n_q_tot, 0.0);
+            for (int tid = 0; tid < n_threads; ++tid) {
+                const double* src = per_thr_q.data() + static_cast<std::size_t>(tid) * n_q_tot;
+                for (std::size_t idx = 0; idx < n_q_tot; ++idx) {
+                    args->bar_q_shift_out[idx] += src[idx];
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+std::int32_t crn_generate_sobol_normals_cpp(const SobolGenArgs* args) noexcept {
+    if (args == nullptr) return -1;
+    if (args->d_assets <= 0 || args->m_rem <= 0 || args->n_sub <= 0 ||
+        args->eff_r <= 0 || args->n_rep <= 0) {
+        return -1;
+    }
+    if (args->z_indep_out == nullptr && args->z_corr_out == nullptr) {
+        return -1;
+    }
+    if (args->apply_bb_time != 0 && args->bb_ortho_mat == nullptr) {
+        return -1;
+    }
+    if (args->apply_corr != 0 && args->z_corr_out != nullptr && args->chol_mat == nullptr) {
+        return -1;
+    }
+
+    const int D = static_cast<int>(args->d_assets);
+    const int M = static_cast<int>(args->m_rem);
+    const int n_sub = static_cast<int>(args->n_sub);
+    const int eff_r = static_cast<int>(args->eff_r);
+    const int n_rep = static_cast<int>(args->n_rep);
+    const int sobol_dim = static_cast<int>(std::max<std::int64_t>(args->sobol_dim, 0));
+    const int n_bits = static_cast<int>((args->n_bits > 0 && args->n_bits <= 32) ? args->n_bits : 30);
+
+    const std::size_t Du = static_cast<std::size_t>(D);
+    const std::size_t Mu = static_cast<std::size_t>(M);
+    const std::size_t Su = static_cast<std::size_t>(n_sub);
+    const std::size_t Ru = static_cast<std::size_t>(eff_r);
+    const std::size_t Nrep_u = static_cast<std::size_t>(n_rep);
+    const std::size_t n_bits_u = static_cast<std::size_t>(n_bits);
+    const std::uint32_t bit_mask = (n_bits >= 32) ? 0xFFFFFFFFu : ((1u << n_bits) - 1u);
+    const double inv_pow2 = std::ldexp(1.0, -n_bits);
+    const double inv_n_sub = 1.0 / static_cast<double>(n_sub);
+    const double inv_sqrt_sub = std::sqrt(inv_n_sub);
+
+    const bool use_gray = args->use_gray_code != 0;
+    const bool apply_bb = args->apply_bb_time != 0;
+    const bool apply_corr = (args->apply_corr != 0) && (args->z_corr_out != nullptr);
+    const bool antithetic = args->antithetic != 0;
+    const int n_gen = antithetic ? ((n_rep + 1) / 2) : n_rep;
+
+    const std::size_t n_dims_total = Mu * (Su + 1u) * Du;
+    const std::size_t out_total = Mu * Su * Ru * Nrep_u * Du;
+
+    std::vector<double> indep_tmp;
+    double* z_indep = args->z_indep_out;
+    if (z_indep == nullptr) {
+        indep_tmp.resize(out_total);
+        z_indep = indep_tmp.data();
+    }
+
+    auto fill_dim_sobol_normals = [&](int dim, int r, double* dst_n) noexcept {
+        if (args->dir_numbers != nullptr && dim < sobol_dim) {
+            const std::uint32_t* dir_row = args->dir_numbers + static_cast<std::size_t>(dim) * n_bits_u;
+            const std::uint32_t shift_val = (args->digital_shifts != nullptr)
+                ? (args->digital_shifts[static_cast<std::size_t>(r) * n_dims_total + static_cast<std::size_t>(dim)] & bit_mask)
+                : 0u;
+            if (use_gray && n_gen > 0) {
+                std::uint32_t acc = shift_val;
+                double u0 = std::clamp((static_cast<double>(acc) + 0.5) * inv_pow2, 1e-12, 1.0 - 1e-12);
+                dst_n[0] = ndtri_std(u0);
+                for (int n_idx = 1; n_idx < n_gen; ++n_idx) {
+                    const int bit_idx = std::countr_zero(static_cast<std::uint32_t>(n_idx));
+                    if (bit_idx < n_bits) {
+                        acc ^= dir_row[bit_idx];
+                    }
+                    const double u = std::clamp((static_cast<double>(acc) + 0.5) * inv_pow2, 1e-12, 1.0 - 1e-12);
+                    dst_n[n_idx] = ndtri_std(u);
+                }
+            } else {
+                for (int n_idx = 0; n_idx < n_gen; ++n_idx) {
+                    std::uint32_t code = static_cast<std::uint32_t>(n_idx);
+                    std::uint32_t acc = shift_val;
+                    for (int b = 0; b < n_bits && code != 0u; ++b, code >>= 1) {
+                        if ((code & 1u) != 0u) {
+                            acc ^= dir_row[b];
+                        }
+                    }
+                    const double u = std::clamp((static_cast<double>(acc) + 0.5) * inv_pow2, 1e-12, 1.0 - 1e-12);
+                    dst_n[n_idx] = ndtri_std(u);
+                }
+            }
+            return;
+        }
+        const std::uint64_t base_seed = static_cast<std::uint64_t>(0x9E3779B97F4A7C15ULL)
+            ^ (static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(0xBF58476D1CE4E5B9ULL))
+            ^ (static_cast<std::uint64_t>(dim) * static_cast<std::uint64_t>(0x94D049BB133111EBULL));
+        for (int n_idx = 0; n_idx < n_gen; ++n_idx) {
+            std::uint64_t rng_state = base_seed ^ static_cast<std::uint64_t>(n_idx);
+            const double u = u64_to_unit_open(splitmix64_next(rng_state));
+            dst_n[n_idx] = ndtri_std(u);
+        }
+    };
+
+    OmpCallGuard omp_guard(out_total >= 8192);
+    const int n_threads = omp_guard.active ? omp_guard.n_threads : 1;
+    const std::size_t n_gen_u = static_cast<std::size_t>(n_gen);
+
+    // Step 1: Generate Sobol + Brownian-bridge substeps into z_indep [M, n_sub, eff_r, n_rep, D].
+    #pragma omp parallel if(omp_guard.active) num_threads(n_threads)
+    {
+        std::vector<double> zc_buf(n_gen_u);
+        std::vector<double> zf_buf(Su * n_gen_u);
+
+        #pragma omp for collapse(2) schedule(static)
+        for (int r = 0; r < eff_r; ++r) {
+            for (int m = 0; m < M; ++m) {
+                const std::size_t ru = static_cast<std::size_t>(r);
+                const std::size_t mu = static_cast<std::size_t>(m);
+                const int coarse_base = m * D;
+                const int fine_base = (M + m * n_sub) * D;
+
+                for (int d = 0; d < D; ++d) {
+                    const std::size_t du = static_cast<std::size_t>(d);
+                    fill_dim_sobol_normals(coarse_base + d, r, zc_buf.data());
+                    if (n_sub == 1) {
+                        const std::size_t base_out = ((mu * Su + 0u) * Ru + ru) * Nrep_u * Du + du;
+                        for (int n = 0; n < n_gen; ++n) {
+                            z_indep[base_out + static_cast<std::size_t>(n) * Du] = zc_buf[static_cast<std::size_t>(n)];
+                        }
+                    } else {
+                        for (int s = 0; s < n_sub; ++s) {
+                            fill_dim_sobol_normals(fine_base + s * D + d, r, zf_buf.data() + static_cast<std::size_t>(s) * n_gen_u);
+                        }
+                        for (int n = 0; n < n_gen; ++n) {
+                            const std::size_t nu = static_cast<std::size_t>(n);
+                            double z_sum = 0.0;
+                            for (int s = 0; s < n_sub; ++s) {
+                                z_sum += zf_buf[static_cast<std::size_t>(s) * n_gen_u + nu];
+                            }
+                            const double delta = zc_buf[nu] * inv_sqrt_sub - z_sum * inv_n_sub;
+                            for (int s = 0; s < n_sub; ++s) {
+                                const std::size_t out_off = ((mu * Su + static_cast<std::size_t>(s)) * Ru + ru) * Nrep_u * Du + nu * Du + du;
+                                z_indep[out_off] = zf_buf[static_cast<std::size_t>(s) * n_gen_u + nu] + delta;
+                            }
+                        }
+                    }
+                }
+
+                if (antithetic && n_gen < n_rep) {
+                    for (int s = 0; s < n_sub; ++s) {
+                        const std::size_t step_off = ((mu * Su + static_cast<std::size_t>(s)) * Ru + ru) * Nrep_u * Du;
+                        for (int n = n_gen; n < n_rep; ++n) {
+                            const int src_n = n - n_gen;
+                            double* dst_n = z_indep + step_off + static_cast<std::size_t>(n) * Du;
+                            const double* src_p = z_indep + step_off + static_cast<std::size_t>(src_n) * Du;
+                            for (int d = 0; d < D; ++d) {
+                                dst_n[d] = -src_p[d];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2: Optional temporal rotation across M periods via bb_ortho_mat [M, M].
+    if (apply_bb && M > 1) {
+        const double* bb = args->bb_ortho_mat;
+        const std::size_t rep_d = Nrep_u * Du;
+        #pragma omp parallel if(omp_guard.active) num_threads(n_threads)
+        {
+            std::vector<double> z_mean(Mu * rep_d);
+            std::vector<double> z_rot(Mu * rep_d);
+
+            #pragma omp for schedule(static)
+            for (int r = 0; r < eff_r; ++r) {
+                const std::size_t ru = static_cast<std::size_t>(r);
+                for (int m = 0; m < M; ++m) {
+                    const std::size_t mu = static_cast<std::size_t>(m);
+                    double* zm = z_mean.data() + mu * rep_d;
+                    const double* src0 = z_indep + ((mu * Su + 0u) * Ru + ru) * rep_d;
+                    for (std::size_t i = 0; i < rep_d; ++i) {
+                        zm[i] = src0[i];
+                    }
+                    for (int s = 1; s < n_sub; ++s) {
+                        const double* srcs = z_indep + ((mu * Su + static_cast<std::size_t>(s)) * Ru + ru) * rep_d;
+                        for (std::size_t i = 0; i < rep_d; ++i) {
+                            zm[i] += srcs[i];
+                        }
+                    }
+                    for (std::size_t i = 0; i < rep_d; ++i) {
+                        zm[i] *= inv_n_sub;
+                    }
+                }
+
+                for (int m = 0; m < M; ++m) {
+                    const std::size_t mu = static_cast<std::size_t>(m);
+                    const double* bb_row = bb + mu * Mu;
+                    double* zr = z_rot.data() + mu * rep_d;
+                    const double b0 = bb_row[0];
+                    const double* zm0 = z_mean.data();
+                    for (std::size_t i = 0; i < rep_d; ++i) {
+                        zr[i] = b0 * zm0[i];
+                    }
+                    for (int k = 1; k < M; ++k) {
+                        const double bk = bb_row[k];
+                        const double* zmk = z_mean.data() + static_cast<std::size_t>(k) * rep_d;
+                        for (std::size_t i = 0; i < rep_d; ++i) {
+                            zr[i] += bk * zmk[i];
+                        }
+                    }
+                }
+
+                for (int m = 0; m < M; ++m) {
+                    const std::size_t mu = static_cast<std::size_t>(m);
+                    const double* zm = z_mean.data() + mu * rep_d;
+                    const double* zr = z_rot.data() + mu * rep_d;
+                    for (int s = 0; s < n_sub; ++s) {
+                        double* dst = z_indep + ((mu * Su + static_cast<std::size_t>(s)) * Ru + ru) * rep_d;
+                        for (std::size_t i = 0; i < rep_d; ++i) {
+                            dst[i] += zr[i] - zm[i];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 3: Optional cross-asset Cholesky correlation z_corr_out = z_indep @ chol_mat.T.
+    if (args->z_corr_out != nullptr) {
+        if (apply_corr) {
+            const double* chol = args->chol_mat;
+            double* z_corr_out = args->z_corr_out;
+            #pragma omp parallel for collapse(2) schedule(static) if(omp_guard.active) num_threads(n_threads)
+            for (int ms = 0; ms < M * n_sub; ++ms) {
+                for (int r = 0; r < eff_r; ++r) {
+                    const std::size_t base = (static_cast<std::size_t>(ms) * Ru + static_cast<std::size_t>(r)) * Nrep_u * Du;
+                    for (int n = 0; n < n_rep; ++n) {
+                        const double* zin = z_indep + base + static_cast<std::size_t>(n) * Du;
+                        double* zout = z_corr_out + base + static_cast<std::size_t>(n) * Du;
+                        for (int d = 0; d < D; ++d) {
+                            const double* c_row = chol + static_cast<std::size_t>(d) * Du;
+                            double acc = 0.0;
+                            for (int k = 0; k <= d; ++k) {
+                                acc += zin[k] * c_row[k];
+                            }
+                            // Support non-lower-triangular square factors gracefully if caller passed one.
+                            for (int k = d + 1; k < D; ++k) {
+                                if (c_row[k] != 0.0) acc += zin[k] * c_row[k];
+                            }
+                            zout[d] = acc;
+                        }
+                    }
+                }
+            }
+        } else if (args->z_corr_out != z_indep) {
+            std::copy(z_indep, z_indep + out_total, args->z_corr_out);
+        }
+    }
+
+    return 0;
+}
+
+std::int32_t crn_eval_vibrato_gamma_cpp(const VibratoGammaArgs* args) noexcept {
+    if (args == nullptr) return -1;
+    if (args->d_assets <= 0 || args->m_rem <= 0 || args->n_paths_total <= 0 ||
+        args->vib_step_start < 0 || args->vib_n_steps <= 0) {
+        return -1;
+    }
+    if (args->perf_mat == nullptr || args->lx_pre == nullptr || args->j_pre == nullptr ||
+        args->sig_pre == nullptr || args->sv_vib == nullptr || args->chol_mat == nullptr ||
+        args->l_inv_t == nullptr || args->c_inv == nullptr || args->fwd_term == nullptr ||
+        args->cdl_m == nullptr || args->cdl2_last == nullptr ||
+        args->ko_barriers == nullptr || args->is_callable == nullptr ||
+        args->cpn_barriers == nullptr || args->is_guaranteed_cpn == nullptr ||
+        args->coupon_rates == nullptr || args->eps_vec == nullptr || args->h_vib_out == nullptr) {
+        return -1;
+    }
+
+    const int D = static_cast<int>(args->d_assets);
+    const int M = static_cast<int>(args->m_rem);
+    const std::size_t N = static_cast<std::size_t>(args->n_paths_total);
+    const int vib_start = static_cast<int>(args->vib_step_start);
+    const int vib_n_steps = static_cast<int>(args->vib_n_steps);
+    const std::size_t Du = static_cast<std::size_t>(D);
+    const int m_last = M - 1;
+
+    const int ia = std::clamp(
+        (args->inv_lex_perm != nullptr && D > 0) ? static_cast<int>(args->inv_lex_perm[0]) : 0,
+        0, D - 1);
+    const int ib = std::clamp(
+        (args->inv_lex_perm != nullptr && D > 1) ? static_cast<int>(args->inv_lex_perm[1]) : 0,
+        0, D - 1);
+
+    const bool is_long_basket = args->is_long_basket != 0;
+    const int call_code = canonicalize_tile_code(args->call_code, D);
+    const int cpn_code = canonicalize_tile_code(args->cpn_code, D);
+    const int eff_opt_raw = (is_long_basket && args->opt_code == 0) ? 2 : args->opt_code;
+    const int eff_opt_code = canonicalize_tile_code(eff_opt_raw, D);
+
+    const bool has_ki = args->has_ki != 0;
+    const bool ki_active = args->ki_active != 0;
+    const bool has_one_star = args->has_one_star != 0;
+    const bool is_mem = args->is_memory != 0;
+    const bool no_notional = args->no_notional != 0;
+    const bool force_cpn_ac = args->force_cpn_ac != 0;
+    const bool cpn_dir_down = args->cpn_dir_down != 0;
+    const bool cpn_type_out = args->cpn_type_out != 0;
+    const bool has_lower_strike = args->has_lower_strike != 0;
+    const bool has_part_call = args->has_part_call != 0;
+
+    const double ko_spread = args->ko_spread;
+    const double cpn_spread = args->cpn_spread;
+    const double ki_spread = args->ki_spread;
+    const double one_star_strike = args->one_star_strike;
+    const double one_star_eps = args->one_star_eps;
+    const double strike = args->strike;
+    const double lower_strike = args->lower_strike;
+    const double ki_barrier = args->ki_barrier;
+    const double option_gearing = args->option_gearing;
+    const double ac_cpn = args->autocall_coupon;
+    const double c_mem_0 = args->c_mem_0;
+    const double i_ki_past = args->i_ki_past;
+    const double part_call_strike = args->part_call_strike;
+    const double part_call_rate = args->part_call_rate;
+    const double one_star_coupon = args->one_star_coupon;
+    const double df_last = args->df_last;
+    const double h_vib = args->h_vib;
+    const double sqrt_h_vib = std::sqrt(std::max(h_vib, 1e-30));
+    const double inv_sqrt_n = 1.0 / std::sqrt(static_cast<double>(vib_n_steps));
+    const double inv_d = 1.0 / static_cast<double>(D);
+    const double scale = 1.0 / static_cast<double>(N);
+
+    const bool hard_ko_sp = std::abs(ko_spread) > 1e-6;
+    const double eff_csp = cpn_dir_down ? -cpn_spread : cpn_spread;
+    const bool hard_cpn_sp = std::abs(eff_csp) > 1e-6;
+    const bool hard_ki_sp = std::abs(ki_spread) > 1e-6;
+    const double blo_ki_k = std::min(ki_barrier, ki_barrier + ki_spread);
+    const double bhi_ki_k = std::max(ki_barrier, ki_barrier + ki_spread);
+    const double inv_sp_ko = 1.0 / std::max(std::abs(ko_spread), 1e-12);
+    const double inv_sp_cp = 1.0 / std::max(std::abs(eff_csp), 1e-12);
+    const double inv_sp_ki = 1.0 / std::max(bhi_ki_k - blo_ki_k, 1e-12);
+    const double blo_ki_islb = std::min(strike, strike + ki_spread);
+    const double bhi_ki_islb = std::max(strike, strike + ki_spread);
+    const double inv_sp_ki_islb = 1.0 / std::max(bhi_ki_islb - blo_ki_islb, 1e-12);
+    const double inv_sp_os = 1.0 / std::max(one_star_eps, 1e-12);
+    const double sign_cpn_k = (cpn_dir_down ? -1.0 : 1.0) * (cpn_type_out ? -1.0 : 1.0);
+    const double term_not = no_notional ? 0.0 : 1.0;
+
+    auto eval_stats_at_period = [&](int m, std::size_t n) noexcept -> IdxBaseStats {
+        IdxBaseStats st{};
+        st.min1 = 1e300;
+        st.min2 = 1e300;
+        st.min3 = 1e300;
+        st.max1 = -1e300;
+        st.max2 = -1e300;
+        st.idx_min1 = -1;
+        st.idx_min2 = -1;
+        st.idx_min3 = -1;
+        st.idx_max1 = -1;
+        st.idx_max2 = -1;
+        st.pb = 1.0;
+        const std::size_t m_off = static_cast<std::size_t>(m) * Du;
+        for (int d = 0; d < D; ++d) {
+            const double pd = args->perf_mat[(m_off + static_cast<std::size_t>(d)) * N + n];
+            if (pd < st.min1) {
+                st.min3 = st.min2; st.idx_min3 = st.idx_min2;
+                st.min2 = st.min1; st.idx_min2 = st.idx_min1;
+                st.min1 = pd; st.idx_min1 = d;
+            } else if (pd < st.min2) {
+                st.min3 = st.min2; st.idx_min3 = st.idx_min2;
+                st.min2 = pd; st.idx_min2 = d;
+            } else if (pd < st.min3) {
+                st.min3 = pd; st.idx_min3 = d;
+            }
+            if (pd > st.max1) {
+                st.max2 = st.max1; st.idx_max2 = st.idx_max1;
+                st.max1 = pd; st.idx_max1 = d;
+            } else if (pd > st.max2) {
+                st.max2 = pd; st.idx_max2 = d;
+            }
+            st.s1 += pd;
+            st.s2 += pd * pd;
+            if (d == ia) st.pa = pd;
+            if (d == ib) st.pb = pd;
+        }
+        return st;
+    };
+
+    auto eval_terminal_opt = [&](const IdxBaseStats& st, double wo, double wb, double os_ind) noexcept -> double {
+        double ki_g = 1.0;
+        if (is_long_basket) {
+            if (has_ki && !ki_active) {
+                ki_g = i_ki_past;
+            } else {
+                const double w_wof = st.min1;
+                ki_g = hard_ki_sp
+                    ? std::clamp((bhi_ki_islb - w_wof) * inv_sp_ki_islb, 0.0, 1.0)
+                    : ((w_wof < strike) ? 1.0 : 0.0);
+                if (has_ki) ki_g = std::max(i_ki_past, ki_g);
+            }
+        } else if (ki_active) {
+            ki_g = hard_ki_sp
+                ? std::clamp((bhi_ki_k - wo) * inv_sp_ki, 0.0, 1.0)
+                : ((wo < ki_barrier) ? 1.0 : 0.0);
+        } else if (has_ki) {
+            ki_g = i_ki_past;
+        }
+
+        double opt = 0.0;
+        if (is_long_basket) {
+            const double w_avg = st.s1 * inv_d;
+            opt -= ki_g * (1.0 - os_ind) * (1.0 - w_avg);
+        } else {
+            const bool put_mask = has_lower_strike ? ((strike > lower_strike) && (option_gearing > 0.0)) : (option_gearing > 0.0);
+            if (put_mask) {
+                double put_intr = std::max(strike - wo, 0.0);
+                if (has_lower_strike) {
+                    put_intr -= std::max(lower_strike - wo, 0.0);
+                }
+                opt -= option_gearing * ki_g * (1.0 - os_ind) * put_intr;
+            }
+        }
+        if (has_part_call && part_call_rate != 0.0) {
+            opt += part_call_rate * std::max(wo - part_call_strike, 0.0);
+        }
+        if (has_one_star && one_star_coupon != 0.0) {
+            (void)wb;
+            opt += os_ind * one_star_coupon;
+        }
+        return opt;
+    };
+
+    auto eval_last_indicators = [&](const IdxBaseStats& st, double& gk_out, double& egc_out, double& opt_out, double& os_out) noexcept {
+        const double wc = select_idx_from_stats(st, inv_d, D, call_code);
+        const double wcp = (cpn_code == call_code) ? wc : select_idx_from_stats(st, inv_d, D, cpn_code);
+        const double wo = (eff_opt_code == call_code) ? wc : ((eff_opt_code == cpn_code) ? wcp : select_idx_from_stats(st, inv_d, D, eff_opt_code));
+        const double wb = has_one_star ? st.max1 : 0.0;
+
+        const double b_ko_l = args->ko_barriers[m_last];
+        const bool is_c_l = args->is_callable[m_last] > 0.5;
+        double gk_l = 0.0;
+        if (is_c_l) {
+            if (hard_ko_sp) {
+                gk_l = std::clamp((wc - std::min(b_ko_l, b_ko_l + ko_spread)) * inv_sp_ko, 0.0, 1.0);
+            } else {
+                gk_l = (wc >= b_ko_l) ? 1.0 : 0.0;
+            }
+        }
+        const double b_cp_l = args->cpn_barriers[m_last];
+        const bool is_g_l = args->is_guaranteed_cpn[m_last] > 0.5;
+        double gc_l = 1.0;
+        if (!is_g_l) {
+            if (hard_cpn_sp) {
+                const double blo_cp = std::min(b_cp_l, b_cp_l + eff_csp);
+                const double r_up = std::clamp((wcp - blo_cp) * inv_sp_cp, 0.0, 1.0);
+                const double hit_s = cpn_dir_down ? (1.0 - r_up) : r_up;
+                gc_l = cpn_type_out ? (1.0 - hit_s) : hit_s;
+            } else {
+                const bool hit_h = cpn_dir_down ? (wcp <= b_cp_l) : (wcp >= b_cp_l);
+                gc_l = cpn_type_out ? (hit_h ? 0.0 : 1.0) : (hit_h ? 1.0 : 0.0);
+            }
+        }
+        const double egc_l = force_cpn_ac ? std::max(gc_l, gk_l) : gc_l;
+        double os_l = 0.0;
+        if (has_one_star) {
+            if (one_star_eps <= 1e-6) {
+                os_l = (wb >= one_star_strike) ? 1.0 : 0.0;
+            } else {
+                os_l = std::clamp((wb - (one_star_strike - 0.5 * one_star_eps)) * inv_sp_os, 0.0, 1.0);
+            }
+        }
+        gk_out = gk_l;
+        egc_out = egc_l;
+        os_out = os_l;
+        opt_out = eval_terminal_opt(st, wo, wb, os_l);
+    };
+
+    const bool write_frozen = (args->frozen_term_out != nullptr) && (M > 1);
+    const std::size_t n_h_tot = Du * Du;
+
+    OmpCallGuard omp_guard(N * Du * static_cast<std::size_t>(std::max(M + vib_n_steps, 1)) >= 4096);
+    const int n_threads = omp_guard.active ? omp_guard.n_threads : 1;
+    std::vector<double> per_thr_h(static_cast<std::size_t>(n_threads) * n_h_tot, 0.0);
+
+    #pragma omp parallel if(omp_guard.active) num_threads(n_threads)
+    {
+#ifdef _OPENMP
+        const int tid = omp_guard.active ? omp_get_thread_num() : 0;
+#else
+        const int tid = 0;
+#endif
+        double* thr_h = per_thr_h.data() + static_cast<std::size_t>(tid) * n_h_tot;
+        std::vector<double> dlns(Du, 0.0);
+        std::vector<double> dcm(is_mem ? Du : 0u, 0.0);
+        std::vector<double> zk_mean(Du, 0.0);
+        std::vector<double> xi(Du, 0.0);
+        std::vector<double> inv_s(Du, 0.0);
+        std::vector<double> j_last(Du, 0.0);
+        std::vector<double> j_pre_v(Du, 0.0);
+        std::vector<double> w1_raw(Du, 0.0);
+        std::vector<double> w1(Du, 0.0);
+        std::vector<double> w1_egc(is_mem ? Du : 0u, 0.0);
+
+        #pragma omp for schedule(static)
+        for (std::size_t n = 0; n < N; ++n) {
+            double surv_pre = 1.0;
+            double c_mem = c_mem_0;
+            std::fill(dlns.begin(), dlns.end(), 0.0);
+            if (is_mem) std::fill(dcm.begin(), dcm.end(), 0.0);
+
+            for (int m = 0; m < m_last; ++m) {
+                if (surv_pre <= 1e-24) break;
+                const IdxBaseStats st = eval_stats_at_period(m, n);
+                const double w_call = select_idx_from_stats(st, inv_d, D, call_code);
+                const double w_cpn = (cpn_code == call_code) ? w_call : select_idx_from_stats(st, inv_d, D, cpn_code);
+
+                const double eps_m = args->eps_vec[m];
+                const double b_ko = args->ko_barriers[m];
+                const double lo_ko = hard_ko_sp ? std::min(b_ko, b_ko + ko_spread) : (b_ko - 0.5 * eps_m);
+                const double hi_ko = hard_ko_sp ? std::max(b_ko, b_ko + ko_spread) : (b_ko + 0.5 * eps_m);
+                const double inv_w_ko = 1.0 / std::max(hi_ko - lo_ko, 1e-12);
+                const double t_ko = (w_call - lo_ko) * inv_w_ko;
+                const bool is_call_m = args->is_callable[m] > 0.5;
+                const double g_k = is_call_m ? c2_s5(t_ko) : 0.0;
+                const double dg_k_dw = is_call_m ? (c2_ds5(t_ko) * inv_w_ko) : 0.0;
+                const double coef_surv_m = -dg_k_dw / std::max(1.0 - g_k, 1e-8);
+
+                const double b_cp = args->cpn_barriers[m];
+                const double lo_cp = hard_cpn_sp ? std::min(b_cp, b_cp + eff_csp) : (b_cp - 0.5 * eps_m);
+                const double hi_cp = hard_cpn_sp ? std::max(b_cp, b_cp + eff_csp) : (b_cp + 0.5 * eps_m);
+                const double inv_w_cp = 1.0 / std::max(hi_cp - lo_cp, 1e-12);
+                const double t_cp = (w_cpn - lo_cp) * inv_w_cp;
+                const double ramp_c2 = c2_s5(t_cp);
+                const double dramp_c2_dw = c2_ds5(t_cp) * inv_w_cp;
+                const double hit_c2 = cpn_dir_down ? (1.0 - ramp_c2) : ramp_c2;
+                const double ind_c2 = cpn_type_out ? (1.0 - hit_c2) : hit_c2;
+                const bool is_guar_m = args->is_guaranteed_cpn[m] > 0.5;
+                const double g_c = is_guar_m ? 1.0 : ind_c2;
+                const double dg_c_dw = is_guar_m ? 0.0 : (dramp_c2_dw * sign_cpn_k);
+
+                double eff_gc = g_c;
+                double w_c_max = 1.0;
+                double w_k_max = 0.0;
+                if (force_cpn_ac) {
+                    eff_gc = std::max(g_c, g_k);
+                    w_c_max = (g_c > g_k) ? 1.0 : ((g_c < g_k) ? 0.0 : 0.5);
+                    w_k_max = 1.0 - w_c_max;
+                }
+
+                const double c_rate = args->coupon_rates[m];
+                const double eff_c_m = is_mem ? (c_rate + c_mem) : 0.0;
+
+                const double w_avg_v = st.s1 * inv_d;
+                const double w_disp_v = std::sqrt(std::max(st.s2 * inv_d - w_avg_v * w_avg_v, 0.0));
+                const std::size_t m_off = static_cast<std::size_t>(m) * Du;
+                for (int d = 0; d < D; ++d) {
+                    const std::size_t du = static_cast<std::size_t>(d);
+                    const double pd = args->perf_mat[(m_off + du) * N + n];
+                    const double cdl_md = args->cdl_m[m_off + du];
+                    const double bp_d = accum_idx_grad_scalar(
+                        0.0, coef_surv_m, pd, d, D, inv_d, ia, ib, st, w_avg_v, w_disp_v, call_code);
+                    const double prev_dlns = dlns[du];
+                    if (is_mem) {
+                        double bp_cm = 0.0;
+                        if (cpn_code == call_code) {
+                            const double bar_wc_cm = force_cpn_ac ? (w_c_max * dg_c_dw + w_k_max * dg_k_dw) : dg_c_dw;
+                            bp_cm = accum_idx_grad_scalar(
+                                0.0, bar_wc_cm, pd, d, D, inv_d, ia, ib, st, w_avg_v, w_disp_v, call_code);
+                        } else {
+                            bp_cm = accum_idx_grad_scalar(
+                                0.0, w_c_max * dg_c_dw, pd, d, D, inv_d, ia, ib, st, w_avg_v, w_disp_v, cpn_code);
+                            if (force_cpn_ac) {
+                                bp_cm = accum_idx_grad_scalar(
+                                    bp_cm, w_k_max * dg_k_dw, pd, d, D, inv_d, ia, ib, st, w_avg_v, w_disp_v, call_code);
+                            }
+                        }
+                        const double d_eff_gc_d = bp_cm * pd * cdl_md;
+                        // V3 literal: c_mem_next = surv_pre * eff_c_m * (1 - eff_gc)
+                        dcm[du] = surv_pre * (
+                            prev_dlns * eff_c_m * (1.0 - eff_gc)
+                            + dcm[du] * (1.0 - eff_gc)
+                            - eff_c_m * d_eff_gc_d
+                        );
+                    }
+                    dlns[du] = prev_dlns + bp_d * pd * cdl_md;
+                }
+
+                if (is_mem) {
+                    c_mem = surv_pre * eff_c_m * (1.0 - eff_gc);
+                }
+                surv_pre = std::max(surv_pre - surv_pre * g_k, 0.0);
+            }
+
+            if (write_frozen) {
+                const IdxBaseStats st_b = eval_stats_at_period(m_last, n);
+                double gk_l = 0.0, egc_l = 0.0, opt_l = 0.0, os_l = 0.0;
+                eval_last_indicators(st_b, gk_l, egc_l, opt_l, os_l);
+                args->frozen_term_out[0u * N + n] = gk_l;
+                args->frozen_term_out[1u * N + n] = egc_l;
+                args->frozen_term_out[2u * N + n] = opt_l;
+                args->frozen_term_out[3u * N + n] = os_l;
+            }
+
+            if (surv_pre <= 1e-24) {
+                continue;
+            }
+
+            for (int k = 0; k < D; ++k) {
+                double z_sum = 0.0;
+                for (int s_v = 0; s_v < vib_n_steps; ++s_v) {
+                    const std::size_t st_i = static_cast<std::size_t>(vib_start + s_v);
+                    z_sum += args->sv_vib[(st_i * Du + static_cast<std::size_t>(k)) * N + n];
+                }
+                zk_mean[static_cast<std::size_t>(k)] = z_sum * inv_sqrt_n;
+            }
+
+            const double eff_c_l = is_mem ? (args->coupon_rates[m_last] + c_mem) : args->coupon_rates[m_last];
+            double f0 = 0.0, fp = 0.0, fm = 0.0, egc_p = 0.0, egc_m = 0.0;
+            for (int sgn = 0; sgn < 3; ++sgn) {
+                const double mult = (sgn == 0) ? 0.0 : ((sgn == 1) ? 1.0 : -1.0);
+                IdxBaseStats st{};
+                st.min1 = 1e300;
+                st.min2 = 1e300;
+                st.min3 = 1e300;
+                st.max1 = -1e300;
+                st.max2 = -1e300;
+                st.idx_min1 = -1;
+                st.idx_min2 = -1;
+                st.idx_min3 = -1;
+                st.idx_max1 = -1;
+                st.idx_max2 = -1;
+                st.pb = 1.0;
+
+                for (int d = 0; d < D; ++d) {
+                    const std::size_t du = static_cast<std::size_t>(d);
+                    const double lxp = args->lx_pre[du * N + n];
+                    const double sigp = std::max(args->sig_pre[du * N + n], 1e-4);
+                    double xd = lxp - 0.5 * sigp * sigp * h_vib;
+                    if (sgn != 0) {
+                        const double* crow = args->chol_mat + du * Du;
+                        double zc_d = 0.0;
+                        for (int k = 0; k < D; ++k) {
+                            zc_d += crow[k] * zk_mean[static_cast<std::size_t>(k)];
+                        }
+                        xd += mult * sigp * sqrt_h_vib * zc_d;
+                    }
+                    const double pd = args->fwd_term[du] * std::exp(std::clamp(xd, -30.0, 30.0));
+                    if (pd < st.min1) {
+                        st.min3 = st.min2; st.idx_min3 = st.idx_min2;
+                        st.min2 = st.min1; st.idx_min2 = st.idx_min1;
+                        st.min1 = pd; st.idx_min1 = d;
+                    } else if (pd < st.min2) {
+                        st.min3 = st.min2; st.idx_min3 = st.idx_min2;
+                        st.min2 = pd; st.idx_min2 = d;
+                    } else if (pd < st.min3) {
+                        st.min3 = pd; st.idx_min3 = d;
+                    }
+                    if (pd > st.max1) {
+                        st.max2 = st.max1; st.idx_max2 = st.idx_max1;
+                        st.max1 = pd; st.idx_max1 = d;
+                    } else if (pd > st.max2) {
+                        st.max2 = pd; st.idx_max2 = d;
+                    }
+                    st.s1 += pd;
+                    st.s2 += pd * pd;
+                    if (d == ia) st.pa = pd;
+                    if (d == ib) st.pb = pd;
+                }
+
+                double gk_s = 0.0, egc_s = 0.0, opt_s = 0.0, os_s = 0.0;
+                eval_last_indicators(st, gk_s, egc_s, opt_s, os_s);
+                (void)os_s;
+                const double f_val = gk_s * (term_not + ac_cpn) + egc_s * eff_c_l + (1.0 - gk_s) * (term_not + opt_s);
+                if (sgn == 0) {
+                    f0 = f_val;
+                } else if (sgn == 1) {
+                    fp = f_val;
+                    egc_p = egc_s;
+                } else {
+                    fm = f_val;
+                    egc_m = egc_s;
+                }
+            }
+
+            const double df_diff = 0.5 * (fp - fm);
+            const double df_hess = 0.5 * (fp + fm) - f0;
+            const double degc_diff = is_mem ? (0.5 * (egc_p - egc_m)) : 0.0;
+            const std::size_t m_last_off = static_cast<std::size_t>(m_last) * Du;
+
+            for (int i = 0; i < D; ++i) {
+                const std::size_t iu = static_cast<std::size_t>(i);
+                const double sig_i = std::max(args->sig_pre[iu * N + n], 1e-4);
+                const double isi = 1.0 / std::max(sig_i * sqrt_h_vib, 1e-6);
+                const double jp = args->j_pre[iu * N + n];
+                const double ji = jp * args->cdl_m[m_last_off + iu];
+                const double* lrow = args->l_inv_t + iu * Du;
+                double xi_i = 0.0;
+                for (int k = 0; k < D; ++k) {
+                    xi_i += lrow[k] * zk_mean[static_cast<std::size_t>(k)];
+                }
+                inv_s[iu] = isi;
+                j_pre_v[iu] = jp;
+                j_last[iu] = ji;
+                xi[iu] = xi_i;
+                w1_raw[iu] = df_diff * xi_i * isi * jp;
+                w1[iu] = df_diff * xi_i * isi * ji;
+                if (is_mem) w1_egc[iu] = degc_diff * xi_i * isi * ji;
+            }
+
+            const double w_surv = df_last * surv_pre;
+            for (int i = 0; i < D; ++i) {
+                const std::size_t iu = static_cast<std::size_t>(i);
+                const double dlns_i = dlns[iu];
+                const double dcm_i = is_mem ? dcm[iu] : 0.0;
+                const double cdl2_i = args->cdl2_last[iu];
+                for (int j = i; j < D; ++j) {
+                    const std::size_t ju = static_cast<std::size_t>(j);
+                    const double cinv_ij = args->c_inv[iu * Du + ju];
+                    const double w2_ij = df_hess * (xi[iu] * xi[ju] - cinv_ij) * inv_s[iu] * inv_s[ju] * j_last[iu] * j_last[ju];
+                    const double cmem_cross = is_mem ? (dcm_i * w1_egc[ju] + dcm[ju] * w1_egc[iu]) : 0.0;
+                    const double diag_corr = (i == j) ? (w1_raw[iu] * cdl2_i) : 0.0;
+                    const double h_ij = w_surv * (w2_ij + dlns_i * w1[ju] + dlns[ju] * w1[iu] + cmem_cross + diag_corr);
+                    thr_h[iu * Du + ju] += h_ij;
+                }
+            }
+        }
+    }
+
+    std::fill(args->h_vib_out, args->h_vib_out + n_h_tot, 0.0);
+    for (int tid = 0; tid < n_threads; ++tid) {
+        const double* src = per_thr_h.data() + static_cast<std::size_t>(tid) * n_h_tot;
+        for (int i = 0; i < D; ++i) {
+            for (int j = i; j < D; ++j) {
+                const std::size_t ij = static_cast<std::size_t>(i) * Du + static_cast<std::size_t>(j);
+                args->h_vib_out[ij] += src[ij];
+            }
+        }
+    }
+    for (int i = 0; i < D; ++i) {
+        for (int j = i; j < D; ++j) {
+            const std::size_t ij = static_cast<std::size_t>(i) * Du + static_cast<std::size_t>(j);
+            const double val = args->h_vib_out[ij] * scale;
+            args->h_vib_out[ij] = val;
+            if (i != j) {
+                args->h_vib_out[static_cast<std::size_t>(j) * Du + static_cast<std::size_t>(i)] = val;
+            }
+        }
+    }
+
+    return 0;
 }
 
 }  // extern "C"

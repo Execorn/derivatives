@@ -2787,18 +2787,25 @@ class PureNumpyTier1Backend:
 
 _F64_DTYPE = np.dtype(np.float64)
 _I64_DTYPE = np.dtype(np.int64)
+_U32_DTYPE = np.dtype(np.uint32)
 
 
-def _ensure_f64_c(arr: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+def _ensure_f64_c(arr: npt.ArrayLike) -> npt.NDArray[np.float64]:
     if type(arr) is np.ndarray and arr.dtype == _F64_DTYPE and arr.flags.c_contiguous:
         return arr
     return np.ascontiguousarray(arr, dtype=np.float64)
 
 
-def _ensure_i64_c(arr: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+def _ensure_i64_c(arr: npt.ArrayLike) -> npt.NDArray[np.int64]:
     if type(arr) is np.ndarray and arr.dtype == _I64_DTYPE and arr.flags.c_contiguous:
         return arr
     return np.ascontiguousarray(arr, dtype=np.int64)
+
+
+def _ensure_u32_c(arr: npt.ArrayLike) -> npt.NDArray[np.uint32]:
+    if type(arr) is np.ndarray and arr.dtype == _U32_DTYPE and arr.flags.c_contiguous:
+        return arr
+    return np.ascontiguousarray(arr, dtype=np.uint32)
 
 
 class Tier1AutocallArgs(ctypes.Structure):
@@ -2860,6 +2867,7 @@ _ARGS_PACKER = struct.Struct("=2q11Q15d12i8Q").pack
 
 
 _ABI_VERSION = 20261124
+_ABI_VERSION_V2 = 20261125
 
 
 class Tier1AbiInfoC(ctypes.Structure):
@@ -2870,6 +2878,148 @@ class Tier1AbiInfoC(ctypes.Structure):
         ("crn_args_size", ctypes.c_uint32),
         ("crn_args_align", ctypes.c_uint32),
     ]
+
+
+class Tier1AbiInfoV2C(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("autocall_args_size", ctypes.c_uint32),
+        ("autocall_args_align", ctypes.c_uint32),
+        ("crn_args_size", ctypes.c_uint32),
+        ("crn_args_align", ctypes.c_uint32),
+        ("platen_sde_aad_args_size", ctypes.c_uint32),
+        ("platen_sde_aad_args_align", ctypes.c_uint32),
+        ("sobol_gen_args_size", ctypes.c_uint32),
+        ("sobol_gen_args_align", ctypes.c_uint32),
+        ("vibrato_gamma_args_size", ctypes.c_uint32),
+        ("vibrato_gamma_args_align", ctypes.c_uint32),
+        ("_pad0", ctypes.c_uint32),
+    ]
+
+
+class PlatenSdeAadArgsC(ctypes.Structure):
+    _fields_ = [
+        ("d_assets", ctypes.c_int64),
+        ("m_rem", ctypes.c_int64),
+        ("n_sub", ctypes.c_int64),
+        ("eff_r", ctypes.c_int64),
+        ("n_rep", ctypes.c_int64),
+        ("lv_nt", ctypes.c_int64),
+        ("lv_ny", ctypes.c_int64),
+        ("lv_tables", ctypes.c_void_p),
+        ("z_indep", ctypes.c_void_p),
+        ("chol_base", ctypes.c_void_p),
+        ("tau_obs", ctypes.c_void_p),
+        ("r_native_obs", ctypes.c_void_p),
+        ("r_tot_obs", ctypes.c_void_p),
+        ("lv_t_grid", ctypes.c_void_p),
+        ("lv_y_min", ctypes.c_void_p),
+        ("lv_y_max", ctypes.c_void_p),
+        ("bar_lx_post", ctypes.c_void_p),
+        ("lx_norm_in", ctypes.c_void_p),
+        ("q_shift_sub", ctypes.c_void_p),
+        ("lx_period_out", ctypes.c_void_p),
+        ("norm_x_out", ctypes.c_void_p),
+        ("bar_lv_out", ctypes.c_void_p),
+        ("bar_chol_out", ctypes.c_void_p),
+        ("bar_q_shift_out", ctypes.c_void_p),
+        ("run_forward", ctypes.c_int32),
+        ("run_backward", ctypes.c_int32),
+        ("compute_lv_aad", ctypes.c_int32),
+        ("compute_chol_aad", ctypes.c_int32),
+        ("compute_q_aad", ctypes.c_int32),
+        ("has_q_shift_sub", ctypes.c_int32),
+    ]
+
+
+class SobolGenArgsC(ctypes.Structure):
+    _fields_ = [
+        ("d_assets", ctypes.c_int64),
+        ("m_rem", ctypes.c_int64),
+        ("n_sub", ctypes.c_int64),
+        ("eff_r", ctypes.c_int64),
+        ("n_rep", ctypes.c_int64),
+        ("sobol_dim", ctypes.c_int64),
+        ("n_bits", ctypes.c_int64),
+        ("dir_numbers", ctypes.c_void_p),
+        ("digital_shifts", ctypes.c_void_p),
+        ("bb_ortho_mat", ctypes.c_void_p),
+        ("chol_mat", ctypes.c_void_p),
+        ("z_indep_out", ctypes.c_void_p),
+        ("z_corr_out", ctypes.c_void_p),
+        ("use_gray_code", ctypes.c_int32),
+        ("apply_bb_time", ctypes.c_int32),
+        ("apply_corr", ctypes.c_int32),
+        ("antithetic", ctypes.c_int32),
+        ("_reserved", ctypes.c_int32 * 2),
+    ]
+
+
+class VibratoGammaArgsC(ctypes.Structure):
+    _fields_ = [
+        ("d_assets", ctypes.c_int64),
+        ("m_rem", ctypes.c_int64),
+        ("n_paths_total", ctypes.c_int64),
+        ("vib_step_start", ctypes.c_int64),
+        ("vib_n_steps", ctypes.c_int64),
+        ("perf_mat", ctypes.c_void_p),
+        ("lx_pre", ctypes.c_void_p),
+        ("j_pre", ctypes.c_void_p),
+        ("sig_pre", ctypes.c_void_p),
+        ("sv_vib", ctypes.c_void_p),
+        ("chol_mat", ctypes.c_void_p),
+        ("l_inv_t", ctypes.c_void_p),
+        ("c_inv", ctypes.c_void_p),
+        ("fwd_term", ctypes.c_void_p),
+        ("cdl_m", ctypes.c_void_p),
+        ("cdl2_last", ctypes.c_void_p),
+        ("ko_barriers", ctypes.c_void_p),
+        ("is_callable", ctypes.c_void_p),
+        ("cpn_barriers", ctypes.c_void_p),
+        ("is_guaranteed_cpn", ctypes.c_void_p),
+        ("coupon_rates", ctypes.c_void_p),
+        ("eps_vec", ctypes.c_void_p),
+        ("inv_lex_perm", ctypes.c_void_p),
+        ("frozen_term_out", ctypes.c_void_p),
+        ("h_vib_out", ctypes.c_void_p),
+        ("df_last", ctypes.c_double),
+        ("h_vib", ctypes.c_double),
+        ("ko_spread", ctypes.c_double),
+        ("cpn_spread", ctypes.c_double),
+        ("ki_spread", ctypes.c_double),
+        ("one_star_strike", ctypes.c_double),
+        ("one_star_eps", ctypes.c_double),
+        ("strike", ctypes.c_double),
+        ("lower_strike", ctypes.c_double),
+        ("ki_barrier", ctypes.c_double),
+        ("option_gearing", ctypes.c_double),
+        ("autocall_coupon", ctypes.c_double),
+        ("c_mem_0", ctypes.c_double),
+        ("i_ki_past", ctypes.c_double),
+        ("part_call_strike", ctypes.c_double),
+        ("part_call_rate", ctypes.c_double),
+        ("one_star_coupon", ctypes.c_double),
+        ("call_code", ctypes.c_int32),
+        ("cpn_code", ctypes.c_int32),
+        ("opt_code", ctypes.c_int32),
+        ("has_ki", ctypes.c_int32),
+        ("ki_active", ctypes.c_int32),
+        ("has_one_star", ctypes.c_int32),
+        ("is_memory", ctypes.c_int32),
+        ("is_long_basket", ctypes.c_int32),
+        ("no_notional", ctypes.c_int32),
+        ("force_cpn_ac", ctypes.c_int32),
+        ("cpn_dir_down", ctypes.c_int32),
+        ("cpn_type_out", ctypes.c_int32),
+        ("has_lower_strike", ctypes.c_int32),
+        ("has_part_call", ctypes.c_int32),
+    ]
+
+
+assert ctypes.sizeof(Tier1AbiInfoV2C) == 48 and ctypes.alignment(Tier1AbiInfoV2C) == 4
+assert ctypes.sizeof(PlatenSdeAadArgsC) == 216 and ctypes.alignment(PlatenSdeAadArgsC) == 8
+assert ctypes.sizeof(SobolGenArgsC) == 128 and ctypes.alignment(SobolGenArgsC) == 8
+assert ctypes.sizeof(VibratoGammaArgsC) == 392 and ctypes.alignment(VibratoGammaArgsC) == 8
 
 
 class Cpp23Tier1Backend:
@@ -2897,6 +3047,32 @@ class Cpp23Tier1Backend:
                 f"autocall=({abi_info.autocall_args_size},{abi_info.autocall_args_align}), "
                 f"crn=({abi_info.crn_args_size},{abi_info.crn_args_align})"
             )
+
+        abi_v2_fn = lib.tier1_abi_info_v2
+        abi_v2_fn.argtypes = []
+        abi_v2_fn.restype = Tier1AbiInfoV2C
+        abi_v2: Tier1AbiInfoV2C = abi_v2_fn()
+        if (
+            int(abi_v2.abi_version) != _ABI_VERSION_V2
+            or int(abi_v2.autocall_args_size) != 336
+            or int(abi_v2.autocall_args_align) != 8
+            or int(abi_v2.crn_args_size) != 320
+            or int(abi_v2.crn_args_align) != 8
+            or int(abi_v2.platen_sde_aad_args_size) != 216
+            or int(abi_v2.platen_sde_aad_args_align) != 8
+            or int(abi_v2.sobol_gen_args_size) != 128
+            or int(abi_v2.sobol_gen_args_align) != 8
+            or int(abi_v2.vibrato_gamma_args_size) != 392
+            or int(abi_v2.vibrato_gamma_args_align) != 8
+        ):
+            raise RuntimeError(
+                "Incompatible tier1_autocall_cpu ABI v2: "
+                f"version={abi_v2.abi_version}, "
+                f"platen=({abi_v2.platen_sde_aad_args_size},{abi_v2.platen_sde_aad_args_align}), "
+                f"sobol=({abi_v2.sobol_gen_args_size},{abi_v2.sobol_gen_args_align}), "
+                f"vibrato=({abi_v2.vibrato_gamma_args_size},{abi_v2.vibrato_gamma_args_align})"
+            )
+        self._abi_info_v2: Tier1AbiInfoV2C = abi_v2
 
         c_vp = ctypes.c_void_p
 
@@ -2991,13 +3167,350 @@ class Cpp23Tier1Backend:
         lib.tier1_eval_autocall_struct_cpu.argtypes = [ctypes.c_void_p]
         lib.tier1_eval_autocall_struct_cpu.restype = None
 
+        lib.crn_step_1d_trajectories_cpp.argtypes = [
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_double,
+            ctypes.c_double,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+        ]
+        lib.crn_step_1d_trajectories_cpp.restype = None
+
+        lib.crn_eval_payoff_loo_l2o_cpp.argtypes = [c_vp]
+        lib.crn_eval_payoff_loo_l2o_cpp.restype = None
+
+        lib.crn_platen_sde_aad_cpp.argtypes = [c_vp]
+        lib.crn_platen_sde_aad_cpp.restype = ctypes.c_int32
+
+        lib.crn_generate_sobol_normals_cpp.argtypes = [c_vp]
+        lib.crn_generate_sobol_normals_cpp.restype = ctypes.c_int32
+
+        lib.crn_eval_vibrato_gamma_cpp.argtypes = [c_vp]
+        lib.crn_eval_vibrato_gamma_cpp.restype = ctypes.c_int32
+
         self._fn_coeffs = lib.tier1_clamped_cubic_coeffs_1d
         self._fn_eval_cubic = lib.tier1_eval_cubic_with_derivs
         self._fn_bridge = lib.tier1_eval_autocall_bridge_cpu
         self._fn_struct = lib.tier1_eval_autocall_struct_cpu
         self._fn_index_moments = lib.tier1_eval_index_moments_cpu
+        self._fn_crn_step_1d = lib.crn_step_1d_trajectories_cpp
+        self._fn_crn_loo_l2o = lib.crn_eval_payoff_loo_l2o_cpp
+        self._fn_platen_sde_aad = lib.crn_platen_sde_aad_cpp
+        self._fn_sobol_gen = lib.crn_generate_sobol_normals_cpp
+        self._fn_vibrato_gamma = lib.crn_eval_vibrato_gamma_cpp
         self._args_cls = Tier1AutocallArgs
         self._args_pack = _ARGS_PACKER
+
+    def abi_info_v2(self) -> Tier1AbiInfoV2C:
+        return self._abi_info_v2
+
+    def crn_platen_sde_aad_cpu(
+        self,
+        *,
+        lv_tables: npt.NDArray[np.float64],
+        z_indep: npt.NDArray[np.float64],
+        chol_base: npt.NDArray[np.float64],
+        tau_obs: npt.NDArray[np.float64],
+        r_native_obs: Optional[npt.NDArray[np.float64]],
+        r_tot_obs: Optional[npt.NDArray[np.float64]],
+        lv_t_grid: npt.NDArray[np.float64],
+        lv_y_min: float | npt.NDArray[np.float64],
+        lv_y_max: float | npt.NDArray[np.float64],
+        n_sub: int,
+        eff_r: int,
+        n_rep: int,
+        bar_lx_post: Optional[npt.NDArray[np.float64]] = None,
+        lx_norm_in: Optional[npt.NDArray[np.float64]] = None,
+        q_shift_sub: Optional[npt.NDArray[np.float64]] = None,
+        run_forward: bool = True,
+        run_backward: bool = False,
+        compute_lv_aad: bool = True,
+        compute_chol_aad: bool = True,
+        compute_q_aad: bool = True,
+    ) -> Tuple[
+        Optional[npt.NDArray[np.float64]],
+        Optional[npt.NDArray[np.float64]],
+        Optional[npt.NDArray[np.float64]],
+        Optional[npt.NDArray[np.float64]],
+        Optional[npt.NDArray[np.float64]],
+    ]:
+        lv_c = _ensure_f64_c(lv_tables)
+        z_c = _ensure_f64_c(z_indep)
+        chol_c = _ensure_f64_c(chol_base)
+        tau_c = _ensure_f64_c(tau_obs)
+        tgrid_c = _ensure_f64_c(lv_t_grid)
+        d_assets, lv_nt, lv_ny = (int(lv_c.shape[0]), int(lv_c.shape[1]), int(lv_c.shape[2]))
+        m_rem = int(tau_c.shape[0])
+        n_total = int(eff_r) * int(n_rep)
+
+        y_min_c = _ensure_f64_c(np.broadcast_to(np.asarray(lv_y_min, dtype=np.float64), (d_assets,)))
+        y_max_c = _ensure_f64_c(np.broadcast_to(np.asarray(lv_y_max, dtype=np.float64), (d_assets,)))
+
+        has_q_sub = q_shift_sub is not None
+        q_sub_c = _ensure_f64_c(q_shift_sub) if q_shift_sub is not None else None
+        rn_c = _ensure_f64_c(r_native_obs) if r_native_obs is not None else None
+        rt_c = _ensure_f64_c(r_tot_obs) if r_tot_obs is not None else None
+        if not has_q_sub and (rn_c is None or rt_c is None):
+            raise ValueError("Provide either q_shift_sub or both r_native_obs and r_tot_obs.")
+
+        lx_period_out = np.empty((m_rem, d_assets, n_total), dtype=np.float64) if run_forward else None
+        norm_x_out = np.empty((m_rem, d_assets, n_total), dtype=np.float64) if run_forward else None
+        bar_post_c = _ensure_f64_c(bar_lx_post) if bar_lx_post is not None else None
+        lx_norm_c = _ensure_f64_c(lx_norm_in) if lx_norm_in is not None else None
+        if run_backward and bar_post_c is None:
+            raise ValueError("bar_lx_post is required when run_backward=True.")
+        if run_backward and lx_norm_c is None and lx_period_out is None:
+            raise ValueError("lx_norm_in is required when run_backward=True and run_forward=False.")
+
+        bar_lv_out = np.empty((d_assets, lv_nt, lv_ny), dtype=np.float64) if (run_backward and compute_lv_aad) else None
+        bar_chol_out = np.empty((d_assets, d_assets), dtype=np.float64) if (run_backward and compute_chol_aad) else None
+        bar_q_out = np.empty((d_assets, m_rem * int(n_sub)), dtype=np.float64) if (run_backward and compute_q_aad) else None
+
+        c_args = PlatenSdeAadArgsC(
+            d_assets=d_assets,
+            m_rem=m_rem,
+            n_sub=int(n_sub),
+            eff_r=int(eff_r),
+            n_rep=int(n_rep),
+            lv_nt=lv_nt,
+            lv_ny=lv_ny,
+            lv_tables=lv_c.ctypes.data,
+            z_indep=z_c.ctypes.data,
+            chol_base=chol_c.ctypes.data,
+            tau_obs=tau_c.ctypes.data,
+            r_native_obs=rn_c.ctypes.data if rn_c is not None else 0,
+            r_tot_obs=rt_c.ctypes.data if rt_c is not None else 0,
+            lv_t_grid=tgrid_c.ctypes.data,
+            lv_y_min=y_min_c.ctypes.data,
+            lv_y_max=y_max_c.ctypes.data,
+            bar_lx_post=bar_post_c.ctypes.data if bar_post_c is not None else 0,
+            lx_norm_in=lx_norm_c.ctypes.data if lx_norm_c is not None else 0,
+            q_shift_sub=q_sub_c.ctypes.data if q_sub_c is not None else 0,
+            lx_period_out=lx_period_out.ctypes.data if lx_period_out is not None else 0,
+            norm_x_out=norm_x_out.ctypes.data if norm_x_out is not None else 0,
+            bar_lv_out=bar_lv_out.ctypes.data if bar_lv_out is not None else 0,
+            bar_chol_out=bar_chol_out.ctypes.data if bar_chol_out is not None else 0,
+            bar_q_shift_out=bar_q_out.ctypes.data if bar_q_out is not None else 0,
+            run_forward=1 if run_forward else 0,
+            run_backward=1 if run_backward else 0,
+            compute_lv_aad=1 if compute_lv_aad else 0,
+            compute_chol_aad=1 if compute_chol_aad else 0,
+            compute_q_aad=1 if compute_q_aad else 0,
+            has_q_shift_sub=1 if has_q_sub else 0,
+        )
+        rc = int(self._fn_platen_sde_aad(ctypes.byref(c_args)))
+        if rc != 0:
+            raise RuntimeError(f"crn_platen_sde_aad_cpp failed with status code {rc}.")
+        return lx_period_out, norm_x_out, bar_lv_out, bar_chol_out, bar_q_out
+
+    def crn_generate_sobol_normals_cpu(
+        self,
+        *,
+        d_assets: int,
+        m_rem: int,
+        n_sub: int,
+        eff_r: int,
+        n_rep: int,
+        dir_numbers: Optional[npt.NDArray[np.uint32]] = None,
+        digital_shifts: Optional[npt.NDArray[np.uint32]] = None,
+        bb_ortho_mat: Optional[npt.NDArray[np.float64]] = None,
+        chol_mat: Optional[npt.NDArray[np.float64]] = None,
+        n_bits: int = 30,
+        use_gray_code: bool = True,
+        apply_bb_time: bool = False,
+        apply_corr: bool = False,
+        antithetic: bool = False,
+        return_indep: bool = True,
+        return_corr: bool = False,
+    ) -> Tuple[Optional[npt.NDArray[np.float64]], Optional[npt.NDArray[np.float64]]]:
+        dir_c = _ensure_u32_c(dir_numbers) if dir_numbers is not None else None
+        sobol_dim = int(dir_c.shape[0]) if dir_c is not None else 0
+        shifts_c = _ensure_u32_c(digital_shifts) if digital_shifts is not None else None
+        bb_c = _ensure_f64_c(bb_ortho_mat) if bb_ortho_mat is not None else None
+        chol_c = _ensure_f64_c(chol_mat) if chol_mat is not None else None
+        shape = (int(m_rem), int(n_sub), int(eff_r), int(n_rep), int(d_assets))
+        z_indep_out = np.empty(shape, dtype=np.float64) if return_indep else None
+        z_corr_out = np.empty(shape, dtype=np.float64) if (return_corr or apply_corr) else None
+        if z_indep_out is None and z_corr_out is None:
+            raise ValueError("At least one of return_indep or return_corr/apply_corr must be True.")
+
+        c_args = SobolGenArgsC(
+            d_assets=int(d_assets),
+            m_rem=int(m_rem),
+            n_sub=int(n_sub),
+            eff_r=int(eff_r),
+            n_rep=int(n_rep),
+            sobol_dim=sobol_dim,
+            n_bits=int(n_bits),
+            dir_numbers=dir_c.ctypes.data if dir_c is not None else 0,
+            digital_shifts=shifts_c.ctypes.data if shifts_c is not None else 0,
+            bb_ortho_mat=bb_c.ctypes.data if bb_c is not None else 0,
+            chol_mat=chol_c.ctypes.data if chol_c is not None else 0,
+            z_indep_out=z_indep_out.ctypes.data if z_indep_out is not None else 0,
+            z_corr_out=z_corr_out.ctypes.data if z_corr_out is not None else 0,
+            use_gray_code=1 if use_gray_code else 0,
+            apply_bb_time=1 if apply_bb_time else 0,
+            apply_corr=1 if apply_corr else 0,
+            antithetic=1 if antithetic else 0,
+        )
+        rc = int(self._fn_sobol_gen(ctypes.byref(c_args)))
+        if rc != 0:
+            raise RuntimeError(f"crn_generate_sobol_normals_cpp failed with status code {rc}.")
+        return z_indep_out, z_corr_out
+
+    def crn_eval_vibrato_gamma_cpu(
+        self,
+        *,
+        perf_mat: npt.NDArray[np.float64],
+        lx_pre: npt.NDArray[np.float64],
+        j_pre: npt.NDArray[np.float64],
+        sig_pre: npt.NDArray[np.float64],
+        sv_vib: npt.NDArray[np.float64],
+        chol_mat: npt.NDArray[np.float64],
+        l_inv_t: npt.NDArray[np.float64],
+        c_inv: npt.NDArray[np.float64],
+        fwd_term: npt.NDArray[np.float64],
+        cdl_m: npt.NDArray[np.float64],
+        cdl2_last: npt.NDArray[np.float64],
+        ko_barriers: npt.NDArray[np.float64],
+        is_callable: npt.NDArray[np.float64],
+        cpn_barriers: npt.NDArray[np.float64],
+        is_guaranteed_cpn: npt.NDArray[np.float64],
+        coupon_rates: npt.NDArray[np.float64],
+        eps_vec: npt.NDArray[np.float64],
+        inv_lex_perm: Optional[npt.NDArray[np.int64]],
+        vib_step_start: int,
+        vib_n_steps: int,
+        df_last: float,
+        h_vib: float,
+        ko_spread: float,
+        cpn_spread: float,
+        ki_spread: float,
+        one_star_strike: float,
+        one_star_eps: float,
+        strike: float,
+        lower_strike: float,
+        ki_barrier: float,
+        option_gearing: float,
+        autocall_coupon: float,
+        c_mem_0: float,
+        i_ki_past: float,
+        part_call_strike: float,
+        part_call_rate: float,
+        one_star_coupon: float,
+        call_code: int,
+        cpn_code: int,
+        opt_code: int,
+        has_ki: bool,
+        ki_active: bool,
+        has_one_star: bool,
+        is_memory: bool,
+        is_long_basket: bool,
+        no_notional: bool,
+        force_cpn_ac: bool,
+        cpn_dir_down: bool,
+        cpn_type_out: bool,
+        has_lower_strike: bool,
+        has_part_call: bool,
+        emit_frozen_term: bool = True,
+    ) -> Tuple[npt.NDArray[np.float64], Optional[npt.NDArray[np.float64]]]:
+        perf_c = _ensure_f64_c(perf_mat)
+        lx_pre_c = _ensure_f64_c(lx_pre)
+        j_pre_c = _ensure_f64_c(j_pre)
+        sig_pre_c = _ensure_f64_c(sig_pre)
+        sv_vib_c = _ensure_f64_c(sv_vib)
+        chol_c = _ensure_f64_c(chol_mat)
+        linvt_c = _ensure_f64_c(l_inv_t)
+        cinv_c = _ensure_f64_c(c_inv)
+        fwd_c = _ensure_f64_c(fwd_term)
+        cdlm_c = _ensure_f64_c(cdl_m)
+        cdl2_c = _ensure_f64_c(cdl2_last)
+        ko_c = _ensure_f64_c(ko_barriers)
+        ic_c = _ensure_f64_c(is_callable)
+        cpn_c = _ensure_f64_c(cpn_barriers)
+        ig_c = _ensure_f64_c(is_guaranteed_cpn)
+        cr_c = _ensure_f64_c(coupon_rates)
+        eps_c = _ensure_f64_c(eps_vec)
+        perm_c = _ensure_i64_c(inv_lex_perm) if inv_lex_perm is not None else None
+
+        m_rem, d_assets, n_paths_total = (int(perf_c.shape[0]), int(perf_c.shape[1]), int(perf_c.shape[2]))
+        h_vib_out = np.empty((d_assets, d_assets), dtype=np.float64)
+        frozen_out = np.empty((4, n_paths_total), dtype=np.float64) if (emit_frozen_term and m_rem > 1) else None
+
+        c_args = VibratoGammaArgsC(
+            d_assets=d_assets,
+            m_rem=m_rem,
+            n_paths_total=n_paths_total,
+            vib_step_start=int(vib_step_start),
+            vib_n_steps=int(vib_n_steps),
+            perf_mat=perf_c.ctypes.data,
+            lx_pre=lx_pre_c.ctypes.data,
+            j_pre=j_pre_c.ctypes.data,
+            sig_pre=sig_pre_c.ctypes.data,
+            sv_vib=sv_vib_c.ctypes.data,
+            chol_mat=chol_c.ctypes.data,
+            l_inv_t=linvt_c.ctypes.data,
+            c_inv=cinv_c.ctypes.data,
+            fwd_term=fwd_c.ctypes.data,
+            cdl_m=cdlm_c.ctypes.data,
+            cdl2_last=cdl2_c.ctypes.data,
+            ko_barriers=ko_c.ctypes.data,
+            is_callable=ic_c.ctypes.data,
+            cpn_barriers=cpn_c.ctypes.data,
+            is_guaranteed_cpn=ig_c.ctypes.data,
+            coupon_rates=cr_c.ctypes.data,
+            eps_vec=eps_c.ctypes.data,
+            inv_lex_perm=perm_c.ctypes.data if perm_c is not None else 0,
+            frozen_term_out=frozen_out.ctypes.data if frozen_out is not None else 0,
+            h_vib_out=h_vib_out.ctypes.data,
+            df_last=float(df_last),
+            h_vib=float(h_vib),
+            ko_spread=float(ko_spread),
+            cpn_spread=float(cpn_spread),
+            ki_spread=float(ki_spread),
+            one_star_strike=float(one_star_strike),
+            one_star_eps=float(one_star_eps),
+            strike=float(strike),
+            lower_strike=float(lower_strike),
+            ki_barrier=float(ki_barrier),
+            option_gearing=float(option_gearing),
+            autocall_coupon=float(autocall_coupon),
+            c_mem_0=float(c_mem_0),
+            i_ki_past=float(i_ki_past),
+            part_call_strike=float(part_call_strike),
+            part_call_rate=float(part_call_rate),
+            one_star_coupon=float(one_star_coupon),
+            call_code=int(call_code),
+            cpn_code=int(cpn_code),
+            opt_code=int(opt_code),
+            has_ki=1 if has_ki else 0,
+            ki_active=1 if ki_active else 0,
+            has_one_star=1 if has_one_star else 0,
+            is_memory=1 if is_memory else 0,
+            is_long_basket=1 if is_long_basket else 0,
+            no_notional=1 if no_notional else 0,
+            force_cpn_ac=1 if force_cpn_ac else 0,
+            cpn_dir_down=1 if cpn_dir_down else 0,
+            cpn_type_out=1 if cpn_type_out else 0,
+            has_lower_strike=1 if has_lower_strike else 0,
+            has_part_call=1 if has_part_call else 0,
+        )
+        rc = int(self._fn_vibrato_gamma(ctypes.byref(c_args)))
+        if rc != 0:
+            raise RuntimeError(f"crn_eval_vibrato_gamma_cpp failed with status code {rc}.")
+        return h_vib_out, frozen_out
 
     @property
     def name(self) -> str:
@@ -3327,10 +3840,17 @@ def _locate_cpp23_shared_lib() -> Optional[Path]:
     env_override = os.environ.get("DEEPVOL_TIER1_CPP_LIB")
     if env_override is not None:
         cleaned = env_override.strip()
-        if cleaned.lower() in ("", "none", "numpy"):
+        if cleaned.lower() == "numpy":
             return None
+        if not cleaned or cleaned.lower() == "none":
+            raise RuntimeError(
+                f"DEEPVOL_TIER1_CPP_LIB={env_override!r} disabled the C++23 backend; "
+                "set DEEPVOL_TIER1_CPP_LIB=numpy explicitly if PureNumpy fallback is intended."
+            )
         p = Path(cleaned)
-        return p if p.is_file() else None
+        if not p.is_file():
+            raise RuntimeError(f"DEEPVOL_TIER1_CPP_LIB points to missing shared library: {p}")
+        return p
     pkg_dir = Path(__file__).resolve().parent
     candidates = (
         pkg_dir / "tier1_autocall_cpu.so",
@@ -3345,7 +3865,7 @@ def _locate_cpp23_shared_lib() -> Optional[Path]:
 
 
 def get_tier1_backend(*, force_numpy: bool = False) -> Tier1MathBackend:
-    """Returns the active IEEE-754 float64 Tier-1 backend (C++23 if built, else pure NumPy)."""
+    """Returns the active IEEE-754 float64 Tier-1 backend (C++23, or PureNumPy if explicitly requested)."""
     if force_numpy:
         return PureNumpyTier1Backend()
     cached = _CACHED_BACKEND
@@ -3359,21 +3879,24 @@ def _init_tier1_backend() -> Tier1MathBackend:
     with _BACKEND_LOCK:
         if _CACHED_BACKEND is not None:
             return _CACHED_BACKEND
+        env_override = os.environ.get("DEEPVOL_TIER1_CPP_LIB")
+        if env_override is not None and env_override.strip().lower() == "numpy":
+            _CACHED_BACKEND = PureNumpyTier1Backend()
+            return _CACHED_BACKEND
         lib_path = _locate_cpp23_shared_lib()
-        if lib_path is not None:
-            try:
-                _CACHED_BACKEND = Cpp23Tier1Backend(lib_path)
-                return _CACHED_BACKEND
-            except (OSError, AttributeError, RuntimeError) as exc:
-                import warnings
-
-                warnings.warn(
-                    f"Falling back to PureNumpyTier1Backend because C++ backend failed to load: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        _CACHED_BACKEND = PureNumpyTier1Backend()
-        return _CACHED_BACKEND
+        if lib_path is None:
+            raise RuntimeError(
+                "C++23 backend shared library tier1_autocall_cpu.so not found. "
+                "Build and install src/deepvol/cpp or set DEEPVOL_TIER1_CPP_LIB=numpy explicitly."
+            )
+        try:
+            _CACHED_BACKEND = Cpp23Tier1Backend(lib_path)
+            return _CACHED_BACKEND
+        except (OSError, AttributeError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"Failed to load C++23 backend from {lib_path}: {exc}. "
+                "Set DEEPVOL_TIER1_CPP_LIB=numpy explicitly if PureNumpy fallback is intended."
+            ) from exc
 
 
 def reset_tier1_backend_cache() -> None:
@@ -3383,12 +3906,241 @@ def reset_tier1_backend_cache() -> None:
         _CACHED_BACKEND = None
 
 
+def _require_cpp23_backend() -> Cpp23Tier1Backend:
+    backend = get_tier1_backend()
+    if not isinstance(backend, Cpp23Tier1Backend):
+        raise RuntimeError(
+            f"Requested C++23 ABI v2 kernel requires Cpp23Tier1Backend, got {backend.name!r}."
+        )
+    return backend
+
+
+def tier1_abi_info_v2() -> Tier1AbiInfoV2C:
+    """Returns the validated ABI v2 handshake struct from tier1_autocall_cpu.so."""
+    return _require_cpp23_backend().abi_info_v2()
+
+
+def crn_platen_sde_aad_cpu(
+    *,
+    lv_tables: npt.NDArray[np.float64],
+    z_indep: npt.NDArray[np.float64],
+    chol_base: npt.NDArray[np.float64],
+    tau_obs: npt.NDArray[np.float64],
+    r_native_obs: Optional[npt.NDArray[np.float64]],
+    r_tot_obs: Optional[npt.NDArray[np.float64]],
+    lv_t_grid: npt.NDArray[np.float64],
+    lv_y_min: float | npt.NDArray[np.float64],
+    lv_y_max: float | npt.NDArray[np.float64],
+    n_sub: int,
+    eff_r: int,
+    n_rep: int,
+    bar_lx_post: Optional[npt.NDArray[np.float64]] = None,
+    lx_norm_in: Optional[npt.NDArray[np.float64]] = None,
+    q_shift_sub: Optional[npt.NDArray[np.float64]] = None,
+    run_forward: bool = True,
+    run_backward: bool = False,
+    compute_lv_aad: bool = True,
+    compute_chol_aad: bool = True,
+    compute_q_aad: bool = True,
+) -> Tuple[
+    Optional[npt.NDArray[np.float64]],
+    Optional[npt.NDArray[np.float64]],
+    Optional[npt.NDArray[np.float64]],
+    Optional[npt.NDArray[np.float64]],
+    Optional[npt.NDArray[np.float64]],
+]:
+    """Dispatches Platen Weak-2.0 forward + reverse-mode SDE AAD to C++23 AVX2/OpenMP."""
+    return _require_cpp23_backend().crn_platen_sde_aad_cpu(
+        lv_tables=lv_tables,
+        z_indep=z_indep,
+        chol_base=chol_base,
+        tau_obs=tau_obs,
+        r_native_obs=r_native_obs,
+        r_tot_obs=r_tot_obs,
+        lv_t_grid=lv_t_grid,
+        lv_y_min=lv_y_min,
+        lv_y_max=lv_y_max,
+        n_sub=n_sub,
+        eff_r=eff_r,
+        n_rep=n_rep,
+        bar_lx_post=bar_lx_post,
+        lx_norm_in=lx_norm_in,
+        q_shift_sub=q_shift_sub,
+        run_forward=run_forward,
+        run_backward=run_backward,
+        compute_lv_aad=compute_lv_aad,
+        compute_chol_aad=compute_chol_aad,
+        compute_q_aad=compute_q_aad,
+    )
+
+
+def crn_generate_sobol_normals_cpu(
+    *,
+    d_assets: int,
+    m_rem: int,
+    n_sub: int,
+    eff_r: int,
+    n_rep: int,
+    dir_numbers: Optional[npt.NDArray[np.uint32]] = None,
+    digital_shifts: Optional[npt.NDArray[np.uint32]] = None,
+    bb_ortho_mat: Optional[npt.NDArray[np.float64]] = None,
+    chol_mat: Optional[npt.NDArray[np.float64]] = None,
+    n_bits: int = 30,
+    use_gray_code: bool = True,
+    apply_bb_time: bool = False,
+    apply_corr: bool = False,
+    antithetic: bool = False,
+    return_indep: bool = True,
+    return_corr: bool = False,
+) -> Tuple[Optional[npt.NDArray[np.float64]], Optional[npt.NDArray[np.float64]]]:
+    """Dispatches Sobol Brownian-bridge normal generation to C++23 AVX2/OpenMP."""
+    return _require_cpp23_backend().crn_generate_sobol_normals_cpu(
+        d_assets=d_assets,
+        m_rem=m_rem,
+        n_sub=n_sub,
+        eff_r=eff_r,
+        n_rep=n_rep,
+        dir_numbers=dir_numbers,
+        digital_shifts=digital_shifts,
+        bb_ortho_mat=bb_ortho_mat,
+        chol_mat=chol_mat,
+        n_bits=n_bits,
+        use_gray_code=use_gray_code,
+        apply_bb_time=apply_bb_time,
+        apply_corr=apply_corr,
+        antithetic=antithetic,
+        return_indep=return_indep,
+        return_corr=return_corr,
+    )
+
+
+def crn_eval_vibrato_gamma_cpu(
+    *,
+    perf_mat: npt.NDArray[np.float64],
+    lx_pre: npt.NDArray[np.float64],
+    j_pre: npt.NDArray[np.float64],
+    sig_pre: npt.NDArray[np.float64],
+    sv_vib: npt.NDArray[np.float64],
+    chol_mat: npt.NDArray[np.float64],
+    l_inv_t: npt.NDArray[np.float64],
+    c_inv: npt.NDArray[np.float64],
+    fwd_term: npt.NDArray[np.float64],
+    cdl_m: npt.NDArray[np.float64],
+    cdl2_last: npt.NDArray[np.float64],
+    ko_barriers: npt.NDArray[np.float64],
+    is_callable: npt.NDArray[np.float64],
+    cpn_barriers: npt.NDArray[np.float64],
+    is_guaranteed_cpn: npt.NDArray[np.float64],
+    coupon_rates: npt.NDArray[np.float64],
+    eps_vec: npt.NDArray[np.float64],
+    inv_lex_perm: Optional[npt.NDArray[np.int64]],
+    vib_step_start: int,
+    vib_n_steps: int,
+    df_last: float,
+    h_vib: float,
+    ko_spread: float,
+    cpn_spread: float,
+    ki_spread: float,
+    one_star_strike: float,
+    one_star_eps: float,
+    strike: float,
+    lower_strike: float,
+    ki_barrier: float,
+    option_gearing: float,
+    autocall_coupon: float,
+    c_mem_0: float,
+    i_ki_past: float,
+    part_call_strike: float,
+    part_call_rate: float,
+    one_star_coupon: float,
+    call_code: int,
+    cpn_code: int,
+    opt_code: int,
+    has_ki: bool,
+    ki_active: bool,
+    has_one_star: bool,
+    is_memory: bool,
+    is_long_basket: bool,
+    no_notional: bool,
+    force_cpn_ac: bool,
+    cpn_dir_down: bool,
+    cpn_type_out: bool,
+    has_lower_strike: bool,
+    has_part_call: bool,
+    emit_frozen_term: bool = True,
+) -> Tuple[npt.NDArray[np.float64], Optional[npt.NDArray[np.float64]]]:
+    """Dispatches terminal antithetic Vibrato Gamma/Cross-Gamma to C++23 OpenMP."""
+    return _require_cpp23_backend().crn_eval_vibrato_gamma_cpu(
+        perf_mat=perf_mat,
+        lx_pre=lx_pre,
+        j_pre=j_pre,
+        sig_pre=sig_pre,
+        sv_vib=sv_vib,
+        chol_mat=chol_mat,
+        l_inv_t=l_inv_t,
+        c_inv=c_inv,
+        fwd_term=fwd_term,
+        cdl_m=cdl_m,
+        cdl2_last=cdl2_last,
+        ko_barriers=ko_barriers,
+        is_callable=is_callable,
+        cpn_barriers=cpn_barriers,
+        is_guaranteed_cpn=is_guaranteed_cpn,
+        coupon_rates=coupon_rates,
+        eps_vec=eps_vec,
+        inv_lex_perm=inv_lex_perm,
+        vib_step_start=vib_step_start,
+        vib_n_steps=vib_n_steps,
+        df_last=df_last,
+        h_vib=h_vib,
+        ko_spread=ko_spread,
+        cpn_spread=cpn_spread,
+        ki_spread=ki_spread,
+        one_star_strike=one_star_strike,
+        one_star_eps=one_star_eps,
+        strike=strike,
+        lower_strike=lower_strike,
+        ki_barrier=ki_barrier,
+        option_gearing=option_gearing,
+        autocall_coupon=autocall_coupon,
+        c_mem_0=c_mem_0,
+        i_ki_past=i_ki_past,
+        part_call_strike=part_call_strike,
+        part_call_rate=part_call_rate,
+        one_star_coupon=one_star_coupon,
+        call_code=call_code,
+        cpn_code=cpn_code,
+        opt_code=opt_code,
+        has_ki=has_ki,
+        ki_active=ki_active,
+        has_one_star=has_one_star,
+        is_memory=is_memory,
+        is_long_basket=is_long_basket,
+        no_notional=no_notional,
+        force_cpn_ac=force_cpn_ac,
+        cpn_dir_down=cpn_dir_down,
+        cpn_type_out=cpn_type_out,
+        has_lower_strike=has_lower_strike,
+        has_part_call=has_part_call,
+        emit_frozen_term=emit_frozen_term,
+    )
+
+
 __all__ = [
     "Cpp23Tier1Backend",
+    "PlatenSdeAadArgsC",
     "PureNumpyTier1Backend",
+    "SobolGenArgsC",
+    "Tier1AbiInfoC",
+    "Tier1AbiInfoV2C",
     "Tier1MathBackend",
+    "VibratoGammaArgsC",
+    "crn_eval_vibrato_gamma_cpu",
+    "crn_generate_sobol_normals_cpu",
+    "crn_platen_sde_aad_cpu",
     "get_tier1_backend",
     "is_exact_analytical_index",
     "monitoring_index_to_code",
     "reset_tier1_backend_cache",
+    "tier1_abi_info_v2",
 ]

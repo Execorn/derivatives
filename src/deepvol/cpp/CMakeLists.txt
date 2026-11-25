@@ -35,7 +35,7 @@ set_target_properties(tier1_autocall_cpu PROPERTIES
 )
 
 if(DEEPVOL_NATIVE_ARCH)
-    set(_DEEPVOL_ARCH_FLAGS -march=native)
+    set(_DEEPVOL_ARCH_FLAGS -march=native -mavx2 -mfma)
 else()
     set(_DEEPVOL_ARCH_FLAGS -mavx2 -mfma -mbmi2)
 endif()

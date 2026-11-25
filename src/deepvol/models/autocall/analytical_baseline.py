@@ -169,6 +169,7 @@ class AutocallBaselineOutput:
     p_onestar_proxy: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0, dtype=torch.float64))
     has_unsupported_exotic_index: bool = False
     unsupported_indices: Tuple[str, ...] = ()
+    coupon_cf_undisc: Optional[torch.Tensor] = None
 
 
 def _black76_call_scalar(f: float, k: float, v: float) -> float:
@@ -2757,6 +2758,7 @@ def _baseline_cpu_via_cpp(
             p_onestar_proxy=z_s.clone(),
             has_unsupported_exotic_index=has_unsupported,
             unsupported_indices=unsupported_tup,
+            coupon_cf_undisc=z_m.clone(),
         )
     if (
         fp_t.ndim != 2
@@ -3392,6 +3394,7 @@ def compute_analytical_autocall_baseline(
                 p_onestar_proxy=z_s.clone(),
                 has_unsupported_exotic_index=has_unsupported,
                 unsupported_indices=unsupported_tup,
+                coupon_cf_undisc=z_m.clone(),
             )
 
         tau_np = (
@@ -3447,6 +3450,22 @@ def compute_analytical_autocall_baseline(
             dw_col = torch.from_numpy(dw_np)[:, -1]
             if m_rem > 1:
                 dw_col = dw_col.contiguous()
+            cr_np = _tensor_to_np_ro(cr_t)
+            ac_cpn_f = float(fields["autocall_coupon"])
+            cpn_undisc_np = np.empty(m_rem, dtype=np.float64)
+            surv_prev_v = 1.0
+            if fields["is_memory"]:
+                mem_v = float(fields["c_mem_0"])
+                for m_idx in range(m_rem):
+                    eff_c_v = float(cr_np[m_idx]) + mem_v
+                    q_v = float(q_np[m_idx])
+                    cpn_undisc_np[m_idx] = surv_prev_v * q_v * eff_c_v + float(p_np[m_idx]) * ac_cpn_f
+                    mem_v = eff_c_v * (1.0 - q_v)
+                    surv_prev_v = float(surv_np[m_idx])
+            else:
+                for m_idx in range(m_rem):
+                    cpn_undisc_np[m_idx] = surv_prev_v * float(q_np[m_idx]) * float(cr_np[m_idx]) + float(p_np[m_idx]) * ac_cpn_f
+                    surv_prev_v = float(surv_np[m_idx])
             return AutocallBaselineOutput(
                 f_w=torch.from_numpy(f_w_np),
                 v_w=torch.from_numpy(v_w_np),
@@ -3465,6 +3484,7 @@ def compute_analytical_autocall_baseline(
                 p_onestar_proxy=sc_t[7] if sc_t.numel() > 7 else torch.zeros_like(sc_t[6]),
                 has_unsupported_exotic_index=has_unsupported,
                 unsupported_indices=unsupported_tup,
+                coupon_cf_undisc=torch.from_numpy(cpn_undisc_np),
             )
 
     # Differentiable PyTorch float64 path (2D single-trade or 3D batched)
@@ -3526,6 +3546,7 @@ def compute_analytical_autocall_baseline(
             p_onestar_proxy=z_s.clone(),
             has_unsupported_exotic_index=has_unsupported,
             unsupported_indices=unsupported_tup,
+            coupon_cf_undisc=z_m.clone(),
         )
 
     def _sched_col(sched: torch.Tensor, idx_m: int) -> torch.Tensor:
@@ -3916,6 +3937,7 @@ def compute_analytical_autocall_baseline(
             notional_pv_proxy = notional_flows_term
 
     cpn_pv_terms: List[torch.Tensor] = []
+    cpn_undisc_terms: List[torch.Tensor] = []
     mem_acc = torch.full((b_sz,), float(fields["c_mem_0"]), dtype=torch.float64, device=device)
     is_memory = bool(fields["is_memory"])
     autocall_coupon = float(fields["autocall_coupon"])
@@ -3923,11 +3945,14 @@ def compute_analytical_autocall_baseline(
         c_m_t = _sched_col(cr_t, m)
         df_m_t = _sched_col(df_t, m)
         eff_c_m_t = (c_m_t + mem_acc) if is_memory else c_m_t
-        cf_cpn_m = df_m_t * (surv_prev[:, m] * q_proxy[:, m] * eff_c_m_t + p_proxy[:, m] * autocall_coupon)
+        cpn_undisc_m = surv_prev[:, m] * q_proxy[:, m] * eff_c_m_t + p_proxy[:, m] * autocall_coupon
+        cf_cpn_m = df_m_t * cpn_undisc_m
+        cpn_undisc_terms.append(cpn_undisc_m)
         cpn_pv_terms.append(cf_cpn_m)
         if is_memory:
             mem_acc = eff_c_m_t * (1.0 - q_proxy[:, m])
 
+    coupon_cf_undisc = torch.stack(cpn_undisc_terms, dim=1)
     coupon_pv_proxy = torch.stack(cpn_pv_terms, dim=1).sum(dim=1)
     opt_sign = 1.0
     option_pv_proxy = df_last * (
@@ -3959,6 +3984,7 @@ def compute_analytical_autocall_baseline(
             p_onestar_proxy=p_onestar_proxy.squeeze(0),
             has_unsupported_exotic_index=has_unsupported,
             unsupported_indices=unsupported_tup,
+            coupon_cf_undisc=coupon_cf_undisc.squeeze(0),
         )
 
     return AutocallBaselineOutput(
@@ -3979,6 +4005,7 @@ def compute_analytical_autocall_baseline(
         p_onestar_proxy=p_onestar_proxy,
         has_unsupported_exotic_index=has_unsupported,
         unsupported_indices=unsupported_tup,
+        coupon_cf_undisc=coupon_cf_undisc,
     )
 
 
