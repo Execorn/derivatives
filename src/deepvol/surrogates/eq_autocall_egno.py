@@ -551,7 +551,7 @@ class MaskedEQAutocallSurrogate(nn.Module):
             n_func_codes=self.n_func_codes,
             func_emb_dim=self.func_emb_dim,
         )
-        # Put head takes [h_sched_last, h_sched_mean, z_basket, z_put_basket, global_put, func_emb_flat, h_disp, c_call_sum, put_phys].
+        # Put head takes [h_sched_last, h_sched_mean, z_basket, z_put_basket, global_put, func_emb_flat, h_disp, c_call_sum, put_phys_12, dput_stats].
         self.put_head = nn.Sequential(
             nn.Linear(
                 5 * self.d_model + self.d_global + 3 * self.func_emb_dim + 2 + self.d_put_phys,
@@ -1647,8 +1647,10 @@ def assemble_surrogate_components(
         if isinstance(force_coupons_on_autocall, bool) and not force_coupons_on_autocall:
             eff_q_m = q_m
         else:
+            calc_dtype = torch.float64 if dtype == torch.float64 else torch.float32
             q_forced = (
-                out.stopping_probs[:, m].float() / surv_prev[:, m].float().clamp(min=1e-12)
+                out.stopping_probs[:, m].to(dtype=calc_dtype)
+                / surv_prev[:, m].to(dtype=calc_dtype).clamp(min=1e-12)
             ).to(dtype=dtype)
             q_forced = torch.maximum(q_m, q_forced).clamp(0.0, 1.0)
             eff_q_m = q_m + force_cpn_t * (q_forced - q_m)

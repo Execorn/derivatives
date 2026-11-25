@@ -1012,6 +1012,7 @@ class EQAutocallModelGuardian:
         has_8d = "scale_weights_8d" in raw or raw_conf_mode == "signed_eb_mondrian_8d"
         if has_8d and "scale_weights_8d" in raw:
             w8 = _to_f64(raw["scale_weights_8d"]).reshape(8)
+            w8[0] = min(max(float(w8[0]), 1.5e-4), 3.0e-4)
             w8[1] = max(float(w8[1]), 5e-4)
             w5 = w8[:5].copy()
             eps0 = float(w8[0])
@@ -1343,6 +1344,7 @@ class EQAutocallModelGuardian:
                 dtype=np.float64,
             )
             w8_eff = np.asarray(w8, dtype=np.float64).reshape(8).copy()
+            w8_eff[0] = min(max(float(w8_eff[0]), 1.5e-4), 3.0e-4)
             w8_eff[1] = max(float(w8_eff[1]), 5e-4)
             s_val = max(float(np.dot(phi_8, w8_eff)), 1.5e-4)
             b_cell = (
@@ -2268,7 +2270,12 @@ class EQAutocallModelGuardian:
         preproc_state: AutocallPreprocState,
         baseline_out: AutocallBaselineOutput | None = None,
     ) -> tuple[bool, list[AutocallFallbackReason]]:
-        """Executes the Tier 3 Post-Inference Probability Simplex, Put-Spread Bound & Funded Residual Gate."""
+        """Executes the Tier 3 Post-Inference Probability Simplex, Put-Spread Bound & Funded Residual Gate.
+
+        Note: `tau_res` is a coarse unit-notional surrogate-vs-proxy sanity bound capped at `0.0250`
+        (`250 bps` of notional), distinct from the pre-inference `tau_desk_bps = 15.0` bps (`0.0015`)
+        conformal uncertainty gate.
+        """
         reasons: list[AutocallFallbackReason] = []
         m_rem = int(preproc_state.m_rem)
         b_out = _resolve_baseline_out(preproc_state, baseline_out)
@@ -2430,6 +2437,7 @@ class EQAutocallModelGuardian:
             if not math.isfinite(raw_tau):
                 reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
                 return False, reasons
+            # 0.0250 unit-notional = 250 bps residual sanity bound (distinct from tau_desk_bps = 15.0 bps).
             tau_res = min(raw_tau, 0.0250)
         else:
             tau_res = float(self.residual_threshold)
@@ -2903,6 +2911,7 @@ class EQAutocallModelGuardian:
                     axis=1,
                 )
                 w8_eff = w8.copy()
+                w8_eff[0] = min(max(float(w8_eff[0]), 1.5e-4), 3.0e-4)
                 w8_eff[1] = max(float(w8_eff[1]), 5e-4)
                 scale_vec = np.maximum(phi_mat_8 @ w8_eff, 1.5e-4)
                 keys_3 = [f"ki{1 if bool(ku) else 0}_m{int(mb)}_d{int(db)}" for ku, mb, db in zip(ki_untrig_vec, m_buck_vec, d_buck_vec)]
@@ -3024,7 +3033,11 @@ class EQAutocallModelGuardian:
         node_feats: torch.Tensor | None = None,
         asset_mask: torch.Tensor | None = None,
     ) -> dict[str, Any]:
-        """Vectorized SR 26-2 post-inference simplex, survival, put-spread, outlier & finiteness audit."""
+        """Vectorized SR 26-2 post-inference simplex, survival, put-spread, outlier & finiteness audit.
+
+        Note: `tau_res_t` caps the coarse unit-notional surrogate-vs-proxy residual bound at `0.0250`
+        (`250 bps` of notional), distinct from the pre-inference `tau_desk_bps = 15.0` bps gate.
+        """
         with torch.no_grad():
             finite_ok = (
                 torch.isfinite(stopping_probs).all(dim=1)

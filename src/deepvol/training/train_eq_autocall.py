@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 import logging
 import math
 import os
 from pathlib import Path
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -60,6 +60,76 @@ def _atomic_torch_save(payload: Any, dest: Path) -> None:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
         raise
+
+
+def _load_or_gen_cached_split(
+    split_name: str,
+    gen_fn: Callable[[], SyntheticAutocallBatch],
+    *,
+    data_dir: str | Path | None,
+    n_samples: int,
+    domain_mode: str,
+    seed: int,
+    d_max: int,
+    m_max: int,
+    save_on_miss: bool = True,
+) -> SyntheticAutocallBatch:
+    """Loads a cached `.pt` split when sample count (`>= n_samples`) and metadata match, else regenerates."""
+    if data_dir is not None:
+        split_path = Path(data_dir) / f"{split_name}.pt"
+        if split_path.is_file():
+            raw_split = torch.load(split_path, map_location="cpu", weights_only=True)
+            if isinstance(raw_split, dict):
+                batch_fields = fields(SyntheticAutocallBatch)
+                required_fields = {
+                    f.name for f in batch_fields if f.default is MISSING and f.default_factory is MISSING
+                }
+                valid_fields = {f.name for f in batch_fields}
+                meta = raw_split.get("_meta")
+                seed_ok = isinstance(meta, dict) and ("seed" not in meta or meta.get("seed") == int(seed))
+                meta_ok = (
+                    isinstance(meta, dict)
+                    and meta.get("domain_mode") == str(domain_mode)
+                    and seed_ok
+                    and required_fields.issubset(raw_split.keys())
+                )
+                if meta_ok:
+                    batch_kwargs = {k: v for k, v in raw_split.items() if k in valid_fields}
+                    cached_batch = SyntheticAutocallBatch(**batch_kwargs)
+                    n_cached = int(cached_batch.node_feats.shape[0])
+                    if (
+                        n_cached >= n_samples
+                        and int(cached_batch.node_feats.shape[1]) == int(d_max)
+                        and int(cached_batch.sched_feats.shape[1]) == int(m_max)
+                    ):
+                        if n_cached > n_samples:
+                            return cached_batch.index_select(torch.arange(n_samples, dtype=torch.long))
+                        return cached_batch
+                _LOGGER.info(
+                    "Regenerating cached split %s (expected n>=%d, domain_mode=%s, seed=%d, d_max=%d, m_max=%d; got meta=%r).",
+                    split_path,
+                    n_samples,
+                    domain_mode,
+                    seed,
+                    d_max,
+                    m_max,
+                    meta,
+                )
+        batch_out = gen_fn()
+        if save_on_miss:
+            payload_split: Dict[str, Any] = {
+                f.name: getattr(batch_out, f.name) for f in fields(SyntheticAutocallBatch)
+            }
+            payload_split["_meta"] = {
+                "n_samples": int(batch_out.node_feats.shape[0]),
+                "domain_mode": str(domain_mode),
+                "seed": int(seed),
+                "d_max": int(d_max),
+                "m_max": int(m_max),
+            }
+            _atomic_torch_save(payload_split, split_path)
+        return batch_out
+    return gen_fn()
 
 DEFAULT_CHECKPOINT_PATH = (
     Path(__file__).resolve().parents[3] / "artifacts" / "checkpoints" / "eq_autocall_egno.pt"
@@ -1284,18 +1354,25 @@ def train_eq_autocall_surrogate(
     ).to(device=dev, dtype=torch.float32)
     model.zero_init_residual_heads(std=1e-4)
 
-    def _load_or_gen_split(split_name: str, gen_fn: Any) -> SyntheticAutocallBatch:
-        if data_dir is not None:
-            split_path = Path(data_dir) / f"{split_name}.pt"
-            if split_path.is_file():
-                raw_split = torch.load(split_path, map_location="cpu", weights_only=True)
-                if isinstance(raw_split, dict):
-                    return SyntheticAutocallBatch(**raw_split)
-            batch_out: SyntheticAutocallBatch = gen_fn()
-            payload_split = {f.name: getattr(batch_out, f.name) for f in fields(SyntheticAutocallBatch)}
-            _atomic_torch_save(payload_split, split_path)
-            return batch_out
-        return gen_fn()  # type: ignore[no-any-return]
+    def _load_or_gen_split(
+        split_name: str,
+        gen_fn: Callable[[], SyntheticAutocallBatch],
+        *,
+        expected_samples: int,
+        expected_domain_mode: str,
+        expected_seed: int,
+    ) -> SyntheticAutocallBatch:
+        return _load_or_gen_cached_split(
+            split_name,
+            gen_fn,
+            data_dir=data_dir,
+            n_samples=expected_samples,
+            domain_mode=expected_domain_mode,
+            seed=expected_seed,
+            d_max=d_max,
+            m_max=m_max,
+            save_on_miss=True,
+        )
 
     eff_cv_test = cv_mode_test if n_mc_paths_test >= 4096 else "none"
 
@@ -1319,6 +1396,9 @@ def train_eq_autocall_surrogate(
                 cv_mode="none",
                 domain_mode="tier2_desk",
             ),
+            expected_samples=n_desk_train,
+            expected_domain_mode="tier2_desk",
+            expected_seed=seed,
         )
         if n_stress_train > 0:
             train_stress = _load_or_gen_split(
@@ -1337,6 +1417,9 @@ def train_eq_autocall_surrogate(
                     cv_mode="none",
                     domain_mode="full_stress",
                 ),
+                expected_samples=n_stress_train,
+                expected_domain_mode="full_stress",
+                expected_seed=seed + 50_000,
             )
             train_data = _concat_batches([train_desk, train_stress])
         else:
@@ -1358,6 +1441,9 @@ def train_eq_autocall_surrogate(
                 cv_mode="none",
                 domain_mode=domain_mode,
             ),
+            expected_samples=n_train_samples,
+            expected_domain_mode=domain_mode,
+            expected_seed=seed,
         )
         train_data = train_desk
     val_data = _load_or_gen_split(
@@ -1377,6 +1463,9 @@ def train_eq_autocall_surrogate(
             compute_pathwise_delta=False,
             domain_mode=domain_mode,
         ),
+        expected_samples=n_val_samples,
+        expected_domain_mode=domain_mode,
+        expected_seed=seed + 100_000,
     )
     cal_data = _load_or_gen_split(
         "cal",
@@ -1395,6 +1484,9 @@ def train_eq_autocall_surrogate(
             compute_pathwise_delta=False,
             domain_mode=domain_mode,
         ),
+        expected_samples=n_cal_samples,
+        expected_domain_mode=domain_mode,
+        expected_seed=seed + 200_000,
     )
     test_data = _load_or_gen_split(
         "test",
@@ -1412,6 +1504,9 @@ def train_eq_autocall_surrogate(
             cv_mode=eff_cv_test,
             domain_mode=domain_mode,
         ),
+        expected_samples=n_test_samples,
+        expected_domain_mode=domain_mode,
+        expected_seed=seed + 300_000,
     )
 
     base_wof_mae, base_multi_mae = _split_worstof_multifunc_mae_bps(test_data.pv_proxy, test_data)
@@ -1760,14 +1855,24 @@ def recalibrate_guardian_stats_from_checkpoint(
 
     eff_cv_test = cv_mode_test if n_mc_paths_test >= 4096 else "none"
 
-    def _load_or_gen_recal(split_name: str, gen_fn: Any) -> SyntheticAutocallBatch:
-        if data_dir is not None:
-            split_path = Path(data_dir) / f"{split_name}.pt"
-            if split_path.is_file():
-                raw_split = torch.load(split_path, map_location="cpu", weights_only=True)
-                if isinstance(raw_split, dict):
-                    return SyntheticAutocallBatch(**raw_split)
-        return gen_fn()  # type: ignore[no-any-return]
+    def _load_or_gen_recal(
+        split_name: str,
+        gen_fn: Callable[[], SyntheticAutocallBatch],
+        *,
+        expected_samples: int,
+        expected_seed: int,
+    ) -> SyntheticAutocallBatch:
+        return _load_or_gen_cached_split(
+            split_name,
+            gen_fn,
+            data_dir=data_dir,
+            n_samples=expected_samples,
+            domain_mode=domain_mode,
+            seed=expected_seed,
+            d_max=d_max,
+            m_max=m_max,
+            save_on_miss=False,
+        )
 
     # OAS covariance and PSI bins depend strictly on the 16D feature distribution (identical Sobol contracts).
     train_data = _load_or_gen_recal(
@@ -1787,6 +1892,8 @@ def recalibrate_guardian_stats_from_checkpoint(
             compute_pathwise_delta=False,
             domain_mode=domain_mode,
         ),
+        expected_samples=n_train_samples,
+        expected_seed=seed,
     )
     cal_data = _load_or_gen_recal(
         "cal",
@@ -1805,6 +1912,8 @@ def recalibrate_guardian_stats_from_checkpoint(
             compute_pathwise_delta=False,
             domain_mode=domain_mode,
         ),
+        expected_samples=n_cal_samples,
+        expected_seed=seed + 200_000,
     )
     test_data = _load_or_gen_recal(
         "test",
@@ -1823,6 +1932,8 @@ def recalibrate_guardian_stats_from_checkpoint(
             compute_pathwise_delta=True,
             domain_mode=domain_mode,
         ),
+        expected_samples=n_test_samples,
+        expected_seed=seed + 300_000,
     )
 
     stats_payload = calibrate_guardian_stats(
