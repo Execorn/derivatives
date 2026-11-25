@@ -551,9 +551,7 @@ def _monotone_convex_eval(
             return 0.0
 
         # Case (i): opposite signs with ratio in [0.5, 2.0]
-        if abs(g0) <= 1e-15 and abs(g1) <= 1e-15:
-            return 0.0
-        # Case (i): single cubic polynomial (covers |g1| in [0.5|g0|, 2|g0|] and g0==0 or g1==0 limits)
+        # Single cubic polynomial (covers |g1| in [0.5|g0|, 2|g0|] and g0==0 or g1==0 limits)
         if (
             (g0 > 0.0 and -2.0 * g0 <= g1 <= -0.5 * g0)
             or (g0 < 0.0 and -2.0 * g0 >= g1 >= -0.5 * g0)

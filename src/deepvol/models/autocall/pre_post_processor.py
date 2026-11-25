@@ -4947,7 +4947,7 @@ def assemble_autocall_cashflows_and_pv(
         notional_pv_s = float(notional_cf_np.sum())
         coupon_pv_s = float(coupon_cf_np.sum())
         funding_pv_s = float(fund_np.sum())
-        pv_total_s = float(preproc_state.pv_in_transit) + notional_pv_s + coupon_pv_s + opt_amt - funding_pv_s
+        pv_total_s = float(preproc_state.pv_in_transit) + cash_today + notional_pv_s + coupon_pv_s + opt_amt - funding_pv_s
 
         out_scalars = torch.tensor(
             [notional_pv_s, coupon_pv_s, opt_amt, funding_pv_s, pv_total_s],
