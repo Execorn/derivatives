@@ -54,6 +54,7 @@ from deepvol.models.autocall.feature_layout import (
     CanonicalTier3Config,
     resolve_canonical_tier3_config,
 )
+from deepvol.models.autocall.gpu_cache_manager import GLOBAL_GPU_CACHE_MANAGER
 import deepvol.models.autocall.greeks_engine as _greeks_mod
 from deepvol.models.autocall.greeks_engine import (
     AutocallGreeksResult,
@@ -262,6 +263,19 @@ _SURROGATE_DIGEST_CACHE_LOCK = threading.Lock()
 _SURROGATE_DIGEST_CACHE: dict[
     int, tuple[MaskedEQAutocallSurrogate, tuple[tuple[tuple[int, ...], int], ...], bytes]
 ] = {}
+_TIER2_DET_CACHE_LOCK = threading.Lock()
+_TIER2_DETERMINISTIC_CACHE: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+_TIER2_DET_CACHE_MAXSIZE: int = 512
+_ORIG_COMPUTE_EQ_AUTOCALL_GREEKS = compute_eq_autocall_greeks
+
+
+def clear_tier2_deterministic_cache() -> None:
+    """Clears memoized Tier-2 surrogate forward and VJP outputs on cache flush."""
+    with _TIER2_DET_CACHE_LOCK:
+        _TIER2_DETERMINISTIC_CACHE.clear()
+
+
+GLOBAL_GPU_CACHE_MANAGER.register_on_clear_callback(clear_tier2_deterministic_cache)
 
 
 def _get_surrogate_content_digest(surrogate: MaskedEQAutocallSurrogate) -> bytes:
@@ -2349,6 +2363,7 @@ class EQAutocallRuntime:
             theta_roll_days=theta_roll_days,
             theta_convention=eff_theta_conv,
             allow_cached_mds_digest=allow_cached_mds_digest,
+            eff_repair_arb=eff_repair,
         )
 
     def _price_parsed_trade(
@@ -2362,6 +2377,7 @@ class EQAutocallRuntime:
         theta_roll_days: int,
         theta_convention: str,
         allow_cached_mds_digest: bool,
+        eff_repair_arb: bool = False,
     ) -> EQAutocallRuntimeResponse:
         src_req = (
             getattr(req_model, "_immutable_cache_source", None)
@@ -2660,18 +2676,73 @@ class EQAutocallRuntime:
                         handled_single_pass_qmc = True
 
             if not handled_single_pass_qmc:
+                state_dig = getattr(state, "state_digest", None)
+                can_cache_t2 = bool(
+                    isinstance(state_dig, str)
+                    and len(state_dig) > 0
+                    and type(surr_for_greeks).__name__ == "MaskedEQAutocallSurrogate"
+                    and not getattr(surr_for_greeks, "training", False)
+                    and compute_eq_autocall_greeks is _ORIG_COMPUTE_EQ_AUTOCALL_GREEKS
+                    and getattr(_greeks_mod, "compute_eq_autocall_greeks", None)
+                    is _ORIG_COMPUTE_EQ_AUTOCALL_GREEKS
+                )
+                surr_dig = _get_surrogate_content_digest(surr_for_greeks) if can_cache_t2 else b""
+                t2_fwd_key = (
+                    (
+                        "t2_fwd",
+                        str(self.device),
+                        id(surr_for_greeks),
+                        surr_dig,
+                        mds_digest_hex,
+                        state_dig,
+                        bool(eff_repair_arb),
+                    )
+                    if can_cache_t2
+                    else None
+                )
+                t2_grk_key = (
+                    (
+                        "t2_grk",
+                        str(self.device),
+                        id(surr_for_greeks),
+                        surr_dig,
+                        mds_digest_hex,
+                        state_dig,
+                        bool(eff_repair_arb),
+                        tuple(greek_queries_present),
+                        int(theta_roll_days),
+                        str(theta_convention),
+                        bool(greeks_extra.get("stabilize_f32_surrogate", True)),
+                    )
+                    if can_cache_t2
+                    else None
+                )
+
                 def _greeks_fn_runtime(st: AutocallPreprocState, _surr: Any) -> AutocallGreeksResult:
+                    if t2_grk_key is not None:
+                        with _TIER2_DET_CACHE_LOCK:
+                            hit_g = _TIER2_DETERMINISTIC_CACHE.get(t2_grk_key)
+                            if hit_g is not None:
+                                _TIER2_DETERMINISTIC_CACHE.move_to_end(t2_grk_key)
+                                return cast(AutocallGreeksResult, hit_g)
                     if (
                         (not getattr(st, "repo_curves_map", None) and getattr(req_model.Model.MarketDataSet, "RepoSpreadCurves", None))
                         or (getattr(st, "quanto_meta", None) and not getattr(st, "quanto_fx_specs", None))
                     ):
                         _attach_runtime_market_metadata(st, req_model, mds_digest_hex=mds_digest_hex)
-                    return compute_eq_autocall_greeks(
+                    res_g = compute_eq_autocall_greeks(
                         st,
                         queries=greek_queries_present,
                         surrogate=surr_for_greeks,
                         **greeks_extra,
                     )
+                    if t2_grk_key is not None:
+                        with _TIER2_DET_CACHE_LOCK:
+                            _TIER2_DETERMINISTIC_CACHE[t2_grk_key] = res_g
+                            _TIER2_DETERMINISTIC_CACHE.move_to_end(t2_grk_key)
+                            while len(_TIER2_DETERMINISTIC_CACHE) > _TIER2_DET_CACHE_MAXSIZE:
+                                _TIER2_DETERMINISTIC_CACHE.popitem(last=False)
+                    return res_g
 
                 greeks_fn = (
                     _greeks_fn_runtime
@@ -2681,11 +2752,27 @@ class EQAutocallRuntime:
                 pv_surr_fn: Any = None
                 if self.device.type == "cuda" and not force_qmc and self._compiled_runner is not None:
                     def _compiled_surr_with_memo(st: AutocallPreprocState) -> AutocallSurrogateOutput:
+                        if t2_fwd_key is not None:
+                            with _TIER2_DET_CACHE_LOCK:
+                                hit_s = _TIER2_DETERMINISTIC_CACHE.get(t2_fwd_key)
+                                if hit_s is not None:
+                                    _TIER2_DETERMINISTIC_CACHE.move_to_end(t2_fwd_key)
+                                    try:
+                                        setattr(st, "_precomputed_surr_out", hit_s)
+                                    except (AttributeError, TypeError):
+                                        pass
+                                    return cast(AutocallSurrogateOutput, hit_s)
                         s_res = self._predict_surrogate_compiled(st)
                         try:
                             setattr(st, "_precomputed_surr_out", s_res)
                         except (AttributeError, TypeError):
                             pass
+                        if t2_fwd_key is not None:
+                            with _TIER2_DET_CACHE_LOCK:
+                                _TIER2_DETERMINISTIC_CACHE[t2_fwd_key] = s_res
+                                _TIER2_DETERMINISTIC_CACHE.move_to_end(t2_fwd_key)
+                                while len(_TIER2_DETERMINISTIC_CACHE) > _TIER2_DET_CACHE_MAXSIZE:
+                                    _TIER2_DETERMINISTIC_CACHE.popitem(last=False)
                         return s_res
 
                     pv_surr_fn = _compiled_surr_with_memo

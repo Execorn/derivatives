@@ -188,7 +188,7 @@ def resolve_canonical_tier3_config(
     if n_fallback_paths is not None:
         eff_paths = max(2, int(n_fallback_paths))
     elif dev_tok == "cuda":
-        eff_paths = 4096 if m_val > 20 else 8192
+        eff_paths = 4096 if (m_val > 20 and d_val > 3) else 8192
     elif m_val > 24:
         eff_paths = 2048
     elif d_val >= 6 and m_val <= 12:
