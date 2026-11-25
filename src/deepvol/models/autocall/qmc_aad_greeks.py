@@ -287,6 +287,7 @@ class _CrnCpuPrep:
         "esc_base",
         "growth_base",
         "w_fund_base_np",
+        "base_lv_tables",
         "base_lv_caches",
         "vol_atm_obs",
         "th_prep",
@@ -372,6 +373,7 @@ class _CrnCpuPrep:
     esc_base: Any
     growth_base: Any
     w_fund_base_np: Any
+    base_lv_tables: Any
     base_lv_caches: Any
     vol_atm_obs: Any
     th_prep: Any
@@ -655,34 +657,25 @@ def clear_qmc_aad_gpu_caches() -> None:
     _CRN_QMC_CG_CACHE.clear()
 
 
-_QMC_CG_MAX_ENTRIES: int = 8
+_QMC_CG_MAX_ENTRIES: int = 2
 
 
 class _QmcCudagraphCache:
-    """Bounded (<=8 entry) shape-keyed CUDAGraph LRU backed by GLOBAL_GPU_CACHE_MANAGER shared pool."""
+    """Bounded (<=8 entry) shape-keyed CUDAGraph LRU backed by GLOBAL_GPU_CACHE_MANAGER cudagraph_pool."""
 
     def __init__(self, max_entries: int = _QMC_CG_MAX_ENTRIES) -> None:
-        self._max_entries = max(1, int(max_entries))
-        self._lock = threading.Lock()
-        self._od: Dict[Tuple[int, int, int, int, int, int], Dict[str, Any]] = {}
+        self._part = GLOBAL_GPU_CACHE_MANAGER.register_cudagraph_pool(max_entries=max_entries)
 
-    def get(self, key: Tuple[int, int, int, int, int, int]) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            entry = self._od.pop(key, None)
-            if entry is not None:
-                self._od[key] = entry
-            return entry
+    def get(self, key: Any) -> Optional[Dict[str, Any]]:
+        return cast(Optional[Dict[str, Any]], self._part.get(key))
 
     def put(self, key: Any, entry: Dict[str, Any]) -> None:
-        with self._lock:
-            self._od.pop(key, None)
-            self._od[key] = entry
-            while len(self._od) > self._max_entries:
-                del self._od[next(iter(self._od))]
+        out_t = entry.get("out_flat_g")
+        exp_bytes = int(out_t.numel() * out_t.element_size()) if isinstance(out_t, torch.Tensor) else 0
+        self._part.put(key, entry, explicit_bytes=exp_bytes)
 
     def clear(self) -> None:
-        with self._lock:
-            self._od.clear()
+        self._part.clear()
 
 
 _CRN_QMC_CG_CACHE = _QmcCudagraphCache(max_entries=_QMC_CG_MAX_ENTRIES)
@@ -7786,6 +7779,7 @@ def compute_qmc_aad_crn_greeks(
         lv_y_max_vec = _warm_cpu.lv_y_max_vec
         t_max = _warm_cpu.t_max
         lv_t_grid = _warm_cpu.lv_t_grid
+        base_lv_tables = _warm_cpu.base_lv_tables
         base_lv_caches = _warm_cpu.base_lv_caches
         ko_arr_np = _warm_cpu.ko_arr_np
         cpn_arr_np = _warm_cpu.cpn_arr_np
@@ -7985,19 +7979,18 @@ def compute_qmc_aad_crn_greeks(
             cached_z_rot = _CRN_SOBOL_CACHE.get(rot_sobol_key)
             if isinstance(cached_z_rot, torch.Tensor) and cached_z_rot.device == qmc_device:
                 z_indep_full_f32 = cached_z_rot
-        if can_triton_sobol and (z_indep_full_f32 is None or (not _warm_gpu_hit)):
+        if can_triton_sobol:
             sv_sobol_gpu = _get_sobol_direction_numbers(qmc_device)
-            if z_indep_full_f32 is None:
-                shift_cache_key = ("sobol_shifts", eff_r, m_rem, n_sub, d_assets, seed, dev_norm_str)
-                shifts_sobol_gpu = _CRN_SOBOL_CACHE.get(shift_cache_key)
-                if shifts_sobol_gpu is None:
-                    rng_c = np.random.default_rng(seed)
-                    rng_f = np.random.default_rng(seed + 31337)
-                    shifts_c = rng_c.integers(0, 1 << 30, size=(eff_r, dim_coarse), dtype=np.int32)
-                    shifts_f = rng_f.integers(0, 1 << 30, size=(eff_r, dim_fine), dtype=np.int32)
-                    shifts_np = np.concatenate([shifts_c, shifts_f], axis=1)
-                    shifts_sobol_gpu = torch.from_numpy(shifts_np).to(device=qmc_device, dtype=torch.int32)
-                    _CRN_SOBOL_CACHE.put(shift_cache_key, shifts_sobol_gpu)
+            shift_cache_key = ("sobol_shifts", eff_r, m_rem, n_sub, d_assets, seed, dev_norm_str)
+            shifts_sobol_gpu = _CRN_SOBOL_CACHE.get(shift_cache_key)
+            if shifts_sobol_gpu is None:
+                rng_c = np.random.default_rng(seed)
+                rng_f = np.random.default_rng(seed + 31337)
+                shifts_c = rng_c.integers(0, 1 << 30, size=(eff_r, dim_coarse), dtype=np.int32)
+                shifts_f = rng_f.integers(0, 1 << 30, size=(eff_r, dim_fine), dtype=np.int32)
+                shifts_np = np.concatenate([shifts_c, shifts_f], axis=1)
+                shifts_sobol_gpu = torch.from_numpy(shifts_np).to(device=qmc_device, dtype=torch.int32)
+                _CRN_SOBOL_CACHE.put(shift_cache_key, shifts_sobol_gpu)
 
         def _get_z_indep_chunk_gpu(r_start_c: int, r_end_c: int, allow_full_cache: bool = True) -> torch.Tensor:
             if allow_full_cache and z_indep_full_f32 is not None:
@@ -11261,6 +11254,7 @@ def compute_qmc_aad_crn_greeks(
                     cpu_p.sqrt_ev_np = sqrt_ev_np
                     cpu_p.r_native_obs_np = r_native_obs_np
                     cpu_p.w_fund_base_np = w_fund_base_np
+                    cpu_p.base_lv_tables = base_lv_tables
                     cpu_p.base_lv_caches = base_lv_caches
                     cpu_p.vol_atm_obs = vol_atm_obs
                     cpu_p.th_prep = th_prep
@@ -11486,6 +11480,7 @@ def compute_qmc_aad_crn_greeks(
             cg_fast_d2h_np: Optional[npt.NDArray[np.float64]] = None
             cg_shape_key: Any = None
             cg_capturing_now = False
+            cg_stream_entered = False
             cg_obj: Any = None
             cg_stream_ctx: Any = None
             cg_pool_lock: Any = None
@@ -11630,212 +11625,177 @@ def compute_qmc_aad_crn_greeks(
                                 cg_hit["out_flat_g"].clone().detach().cpu().numpy(),
                                 dtype=np.float64,
                             )
-                finally:
-                    if cg_fast_d2h_np is not None:
+                except Exception:
+                    if cg_pool_lock is not None:
                         cg_pool_lock.release()
                         cg_pool_lock = None
-
-            out_flat_g: Optional[torch.Tensor] = (
-                torch.zeros((tot_out_el,), dtype=torch.float64, device=qmc_device)
-                if (tot_out_el > 0 and cg_fast_d2h_np is None)
-                else None
-            )
-
-            def _out_view(tag: str) -> Optional[torch.Tensor]:
-                if out_flat_g is None:
-                    return None
-                sp_o = pack_spans.get(tag)
-                if sp_o is None:
-                    return None
-                return out_flat_g[sp_o[0] : sp_o[1]].view(sp_o[2])
-
-            stage1_rep_g = _out_view("stage1")
-            gpu_eval_pv_g = _out_view("eval_pv")
-            pv_preterm_g = _out_view("preterm")
-            pv_th_fused_g = _out_view("th_fused")
-            h_vib_tot_g = _out_view("h_vib")
-            bar_chol_tot_g = _out_view("bar_chol")
-            bar_sigma_cont_tot_g = _out_view("bar_sigma_cont")
-            bar_lv_tot_g = _out_view("bar_lv")
-            bar_q_tot_g = _out_view("bar_q")
-            bar_ln_fwd_tot_g = _out_view("bar_lnf")
-            bar_cf_wf_tot_g = _out_view("bar_cf_wf")
-            s1_gbm_crn_g = _out_view("s1_gbm_crn")
-            s1_gbm_cheap_g = _out_view("s1_gbm_cheap")
-            cf_surv_gbm_crn_g = _out_view("cf_surv_gbm_crn")
-            cf_surv_gbm_cheap_g = _out_view("cf_surv_gbm_cheap")
-            stat_direct_alias = bool((not dyn_entries) and n_stat_rows > 0 and gpu_eval_pv_g is not None and n_stat_rows == gpu_eval_rows_total)
-            stat_acc_g: Optional[torch.Tensor] = (
-                gpu_eval_pv_g
-                if stat_direct_alias
-                else (torch.zeros((n_stat_rows,), dtype=torch.float64, device=qmc_device) if (n_stat_rows > 0 and cg_fast_d2h_np is None) else None)
-            )
-
-            if can_cg_qmc and cg_fast_d2h_np is None and out_flat_g is not None and cg_pool_lock is not None:
-                try:
-                    cg_stream = torch.cuda.Stream(device=qmc_device)  # type: ignore[no-untyped-call]
-                    cg_stream.wait_stream(torch.cuda.current_stream(qmc_device))
-                    with torch.cuda.stream(cg_stream):
-                        _warm_z_cg = _get_z_indep_chunk_gpu(0, min(eff_r, r_chunk), allow_full_cache=False)
-                        if use_f32_step1 and (need_fwd_ckpt or need_spot_bumps or th_chunk_in_step1 or use_mf_cv):
-                            _ = torch.matmul(chol_f32_g_cached, _warm_z_cg)
-                        del _warm_z_cg
-                    cg_stream.synchronize()
-                    cg_before_stats_qmc = torch.cuda.memory_stats(qmc_device)
-                    cg_obj = torch.cuda.CUDAGraph()  # type: ignore[no-untyped-call]
-                    cg_stream_ctx = torch.cuda.stream(cg_stream)
-                    cg_stream_ctx.__enter__()
-                    cg_obj.capture_begin(
-                        pool=GLOBAL_GPU_CACHE_MANAGER.get_shared_graph_pool(qmc_device),
-                        capture_error_mode="thread_local",
-                    )
-                    cg_capturing_now = True
-                    out_flat_g.zero_()
-                    if stat_acc_g is not None and (not stat_direct_alias):
-                        stat_acc_g.zero_()
-                except Exception:
-                    if cg_capturing_now and cg_obj is not None:
-                        try:
-                            cg_obj.capture_end()
-                        except Exception as end_exc:
-                            logger.debug("QMC CUDAGraph capture_end cleanup failed: %s", end_exc)
-                    if cg_stream_ctx is not None:
-                        try:
-                            cg_stream_ctx.__exit__(None, None, None)
-                        except Exception as ctx_exc:
-                            logger.debug("QMC CUDAGraph stream exit cleanup failed: %s", ctx_exc)
+                    raise
+                if cg_fast_d2h_np is not None and cg_pool_lock is not None:
                     cg_pool_lock.release()
                     cg_pool_lock = None
-                    cg_capturing_now = False
-                    cg_obj = None
-                    cg_stream_ctx = None
 
-            z_corr_full_f32: Optional[torch.Tensor] = None
-            z_corr_coarse_f32: Optional[torch.Tensor] = None
-            if (
-                (not cg_capturing_now)
-                and cg_fast_d2h_np is None
-                and use_f32_step1
-                and z_indep_full_f32 is not None
-                and (need_fwd_ckpt or need_spot_bumps or th_chunk_in_step1 or use_mf_cv)
-            ):
-                z_corr_bytes = (m_rem * n_sub + (m_rem if use_mf_cv else 0)) * d_assets * n_total * 4
-                if z_corr_bytes <= 18 * 1024 * 1024:
-                    z_corr_key = ("zcorr_v1", rot_sobol_key, chol_base.tobytes(), bool(use_mf_cv))
-                    zc_hit = _CRN_ZCORR_CACHE.get(z_corr_key)
-                    if (
-                        isinstance(zc_hit, tuple)
-                        and len(zc_hit) == 2
-                        and isinstance(zc_hit[0], torch.Tensor)
-                        and zc_hit[0].device == qmc_device
-                    ):
-                        z_corr_full_f32, z_corr_coarse_f32 = zc_hit
-                    else:
-                        z_corr_full_f32 = torch.matmul(chol_f32_g_cached, z_indep_full_f32)
-                        z_corr_coarse_f32 = (
-                            z_corr_full_f32.view(m_rem, n_sub, d_assets, n_total).sum(dim=1)
-                            if use_mf_cv
-                            else None
-                        )
-                        _CRN_ZCORR_CACHE.put(z_corr_key, (z_corr_full_f32, z_corr_coarse_f32))
+            try:
+                out_flat_g: Optional[torch.Tensor] = (
+                    torch.zeros((tot_out_el,), dtype=torch.float64, device=qmc_device)
+                    if (tot_out_el > 0 and cg_fast_d2h_np is None)
+                    else None
+                )
 
-            single_chunk = bool(eff_r <= r_chunk)
-            inv_sqrt_nsub_val = 1.0 / math.sqrt(float(n_sub))
-            for r_start in ([] if cg_fast_d2h_np is not None else range(0, eff_r, r_chunk)):
-                r_end = min(eff_r, r_start + r_chunk)
-                r_cnt_c = r_end - r_start
-                n_chunk = r_cnt_c * n_rep
-                w_chunk = float(r_cnt_c) / float(eff_r)
-                z_indep_f32_c = _get_z_indep_chunk_gpu(r_start, r_end, allow_full_cache=(not cg_capturing_now))
+                def _out_view(tag: str) -> Optional[torch.Tensor]:
+                    if out_flat_g is None:
+                        return None
+                    sp_o = pack_spans.get(tag)
+                    if sp_o is None:
+                        return None
+                    return out_flat_g[sp_o[0] : sp_o[1]].view(sp_o[2])
 
-                lx_period_c: Optional[torch.Tensor] = None
-                vib_lx_pre_c: Optional[torch.Tensor] = None
-                vib_j_pre_c: Optional[torch.Tensor] = None
-                vib_sig_pre_c: Optional[torch.Tensor] = None
-                z_corr_c: Optional[torch.Tensor] = None
-                z_corr_f32_mdn_c: Optional[torch.Tensor] = None
-                if use_f32_step1 and (need_fwd_ckpt or need_spot_bumps or th_chunk_in_step1 or use_mf_cv):
-                    if z_corr_full_f32 is not None:
-                        z_corr_f32_mdn_c = (
-                            z_corr_full_f32
-                            if single_chunk
-                            else z_corr_full_f32[:, :, r_start * n_rep : r_end * n_rep].contiguous()
-                        )
-                    else:
-                        z_corr_f32_mdn_c = torch.matmul(chol_f32_g_cached, z_indep_f32_c)
-                    if not (want_chol_aad_sde or use_vibrato_gamma or (need_stage2_aad and not fuse_m_sde)):
-                        del z_indep_f32_c
-                        z_indep_f32_c = dummy_f32_1
+                stage1_rep_g = _out_view("stage1")
+                gpu_eval_pv_g = _out_view("eval_pv")
+                pv_preterm_g = _out_view("preterm")
+                pv_th_fused_g = _out_view("th_fused")
+                h_vib_tot_g = _out_view("h_vib")
+                bar_chol_tot_g = _out_view("bar_chol")
+                bar_sigma_cont_tot_g = _out_view("bar_sigma_cont")
+                bar_lv_tot_g = _out_view("bar_lv")
+                bar_q_tot_g = _out_view("bar_q")
+                bar_ln_fwd_tot_g = _out_view("bar_lnf")
+                bar_cf_wf_tot_g = _out_view("bar_cf_wf")
+                s1_gbm_crn_g = _out_view("s1_gbm_crn")
+                s1_gbm_cheap_g = _out_view("s1_gbm_cheap")
+                cf_surv_gbm_crn_g = _out_view("cf_surv_gbm_crn")
+                cf_surv_gbm_cheap_g = _out_view("cf_surv_gbm_cheap")
+                stat_direct_alias = bool((not dyn_entries) and n_stat_rows > 0 and gpu_eval_pv_g is not None and n_stat_rows == gpu_eval_rows_total)
+                stat_acc_g: Optional[torch.Tensor] = (
+                    gpu_eval_pv_g
+                    if stat_direct_alias
+                    else (torch.zeros((n_stat_rows,), dtype=torch.float64, device=qmc_device) if (n_stat_rows > 0 and cg_fast_d2h_np is None) else None)
+                )
 
-                perf_base_c: Optional[torch.Tensor] = None
-                norm_x_c: Optional[torch.Tensor] = None
-                if need_fwd_ckpt:
-                    lx_period_c = torch.empty((m_rem, d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
-                    if use_vibrato_gamma:
-                        vib_lx_pre_c = torch.empty((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
-                        vib_j_pre_c = torch.empty((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
-                        vib_sig_pre_c = torch.empty((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
-                        vib_j_state_c = (
-                            torch.ones((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
-                            if not fuse_m_sde
-                            else dummy_f32_1
+                if can_cg_qmc and cg_fast_d2h_np is None and out_flat_g is not None and cg_pool_lock is not None:
+                    try:
+                        cg_stream = torch.cuda.Stream(device=qmc_device)  # type: ignore[no-untyped-call]
+                        cg_stream.wait_stream(torch.cuda.current_stream(qmc_device))
+                        with torch.cuda.stream(cg_stream):
+                            _warm_z_cg = _get_z_indep_chunk_gpu(0, min(eff_r, r_chunk), allow_full_cache=False)
+                            if use_f32_step1 and (need_fwd_ckpt or need_spot_bumps or th_chunk_in_step1 or use_mf_cv):
+                                _ = torch.matmul(chol_f32_g_cached, _warm_z_cg)
+                            del _warm_z_cg
+                        cg_stream.synchronize()
+                        torch.cuda.empty_cache()
+                        cg_before_stats_qmc = torch.cuda.memory_stats(qmc_device)
+                        cg_obj = torch.cuda.CUDAGraph()  # type: ignore[no-untyped-call]
+                        cg_stream_ctx = torch.cuda.stream(cg_stream)
+                        cg_stream_ctx.__enter__()
+                        cg_stream_entered = True
+                        cg_obj.capture_begin(
+                            pool=GLOBAL_GPU_CACHE_MANAGER.get_shared_graph_pool(qmc_device),
+                            capture_error_mode="thread_local",
                         )
-                    else:
-                        vib_j_state_c = dummy_f32_1
-                    use_zc_fwd = bool(z_corr_f32_mdn_c is not None)
-                    z_fwd_in = z_corr_f32_mdn_c if z_corr_f32_mdn_c is not None else z_indep_f32_c
-                    if fuse_m_sde:
-                        if use_f32_perf_direct:
-                            perf_base_c = torch.empty((m_rem, d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
-                        _fast_triton_launch(
-                            _qmc_fwd_checkpoint_kernel,
-                            (1, r_cnt_c * d_assets),
-                            z_fwd_in,
-                            dummy_shifts_g,
-                            chol_f32_g_cached,
-                            lv_f32_g_cached,
-                            y_min_f32_g,
-                            inv_dy_f32_g,
-                            t_mid_ptr_g,
-                            dt_sub_ptr_g,
-                            sqrt_dt_ptr_g,
-                            q_shift_mid_ptr_g,
-                            dummy_shifts_g,
-                            dummy_f32_1,
-                            dummy_f32_1,
-                            lx_period_c,
-                            vib_lx_pre_c if vib_lx_pre_c is not None else dummy_f32_1,
-                            vib_j_pre_c if vib_j_pre_c is not None else dummy_f32_1,
-                            vib_sig_pre_c if vib_sig_pre_c is not None else dummy_f32_1,
-                            vib_j_state_c,
-                            fwd_perf_f32_step_g,
-                            perf_base_c if perf_base_c is not None else dummy_f32_1,
-                            inv_dt_f32_val,
-                            d_assets,
-                            m_rem,
-                            1,
-                            vib_period_idx,
-                            vib_sub_idx,
-                            n_rep=n_rep,
-                            n_sub=n_sub,
-                            N_t=lv_nt,
-                            N_y=lv_ny,
-                            BLOCK_N=block_n_sde,
-                            period_idx=0,
-                            FUSE_M=True,
-                            SAVE_VIBRATO=use_vibrato_gamma,
-                            VIB_PERIOD_LEVEL=vib_period_level,
-                            USE_Z_CORR=use_zc_fwd,
-                            EMIT_PERF=use_f32_perf_direct,
-                            num_warps=nw_sde,
-                        )
-                    else:
-                        tile_max_c = torch.empty((r_cnt_c, n_tiles_sde, d_assets), dtype=torch.float32, device=qmc_device)
-                        tile_ex_sum_c = torch.empty((r_cnt_c, n_tiles_sde, d_assets), dtype=torch.float32, device=qmc_device)
-                        for m_cur_s in range(m_rem):
+                        cg_capturing_now = True
+                        out_flat_g.zero_()
+                        if stat_acc_g is not None and (not stat_direct_alias):
+                            stat_acc_g.zero_()
+                    except Exception:
+                        if cg_capturing_now and cg_obj is not None:
+                            try:
+                                cg_capturing_now = False
+                                cg_obj.capture_end()
+                            except Exception as end_exc:
+                                logger.debug("QMC CUDAGraph capture_end cleanup failed: %s", end_exc)
+                        if cg_stream_entered and cg_stream_ctx is not None:
+                            try:
+                                cg_stream_entered = False
+                                cg_stream_ctx.__exit__(None, None, None)
+                            except Exception as ctx_exc:
+                                logger.debug("QMC CUDAGraph stream exit cleanup failed: %s", ctx_exc)
+                        if cg_pool_lock is not None:
+                            cg_pool_lock.release()
+                            cg_pool_lock = None
+                        cg_capturing_now = False
+                        cg_stream_entered = False
+                        cg_obj = None
+                        cg_stream_ctx = None
+
+                z_corr_full_f32: Optional[torch.Tensor] = None
+                z_corr_coarse_f32: Optional[torch.Tensor] = None
+                if (
+                    (not cg_capturing_now)
+                    and cg_fast_d2h_np is None
+                    and use_f32_step1
+                    and z_indep_full_f32 is not None
+                    and (need_fwd_ckpt or need_spot_bumps or th_chunk_in_step1 or use_mf_cv)
+                ):
+                    z_corr_bytes = (m_rem * n_sub + (m_rem if use_mf_cv else 0)) * d_assets * n_total * 4
+                    if z_corr_bytes <= 18 * 1024 * 1024:
+                        z_corr_key = ("zcorr_v1", rot_sobol_key, chol_base.tobytes(), bool(use_mf_cv))
+                        zc_hit = _CRN_ZCORR_CACHE.get(z_corr_key)
+                        if (
+                            isinstance(zc_hit, tuple)
+                            and len(zc_hit) == 2
+                            and isinstance(zc_hit[0], torch.Tensor)
+                            and zc_hit[0].device == qmc_device
+                        ):
+                            z_corr_full_f32, z_corr_coarse_f32 = zc_hit
+                        else:
+                            z_corr_full_f32 = torch.matmul(chol_f32_g_cached, z_indep_full_f32)
+                            z_corr_coarse_f32 = (
+                                z_corr_full_f32.view(m_rem, n_sub, d_assets, n_total).sum(dim=1)
+                                if use_mf_cv
+                                else None
+                            )
+                            _CRN_ZCORR_CACHE.put(z_corr_key, (z_corr_full_f32, z_corr_coarse_f32))
+
+                single_chunk = bool(eff_r <= r_chunk)
+                inv_sqrt_nsub_val = 1.0 / math.sqrt(float(n_sub))
+                for r_start in ([] if cg_fast_d2h_np is not None else range(0, eff_r, r_chunk)):
+                    r_end = min(eff_r, r_start + r_chunk)
+                    r_cnt_c = r_end - r_start
+                    n_chunk = r_cnt_c * n_rep
+                    w_chunk = float(r_cnt_c) / float(eff_r)
+                    z_indep_f32_c = _get_z_indep_chunk_gpu(r_start, r_end, allow_full_cache=(not cg_capturing_now))
+
+                    lx_period_c: Optional[torch.Tensor] = None
+                    vib_lx_pre_c: Optional[torch.Tensor] = None
+                    vib_j_pre_c: Optional[torch.Tensor] = None
+                    vib_sig_pre_c: Optional[torch.Tensor] = None
+                    z_corr_c: Optional[torch.Tensor] = None
+                    z_corr_f32_mdn_c: Optional[torch.Tensor] = None
+                    if use_f32_step1 and (need_fwd_ckpt or need_spot_bumps or th_chunk_in_step1 or use_mf_cv):
+                        if z_corr_full_f32 is not None:
+                            z_corr_f32_mdn_c = (
+                                z_corr_full_f32
+                                if single_chunk
+                                else z_corr_full_f32[:, :, r_start * n_rep : r_end * n_rep].contiguous()
+                            )
+                        else:
+                            z_corr_f32_mdn_c = torch.matmul(chol_f32_g_cached, z_indep_f32_c)
+                        if not (want_chol_aad_sde or use_vibrato_gamma or (need_stage2_aad and not fuse_m_sde)):
+                            del z_indep_f32_c
+                            z_indep_f32_c = dummy_f32_1
+
+                    perf_base_c: Optional[torch.Tensor] = None
+                    norm_x_c: Optional[torch.Tensor] = None
+                    if need_fwd_ckpt:
+                        lx_period_c = torch.empty((m_rem, d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
+                        if use_vibrato_gamma:
+                            vib_lx_pre_c = torch.empty((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
+                            vib_j_pre_c = torch.empty((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
+                            vib_sig_pre_c = torch.empty((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
+                            vib_j_state_c = (
+                                torch.ones((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
+                                if not fuse_m_sde
+                                else dummy_f32_1
+                            )
+                        else:
+                            vib_j_state_c = dummy_f32_1
+                        use_zc_fwd = bool(z_corr_f32_mdn_c is not None)
+                        z_fwd_in = z_corr_f32_mdn_c if z_corr_f32_mdn_c is not None else z_indep_f32_c
+                        if fuse_m_sde:
+                            if use_f32_perf_direct:
+                                perf_base_c = torch.empty((m_rem, d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
                             _fast_triton_launch(
                                 _qmc_fwd_checkpoint_kernel,
-                                (n_tiles_sde, r_cnt_c * d_assets),
+                                (1, r_cnt_c * d_assets),
                                 z_fwd_in,
                                 dummy_shifts_g,
                                 chol_f32_g_cached,
@@ -11847,19 +11807,19 @@ def compute_qmc_aad_crn_greeks(
                                 sqrt_dt_ptr_g,
                                 q_shift_mid_ptr_g,
                                 dummy_shifts_g,
-                                tile_max_c,
-                                tile_ex_sum_c,
+                                dummy_f32_1,
+                                dummy_f32_1,
                                 lx_period_c,
                                 vib_lx_pre_c if vib_lx_pre_c is not None else dummy_f32_1,
                                 vib_j_pre_c if vib_j_pre_c is not None else dummy_f32_1,
                                 vib_sig_pre_c if vib_sig_pre_c is not None else dummy_f32_1,
                                 vib_j_state_c,
                                 fwd_perf_f32_step_g,
-                                dummy_f32_1,
+                                perf_base_c if perf_base_c is not None else dummy_f32_1,
                                 inv_dt_f32_val,
                                 d_assets,
                                 m_rem,
-                                n_tiles_sde,
+                                1,
                                 vib_period_idx,
                                 vib_sub_idx,
                                 n_rep=n_rep,
@@ -11867,680 +11827,120 @@ def compute_qmc_aad_crn_greeks(
                                 N_t=lv_nt,
                                 N_y=lv_ny,
                                 BLOCK_N=block_n_sde,
-                                period_idx=m_cur_s,
-                                FUSE_M=False,
+                                period_idx=0,
+                                FUSE_M=True,
                                 SAVE_VIBRATO=use_vibrato_gamma,
                                 VIB_PERIOD_LEVEL=vib_period_level,
                                 USE_Z_CORR=use_zc_fwd,
-                                EMIT_PERF=False,
+                                EMIT_PERF=use_f32_perf_direct,
                                 num_warps=nw_sde,
                             )
-                            m_gmax = tile_max_c.max(dim=1, keepdim=True).values
-                            ex_sum_rep = (tile_ex_sum_c * torch.exp(tile_max_c - m_gmax)).sum(dim=1, keepdim=True)
-                            log_m_c = (m_gmax + torch.log((ex_sum_rep / float(n_rep)).clamp(min=1e-30))).squeeze(1).T.unsqueeze(-1)
-                            lx_view_m = lx_period_c[m_cur_s].view(d_assets, r_cnt_c, n_rep)
-                            lx_view_m.sub_(log_m_c)
-                            if use_vibrato_gamma:
-                                omega_m = torch.exp(lx_view_m) / float(n_rep)
-                                j_dev_m = vib_j_state_c.view(d_assets, r_cnt_c, n_rep) - 1.0
-                                vib_j_state_c.copy_((1.0 + (j_dev_m - (omega_m * j_dev_m).sum(dim=2, keepdim=True))).reshape(d_assets, n_chunk))
-                        del tile_max_c, tile_ex_sum_c
-                    del vib_j_state_c
-                    if perf_base_c is None:
-                        if need_norm_x_kept:
-                            norm_x_c = torch.exp(lx_period_c.to(dtype=torch.float64)).transpose(0, 1).contiguous()
-                            perf_base_c = (norm_x_c * fwd_perf_g.unsqueeze(-1)).permute(1, 0, 2).contiguous()
                         else:
-                            perf_base_c = (torch.exp(lx_period_c.to(dtype=torch.float64)) * fwd_perf_g.T.unsqueeze(-1)).contiguous()
-                    if not need_stage2_aad:
-                        del lx_period_c
-                        lx_period_c = None
-                else:
-                    z_corr_c = torch.matmul(
-                        chol_f64_g,
-                        z_indep_f32_c.to(dtype=torch.float64).permute(1, 0, 2).reshape(d_assets, -1),
-                    ).view(d_assets, m_rem, n_sub, n_chunk).contiguous()
-                    lv_step_in = torch.as_tensor(base_lv_tables, dtype=torch.float64, device=qmc_device).contiguous()
-                    norm_x_c = _gpu_step_1d_f64(
-                        lv_step_in,
-                        z_corr_c,
-                        tau_step_g[:m_rem],
-                        rn_step_g[: d_assets * m_rem].view(d_assets, m_rem),
-                        rt_step_g[: d_assets * m_rem].view(d_assets, m_rem),
-                        2,
-                        meta_lv_t=id_d_g,
-                        meta_r_t=id_d_g,
-                        meta_z_t=id_d_g,
-                    )
-                    del lv_step_in
-                    perf_base_c = (norm_x_c * fwd_perf_g.unsqueeze(-1)).permute(1, 0, 2).contiguous()
-                    if not need_norm_x_kept:
-                        del norm_x_c
-                        norm_x_c = None
-
-                assert perf_base_c is not None
-
-                # Evaluate Stage-1 & Stage-2 payoff adjoints + Continuous KI probabilities for this chunk.
-                i_ki_ext_c: Optional[torch.Tensor] = None
-                if is_cont_ki_active and (need_stage2_aad or emit_stage1_gpu or gpu_eval_rows_total > 0):
-                    s1_c_box: List[torch.Tensor] = []
-                    iki_c_box: List[torch.Tensor] = []
-                    cg_c_box: List[torch.Tensor] = []
-                    bar_lx_post_c, bar_ln_fwd_c, bar_lv_cont_c = _compute_payoff_aad_state_adjoints_torch(
-                        perf_base_c,
-                        ko_barriers=gpu_meta["ko"],
-                        is_callable=gpu_meta["is_call"],
-                        cpn_barriers=gpu_meta["cpn"],
-                        is_guar=gpu_meta["is_guar"],
-                        cpn_rates=gpu_meta["cpn_rates"],
-                        df_pay=gpu_meta["df_pay"],
-                        w_fund=gpu_meta["w_fund"],
-                        inv_perm=inv_perm,
-                        call_code=call_code,
-                        cpn_code=cpn_code,
-                        opt_code=opt_code,
-                        ko_spread=ko_spread,
-                        cpn_spread=cpn_spread,
-                        ki_spread=ki_spread,
-                        cpn_dir_down=dir_down,
-                        cpn_type_out=type_out,
-                        is_memory=is_memory,
-                        force_cpn_ac=force_cpn_ac,
-                        no_notional=no_notional,
-                        is_long_basket=is_long_flag,
-                        has_ki=has_ki,
-                        ki_barrier=b_ki,
-                        i_ki_past=float(state.i_ki_past),
-                        ki_monitoring_type=ki_monitoring_type,
-                        tau_obs=tau_obs_np,
-                        vol_atm_obs=vol_atm_obs,
-                        strike=k_put,
-                        lower_strike=state.lower_strike,
-                        option_gearing=float(state.option_gearing),
-                        ac_cpn=float(state.autocall_coupon),
-                        c_mem_0=float(state.c_mem_0),
-                        part_call_strike=state.participation_call_strike,
-                        part_call_rate=part_call_rate,
-                        one_star_strike=(k_os if k_os > 0.0 else state.one_star_strike),
-                        one_star_coupon=os_cpn,
-                        one_star_eps=one_star_eps,
-                        barrier_eps_min=barrier_eps_min,
-                        barrier_eps_max=barrier_eps_max,
-                        lv_tables_t=lv_f32_g_cached,
-                        corr_t=gpu_meta["corr"],
-                        fwd_perf_t=fwd_perf_g,
-                        y_min=lv_y_min_vec,
-                        y_max=lv_y_max_vec,
-                        n_sub=n_sub,
-                        corr_grad_out=cg_c_box if (want_cega and d_assets > 1) else None,
-                        n_rep=n_rep,
-                        emit_stage1=emit_stage1_gpu,
-                        out_stage1_rep=s1_c_box,
-                        compute_grads=need_stage2_aad,
-                        out_i_ki_ext=iki_c_box,
-                    )
-                    i_ki_ext_c = iki_c_box[0] if iki_c_box else None
-                    if stage1_rep_g is not None and s1_c_box:
-                        stage1_rep_g[r_start:r_end] = s1_c_box[0]
-                    if bar_ln_fwd_tot_g is not None:
-                        bar_ln_fwd_tot_g += w_chunk * bar_ln_fwd_c
-                    if bar_lv_tot_g is not None and bar_lv_cont_c is not None:
-                        bar_lv_tot_g += w_chunk * bar_lv_cont_c
-                    if bar_sigma_cont_tot_g is not None and cg_c_box:
-                        bar_sigma_cont_tot_g += w_chunk * cg_c_box[0]
-                elif use_triton_aad_s2 and (need_stage2_aad or emit_stage1_gpu):
-                    s1_chunk_g = (
-                        stage1_rep_g[r_start:r_end]
-                        if stage1_rep_g is not None
-                        else None
-                    )
-                    bar_lx_post_c, bar_ln_fwd_c, bar_cf_wf_c = _compute_payoff_aad_state_adjoints_triton(
-                        perf_base_c,
-                        ko_barriers=gpu_meta["ko"],
-                        is_callable=gpu_meta["is_call"],
-                        cpn_barriers=gpu_meta["cpn"],
-                        is_guar=gpu_meta["is_guar"],
-                        cpn_rates=gpu_meta["cpn_rates"],
-                        df_pay=gpu_meta["df_pay"],
-                        w_fund=gpu_meta["w_fund"],
-                        inv_perm_g=gpu_meta["inv_perm"],
-                        payoff_f64_g=gpu_meta["payoff_f64"],
-                        call_code=call_code,
-                        cpn_code=cpn_code,
-                        eff_opt_code=eff_opt_code_s2,
-                        cpn_dir_down=dir_down,
-                        cpn_type_out=type_out,
-                        is_memory=is_memory,
-                        force_cpn_ac=force_cpn_ac,
-                        no_notional=no_notional,
-                        is_long_basket=is_long_flag,
-                        has_ki=has_ki,
-                        ki_barrier=b_ki,
-                        i_ki_past=float(state.i_ki_past),
-                        has_one_star=bool(k_os > 0.0),
-                        tau_obs=tau_obs_np,
-                        vol_atm_obs=vol_atm_obs,
-                        barrier_eps_min=barrier_eps_min,
-                        barrier_eps_max=barrier_eps_max,
-                        compute_cf_wf=want_cf_wf_aad,
-                        eps_g_cached=eps_aad_g,
-                        n_rep=n_rep,
-                        has_lower_strike=has_lower_strike_flag,
-                        has_part_call=has_part_call_flag,
-                        emit_stage1=emit_stage1_gpu,
-                        out_stage1_rep_g=s1_chunk_g,
-                    )
-                    if bar_ln_fwd_tot_g is not None:
-                        if single_chunk:
-                            bar_ln_fwd_tot_g.copy_(bar_ln_fwd_c)
-                        else:
-                            bar_ln_fwd_tot_g += w_chunk * bar_ln_fwd_c
-                    if bar_cf_wf_tot_g is not None and bar_cf_wf_c is not None:
-                        if single_chunk:
-                            bar_cf_wf_tot_g.copy_(bar_cf_wf_c)
-                        else:
-                            bar_cf_wf_tot_g += w_chunk * bar_cf_wf_c
-                    if not need_stage2_aad:
-                        del bar_lx_post_c
-                        bar_lx_post_c = None
-                else:
-                    bar_lx_post_c = None
-
-                # Backpropagate bar_lx_post_c through rematerialized Platen substeps using parallel period shards.
-                if need_stage2_aad and bar_lx_post_c is not None and lx_period_c is not None:
-                    bar_q_c = (
-                        torch.zeros((d_assets, n_steps_tot_g), dtype=torch.float32, device=qmc_device)
-                        if want_q_aad_sde
-                        else dummy_f32_1
-                    )
-                    if fuse_m_sde:
-                        bar_lv_f32_c = (
-                            torch.zeros((d_assets, lv_nt, lv_ny), dtype=torch.float32, device=qmc_device)
-                            if want_lv_aad_sde
-                            else dummy_f32_1
-                        )
-                        bar_zc_c = (
-                            torch.empty(
-                                (n_steps_tot_g, d_assets, n_chunk),
-                                dtype=torch.float32,
-                                device=qmc_device,
-                            )
-                            if want_chol_aad_sde
-                            else dummy_f32_1
-                        )
-                        use_zc_bwd = bool(z_corr_f32_mdn_c is not None)
-                        z_bwd_prop_in = z_corr_f32_mdn_c if z_corr_f32_mdn_c is not None else z_indep_f32_c
-                        _fast_triton_launch(
-                            _qmc_bwd_state_prop_kernel,
-                            (1, r_cnt_c * d_assets),
-                            z_bwd_prop_in,
-                            chol_f32_g_cached,
-                            lv_f32_g_cached,
-                            y_min_f32_g,
-                            inv_dy_f32_g,
-                            t_mid_ptr_g,
-                            dt_sub_ptr_g,
-                            sqrt_dt_ptr_g,
-                            q_shift_mid_ptr_g,
-                            bar_lx_post_c,
-                            lx_period_c,
-                            dummy_f32_1,
-                            inv_dt_f32_val,
-                            d_assets,
-                            m_rem,
-                            n_rep=n_rep,
-                            n_sub=n_sub,
-                            N_t=lv_nt,
-                            N_y=lv_ny,
-                            BLOCK_N=block_n_sde,
-                            USE_Z_CORR=use_zc_bwd,
-                            num_warps=nw_sde,
-                        )
-                        if want_lv_aad_sde or want_chol_aad_sde or want_q_aad_sde:
-                            bwd_bn_cap = int(os.environ.get("DEEPVOL_BWD_BN", "128"))
-                            bwd_nw = int(os.environ.get("DEEPVOL_BWD_NW", "4"))
-                            block_p2_sde = min(bwd_bn_cap, max(32, _next_power_of_two_int(n_rep)))
-                            n_tiles_p2_sde = (n_rep + block_p2_sde - 1) // block_p2_sde
-                            _fast_triton_launch(
-                                _qmc_bwd_period_scatter_kernel,
-                                (n_tiles_p2_sde, m_rem * r_cnt_c * d_assets),
-                                z_indep_f32_c,
-                                z_bwd_prop_in,
-                                chol_f32_g_cached,
-                                lv_f32_g_cached,
-                                y_min_f32_g,
-                                inv_dy_f32_g,
-                                t_mid_ptr_g,
-                                dt_sub_ptr_g,
-                                sqrt_dt_ptr_g,
-                                q_shift_mid_ptr_g,
-                                bar_lx_post_c,
-                                lx_period_c,
-                                bar_lv_f32_c,
-                                bar_zc_c,
-                                bar_q_c,
-                                inv_dt_f32_val,
-                                d_assets,
-                                m_rem,
-                                r_cnt_c,
-                                n_rep=n_rep,
-                                n_sub=n_sub,
-                                N_t=lv_nt,
-                                N_y=lv_ny,
-                                BLOCK_N=block_p2_sde,
-                                N_LV_SHARDS=1,
-                                COMPUTE_LV_AAD=want_lv_aad_sde,
-                                COMPUTE_CHOL_AAD=want_chol_aad_sde,
-                                COMPUTE_Q_AAD=want_q_aad_sde,
-                                USE_Z_CORR=use_zc_bwd,
-                                num_warps=bwd_nw,
-                            )
-                        if want_lv_aad_sde and bar_lv_tot_g is not None:
-                            if single_chunk and (not is_cont_ki_active):
-                                bar_lv_tot_g.copy_(bar_lv_f32_c)
-                            else:
-                                bar_lv_tot_g += w_chunk * bar_lv_f32_c.to(dtype=torch.float64)
-                        if want_chol_aad_sde and bar_chol_tot_g is not None:
-                            if single_chunk:
-                                torch.sum(
-                                    torch.bmm(bar_zc_c, z_indep_f32_c.transpose(1, 2)),
-                                    dim=0,
-                                    dtype=torch.float64,
-                                    out=bar_chol_tot_g,
+                            tile_max_c = torch.empty((r_cnt_c, n_tiles_sde, d_assets), dtype=torch.float32, device=qmc_device)
+                            tile_ex_sum_c = torch.empty((r_cnt_c, n_tiles_sde, d_assets), dtype=torch.float32, device=qmc_device)
+                            for m_cur_s in range(m_rem):
+                                _fast_triton_launch(
+                                    _qmc_fwd_checkpoint_kernel,
+                                    (n_tiles_sde, r_cnt_c * d_assets),
+                                    z_fwd_in,
+                                    dummy_shifts_g,
+                                    chol_f32_g_cached,
+                                    lv_f32_g_cached,
+                                    y_min_f32_g,
+                                    inv_dy_f32_g,
+                                    t_mid_ptr_g,
+                                    dt_sub_ptr_g,
+                                    sqrt_dt_ptr_g,
+                                    q_shift_mid_ptr_g,
+                                    dummy_shifts_g,
+                                    tile_max_c,
+                                    tile_ex_sum_c,
+                                    lx_period_c,
+                                    vib_lx_pre_c if vib_lx_pre_c is not None else dummy_f32_1,
+                                    vib_j_pre_c if vib_j_pre_c is not None else dummy_f32_1,
+                                    vib_sig_pre_c if vib_sig_pre_c is not None else dummy_f32_1,
+                                    vib_j_state_c,
+                                    fwd_perf_f32_step_g,
+                                    dummy_f32_1,
+                                    inv_dt_f32_val,
+                                    d_assets,
+                                    m_rem,
+                                    n_tiles_sde,
+                                    vib_period_idx,
+                                    vib_sub_idx,
+                                    n_rep=n_rep,
+                                    n_sub=n_sub,
+                                    N_t=lv_nt,
+                                    N_y=lv_ny,
+                                    BLOCK_N=block_n_sde,
+                                    period_idx=m_cur_s,
+                                    FUSE_M=False,
+                                    SAVE_VIBRATO=use_vibrato_gamma,
+                                    VIB_PERIOD_LEVEL=vib_period_level,
+                                    USE_Z_CORR=use_zc_fwd,
+                                    EMIT_PERF=False,
+                                    num_warps=nw_sde,
                                 )
+                                m_gmax = tile_max_c.max(dim=1, keepdim=True).values
+                                ex_sum_rep = (tile_ex_sum_c * torch.exp(tile_max_c - m_gmax)).sum(dim=1, keepdim=True)
+                                log_m_c = (m_gmax + torch.log((ex_sum_rep / float(n_rep)).clamp(min=1e-30))).squeeze(1).T.unsqueeze(-1)
+                                lx_view_m = lx_period_c[m_cur_s].view(d_assets, r_cnt_c, n_rep)
+                                lx_view_m.sub_(log_m_c)
+                                if use_vibrato_gamma:
+                                    omega_m = torch.exp(lx_view_m) / float(n_rep)
+                                    j_dev_m = vib_j_state_c.view(d_assets, r_cnt_c, n_rep) - 1.0
+                                    vib_j_state_c.copy_((1.0 + (j_dev_m - (omega_m * j_dev_m).sum(dim=2, keepdim=True))).reshape(d_assets, n_chunk))
+                            del tile_max_c, tile_ex_sum_c
+                        del vib_j_state_c
+                        if perf_base_c is None:
+                            if need_norm_x_kept:
+                                norm_x_c = torch.exp(lx_period_c.to(dtype=torch.float64)).transpose(0, 1).contiguous()
+                                perf_base_c = (norm_x_c * fwd_perf_g.unsqueeze(-1)).permute(1, 0, 2).contiguous()
                             else:
-                                bar_chol_tot_g += w_chunk * torch.bmm(
-                                    bar_zc_c, z_indep_f32_c.transpose(1, 2)
-                                ).sum(dim=0, dtype=torch.float64)
-                        del bar_lv_f32_c, bar_zc_c
+                                perf_base_c = (torch.exp(lx_period_c.to(dtype=torch.float64)) * fwd_perf_g.T.unsqueeze(-1)).contiguous()
+                        if not need_stage2_aad:
+                            del lx_period_c
+                            lx_period_c = None
                     else:
-                        bar_lv_f32_c = (
-                            torch.zeros((d_assets, lv_nt, lv_ny), dtype=torch.float32, device=qmc_device)
-                            if want_lv_aad_sde
-                            else torch.empty((1,), dtype=torch.float32, device=qmc_device)
-                        )
-                        bar_chol_c = (
-                            torch.zeros((d_assets, d_assets), dtype=torch.float32, device=qmc_device)
-                            if want_chol_aad_sde
-                            else torch.empty((1,), dtype=torch.float32, device=qmc_device)
-                        )
-                        bar_x_c = torch.zeros((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
-                        for p_cur_s in range(m_rem - 1, -1, -1):
-                            bar_tot_p = (bar_x_c + bar_lx_post_c[p_cur_s]).view(d_assets, r_cnt_c, n_rep)
-                            omega_p = torch.exp(lx_period_c[p_cur_s].view(d_assets, r_cnt_c, n_rep)) / float(n_rep)
-                            bar_x_c = (bar_tot_p - omega_p * bar_tot_p.sum(dim=2, keepdim=True)).reshape(d_assets, n_chunk).contiguous()
-                            _fast_triton_launch(
-                                _qmc_bwd_sde_aad_kernel,
-                                (n_tiles_sde, r_cnt_c * d_assets),
-                                z_indep_f32_c,
-                                dummy_shifts_g,
-                                chol_f32_g_cached,
-                                lv_f32_g_cached,
-                                y_min_f32_g,
-                                inv_dy_f32_g,
-                                t_mid_ptr_g,
-                                dt_sub_ptr_g,
-                                sqrt_dt_ptr_g,
-                                q_shift_mid_ptr_g,
-                                bar_x_c,
-                                bar_lx_post_c,
-                                lx_period_c,
-                                bar_lv_f32_c,
-                                bar_chol_c,
-                                bar_q_c,
-                                inv_dt_f32_val,
-                                d_assets,
-                                m_rem,
-                                n_rep=n_rep,
-                                n_sub=n_sub,
-                                N_t=lv_nt,
-                                N_y=lv_ny,
-                                BLOCK_N=block_n_sde,
-                                period_idx=p_cur_s,
-                                FUSE_M=False,
-                                COMPUTE_LV_AAD=want_lv_aad_sde,
-                                COMPUTE_CHOL_AAD=want_chol_aad_sde,
-                                COMPUTE_Q_AAD=want_q_aad_sde,
-                                ATOM_SHARDS=1,
-                                num_warps=nw_sde,
-                            )
-                        del bar_x_c
-                        if want_lv_aad_sde and bar_lv_tot_g is not None:
-                            bar_lv_tot_g += w_chunk * bar_lv_f32_c.to(dtype=torch.float64)
-                        if want_chol_aad_sde and bar_chol_tot_g is not None:
-                            bar_chol_tot_g += w_chunk * bar_chol_c.to(dtype=torch.float64)
-                        del bar_lv_f32_c, bar_chol_c
-                    if want_q_aad_sde and bar_q_tot_g is not None:
-                        bar_q_tot_g += w_chunk * bar_q_c.to(dtype=torch.float64)
-                    del bar_q_c
-                if bar_lx_post_c is not None:
-                    del bar_lx_post_c
-                if lx_period_c is not None:
-                    del lx_period_c
-
-                # Compute Antithetic Cholesky Vibrato Gamma + frozen terminal state in chunk memory.
-                frozen_term_c: Optional[torch.Tensor] = None
-                if use_vibrato_gamma:
-                    assert vib_lx_pre_c is not None and vib_j_pre_c is not None and vib_sig_pre_c is not None
-                    assert l_inv_t_g is not None and c_inv_g is not None and cdl_m_g is not None and cdl2_last_g is not None
-                    assert h_vib_tot_g is not None
-                    block_nv = min(128, max(32, _next_power_of_two_int(n_chunk)))
-                    grid_nv = (n_chunk + block_nv - 1) // block_nv
-                    use_f32_vib_pre = bool(os.environ.get("DEEPVOL_VIB_F32", "1") == "1")
-                    d_ln_surv_tmp_c = torch.empty(
-                        ((2 * d_assets if is_memory else d_assets), n_chunk),
-                        dtype=torch.float32 if use_f32_vib_pre else torch.float64,
-                        device=qmc_device,
-                    )
-                    h_vib_out_c = torch.empty((grid_nv, d_assets, d_assets), dtype=torch.float64, device=qmc_device)
-                    if m_rem > 1:
-                        frozen_term_c = torch.empty((4, n_chunk), dtype=torch.float64, device=qmc_device)
-                    _fast_triton_launch(
-                        _vibrato_gamma_f64_kernel,
-                        (grid_nv,),
-                        perf_base_c,
-                        vib_lx_pre_c,
-                        vib_j_pre_c,
-                        vib_sig_pre_c,
-                        z_indep_f32_c,
-                        chol_f64_g,
-                        l_inv_t_g,
-                        c_inv_g,
-                        fwd_perf_g[:, m_rem - 1].contiguous(),
-                        cdl_m_g,
-                        cdl2_last_g,
-                        gpu_meta["ko"],
-                        gpu_meta["is_call"],
-                        gpu_meta["cpn"],
-                        gpu_meta["is_guar"],
-                        gpu_meta["cpn_rates"],
-                        eps_aad_g,
-                        gpu_meta["inv_perm"],
-                        gpu_meta["payoff_f64"],
-                        d_ln_surv_tmp_c,
-                        frozen_term_c,
-                        h_vib_out_c,
-                        df_last_val,
-                        h_vib_val,
-                        vib_step_start,
-                        vib_n_steps,
-                        d_assets,
-                        m_rem,
-                        n_chunk,
-                        CALL_CODE=call_code,
-                        CPN_CODE=cpn_code,
-                        EFF_OPT_CODE=eff_opt_code_s2,
-                        HAS_KI=has_ki,
-                        KI_ACTIVE=bool(has_ki and b_ki > 0.0 and float(state.i_ki_past) < 0.5),
-                        HAS_ONE_STAR=bool(k_os > 0.0),
-                        IS_MEM=is_memory,
-                        IS_LONG=is_long_flag,
-                        NO_NOTIONAL=no_notional,
-                        FORCE_CPN_AC=force_cpn_ac,
-                        CPN_DIR_DOWN=dir_down,
-                        CPN_TYPE_OUT=type_out,
-                        HAS_LOWER_STRIKE=has_lower_strike_flag,
-                        HAS_PART_CALL=has_part_call_flag,
-                        BLOCK_N=block_nv,
-                        USE_F32_PRE=use_f32_vib_pre,
-                        num_warps=4,
-                    )
-                    if single_chunk:
-                        torch.sum(h_vib_out_c, dim=0, out=h_vib_tot_g)
-                    else:
-                        h_vib_tot_g += w_chunk * h_vib_out_c.sum(dim=0)
-                    del d_ln_surv_tmp_c, h_vib_out_c, vib_lx_pre_c, vib_j_pre_c, vib_sig_pre_c
-
-                if use_mf_cv and s1_gbm_crn_g is not None and chol_scaled_f32_g is not None:
-                    if z_corr_coarse_f32 is not None:
-                        zc_crn_mdn = (
-                            z_corr_coarse_f32
-                            if single_chunk
-                            else z_corr_coarse_f32[:, :, r_start * n_rep : r_end * n_rep].contiguous()
-                        )
-                        _run_mf_gbm_batch(
-                            zc_crn_mdn,
-                            s1_gbm_crn_g[r_start:r_end],
-                            cf_surv_gbm_crn_g[r_start:r_end] if cf_surv_gbm_crn_g is not None else None,
-                            layout_mdn=True,
-                            r_b_ov=r_cnt_c,
-                            n_rep_ov=n_rep,
-                            z_scale_val=inv_sqrt_nsub_val,
-                            pre_zeroed=True,
-                        )
-                    elif z_corr_f32_mdn_c is not None:
-                        zc_crn_mdn = z_corr_f32_mdn_c.view(m_rem, n_sub, d_assets, n_chunk).sum(dim=1)
-                        _run_mf_gbm_batch(
-                            zc_crn_mdn,
-                            s1_gbm_crn_g[r_start:r_end],
-                            cf_surv_gbm_crn_g[r_start:r_end] if cf_surv_gbm_crn_g is not None else None,
-                            layout_mdn=True,
-                            r_b_ov=r_cnt_c,
-                            n_rep_ov=n_rep,
-                            z_scale_val=inv_sqrt_nsub_val,
-                            pre_zeroed=True,
-                        )
-                        del zc_crn_mdn
-                    else:
-                        zc_crn_mean = z_indep_f32_c.view(m_rem, n_sub, d_assets, n_chunk).mean(dim=1)
-                        zc_crn_rmdn = zc_crn_mean.view(m_rem, d_assets, r_cnt_c, n_rep).permute(2, 0, 1, 3)
-                        z_coarse_corr_crn = torch.matmul(chol_scaled_f32_g, zc_crn_rmdn).contiguous()
-                        _run_mf_gbm_batch(
-                            z_coarse_corr_crn,
-                            s1_gbm_crn_g[r_start:r_end],
-                            cf_surv_gbm_crn_g[r_start:r_end] if cf_surv_gbm_crn_g is not None else None,
-                            pre_zeroed=True,
-                        )
-                        del zc_crn_mean, zc_crn_rmdn, z_coarse_corr_crn
-
-                # Convert chunk Z_indep -> Z_corr if spot bumps or Theta need 1D SDE stepping, then drop Z_indep.
-                if (need_spot_bumps or th_chunk_in_step1) and z_corr_c is None and z_corr_f32_mdn_c is None:
-                    zc_dtype = torch.float32 if use_f32_step1 else torch.float64
-                    chol_step = chol_f32_g_cached if use_f32_step1 else chol_f64_g
-                    z_corr_c = torch.matmul(
-                        chol_step,
-                        z_indep_f32_c.to(dtype=zc_dtype).permute(1, 0, 2).reshape(d_assets, -1),
-                    ).view(d_assets, m_rem, n_sub, n_chunk).contiguous()
-                del z_indep_f32_c
-
-                perf_sp_pm_c: Optional[torch.Tensor] = None
-                alt_sp_cg_c: Optional[torch.Tensor] = None
-                if need_spot_bumps:
-                    assert sp_pm_meta_g is not None and lv_sp_pm_g is not None and fwd_sp_pm_g is not None
-                    if z_corr_f32_mdn_c is not None:
-                        perf_sp_pm_c = _gpu_step_1d_f64(
-                            lv_sp_pm_g,
-                            z_corr_f32_mdn_c,
-                            tau_step_g[:m_rem],
-                            rn_step_g[: d_assets * m_rem].view(d_assets, m_rem),
-                            rt_step_g[: d_assets * m_rem].view(d_assets, m_rem),
-                            2,
-                            meta_lv_t=sp_pm_meta_g[0],
-                            meta_r_t=sp_pm_meta_g[1],
-                            meta_z_t=sp_pm_meta_g[2],
-                            z_layout_mdn=True,
-                            fwd_perf_scale_t=fwd_sp_pm_g,
-                            out_mdn=False,
-                            out_f32=use_f32_perf_direct,
-                        )
-                    else:
-                        assert z_corr_c is not None
-                        nx_sp_c = _gpu_step_1d_f64(
-                            lv_sp_pm_g,
+                        z_corr_c = torch.matmul(
+                            chol_f64_g,
+                            z_indep_f32_c.to(dtype=torch.float64).permute(1, 0, 2).reshape(d_assets, -1),
+                        ).view(d_assets, m_rem, n_sub, n_chunk).contiguous()
+                        lv_step_in = torch.as_tensor(base_lv_tables, dtype=torch.float64, device=qmc_device).contiguous()
+                        norm_x_c = _gpu_step_1d_f64(
+                            lv_step_in,
                             z_corr_c,
                             tau_step_g[:m_rem],
                             rn_step_g[: d_assets * m_rem].view(d_assets, m_rem),
                             rt_step_g[: d_assets * m_rem].view(d_assets, m_rem),
                             2,
-                            meta_lv_t=sp_pm_meta_g[0],
-                            meta_r_t=sp_pm_meta_g[1],
-                            meta_z_t=sp_pm_meta_g[2],
-                        )
-                        perf_sp_pm_c = (nx_sp_c * fwd_sp_pm_g.unsqueeze(-1)).contiguous()
-                        del nx_sp_c
-                    if need_sp_cg_alt_g or (pre_pack is not None and not want_gamma):
-                        alt_sp_cg_c = torch.stack(
-                            [
-                                perf_sp_pm_c[:d_assets].permute(1, 0, 2),
-                                perf_sp_pm_c[d_assets:].permute(1, 0, 2),
-                            ],
-                            dim=0,
-                        ).contiguous()
-
-                if stat_pack is not None and stat_acc_g is not None:
-                    stat_mc_c = _run_loo_l2o_eval(
-                        perf_base_c,
-                        perf_sp_pm_c,
-                        perf_sp_pm_c,
-                        np.empty(0, dtype=np.int32),
-                        np.empty(0, dtype=np.int32),
-                        None,
-                        None,
-                        None,
-                        alt_perf=alt_sp_cg_c if need_sp_cg_alt_g else None,
-                        return_gpu=True,
-                        pure_mc=True,
-                        static_gpu_pack=stat_pack,
-                        i_ki_ext_g=i_ki_ext_c,
-                        out_pv_g=stat_acc_g if single_chunk else None,
-                    )
-                    if not single_chunk:
-                        stat_acc_g += w_chunk * stat_mc_c
-
-                if pre_pack is not None and pv_preterm_g is not None and frozen_term_c is not None:
-                    pre_mc_c = _run_loo_l2o_eval(
-                        perf_base_c,
-                        perf_sp_pm_c if want_gamma else None,
-                        perf_sp_pm_c if want_gamma else None,
-                        np.empty(0, dtype=np.int32),
-                        np.empty(0, dtype=np.int32),
-                        None,
-                        None,
-                        None,
-                        alt_perf=alt_sp_cg_c if (not want_gamma) else None,
-                        return_gpu=True,
-                        pure_mc=True,
-                        static_gpu_pack=pre_pack,
-                        eps_vec_g=eps_aad_g,
-                        frozen_term_g=frozen_term_c,
-                        use_c2_preterm=True,
-                        use_frozen_term=True,
-                        out_pv_g=pv_preterm_g if single_chunk else None,
-                    )
-                    if not single_chunk:
-                        pv_preterm_g += w_chunk * pre_mc_c
-
-                if dyn_entries and gpu_eval_pv_g is not None:
-                    assert norm_x_c is not None
-                    for s_r_d, e_r_d, sp_d, df_d_g, wf_d_g in dyn_entries:
-                        nb_d = e_r_d - s_r_d
-                        if sp_d["fwd_alt"] is not None:
-                            fwd_a_g = torch.as_tensor(sp_d["fwd_alt"], dtype=torch.float64, device=qmc_device)
-                            alt_d_c = (norm_x_c.unsqueeze(0) * fwd_a_g.unsqueeze(-1)).permute(0, 2, 1, 3).contiguous()
-                            dyn_mc_c = _run_loo_l2o_eval(
-                                None,
-                                alt_d_c,
-                                None,
-                                np.full(nb_d, -2, dtype=np.int32),
-                                sp_d["ab"],
-                                df_d_g,
-                                wf_d_g,
-                                None,
-                                return_gpu=True,
-                                pure_mc=True,
-                                i_ki_ext_g=i_ki_ext_c,
-                            )
-                            del alt_d_c, fwd_a_g
-                        else:
-                            aa_d_g = torch.as_tensor(sp_d["aa"], dtype=torch.long, device=qmc_device)
-                            fwd_ba_g = torch.as_tensor(sp_d["fwd_ba"], dtype=torch.float64, device=qmc_device)
-                            ba_d_c = (norm_x_c.index_select(0, aa_d_g) * fwd_ba_g[:, :, None]).contiguous()
-                            dyn_mc_c = _run_loo_l2o_eval(
-                                perf_base_c,
-                                ba_d_c,
-                                None,
-                                sp_d["aa"],
-                                sp_d["ab"],
-                                df_d_g,
-                                wf_d_g,
-                                None,
-                                return_gpu=True,
-                                pure_mc=True,
-                                i_ki_ext_g=i_ki_ext_c,
-                            )
-                            del aa_d_g, fwd_ba_g, ba_d_c
-                        gpu_eval_pv_g[s_r_d:e_r_d] += w_chunk * dyn_mc_c
-                if norm_x_c is not None:
-                    del norm_x_c
-                if frozen_term_c is not None:
-                    del frozen_term_c
-                if alt_sp_cg_c is not None:
-                    del alt_sp_cg_c
-                if perf_sp_pm_c is not None:
-                    del perf_sp_pm_c
-                if i_ki_ext_c is not None:
-                    del i_ki_ext_c
-                del perf_base_c
-
-                if th_chunk_in_step1 and th_pack is not None and pv_th_fused_g is not None and th_prep is not None:
-                    assert lv_th_g is not None and fwd_th_g is not None
-                    if z_corr_f32_mdn_c is not None:
-                        z_th_mdn = z_corr_f32_mdn_c if k_cross_g == 0 else z_corr_f32_mdn_c[k_cross_g * n_sub :]
-                        del z_corr_f32_mdn_c
-                        z_corr_f32_mdn_c = None
-                        perf_th_c = _gpu_step_1d_f64(
-                            lv_th_g,
-                            z_th_mdn,
-                            tau_step_g[m_rem:],
-                            rn_step_g[d_assets * m_rem :].view(d_assets, m_rem_th_g),
-                            rt_step_g[d_assets * m_rem :].view(d_assets, m_rem_th_g),
-                            2,
-                            m_periods=m_rem_th_g,
                             meta_lv_t=id_d_g,
                             meta_r_t=id_d_g,
                             meta_z_t=id_d_g,
-                            inv_dt_vec_t=inv_dt_base_g[1:2],
-                            z_layout_mdn=True,
-                            fwd_perf_scale_t=fwd_th_g,
-                            out_mdn=True,
-                            out_f32=use_f32_perf_direct,
                         )
-                        del z_th_mdn
-                    else:
-                        assert z_corr_c is not None
-                        z_th_c = z_corr_c if k_cross_g == 0 else z_corr_c[:, k_cross_g:, :, :].contiguous()
-                        del z_corr_c
-                        z_corr_c = None
-                        nx_th_c = _gpu_step_1d_f64(
-                            lv_th_g,
-                            z_th_c,
-                            tau_step_g[m_rem:],
-                            rn_step_g[d_assets * m_rem :].view(d_assets, m_rem_th_g),
-                            rt_step_g[d_assets * m_rem :].view(d_assets, m_rem_th_g),
-                            2,
-                            m_periods=m_rem_th_g,
-                            meta_lv_t=id_d_g,
-                            meta_r_t=id_d_g,
-                            meta_z_t=id_d_g,
-                            inv_dt_vec_t=inv_dt_base_g[1:2],
-                        )
-                        del z_th_c
-                        perf_th_c = (nx_th_c * fwd_th_g.unsqueeze(-1)).permute(1, 0, 2).contiguous()
-                        del nx_th_c
-                    i_ki_th_c: Optional[torch.Tensor] = None
-                    if is_cont_ki_active:
-                        assert df_th_g is not None and ko_th_g is not None and ic_th_g is not None
-                        assert cp_th_g is not None and ig_th_g is not None and cr_th_g is not None
-                        iki_th_box: List[torch.Tensor] = []
-                        _compute_payoff_aad_state_adjoints_torch(
-                            perf_th_c,
-                            ko_barriers=ko_th_g,
-                            is_callable=ic_th_g,
-                            cpn_barriers=cp_th_g,
-                            is_guar=ig_th_g,
-                            cpn_rates=cr_th_g,
-                            df_pay=df_th_g[0],
-                            w_fund=wf_th_g[0] if wf_th_g is not None else None,
+                        del lv_step_in
+                        perf_base_c = (norm_x_c * fwd_perf_g.unsqueeze(-1)).permute(1, 0, 2).contiguous()
+                        if not need_norm_x_kept:
+                            del norm_x_c
+                            norm_x_c = None
+
+                    assert perf_base_c is not None
+
+                    # Evaluate Stage-1 & Stage-2 payoff adjoints + Continuous KI probabilities for this chunk.
+                    i_ki_ext_c: Optional[torch.Tensor] = None
+                    if is_cont_ki_active and (need_stage2_aad or emit_stage1_gpu or gpu_eval_rows_total > 0):
+                        s1_c_box: List[torch.Tensor] = []
+                        iki_c_box: List[torch.Tensor] = []
+                        cg_c_box: List[torch.Tensor] = []
+                        bar_lx_post_c, bar_ln_fwd_c, bar_lv_cont_c = _compute_payoff_aad_state_adjoints_torch(
+                            perf_base_c,
+                            ko_barriers=gpu_meta["ko"],
+                            is_callable=gpu_meta["is_call"],
+                            cpn_barriers=gpu_meta["cpn"],
+                            is_guar=gpu_meta["is_guar"],
+                            cpn_rates=gpu_meta["cpn_rates"],
+                            df_pay=gpu_meta["df_pay"],
+                            w_fund=gpu_meta["w_fund"],
                             inv_perm=inv_perm,
                             call_code=call_code,
                             cpn_code=cpn_code,
@@ -12556,15 +11956,15 @@ def compute_qmc_aad_crn_greeks(
                             is_long_basket=is_long_flag,
                             has_ki=has_ki,
                             ki_barrier=b_ki,
-                            i_ki_past=float(th_prep["eff_iki"]),
+                            i_ki_past=float(state.i_ki_past),
                             ki_monitoring_type=ki_monitoring_type,
-                            tau_obs=th_prep["tau_obs"],
-                            vol_atm_obs=vol_atm_obs[:, k_cross_g:] if vol_atm_obs is not None else None,
+                            tau_obs=tau_obs_np,
+                            vol_atm_obs=vol_atm_obs,
                             strike=k_put,
                             lower_strike=state.lower_strike,
                             option_gearing=float(state.option_gearing),
                             ac_cpn=float(state.autocall_coupon),
-                            c_mem_0=float(th_prep["eff_cmem"]),
+                            c_mem_0=float(state.c_mem_0),
                             part_call_strike=state.participation_call_strike,
                             part_call_rate=part_call_rate,
                             one_star_strike=(k_os if k_os > 0.0 else state.one_star_strike),
@@ -12572,116 +11972,723 @@ def compute_qmc_aad_crn_greeks(
                             one_star_eps=one_star_eps,
                             barrier_eps_min=barrier_eps_min,
                             barrier_eps_max=barrier_eps_max,
-                            lv_tables_t=lv_th_g,
+                            lv_tables_t=lv_f32_g_cached,
                             corr_t=gpu_meta["corr"],
-                            fwd_perf_t=fwd_th_g,
+                            fwd_perf_t=fwd_perf_g,
                             y_min=lv_y_min_vec,
                             y_max=lv_y_max_vec,
                             n_sub=n_sub,
+                            corr_grad_out=cg_c_box if (want_cega and d_assets > 1) else None,
                             n_rep=n_rep,
-                            emit_stage1=False,
-                            compute_grads=False,
-                            out_i_ki_ext=iki_th_box,
+                            emit_stage1=emit_stage1_gpu,
+                            out_stage1_rep=s1_c_box,
+                            compute_grads=need_stage2_aad,
+                            out_i_ki_ext=iki_c_box,
                         )
-                        i_ki_th_c = iki_th_box[0] if iki_th_box else None
-                    th_mc_c = _run_loo_l2o_eval(
-                        perf_th_c,
-                        None,
-                        None,
-                        np.empty(0, dtype=np.int32),
-                        np.empty(0, dtype=np.int32),
-                        None,
-                        None,
-                        None,
-                        return_gpu=True,
-                        pure_mc=True,
-                        static_gpu_pack=th_pack,
-                        m_periods=m_rem_th_g,
-                        ko_ov=ko_th_g,
-                        is_call_ov=ic_th_g,
-                        cpn_ov=cp_th_g,
-                        is_guar_ov=ig_th_g,
-                        cpn_rates_ov=cr_th_g,
-                        payoff_f64_ov=payoff_th_g,
-                        eps_vec_g=eps_th_g,
-                        i_ki_ext_g=i_ki_th_c,
-                        out_pv_g=pv_th_fused_g if single_chunk else None,
-                    )
-                    if not single_chunk:
-                        pv_th_fused_g += w_chunk * th_mc_c
-                    del perf_th_c
-                    if i_ki_th_c is not None:
-                        del i_ki_th_c
-                elif z_corr_c is not None:
-                    del z_corr_c
-                if z_corr_f32_mdn_c is not None:
-                    del z_corr_f32_mdn_c
+                        i_ki_ext_c = iki_c_box[0] if iki_c_box else None
+                        if stage1_rep_g is not None and s1_c_box:
+                            stage1_rep_g[r_start:r_end] = s1_c_box[0]
+                        if bar_ln_fwd_tot_g is not None:
+                            bar_ln_fwd_tot_g += w_chunk * bar_ln_fwd_c
+                        if bar_lv_tot_g is not None and bar_lv_cont_c is not None:
+                            bar_lv_tot_g += w_chunk * bar_lv_cont_c
+                        if bar_sigma_cont_tot_g is not None and cg_c_box:
+                            bar_sigma_cont_tot_g += w_chunk * cg_c_box[0]
+                    elif use_triton_aad_s2 and (need_stage2_aad or emit_stage1_gpu):
+                        s1_chunk_g = (
+                            stage1_rep_g[r_start:r_end]
+                            if stage1_rep_g is not None
+                            else None
+                        )
+                        bar_lx_post_c, bar_ln_fwd_c, bar_cf_wf_c = _compute_payoff_aad_state_adjoints_triton(
+                            perf_base_c,
+                            ko_barriers=gpu_meta["ko"],
+                            is_callable=gpu_meta["is_call"],
+                            cpn_barriers=gpu_meta["cpn"],
+                            is_guar=gpu_meta["is_guar"],
+                            cpn_rates=gpu_meta["cpn_rates"],
+                            df_pay=gpu_meta["df_pay"],
+                            w_fund=gpu_meta["w_fund"],
+                            inv_perm_g=gpu_meta["inv_perm"],
+                            payoff_f64_g=gpu_meta["payoff_f64"],
+                            call_code=call_code,
+                            cpn_code=cpn_code,
+                            eff_opt_code=eff_opt_code_s2,
+                            cpn_dir_down=dir_down,
+                            cpn_type_out=type_out,
+                            is_memory=is_memory,
+                            force_cpn_ac=force_cpn_ac,
+                            no_notional=no_notional,
+                            is_long_basket=is_long_flag,
+                            has_ki=has_ki,
+                            ki_barrier=b_ki,
+                            i_ki_past=float(state.i_ki_past),
+                            has_one_star=bool(k_os > 0.0),
+                            tau_obs=tau_obs_np,
+                            vol_atm_obs=vol_atm_obs,
+                            barrier_eps_min=barrier_eps_min,
+                            barrier_eps_max=barrier_eps_max,
+                            compute_cf_wf=want_cf_wf_aad,
+                            eps_g_cached=eps_aad_g,
+                            n_rep=n_rep,
+                            has_lower_strike=has_lower_strike_flag,
+                            has_part_call=has_part_call_flag,
+                            emit_stage1=emit_stage1_gpu,
+                            out_stage1_rep_g=s1_chunk_g,
+                        )
+                        if bar_ln_fwd_tot_g is not None:
+                            if single_chunk:
+                                bar_ln_fwd_tot_g.copy_(bar_ln_fwd_c)
+                            else:
+                                bar_ln_fwd_tot_g += w_chunk * bar_ln_fwd_c
+                        if bar_cf_wf_tot_g is not None and bar_cf_wf_c is not None:
+                            if single_chunk:
+                                bar_cf_wf_tot_g.copy_(bar_cf_wf_c)
+                            else:
+                                bar_cf_wf_tot_g += w_chunk * bar_cf_wf_c
+                        if not need_stage2_aad:
+                            del bar_lx_post_c
+                            bar_lx_post_c = None
+                    else:
+                        bar_lx_post_c = None
 
-            if use_mf_cv and mf_cheap_hit is None and s1_gbm_cheap_g is not None and sv_sobol_gpu is not None:
-                assert u_rot_gpu is not None and n_rep_gen_mf > 0
-                mf_shift_key = ("sobol_mf_shifts_v3", eff_r_mf, n_rep_gen_mf, m_rem, d_assets, seed + 99991, dev_norm_str)
-                shifts_mf_gpu = _CRN_SOBOL_CACHE.get(mf_shift_key)
-                if shifts_mf_gpu is None:
-                    rng_mf = np.random.default_rng(seed + 99991)
-                    shifts_mf_np = rng_mf.integers(0, 1 << 30, size=(eff_r_mf, m_rem * 2 * d_assets), dtype=np.int32)
-                    shifts_mf_gpu = torch.from_numpy(shifts_mf_np).to(device=qmc_device, dtype=torch.int32)
-                    _CRN_SOBOL_CACHE.put(mf_shift_key, shifts_mf_gpu)
-                cv_eig_f32_g = chol_f32_g_cached.contiguous()
-                mf_per_rep_bytes = max(m_rem * d_assets * 8 + d_assets * 4, 1) * n_rep_gen_mf
-                r_mf_chunk = min(eff_r_mf, max(1, (36 * 1024 * 1024) // mf_per_rep_bytes))
-                m_pow_mf = int(round(math.log2(n_rep_gen_mf)))
-                block_n_mf = min(256, n_rep_gen_mf)
-                n_tiles_mf = (n_rep_gen_mf + block_n_mf - 1) // block_n_mf
-                for r_mf_s in range(0, eff_r_mf, r_mf_chunk):
-                    r_mf_e = min(eff_r_mf, r_mf_s + r_mf_chunk)
-                    r_mf_c = r_mf_e - r_mf_s
-                    n_mf_tot = r_mf_c * n_rep_gen_mf
-                    z_raw_mf = torch.empty((m_rem, d_assets, n_mf_tot), dtype=torch.float32, device=qmc_device)
-                    _fast_triton_launch(
-                        _sobol_bridge_normals_kernel,
-                        (n_tiles_mf, m_rem * r_mf_c),
-                        sv_sobol_gpu,
-                        shifts_mf_gpu[r_mf_s:r_mf_e],
-                        z_raw_mf,
-                        m_rem,
-                        d_assets,
-                        n_rep=n_rep_gen_mf,
-                        n_sub=1,
-                        m_pow=m_pow_mf,
-                        BLOCK_N=block_n_mf,
-                        num_warps=4,
-                    )
-                    tmp_mf = torch.matmul(cv_eig_f32_g, z_raw_mf).view(m_rem, d_assets * n_mf_tot)
-                    del z_raw_mf
-                    z_corr_mf = torch.matmul(u_rot_gpu, tmp_mf).view(m_rem, d_assets, n_mf_tot)
-                    del tmp_mf
-                    sb_s = r_mf_s * ema_group_mf
-                    sb_e = r_mf_e * ema_group_mf
-                    _run_mf_gbm_batch(
-                        z_corr_mf,
-                        s1_gbm_cheap_g[sb_s:sb_e],
-                        cf_surv_gbm_cheap_g[sb_s:sb_e] if cf_surv_gbm_cheap_g is not None else None,
-                        antithetic=True,
-                        layout_mdn=True,
-                        r_b_ov=r_mf_c * ema_group_mf,
-                        n_rep_ov=n_rep_mf,
-                        z_scale_val=1.0,
-                        pre_zeroed=True,
-                    )
-                    del z_corr_mf
-                del cv_eig_f32_g
+                    # Backpropagate bar_lx_post_c through rematerialized Platen substeps using parallel period shards.
+                    if need_stage2_aad and bar_lx_post_c is not None and lx_period_c is not None:
+                        bar_q_c = (
+                            torch.zeros((d_assets, n_steps_tot_g), dtype=torch.float32, device=qmc_device)
+                            if want_q_aad_sde
+                            else dummy_f32_1
+                        )
+                        if fuse_m_sde:
+                            bar_lv_f32_c = (
+                                torch.zeros((d_assets, lv_nt, lv_ny), dtype=torch.float32, device=qmc_device)
+                                if want_lv_aad_sde
+                                else dummy_f32_1
+                            )
+                            bar_zc_c = (
+                                torch.empty(
+                                    (n_steps_tot_g, d_assets, n_chunk),
+                                    dtype=torch.float32,
+                                    device=qmc_device,
+                                )
+                                if want_chol_aad_sde
+                                else dummy_f32_1
+                            )
+                            use_zc_bwd = bool(z_corr_f32_mdn_c is not None)
+                            z_bwd_prop_in = z_corr_f32_mdn_c if z_corr_f32_mdn_c is not None else z_indep_f32_c
+                            _fast_triton_launch(
+                                _qmc_bwd_state_prop_kernel,
+                                (1, r_cnt_c * d_assets),
+                                z_bwd_prop_in,
+                                chol_f32_g_cached,
+                                lv_f32_g_cached,
+                                y_min_f32_g,
+                                inv_dy_f32_g,
+                                t_mid_ptr_g,
+                                dt_sub_ptr_g,
+                                sqrt_dt_ptr_g,
+                                q_shift_mid_ptr_g,
+                                bar_lx_post_c,
+                                lx_period_c,
+                                dummy_f32_1,
+                                inv_dt_f32_val,
+                                d_assets,
+                                m_rem,
+                                n_rep=n_rep,
+                                n_sub=n_sub,
+                                N_t=lv_nt,
+                                N_y=lv_ny,
+                                BLOCK_N=block_n_sde,
+                                USE_Z_CORR=use_zc_bwd,
+                                num_warps=nw_sde,
+                            )
+                            if want_lv_aad_sde or want_chol_aad_sde or want_q_aad_sde:
+                                bwd_bn_cap = int(os.environ.get("DEEPVOL_BWD_BN", "128"))
+                                bwd_nw = int(os.environ.get("DEEPVOL_BWD_NW", "4"))
+                                block_p2_sde = min(bwd_bn_cap, max(32, _next_power_of_two_int(n_rep)))
+                                n_tiles_p2_sde = (n_rep + block_p2_sde - 1) // block_p2_sde
+                                _fast_triton_launch(
+                                    _qmc_bwd_period_scatter_kernel,
+                                    (n_tiles_p2_sde, m_rem * r_cnt_c * d_assets),
+                                    z_indep_f32_c,
+                                    z_bwd_prop_in,
+                                    chol_f32_g_cached,
+                                    lv_f32_g_cached,
+                                    y_min_f32_g,
+                                    inv_dy_f32_g,
+                                    t_mid_ptr_g,
+                                    dt_sub_ptr_g,
+                                    sqrt_dt_ptr_g,
+                                    q_shift_mid_ptr_g,
+                                    bar_lx_post_c,
+                                    lx_period_c,
+                                    bar_lv_f32_c,
+                                    bar_zc_c,
+                                    bar_q_c,
+                                    inv_dt_f32_val,
+                                    d_assets,
+                                    m_rem,
+                                    r_cnt_c,
+                                    n_rep=n_rep,
+                                    n_sub=n_sub,
+                                    N_t=lv_nt,
+                                    N_y=lv_ny,
+                                    BLOCK_N=block_p2_sde,
+                                    N_LV_SHARDS=1,
+                                    COMPUTE_LV_AAD=want_lv_aad_sde,
+                                    COMPUTE_CHOL_AAD=want_chol_aad_sde,
+                                    COMPUTE_Q_AAD=want_q_aad_sde,
+                                    USE_Z_CORR=use_zc_bwd,
+                                    num_warps=bwd_nw,
+                                )
+                            if want_lv_aad_sde and bar_lv_tot_g is not None:
+                                if single_chunk and (not is_cont_ki_active):
+                                    bar_lv_tot_g.copy_(bar_lv_f32_c)
+                                else:
+                                    bar_lv_tot_g += w_chunk * bar_lv_f32_c.to(dtype=torch.float64)
+                            if want_chol_aad_sde and bar_chol_tot_g is not None:
+                                if single_chunk:
+                                    torch.sum(
+                                        torch.bmm(bar_zc_c, z_indep_f32_c.transpose(1, 2)),
+                                        dim=0,
+                                        dtype=torch.float64,
+                                        out=bar_chol_tot_g,
+                                    )
+                                else:
+                                    bar_chol_tot_g += w_chunk * torch.bmm(
+                                        bar_zc_c, z_indep_f32_c.transpose(1, 2)
+                                    ).sum(dim=0, dtype=torch.float64)
+                            del bar_lv_f32_c, bar_zc_c
+                        else:
+                            bar_lv_f32_c = (
+                                torch.zeros((d_assets, lv_nt, lv_ny), dtype=torch.float32, device=qmc_device)
+                                if want_lv_aad_sde
+                                else torch.empty((1,), dtype=torch.float32, device=qmc_device)
+                            )
+                            bar_chol_c = (
+                                torch.zeros((d_assets, d_assets), dtype=torch.float32, device=qmc_device)
+                                if want_chol_aad_sde
+                                else torch.empty((1,), dtype=torch.float32, device=qmc_device)
+                            )
+                            bar_x_c = torch.zeros((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
+                            for p_cur_s in range(m_rem - 1, -1, -1):
+                                bar_tot_p = (bar_x_c + bar_lx_post_c[p_cur_s]).view(d_assets, r_cnt_c, n_rep)
+                                omega_p = torch.exp(lx_period_c[p_cur_s].view(d_assets, r_cnt_c, n_rep)) / float(n_rep)
+                                bar_x_c = (bar_tot_p - omega_p * bar_tot_p.sum(dim=2, keepdim=True)).reshape(d_assets, n_chunk).contiguous()
+                                _fast_triton_launch(
+                                    _qmc_bwd_sde_aad_kernel,
+                                    (n_tiles_sde, r_cnt_c * d_assets),
+                                    z_indep_f32_c,
+                                    dummy_shifts_g,
+                                    chol_f32_g_cached,
+                                    lv_f32_g_cached,
+                                    y_min_f32_g,
+                                    inv_dy_f32_g,
+                                    t_mid_ptr_g,
+                                    dt_sub_ptr_g,
+                                    sqrt_dt_ptr_g,
+                                    q_shift_mid_ptr_g,
+                                    bar_x_c,
+                                    bar_lx_post_c,
+                                    lx_period_c,
+                                    bar_lv_f32_c,
+                                    bar_chol_c,
+                                    bar_q_c,
+                                    inv_dt_f32_val,
+                                    d_assets,
+                                    m_rem,
+                                    n_rep=n_rep,
+                                    n_sub=n_sub,
+                                    N_t=lv_nt,
+                                    N_y=lv_ny,
+                                    BLOCK_N=block_n_sde,
+                                    period_idx=p_cur_s,
+                                    FUSE_M=False,
+                                    COMPUTE_LV_AAD=want_lv_aad_sde,
+                                    COMPUTE_CHOL_AAD=want_chol_aad_sde,
+                                    COMPUTE_Q_AAD=want_q_aad_sde,
+                                    ATOM_SHARDS=1,
+                                    num_warps=nw_sde,
+                                )
+                            del bar_x_c
+                            if want_lv_aad_sde and bar_lv_tot_g is not None:
+                                bar_lv_tot_g += w_chunk * bar_lv_f32_c.to(dtype=torch.float64)
+                            if want_chol_aad_sde and bar_chol_tot_g is not None:
+                                bar_chol_tot_g += w_chunk * bar_chol_c.to(dtype=torch.float64)
+                            del bar_lv_f32_c, bar_chol_c
+                        if want_q_aad_sde and bar_q_tot_g is not None:
+                            bar_q_tot_g += w_chunk * bar_q_c.to(dtype=torch.float64)
+                        del bar_q_c
+                    if bar_lx_post_c is not None:
+                        del bar_lx_post_c
+                    if lx_period_c is not None:
+                        del lx_period_c
 
-            # Finalize rare dynamic rows on GPU, then perform a single direct D2H transfer of out_flat_g.
-            if cg_fast_d2h_np is None and (not stat_direct_alias) and gpu_eval_pv_g is not None:
-                if stat_acc_g is not None and stat_pos_g is not None and stat_itr_g is not None:
-                    gpu_eval_pv_g[stat_pos_g] = stat_acc_g + stat_itr_g
-                for s_r_d, e_r_d, sp_d, _, _ in dyn_entries:
-                    gpu_eval_pv_g[s_r_d:e_r_d] += torch.as_tensor(sp_d["itr"], dtype=torch.float64, device=qmc_device)
+                    # Compute Antithetic Cholesky Vibrato Gamma + frozen terminal state in chunk memory.
+                    frozen_term_c: Optional[torch.Tensor] = None
+                    if use_vibrato_gamma:
+                        assert vib_lx_pre_c is not None and vib_j_pre_c is not None and vib_sig_pre_c is not None
+                        assert l_inv_t_g is not None and c_inv_g is not None and cdl_m_g is not None and cdl2_last_g is not None
+                        assert h_vib_tot_g is not None
+                        block_nv = min(128, max(32, _next_power_of_two_int(n_chunk)))
+                        grid_nv = (n_chunk + block_nv - 1) // block_nv
+                        use_f32_vib_pre = bool(os.environ.get("DEEPVOL_VIB_F32", "1") == "1")
+                        d_ln_surv_tmp_c = torch.empty(
+                            ((2 * d_assets if is_memory else d_assets), n_chunk),
+                            dtype=torch.float32 if use_f32_vib_pre else torch.float64,
+                            device=qmc_device,
+                        )
+                        h_vib_out_c = torch.empty((grid_nv, d_assets, d_assets), dtype=torch.float64, device=qmc_device)
+                        if m_rem > 1:
+                            frozen_term_c = torch.empty((4, n_chunk), dtype=torch.float64, device=qmc_device)
+                        _fast_triton_launch(
+                            _vibrato_gamma_f64_kernel,
+                            (grid_nv,),
+                            perf_base_c,
+                            vib_lx_pre_c,
+                            vib_j_pre_c,
+                            vib_sig_pre_c,
+                            z_indep_f32_c,
+                            chol_f64_g,
+                            l_inv_t_g,
+                            c_inv_g,
+                            fwd_perf_g[:, m_rem - 1].contiguous(),
+                            cdl_m_g,
+                            cdl2_last_g,
+                            gpu_meta["ko"],
+                            gpu_meta["is_call"],
+                            gpu_meta["cpn"],
+                            gpu_meta["is_guar"],
+                            gpu_meta["cpn_rates"],
+                            eps_aad_g,
+                            gpu_meta["inv_perm"],
+                            gpu_meta["payoff_f64"],
+                            d_ln_surv_tmp_c,
+                            frozen_term_c,
+                            h_vib_out_c,
+                            df_last_val,
+                            h_vib_val,
+                            vib_step_start,
+                            vib_n_steps,
+                            d_assets,
+                            m_rem,
+                            n_chunk,
+                            CALL_CODE=call_code,
+                            CPN_CODE=cpn_code,
+                            EFF_OPT_CODE=eff_opt_code_s2,
+                            HAS_KI=has_ki,
+                            KI_ACTIVE=bool(has_ki and b_ki > 0.0 and float(state.i_ki_past) < 0.5),
+                            HAS_ONE_STAR=bool(k_os > 0.0),
+                            IS_MEM=is_memory,
+                            IS_LONG=is_long_flag,
+                            NO_NOTIONAL=no_notional,
+                            FORCE_CPN_AC=force_cpn_ac,
+                            CPN_DIR_DOWN=dir_down,
+                            CPN_TYPE_OUT=type_out,
+                            HAS_LOWER_STRIKE=has_lower_strike_flag,
+                            HAS_PART_CALL=has_part_call_flag,
+                            BLOCK_N=block_nv,
+                            USE_F32_PRE=use_f32_vib_pre,
+                            num_warps=4,
+                        )
+                        if single_chunk:
+                            torch.sum(h_vib_out_c, dim=0, out=h_vib_tot_g)
+                        else:
+                            h_vib_tot_g += w_chunk * h_vib_out_c.sum(dim=0)
+                        del d_ln_surv_tmp_c, h_vib_out_c, vib_lx_pre_c, vib_j_pre_c, vib_sig_pre_c
 
-            if cg_capturing_now and cg_obj is not None and out_flat_g is not None and cg_pool_lock is not None:
-                try:
+                    if use_mf_cv and s1_gbm_crn_g is not None and chol_scaled_f32_g is not None:
+                        if z_corr_coarse_f32 is not None:
+                            zc_crn_mdn = (
+                                z_corr_coarse_f32
+                                if single_chunk
+                                else z_corr_coarse_f32[:, :, r_start * n_rep : r_end * n_rep].contiguous()
+                            )
+                            _run_mf_gbm_batch(
+                                zc_crn_mdn,
+                                s1_gbm_crn_g[r_start:r_end],
+                                cf_surv_gbm_crn_g[r_start:r_end] if cf_surv_gbm_crn_g is not None else None,
+                                layout_mdn=True,
+                                r_b_ov=r_cnt_c,
+                                n_rep_ov=n_rep,
+                                z_scale_val=inv_sqrt_nsub_val,
+                                pre_zeroed=True,
+                            )
+                        elif z_corr_f32_mdn_c is not None:
+                            zc_crn_mdn = z_corr_f32_mdn_c.view(m_rem, n_sub, d_assets, n_chunk).sum(dim=1)
+                            _run_mf_gbm_batch(
+                                zc_crn_mdn,
+                                s1_gbm_crn_g[r_start:r_end],
+                                cf_surv_gbm_crn_g[r_start:r_end] if cf_surv_gbm_crn_g is not None else None,
+                                layout_mdn=True,
+                                r_b_ov=r_cnt_c,
+                                n_rep_ov=n_rep,
+                                z_scale_val=inv_sqrt_nsub_val,
+                                pre_zeroed=True,
+                            )
+                            del zc_crn_mdn
+                        else:
+                            zc_crn_mean = z_indep_f32_c.view(m_rem, n_sub, d_assets, n_chunk).mean(dim=1)
+                            zc_crn_rmdn = zc_crn_mean.view(m_rem, d_assets, r_cnt_c, n_rep).permute(2, 0, 1, 3)
+                            z_coarse_corr_crn = torch.matmul(chol_scaled_f32_g, zc_crn_rmdn).contiguous()
+                            _run_mf_gbm_batch(
+                                z_coarse_corr_crn,
+                                s1_gbm_crn_g[r_start:r_end],
+                                cf_surv_gbm_crn_g[r_start:r_end] if cf_surv_gbm_crn_g is not None else None,
+                                pre_zeroed=True,
+                            )
+                            del zc_crn_mean, zc_crn_rmdn, z_coarse_corr_crn
+
+                    # Convert chunk Z_indep -> Z_corr if spot bumps or Theta need 1D SDE stepping, then drop Z_indep.
+                    if (need_spot_bumps or th_chunk_in_step1) and z_corr_c is None and z_corr_f32_mdn_c is None:
+                        zc_dtype = torch.float32 if use_f32_step1 else torch.float64
+                        chol_step = chol_f32_g_cached if use_f32_step1 else chol_f64_g
+                        z_corr_c = torch.matmul(
+                            chol_step,
+                            z_indep_f32_c.to(dtype=zc_dtype).permute(1, 0, 2).reshape(d_assets, -1),
+                        ).view(d_assets, m_rem, n_sub, n_chunk).contiguous()
+                    del z_indep_f32_c
+
+                    perf_sp_pm_c: Optional[torch.Tensor] = None
+                    alt_sp_cg_c: Optional[torch.Tensor] = None
+                    if need_spot_bumps:
+                        assert sp_pm_meta_g is not None and lv_sp_pm_g is not None and fwd_sp_pm_g is not None
+                        if z_corr_f32_mdn_c is not None:
+                            perf_sp_pm_c = _gpu_step_1d_f64(
+                                lv_sp_pm_g,
+                                z_corr_f32_mdn_c,
+                                tau_step_g[:m_rem],
+                                rn_step_g[: d_assets * m_rem].view(d_assets, m_rem),
+                                rt_step_g[: d_assets * m_rem].view(d_assets, m_rem),
+                                2,
+                                meta_lv_t=sp_pm_meta_g[0],
+                                meta_r_t=sp_pm_meta_g[1],
+                                meta_z_t=sp_pm_meta_g[2],
+                                z_layout_mdn=True,
+                                fwd_perf_scale_t=fwd_sp_pm_g,
+                                out_mdn=False,
+                                out_f32=use_f32_perf_direct,
+                            )
+                        else:
+                            assert z_corr_c is not None
+                            nx_sp_c = _gpu_step_1d_f64(
+                                lv_sp_pm_g,
+                                z_corr_c,
+                                tau_step_g[:m_rem],
+                                rn_step_g[: d_assets * m_rem].view(d_assets, m_rem),
+                                rt_step_g[: d_assets * m_rem].view(d_assets, m_rem),
+                                2,
+                                meta_lv_t=sp_pm_meta_g[0],
+                                meta_r_t=sp_pm_meta_g[1],
+                                meta_z_t=sp_pm_meta_g[2],
+                            )
+                            perf_sp_pm_c = (nx_sp_c * fwd_sp_pm_g.unsqueeze(-1)).contiguous()
+                            del nx_sp_c
+                        if need_sp_cg_alt_g or (pre_pack is not None and not want_gamma):
+                            alt_sp_cg_c = torch.stack(
+                                [
+                                    perf_sp_pm_c[:d_assets].permute(1, 0, 2),
+                                    perf_sp_pm_c[d_assets:].permute(1, 0, 2),
+                                ],
+                                dim=0,
+                            ).contiguous()
+
+                    if stat_pack is not None and stat_acc_g is not None:
+                        stat_mc_c = _run_loo_l2o_eval(
+                            perf_base_c,
+                            perf_sp_pm_c,
+                            perf_sp_pm_c,
+                            np.empty(0, dtype=np.int32),
+                            np.empty(0, dtype=np.int32),
+                            None,
+                            None,
+                            None,
+                            alt_perf=alt_sp_cg_c if need_sp_cg_alt_g else None,
+                            return_gpu=True,
+                            pure_mc=True,
+                            static_gpu_pack=stat_pack,
+                            i_ki_ext_g=i_ki_ext_c,
+                            out_pv_g=stat_acc_g if single_chunk else None,
+                        )
+                        if not single_chunk:
+                            stat_acc_g += w_chunk * stat_mc_c
+
+                    if pre_pack is not None and pv_preterm_g is not None and frozen_term_c is not None:
+                        pre_mc_c = _run_loo_l2o_eval(
+                            perf_base_c,
+                            perf_sp_pm_c if want_gamma else None,
+                            perf_sp_pm_c if want_gamma else None,
+                            np.empty(0, dtype=np.int32),
+                            np.empty(0, dtype=np.int32),
+                            None,
+                            None,
+                            None,
+                            alt_perf=alt_sp_cg_c if (not want_gamma) else None,
+                            return_gpu=True,
+                            pure_mc=True,
+                            static_gpu_pack=pre_pack,
+                            eps_vec_g=eps_aad_g,
+                            frozen_term_g=frozen_term_c,
+                            use_c2_preterm=True,
+                            use_frozen_term=True,
+                            out_pv_g=pv_preterm_g if single_chunk else None,
+                        )
+                        if not single_chunk:
+                            pv_preterm_g += w_chunk * pre_mc_c
+
+                    if dyn_entries and gpu_eval_pv_g is not None:
+                        assert norm_x_c is not None
+                        for s_r_d, e_r_d, sp_d, df_d_g, wf_d_g in dyn_entries:
+                            nb_d = e_r_d - s_r_d
+                            if sp_d["fwd_alt"] is not None:
+                                fwd_a_g = torch.as_tensor(sp_d["fwd_alt"], dtype=torch.float64, device=qmc_device)
+                                alt_d_c = (norm_x_c.unsqueeze(0) * fwd_a_g.unsqueeze(-1)).permute(0, 2, 1, 3).contiguous()
+                                dyn_mc_c = _run_loo_l2o_eval(
+                                    None,
+                                    alt_d_c,
+                                    None,
+                                    np.full(nb_d, -2, dtype=np.int32),
+                                    sp_d["ab"],
+                                    df_d_g,
+                                    wf_d_g,
+                                    None,
+                                    return_gpu=True,
+                                    pure_mc=True,
+                                    i_ki_ext_g=i_ki_ext_c,
+                                )
+                                del alt_d_c, fwd_a_g
+                            else:
+                                aa_d_g = torch.as_tensor(sp_d["aa"], dtype=torch.long, device=qmc_device)
+                                fwd_ba_g = torch.as_tensor(sp_d["fwd_ba"], dtype=torch.float64, device=qmc_device)
+                                ba_d_c = (norm_x_c.index_select(0, aa_d_g) * fwd_ba_g[:, :, None]).contiguous()
+                                dyn_mc_c = _run_loo_l2o_eval(
+                                    perf_base_c,
+                                    ba_d_c,
+                                    None,
+                                    sp_d["aa"],
+                                    sp_d["ab"],
+                                    df_d_g,
+                                    wf_d_g,
+                                    None,
+                                    return_gpu=True,
+                                    pure_mc=True,
+                                    i_ki_ext_g=i_ki_ext_c,
+                                )
+                                del aa_d_g, fwd_ba_g, ba_d_c
+                            gpu_eval_pv_g[s_r_d:e_r_d] += w_chunk * dyn_mc_c
+                    if norm_x_c is not None:
+                        del norm_x_c
+                    if frozen_term_c is not None:
+                        del frozen_term_c
+                    if alt_sp_cg_c is not None:
+                        del alt_sp_cg_c
+                    if perf_sp_pm_c is not None:
+                        del perf_sp_pm_c
+                    if i_ki_ext_c is not None:
+                        del i_ki_ext_c
+                    del perf_base_c
+
+                    if th_chunk_in_step1 and th_pack is not None and pv_th_fused_g is not None and th_prep is not None:
+                        assert lv_th_g is not None and fwd_th_g is not None
+                        if z_corr_f32_mdn_c is not None:
+                            z_th_mdn = z_corr_f32_mdn_c if k_cross_g == 0 else z_corr_f32_mdn_c[k_cross_g * n_sub :]
+                            del z_corr_f32_mdn_c
+                            z_corr_f32_mdn_c = None
+                            perf_th_c = _gpu_step_1d_f64(
+                                lv_th_g,
+                                z_th_mdn,
+                                tau_step_g[m_rem:],
+                                rn_step_g[d_assets * m_rem :].view(d_assets, m_rem_th_g),
+                                rt_step_g[d_assets * m_rem :].view(d_assets, m_rem_th_g),
+                                2,
+                                m_periods=m_rem_th_g,
+                                meta_lv_t=id_d_g,
+                                meta_r_t=id_d_g,
+                                meta_z_t=id_d_g,
+                                inv_dt_vec_t=inv_dt_base_g[1:2],
+                                z_layout_mdn=True,
+                                fwd_perf_scale_t=fwd_th_g,
+                                out_mdn=True,
+                                out_f32=use_f32_perf_direct,
+                            )
+                            del z_th_mdn
+                        else:
+                            assert z_corr_c is not None
+                            z_th_c = z_corr_c if k_cross_g == 0 else z_corr_c[:, k_cross_g:, :, :].contiguous()
+                            del z_corr_c
+                            z_corr_c = None
+                            nx_th_c = _gpu_step_1d_f64(
+                                lv_th_g,
+                                z_th_c,
+                                tau_step_g[m_rem:],
+                                rn_step_g[d_assets * m_rem :].view(d_assets, m_rem_th_g),
+                                rt_step_g[d_assets * m_rem :].view(d_assets, m_rem_th_g),
+                                2,
+                                m_periods=m_rem_th_g,
+                                meta_lv_t=id_d_g,
+                                meta_r_t=id_d_g,
+                                meta_z_t=id_d_g,
+                                inv_dt_vec_t=inv_dt_base_g[1:2],
+                            )
+                            del z_th_c
+                            perf_th_c = (nx_th_c * fwd_th_g.unsqueeze(-1)).permute(1, 0, 2).contiguous()
+                            del nx_th_c
+                        i_ki_th_c: Optional[torch.Tensor] = None
+                        if is_cont_ki_active:
+                            assert df_th_g is not None and ko_th_g is not None and ic_th_g is not None
+                            assert cp_th_g is not None and ig_th_g is not None and cr_th_g is not None
+                            iki_th_box: List[torch.Tensor] = []
+                            _compute_payoff_aad_state_adjoints_torch(
+                                perf_th_c,
+                                ko_barriers=ko_th_g,
+                                is_callable=ic_th_g,
+                                cpn_barriers=cp_th_g,
+                                is_guar=ig_th_g,
+                                cpn_rates=cr_th_g,
+                                df_pay=df_th_g[0],
+                                w_fund=wf_th_g[0] if wf_th_g is not None else None,
+                                inv_perm=inv_perm,
+                                call_code=call_code,
+                                cpn_code=cpn_code,
+                                opt_code=opt_code,
+                                ko_spread=ko_spread,
+                                cpn_spread=cpn_spread,
+                                ki_spread=ki_spread,
+                                cpn_dir_down=dir_down,
+                                cpn_type_out=type_out,
+                                is_memory=is_memory,
+                                force_cpn_ac=force_cpn_ac,
+                                no_notional=no_notional,
+                                is_long_basket=is_long_flag,
+                                has_ki=has_ki,
+                                ki_barrier=b_ki,
+                                i_ki_past=float(th_prep["eff_iki"]),
+                                ki_monitoring_type=ki_monitoring_type,
+                                tau_obs=th_prep["tau_obs"],
+                                vol_atm_obs=vol_atm_obs[:, k_cross_g:] if vol_atm_obs is not None else None,
+                                strike=k_put,
+                                lower_strike=state.lower_strike,
+                                option_gearing=float(state.option_gearing),
+                                ac_cpn=float(state.autocall_coupon),
+                                c_mem_0=float(th_prep["eff_cmem"]),
+                                part_call_strike=state.participation_call_strike,
+                                part_call_rate=part_call_rate,
+                                one_star_strike=(k_os if k_os > 0.0 else state.one_star_strike),
+                                one_star_coupon=os_cpn,
+                                one_star_eps=one_star_eps,
+                                barrier_eps_min=barrier_eps_min,
+                                barrier_eps_max=barrier_eps_max,
+                                lv_tables_t=lv_th_g,
+                                corr_t=gpu_meta["corr"],
+                                fwd_perf_t=fwd_th_g,
+                                y_min=lv_y_min_vec,
+                                y_max=lv_y_max_vec,
+                                n_sub=n_sub,
+                                n_rep=n_rep,
+                                emit_stage1=False,
+                                compute_grads=False,
+                                out_i_ki_ext=iki_th_box,
+                            )
+                            i_ki_th_c = iki_th_box[0] if iki_th_box else None
+                        th_mc_c = _run_loo_l2o_eval(
+                            perf_th_c,
+                            None,
+                            None,
+                            np.empty(0, dtype=np.int32),
+                            np.empty(0, dtype=np.int32),
+                            None,
+                            None,
+                            None,
+                            return_gpu=True,
+                            pure_mc=True,
+                            static_gpu_pack=th_pack,
+                            m_periods=m_rem_th_g,
+                            ko_ov=ko_th_g,
+                            is_call_ov=ic_th_g,
+                            cpn_ov=cp_th_g,
+                            is_guar_ov=ig_th_g,
+                            cpn_rates_ov=cr_th_g,
+                            payoff_f64_ov=payoff_th_g,
+                            eps_vec_g=eps_th_g,
+                            i_ki_ext_g=i_ki_th_c,
+                            out_pv_g=pv_th_fused_g if single_chunk else None,
+                        )
+                        if not single_chunk:
+                            pv_th_fused_g += w_chunk * th_mc_c
+                        del perf_th_c
+                        if i_ki_th_c is not None:
+                            del i_ki_th_c
+                    elif z_corr_c is not None:
+                        del z_corr_c
+                    if z_corr_f32_mdn_c is not None:
+                        del z_corr_f32_mdn_c
+
+                if use_mf_cv and mf_cheap_hit is None and s1_gbm_cheap_g is not None and sv_sobol_gpu is not None:
+                    assert u_rot_gpu is not None and n_rep_gen_mf > 0
+                    mf_shift_key = ("sobol_mf_shifts_v3", eff_r_mf, n_rep_gen_mf, m_rem, d_assets, seed + 99991, dev_norm_str)
+                    shifts_mf_gpu = _CRN_SOBOL_CACHE.get(mf_shift_key)
+                    if shifts_mf_gpu is None:
+                        rng_mf = np.random.default_rng(seed + 99991)
+                        shifts_mf_np = rng_mf.integers(0, 1 << 30, size=(eff_r_mf, m_rem * 2 * d_assets), dtype=np.int32)
+                        shifts_mf_gpu = torch.from_numpy(shifts_mf_np).to(device=qmc_device, dtype=torch.int32)
+                        _CRN_SOBOL_CACHE.put(mf_shift_key, shifts_mf_gpu)
+                    cv_eig_f32_g = chol_f32_g_cached.contiguous()
+                    mf_per_rep_bytes = max(m_rem * d_assets * 8 + d_assets * 4, 1) * n_rep_gen_mf
+                    r_mf_chunk = min(eff_r_mf, max(1, (36 * 1024 * 1024) // mf_per_rep_bytes))
+                    m_pow_mf = int(round(math.log2(n_rep_gen_mf)))
+                    block_n_mf = min(256, n_rep_gen_mf)
+                    n_tiles_mf = (n_rep_gen_mf + block_n_mf - 1) // block_n_mf
+                    for r_mf_s in range(0, eff_r_mf, r_mf_chunk):
+                        r_mf_e = min(eff_r_mf, r_mf_s + r_mf_chunk)
+                        r_mf_c = r_mf_e - r_mf_s
+                        n_mf_tot = r_mf_c * n_rep_gen_mf
+                        z_raw_mf = torch.empty((m_rem, d_assets, n_mf_tot), dtype=torch.float32, device=qmc_device)
+                        _fast_triton_launch(
+                            _sobol_bridge_normals_kernel,
+                            (n_tiles_mf, m_rem * r_mf_c),
+                            sv_sobol_gpu,
+                            shifts_mf_gpu[r_mf_s:r_mf_e],
+                            z_raw_mf,
+                            m_rem,
+                            d_assets,
+                            n_rep=n_rep_gen_mf,
+                            n_sub=1,
+                            m_pow=m_pow_mf,
+                            BLOCK_N=block_n_mf,
+                            num_warps=4,
+                        )
+                        tmp_mf = torch.matmul(cv_eig_f32_g, z_raw_mf).view(m_rem, d_assets * n_mf_tot)
+                        del z_raw_mf
+                        z_corr_mf = torch.matmul(u_rot_gpu, tmp_mf).view(m_rem, d_assets, n_mf_tot)
+                        del tmp_mf
+                        sb_s = r_mf_s * ema_group_mf
+                        sb_e = r_mf_e * ema_group_mf
+                        _run_mf_gbm_batch(
+                            z_corr_mf,
+                            s1_gbm_cheap_g[sb_s:sb_e],
+                            cf_surv_gbm_cheap_g[sb_s:sb_e] if cf_surv_gbm_cheap_g is not None else None,
+                            antithetic=True,
+                            layout_mdn=True,
+                            r_b_ov=r_mf_c * ema_group_mf,
+                            n_rep_ov=n_rep_mf,
+                            z_scale_val=1.0,
+                            pre_zeroed=True,
+                        )
+                        del z_corr_mf
+                    del cv_eig_f32_g
+
+                # Finalize rare dynamic rows on GPU, then perform a single direct D2H transfer of out_flat_g.
+                if cg_fast_d2h_np is None and (not stat_direct_alias) and gpu_eval_pv_g is not None:
+                    if stat_acc_g is not None and stat_pos_g is not None and stat_itr_g is not None:
+                        gpu_eval_pv_g[stat_pos_g] = stat_acc_g + stat_itr_g
+                    for s_r_d, e_r_d, sp_d, _, _ in dyn_entries:
+                        gpu_eval_pv_g[s_r_d:e_r_d] += torch.as_tensor(sp_d["itr"], dtype=torch.float64, device=qmc_device)
+
+                if cg_capturing_now and cg_obj is not None and out_flat_g is not None and cg_pool_lock is not None:
+                    cg_capturing_now = False
                     cg_obj.capture_end()
-                    if cg_stream_ctx is not None:
+                    if cg_stream_entered and cg_stream_ctx is not None:
+                        cg_stream_entered = False
                         cg_stream_ctx.__exit__(None, None, None)
                     GLOBAL_GPU_CACHE_MANAGER.account_pool_capture_bytes(qmc_device, cg_before_stats_qmc)
                     _CRN_QMC_CG_CACHE.put(
@@ -12694,22 +12701,36 @@ def compute_qmc_aad_crn_greeks(
                             "keepalive": (
                                 out_flat_g,
                                 stat_acc_g,
+                                stat_pos_g,
                                 sv_sobol_gpu,
                                 shifts_sobol_gpu,
                                 u_rot_gpu,
                                 v_rot_gpu,
+                                id_d_g,
+                                dummy_f32_1,
+                                *(sp_pm_meta_g or ()),
                                 *cg_src_tensors,
                             ),
                         },
                     )
                     cg_obj.replay()
                     cg_fast_d2h_np = np.asarray(out_flat_g.clone().detach().cpu().numpy(), dtype=np.float64)
-                finally:
+            finally:
+                if cg_capturing_now and cg_obj is not None:
+                    try:
+                        cg_capturing_now = False
+                        cg_obj.capture_end()
+                    except Exception as end_exc:
+                        logger.debug("QMC CUDAGraph capture_end cleanup failed: %s", end_exc)
+                if cg_stream_entered and cg_stream_ctx is not None:
+                    try:
+                        cg_stream_entered = False
+                        cg_stream_ctx.__exit__(None, None, None)
+                    except Exception as ctx_exc:
+                        logger.debug("QMC CUDAGraph stream exit cleanup failed: %s", ctx_exc)
+                if cg_pool_lock is not None:
                     cg_pool_lock.release()
                     cg_pool_lock = None
-            elif cg_pool_lock is not None:
-                cg_pool_lock.release()
-                cg_pool_lock = None
 
             s1_gbm_crn_np: Optional[npt.NDArray[np.float64]] = None
             s1_gbm_cheap_np: Optional[npt.NDArray[np.float64]] = None

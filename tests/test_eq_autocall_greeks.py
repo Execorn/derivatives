@@ -1434,6 +1434,87 @@ def test_qmc_aad_is_long_basket_gearing_parity(
         assert abs(float(r59_all.product_value) - 0.8875) * 1e4 < 15.0
 
 
+@pytest.mark.gpu
+def test_gpu_warm_cache_cudagraph_all_greeks_regression(
+    multi_period_request: EQAutocallableTradeRequest,
+) -> None:
+    """Verifies 3 consecutive GPU calls (_warm_gpu_hit=False -> True capture -> True replay) with 0.00 bps drift."""
+    import gc
+    import os
+    import subprocess
+
+    from deepvol.api.eq_autocall_runtime import ALL_8_GREEK_QUERIES, EQAutocallRuntime
+    from deepvol.models.autocall.gpu_cache_manager import GLOBAL_GPU_CACHE_MANAGER
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU required for warm-cache CUDAGraph regression test")
+
+    GLOBAL_GPU_CACHE_MANAGER.clear_all(clear_canonical_models=True)
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base_res = torch.cuda.memory_reserved()
+
+    req_gpu = copy.deepcopy(multi_period_request)
+    req_gpu.Queries = ["ProductValue", "CashFlows", *ALL_8_GREEK_QUERIES]  # type: ignore[assignment]
+    runtime = EQAutocallRuntime(device="cuda")
+
+    r1 = runtime.price_trade(req_gpu, engine="auto", include_all_greeks=True)
+    r2 = runtime.price_trade(req_gpu, engine="auto", include_all_greeks=True)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    r3 = runtime.price_trade(req_gpu, engine="auto", include_all_greeks=True)
+    torch.cuda.synchronize()
+    call3_ms = (time.perf_counter() - t0) * 1000.0
+
+    for res in (r1, r2, r3):
+        assert res.engine_used == "Tier3_DupireQMC"
+        assert res.audit_record is not None
+        assert res.audit_record.get("greeks_engine_used") == "Tier4_DupireQMC_CRN"
+        assert res.Theta is not None and np.isfinite(float(res.Theta))
+        assert res.Delta is not None and res.Gamma is not None
+        assert res.MultivariateAggregatedCashGamma is not None
+        assert res.Vega is not None and res.Rho is not None
+        assert res.DividendsSensitivities is not None and res.Cega is not None
+        assert len(res.CashFlows) > 0
+
+    assert abs(float(r2.ProductValue) - float(r1.ProductValue)) * 1e4 < 1e-6
+    assert abs(float(r3.ProductValue) - float(r1.ProductValue)) * 1e4 < 1e-6
+    assert abs(float(r2.Theta) - float(r1.Theta)) <= 1e-8  # type: ignore[arg-type]
+    assert abs(float(r3.Theta) - float(r1.Theta)) <= 1e-8  # type: ignore[arg-type]
+    assert len(r2.CashFlows) == len(r1.CashFlows) == len(r3.CashFlows)
+    for c1, c2, c3 in zip(r1.CashFlows, r2.CashFlows, r3.CashFlows):
+        assert abs(float(c2.Amount) - float(c1.Amount)) <= 1e-8
+        assert abs(float(c3.Amount) - float(c1.Amount)) <= 1e-8
+    for uid in r1.Delta:  # type: ignore[union-attr]
+        assert abs(float(r2.Delta[uid]) - float(r1.Delta[uid])) <= 1e-8  # type: ignore[index]
+        assert abs(float(r3.Delta[uid]) - float(r1.Delta[uid])) <= 1e-8  # type: ignore[index]
+
+    if sys.gettrace() is None:
+        assert call3_ms < 15.0, f"Call 3 warm latency {call3_ms:.2f} ms >= 15.0 ms"
+
+    max_res = torch.cuda.max_memory_reserved()
+    if base_res <= 64 * 1024 * 1024:
+        assert max_res <= 250.0 * 1024 * 1024, (
+            f"Peak reserved VRAM {max_res / (1024.0 * 1024.0):.1f} MB > 250.0 MB"
+        )
+    else:
+        delta_mb = (max_res - base_res) / (1024.0 * 1024.0)
+        assert delta_mb <= 250.0, f"Delta reserved VRAM {delta_mb:.1f} MB > 250.0 MB"
+        if os.environ.get("_DEEPVOL_VRAM_SUBPROC") != "1":
+            sub_env = os.environ.copy()
+            sub_env["_DEEPVOL_VRAM_SUBPROC"] = "1"
+            sub_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            subprocess.run(
+                [sys.executable, "-m", "pytest", __file__, "-k", "test_gpu_warm_cache_cudagraph_all_greeks_regression", "-q"],
+                env=sub_env,
+                check=True,
+                timeout=120,
+            )
+
+
+
 
 
 
