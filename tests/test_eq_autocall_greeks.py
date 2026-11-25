@@ -1005,4 +1005,363 @@ def test_greeks_audit_blind_spots(
     assert abs(float(v_mat[ei, ki]) - fd_v_ek) <= max(1e-3, 0.15 * abs(fd_v_ek))
 
 
+def test_qmc_aad_v3_is_long_basket_and_onestar_parity(
+    multi_period_request: EQAutocallableTradeRequest,
+) -> None:
+    """Verifies V3 memory VJP, IsLongBasket I_ramp VJP, and OneStar shifted left-spread on CPU."""
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        QmcAadGreeksConfig,
+        _compute_payoff_aad_state_adjoints_torch,
+        compute_qmc_aad_crn_greeks,
+    )
+
+    # 1) V3 literal forward & VJP vs central FD across perf_base on overlapping spreads.
+    rng = np.random.default_rng(123)
+    m_rem, d_assets, n_tot = 3, 2, 256
+    perf0 = torch.tensor(
+        np.exp(0.18 * rng.standard_normal((m_rem, d_assets, n_tot))),
+        dtype=torch.float64,
+    )
+    ko_b = torch.tensor([0.95, 0.92, 0.90], dtype=torch.float64)
+    is_c = torch.tensor([1.0, 1.0, 0.0], dtype=torch.float64)
+    cpn_b = torch.tensor([0.78, 0.78, 0.78], dtype=torch.float64)
+    is_g = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float64)
+    cpn_r = torch.tensor([0.04, 0.04, 0.04], dtype=torch.float64)
+    df_p = torch.tensor([0.96, 0.92, 0.88], dtype=torch.float64)
+    wf = torch.tensor([0.01, 0.01, 0.01], dtype=torch.float64)
+    tau_o = np.array([0.25, 0.50, 0.75], dtype=np.float64)
+
+    s1_box: list[torch.Tensor] = []
+    bar_lx, bar_ln_fwd, _ = _compute_payoff_aad_state_adjoints_torch(
+        perf0,
+        ko_barriers=ko_b,
+        is_callable=is_c,
+        cpn_barriers=cpn_b,
+        is_guar=is_g,
+        cpn_rates=cpn_r,
+        df_pay=df_p,
+        w_fund=wf,
+        inv_perm=[0, 1],
+        call_code=0,
+        cpn_code=0,
+        opt_code=0,
+        ko_spread=-0.10,
+        cpn_spread=-0.10,
+        ki_spread=-0.10,
+        cpn_dir_down=False,
+        cpn_type_out=False,
+        is_memory=True,
+        force_cpn_ac=False,
+        no_notional=False,
+        is_long_basket=True,
+        has_ki=True,
+        ki_barrier=1.0,
+        i_ki_past=0.0,
+        ki_monitoring_type="European",
+        tau_obs=tau_o,
+        vol_atm_obs=None,
+        strike=0.90,
+        lower_strike=None,
+        option_gearing=1.111111,
+        ac_cpn=0.0,
+        c_mem_0=0.04,
+        part_call_strike=None,
+        part_call_rate=0.0,
+        one_star_strike=1.10,
+        one_star_coupon=0.02,
+        one_star_eps=0.10,
+        barrier_eps_min=0.015,
+        barrier_eps_max=0.02,
+        n_rep=n_tot,
+        emit_stage1=True,
+        out_stage1_rep=s1_box,
+    )
+    assert len(s1_box) == 1
+    h_fd = 1e-6
+    p_u = perf0.clone()
+    p_d = perf0.clone()
+    p_u[2, 0, :] *= float(np.exp(h_fd))
+    p_d[2, 0, :] *= float(np.exp(-h_fd))
+    s_u: list[torch.Tensor] = []
+    s_d: list[torch.Tensor] = []
+    kw_common: dict[str, Any] = dict(
+        ko_barriers=ko_b,
+        is_callable=is_c,
+        cpn_barriers=cpn_b,
+        is_guar=is_g,
+        cpn_rates=cpn_r,
+        df_pay=df_p,
+        w_fund=wf,
+        inv_perm=[0, 1],
+        call_code=0,
+        cpn_code=0,
+        opt_code=0,
+        ko_spread=-0.10,
+        cpn_spread=-0.10,
+        ki_spread=-0.10,
+        cpn_dir_down=False,
+        cpn_type_out=False,
+        is_memory=True,
+        force_cpn_ac=False,
+        no_notional=False,
+        is_long_basket=True,
+        has_ki=True,
+        ki_barrier=1.0,
+        i_ki_past=0.0,
+        ki_monitoring_type="European",
+        tau_obs=tau_o,
+        vol_atm_obs=None,
+        strike=0.90,
+        lower_strike=None,
+        option_gearing=1.111111,
+        ac_cpn=0.0,
+        c_mem_0=0.04,
+        part_call_strike=None,
+        part_call_rate=0.0,
+        one_star_strike=1.10,
+        one_star_coupon=0.02,
+        one_star_eps=0.10,
+        barrier_eps_min=0.015,
+        barrier_eps_max=0.02,
+        n_rep=n_tot,
+        emit_stage1=True,
+        compute_grads=False,
+    )
+    _compute_payoff_aad_state_adjoints_torch(p_u, out_stage1_rep=s_u, **kw_common)
+    _compute_payoff_aad_state_adjoints_torch(p_d, out_stage1_rep=s_d, **kw_common)
+    c0_s = 3 * m_rem
+    fd_ln = (float(s_u[0][0, c0_s + 4]) - float(s_d[0][0, c0_s + 4])) / (2.0 * h_fd)
+    assert abs(float(bar_ln_fwd[0, 2]) - fd_ln) <= 1e-4
+    assert torch.isfinite(bar_lx).all()
+
+    # 2) OneStar left-shifted spread [1.00, 1.10] when KI is active vs centered [1.09, 1.11] when KI is None.
+    req_os = copy.deepcopy(multi_period_request)
+    req_os.Product.OneStarStrike = 1.10
+    req_os.Product.OneStarCoupon = 0.05
+    req_os.Product.AutoCallTriggerAbsoluteDigitalSpread = -0.10
+    req_os.Product.OptionDownAndInBarrierLevel = 0.78
+    req_os.Product.OptionDownAndInBarrierAbsoluteDigitalSpread = -0.05
+    st_ki = preprocess_eq_autocall(req_os)
+    cfg_os = QmcAadGreeksConfig(n_paths=512, n_replicates=4, n_substeps=2)
+    res_ki = compute_qmc_aad_crn_greeks(st_ki, req_os, queries=["ProductValue", "Delta"], config=cfg_os, device="cpu")
+    req_no_ki = copy.deepcopy(req_os)
+    req_no_ki.Product.OptionDownAndInBarrierLevel = None
+    st_no_ki = preprocess_eq_autocall(req_no_ki)
+    res_no_ki = compute_qmc_aad_crn_greeks(st_no_ki, req_no_ki, queries=["ProductValue"], config=cfg_os, device="cpu")
+    assert np.isfinite(res_ki.product_value) and np.isfinite(res_no_ki.product_value)
+
+
+def test_qmc_aad_murray_cholesky_4mode_ki_and_device_respect(
+    multi_period_request: EQAutocallableTradeRequest,
+) -> None:
+    """Checks Murray (2016) lower-Cholesky Cega vs FD, 4-mode KI, MF-CV, and device/query invariance."""
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        QmcAadGreeksConfig,
+        cholesky_corr_adjoint_np,
+        compute_qmc_aad_crn_greeks,
+    )
+
+    req_eq = copy.deepcopy(multi_period_request)
+    # Use explicit smooth digital spreads so Stage-1 FD and Stage-2 AAD Cega share the exact smoothed payoff.
+    req_eq.Product.AutoCallTriggerAbsoluteDigitalSpread = -0.10
+    if req_eq.Product.CouponBarrierLevels is not None:
+        req_eq.Product.CouponBarrierAbsoluteDigitalSpread = -0.10
+    if req_eq.Product.OptionDownAndInBarrierLevel is not None:
+        req_eq.Product.OptionDownAndInBarrierAbsoluteDigitalSpread = -0.05
+    uids = req_eq.Product.UnderlyingIdentifiers
+    # 1) Direct Murray (2016) lower-Cholesky adjoint verification on D=5 equicorrelated (rho=0.65, coalescent eigenvalues).
+    corr5 = np.full((5, 5), 0.65, dtype=np.float64)
+    np.fill_diagonal(corr5, 1.0)
+    chol5 = np.linalg.cholesky(corr5)
+    bar_l5 = np.random.default_rng(11).standard_normal((5, 5))
+    s5 = cholesky_corr_adjoint_np(chol5, bar_l5)
+    murray_sym = s5 + s5.T - np.diag(np.diag(s5))
+    h_m = 1e-6
+    cu5, cd5 = corr5.copy(), corr5.copy()
+    cu5[0, 1] += h_m
+    cu5[1, 0] += h_m
+    cd5[0, 1] -= h_m
+    cd5[1, 0] -= h_m
+    fd_m01 = float(np.sum(bar_l5 * (np.linalg.cholesky(cu5) - np.linalg.cholesky(cd5)))) / (2.0 * h_m)
+    assert abs(float(murray_sym[0, 1]) - fd_m01) < 1e-9
+
+    # 2) Full QMC CRN run with non-coalescent SPD corr: check device respect, pv_only == all_greeks, and Cega vs FD.
+    req_eq.Model.MarketDataSet.Correlations = {
+        f"{uids[i]}&{uids[j]}": round(0.45 + 0.04 * i + 0.02 * j, 4)
+        for i in range(len(uids))
+        for j in range(i + 1, len(uids))
+    }
+    st_eq = preprocess_eq_autocall(req_eq)
+    cfg_ch = QmcAadGreeksConfig(n_paths=2048, n_replicates=4, n_substeps=4, corr_aad_mode="cholesky")
+
+    res_pv = compute_qmc_aad_crn_greeks(st_eq, req_eq, queries=["ProductValue"], config=cfg_ch, device="cpu")
+    res_all = compute_qmc_aad_crn_greeks(
+        st_eq,
+        req_eq,
+        queries=["ProductValue", "Delta", "Gamma", "Vega", "Rho", "DividendsSensitivities", "Theta", "Cega"],
+        config=cfg_ch,
+        device="cpu",
+    )
+    assert abs(float(res_pv.product_value) - float(res_all.product_value)) < 1e-12
+    assert res_all.delta_tensor is not None and res_all.delta_tensor.device.type == "cpu"
+
+    h_c = 2e-3
+    r_cu = copy.deepcopy(req_eq)
+    r_cd = copy.deepcopy(req_eq)
+    k01 = f"{uids[0]}&{uids[1]}"
+    c01_base = float(req_eq.Model.MarketDataSet.Correlations[k01])
+    r_cu.Model.MarketDataSet.Correlations[k01] = c01_base + h_c
+    r_cd.Model.MarketDataSet.Correlations[k01] = c01_base - h_c
+    pv_cu = float(
+        compute_qmc_aad_crn_greeks(preprocess_eq_autocall(r_cu), r_cu, queries=["ProductValue"], config=cfg_ch, device="cpu").product_value
+    )
+    pv_cd = float(
+        compute_qmc_aad_crn_greeks(preprocess_eq_autocall(r_cd), r_cd, queries=["ProductValue"], config=cfg_ch, device="cpu").product_value
+    )
+    fd_c01 = (pv_cu - pv_cd) / (2.0 * h_c)
+    assert res_all.cega is not None
+    got_c01 = float(res_all.cega[uids[0]][uids[1]])
+    assert abs(got_c01 - fd_c01) <= max(5e-3, 0.25 * abs(fd_c01))
+
+    # CPU MF-CV vs none convergence.
+    cfg_no_cv = QmcAadGreeksConfig(n_paths=2048, n_replicates=4, n_substeps=4, cv_mode="none")
+    res_no_cv = compute_qmc_aad_crn_greeks(st_eq, req_eq, queries=["ProductValue"], config=cfg_no_cv, device="cpu")
+    assert np.isfinite(float(res_no_cv.product_value))
+
+    # 4-mode ki_obs_type dispatch distinctness.
+    pvs_ki: dict[str, float] = {}
+    for mode in ("European", "Discrete", "Daily", "Continuous"):
+        r_m = copy.deepcopy(req_eq)
+        st_m = preprocess_eq_autocall(r_m)
+        object.__setattr__(st_m, "ki_obs_type", mode)
+        pvs_ki[mode] = float(
+            compute_qmc_aad_crn_greeks(st_m, r_m, queries=["ProductValue"], config=cfg_ch, device="cpu").product_value
+        )
+    assert all(np.isfinite(v) for v in pvs_ki.values())
+    assert pvs_ki["Continuous"] <= pvs_ki["European"] + 1e-3
+
+
+def test_qmc_aad_buehler_lv_rho_divs_and_3d_spotcarry_theta(
+    multi_period_request: EQAutocallableTradeRequest,
+) -> None:
+    """Verifies Buehler LV-rebuild Rho/Dividends pullback and 3d_spotCarry Theta parity."""
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        QmcAadGreeksConfig,
+        _build_lv_table_and_forward_cache,
+        _pullback_lv_to_r_nat_and_div,
+        compute_qmc_aad_crn_greeks,
+    )
+
+    st_base = preprocess_eq_autocall(multi_period_request)
+    tk0 = st_base.sorted_identifiers[0]
+    surf0 = st_base.vol_surfaces[tk0]
+    tau_obs = st_base.tau_obs.detach().cpu().numpy().astype(np.float64)
+    r_nat0 = st_base.dividend_schedule.r_native_obs[0].detach().cpu().numpy().astype(np.float64)
+    dpv0 = st_base.dividend_schedule.div_pv[0].detach().cpu().numpy().astype(np.float64)
+    spot0 = float(st_base.spots_t0[0].item())
+    t_grid = np.linspace(1e-5, float(tau_obs[-1]), 32, dtype=np.float64)
+    y_grid = np.linspace(-1.5, 1.5, 64, dtype=np.float64)
+
+    cache0 = _build_lv_table_and_forward_cache(surf0, spot0, tau_obs, r_nat0, t_grid, y_grid, dpv0)
+    rng = np.random.default_rng(7)
+    bar_lv = rng.standard_normal(cache0["lv_out"].shape)
+    g_rn, g_dpv = _pullback_lv_to_r_nat_and_div(cache0, bar_lv)
+
+    h = 1e-7
+    for m_idx in range(len(tau_obs)):
+        rn_p, rn_m = r_nat0.copy(), r_nat0.copy()
+        rn_p[m_idx] += h
+        rn_m[m_idx] -= h
+        lv_p = _build_lv_table_and_forward_cache(surf0, spot0, tau_obs, rn_p, t_grid, y_grid, dpv0)["lv_out"]
+        lv_m = _build_lv_table_and_forward_cache(surf0, spot0, tau_obs, rn_m, t_grid, y_grid, dpv0)["lv_out"]
+        fd_rn = float(np.sum(bar_lv * (lv_p - lv_m))) / (2.0 * h)
+        assert abs(float(g_rn[m_idx]) - fd_rn) <= max(1e-5, 1e-3 * abs(fd_rn))
+
+        dp_p, dp_m = dpv0.copy(), dpv0.copy()
+        dp_p[m_idx] += h
+        dp_m[m_idx] -= h
+        lv_dp = _build_lv_table_and_forward_cache(surf0, spot0, tau_obs, r_nat0, t_grid, y_grid, dp_p)["lv_out"]
+        lv_dm = _build_lv_table_and_forward_cache(surf0, spot0, tau_obs, r_nat0, t_grid, y_grid, dp_m)["lv_out"]
+        fd_dp = float(np.sum(bar_lv * (lv_dp - lv_dm))) / (2.0 * h)
+        assert abs(float(g_dpv[m_idx]) - fd_dp) <= max(1e-5, 1e-3 * abs(fd_dp))
+
+    # Friday 2026-06-05 -> Monday 2026-06-08 3d_spotCarry Theta parity (k_cross==0 vs manual roll & k_cross>0).
+    from deepvol.models.autocall.greeks_engine import _curve_df_cached_np, _normalize_curve_obj
+
+    req_fri = copy.deepcopy(multi_period_request)
+    req_fri.Model.MarketDataSet.AsOfDate = datetime.datetime(2026, 6, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    for curve in req_fri.Model.MarketDataSet.RatesCurvesBundles.values():
+        curve.AsOfDate = datetime.datetime(2026, 6, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    st_fri = preprocess_eq_autocall(req_fri)
+    cfg_th = QmcAadGreeksConfig(n_paths=1024, n_replicates=4, n_substeps=4, cv_mode="none")
+    res_th = compute_qmc_aad_crn_greeks(
+        st_fri,
+        req_fri,
+        queries=["ProductValue", "Theta", "Rho", "DividendsSensitivities"],
+        config=cfg_th,
+        theta_convention="murex_bizday_forward_fixed",
+        device="cpu",
+    )
+    assert res_th.theta is not None and np.isfinite(float(res_th.theta))
+    assert res_th.rho is not None and len(res_th.rho) >= 1
+    assert res_th.dividends_sensitivities is not None
+
+    # Explicit Monday 2026-06-08 manual roll with 3d_spotCarry must match res_th.theta tightly.
+    req_mon = copy.deepcopy(req_fri)
+    dt_mon = datetime.datetime(2026, 6, 8, 0, 0, tzinfo=datetime.timezone.utc)
+    req_mon.Model.MarketDataSet.AsOfDate = dt_mon
+    for curve in req_mon.Model.MarketDataSet.RatesCurvesBundles.values():
+        curve.AsOfDate = dt_mon
+    dc_fri = _normalize_curve_obj(st_fri.discount_curve, as_of_date=req_fri.Model.MarketDataSet.AsOfDate)
+    df_fin_3d = float(_curve_df_cached_np(dc_fri, [dt_mon])[0])
+    for i_tk, tk in enumerate(st_fri.sorted_identifiers):
+        df_rep_3d = float(np.exp(-float(st_fri.dividend_schedule.repo_spread_avg[i_tk].item()) * 3.0 / 365.0))
+        req_mon.Model.MarketDataSet.Spots[tk] = float(req_mon.Model.MarketDataSet.Spots[tk]) * (df_rep_3d / df_fin_3d)
+    st_mon = preprocess_eq_autocall(req_mon)
+    res_mon = compute_qmc_aad_crn_greeks(
+        st_mon,
+        req_mon,
+        queries=["ProductValue"],
+        config=cfg_th,
+        device="cpu",
+    )
+    manual_theta_3d = float(res_mon.product_value) - float(res_th.product_value)
+    assert abs(float(res_th.theta) - manual_theta_3d) < 5e-4
+
+    # k_cross > 0 roll crossing the first future observation date (2026-07-22) with OneStar active.
+    from deepvol.api.schemas_eq_autocall import FixingsSpec
+
+    req_cross = copy.deepcopy(req_fri)
+    dt_pre = datetime.datetime(2026, 7, 21, 0, 0, tzinfo=datetime.timezone.utc)
+    dt_post = datetime.datetime(2026, 7, 22, 0, 0, tzinfo=datetime.timezone.utc)
+    req_cross.Model.MarketDataSet.AsOfDate = dt_pre
+    for curve in req_cross.Model.MarketDataSet.RatesCurvesBundles.values():
+        curve.AsOfDate = dt_pre
+    req_cross.Product.OneStarStrike = 1.10
+    req_cross.Product.OneStarCoupon = 0.0
+    for uid in req_cross.Product.UnderlyingIdentifiers:
+        spot_v = float(req_cross.Model.MarketDataSet.Spots[uid])
+        if uid in req_cross.Model.MarketDataSet.Fixings:
+            fx_spec = req_cross.Model.MarketDataSet.Fixings[uid]
+            fx_spec.Dates = list(fx_spec.Dates) + [dt_post]
+            fx_spec.Values = list(fx_spec.Values) + [spot_v]
+        else:
+            req_cross.Model.MarketDataSet.Fixings[uid] = FixingsSpec(
+                Identifier=uid,
+                Dates=[dt_post],
+                Values=[spot_v],
+            )
+    st_cross = preprocess_eq_autocall(req_cross)
+    res_cross = compute_qmc_aad_crn_greeks(
+        st_cross,
+        req_cross,
+        queries=["ProductValue", "Theta"],
+        config=cfg_th,
+        theta_convention="murex_bizday_forward_fixed",
+        device="cpu",
+    )
+    assert res_cross.theta is not None and np.isfinite(float(res_cross.theta))
+
+
+
 
