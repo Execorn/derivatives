@@ -5331,7 +5331,7 @@ void crn_eval_payoff_loo_l2o_cpp(const CrnLooL2oBatchArgs* args) noexcept {
     const int call_code = args->call_code;
     const int cpn_code = args->cpn_code;
     const bool is_long_basket = (args->is_long_basket != 0);
-    const int opt_code = (is_long_basket && args->opt_code == 0) ? 2 : args->opt_code;
+    const int opt_code = args->opt_code;
     const int eff_call = canonicalize_tile_code(call_code, D);
     const int eff_cpn = canonicalize_tile_code(cpn_code, D);
     const int eff_opt = canonicalize_tile_code(opt_code, D);
@@ -6670,7 +6670,7 @@ std::int32_t crn_eval_vibrato_gamma_cpp(const VibratoGammaArgs* args) noexcept {
     const bool is_long_basket = args->is_long_basket != 0;
     const int call_code = canonicalize_tile_code(args->call_code, D);
     const int cpn_code = canonicalize_tile_code(args->cpn_code, D);
-    const int eff_opt_raw = (is_long_basket && args->opt_code == 0) ? 2 : args->opt_code;
+    const int eff_opt_raw = args->opt_code;
     const int eff_opt_code = canonicalize_tile_code(eff_opt_raw, D);
 
     const bool has_ki = args->has_ki != 0;
