@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import logging
 import math
 import os
@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import numpy.typing as npt
 from scipy import sparse as sp_sparse
-from scipy.optimize import linprog, nnls
+from scipy.optimize import linprog, minimize, nnls
 from scipy.stats import norm
 import torch
 import torch.nn as nn
@@ -37,6 +37,7 @@ from deepvol.models.autocall.feature_layout import (
 from deepvol.mrm.eq_autocall_guardian import _regularize_cov_oas_correlation_space
 from deepvol.surrogates.eq_autocall_egno import (
     MaskedEQAutocallSurrogate,
+    assemble_surrogate_components,
     assemble_surrogate_product_value,
 )
 
@@ -90,6 +91,25 @@ FEATURE_NAMES_16D: Tuple[str, ...] = (
 )
 
 
+def _concat_batches(batches: List[SyntheticAutocallBatch]) -> SyntheticAutocallBatch:
+    """Concatenates non-empty `SyntheticAutocallBatch` splits along dimension 0."""
+    non_empty = [b for b in batches if int(b.node_feats.shape[0]) > 0]
+    if not non_empty:
+        return batches[0]
+    if len(non_empty) == 1:
+        return non_empty[0]
+    merged: Dict[str, Any] = {}
+    for f in fields(SyntheticAutocallBatch):
+        vals = [getattr(b, f.name) for b in non_empty]
+        if all(v is None for v in vals):
+            merged[f.name] = None
+        elif any(v is None for v in vals):
+            merged[f.name] = None
+        else:
+            merged[f.name] = torch.cat(vals, dim=0)
+    return SyntheticAutocallBatch(**merged)
+
+
 @dataclass
 class SobolevLossBreakdown:
     """Detailed component breakdown of `SpreadAttenuatedSobolevLoss`."""
@@ -133,8 +153,8 @@ class SpreadAttenuatedSobolevLoss(nn.Module):
     def __init__(
         self,
         delta_b_0: float = 0.05,
-        lambda_comp: float = 0.50,
-        lambda_delta: float = 1.0,
+        lambda_comp: float = 0.40,
+        lambda_delta: float = 0.65,
         lambda_mono: float = 1.0,
         lambda_jac: float = 1e-4,
         ko_bump_delta: float = 0.02,
@@ -179,6 +199,9 @@ class SpreadAttenuatedSobolevLoss(nn.Module):
         h_bumped: Optional[torch.Tensor] = None,
         surv_base: Optional[torch.Tensor] = None,
         surv_bumped: Optional[torch.Tensor] = None,
+        pv_coupon_pred: Optional[torch.Tensor] = None,
+        pv_coupon_target: Optional[torch.Tensor] = None,
+        coupon_pv_valid: Optional[torch.Tensor] = None,
     ) -> SobolevLossBreakdown:
         """Computes all Sobolev loss terms from pre-evaluated prediction and target tensors."""
         dtype = pv_pred.dtype
@@ -193,29 +216,56 @@ class SpreadAttenuatedSobolevLoss(nn.Module):
         d_count = m_asset.sum(dim=1).clamp(min=1.0)
         m_count = m_sched.sum(dim=1).clamp(min=1.0)
 
-        # 1. Balanced SmoothL1 + light MSE value loss (prevents exotic outliers drowning WorstOf)
+        # 1. Balanced SmoothL1 + MSE value loss (targets <=15 bps MAE across all regimes)
         val_loss = (
-            100.0 * F.smooth_l1_loss(pv_pred, pv_t, beta=0.0005)
-            + 10.0 * F.mse_loss(pv_pred, pv_t)
+            160.0 * F.smooth_l1_loss(pv_pred, pv_t, beta=0.0002)
+            + 40.0 * F.mse_loss(pv_pred, pv_t)
         )
 
-        # 2. Component probability & put-loss supervision on live survival periods
+        # 2. Component probability, coupon-leg PV & put-loss supervision on live survival periods
         p_err_sq = ((p_pred - p_t) ** 2) * m_sched
+        p_huber = F.smooth_l1_loss(p_pred, p_t, beta=0.005, reduction="none") * m_sched
         surv_prev_t = torch.cat(
             [torch.ones_like(p_t[:, :1]), (1.0 - torch.cumsum(p_t, dim=1))[:, :-1]],
             dim=1,
         )
         q_valid = m_sched * (surv_prev_t > 1e-4).to(dtype=dtype)
+        q_count = q_valid.sum(dim=1).clamp(min=1.0)
         q_err_sq = ((q_pred - q_t) ** 2) * q_valid
-        prob_mse = (
-            (p_err_sq.sum(dim=1) / m_count)
-            + (q_err_sq.sum(dim=1) / q_valid.sum(dim=1).clamp(min=1.0))
-        ).mean()
-        put_loss = (
-            100.0 * F.smooth_l1_loss(l_put_pred, l_t, beta=0.0005)
-            + 10.0 * F.mse_loss(l_put_pred, l_t)
+        q_huber = F.smooth_l1_loss(q_pred, q_t, beta=0.005, reduction="none") * q_valid
+        # Memory autocalls (M > 1) carry a W1 path-covariance gap vs scalar q_mc; relax raw q_mc weight
+        # while supervising pv_coupon_pred directly against V3 coupon_pv_mc.
+        is_mem = global_feats[:, int(AutocallGlobalCol.IS_MEMORY_FLAG)] > 0.5
+        exact_q_mask = (~is_mem) | (m_count <= 1.5)
+        q_sample_w = torch.where(
+            exact_q_mask,
+            torch.ones_like(m_count),
+            torch.full_like(m_count, 0.02),
         )
-        comp_loss = 50.0 * prob_mse + put_loss
+        p_term = (p_err_sq.sum(dim=1) / m_count) + 0.5 * (p_huber.sum(dim=1) / m_count)
+        q_term = q_sample_w * ((q_err_sq.sum(dim=1) / q_count) + 0.5 * (q_huber.sum(dim=1) / q_count))
+        prob_mse = (p_term + q_term).mean()
+        put_loss = (
+            160.0 * F.smooth_l1_loss(l_put_pred, l_t, beta=0.0002)
+            + 40.0 * F.mse_loss(l_put_pred, l_t)
+        )
+        if pv_coupon_pred is not None and pv_coupon_target is not None:
+            cpn_t = pv_coupon_target.to(dtype=dtype)
+            valid_cpn = (
+                (coupon_pv_valid > 0.5)
+                if coupon_pv_valid is not None
+                else torch.ones_like(pv_coupon_pred, dtype=torch.bool)
+            )
+            if bool(valid_cpn.any()):
+                cpn_loss = (
+                    160.0 * F.smooth_l1_loss(pv_coupon_pred[valid_cpn], cpn_t[valid_cpn], beta=0.0002)
+                    + 40.0 * F.mse_loss(pv_coupon_pred[valid_cpn], cpn_t[valid_cpn])
+                )
+            else:
+                cpn_loss = torch.zeros((), dtype=dtype, device=pv_pred.device)
+        else:
+            cpn_loss = torch.zeros((), dtype=dtype, device=pv_pred.device)
+        comp_loss = 80.0 * prob_mse + put_loss + cpn_loss
 
         # 3. Spread-attenuated Huber first-order Delta Sobolev penalty (applied ONCE)
         w_spread = self.spread_attenuation_weight(global_feats.to(dtype=dtype))
@@ -267,6 +317,7 @@ class SpreadAttenuatedSobolevLoss(nn.Module):
         *,
         create_graph_for_sobolev: bool = True,
         compute_sobolev: bool = True,
+        compute_mono: bool = True,
         return_breakdown: bool = False,
     ) -> torch.Tensor | SobolevLossBreakdown:
         """Evaluates `model` on `batch` and computes the Spread-Attenuated Sobolev H^1 loss."""
@@ -293,7 +344,7 @@ class SpreadAttenuatedSobolevLoss(nn.Module):
             all_active=True,
             require_second_order_sdpa=bool(compute_sobolev and create_graph_for_sobolev),
         )
-        pv_pred = assemble_surrogate_product_value(
+        pv_pred, _, pv_coupon_pred, _ = assemble_surrogate_components(
             surr_out,
             sched_in,
             smask_in,
@@ -307,12 +358,17 @@ class SpreadAttenuatedSobolevLoss(nn.Module):
 
         if compute_sobolev and self.lambda_delta > 0.0:
             # Contract total derivative d(V_pred)/dX @ dX/d(ln M0) using precomputed static Jacobians.
-            g_node, g_edge, g_sched, g_glob = torch.autograd.grad(
+            g_node_raw, g_edge_raw, g_sched_raw, g_glob_raw = torch.autograd.grad(
                 pv_pred.sum(),
                 (node_in, edge_in, sched_in, glob_in),
                 create_graph=create_graph_for_sobolev,
                 retain_graph=True,
+                allow_unused=True,
             )
+            g_node = torch.zeros_like(node_in) if g_node_raw is None else g_node_raw
+            g_edge = torch.zeros_like(edge_in) if g_edge_raw is None else g_edge_raw
+            g_sched = torch.zeros_like(sched_in) if g_sched_raw is None else g_sched_raw
+            g_glob = torch.zeros_like(glob_in) if g_glob_raw is None else g_glob_raw
             # LOG_PERF_DIFF = sqrt(diff^2 + eps) is symmetric in (i, j), so both cols 1 and 2 add transpose grads.
             g_edge_sym = g_edge[:, :, :, 1:3] + g_edge.transpose(1, 2)[:, :, :, 1:3]
             delta_pred_total = (
@@ -331,7 +387,7 @@ class SpreadAttenuatedSobolevLoss(nn.Module):
         # Evaluate KO barrier monotonicity bump using precomputed analytically bumped PROXY_KO_PROB.
         h_bumped: Optional[torch.Tensor] = None
         surv_bumped: Optional[torch.Tensor] = None
-        if self.lambda_mono > 0.0 and self.ko_bump_delta > 0.0:
+        if compute_mono and self.lambda_mono > 0.0 and self.ko_bump_delta > 0.0:
             sched_bumped = sched_in.detach().clone()
             is_call = sched_bumped[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)] * smask_in
             sched_bumped[:, :, int(AutocallSchedCol.LOG_KO_BARRIER)] = (
@@ -381,7 +437,19 @@ class SpreadAttenuatedSobolevLoss(nn.Module):
             h_bumped=h_bumped,
             surv_base=surr_out.survival_probs,
             surv_bumped=surv_bumped,
+            pv_coupon_pred=pv_coupon_pred,
+            pv_coupon_target=batch.coupon_pv_mc,
+            coupon_pv_valid=batch.coupon_pv_valid,
         )
+        # Light shrinkage keeps residual logits calibrated under extreme barrier extrapolation.
+        m_cnt = (smask_in > 0.5).to(dtype=pv_pred.dtype).sum(dim=1).clamp(min=1.0)
+        logit_reg = 1e-4 * (
+            (((surr_out.delta_hazard_logits ** 2) + (surr_out.delta_coupon_logits ** 2)) * smask_in)
+            .sum(dim=1)
+            / m_cnt
+            + (surr_out.delta_put_loss ** 2)
+        ).mean()
+        breakdown.total_loss = breakdown.total_loss + logit_reg
         if return_breakdown:
             return breakdown
         return breakdown.total_loss
@@ -445,9 +513,13 @@ def extract_16d_features_from_batch(batch: SyntheticAutocallBatch) -> npt.NDArra
     return out
 
 
-def _compute_difficulty_basis_5d(batch: SyntheticAutocallBatch) -> npt.NDArray[np.float64]:
-    """Computes the 5D physical difficulty basis phi(x) >= 0 in float64:
-    [1.0, sqrt(h_disp * v_bar), ((M_rem - 1)/47) * v_bar, I_WOF * h_disp, I_live_KI * G_put * v_last].
+def _compute_difficulty_basis_8d(
+    batch: SyntheticAutocallBatch,
+    residual_pv_abs: Optional[npt.NDArray[np.float64]] = None,
+) -> npt.NDArray[np.float64]:
+    """Computes the 8D physical difficulty basis phi(x) >= 0 in float64:
+    [1.0, sqrt(h_disp * v_bar), ((M_rem - 1)/47) * v_bar, I_WOF * h_disp, I_live_KI * G_put * v_last,
+     I_mem * c_mem_0, G_put * L_put_proxy * max(0, 1 - min_m0), |PV_surr - PV_proxy|].
     """
     n_b = int(batch.node_feats.shape[0])
     w_col = batch.node_feats[:, :, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)].to(torch.float64)
@@ -501,12 +573,46 @@ def _compute_difficulty_basis_5d(batch: SyntheticAutocallBatch) -> npt.NDArray[n
         v_last = torch.zeros((n_b,), dtype=torch.float64, device=h_disp.device)
     phi_4 = (has_ki & not_ki_past).to(dtype=torch.float64) * g_put * v_last
 
-    return torch.stack([phi_0, phi_1, phi_2, phi_3, phi_4], dim=1).detach().cpu().numpy().astype(np.float64)
+    is_mem = (batch.global_feats[:, int(AutocallGlobalCol.IS_MEMORY_FLAG)].to(torch.float64) > 0.5).to(
+        dtype=torch.float64
+    )
+    c_mem_0 = batch.global_feats[:, int(AutocallGlobalCol.C_MEM_0)].to(torch.float64).clamp(min=0.0)
+    phi_5 = is_mem * c_mem_0
+
+    l_put_px = batch.global_feats[:, int(AutocallGlobalCol.L_PUT_PROXY)].to(torch.float64).clamp(min=0.0)
+    log_m = batch.node_feats[:, :, int(AutocallNodeCol.LOG_MONEYNESS)].to(torch.float64)
+    active_bool = batch.asset_mask > 0.5
+    m0_vals = torch.exp(log_m.clamp(-10.0, 10.0))
+    m0_masked = torch.where(active_bool, m0_vals, torch.full_like(m0_vals, 1e6))
+    has_any_a = active_bool.any(dim=1)
+    min_m0 = torch.where(has_any_a, m0_masked.min(dim=1).values, torch.ones_like(phi_0))
+    phi_6 = g_put * l_put_px * (1.0 - min_m0).clamp(min=0.0)
+
+    if residual_pv_abs is not None:
+        res_arr = np.asarray(residual_pv_abs, dtype=np.float64).reshape(-1)
+        if res_arr.shape[0] != n_b:
+            raise ValueError(f"residual_pv_abs length {res_arr.shape[0]} != batch size {n_b}.")
+        phi_7 = torch.as_tensor(np.maximum(res_arr, 0.0), dtype=torch.float64, device=h_disp.device)
+    else:
+        phi_7 = torch.zeros((n_b,), dtype=torch.float64, device=h_disp.device)
+
+    return (
+        torch.stack([phi_0, phi_1, phi_2, phi_3, phi_4, phi_5, phi_6, phi_7], dim=1)
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float64)
+    )
+
+
+def _compute_difficulty_basis_5d(batch: SyntheticAutocallBatch) -> npt.NDArray[np.float64]:
+    """Computes the leading 5D physical difficulty basis phi(x) >= 0 in float64."""
+    return _compute_difficulty_basis_8d(batch)[:, :5]
 
 
 def _compute_local_scale_factor(batch: SyntheticAutocallBatch) -> npt.NDArray[np.float64]:
     """Computes sqrt(h_disp * v_bar) local heteroscedastic scale factor per trade."""
-    return _compute_difficulty_basis_5d(batch)[:, 1]
+    return _compute_difficulty_basis_8d(batch)[:, 1]
 
 
 def _extract_mondrian_cell_keys_from_batch(batch: SyntheticAutocallBatch) -> List[str]:
@@ -526,11 +632,58 @@ def _extract_mondrian_cell_keys_from_batch(batch: SyntheticAutocallBatch) -> Lis
     return keys
 
 
+def _extract_mondrian_cell_keys_24_from_batch(batch: SyntheticAutocallBatch) -> List[str]:
+    """Maps each trade in `batch` to its 24-cell Mondrian key `ki{0,1}_m{0,1,2}_d{0,1}_mem{0,1}`."""
+    base_keys = _extract_mondrian_cell_keys_from_batch(batch)
+    is_mem = (batch.global_feats[:, int(AutocallGlobalCol.IS_MEMORY_FLAG)] > 0.5).detach().cpu().numpy()
+    return [f"{bk}_mem{1 if bool(mem_f) else 0}" for bk, mem_f in zip(base_keys, is_mem)]
+
+
 def compute_conformal_half_width_bps(
     batch: SyntheticAutocallBatch,
     stats_payload: Dict[str, Any],
+    *,
+    pv_pred: Optional[torch.Tensor | npt.NDArray[np.float64]] = None,
 ) -> npt.NDArray[np.float64]:
-    """Computes split-conformal half-width in bps using 5D difficulty weights (and optional Mondrian table)."""
+    """Computes split/Mondrian-conformal worst-case error bound in bps (8D signed EB-Mondrian or 5D fallback)."""
+    if (
+        "scale_weights_8d" in stats_payload
+        and stats_payload["scale_weights_8d"] is not None
+        and "mondrian_q_lo_table" in stats_payload
+        and "mondrian_q_hi_table" in stats_payload
+    ):
+        w8 = np.asarray(
+            stats_payload["scale_weights_8d"].detach().cpu().numpy()
+            if isinstance(stats_payload["scale_weights_8d"], torch.Tensor)
+            else stats_payload["scale_weights_8d"],
+            dtype=np.float64,
+        ).reshape(8)
+        res_abs: Optional[npt.NDArray[np.float64]] = None
+        if pv_pred is not None:
+            pv_p_np = (
+                pv_pred.detach().cpu().numpy().astype(np.float64)
+                if isinstance(pv_pred, torch.Tensor)
+                else np.asarray(pv_pred, dtype=np.float64)
+            )
+            pv_px_np = batch.pv_proxy.detach().cpu().numpy().astype(np.float64)
+            res_abs = np.abs(pv_p_np - pv_px_np)
+        phi_8 = _compute_difficulty_basis_8d(batch, residual_pv_abs=res_abs)
+        scale_8 = np.maximum(phi_8 @ w8, 1.5e-4)
+
+        b_glob = float(stats_payload.get("b_global_conformal", 0.0))
+        q_lo_glob = float(stats_payload.get("q_lo_conformal", stats_payload.get("q_err_conformal", 0.0)))
+        q_hi_glob = float(stats_payload.get("q_hi_conformal", stats_payload.get("q_err_conformal", 0.0)))
+        b_tbl = stats_payload.get("mondrian_bias_table") or {}
+        q_lo_tbl = stats_payload.get("mondrian_q_lo_table") or {}
+        q_hi_tbl = stats_payload.get("mondrian_q_hi_table") or {}
+        cell_keys_24 = _extract_mondrian_cell_keys_24_from_batch(batch)
+        b_vec = np.array([float(b_tbl.get(k, b_glob)) for k in cell_keys_24], dtype=np.float64)
+        q_lo_vec = np.array([float(q_lo_tbl.get(k, q_lo_glob)) for k in cell_keys_24], dtype=np.float64)
+        q_hi_vec = np.array([float(q_hi_tbl.get(k, q_hi_glob)) for k in cell_keys_24], dtype=np.float64)
+        lo_bound = np.abs(b_vec - q_lo_vec * scale_8)
+        hi_bound = np.abs(b_vec + q_hi_vec * scale_8)
+        return np.asarray(np.maximum(lo_bound, hi_bound) * 1e4, dtype=np.float64)
+
     q_err = float(stats_payload["q_err_conformal"])
     if "scale_weights_5d" in stats_payload and stats_payload["scale_weights_5d"] is not None:
         w5 = np.asarray(
@@ -601,20 +754,27 @@ def _predict_batch_pv(
     return torch.cat(preds, dim=0)
 
 
-def _fit_quantile_scale_weights_5d(
+def _fit_quantile_scale_weights_8d(
     phi_fit: npt.NDArray[np.float64],
     err_fit: npt.NDArray[np.float64],
     *,
     tau: float = 0.90,
+    l2_reg: float = 1e-4,
+    w1_floor: float = 5e-4,
 ) -> npt.NDArray[np.float64]:
-    """Fits non-negative tau-quantile pinball loss regression weights w in R>=0^5."""
-    n1 = int(phi_fit.shape[0])
+    """Fits L2-regularized non-negative tau-quantile pinball weights w in R>=0^8 with w[1] >= w1_floor."""
+    n1, d_phi = phi_fit.shape
+    w_init = np.zeros(d_phi, dtype=np.float64)
+    w_init[0] = 1.5e-4
+    if d_phi > 1:
+        w_init[1] = float(w1_floor)
+
     if n1 >= 32:
-        c = np.zeros(5 + 2 * n1, dtype=np.float64)
+        c = np.zeros(d_phi + 2 * n1, dtype=np.float64)
         c[0] = 1e-3
-        c[1:5] = 1e-5
-        c[5 : 5 + n1] = float(tau) / float(n1)
-        c[5 + n1 : 5 + 2 * n1] = (1.0 - float(tau)) / float(n1)
+        c[1:d_phi] = 1e-4
+        c[d_phi : d_phi + n1] = float(tau) / float(n1)
+        c[d_phi + n1 : d_phi + 2 * n1] = (1.0 - float(tau)) / float(n1)
         a_eq = sp_sparse.hstack(
             [
                 sp_sparse.csr_matrix(phi_fit),
@@ -623,18 +783,57 @@ def _fit_quantile_scale_weights_5d(
             ],
             format="csr",
         )
-        bounds = [(1.5e-4, None)] + [(0.0, None)] * (4 + 2 * n1)
-        res = linprog(c=c, A_eq=a_eq, b_eq=err_fit, bounds=bounds, method="highs")
+        bounds_lp = (
+            [(1.5e-4, 3.0e-4), (float(w1_floor), None)]
+            + [(0.0, None)] * (d_phi - 2)
+            + [(0.0, None)] * (2 * n1)
+        )
+        res = linprog(c=c, A_eq=a_eq, b_eq=err_fit, bounds=bounds_lp, method="highs")
         if bool(res.success) and res.x is not None:
-            w = np.asarray(res.x[:5], dtype=np.float64)
-            w[0] = max(float(w[0]), 1.5e-4)
-            w[1:] = np.maximum(w[1:], 0.0)
-            return w
+            w_init = np.asarray(res.x[:d_phi], dtype=np.float64)
+        else:
+            w_nnls, _ = nnls(phi_fit, err_fit)
+            w_init = np.asarray(w_nnls[:d_phi], dtype=np.float64)
+    else:
+        w_nnls, _ = nnls(phi_fit, err_fit)
+        w_init = np.asarray(w_nnls[:d_phi], dtype=np.float64)
 
-    w_nnls, _ = nnls(phi_fit, err_fit)
-    w_out = np.asarray(w_nnls[:5], dtype=np.float64)
-    w_out[0] = max(float(w_out[0]), 1.5e-4)
-    w_out[1:] = np.maximum(w_out[1:], 0.0)
+    w_init[0] = min(max(float(w_init[0]), 1.5e-4), 3.0e-4)
+    if d_phi > 1:
+        w_init[1] = max(float(w_init[1]), float(w1_floor))
+        w_init[2:] = np.maximum(w_init[2:], 0.0)
+
+    eps_smooth = 1e-5
+    inv_n = 1.0 / float(max(n1, 1))
+    tau_f = float(tau)
+
+    def _smooth_pinball_obj(w_vec: npt.NDArray[np.float64]) -> Tuple[float, npt.NDArray[np.float64]]:
+        r = err_fit - phi_fit @ w_vec
+        z = np.clip(r / eps_smooth, -40.0, 40.0)
+        sp_pos = np.where(r / eps_smooth > 40.0, r, eps_smooth * np.log1p(np.exp(z)))
+        sp_neg = np.where(-r / eps_smooth > 40.0, -r, eps_smooth * np.log1p(np.exp(-z)))
+        sig_pos = 1.0 / (1.0 + np.exp(-z))
+        sig_neg = 1.0 - sig_pos
+        loss = inv_n * float(np.sum(tau_f * sp_pos + (1.0 - tau_f) * sp_neg))
+        reg = 0.5 * float(l2_reg) * float(np.sum(w_vec[1:] * w_vec[1:]))
+        d_loss_dr = inv_n * (tau_f * sig_pos - (1.0 - tau_f) * sig_neg)
+        grad = -(phi_fit.T @ d_loss_dr)
+        grad[1:] += float(l2_reg) * w_vec[1:]
+        return loss + reg, grad
+
+    bounds_lbfgs = [(1.5e-4, 3.0e-4), (float(w1_floor), None)] + [(0.0, None)] * max(d_phi - 2, 0)
+    opt = minimize(
+        _smooth_pinball_obj,
+        w_init,
+        jac=True,
+        method="L-BFGS-B",
+        bounds=bounds_lbfgs[:d_phi],
+    )
+    w_out = np.asarray(opt.x if bool(opt.success) else w_init, dtype=np.float64)
+    w_out[0] = min(max(float(w_out[0]), 1.5e-4), 3.0e-4)
+    if d_phi > 1:
+        w_out[1] = max(float(w_out[1]), float(w1_floor))
+        w_out[2:] = np.maximum(w_out[2:], 0.0)
     return w_out
 
 
@@ -645,10 +844,10 @@ def calibrate_guardian_stats(
     *,
     device: torch.device,
     conformal_alpha: float = 0.05,
-    tau_desk_bps: float = 60.0,
+    tau_desk_bps: float = 15.0,
     stats_path: Optional[Path] = DEFAULT_GUARDIAN_STATS_PATH,
 ) -> Dict[str, Any]:
-    """Fits correlation-space standardized OAS covariance, Laplace-smoothed 10-decile PSI bins, and Mondrian 5D-CQR quantiles."""
+    """Fits OAS covariance, Laplace-smoothed 10-decile PSI bins, and signed 8D EB-Mondrian CQR quantiles."""
     x_fit = extract_16d_features_from_batch(train_batch)
     n_fit, p = x_fit.shape
     ref_mean = np.mean(x_fit, axis=0)
@@ -691,7 +890,7 @@ def calibrate_guardian_stats(
         probs = (counts.astype(np.float64) + 0.5) / (float(max(n_fit, 1)) + 5.0)
         psi_ref_probs[j] = probs / np.sum(probs)
 
-    # Split-conformal calibration strictly on held-out Cal split (Cal-1 quantile fit, disjoint Cal-2 conformal quantile)
+    # Split-conformal calibration strictly on held-out Cal split (Cal-1 scale/bias fit, Cal-2 signed conformal quantiles)
     x_cal = extract_16d_features_from_batch(cal_batch)
     n_cal = int(x_cal.shape[0])
     if n_cal < 2048:
@@ -706,43 +905,106 @@ def calibrate_guardian_stats(
 
     pv_pred_cal = _predict_batch_pv(model, cal_batch, device=device).numpy()
     pv_mc_cal = cal_batch.pv_mc.detach().cpu().numpy().astype(np.float64)
-    abs_err_cal = np.abs(pv_pred_cal - pv_mc_cal)
-    phi_cal = _compute_difficulty_basis_5d(cal_batch)
-    all_cell_keys = _extract_mondrian_cell_keys_from_batch(cal_batch)
+    pv_px_cal = cal_batch.pv_proxy.detach().cpu().numpy().astype(np.float64)
+    signed_res_cal = pv_mc_cal - pv_pred_cal
+    abs_err_cal = np.abs(signed_res_cal)
+    res_px_cal = np.abs(pv_pred_cal - pv_px_cal)
+    phi_cal_8d = _compute_difficulty_basis_8d(cal_batch, residual_pv_abs=res_px_cal)
+    all_cell_keys_12 = _extract_mondrian_cell_keys_from_batch(cal_batch)
+    all_cell_keys_24 = _extract_mondrian_cell_keys_24_from_batch(cal_batch)
 
+    tau_q = max(0.85, min(0.98, 1.0 - float(conformal_alpha)))
+    m0_eb = 50.0
     if n_cal >= 64:
         split_idx = n_cal // 2
-        w5 = _fit_quantile_scale_weights_5d(phi_cal[:split_idx], abs_err_cal[:split_idx], tau=0.90)
-        phi_score = phi_cal[split_idx:]
+        w8 = _fit_quantile_scale_weights_8d(phi_cal_8d[:split_idx], abs_err_cal[:split_idx], tau=tau_q)
+        fit_res = signed_res_cal[:split_idx]
+        fit_keys_24 = np.asarray(all_cell_keys_24[:split_idx])
+        phi_score = phi_cal_8d[split_idx:]
+        signed_score = signed_res_cal[split_idx:]
         err_score = abs_err_cal[split_idx:]
-        score_cell_keys = all_cell_keys[split_idx:]
+        score_keys_12 = all_cell_keys_12[split_idx:]
+        score_keys_24 = all_cell_keys_24[split_idx:]
     else:
-        w5 = _fit_quantile_scale_weights_5d(phi_cal, abs_err_cal, tau=0.90)
-        phi_score = phi_cal
+        w8 = _fit_quantile_scale_weights_8d(phi_cal_8d, abs_err_cal, tau=tau_q)
+        fit_res = signed_res_cal
+        fit_keys_24 = np.asarray(all_cell_keys_24)
+        phi_score = phi_cal_8d
+        signed_score = signed_res_cal
         err_score = abs_err_cal
-        score_cell_keys = all_cell_keys
+        score_keys_12 = all_cell_keys_12
+        score_keys_24 = all_cell_keys_24
 
+    b_global = float(np.mean(fit_res)) if fit_res.size > 0 else 0.0
+    mondrian_bias_table: Dict[str, float] = {}
+    for ki_b in (0, 1):
+        for m_b in (0, 1, 2):
+            for d_b in (0, 1):
+                for mem_b in (0, 1):
+                    ck24 = f"ki{ki_b}_m{m_b}_d{d_b}_mem{mem_b}"
+                    c_mask_f = fit_keys_24 == ck24
+                    n_cf = int(np.sum(c_mask_f))
+                    if n_cf > 0:
+                        b_emp = float(np.mean(fit_res[c_mask_f]))
+                        b_hat = (n_cf / (n_cf + m0_eb)) * b_emp + (m0_eb / (n_cf + m0_eb)) * b_global
+                    else:
+                        b_hat = b_global
+                    mondrian_bias_table[ck24] = float(b_hat)
+
+    eff_alpha = float(conformal_alpha) * 0.88 if 0.0 < float(conformal_alpha) < 0.25 else float(conformal_alpha)
     n_score = int(err_score.shape[0])
-    denom_score = np.maximum(phi_score @ w5, 1.5e-4)
-    scores_cal = err_score / denom_score
-    q_err_level = min(1.0, math.ceil((n_score + 1) * (1.0 - conformal_alpha)) / float(max(n_score, 1)))
-    q_err_conformal = float(np.quantile(scores_cal, q_err_level))
-    scale_eps0 = float(w5[0])
-    scale_c1 = float(w5[1])
+    denom_score = np.maximum(phi_score @ w8, 1.5e-4)
 
-    # 12-Cell Hierarchical Mondrian Conformal Quantiles with Empirical Bayes shrinkage (m0 = 50)
-    m0_eb = 50.0
+    # Centered signed standardized residuals on Cal-2 for asymmetric EB-Mondrian quantiles
+    b_hat_score = np.array([mondrian_bias_table.get(k, b_global) for k in score_keys_24], dtype=np.float64)
+    u_score = (signed_score - b_hat_score) / denom_score
+    alpha_side = 0.5 * eff_alpha
+    lvl_side = min(1.0, math.ceil((n_score + 1) * (1.0 - alpha_side)) / float(max(n_score, 1)))
+    q_hi_global = max(0.0, float(np.quantile(u_score, lvl_side))) if n_score > 0 else 0.0
+    q_lo_global = max(0.0, float(np.quantile(-u_score, lvl_side))) if n_score > 0 else 0.0
+
+    mondrian_q_lo_table: Dict[str, float] = {}
+    mondrian_q_hi_table: Dict[str, float] = {}
+    score_keys_24_arr = np.asarray(score_keys_24)
+    for ki_b in (0, 1):
+        for m_b in (0, 1, 2):
+            for d_b in (0, 1):
+                for mem_b in (0, 1):
+                    ck24 = f"ki{ki_b}_m{m_b}_d{d_b}_mem{mem_b}"
+                    c_mask = score_keys_24_arr == ck24
+                    n_c = int(np.sum(c_mask))
+                    if n_c > 0:
+                        c_u = u_score[c_mask]
+                        lvl_c = min(1.0, math.ceil((n_c + 1) * (1.0 - alpha_side)) / float(n_c))
+                        q_hi_emp = max(0.0, float(np.quantile(c_u, lvl_c)))
+                        q_lo_emp = max(0.0, float(np.quantile(-c_u, lvl_c)))
+                        q_hi_c = (n_c / (n_c + m0_eb)) * q_hi_emp + (m0_eb / (n_c + m0_eb)) * q_hi_global
+                        q_lo_c = (n_c / (n_c + m0_eb)) * q_lo_emp + (m0_eb / (n_c + m0_eb)) * q_lo_global
+                    else:
+                        q_hi_c = q_hi_global
+                        q_lo_c = q_lo_global
+                    mondrian_q_hi_table[ck24] = float(q_hi_c)
+                    mondrian_q_lo_table[ck24] = float(q_lo_c)
+
+    # Legacy 12-cell unsigned summary kept populated for backward compatibility
+    scores_cal = err_score / denom_score
+    q_err_level = min(1.0, math.ceil((n_score + 1) * (1.0 - eff_alpha)) / float(max(n_score, 1)))
+    q_err_conformal = float(np.quantile(scores_cal, q_err_level))
+    w5 = w8[:5].copy()
+    scale_eps0 = float(w8[0])
+    scale_c1 = float(w8[1])
+
     mondrian_q_err_table: Dict[str, float] = {}
-    score_keys_arr = np.asarray(score_cell_keys)
+    score_keys_12_arr = np.asarray(score_keys_12)
     for ki_b in (0, 1):
         for m_b in (0, 1, 2):
             for d_b in (0, 1):
                 ck = f"ki{ki_b}_m{m_b}_d{d_b}"
-                c_mask = score_keys_arr == ck
+                c_mask = score_keys_12_arr == ck
                 n_c = int(np.sum(c_mask))
                 if n_c > 0:
                     c_scores = scores_cal[c_mask]
-                    lvl_c = min(1.0, math.ceil((n_c + 1) * (1.0 - conformal_alpha)) / float(n_c))
+                    lvl_c = min(1.0, math.ceil((n_c + 1) * (1.0 - eff_alpha)) / float(n_c))
                     q_emp_c = float(np.quantile(c_scores, lvl_c))
                     q_eff_c = (n_c / (n_c + m0_eb)) * q_emp_c + (m0_eb / (n_c + m0_eb)) * q_err_conformal
                 else:
@@ -751,6 +1013,7 @@ def calibrate_guardian_stats(
 
     payload: Dict[str, Any] = {
         "schema_version": FEATURE_SCHEMA_VERSION,
+        "conformal_mode": "signed_8d_eb_mondrian",
         "feature_names_16d": list(FEATURE_NAMES_16D),
         "ref_mean_16d": torch.from_numpy(ref_mean).to(torch.float64),
         "ref_cov_oas_16d": torch.from_numpy(cov_oas_in).to(torch.float64),
@@ -763,11 +1026,18 @@ def calibrate_guardian_stats(
         "tau_desk_bps": float(tau_desk_bps),
         "q_ood_conformal": q_ood_conformal,
         "q_err_conformal": q_err_conformal,
+        "b_global_conformal": b_global,
+        "q_lo_conformal": q_lo_global,
+        "q_hi_conformal": q_hi_global,
         "scale_weights_5d": torch.from_numpy(w5).to(torch.float64),
+        "scale_weights_8d": torch.from_numpy(w8).to(torch.float64),
         "scale_eps0": scale_eps0,
         "scale_c1": scale_c1,
         "n_cal": n_cal,
         "mondrian_q_err_table": mondrian_q_err_table,
+        "mondrian_bias_table": mondrian_bias_table,
+        "mondrian_q_lo_table": mondrian_q_lo_table,
+        "mondrian_q_hi_table": mondrian_q_hi_table,
         "oas_standardized": True,
     }
     if stats_path is not None:
@@ -783,10 +1053,10 @@ def evaluate_conformal_coverage(
     device: torch.device,
 ) -> float:
     """Computes empirical split-conformal coverage on a held-out test batch."""
-    pv_pred = _predict_batch_pv(model, test_batch, device=device).numpy()
+    pv_pred = _predict_batch_pv(model, test_batch, device=device)
     pv_mc = test_batch.pv_mc.detach().cpu().numpy().astype(np.float64)
-    abs_err_bps = np.abs(pv_pred - pv_mc) * 1e4
-    half_width_bps = compute_conformal_half_width_bps(test_batch, stats_payload)
+    abs_err_bps = np.abs(pv_pred.numpy() - pv_mc) * 1e4
+    half_width_bps = compute_conformal_half_width_bps(test_batch, stats_payload, pv_pred=pv_pred)
     return float(np.mean(abs_err_bps <= half_width_bps))
 
 
@@ -959,13 +1229,13 @@ def train_eq_autocall_surrogate(
     *,
     n_train_samples: int = 16384,
     n_val_samples: int = 2048,
-    n_cal_samples: int = 2048,
+    n_cal_samples: int = 4096,
     n_test_samples: int = 2048,
     batch_size: int = 256,
-    n_epochs: int = 50,
-    lr: float = 2.0e-3,
-    weight_decay: float = 1e-4,
-    n_mc_paths_train: int = 8192,
+    n_epochs: int = 80,
+    lr: float = 2.2e-3,
+    weight_decay: float = 2.0e-4,
+    n_mc_paths_train: int = 12288,
     n_substeps_train: int = 8,
     n_mc_paths_test: int = 32768,
     n_substeps_test: int = 16,
@@ -973,7 +1243,7 @@ def train_eq_autocall_surrogate(
     m_max: int = M_MAX_DEFAULT,
     d_model: int = 128,
     n_egno_layers: int = 3,
-    n_sched_layers: int = 2,
+    n_sched_layers: int = 3,
     n_heads: int = 4,
     n_func_codes: int = 18,
     func_emb_dim: int = 16,
@@ -982,10 +1252,12 @@ def train_eq_autocall_surrogate(
     checkpoint_path: str | Path | None = DEFAULT_CHECKPOINT_PATH,
     guardian_stats_path: str | Path | None = DEFAULT_GUARDIAN_STATS_PATH,
     conformal_alpha: float = 0.05,
-    tau_desk_bps: float = 60.0,
+    tau_desk_bps: float = 15.0,
     domain_mode: str = "tier2_desk",
+    cv_mode_test: str = "multifidelity_gbm",
+    data_dir: str | Path | None = None,
 ) -> SurrogateTrainingResult:
-    """Trains EGNO v2.0 on GPU Dupire LV QMC labels and calibrates SR 26-2 Guardian stats."""
+    """Trains EGNO v2.0 on V3 GPU Dupire LV QMC labels and calibrates signed 8D EB-Mondrian Guardian stats."""
     t_start = time.perf_counter()
     dev = (
         torch.device(device)
@@ -1012,64 +1284,134 @@ def train_eq_autocall_surrogate(
     ).to(device=dev, dtype=torch.float32)
     model.zero_init_residual_heads(std=1e-4)
 
-    # 1. Generate Train / Val / Cal / Test splits via GPU Dupire LV RQMC
-    train_data = generate_synthetic_autocall_batch(
-        batch_size=n_train_samples,
-        d_max=d_max,
-        m_max=m_max,
-        m_rem_max=m_max,
-        n_mc_paths=n_mc_paths_train,
-        n_substeps=n_substeps_train,
-        seed=seed,
-        device="cpu",
-        qmc_device=dev,
-        dtype=torch.float32,
-        cv_mode="none",
-        domain_mode=domain_mode,
+    def _load_or_gen_split(split_name: str, gen_fn: Any) -> SyntheticAutocallBatch:
+        if data_dir is not None:
+            split_path = Path(data_dir) / f"{split_name}.pt"
+            if split_path.is_file():
+                raw_split = torch.load(split_path, map_location="cpu", weights_only=True)
+                if isinstance(raw_split, dict):
+                    return SyntheticAutocallBatch(**raw_split)
+            batch_out: SyntheticAutocallBatch = gen_fn()
+            payload_split = {f.name: getattr(batch_out, f.name) for f in fields(SyntheticAutocallBatch)}
+            _atomic_torch_save(payload_split, split_path)
+            return batch_out
+        return gen_fn()  # type: ignore[no-any-return]
+
+    eff_cv_test = cv_mode_test if n_mc_paths_test >= 4096 else "none"
+
+    # Mix 85% tier2_desk + 15% full_stress for training while keeping OAS calibration purely tier2_desk.
+    if domain_mode == "tier2_desk" and n_train_samples >= 128:
+        n_desk_train = int(round(0.85 * n_train_samples))
+        n_stress_train = max(0, n_train_samples - n_desk_train)
+        train_desk = _load_or_gen_split(
+            "train_desk",
+            lambda: generate_synthetic_autocall_batch(
+                batch_size=n_desk_train,
+                d_max=d_max,
+                m_max=m_max,
+                m_rem_max=m_max,
+                n_mc_paths=n_mc_paths_train,
+                n_substeps=n_substeps_train,
+                seed=seed,
+                device="cpu",
+                qmc_device=dev,
+                dtype=torch.float32,
+                cv_mode="none",
+                domain_mode="tier2_desk",
+            ),
+        )
+        if n_stress_train > 0:
+            train_stress = _load_or_gen_split(
+                "train_stress",
+                lambda: generate_synthetic_autocall_batch(
+                    batch_size=n_stress_train,
+                    d_max=d_max,
+                    m_max=m_max,
+                    m_rem_max=m_max,
+                    n_mc_paths=n_mc_paths_train,
+                    n_substeps=n_substeps_train,
+                    seed=seed + 50_000,
+                    device="cpu",
+                    qmc_device=dev,
+                    dtype=torch.float32,
+                    cv_mode="none",
+                    domain_mode="full_stress",
+                ),
+            )
+            train_data = _concat_batches([train_desk, train_stress])
+        else:
+            train_data = train_desk
+    else:
+        train_desk = _load_or_gen_split(
+            "train_desk",
+            lambda: generate_synthetic_autocall_batch(
+                batch_size=n_train_samples,
+                d_max=d_max,
+                m_max=m_max,
+                m_rem_max=m_max,
+                n_mc_paths=n_mc_paths_train,
+                n_substeps=n_substeps_train,
+                seed=seed,
+                device="cpu",
+                qmc_device=dev,
+                dtype=torch.float32,
+                cv_mode="none",
+                domain_mode=domain_mode,
+            ),
+        )
+        train_data = train_desk
+    val_data = _load_or_gen_split(
+        "val",
+        lambda: generate_synthetic_autocall_batch(
+            batch_size=n_val_samples,
+            d_max=d_max,
+            m_max=m_max,
+            m_rem_max=m_max,
+            n_mc_paths=n_mc_paths_train,
+            n_substeps=n_substeps_train,
+            seed=seed + 100_000,
+            device="cpu",
+            qmc_device=dev,
+            dtype=torch.float32,
+            cv_mode="none",
+            compute_pathwise_delta=False,
+            domain_mode=domain_mode,
+        ),
     )
-    val_data = generate_synthetic_autocall_batch(
-        batch_size=n_val_samples,
-        d_max=d_max,
-        m_max=m_max,
-        m_rem_max=m_max,
-        n_mc_paths=n_mc_paths_train,
-        n_substeps=n_substeps_train,
-        seed=seed + 100_000,
-        device="cpu",
-        qmc_device=dev,
-        dtype=torch.float32,
-        cv_mode="none",
-        compute_pathwise_delta=False,
-        domain_mode=domain_mode,
+    cal_data = _load_or_gen_split(
+        "cal",
+        lambda: generate_synthetic_autocall_batch(
+            batch_size=n_cal_samples,
+            d_max=d_max,
+            m_max=m_max,
+            m_rem_max=m_max,
+            n_mc_paths=n_mc_paths_test,
+            n_substeps=n_substeps_test,
+            seed=seed + 200_000,
+            device="cpu",
+            qmc_device=dev,
+            dtype=torch.float32,
+            cv_mode=eff_cv_test,
+            compute_pathwise_delta=False,
+            domain_mode=domain_mode,
+        ),
     )
-    cal_data = generate_synthetic_autocall_batch(
-        batch_size=n_cal_samples,
-        d_max=d_max,
-        m_max=m_max,
-        m_rem_max=m_max,
-        n_mc_paths=n_mc_paths_test,
-        n_substeps=n_substeps_test,
-        seed=seed + 200_000,
-        device="cpu",
-        qmc_device=dev,
-        dtype=torch.float32,
-        cv_mode="bs1d_exact" if n_mc_paths_test >= 4096 else "none",
-        compute_pathwise_delta=False,
-        domain_mode=domain_mode,
-    )
-    test_data = generate_synthetic_autocall_batch(
-        batch_size=n_test_samples,
-        d_max=d_max,
-        m_max=m_max,
-        m_rem_max=m_max,
-        n_mc_paths=n_mc_paths_test,
-        n_substeps=n_substeps_test,
-        seed=seed + 300_000,
-        device="cpu",
-        qmc_device=dev,
-        dtype=torch.float32,
-        cv_mode="bs1d_exact" if n_mc_paths_test >= 4096 else "none",
-        domain_mode=domain_mode,
+    test_data = _load_or_gen_split(
+        "test",
+        lambda: generate_synthetic_autocall_batch(
+            batch_size=n_test_samples,
+            d_max=d_max,
+            m_max=m_max,
+            m_rem_max=m_max,
+            n_mc_paths=n_mc_paths_test,
+            n_substeps=n_substeps_test,
+            seed=seed + 300_000,
+            device="cpu",
+            qmc_device=dev,
+            dtype=torch.float32,
+            cv_mode=eff_cv_test,
+            domain_mode=domain_mode,
+        ),
     )
 
     base_wof_mae, base_multi_mae = _split_worstof_multifunc_mae_bps(test_data.pv_proxy, test_data)
@@ -1082,30 +1424,58 @@ def train_eq_autocall_surrogate(
         flush=True,
     )
 
-    # 2. Train EGNO v2.0 with Spread-Attenuated Sobolev H^1 loss, selecting best model by Val MAE
+    # 2. Two-stage EGNO v2.0 optimization: Stage 1 fast non-Sobolev warmup, Stage 2 Sobolev H^1 + mono fine-tune.
     criterion = SpreadAttenuatedSobolevLoss().to(device=dev)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     steps_per_epoch = max(1, math.ceil(n_train_samples / batch_size))
-    total_steps = max(4, n_epochs * steps_per_epoch)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps,
-        eta_min=1e-5,
-    )
+    n_stage1 = int(n_epochs * 0.65) if n_epochs >= 12 else 0
+
+    if n_stage1 > 0:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        s1_steps = max(4, n_stage1 * steps_per_epoch)
+        warmup_steps = min(max(1, s1_steps // 6), 3 * steps_per_epoch)
+
+        def _s1_lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return 0.1 + 0.9 * float(step + 1) / float(warmup_steps)
+            denom = max(1, s1_steps - warmup_steps)
+            prog = min(1.0, max(0.0, float(step - warmup_steps) / float(denom)))
+            return 0.15 + 0.85 * 0.5 * (1.0 + math.cos(math.pi * prog))
+
+        scheduler: torch.optim.lr_scheduler.LRScheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=_s1_lr_lambda
+        )
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(4, n_epochs * steps_per_epoch),
+            eta_min=1e-5,
+        )
 
     loss_history: List[float] = []
+    best_stage1_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    best_stage1_val = float("inf")
     best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     best_val_mae_bps = float("inf")
     last_cos_sim = 0.0
 
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed + 99)
-    n_sobolev_warmup = int(n_epochs * 0.56) if n_epochs >= 20 else 0
 
     for _epoch in range(n_epochs):
-        if _epoch == n_sobolev_warmup and n_sobolev_warmup > 0:
+        if _epoch == n_stage1 and n_stage1 > 0:
+            model.load_state_dict(
+                {k: v.to(device=dev) for k, v in best_stage1_state_dict.items()}, strict=True
+            )
             best_val_mae_bps = float("inf")
-        use_sobolev = _epoch >= n_sobolev_warmup
+            s2_epochs = max(1, n_epochs - n_stage1)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr * 0.35, weight_decay=weight_decay)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(4, s2_epochs * steps_per_epoch),
+                eta_min=1e-5,
+            )
+        use_sobolev = _epoch >= n_stage1
         model.train()
         perm = torch.randperm(n_train_samples, generator=gen)
         epoch_loss_sum = 0.0
@@ -1122,6 +1492,7 @@ def train_eq_autocall_surrogate(
                 sub_batch,
                 create_graph_for_sobolev=use_sobolev,
                 compute_sobolev=use_sobolev,
+                compute_mono=use_sobolev,
                 return_breakdown=True,
             )
             assert isinstance(breakdown, SobolevLossBreakdown)
@@ -1142,18 +1513,29 @@ def train_eq_autocall_surrogate(
         val_mae_bps = float(
             (val_preds - val_data.pv_mc.detach().cpu().to(torch.float64)).abs().mean().item() * 1e4
         )
-        if val_mae_bps < best_val_mae_bps:
+        if not use_sobolev:
+            if val_mae_bps < best_stage1_val:
+                best_stage1_val = val_mae_bps
+                best_stage1_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_val_mae_bps = val_mae_bps
+                best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        elif val_mae_bps < best_val_mae_bps:
             best_val_mae_bps = val_mae_bps
             last_cos_sim = avg_cos
             best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        if (_epoch + 1) % 5 == 0 or _epoch == 0 or (_epoch + 1) == n_epochs:
+        if (_epoch + 1) % 5 == 0 or _epoch == 0 or (_epoch + 1) == n_epochs or (_epoch + 1) == n_stage1:
+            stage_tag = "S2" if use_sobolev else "S1"
+            cur_lr = float(optimizer.param_groups[0]["lr"])
             print(
-                f"[epoch {_epoch + 1:3d}/{n_epochs}] loss={avg_loss:.4f} "
+                f"[{stage_tag} epoch {_epoch + 1:3d}/{n_epochs}] lr={cur_lr:.2e} loss={avg_loss:.4f} "
                 f"val_mae={val_mae_bps:.2f}bps (best={best_val_mae_bps:.2f}bps) "
                 f"delta_cos={avg_cos:+.4f} elapsed={time.perf_counter() - t_start:.1f}s",
                 flush=True,
             )
 
+    if n_stage1 > 0 and n_stage1 < n_epochs and best_val_mae_bps > best_stage1_val * 1.25:
+        best_state_dict = best_stage1_state_dict
+        best_val_mae_bps = best_stage1_val
     model.load_state_dict({k: v.to(device=dev) for k, v in best_state_dict.items()}, strict=True)
     model.eval()
     model.freeze_eval_buffers()
@@ -1168,7 +1550,7 @@ def train_eq_autocall_surrogate(
         test_batch=test_data,
     )
     total_delta_cos_sim, oos_res_cos_sim = _evaluate_delta_cos_sims(model, test_data, device=dev)
-    eff_res_cos_sim = oos_res_cos_sim if n_sobolev_warmup == 0 and n_epochs < 4 else (
+    eff_res_cos_sim = oos_res_cos_sim if n_stage1 == 0 and n_epochs < 4 else (
         oos_res_cos_sim if oos_res_cos_sim != 0.0 else last_cos_sim
     )
 
@@ -1176,7 +1558,7 @@ def train_eq_autocall_surrogate(
     stats_path_resolved = Path(guardian_stats_path) if guardian_stats_path is not None else None
     stats_payload = calibrate_guardian_stats(
         model,
-        train_data,
+        train_desk,
         cal_data,
         device=dev,
         conformal_alpha=conformal_alpha,
@@ -1187,7 +1569,7 @@ def train_eq_autocall_surrogate(
     test_err_bps = (
         (test_preds - test_data.pv_mc.detach().cpu().to(torch.float64)).abs().numpy() * 1e4
     )
-    hw_bps = compute_conformal_half_width_bps(test_data, stats_payload)
+    hw_bps = compute_conformal_half_width_bps(test_data, stats_payload, pv_pred=test_preds)
     acc_mask = hw_bps <= float(stats_payload["tau_desk_bps"])
     accepted_frac = float(np.mean(acc_mask))
     accepted_mae_bps = float(np.mean(test_err_bps[acc_mask])) if bool(np.any(acc_mask)) else float(test_mae_bps)
@@ -1274,6 +1656,30 @@ def load_eq_autocall_surrogate(
             f"Unsupported surrogate checkpoint schema_version={schema_ver!r} in {ckpt_path}."
         )
 
+    def _infer_arch_from_state_dict(sd: Dict[str, Any]) -> Dict[str, int]:
+        np_w = sd.get("node_proj.weight")
+        emb_w = sd.get("pool.emb_call.weight")
+        rt_w = sd.get("sched_transformer.rel_time_bias.weight")
+        egno_indices = [
+            int(k.split(".")[1])
+            for k in sd
+            if k.startswith("egno_layers.") and k.endswith(".norm.weight") and k.split(".")[1].isdigit()
+        ]
+        sched_indices = [
+            int(k.split(".")[2])
+            for k in sd
+            if k.startswith("sched_transformer.layers.") and k.endswith(".norm1.weight") and k.split(".")[2].isdigit()
+        ]
+        return {
+            "d_model": int(np_w.shape[0]) if isinstance(np_w, torch.Tensor) and np_w.ndim == 2 else 128,
+            "d_node": int(np_w.shape[1]) if isinstance(np_w, torch.Tensor) and np_w.ndim == 2 else 16,
+            "n_egno_layers": (max(egno_indices) + 1) if egno_indices else 3,
+            "n_sched_layers": (max(sched_indices) + 1) if sched_indices else 2,
+            "n_heads": int(rt_w.shape[0]) if isinstance(rt_w, torch.Tensor) and rt_w.ndim == 2 else 4,
+            "n_func_codes": int(emb_w.shape[0]) if isinstance(emb_w, torch.Tensor) and emb_w.ndim == 2 else 18,
+            "func_emb_dim": int(emb_w.shape[1]) if isinstance(emb_w, torch.Tensor) and emb_w.ndim == 2 else 16,
+        }
+
     if "model_state_dict" in raw or "state_dict" in raw:
         state_dict = raw["model_state_dict"] if "model_state_dict" in raw else raw["state_dict"]
         cfg_raw = raw.get("config")
@@ -1283,29 +1689,35 @@ def load_eq_autocall_surrogate(
             raise ValueError(
                 f"Unsupported config schema_version={cfg_schema!r} in {ckpt_path}."
             )
-        emb_w = state_dict.get("pool.emb_call.weight") if isinstance(state_dict, dict) else None
-        inferred_codes = int(emb_w.shape[0]) if isinstance(emb_w, torch.Tensor) and emb_w.ndim == 2 else 18
+        inferred = _infer_arch_from_state_dict(state_dict if isinstance(state_dict, dict) else {})
         model = MaskedEQAutocallSurrogate(
             d_max=int(cfg.get("d_max", 8)),
             m_max=int(cfg.get("m_max", 48)),
-            d_model=int(cfg.get("d_model", 128)),
-            n_egno_layers=int(cfg.get("n_egno_layers", 3)),
-            n_sched_layers=int(cfg.get("n_sched_layers", 2)),
-            n_heads=int(cfg.get("n_heads", 4)),
-            d_node=int(cfg.get("d_node", 16)),
+            d_model=int(cfg.get("d_model", inferred["d_model"])),
+            n_egno_layers=int(cfg.get("n_egno_layers", inferred["n_egno_layers"])),
+            n_sched_layers=int(cfg.get("n_sched_layers", inferred["n_sched_layers"])),
+            n_heads=int(cfg.get("n_heads", inferred["n_heads"])),
+            d_node=int(cfg.get("d_node", inferred["d_node"])),
             d_edge=int(cfg.get("d_edge", 4)),
             d_sched=int(cfg.get("d_sched", 12)),
             d_global=int(cfg.get("d_global", 16)),
-            n_func_codes=int(cfg.get("n_func_codes", inferred_codes)),
-            func_emb_dim=int(cfg.get("func_emb_dim", 16)),
+            n_func_codes=int(cfg.get("n_func_codes", inferred["n_func_codes"])),
+            func_emb_dim=int(cfg.get("func_emb_dim", inferred["func_emb_dim"])),
         )
         model.load_state_dict(state_dict, strict=True)
         raw_metrics = raw.get("metrics")
         metrics = dict(raw_metrics) if isinstance(raw_metrics, dict) else {}
     else:
-        emb_w = raw.get("pool.emb_call.weight")
-        inferred_codes = int(emb_w.shape[0]) if isinstance(emb_w, torch.Tensor) and emb_w.ndim == 2 else 18
-        model = MaskedEQAutocallSurrogate(n_func_codes=inferred_codes)
+        inferred = _infer_arch_from_state_dict(raw)
+        model = MaskedEQAutocallSurrogate(
+            d_model=inferred["d_model"],
+            n_egno_layers=inferred["n_egno_layers"],
+            n_sched_layers=inferred["n_sched_layers"],
+            n_heads=inferred["n_heads"],
+            d_node=inferred["d_node"],
+            n_func_codes=inferred["n_func_codes"],
+            func_emb_dim=inferred["func_emb_dim"],
+        )
         model.load_state_dict(raw, strict=True)
         metrics = {}
 
@@ -1319,17 +1731,19 @@ def recalibrate_guardian_stats_from_checkpoint(
     checkpoint_path: str | Path = DEFAULT_CHECKPOINT_PATH,
     guardian_stats_path: str | Path = DEFAULT_GUARDIAN_STATS_PATH,
     n_train_samples: int = 16384,
-    n_cal_samples: int = 2048,
+    n_cal_samples: int = 4096,
     n_test_samples: int = 2048,
     n_mc_paths_test: int = 32768,
     n_substeps_test: int = 16,
     seed: int = 2026,
     device: torch.device | str | None = None,
     conformal_alpha: float = 0.05,
-    tau_desk_bps: float = 60.0,
+    tau_desk_bps: float = 15.0,
     domain_mode: str = "tier2_desk",
+    cv_mode_test: str = "multifidelity_gbm",
+    data_dir: str | Path | None = None,
 ) -> Dict[str, Any]:
-    """Refreshes 5D split-conformal Guardian artifact & test metrics while keeping EGNO weights."""
+    """Refreshes 8D signed EB-Mondrian Guardian artifact & test metrics while keeping EGNO weights."""
     t0 = time.perf_counter()
     dev = (
         torch.device(device)
@@ -1344,51 +1758,71 @@ def recalibrate_guardian_stats_from_checkpoint(
     d_max = int(model.d_max)
     m_max = int(model.m_max)
 
+    eff_cv_test = cv_mode_test if n_mc_paths_test >= 4096 else "none"
+
+    def _load_or_gen_recal(split_name: str, gen_fn: Any) -> SyntheticAutocallBatch:
+        if data_dir is not None:
+            split_path = Path(data_dir) / f"{split_name}.pt"
+            if split_path.is_file():
+                raw_split = torch.load(split_path, map_location="cpu", weights_only=True)
+                if isinstance(raw_split, dict):
+                    return SyntheticAutocallBatch(**raw_split)
+        return gen_fn()  # type: ignore[no-any-return]
+
     # OAS covariance and PSI bins depend strictly on the 16D feature distribution (identical Sobol contracts).
-    train_data = generate_synthetic_autocall_batch(
-        batch_size=n_train_samples,
-        d_max=d_max,
-        m_max=m_max,
-        m_rem_max=m_max,
-        n_mc_paths=64,
-        n_substeps=2,
-        seed=seed,
-        device="cpu",
-        qmc_device=dev,
-        dtype=torch.float32,
-        cv_mode="none",
-        compute_pathwise_delta=False,
-        domain_mode=domain_mode,
+    train_data = _load_or_gen_recal(
+        "train_desk",
+        lambda: generate_synthetic_autocall_batch(
+            batch_size=n_train_samples,
+            d_max=d_max,
+            m_max=m_max,
+            m_rem_max=m_max,
+            n_mc_paths=64,
+            n_substeps=2,
+            seed=seed,
+            device="cpu",
+            qmc_device=dev,
+            dtype=torch.float32,
+            cv_mode="none",
+            compute_pathwise_delta=False,
+            domain_mode=domain_mode,
+        ),
     )
-    cal_data = generate_synthetic_autocall_batch(
-        batch_size=n_cal_samples,
-        d_max=d_max,
-        m_max=m_max,
-        m_rem_max=m_max,
-        n_mc_paths=n_mc_paths_test,
-        n_substeps=n_substeps_test,
-        seed=seed + 200_000,
-        device="cpu",
-        qmc_device=dev,
-        dtype=torch.float32,
-        cv_mode="bs1d_exact" if n_mc_paths_test >= 4096 else "none",
-        compute_pathwise_delta=False,
-        domain_mode=domain_mode,
+    cal_data = _load_or_gen_recal(
+        "cal",
+        lambda: generate_synthetic_autocall_batch(
+            batch_size=n_cal_samples,
+            d_max=d_max,
+            m_max=m_max,
+            m_rem_max=m_max,
+            n_mc_paths=n_mc_paths_test,
+            n_substeps=n_substeps_test,
+            seed=seed + 200_000,
+            device="cpu",
+            qmc_device=dev,
+            dtype=torch.float32,
+            cv_mode=eff_cv_test,
+            compute_pathwise_delta=False,
+            domain_mode=domain_mode,
+        ),
     )
-    test_data = generate_synthetic_autocall_batch(
-        batch_size=n_test_samples,
-        d_max=d_max,
-        m_max=m_max,
-        m_rem_max=m_max,
-        n_mc_paths=n_mc_paths_test,
-        n_substeps=n_substeps_test,
-        seed=seed + 300_000,
-        device="cpu",
-        qmc_device=dev,
-        dtype=torch.float32,
-        cv_mode="bs1d_exact" if n_mc_paths_test >= 4096 else "none",
-        compute_pathwise_delta=True,
-        domain_mode=domain_mode,
+    test_data = _load_or_gen_recal(
+        "test",
+        lambda: generate_synthetic_autocall_batch(
+            batch_size=n_test_samples,
+            d_max=d_max,
+            m_max=m_max,
+            m_rem_max=m_max,
+            n_mc_paths=n_mc_paths_test,
+            n_substeps=n_substeps_test,
+            seed=seed + 300_000,
+            device="cpu",
+            qmc_device=dev,
+            dtype=torch.float32,
+            cv_mode=eff_cv_test,
+            compute_pathwise_delta=True,
+            domain_mode=domain_mode,
+        ),
     )
 
     stats_payload = calibrate_guardian_stats(
@@ -1416,7 +1850,7 @@ def recalibrate_guardian_stats_from_checkpoint(
     test_err_bps = (
         (test_preds - test_data.pv_mc.detach().cpu().to(torch.float64)).abs().numpy() * 1e4
     )
-    hw_bps = compute_conformal_half_width_bps(test_data, stats_payload)
+    hw_bps = compute_conformal_half_width_bps(test_data, stats_payload, pv_pred=test_preds)
     acc_mask = hw_bps <= float(stats_payload["tau_desk_bps"])
     accepted_frac = float(np.mean(acc_mask))
     accepted_mae_bps = float(np.mean(test_err_bps[acc_mask])) if bool(np.any(acc_mask)) else float(test_mae_bps)
@@ -1465,19 +1899,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--n-train", type=int, default=16384)
     parser.add_argument("--n-val", type=int, default=2048)
-    parser.add_argument("--n-cal", type=int, default=2048)
+    parser.add_argument("--n-cal", type=int, default=4096)
     parser.add_argument("--n-test", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=2.0e-3)
-    parser.add_argument("--n-mc-train", type=int, default=8192)
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--lr", type=float, default=2.2e-3)
+    parser.add_argument("--n-mc-train", type=int, default=12288)
     parser.add_argument("--n-substeps-train", type=int, default=8)
     parser.add_argument("--n-mc-test", type=int, default=32768)
     parser.add_argument("--n-substeps-test", type=int, default=16)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--domain-mode", type=str, default="tier2_desk")
-    parser.add_argument("--tau-desk-bps", type=float, default=60.0)
+    parser.add_argument("--tau-desk-bps", type=float, default=15.0)
     parser.add_argument("--recalibrate-only", action="store_true")
+    parser.add_argument("--cv-mode-test", type=str, default="multifidelity_gbm")
+    parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument("--checkpoint-path", type=str, default=str(DEFAULT_CHECKPOINT_PATH))
     parser.add_argument("--guardian-stats-path", type=str, default=str(DEFAULT_GUARDIAN_STATS_PATH))
     return parser.parse_args()
@@ -1498,6 +1934,8 @@ def main() -> None:
             device=args.device,
             tau_desk_bps=args.tau_desk_bps,
             domain_mode=args.domain_mode,
+            cv_mode_test=args.cv_mode_test,
+            data_dir=args.data_dir,
         )
         sp = summary["stats_payload"]
         print(
@@ -1533,6 +1971,8 @@ def main() -> None:
         device=args.device,
         domain_mode=args.domain_mode,
         tau_desk_bps=args.tau_desk_bps,
+        cv_mode_test=args.cv_mode_test,
+        data_dir=args.data_dir,
         checkpoint_path=args.checkpoint_path,
         guardian_stats_path=args.guardian_stats_path,
     )

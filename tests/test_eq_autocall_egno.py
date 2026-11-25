@@ -796,4 +796,37 @@ def test_egno_audit_blind_spots_shapes_masks_diff_and_runner() -> None:
     assert torch.isfinite(dh_m0).all() and torch.isfinite(dc_m0).all() and torch.isfinite(dp_m0).all()
 
 
+def test_egno_v3_put_subgraph_rel_time_bias_and_softened_q_gate() -> None:
+    """Verify 7475097 Put-KI subgraph, rel_time_bias, component assembly, and softened q_gate=1e-14."""
+    from deepvol.surrogates.eq_autocall_egno import assemble_surrogate_components
+
+    torch.manual_seed(123)
+    model = MaskedEQAutocallSurrogate(
+        d_max=8, m_max=48, d_model=64, n_egno_layers=3, n_sched_layers=3, n_heads=4
+    ).eval()
+    assert model.d_sched_phys == 25
+    assert model.d_put_phys == 16
+    assert model.sched_transformer.n_sched_layers == 3
+    assert hasattr(model, "put_egno") and hasattr(model, "put_pool")
+    assert hasattr(model.sched_transformer, "rel_time_bias")
+
+    nf, ef, am, sf, sm, gf, _ = _build_synthetic_autocall_batch(batch_size=3, seed=707)
+    # Set small non-zero q_proxy (~3e-6) on period 1 to verify softened 1e-14 gate avoids 5x attenuation.
+    sf[:, 1, int(AutocallSchedCol.IS_GUARANTEED_CPN)] = 0.0
+    sf[:, 1, int(AutocallSchedCol.PROXY_CPN_PROB)] = 3e-6
+
+    out = model(nf, ef, am, sf, sm, gf)
+    pv_tot, pv_not, pv_cpn, pv_opt = assemble_surrogate_components(out, sf, sm, gf)
+    torch.testing.assert_close(pv_tot, pv_not + pv_cpn + pv_opt, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(pv_tot, model.assemble_product_value(out, sf, sm, gf))
+
+    # Check q_gate(3e-6) = (9e-12) / (9e-12 + 1e-14) = 0.9989 > 0.99 (vs 0.082 under 1e-10).
+    q_p1 = sf[:, 1, int(AutocallSchedCol.PROXY_CPN_PROB)]
+    logit_q1 = torch.log(q_p1 / (1.0 - q_p1))
+    expected_unattenuated = torch.sigmoid(logit_q1 + out.delta_coupon_logits[:, 1])
+    ratio = out.coupon_probs[:, 1] / expected_unattenuated.clamp(min=1e-12)
+    assert float(ratio.min().item()) > 0.99
+
+
+
 

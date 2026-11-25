@@ -388,6 +388,7 @@ class ParallelScheduleTransformer(nn.Module):
         self.d_model = int(d_model)
         self.n_heads = int(n_heads)
         self.n_sched_layers = int(n_sched_layers)
+        self.rel_time_bias = nn.Linear(4, self.n_heads)
         self.layers = nn.ModuleList(
             [PreNormSDPALayer(d_model=self.d_model, n_heads=self.n_heads) for _ in range(self.n_sched_layers)]
         )
@@ -397,6 +398,7 @@ class ParallelScheduleTransformer(nn.Module):
         x: torch.Tensor,
         sched_mask: torch.Tensor,
         *,
+        tau_obs: Optional[torch.Tensor] = None,
         all_sched_active: Optional[bool] = None,
         require_second_order_sdpa: bool = False,
     ) -> torch.Tensor:
@@ -413,7 +415,27 @@ class ParallelScheduleTransformer(nn.Module):
         zero_bias = torch.zeros((), dtype=x.dtype, device=x.device)
         # Use -1e4 instead of -1e9 so float16 softmax attention biases stay finite.
         neg_bias = torch.full((), -1e4, dtype=x.dtype, device=x.device)
-        attn_bias_4d = torch.where(allow_attn, zero_bias, neg_bias).unsqueeze(1)
+        if tau_obs is not None:
+            tau_clean = torch.where(active_sched, tau_obs, torch.zeros_like(tau_obs))
+            dt = tau_clean.unsqueeze(1) - tau_clean.unsqueeze(2)
+            abs_dt = torch.sqrt(dt * dt + 1e-4)
+            rel_feat = torch.stack(
+                [
+                    torch.tanh(dt * 0.5),
+                    torch.tanh(dt * 4.0),
+                    torch.exp(-abs_dt),
+                    torch.sigmoid(dt * 8.0) - 0.5,
+                ],
+                dim=-1,
+            ).to(dtype=x.dtype)
+            rel_bias = F.linear(
+                rel_feat,
+                self.rel_time_bias.weight.to(dtype=x.dtype),
+                self.rel_time_bias.bias.to(dtype=x.dtype),
+            ).permute(0, 3, 1, 2)
+            attn_bias_4d = torch.where(allow_attn.unsqueeze(1), rel_bias, neg_bias)
+        else:
+            attn_bias_4d = torch.where(allow_attn, zero_bias, neg_bias).unsqueeze(1)
 
         for layer in self.layers:
             assert isinstance(layer, PreNormSDPALayer)
@@ -460,7 +482,39 @@ class MaskedEQAutocallSurrogate(nn.Module):
         self.n_func_codes = int(n_func_codes)
         self.func_emb_dim = int(func_emb_dim)
 
+        self.d_sched_phys = 25
+        self.d_put_phys = 16
+        node_scales = torch.tensor(
+            [1.0, 5.0, 5.0, 15.0, 3.0, 3.0, 10.0, 2.0, 1.0, 10.0, 10.0, 0.0, 2.0, 1.0, 1.0, 1.0],
+            dtype=torch.float32,
+        )
+        edge_scales = torch.tensor([1.0, 5.0, 1.0, 1.0], dtype=torch.float32)
+        sched_scales = torch.tensor(
+            [0.25, 4.0, 0.0, 2.0, 1.0, 2.0, 1.0, 0.0, 0.5, 2.0, 2.0, 2.0],
+            dtype=torch.float32,
+        )
+        global_ko_cpn_mask = torch.tensor(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            dtype=torch.float32,
+        )
+        global_put_scales = torch.tensor(
+            [1.5, 1.5, 1.0, 1.0, 0.0, 0.0, 0.0, 10.0, 0.0, 2.0, 1.5, 0.0, 0.0, 0.0, 1.0, 10.0],
+            dtype=torch.float32,
+        )
+        self._node_scales: torch.Tensor
+        self._edge_scales: torch.Tensor
+        self._sched_scales: torch.Tensor
+        self._global_ko_cpn_mask: torch.Tensor
+        self._global_put_scales: torch.Tensor
+        self.register_buffer("_node_scales", node_scales[: self.d_node], persistent=False)
+        self.register_buffer("_edge_scales", edge_scales[: self.d_edge], persistent=False)
+        self.register_buffer("_sched_scales", sched_scales[: self.d_sched], persistent=False)
+        self.register_buffer("_global_ko_cpn_mask", global_ko_cpn_mask[: self.d_global], persistent=False)
+        self.register_buffer("_global_put_scales", global_put_scales[: self.d_global], persistent=False)
+
         self.node_proj = nn.Linear(self.d_node, self.d_model)
+        self.node_ctx_proj = nn.Linear(self.d_global + 3 * self.func_emb_dim, self.d_model)
+        self.node_in_norm = nn.LayerNorm(self.d_model)
         self.egno_layers = nn.ModuleList(
             [MaskedEGNOLayer(d_model=self.d_model, d_edge=self.d_edge) for _ in range(self.n_egno_layers)]
         )
@@ -473,6 +527,8 @@ class MaskedEQAutocallSurrogate(nn.Module):
         )
 
         self.sched_proj = nn.Linear(self.d_sched + 2 * self.d_model + self.d_global, self.d_model)
+        self.sched_phys_proj = nn.Linear(self.d_sched_phys, self.d_model)
+        self.sched_in_norm = nn.LayerNorm(self.d_model)
         self.sched_transformer = ParallelScheduleTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
@@ -480,13 +536,27 @@ class MaskedEQAutocallSurrogate(nn.Module):
         )
 
         self.period_head = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model),
+            nn.Linear(2 * self.d_model, self.d_model),
             nn.SiLU(),
             nn.Linear(self.d_model, 2),
         )
-        # Put head takes [h_sched_last, h_sched_mean, z_basket, global_scaled, func_emb_flat, h_disp, sum(c_call)].
+        # Dedicated S_D-equivariant Put-KI subgraph keeping period_head invariant to K_PUT/B_KI.
+        self.put_node_proj = nn.Linear(self.d_model + 6 + self.d_global + 4, self.d_model)
+        self.put_in_norm = nn.LayerNorm(self.d_model)
+        self.put_egno = MaskedEGNOLayer(d_model=self.d_model, d_edge=self.d_edge)
+        self.put_pool = OrderStatisticPooling(
+            hidden_dim=self.d_model,
+            out_dim=self.d_model,
+            init_tau=self.init_tau,
+            n_func_codes=self.n_func_codes,
+            func_emb_dim=self.func_emb_dim,
+        )
+        # Put head takes [h_sched_last, h_sched_mean, z_basket, z_put_basket, global_put, func_emb_flat, h_disp, c_call_sum, put_phys].
         self.put_head = nn.Sequential(
-            nn.Linear(4 * self.d_model + self.d_global + 3 * self.func_emb_dim + 2, 2 * self.d_model),
+            nn.Linear(
+                5 * self.d_model + self.d_global + 3 * self.func_emb_dim + 2 + self.d_put_phys,
+                2 * self.d_model,
+            ),
             nn.SiLU(),
             nn.Linear(2 * self.d_model, self.d_model),
             nn.SiLU(),
@@ -523,6 +593,8 @@ class MaskedEQAutocallSurrogate(nn.Module):
     def freeze_eval_buffers(self) -> None:
         """Freeze pooled tau and fused EGNO eval buffers safely outside inference_mode."""
         self.pool.freeze_eval_buffers()
+        self.put_pool.freeze_eval_buffers()
+        self.put_egno.freeze_eval_buffers()
         for layer in self.egno_layers:
             assert isinstance(layer, MaskedEGNOLayer)
             layer.freeze_eval_buffers()
@@ -652,8 +724,16 @@ class MaskedEQAutocallSurrogate(nn.Module):
             active_sched.unsqueeze(-1), sched_feats, torch.zeros_like(sched_feats)
         )
         global_clean = global_feats
+        calc_dtype = (
+            torch.float32
+            if node_feats.dtype in (torch.float16, torch.bfloat16)
+            else node_feats.dtype
+        )
 
-        w_col = node_clean[:, :, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)]
+        if self.d_node > int(AutocallNodeCol.PROXY_DELTA_WEIGHT):
+            w_col = node_clean[:, :, int(AutocallNodeCol.PROXY_DELTA_WEIGHT)]
+        else:
+            w_col = torch.ones_like(m_asset)
         if detach_gate_weights:
             w_col = w_col.detach()
         w_signed = w_col * m_asset
@@ -663,22 +743,47 @@ class MaskedEQAutocallSurrogate(nn.Module):
         w_norm = w_abs / w_sum.clamp(min=1e-6)
         h_disp = has_w * (1.0 - (w_norm * w_norm).sum(dim=1)).clamp(0.0, 1.0)
 
-        pair_mask_4d = pair_mask.unsqueeze(-1)
-        sum_p = pair_mask.sum(dim=2, keepdim=True)
-        denom = sum_p.clamp(min=1.0)
-        inv_denom = 1.0 / denom
-        bias_scale = sum_p * inv_denom
-
-        h = F.linear(node_clean, self.node_proj.weight, self.node_proj.bias) * m_asset_3d
-        for layer in self.egno_layers:
-            assert isinstance(layer, MaskedEGNOLayer)
-            h = layer.forward_premasked(
-                h,
-                edge_clean,
-                m_asset_3d,
-                pair_mask_4d,
-                inv_denom,
-                bias_scale,
+        has_any_asset = active_asset.any(dim=1, keepdim=True)
+        if self.d_node > int(AutocallNodeCol.DIST_TO_PUT_STRIKE) and d_dim > 0:
+            dput_clean = torch.where(
+                active_asset,
+                2.0 * torch.asinh(0.5 * node_clean[:, :, int(AutocallNodeCol.DIST_TO_PUT_STRIKE)]),
+                torch.zeros_like(m_asset),
+            ).to(dtype=calc_dtype)
+            m_asset_c = m_asset.to(dtype=calc_dtype)
+            w_norm_c = w_norm.to(dtype=calc_dtype)
+            n_act_c = m_asset_c.sum(dim=1, keepdim=True).clamp(min=1.0)
+            dput_wmean = (w_norm_c * dput_clean).sum(dim=1, keepdim=True)
+            dput_mean = (m_asset_c * dput_clean).sum(dim=1, keepdim=True) / n_act_c
+            alpha_p = 2.0
+            z_p = alpha_p * dput_clean
+            z_p_max = (
+                torch.where(active_asset, z_p, torch.full_like(z_p, -1e4))
+                .amax(dim=1, keepdim=True)
+                .detach()
+            )
+            exp_pos = m_asset_c * torch.exp(z_p - z_p_max)
+            lse_pos = z_p_max + torch.log(
+                (exp_pos.sum(dim=1, keepdim=True) / n_act_c).clamp(min=1e-12)
+            )
+            dput_softmax = torch.where(has_any_asset, lse_pos / alpha_p, torch.zeros_like(lse_pos))
+            nz_p = -z_p
+            nz_p_max = (
+                torch.where(active_asset, nz_p, torch.full_like(nz_p, -1e4))
+                .amax(dim=1, keepdim=True)
+                .detach()
+            )
+            exp_neg = m_asset_c * torch.exp(nz_p - nz_p_max)
+            lse_neg = nz_p_max + torch.log(
+                (exp_neg.sum(dim=1, keepdim=True) / n_act_c).clamp(min=1e-12)
+            )
+            dput_softmin = torch.where(has_any_asset, -lse_neg / alpha_p, torch.zeros_like(lse_neg))
+            dput_stats = torch.cat(
+                [dput_wmean, dput_mean, dput_softmin, dput_softmax], dim=-1
+            ).to(dtype=node_feats.dtype)
+        else:
+            dput_stats = torch.zeros(
+                (batch_size, 4), device=node_feats.device, dtype=node_feats.dtype
             )
 
         if self.d_global > int(AutocallGlobalCol.OPT_INDEX_ID):
@@ -701,24 +806,11 @@ class MaskedEQAutocallSurrogate(nn.Module):
                 )
                 fc_tensor = torch.stack([fc_tensor[:, 0], fc_tensor[:, 1], opt_aligned], dim=1)
             func_codes: Optional[torch.Tensor] = fc_tensor
-            func_emb_flat = torch.cat(
-                [
-                    self.pool.emb_call(fc_tensor[:, 0]),
-                    self.pool.emb_cpn(fc_tensor[:, 1]),
-                    self.pool.emb_opt(fc_tensor[:, 2]),
-                ],
-                dim=-1,
-            )
-            c_idx_s = int(AutocallGlobalCol.CALL_INDEX_ID)
-            o_idx_e = int(AutocallGlobalCol.OPT_INDEX_ID) + 1
-            global_scaled = torch.cat(
-                [
-                    global_clean[:, :c_idx_s],
-                    torch.zeros_like(global_clean[:, c_idx_s:o_idx_e]),
-                    global_clean[:, o_idx_e:],
-                ],
-                dim=-1,
-            )
+            emb_call = self.pool.emb_call(fc_tensor[:, 0])
+            emb_cpn = self.pool.emb_cpn(fc_tensor[:, 1])
+            emb_opt = self.pool.emb_opt(fc_tensor[:, 2])
+            func_emb_flat = torch.cat([emb_call, emb_cpn, emb_opt], dim=-1)
+            func_emb_ko_cpn = torch.cat([emb_call, emb_cpn, torch.zeros_like(emb_opt)], dim=-1)
         else:
             func_codes = None
             func_emb_flat = torch.zeros(
@@ -726,7 +818,61 @@ class MaskedEQAutocallSurrogate(nn.Module):
                 device=global_clean.device,
                 dtype=global_clean.dtype,
             )
-            global_scaled = global_clean
+            func_emb_ko_cpn = func_emb_flat
+
+        global_ko_cpn = global_clean * self._global_ko_cpn_mask.to(dtype=global_clean.dtype)
+        global_put_scaled = global_clean * self._global_put_scales.to(dtype=global_clean.dtype)
+
+        node_scaled = node_clean * self._node_scales.to(dtype=node_clean.dtype)
+        if self.d_node > int(AutocallNodeCol.SSVI_CURV_ETA):
+            col0 = 2.0 * torch.asinh(0.5 * node_clean[:, :, 0:1])
+            col8 = torch.asinh(node_clean[:, :, 8:9])
+            node_scaled = torch.cat(
+                [col0, node_scaled[:, :, 1:8], col8, node_scaled[:, :, 9:]],
+                dim=-1,
+            )
+        edge_scaled = edge_clean * self._edge_scales.to(dtype=edge_clean.dtype)
+        if self.d_edge > int(AutocallEdgeCol.LOG_PERF_DIFF):
+            ecol2 = 2.0 * torch.asinh(0.5 * edge_clean[:, :, :, 2:3])
+            edge_scaled = torch.cat(
+                [edge_scaled[:, :, :, :2], ecol2, edge_scaled[:, :, :, 3:]],
+                dim=-1,
+            )
+
+        pair_mask_4d = pair_mask.unsqueeze(-1)
+        sum_p = pair_mask.sum(dim=2, keepdim=True)
+        denom = sum_p.clamp(min=1.0)
+        inv_denom = 1.0 / denom
+        bias_scale = sum_p * inv_denom
+
+        if d_dim > 0:
+            node_ctx = F.linear(
+                torch.cat([global_ko_cpn, func_emb_ko_cpn], dim=-1),
+                self.node_ctx_proj.weight.to(dtype=node_scaled.dtype),
+                self.node_ctx_proj.bias.to(dtype=node_scaled.dtype),
+            ).unsqueeze(1)
+            h_raw = F.linear(node_scaled, self.node_proj.weight, self.node_proj.bias) + node_ctx
+            h_normed = F.layer_norm(
+                h_raw,
+                (self.d_model,),
+                self.node_in_norm.weight.to(dtype=h_raw.dtype),
+                self.node_in_norm.bias.to(dtype=h_raw.dtype),
+                1e-5,
+            )
+            h = torch.where(active_3d, h_normed, torch.zeros_like(h_normed))
+        else:
+            h = F.linear(node_scaled, self.node_proj.weight, self.node_proj.bias) * m_asset_3d
+
+        for layer in self.egno_layers:
+            assert isinstance(layer, MaskedEGNOLayer)
+            h = layer.forward_premasked(
+                h,
+                edge_scaled,
+                m_asset_3d,
+                pair_mask_4d,
+                inv_denom,
+                bias_scale,
+            )
 
         z_basket = self.pool(
             h,
@@ -735,6 +881,28 @@ class MaskedEQAutocallSurrogate(nn.Module):
             func_codes=func_codes,
             all_active=False,
         )
+
+        k_put_c = global_clean[:, int(AutocallGlobalCol.K_PUT)].to(dtype=calc_dtype)
+        k_put_pos_c = 0.5 * (k_put_c + torch.sqrt(k_put_c * k_put_c + 1e-8))
+        b_ki_c = global_clean[:, int(AutocallGlobalCol.B_KI)].to(dtype=calc_dtype)
+        has_ki_c = (
+            global_clean[:, int(AutocallGlobalCol.HAS_KI_FLAG)]
+            .detach()
+            .clamp(0.0, 1.0)
+            .to(dtype=calc_dtype)
+        )
+        l_put_px_c = global_clean[:, int(AutocallGlobalCol.L_PUT_PROXY)].to(dtype=calc_dtype)
+        if self.d_global > int(AutocallGlobalCol.LOWER_STRIKE):
+            k_low_c = global_clean[:, int(AutocallGlobalCol.LOWER_STRIKE)].to(dtype=calc_dtype)
+        else:
+            k_low_c = torch.zeros_like(k_put_c)
+        k_low_pos_c = 0.5 * (k_low_c + torch.sqrt(k_low_c * k_low_c + 1e-8))
+        dk_c = k_put_pos_c - k_low_pos_c
+        k_eff_pos_c = 0.5 * (dk_c + torch.sqrt(dk_c * dk_c + 1e-8))
+        log_k_put_s = torch.log(torch.sqrt(k_put_pos_c * k_put_pos_c + 1e-4))
+        log_b_ki_s = torch.log(torch.sqrt(b_ki_c * b_ki_c + 1e-4))
+        log_k_low_s = torch.log(torch.sqrt(k_low_pos_c * k_low_pos_c + 1e-4))
+        has_low_c = 1.0 - torch.exp(-k_low_pos_c * k_low_pos_c * 1e4)
 
         if m_dim == 0:
             delta_hazard = torch.zeros(
@@ -750,17 +918,141 @@ class MaskedEQAutocallSurrogate(nn.Module):
             c_call_sum = torch.zeros(
                 (batch_size, 1), device=node_feats.device, dtype=node_feats.dtype
             )
+            put_phys_12 = torch.zeros(
+                (batch_size, 12), device=node_feats.device, dtype=node_feats.dtype
+            )
+            surv_term_pred_c = torch.zeros((batch_size,), device=node_feats.device, dtype=calc_dtype)
+            surv_proxy_term_c = torch.zeros((batch_size,), device=node_feats.device, dtype=calc_dtype)
+            tau_last_c = torch.zeros((batch_size,), device=node_feats.device, dtype=calc_dtype)
+            r_proxy_c = torch.zeros((batch_size,), device=node_feats.device, dtype=calc_dtype)
+            has_sched_any_c = torch.zeros((batch_size,), device=node_feats.device, dtype=calc_dtype)
         else:
+            idx_grid = torch.arange(m_dim, device=sched_feats.device).unsqueeze(0)
+            active_indices = torch.where(active_sched, idx_grid, torch.zeros_like(idx_grid))
+            last_pos = active_indices.argmax(dim=1, keepdim=True)
+            has_sched_any = active_sched.any(dim=1, keepdim=True)
+            has_sched_any_c = has_sched_any.squeeze(1).to(dtype=calc_dtype)
+
+            tau_obs_c = sched_clean[:, :, int(AutocallSchedCol.TAU_OBS)].to(dtype=calc_dtype)
+            delta_tau_c = sched_clean[:, :, int(AutocallSchedCol.DELTA_TAU)].to(dtype=calc_dtype)
+            log_ko_b_c = sched_clean[:, :, int(AutocallSchedCol.LOG_KO_BARRIER)].to(dtype=calc_dtype)
+            m_sched_c = m_sched.to(dtype=calc_dtype)
+            c_call_c = (
+                sched_clean[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)].detach().clamp(0.0, 1.0).to(dtype=calc_dtype)
+                * m_sched_c
+            )
+            log_cpn_b_c = sched_clean[:, :, int(AutocallSchedCol.LOG_CPN_BARRIER)].to(dtype=calc_dtype)
+            g_cpn_c = (
+                sched_clean[:, :, int(AutocallSchedCol.IS_GUARANTEED_CPN)].detach().clamp(0.0, 1.0).to(dtype=calc_dtype)
+                * m_sched_c
+            )
+            stulz_fwd_c = sched_clean[:, :, int(AutocallSchedCol.STULZ_FWD_W)].to(dtype=calc_dtype)
+            stulz_vol_c = sched_clean[:, :, int(AutocallSchedCol.STULZ_VOL_W)].to(dtype=calc_dtype)
+            p_proxy_c = sched_clean[:, :, int(AutocallSchedCol.PROXY_KO_PROB)].to(dtype=calc_dtype).clamp(0.0, 1.0) * c_call_c
+            q_proxy_c = sched_clean[:, :, int(AutocallSchedCol.PROXY_CPN_PROB)].to(dtype=calc_dtype).clamp(0.0, 1.0) * m_sched_c
+
+            cum_p_proxy_c = torch.cumsum(p_proxy_c, dim=1)
+            surv_prev_proxy_c = (1.0 - (cum_p_proxy_c - p_proxy_c)).clamp(min=1e-6)
+            h_proxy_c = (p_proxy_c / surv_prev_proxy_c).clamp(min=1e-6, max=1.0 - 1e-6)
+            logit_h_proxy_c = torch.log(h_proxy_c / (1.0 - h_proxy_c))
+            q_proxy_clamped_c = q_proxy_c.clamp(min=1e-6, max=1.0 - 1e-6)
+            logit_q_proxy_c = torch.log(q_proxy_clamped_c / (1.0 - q_proxy_clamped_c))
+
+            s_tau_c = torch.sqrt(tau_obs_c * tau_obs_c + 1e-4)
+            std_w_c = torch.sqrt(stulz_vol_c * stulz_vol_c * s_tau_c + 1e-4)
+            z_ko_c = c_call_c * (stulz_fwd_c - log_ko_b_c) / std_w_c * 0.35
+            z_cpn_c = (1.0 - g_cpn_c) * (stulz_fwd_c - log_cpn_b_c) / std_w_c * 0.35
+            z_ko_gap_c = c_call_c * (1.0 - g_cpn_c) * (log_ko_b_c - log_cpn_b_c) / std_w_c * 0.35
+
+            df_pay_c = sched_clean[:, :, int(AutocallSchedCol.DF_PAY)].to(dtype=calc_dtype)
+            cpn_rate_c = sched_clean[:, :, int(AutocallSchedCol.COUPON_RATE)].to(dtype=calc_dtype)
+            sched_cnt_c = m_sched_c.sum(dim=1, keepdim=True).clamp(min=1.0)
+            has_gt1_sched_c = (m_sched_c.sum(dim=1, keepdim=True) > 1.5).to(dtype=calc_dtype)
+            df_mean_c = (df_pay_c * m_sched_c).sum(dim=1, keepdim=True) / sched_cnt_c
+            df_mean_safe_c = torch.sqrt(df_mean_c * df_mean_c + 1e-4)
+            df_rel_c = (df_pay_c / df_mean_safe_c - 1.0) * m_sched_c * has_gt1_sched_c
+            is_mem_c = (
+                global_clean[:, int(AutocallGlobalCol.IS_MEMORY_FLAG)]
+                .detach()
+                .clamp(0.0, 1.0)
+                .to(dtype=calc_dtype)
+                .unsqueeze(1)
+                * m_sched_c
+                * has_gt1_sched_c
+            )
+            cmem0_raw_c = global_clean[:, int(AutocallGlobalCol.C_MEM_0)].to(dtype=calc_dtype).unsqueeze(1)
+            cmem0_pos_c = 0.5 * (cmem0_raw_c + torch.sqrt(cmem0_raw_c * cmem0_raw_c + 1e-8))
+            cpn_pos_c = torch.sqrt(cpn_rate_c * cpn_rate_c + 1e-5)
+            mem_ratio_c = is_mem_c * torch.asinh(0.25 * cmem0_pos_c / cpn_pos_c)
+
+            tau_last_c = torch.gather(tau_obs_c, dim=1, index=last_pos).squeeze(1) * has_sched_any_c
+            tau_frac_c = (tau_obs_c / torch.sqrt(tau_last_c * tau_last_c + 1e-4).unsqueeze(1)) * m_sched_c
+            p_sum_all_c = p_proxy_c.sum(dim=1, keepdim=True)
+            rem_p_c = ((p_sum_all_c - cum_p_proxy_c + p_proxy_c) / surv_prev_proxy_c).clamp(min=0.0, max=1.0) * m_sched_c
+            rem_steps_c = ((sched_cnt_c - torch.cumsum(m_sched_c, dim=1)) / 48.0) * m_sched_c
+            w1_miss_c = (1.0 - g_cpn_c) * (1.0 - q_proxy_c) * cpn_rate_c * m_sched_c
+            cum_miss_c = torch.cumsum(w1_miss_c, dim=1) - w1_miss_c
+            mem_traj_c = is_mem_c * torch.asinh(0.25 * (cmem0_pos_c + cum_miss_c) / cpn_pos_c)
+
+            sched_phys = torch.stack(
+                [
+                    tau_obs_c * 0.25,
+                    torch.sqrt(delta_tau_c * delta_tau_c + 1e-4) * 2.0,
+                    torch.log(s_tau_c + 0.1) * 0.5,
+                    c_call_c,
+                    g_cpn_c,
+                    surv_prev_proxy_c * m_sched_c,
+                    (1.0 - surv_prev_proxy_c) * m_sched_c,
+                    h_proxy_c * c_call_c,
+                    2.0 * torch.asinh(0.5 * (logit_h_proxy_c * 0.15)) * c_call_c,
+                    q_proxy_c * (1.0 - g_cpn_c) * m_sched_c,
+                    2.0 * torch.asinh(0.5 * (logit_q_proxy_c * 0.15)) * (1.0 - g_cpn_c) * m_sched_c,
+                    2.0 * torch.asinh(0.5 * z_ko_c),
+                    2.0 * torch.asinh(0.5 * z_cpn_c) * m_sched_c,
+                    c_call_c * log_ko_b_c,
+                    (1.0 - g_cpn_c) * log_cpn_b_c * m_sched_c,
+                    stulz_fwd_c * 0.5 * m_sched_c,
+                    stulz_vol_c * 2.0 * m_sched_c,
+                    2.0 * torch.asinh(0.5 * z_ko_gap_c) * m_sched_c,
+                    is_mem_c,
+                    mem_ratio_c,
+                    df_rel_c,
+                    tau_frac_c,
+                    rem_p_c,
+                    rem_steps_c,
+                    mem_traj_c,
+                ],
+                dim=-1,
+            ).to(dtype=sched_clean.dtype)
+            sched_phys = torch.where(
+                active_sched.unsqueeze(-1), sched_phys, torch.zeros_like(sched_phys)
+            )
+
+            sched_scaled = sched_clean * self._sched_scales.to(dtype=sched_clean.dtype)
             z_exp = z_basket.unsqueeze(1).expand(batch_size, m_dim, -1)
-            g_exp = global_scaled.unsqueeze(1).expand(batch_size, m_dim, -1)
-            sched_in = torch.cat([sched_clean, z_exp, g_exp], dim=-1)
-            sched_tokens = F.silu(F.linear(sched_in, self.sched_proj.weight, self.sched_proj.bias))
+            g_exp = global_ko_cpn.unsqueeze(1).expand(batch_size, m_dim, -1)
+            sched_in = torch.cat([sched_scaled, z_exp, g_exp], dim=-1)
+            sched_base = F.linear(sched_in, self.sched_proj.weight, self.sched_proj.bias)
+            sched_phys_emb = F.linear(
+                sched_phys,
+                self.sched_phys_proj.weight.to(dtype=sched_phys.dtype),
+                self.sched_phys_proj.bias.to(dtype=sched_phys.dtype),
+            )
+            sched_tokens_raw = F.silu(sched_base + sched_phys_emb)
+            sched_tokens_normed = F.layer_norm(
+                sched_tokens_raw,
+                (self.d_model,),
+                self.sched_in_norm.weight.to(dtype=sched_tokens_raw.dtype),
+                self.sched_in_norm.bias.to(dtype=sched_tokens_raw.dtype),
+                1e-5,
+            )
             sched_tokens = torch.where(
-                active_sched.unsqueeze(-1), sched_tokens, torch.zeros_like(sched_tokens)
+                active_sched.unsqueeze(-1), sched_tokens_normed, torch.zeros_like(sched_tokens_normed)
             )
             seq_out = self.sched_transformer(
                 sched_tokens,
                 m_sched,
+                tau_obs=sched_clean[:, :, int(AutocallSchedCol.TAU_OBS)],
                 all_sched_active=False,
                 require_second_order_sdpa=require_second_order_sdpa,
             )
@@ -768,8 +1060,9 @@ class MaskedEQAutocallSurrogate(nn.Module):
             plin0 = self.period_head[0]
             plin2 = self.period_head[2]
             assert isinstance(plin0, nn.Linear) and isinstance(plin2, nn.Linear)
+            period_feat = torch.cat([seq_out, sched_tokens], dim=-1)
             period_logits = F.linear(
-                F.silu(F.linear(seq_out, plin0.weight, plin0.bias)),
+                F.silu(F.linear(period_feat, plin0.weight, plin0.bias)),
                 plin2.weight,
                 plin2.bias,
             )
@@ -784,20 +1077,141 @@ class MaskedEQAutocallSurrogate(nn.Module):
                 torch.zeros_like(period_logits[:, :, 1]),
             )
 
-            c_call = (
-                sched_clean[:, :, int(AutocallSchedCol.IS_CALLABLE_FLAG)].detach().clamp(0.0, 1.0)
-                * m_sched
-            )
-            c_call_sum = c_call.sum(dim=1, keepdim=True)
+            c_call_sum = c_call_c.sum(dim=1, keepdim=True).to(dtype=sched_clean.dtype) * 0.05
             sched_count = m_sched.sum(dim=1, keepdim=True).clamp(min=1.0)
             h_sched_mean = seq_out.sum(dim=1) / sched_count
-            idx_grid = torch.arange(m_dim, device=sched_feats.device).unsqueeze(0)
-            active_indices = torch.where(active_sched, idx_grid, torch.zeros_like(idx_grid))
-            last_pos = active_indices.argmax(dim=1, keepdim=True)
-            has_sched_any = active_sched.any(dim=1, keepdim=True)
             last_idx = last_pos.unsqueeze(-1).expand(batch_size, 1, self.d_model)
             h_sched_last = torch.gather(seq_out, dim=1, index=last_idx).squeeze(1) * has_sched_any.to(
                 dtype=seq_out.dtype
+            )
+
+            hazard_act_c = c_call_c * torch.sigmoid(
+                logit_h_proxy_c + delta_hazard.to(dtype=calc_dtype)
+            )
+            survival_act_c = torch.cumprod(1.0 - hazard_act_c, dim=1) * has_sched_any_c.unsqueeze(1)
+            surv_term_pred_c = survival_act_c[:, -1]
+            surv_proxy_term_c = (1.0 - p_proxy_c.sum(dim=1)).clamp(min=0.0) * has_sched_any_c
+            stulz_fwd_last_c = (
+                torch.gather(stulz_fwd_c, dim=1, index=last_pos).squeeze(1) * has_sched_any_c
+            )
+            stulz_vol_last_c = (
+                torch.gather(stulz_vol_c, dim=1, index=last_pos).squeeze(1) * has_sched_any_c
+            )
+
+            denom_px_c = (k_eff_pos_c * surv_proxy_term_c).clamp(min=1e-6)
+            r_proxy_c = (l_put_px_c / denom_px_c).clamp(min=1e-6, max=1.0 - 1e-6) * has_sched_any_c
+            r_proxy_safe_c = r_proxy_c.clamp(min=1e-6, max=1.0 - 1e-6)
+            logit_r_px_c = torch.log(r_proxy_safe_c / (1.0 - r_proxy_safe_c)) * has_sched_any_c
+            std_w_last_c = torch.sqrt(
+                stulz_vol_last_c * stulz_vol_last_c * torch.sqrt(tau_last_c * tau_last_c + 1e-4)
+                + 1e-4
+            )
+            z_put_last_c = (
+                2.0 * torch.asinh(0.5 * (stulz_fwd_last_c - log_k_put_s) / std_w_last_c * 0.35)
+                * has_sched_any_c
+            )
+            z_ki_last_c = (
+                2.0 * torch.asinh(0.5 * (stulz_fwd_last_c - log_b_ki_s) / std_w_last_c * 0.35)
+                * has_ki_c
+                * has_sched_any_c
+            )
+            put_phys_12 = torch.stack(
+                [
+                    surv_term_pred_c,
+                    surv_proxy_term_c,
+                    surv_term_pred_c - surv_proxy_term_c,
+                    r_proxy_c,
+                    2.0 * torch.asinh(0.5 * (logit_r_px_c * 0.15)),
+                    k_eff_pos_c,
+                    has_ki_c * b_ki_c + (1.0 - has_ki_c) * k_eff_pos_c,
+                    stulz_fwd_last_c * 0.5,
+                    stulz_vol_last_c * 2.0,
+                    z_put_last_c,
+                    z_ki_last_c,
+                    tau_last_c * 0.25,
+                ],
+                dim=-1,
+            ).to(dtype=node_feats.dtype)
+
+        if d_dim > 0:
+            log_m_i = node_clean[:, :, int(AutocallNodeCol.LOG_MONEYNESS)].to(dtype=calc_dtype)
+            if self.d_node > int(AutocallNodeCol.IV_TERM_ATM):
+                iv_term_i = node_clean[:, :, int(AutocallNodeCol.IV_TERM_ATM)].to(dtype=calc_dtype)
+            else:
+                iv_term_i = node_clean[:, :, int(AutocallNodeCol.IV_SHORT_ATM)].to(dtype=calc_dtype)
+            if self.d_node > int(AutocallNodeCol.DIST_TO_PUT_STRIKE):
+                dist_put_i = node_clean[:, :, int(AutocallNodeCol.DIST_TO_PUT_STRIKE)].to(dtype=calc_dtype)
+            else:
+                dist_put_i = log_m_i - log_k_put_s.unsqueeze(1)
+            s_tau_last_c = torch.sqrt(tau_last_c * tau_last_c + 1e-4).unsqueeze(1)
+            vol_tau_i = torch.sqrt(iv_term_i * iv_term_i * s_tau_last_c + 1e-4)
+            d_put_node_i = 2.0 * torch.asinh(0.5 * dist_put_i)
+            z_put_node_i = (
+                2.0 * torch.asinh(0.5 * (dist_put_i / vol_tau_i * 0.5)) * has_sched_any_c.unsqueeze(1)
+            )
+            ki_diff_i = log_m_i - log_b_ki_s.unsqueeze(1)
+            d_ki_node_i = has_ki_c.unsqueeze(1) * 2.0 * torch.asinh(0.5 * ki_diff_i)
+            z_ki_node_i = (
+                has_ki_c.unsqueeze(1)
+                * 2.0
+                * torch.asinh(0.5 * (ki_diff_i / vol_tau_i * 0.5))
+                * has_sched_any_c.unsqueeze(1)
+            )
+            d_low_node_i = has_low_c.unsqueeze(1) * 2.0 * torch.asinh(0.5 * (log_m_i - log_k_low_s.unsqueeze(1)))
+            vol_tau_feat_i = vol_tau_i * has_sched_any_c.unsqueeze(1)
+            put_node_6 = torch.where(
+                active_3d,
+                torch.stack(
+                    [
+                        d_put_node_i,
+                        z_put_node_i,
+                        d_ki_node_i,
+                        z_ki_node_i,
+                        d_low_node_i,
+                        vol_tau_feat_i,
+                    ],
+                    dim=-1,
+                ).to(dtype=h.dtype),
+                torch.zeros((batch_size, d_dim, 6), device=h.device, dtype=h.dtype),
+            )
+            put_ctx_s = torch.stack(
+                [surv_term_pred_c, surv_proxy_term_c, tau_last_c * 0.25, r_proxy_c], dim=-1
+            ).to(dtype=h.dtype)
+            put_ctx_exp = torch.cat([global_put_scaled, put_ctx_s], dim=-1).unsqueeze(1).expand(batch_size, d_dim, -1)
+            h_put_in = torch.cat([h, put_node_6, put_ctx_exp], dim=-1)
+            h_put_raw = F.silu(
+                F.linear(
+                    h_put_in,
+                    self.put_node_proj.weight.to(dtype=h.dtype),
+                    self.put_node_proj.bias.to(dtype=h.dtype),
+                )
+            )
+            h_put_normed = F.layer_norm(
+                h_put_raw,
+                (self.d_model,),
+                self.put_in_norm.weight.to(dtype=h.dtype),
+                self.put_in_norm.bias.to(dtype=h.dtype),
+                1e-5,
+            )
+            h_put = torch.where(active_3d, h_put_normed, torch.zeros_like(h_put_normed))
+            h_put = self.put_egno.forward_premasked(
+                h_put,
+                edge_scaled,
+                m_asset_3d,
+                pair_mask_4d,
+                inv_denom,
+                bias_scale,
+            )
+            z_put_basket = self.put_pool(
+                h_put,
+                m_asset,
+                asset_weights=w_signed,
+                func_codes=func_codes,
+                all_active=False,
+            )
+        else:
+            z_put_basket = torch.zeros(
+                (batch_size, self.d_model), device=node_feats.device, dtype=node_feats.dtype
             )
 
         put_in = torch.cat(
@@ -805,10 +1219,13 @@ class MaskedEQAutocallSurrogate(nn.Module):
                 h_sched_last,
                 h_sched_mean,
                 z_basket,
-                global_scaled,
+                z_put_basket,
+                global_put_scaled,
                 func_emb_flat,
                 h_disp.unsqueeze(-1),
                 c_call_sum,
+                put_phys_12,
+                dput_stats,
             ],
             dim=-1,
         )
@@ -994,7 +1411,8 @@ class MaskedEQAutocallSurrogate(nn.Module):
 
         q_proxy_clamped = q_proxy.clamp(min=1e-6, max=1.0 - 1e-6)
         logit_q_proxy = torch.log(q_proxy_clamped / (1.0 - q_proxy_clamped))
-        q_gate = (q_proxy * q_proxy) / (q_proxy * q_proxy + 1e-10)
+        # Softened 1e-14 gate avoids 5x attenuation on seasoned deep-ITM deals where q_proxy ~ 1e-6..5e-6.
+        q_gate = (q_proxy * q_proxy) / (q_proxy * q_proxy + 1e-14)
         q_pred = q_gate * torch.sigmoid(logit_q_proxy + delta_coupon_act.to(dtype=calc_dtype))
         coupon_act = m_sched * (g_cpn + (1.0 - g_cpn) * q_pred)
 
@@ -1114,7 +1532,7 @@ class MaskedEQAutocallSurrogate(nn.Module):
         )
 
 
-def assemble_surrogate_product_value(
+def assemble_surrogate_components(
     out: AutocallSurrogateOutput,
     sched_feats: torch.Tensor,
     sched_mask: torch.Tensor,
@@ -1131,15 +1549,16 @@ def assemble_surrogate_product_value(
     lower_strike: Optional[float | torch.Tensor] = None,
     one_star_pv: float | torch.Tensor = 0.0,
     part_call_pv: float | torch.Tensor = 0.0,
-) -> torch.Tensor:
-    """Assemble total ProductValue via the W1 affine stopping-time decomposition."""
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Assemble (ProductValue, NotionalPV, CouponPV, OptionPV) via W1 stopping-time decomposition."""
     batch_size, m_dim, _ = sched_feats.shape
     dtype = sched_feats.dtype
     device = sched_feats.device
 
     pv_transit_t = _normalize_batch_vec(pv_in_transit, batch_size, dtype, device)
+    zeros_b = torch.zeros_like(pv_transit_t)
     if m_dim == 0:
-        return pv_transit_t
+        return pv_transit_t, zeros_b, zeros_b, zeros_b
 
     if is_long_basket is None:
         if global_feats.shape[-1] > int(AutocallGlobalCol.IS_LONG_BASKET):
@@ -1260,6 +1679,48 @@ def assemble_surrogate_product_value(
     autocalled_t = _normalize_batch_vec(already_autocalled, batch_size, torch.bool, device)
     is_live = has_any & (~autocalled_t)
     res_pv: torch.Tensor = torch.where(is_live, active_pv, pv_transit_t)
+    res_not = torch.where(is_live, pv_notional, zeros_b)
+    res_cpn = torch.where(is_live, pv_coupon, zeros_b)
+    res_opt = torch.where(is_live, pv_option, zeros_b)
+    return res_pv, res_not, res_cpn, res_opt
+
+
+def assemble_surrogate_product_value(
+    out: AutocallSurrogateOutput,
+    sched_feats: torch.Tensor,
+    sched_mask: torch.Tensor,
+    global_feats: torch.Tensor,
+    *,
+    no_notional_repayment: bool | torch.Tensor = False,
+    autocall_coupon: float | torch.Tensor = 0.0,
+    force_coupons_on_autocall: bool | torch.Tensor = False,
+    is_long_basket: Optional[bool | torch.Tensor] = None,
+    pv_in_transit: float | torch.Tensor = 0.0,
+    funding_pv: float | torch.Tensor = 0.0,
+    already_autocalled: bool | torch.Tensor = False,
+    w_fund_per_period: Optional[torch.Tensor] = None,
+    lower_strike: Optional[float | torch.Tensor] = None,
+    one_star_pv: float | torch.Tensor = 0.0,
+    part_call_pv: float | torch.Tensor = 0.0,
+) -> torch.Tensor:
+    """Assemble total ProductValue via the W1 affine stopping-time decomposition."""
+    res_pv, _, _, _ = assemble_surrogate_components(
+        out=out,
+        sched_feats=sched_feats,
+        sched_mask=sched_mask,
+        global_feats=global_feats,
+        no_notional_repayment=no_notional_repayment,
+        autocall_coupon=autocall_coupon,
+        force_coupons_on_autocall=force_coupons_on_autocall,
+        is_long_basket=is_long_basket,
+        pv_in_transit=pv_in_transit,
+        funding_pv=funding_pv,
+        already_autocalled=already_autocalled,
+        w_fund_per_period=w_fund_per_period,
+        lower_strike=lower_strike,
+        one_star_pv=one_star_pv,
+        part_call_pv=part_call_pv,
+    )
     return res_pv
 
 
@@ -1274,5 +1735,6 @@ __all__ = [
     "MonitoringIndexCode",
     "ParallelScheduleTransformer",
     "PreNormSDPALayer",
+    "assemble_surrogate_components",
     "assemble_surrogate_product_value",
 ]

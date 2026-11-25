@@ -120,6 +120,8 @@ class SyntheticAutocallBatch:
     jac_edge_self: torch.Tensor             # (B, D_max, D_max, 2) for cols [COVARIANCE_TERM, LOG_PERF_DIFF]
     jac_sched_logm: torch.Tensor            # (B, D_max, M_max, 4) for cols [8..11]
     jac_lput_logm: torch.Tensor             # (B, D_max)
+    coupon_pv_mc: Optional[torch.Tensor] = None     # (B,) exact MC coupon PV when standard put/no-exotic
+    coupon_pv_valid: Optional[torch.Tensor] = None  # (B,) 1.0 when coupon_pv_mc is exact, else 0.0
 
     def to(
         self,
@@ -160,6 +162,8 @@ class SyntheticAutocallBatch:
             jac_edge_self=_mv(self.jac_edge_self),
             jac_sched_logm=_mv(self.jac_sched_logm),
             jac_lput_logm=_mv(self.jac_lput_logm),
+            coupon_pv_mc=_mv(self.coupon_pv_mc) if self.coupon_pv_mc is not None else None,
+            coupon_pv_valid=_mv(self.coupon_pv_valid) if self.coupon_pv_valid is not None else None,
         )
 
     def index_select(self, idx: torch.Tensor) -> SyntheticAutocallBatch:
@@ -192,6 +196,8 @@ class SyntheticAutocallBatch:
             jac_edge_self=self.jac_edge_self.index_select(0, idx_dev),
             jac_sched_logm=self.jac_sched_logm.index_select(0, idx_dev),
             jac_lput_logm=self.jac_lput_logm.index_select(0, idx_dev),
+            coupon_pv_mc=self.coupon_pv_mc.index_select(0, idx_dev) if self.coupon_pv_mc is not None else None,
+            coupon_pv_valid=self.coupon_pv_valid.index_select(0, idx_dev) if self.coupon_pv_valid is not None else None,
         )
 
 
@@ -338,10 +344,16 @@ class _LazySSVIBank:
             if surf is not None:
                 return surf
             if self.domain_mode == "core_desk":
-                iv_s = 0.15 + 0.27 * float(self._u_bank[k, 0])
-                iv_sl = -0.04 + 0.09 * float(self._u_bank[k, 1])
-                rho_k = -0.55 + 0.65 * float(self._u_bank[k, 2])
-                eta_k = 0.15 + 0.30 * float(self._u_bank[k, 3])
+                iv_s = 0.15 + 0.30 * float(self._u_bank[k, 0])
+                if (k % 5) == 0:
+                    # Include flat/near-flat RUB Murex vol surfaces alongside skewed SSVI surfaces.
+                    iv_sl = -0.01 + 0.02 * float(self._u_bank[k, 1])
+                    rho_k = -0.08 + 0.16 * float(self._u_bank[k, 2])
+                    eta_k = 0.02 + 0.10 * float(self._u_bank[k, 3])
+                else:
+                    iv_sl = -0.05 + 0.11 * float(self._u_bank[k, 1])
+                    rho_k = -0.58 + 0.80 * float(self._u_bank[k, 2])
+                    eta_k = 0.12 + 0.50 * float(self._u_bank[k, 3])
             else:
                 iv_s = 0.14 + 0.41 * float(self._u_bank[k, 0])
                 iv_sl = -0.07 + 0.16 * float(self._u_bank[k, 1])
@@ -471,9 +483,11 @@ def _build_contract_state_and_jacs(
             # 85% core desk manifold: m0 in [0.60, 1.35]
             m0_np = 0.60 + 0.75 * m0_u
         else:
-            # 15% seasoned/distressed belt (especially M_rem <= 4 so reference 45476647 is well in-support)
+            # 15% seasoned/distressed belt covering min_m0 in [0.30, 0.65] for M_rem <= 12
             if m_rem <= 4 and float(rng.random()) < 0.70:
                 m0_np = 0.18 + 0.55 * m0_u
+            elif m_rem <= 12 and float(rng.random()) < 0.65:
+                m0_np = 0.25 + 0.50 * m0_u
             else:
                 m0_np = 0.18 + 1.22 * m0_u
     else:
@@ -490,20 +504,37 @@ def _build_contract_state_and_jacs(
     ref_np = np.full(d_active, 100.0, dtype=np.float64)
     spots_np = ref_np * m0_np
 
-    r_disc = (0.02 + 0.20 * float(u_row[2])) if domain_mode == "tier2_desk" else (0.02 + 0.14 * float(u_row[2]))
-    div_yields = 0.04 * rng.random(d_active)
+    if domain_mode == "tier2_desk":
+        # 80% high RUB rate regime (13%-22%), 20% lower-rate / FX-quanto regime (2%-13%).
+        u_r = float(u_row[2])
+        if u_r < 0.80:
+            r_disc = 0.13 + 0.09 * (u_r / 0.80)
+        else:
+            r_disc = 0.02 + 0.11 * ((u_r - 0.80) / 0.20)
+        div_cap = 0.075 if float(rng.random()) < 0.20 else 0.04
+        div_yields = div_cap * rng.random(d_active)
+    else:
+        r_disc = 0.02 + 0.14 * float(u_row[2])
+        div_yields = 0.04 * rng.random(d_active)
     repo_avg_np = 0.03 * rng.random(d_active)
     carry_1y_np = r_disc - div_yields - repo_avg_np
 
     u_dtau = float(u_row[3])
     if domain_mode == "tier2_desk":
-        # Cap contract maturity <= 5.0y across M_rem in [1..48]
+        # Cap contract maturity <= 5.0y across M_rem in [1..48], including seasoned fractional first dates.
         if m_rem > 20:
             dtau = 1.0 / 12.0
         elif m_rem >= 9:
-            dtau = (1.0 / 12.0) if u_dtau < 0.50 else 0.25
+            dtau = (1.0 / 12.0) if u_dtau < 0.55 else 0.25
         else:
             dtau = 0.15 + 0.35 * u_dtau
+        if float(rng.random()) < 0.65:
+            tau_0 = max(0.06, dtau * (0.20 + 0.80 * float(rng.random())))
+        else:
+            tau_0 = dtau
+        tau_obs_np = tau_0 + np.arange(m_rem, dtype=np.float64) * dtau
+        delta_tau_np = np.full(m_rem, dtau, dtype=np.float64)
+        delta_tau_np[0] = tau_0
     else:
         if m_rem <= 12:
             dtau = 0.08333333333333333 if u_dtau < 0.25 else (0.25 if u_dtau < 0.80 else 0.50)
@@ -511,19 +542,20 @@ def _build_contract_state_and_jacs(
             dtau = 0.08333333333333333 if u_dtau < 0.35 else (0.25 if u_dtau < 0.90 else 0.50)
         else:
             dtau = 0.08333333333333333 if u_dtau < 0.45 else 0.25
-
-    tau_obs_np = np.arange(1, m_rem + 1, dtype=np.float64) * dtau
-    delta_tau_np = np.full(m_rem, dtau, dtype=np.float64)
+        tau_obs_np = np.arange(1, m_rem + 1, dtype=np.float64) * dtau
+        delta_tau_np = np.full(m_rem, dtau, dtype=np.float64)
     df_pay_np = np.exp(-r_disc * tau_obs_np)
 
     u_fn = float(u_row[4])
     if domain_mode == "tier2_desk":
-        if d_active < 2 or u_fn < 0.60:
+        if d_active < 2 or u_fn < 0.52:
             call_idx = "WorstOf"
-        elif u_fn < 0.80:
+        elif u_fn < 0.72:
             call_idx = "BestOf"
-        else:
+        elif u_fn < 0.90:
             call_idx = "AverageOf"
+        else:
+            call_idx = "EquallyWeightedBasket"
         cpn_idx = call_idx
         opt_idx = call_idx
     elif d_active < 2:
@@ -626,46 +658,59 @@ def _build_contract_state_and_jacs(
         k_put = 0.05 + 0.20 * float(u_row[7])
     elif is_diff_opt:
         k_put = -0.20 + 0.45 * float(u_row[7])
+    elif domain_mode == "tier2_desk" and float(u_row[7]) < 0.06:
+        # Exercise capital-protected / near-zero-put structures (e.g. PS 53391858).
+        k_put = 1e-6
     else:
-        k_put = 0.65 + 0.35 * float(u_row[7])
-    has_lower = float(u_row[8]) < 0.25 and k_put > 0.12
+        k_put = 0.60 + 0.45 * float(u_row[7])
+    low_prob = 0.05 if domain_mode == "tier2_desk" else 0.25
+    has_lower = float(u_row[8]) < low_prob and k_put > 0.12
     if domain_mode == "tier2_desk":
         lower_strike_val = (
             round(min(0.35, k_put * 0.60) * float(rng.random()), 4) if has_lower else 0.0
         )
     else:
         lower_strike_val = round(k_put * (0.25 + 0.45 * float(rng.random())), 4) if has_lower else 0.0
-    has_ki = float(u_row[9]) < 0.65
+    ki_prob = 0.42 if domain_mode == "tier2_desk" else 0.65
+    has_ki = (float(u_row[9]) < ki_prob) and (k_put > 0.10)
     if opt_idx == "Dispersion":
         b_ki = (0.03 + 0.12 * float(rng.random())) if has_ki else k_put
     elif is_diff_opt:
         b_ki = (-0.30 + 0.30 * float(rng.random())) if has_ki else k_put
     else:
-        b_ki = (0.45 + 0.35 * float(rng.random())) if has_ki else k_put
+        b_ki = (0.45 + 0.45 * float(rng.random())) if has_ki else k_put
     i_ki_past = 1.0 if (has_ki and float(u_row[10]) < 0.10) else 0.0
     if domain_mode == "tier2_desk":
-        g_put = (
-            min(1.25, max(0.50, 1.0 / max(k_put, 1e-4)))
-            if float(u_row[11]) < 0.50
-            else (0.50 + 0.75 * float(rng.random()))
-        )
+        if k_put <= 1e-4:
+            g_put = 0.0
+        elif float(u_row[11]) < 0.50:
+            g_put = min(1.40, max(0.50, 1.0 / max(k_put, 1e-4)))
+        else:
+            g_put = 0.50 + 0.75 * float(rng.random())
     else:
         g_put = (
             min(2.0, 1.0 / max(abs(k_put), 0.25))
             if float(u_row[11]) < 0.50
             else (0.5 + 1.2 * float(rng.random()))
         )
-    is_memory = float(u_row[12]) < 0.65
-    c_mem_cap = 0.40 if (domain_mode == "tier2_desk" and is_distressed) else (0.38 if domain_mode == "tier2_desk" else 0.45)
-    c_mem_0 = (float(rng.random()) * c_mem_cap) if (is_memory and float(rng.random()) < 0.70) else 0.0
-
-    no_notional = float(u_row[13]) < 0.08
-    ac_cpn = (0.02 + 0.10 * float(rng.random())) if float(u_row[14]) < 0.12 else 0.0
-    force_cpn = float(u_row[15]) < 0.18
+    mem_prob = 0.80 if domain_mode == "tier2_desk" else 0.65
+    is_memory = float(u_row[12]) < mem_prob
+    if domain_mode == "tier2_desk":
+        c_mem_cap = 0.72 if (is_distressed or float(rng.random()) < 0.25) else 0.42
+        c_mem_0 = (
+            float(rng.random()) * c_mem_cap
+            if (is_memory and float(rng.random()) < 0.72)
+            else 0.0
+        )
+        no_notional = float(u_row[13]) < 0.02
+        ac_cpn = (0.02 + 0.08 * float(rng.random())) if float(u_row[14]) < 0.02 else 0.0
+        force_cpn = False
+    else:
+        c_mem_0 = (float(rng.random()) * 0.45) if (is_memory and float(rng.random()) < 0.70) else 0.0
+        no_notional = float(u_row[13]) < 0.08
+        ac_cpn = (0.02 + 0.10 * float(rng.random())) if float(u_row[14]) < 0.12 else 0.0
+        force_cpn = float(u_row[15]) < 0.18
     is_long_basket = False if domain_mode == "tier2_desk" else (float(u_row[16]) < 0.10)
-    if is_long_basket and monitoring_index_to_code(opt_idx) == int(MonitoringIndexCode.WORST_OF):
-        opt_idx = "AverageOf"
-        is_diff_opt = False
 
     if domain_mode == "full_stress" and float(rng.random()) < 0.08:
         one_star_strike_val: Optional[float] = round(0.85 + 0.35 * float(rng.random()), 4)
@@ -685,15 +730,25 @@ def _build_contract_state_and_jacs(
     def _draw_spread() -> float:
         if domain_mode == "tier2_desk":
             u_sp = float(rng.random())
-            return 0.0 if u_sp < 0.03 else -(0.005 + 0.145 * ((u_sp - 0.03) / 0.97))
+            if u_sp < 0.05:
+                return 0.0
+            if u_sp < 0.80:
+                return -(0.045 + 0.110 * ((u_sp - 0.05) / 0.75))
+            return -(0.005 + 0.040 * ((u_sp - 0.80) / 0.20))
         u_s = float(rng.random())
         if u_s < 0.05:
             return 0.0
         return -(0.005 + 0.195 * float(rng.random()))
 
-    ko_spread = _draw_spread()
-    cpn_spread = _draw_spread()
-    ki_spread = _draw_spread()
+    if domain_mode == "tier2_desk" and float(rng.random()) < 0.60:
+        shared_sp = _draw_spread()
+        ko_spread = shared_sp
+        cpn_spread = shared_sp
+        ki_spread = shared_sp
+    else:
+        ko_spread = _draw_spread()
+        cpn_spread = _draw_spread()
+        ki_spread = _draw_spread()
 
     def _barrier_scale(idx_name: str, is_ko: bool) -> Tuple[float, float]:
         if idx_name == "Dispersion":
@@ -708,13 +763,19 @@ def _build_contract_state_and_jacs(
             int(MonitoringIndexCode.RATIO_AVERAGE_WORST),
         ):
             return (1.05 + 0.20 * float(rng.random()), 0.01) if is_ko else (0.75 + 0.20 * float(rng.random()), 0.0)
+        if domain_mode == "tier2_desk":
+            if is_ko:
+                if float(rng.random()) < 0.88:
+                    return (0.90 + 0.25 * float(rng.random()), 0.025 * float(rng.random()))
+                return (1.15 + 1.05 * float(rng.random()), 0.03 + 0.18 * float(rng.random()))
+            return (0.58 + 0.40 * float(rng.random()), 0.0)
         return (0.95 + 0.15 * float(rng.random()), 0.015 * float(rng.random())) if is_ko else (0.65 + 0.20 * float(rng.random()), 0.0)
 
     base_ko, step_ko = _barrier_scale(call_idx, True)
     base_cpn_b, _ = _barrier_scale(cpn_idx, False)
     if domain_mode == "tier2_desk":
-        # FixedRate * dtau per Murex schedule convention (6%-20% annualized coupon)
-        cpn_rate_val = (0.06 + 0.14 * float(rng.random())) * dtau
+        # FixedRate * dtau per Murex schedule convention (6%-34% annualized coupon)
+        cpn_rate_val = (0.06 + 0.28 * float(rng.random())) * dtau
     else:
         cpn_rate_val = 0.02 + 0.03 * float(rng.random())
 
@@ -727,7 +788,8 @@ def _build_contract_state_and_jacs(
     log_cpn_feat_np = np.zeros(m_rem, dtype=np.float64)
 
     lockout_len = int(rng.integers(1, min(4, m_rem))) if (m_rem > 1 and float(u_row[17]) < 0.25) else 0
-    has_guar_0 = float(u_row[18]) < 0.20
+    has_guar_0 = float(u_row[18]) < 0.22
+    all_guar = (domain_mode == "tier2_desk") and (float(rng.random()) < 0.05)
     call_is_diff = _is_diff_index(call_idx)
     cpn_is_diff = _is_diff_index(cpn_idx)
     for m in range(m_rem):
@@ -747,7 +809,7 @@ def _build_contract_state_and_jacs(
             ko_barriers_np[m] = b_k
             is_callable_np[m] = 1.0
 
-        if m == 0 and has_guar_0:
+        if all_guar or (m == 0 and has_guar_0):
             cpn_barriers_np[m] = 1e-5
             is_guar_np[m] = 1.0
             log_cpn_feat_np[m] = math.asinh(0.05) if cpn_is_diff else math.log(0.05)
@@ -794,18 +856,20 @@ def _build_contract_state_and_jacs(
         t_t = float(tau_obs_np[-1])
         f_s = float(f_row[0])
         f_t = float(f_row[-1])
+        iv_t_val = float(iv_0_np[i, -1])
+        iv_s_val = float(iv_0_np[i, 0])
         surf_feats_0_np[i] = surf_i.extract_node_surface_features_values_only(
-            t_s, f_s, t_t, f_t, iv_short_val=float(iv_0_np[i, 0]), iv_term_val=float(iv_0_np[i, -1])
+            t_s, f_s, t_t, f_t, iv_short_val=iv_s_val, iv_term_val=iv_t_val
         )
         es = max(1e-4 * f_s, 1e-5)
         et = max(1e-4 * f_t, 1e-5)
         d_surf_df_short_np[i] = (
-            surf_i.extract_node_surface_features_values_only(t_s, f_s + es, t_t, f_t)
-            - surf_i.extract_node_surface_features_values_only(t_s, max(f_s - es, 1e-5), t_t, f_t)
+            surf_i.extract_node_surface_features_values_only(t_s, f_s + es, t_t, f_t, iv_term_val=iv_t_val)
+            - surf_i.extract_node_surface_features_values_only(t_s, max(f_s - es, 1e-5), t_t, f_t, iv_term_val=iv_t_val)
         ) / (f_s + es - max(f_s - es, 1e-5))
         d_surf_df_term_np[i] = (
-            surf_i.extract_node_surface_features_values_only(t_s, f_s, t_t, f_t + et)
-            - surf_i.extract_node_surface_features_values_only(t_s, f_s, t_t, max(f_t - et, 1e-5))
+            surf_i.extract_node_surface_features_values_only(t_s, f_s, t_t, f_t + et, iv_short_val=iv_s_val)
+            - surf_i.extract_node_surface_features_values_only(t_s, f_s, t_t, max(f_t - et, 1e-5), iv_short_val=iv_s_val)
         ) / (f_t + et - max(f_t - et, 1e-5))
 
     # Tensors used inside jacfwd feature builder
@@ -1319,6 +1383,11 @@ def _build_contract_state_and_jacs(
         feature_schema_version=FEATURE_SCHEMA_VERSION,
     )
 
+    has_exotic_opt = (
+        is_long_basket
+        or (one_star_strike_val is not None)
+        or (part_call_strike_val is not None)
+    )
     mod_vec = torch.tensor(
         [
             1.0 if no_notional else 0.0,
@@ -1326,6 +1395,7 @@ def _build_contract_state_and_jacs(
             1.0 if force_cpn else 0.0,
             1.0 if is_long_basket else 0.0,
             float(lower_strike_val),
+            0.0 if has_exotic_opt else 1.0,
         ],
         dtype=torch.float64,
     )
@@ -1412,6 +1482,8 @@ def generate_synthetic_autocall_batch(
             jac_edge_self=torch.zeros((b0, d0, d0, 2), device=dev, dtype=dtype),
             jac_sched_logm=torch.zeros((b0, d0, m0, 4), device=dev, dtype=dtype),
             jac_lput_logm=torch.zeros((b0, d0), device=dev, dtype=dtype),
+            coupon_pv_mc=torch.zeros((b0,), device=dev, dtype=dtype),
+            coupon_pv_valid=torch.zeros((b0,), device=dev, dtype=dtype),
         )
     eff_qmc_dev = (
         torch.device(qmc_device)
@@ -1555,14 +1627,36 @@ def generate_synthetic_autocall_batch(
     )
 
     mods = torch.stack(mod_list, dim=0)
+    sched_stack = torch.stack(sched_list, dim=0)
+    smask_stack = torch.stack(smask_list, dim=0)
+    glob_stack = torch.stack(glob_list, dim=0)
+
+    # Exact MC coupon PV by accounting identity PV_mc = NotionalPV_mc + CouponPV_mc + OptionPV_mc
+    # whenever no exotic option leg (IsLongBasket / OneStar / ParticipationCall) is active.
+    active_s_bool = smask_stack > 0.5
+    idx_s_grid = torch.arange(m_max, dtype=torch.long).unsqueeze(0)
+    last_s_idx = torch.where(active_s_bool, idx_s_grid, torch.zeros_like(idx_s_grid)).argmax(dim=1, keepdim=True)
+    df_pay_mc = sched_stack[:, :, 2] * active_s_bool.to(dtype=torch.float64)
+    df_term_mc = torch.gather(df_pay_mc, dim=1, index=last_s_idx).squeeze(1)
+    p_mc_act = p_mc_t * active_s_bool.to(dtype=torch.float64)
+    surv_term_mc = (1.0 - p_mc_act.sum(dim=1)).clamp(min=0.0)
+    notional_pv_mc = (1.0 - mods[:, 0]) * ((df_pay_mc * p_mc_act).sum(dim=1) + df_term_mc * surv_term_mc)
+    g_put_mc = glob_stack[:, 4]
+    option_pv_mc = -df_term_mc * g_put_mc * l_put_mc_t
+    cpn_valid_t = mods[:, 5]
+    coupon_pv_mc_t = torch.where(
+        cpn_valid_t > 0.5,
+        pv_mc_t - notional_pv_mc - option_pv_mc,
+        torch.zeros_like(pv_mc_t),
+    )
 
     batch = SyntheticAutocallBatch(
         node_feats=torch.stack(node_list, dim=0),
         edge_feats=torch.stack(edge_list, dim=0),
         asset_mask=torch.stack(amask_list, dim=0),
-        sched_feats=torch.stack(sched_list, dim=0),
-        sched_mask=torch.stack(smask_list, dim=0),
-        global_feats=torch.stack(glob_list, dim=0),
+        sched_feats=sched_stack,
+        sched_mask=smask_stack,
+        global_feats=glob_stack,
         p_proxy=torch.stack(p_px_list, dim=0),
         q_proxy=torch.stack(q_px_list, dim=0),
         l_put_proxy=torch.stack(lp_px_list, dim=0),
@@ -1583,6 +1677,8 @@ def generate_synthetic_autocall_batch(
         jac_edge_self=torch.stack(je_list, dim=0),
         jac_sched_logm=torch.stack(js_list, dim=0),
         jac_lput_logm=torch.stack(jl_list, dim=0),
+        coupon_pv_mc=coupon_pv_mc_t,
+        coupon_pv_valid=cpn_valid_t,
     )
     if cache_key is not None:
         with _MINI_BATCH_CACHE_LOCK:

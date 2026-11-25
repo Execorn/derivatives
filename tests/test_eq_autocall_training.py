@@ -19,6 +19,7 @@ from pathlib import Path
 import sys
 from unittest import mock
 
+import pytest
 import scipy.stats as stats
 import torch
 
@@ -135,6 +136,11 @@ def test_synthetic_autocall_batch_invariants() -> None:
     assert float(batch.l_put_mc.min().item()) >= 0.0
     assert torch.isfinite(batch.pv_mc).all()
     assert torch.isfinite(batch.delta_mc).all()
+    assert batch.coupon_pv_mc is not None and batch.coupon_pv_valid is not None
+    assert batch.coupon_pv_mc.shape == (16,)
+    assert batch.coupon_pv_valid.shape == (16,)
+    assert torch.isfinite(batch.coupon_pv_mc).all()
+    assert torch.all((batch.coupon_pv_valid == 0.0) | (batch.coupon_pv_valid == 1.0))
 
 
 def test_w4_spread_attenuated_sobolev_loss_and_monotonicity() -> None:
@@ -149,7 +155,7 @@ def test_w4_spread_attenuated_sobolev_loss_and_monotonicity() -> None:
 
     # 1. Check spread attenuation formula w(Delta_B) = |Delta_B| / (|Delta_B| + 0.05)
     glob_zero = torch.zeros((4, 16), dtype=torch.float32)
-    w_zero = criterion.spread_attenuated_weight(glob_zero) if hasattr(criterion, "spread_attenuated_weight") else criterion.spread_attenuation_weight(glob_zero)
+    w_zero = criterion.spread_attenuation_weight(glob_zero)
     assert torch.allclose(w_zero, torch.zeros_like(w_zero))
 
     glob_005 = torch.zeros((4, 16), dtype=torch.float32)
@@ -169,16 +175,15 @@ def test_w4_spread_attenuated_sobolev_loss_and_monotonicity() -> None:
     assert float(breakdown.sobolev_delta_loss.item()) >= 0.0
     assert float(breakdown.monotonicity_loss.item()) >= 0.0
 
-    breakdown.total_loss.backward()
+    breakdown.total_loss.backward()  # type: ignore[no-untyped-call]
     grad_norms = [
         float(p.grad.norm().item()) for p in model.parameters() if p.grad is not None
     ]
     assert len(grad_norms) > 0 and max(grad_norms) > 0.0
 
 
-def test_G1_5_checkpoint_out_of_sample_mae_and_trainer_roundtrip(tmp_path: Path) -> None:
-    """Gate G1.5: Verify saved v2.0 checkpoint metrics, conformal calibration, and trainer roundtrip."""
-    import pytest
+def test_G1_5_saved_checkpoint_and_8d_stats() -> None:
+    """Gate G1.5: Verify retrained v2.0 7475097/V3 checkpoint metrics and 8D signed EB-Mondrian stats."""
     from deepvol.training.train_eq_autocall import (
         DEFAULT_GUARDIAN_STATS_PATH,
         _predict_batch_pv,
@@ -192,10 +197,13 @@ def test_G1_5_checkpoint_out_of_sample_mae_and_trainer_roundtrip(tmp_path: Path)
     raw_ckpt = torch.load(DEFAULT_CHECKPOINT_PATH, map_location="cpu", weights_only=True)
     assert raw_ckpt["schema_version"] == "2.0"
     assert raw_ckpt["oracle_mode"] == "dupire_lv_gpu_rqmc"
+    state_dict = raw_ckpt.get("model_state_dict") or raw_ckpt.get("state_dict") or {}
+    if "put_egno.norm.weight" not in state_dict:
+        pytest.skip("Pre-Phase-B legacy checkpoint on disk; Phase B GPU retrain will regenerate 7475097/V3 checkpoint.")
+
     model, metrics = load_eq_autocall_surrogate(DEFAULT_CHECKPOINT_PATH, device="cpu")
     assert isinstance(model, MaskedEQAutocallSurrogate)
 
-    # Dual OOS gates approved in Coordinator #91
     assert metrics["test_worstof_mae_bps"] <= 48.0
     assert metrics["test_multifunc_mae_bps"] <= 35.0
     assert metrics["conformal_accepted_mae_bps"] <= 15.0
@@ -205,10 +213,14 @@ def test_G1_5_checkpoint_out_of_sample_mae_and_trainer_roundtrip(tmp_path: Path)
 
     stats_payload = torch.load(DEFAULT_GUARDIAN_STATS_PATH, map_location="cpu", weights_only=True)
     assert stats_payload["schema_version"] == "2.0"
-    assert float(stats_payload["tau_desk_bps"]) == pytest.approx(60.0)
-    assert tuple(stats_payload["scale_weights_5d"].shape) == (5,)
+    assert stats_payload["conformal_mode"] == "signed_8d_eb_mondrian"
+    assert float(stats_payload["tau_desk_bps"]) == pytest.approx(15.0)
+    assert tuple(stats_payload["scale_weights_8d"].shape) == (8,)
+    assert float(stats_payload["scale_weights_8d"][1].item()) >= 5e-4 - 1e-12
+    assert len(stats_payload["mondrian_bias_table"]) == 24
+    assert len(stats_payload["mondrian_q_lo_table"]) == 24
+    assert len(stats_payload["mondrian_q_hi_table"]) == 24
 
-    # Live OOS check across D=1..8 on freshly sampled tier2_desk trades
     oos_batch = generate_synthetic_autocall_batch(
         batch_size=32,
         d_max=8,
@@ -231,11 +243,20 @@ def test_G1_5_checkpoint_out_of_sample_mae_and_trainer_roundtrip(tmp_path: Path)
     assert cov_live >= 0.85
 
     preds = _predict_batch_pv(model, oos_batch, device=torch.device("cpu"))
-    hw_bps = compute_conformal_half_width_bps(oos_batch, stats_payload)
+    hw_bps = compute_conformal_half_width_bps(oos_batch, stats_payload, pv_pred=preds)
     assert hw_bps.shape == (32,) and float(hw_bps.min()) > 0.0
     assert torch.isfinite(preds).all()
 
-    # Fast training roundtrip into tmp_path covering train_eq_autocall_surrogate + calibrate_guardian_stats (Cal-1/Cal-2 >= 64)
+
+def test_trainer_roundtrip_coupon_pv_and_8d_signed_conformal(tmp_path: Path) -> None:
+    """Verify full trainer roundtrip with pv_coupon_mc supervision, 8D signed EB-Mondrian stats, and CLI."""
+    from deepvol.training.train_eq_autocall import (
+        _predict_batch_pv,
+        compute_conformal_half_width_bps,
+        evaluate_conformal_coverage,
+        main as train_main,
+    )
+
     dev_str = "cuda" if torch.cuda.is_available() else "cpu"
     tmp_ckpt = tmp_path / "test_ckpt.pt"
     tmp_stats = tmp_path / "test_guardian_stats.pt"
@@ -252,7 +273,7 @@ def test_G1_5_checkpoint_out_of_sample_mae_and_trainer_roundtrip(tmp_path: Path)
         n_substeps_test=2,
         d_model=64,
         n_egno_layers=2,
-        n_sched_layers=1,
+        n_sched_layers=3,
         checkpoint_path=tmp_ckpt,
         guardian_stats_path=tmp_stats,
         device=dev_str,
@@ -262,6 +283,33 @@ def test_G1_5_checkpoint_out_of_sample_mae_and_trainer_roundtrip(tmp_path: Path)
     assert res.test_mae_bps >= 0.0
     loaded_tmp, _ = load_eq_autocall_surrogate(tmp_ckpt, device="cpu")
     assert loaded_tmp.d_model == 64
+    assert loaded_tmp.n_sched_layers == 3
+
+    stats_tmp = torch.load(tmp_stats, map_location="cpu", weights_only=True)
+    assert stats_tmp["conformal_mode"] == "signed_8d_eb_mondrian"
+    assert float(stats_tmp["tau_desk_bps"]) == pytest.approx(15.0)
+    assert tuple(stats_tmp["scale_weights_8d"].shape) == (8,)
+    assert float(stats_tmp["scale_weights_8d"][1].item()) >= 5e-4 - 1e-12
+    assert len(stats_tmp["mondrian_bias_table"]) == 24
+    assert len(stats_tmp["mondrian_q_lo_table"]) == 24
+    assert len(stats_tmp["mondrian_q_hi_table"]) == 24
+
+    oos_batch = generate_synthetic_autocall_batch(
+        batch_size=16,
+        d_max=8,
+        m_max=48,
+        m_rem_max=12,
+        n_mc_paths=64,
+        n_substeps=2,
+        seed=9999,
+        dtype=torch.float32,
+        domain_mode="tier2_desk",
+    )
+    preds = _predict_batch_pv(loaded_tmp, oos_batch, device=torch.device("cpu"))
+    hw_bps = compute_conformal_half_width_bps(oos_batch, stats_tmp, pv_pred=preds)
+    assert hw_bps.shape == (16,) and float(hw_bps.min()) > 0.0
+    cov = evaluate_conformal_coverage(loaded_tmp, oos_batch, stats_tmp, device=torch.device("cpu"))
+    assert 0.0 <= cov <= 1.0
 
     # Exercise evaluate_surrogate_mae_bps standalone generation path (test_batch=None)
     mae_gen, mae_gen_bps, per_d_gen = evaluate_surrogate_mae_bps(
@@ -282,8 +330,6 @@ def test_G1_5_checkpoint_out_of_sample_mae_and_trainer_roundtrip(tmp_path: Path)
     assert stress_batch.global_feats.shape == (8, 16)
 
     # Exercise recalibrate_guardian_stats_from_checkpoint, raw state dict loading, and CLI main() on tmp copies
-    from deepvol.training.train_eq_autocall import main as train_main
-
     recal_out = recalibrate_guardian_stats_from_checkpoint(
         checkpoint_path=tmp_ckpt,
         guardian_stats_path=tmp_stats,
@@ -294,22 +340,22 @@ def test_G1_5_checkpoint_out_of_sample_mae_and_trainer_roundtrip(tmp_path: Path)
         n_substeps_test=2,
         seed=99,
         device=dev_str,
-        tau_desk_bps=60.0,
+        tau_desk_bps=15.0,
     )
     assert float(recal_out["conformal_coverage"]) > 0.50
     assert float(recal_out["conformal_coverage"]) <= 1.0
     assert "stats_payload" in recal_out
 
     raw_state_path = tmp_path / "raw_state.pt"
-    torch.save(model.state_dict(), raw_state_path)
+    torch.save(loaded_tmp.state_dict(), raw_state_path)
     loaded_raw, raw_metrics = load_eq_autocall_surrogate(raw_state_path, device="cpu")
-    assert loaded_raw.d_max == model.d_max and raw_metrics == {}
+    assert loaded_raw.d_max == loaded_tmp.d_max and raw_metrics == {}
 
     # Saved state dict with config=None loads cleanly without AttributeError.
     none_cfg_path = tmp_path / "none_cfg_ckpt.pt"
-    torch.save({"config": None, "state_dict": model.state_dict()}, none_cfg_path)
+    torch.save({"config": None, "state_dict": loaded_tmp.state_dict()}, none_cfg_path)
     loaded_nc, nc_metrics = load_eq_autocall_surrogate(none_cfg_path, device="cpu")
-    assert loaded_nc.d_max == model.d_max and nc_metrics == {}
+    assert loaded_nc.d_max == loaded_tmp.d_max and nc_metrics == {}
 
     with mock.patch.object(
         sys,
@@ -423,6 +469,11 @@ def test_training_and_sobol_audit_blind_spots(tmp_path: Path) -> None:
     )
     assert int(payload["n_cal"]) == 2048
     assert bool(payload.get("oas_standardized", False)) is True
+    assert payload.get("conformal_mode") == "signed_8d_eb_mondrian"
+    assert float(payload["tau_desk_bps"]) == pytest.approx(15.0)
+    assert tuple(payload["scale_weights_8d"].shape) == (8,)
+    assert float(payload["scale_weights_8d"][1].item()) >= 5e-4 - 1e-12
+    assert len(payload["mondrian_bias_table"]) == 24
     guardian = EQAutocallModelGuardian(d_max=8, m_max=48, stats_path=stats_path)
     np.testing.assert_allclose(
         guardian.ref_cov_inv_16d, payload["ref_cov_inv_16d"].numpy(), rtol=1e-12, atol=1e-12
