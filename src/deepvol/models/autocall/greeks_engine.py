@@ -418,21 +418,43 @@ def _replay_or_capture_cg(
                 cur_s = torch.cuda.current_stream(device=device)
                 cap_stream.wait_stream(cur_s)
                 GLOBAL_GPU_CACHE_MANAGER.wait_pool_event(device, cap_stream)
-                tf32_ctx = (
-                    GLOBAL_GPU_CACHE_MANAGER.tf32_precision_guard(use_tf32)
-                    if use_tf32 is not None
-                    else contextlib.nullcontext()
-                )
-                with tf32_ctx:
-                    with torch.cuda.stream(cap_stream):
-                        for _ in range(2):
-                            _ = capture_fn(static_in)
-                    cg = torch.cuda.CUDAGraph()  # type: ignore[no-untyped-call]
-                    with torch.cuda.graph(cg, pool=pool, stream=cap_stream):
-                        static_out = capture_fn(static_in)
-                cur_s.wait_stream(cap_stream)
-                GLOBAL_GPU_CACHE_MANAGER.record_pool_event(device, cur_s)
-                GLOBAL_GPU_CACHE_MANAGER.account_pool_capture_bytes(device, before_stats)
+                cg: Any = None
+                captured_ok = False
+                try:
+                    tf32_ctx = (
+                        GLOBAL_GPU_CACHE_MANAGER.tf32_precision_guard(use_tf32)
+                        if use_tf32 is not None
+                        else contextlib.nullcontext()
+                    )
+                    with tf32_ctx:
+                        with torch.cuda.stream(cap_stream):
+                            for _ in range(2):
+                                _ = capture_fn(static_in)
+                        cg = torch.cuda.CUDAGraph()  # type: ignore[no-untyped-call]
+                        with torch.cuda.graph(cg, pool=pool, stream=cap_stream):
+                            static_out = capture_fn(static_in)
+                    cur_s.wait_stream(cap_stream)
+                    captured_ok = True
+                    GLOBAL_GPU_CACHE_MANAGER.account_pool_capture_bytes(device, before_stats)
+                finally:
+                    if not captured_ok:
+                        if cg is not None:
+                            try:
+                                cg.reset()
+                            except Exception as exc:
+                                logger.debug("Failed to reset partially captured CUDAGraph: %s", exc)
+                        try:
+                            with torch.cuda.stream(cap_stream):
+                                if torch.cuda.is_current_stream_capturing():  # type: ignore[no-untyped-call]
+                                    if cg is not None:
+                                        cg.capture_end()
+                        except Exception as exc:
+                            logger.debug("Failed to end partially captured CUDAGraph stream: %s", exc)
+                        try:
+                            cur_s.wait_stream(cap_stream)
+                        except Exception as exc:
+                            logger.debug("Failed to synchronize capture stream after error: %s", exc)
+                    GLOBAL_GPU_CACHE_MANAGER.record_pool_event(device, cur_s)
                 entry = {
                     "lock": threading.Lock(),
                     "graph": cg,
@@ -449,12 +471,14 @@ def _replay_or_capture_cg(
     with entry_lock, pool_lock:
         cur_s = torch.cuda.current_stream(device=device)
         GLOBAL_GPU_CACHE_MANAGER.wait_pool_event(device, cur_s)
-        for s_t, l_t in zip(entry["static_in"], live_inputs):
-            s_t.copy_(l_t)
-        entry["graph"].replay()
-        record_obj_cuda_stream(entry, cur_s)
-        GLOBAL_GPU_CACHE_MANAGER.record_pool_event(device, cur_s)
-        return tuple(o.clone() for o in entry["static_out"])
+        try:
+            for s_t, l_t in zip(entry["static_in"], live_inputs):
+                s_t.copy_(l_t)
+            entry["graph"].replay()
+            record_obj_cuda_stream(entry, cur_s)
+            return tuple(o.clone() for o in entry["static_out"])
+        finally:
+            GLOBAL_GPU_CACHE_MANAGER.record_pool_event(device, cur_s)
 _CRN_SOBOL_CACHE = ThreadSafeLRUCache(maxsize=64)
 _CRN_LV_CACHE = ThreadSafeLRUCache(maxsize=256)
 _CRN_VEGA_JAC_CACHE = ThreadSafeLRUCache(maxsize=256)
@@ -481,7 +505,8 @@ def _in_functorch_transform() -> bool:
     if callable(peek_fn):
         try:
             return peek_fn() is not None
-        except Exception:
+        except (RuntimeError, AttributeError, TypeError) as exc:
+            logger.debug("Failed to inspect functorch interpreter stack: %s", exc)
             return False
     return False
 
@@ -3355,7 +3380,6 @@ inline void clark_symmetrized_bwd_item(
         v_safe[i] = vp_r[i * M + m_idx] > 1e-12 ? vp_r[i * M + m_idx] : 1e-12;
     }
 
-    // Step A: Scalar blend adjoints on tiny sub_tp
     double g_gsep = 0.0, g_fsym = 0.0, g_m2sym = 0.0, g_wsym[kMaxD] = {0.0};
     double g_ff = 0.0, g_vf = 0.0, g_wf[kMaxD] = {0.0};
     {
@@ -3396,7 +3420,6 @@ inline void clark_symmetrized_bwd_item(
         }
     }
 
-    // Step B: g_sep wrt fp
     if (need_fp_grad && g_gsep != 0.0) {
         constexpr double kInvTwoTau2 = 1.0 / (2.0 * 0.001 * 0.001);
         sub_tp.reset();
@@ -3433,7 +3456,6 @@ inline void clark_symmetrized_bwd_item(
         }
     };
 
-    // Step C: separated order branch if g_sep >= 1e-15
     if (item.g_sep_v >= 1e-15) {
         bool any_wf = (g_ff != 0.0 || g_vf != 0.0);
         for (int i = 0; i < d; ++i) if (g_wf[i] != 0.0) any_wf = true;
@@ -3450,7 +3472,6 @@ inline void clark_symmetrized_bwd_item(
         }
     }
 
-    // Step D: L1-resident per-tree backward sweep
     bool any_sym_w = (g_fsym != 0.0 || g_m2sym != 0.0);
     for (int i = 0; i < d; ++i) if (g_wsym[i] != 0.0) any_sym_w = true;
     if (!any_sym_w) return;
@@ -5684,7 +5705,6 @@ void pre_surr_quanto_fwd_bwd_cpp(
         return;
     }
 
-    // Backward pass: compute VJP cotangents on all inputs.
     const bool need_sp0 = (sp->flags & 1) != 0;
     const bool need_spg = (sp->flags & 2) != 0;
     const bool need_dfp_out = (sp->flags & 4) != 0;
@@ -6677,8 +6697,8 @@ def _get_surrogate_cuda_graph_runner(
                             if g_partial is not None:
                                 try:
                                     g_partial.reset()
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    logger.debug("Failed to reset partially captured surrogate CUDAGraph: %s", exc)
                         try:
                             with torch.cuda.stream(stream):
                                 if torch.cuda.is_current_stream_capturing():  # type: ignore[no-untyped-call]
@@ -6686,8 +6706,8 @@ def _get_surrogate_cuda_graph_runner(
                                         g_bwd.capture_end()
                                     elif g_fwd is not None:
                                         g_fwd.capture_end()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("Failed to end partially captured surrogate CUDAGraph stream: %s", exc)
                     GLOBAL_GPU_CACHE_MANAGER.record_pool_event(surr_dev, stream)
             keep_alive = (s_am_g, s_sm_g, s_nf, s_ef, s_sf, s_gf, f_hs, f_cs, f_ps)
             runner = (stream, g_fwd, g_bwd, s_packed_g, s_out_g, s_gin_g, s_gout_g, nh, b_tot, m_rem, keep_alive)
@@ -6743,11 +6763,13 @@ class _PackedCudaSurrogateFn(torch.autograd.Function):
             pool_lock = GLOBAL_GPU_CACHE_MANAGER.get_shared_graph_pool_lock(surr_dev)
             with pool_lock, torch.cuda.stream(stream):
                 GLOBAL_GPU_CACHE_MANAGER.wait_pool_event(surr_dev, stream)
-                s_packed_g.copy_(packed_cpu_f64.detach().to(dtype=surr_dtype), non_blocking=False)
-                g_fwd.replay()
-                record_obj_cuda_stream(cg_runner, stream)
-                GLOBAL_GPU_CACHE_MANAGER.record_pool_event(surr_dev, stream)
-                out_cpu = s_out_g.to(device=packed_cpu_f64.device, dtype=torch.float64)
+                try:
+                    s_packed_g.copy_(packed_cpu_f64.detach().to(dtype=surr_dtype), non_blocking=False)
+                    g_fwd.replay()
+                    record_obj_cuda_stream(cg_runner, stream)
+                    out_cpu = s_out_g.to(device=packed_cpu_f64.device, dtype=torch.float64)
+                finally:
+                    GLOBAL_GPU_CACHE_MANAGER.record_pool_event(surr_dev, stream)
             ctx.gpu_state = ("cg", cg_runner) if need_g else None
             return (
                 out_cpu[:nh].view(b_tot, m_rem),
@@ -6822,11 +6844,13 @@ class _PackedCudaSurrogateFn(torch.autograd.Function):
             pool_lock = GLOBAL_GPU_CACHE_MANAGER.get_shared_graph_pool_lock(surr_dev)
             with pool_lock, torch.cuda.stream(stream):
                 GLOBAL_GPU_CACHE_MANAGER.wait_pool_event(surr_dev, stream)
-                s_gin_g.copy_(g_cat_cpu, non_blocking=False)
-                g_bwd.replay()
-                record_obj_cuda_stream(cg_runner, stream)
-                GLOBAL_GPU_CACHE_MANAGER.record_pool_event(surr_dev, stream)
-                g_packed_cpu = s_gout_g.to(device=cpu_dev, dtype=torch.float64)
+                try:
+                    s_gin_g.copy_(g_cat_cpu, non_blocking=False)
+                    g_bwd.replay()
+                    record_obj_cuda_stream(cg_runner, stream)
+                    g_packed_cpu = s_gout_g.to(device=cpu_dev, dtype=torch.float64)
+                finally:
+                    GLOBAL_GPU_CACHE_MANAGER.record_pool_event(surr_dev, stream)
             return (g_packed_cpu,) + (None,) * 11
         _, nf_g, ef_g, sf_g, gf_g, haz_s, cpn_s, put_s = gpu_state
         surr_dev = nf_g.device
@@ -7956,7 +7980,6 @@ def evaluate_differentiable_pv(
     future_obs_dts = base_state.seasoned_state.future_obs_dates[m_slice]
     future_pay_dts = base_state.seasoned_state.future_pay_dates[m_slice]
 
-    # 2. Observation & payment tenors
     tau_obs_orig = base_state.tau_obs.to(dtype=torch.float64, device=device)[m_slice]
     tau_pay_orig = base_state.tau_pay.to(dtype=torch.float64, device=device)[m_slice]
     time_dcc = getattr(base_state.seasoned_state, "time_day_count_convention", "Act365")
@@ -7989,7 +8012,6 @@ def evaluate_differentiable_pv(
         tau_pay_t = tau_pay_orig
         delta_tau_t = base_state.delta_tau.to(dtype=torch.float64, device=device)[m_slice]
 
-    # 3. Discount factors at observation and payment dates using rolled datetime dates
     disc_anchor_val = (
         max(float(np.asarray(disc_curve_obj.df(eff_as_of), dtype=np.float64).reshape(-1)[0]), 1e-15)
         if (eff_as_of is not None and disc_curve_obj is not None and hasattr(disc_curve_obj, "df"))
@@ -8070,7 +8092,6 @@ def evaluate_differentiable_pv(
         else:
             asset_fin_deltas.append(None)
 
-    # 4. Buehler Escrowed Dividend PVs, Smooth Softplus Floor, Forwards, & Repo/Quanto Live Drift
     div_sched = base_state.dividend_schedule
     eff_as_of_cmp = eff_as_of if eff_as_of is not None else as_of_orig
     quanto_meta_pv = getattr(base_state, "quanto_meta", None) or {}
@@ -8230,7 +8251,6 @@ def evaluate_differentiable_pv(
     ref_col = ref_spots.unsqueeze(1)
     escrowed_spot = _escrowed_spot_softplus(spots_col, div_pv_t)
 
-    # 5. Live Quanto Drift & FX Sensitivities + Sticky-Strike IVs + 7D Node Surface Features
     r_tot_base = div_sched.r_tot_obs.to(dtype=torch.float64, device=device)[:, m_slice]
     df_fin_base = div_sched.df_fin_obs.to(dtype=torch.float64, device=device)[:, m_slice].clamp(min=1e-15)
     repo_spread_avg = div_sched.repo_spread_avg.to(dtype=torch.float64, device=device).clone()
@@ -8438,7 +8458,6 @@ def evaluate_differentiable_pv(
     iv_at_fwd_t = torch.stack(iv_rows, dim=0)
     v_perf_t = iv_at_fwd_t * torch.sqrt(tau_obs_t.clamp(min=1e-12)).unsqueeze(0)
 
-    # 6. Symmetrized Correlation Matrix with smooth |rho| -> 1 guard
     if corr_matrix is not None:
         corr_in = corr_matrix.to(dtype=torch.float64, device=device)
         eye_d = torch.eye(d_assets, dtype=torch.float64, device=device)
@@ -8453,7 +8472,6 @@ def evaluate_differentiable_pv(
     is_guaranteed_t = base_state.is_guaranteed_cpn.to(dtype=torch.float64, device=device)[m_slice]
     coupon_amounts_t = base_state.coupon_amounts.to(dtype=torch.float64, device=device)[m_slice]
 
-    # 7. Analytical Stulz-Margrabe Moment-Matched Basket Proxy in torch.float64
     proxy_inputs = {
         "forward_perf": forward_perf,
         "v_perf": v_perf_t,
@@ -8587,7 +8605,6 @@ def evaluate_differentiable_pv(
     else:
         baseline = compute_analytical_autocall_baseline(proxy_inputs, use_fast_cpu=False)
 
-    # 8. Decoupled Float64/Float32 Single-VJP Surrogate AD via plain `.to()` boundaries (GRK-001)
     if eff_surrogate is not None:
         first_param = _surrogate_first_param(eff_surrogate)
         surr_dtype = first_param.dtype if first_param is not None else torch.float32
@@ -8778,7 +8795,6 @@ def evaluate_differentiable_pv(
             [torch.ones(1, dtype=torch.float64, device=device), survival_probs[:-1]], dim=0
         )
 
-    # 9. Assemble W1 cash flows and ProductValue in torch.float64
     seasoned_for_post = base_state.seasoned_state
     if k_cross > 0:
         from dataclasses import replace as _dc_replace
@@ -12742,7 +12758,6 @@ def compute_eq_autocall_greeks(
 
     quanto_fx_ids = _collect_quanto_fx_ids(state)
 
-    # 1. Delta (in original asset order pi_lex^{-1})
     delta_dict: dict[str, float] | None = None
     delta_tensor_orig: torch.Tensor | None = None
     grad_spots_sorted = grad_map.get(("spots", ""))
@@ -20297,7 +20312,6 @@ def compute_batched_surrogate_greeks(
                     idx_last=idx_last_eff,
                 )
             else:
-                # Single b_eff CUDAGraph forward call (saves ~4 ms vs 2x chunked launch)
                 fcpn_2 = (
                     torch.cat([force_coupons_on_autocall, force_coupons_on_autocall], dim=0).to(device=device, dtype=torch.float32)
                     if isinstance(force_coupons_on_autocall, torch.Tensor) and force_coupons_on_autocall.ndim >= 1

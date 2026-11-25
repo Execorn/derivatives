@@ -258,6 +258,7 @@ def _check_no_nan_at_null_paths(root: Any, null_paths: tuple[tuple[str | int, ..
 _CPU_GREEKS_CACHE_LOCK = threading.Lock()
 _CPU_GREEKS_MICROBATCH_CACHE: OrderedDict[tuple[Any, ...], BatchedSurrogateGreeksOutput] = OrderedDict()
 _CPU_GREEKS_MICROBATCH_MAXSIZE: int = 256
+_SURROGATE_DIGEST_CACHE_LOCK = threading.Lock()
 _SURROGATE_DIGEST_CACHE: dict[
     int, tuple[MaskedEQAutocallSurrogate, tuple[tuple[tuple[int, ...], int], ...], bytes]
 ] = {}
@@ -270,16 +271,18 @@ def _get_surrogate_content_digest(surrogate: MaskedEQAutocallSurrogate) -> bytes
     params = list(surrogate.parameters())
     ver_sig = tuple((tuple(p.shape), 0 if p.is_inference() else int(p._version)) for p in params)
     sid = id(surrogate)
-    cached = _SURROGATE_DIGEST_CACHE.get(sid)
+    with _SURROGATE_DIGEST_CACHE_LOCK:
+        cached = _SURROGATE_DIGEST_CACHE.get(sid)
     if cached is not None and cached[0] is surrogate and cached[1] == ver_sig:
         return cached[2]
     h = hashlib.sha256()
     for p in params:
         h.update(p.detach().cpu().contiguous().numpy().tobytes())
     digest = h.digest()
-    if len(_SURROGATE_DIGEST_CACHE) >= 64:
-        _SURROGATE_DIGEST_CACHE.clear()
-    _SURROGATE_DIGEST_CACHE[sid] = (surrogate, ver_sig, digest)
+    with _SURROGATE_DIGEST_CACHE_LOCK:
+        if len(_SURROGATE_DIGEST_CACHE) >= 64:
+            _SURROGATE_DIGEST_CACHE.clear()
+        _SURROGATE_DIGEST_CACHE[sid] = (surrogate, ver_sig, digest)
     return digest
 
 
@@ -452,7 +455,6 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
 
     deferred_spline_checks: list[tuple[str, Any, tuple[Any, ...]]] = []
 
-    # Fast vectorized Black-76 discrete convexity pass catches severe smile arbitrage in <=0.4 ms cold.
     for ticker, surf in ordered_surfs:
         type_name = str(getattr(surf, "TypeName", "") or "")
         strikes_attr = getattr(surf, "Strikes", None)
@@ -1107,11 +1109,12 @@ def _parse_fx_tenor_to_years(tenor_val: Any) -> float:
             else:
                 try:
                     num_f = float(s)
+                except ValueError:
+                    res_y = 1.0
+                else:
                     if not math.isfinite(num_f):
                         raise ValueError(f"Non-finite FX tenor: {tenor_val!r}")
                     res_y = max(num_f, 1e-6)
-                except ValueError:
-                    res_y = 1.0
     if isinstance(tenor_val, str) and math.isfinite(res_y):
         with _FX_TENOR_CACHE_LOCK:
             _FX_TENOR_YEARS_CACHE[tenor_val] = res_y
@@ -3852,11 +3855,9 @@ class EQAutocallRuntime:
                         )
 
                     prod_spec = AutoCallableProductSpec.model_validate(item["Product"])
-                    raw_queries = (
-                        item["Queries"]
-                        if "Queries" in item
-                        else ("ProductValue", "CashFlows")
-                    )
+                    raw_queries = item.get("Queries")
+                    if raw_queries is None:
+                        raw_queries = ("ProductValue", "CashFlows")
                     if not isinstance(raw_queries, (list, tuple)) or len(raw_queries) == 0:
                         raise ValueError("Queries must not be empty")
                     queries_list = [AutocallQueryMetric(q) for q in raw_queries]

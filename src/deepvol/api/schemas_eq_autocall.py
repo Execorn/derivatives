@@ -1709,7 +1709,6 @@ def _parse_str_dag_at(tokens: List[str], idx: int, n_toks: int) -> Tuple[Any, in
     if idx >= n_toks:
         raise ValueError("Unexpected end of token stream while parsing Murex DAG")
 
-    # Fast local aliases
     num_start = _NUM_START
     sha1_full = _SHA1_RE.fullmatch
     dt_cls = datetime.datetime
@@ -1757,7 +1756,6 @@ def _parse_str_dag_at(tokens: List[str], idx: int, n_toks: int) -> Tuple[Any, in
             stack.append([])
             continue
         else:
-            # Scalar token
             if ch in num_start:
                 if len(val) == 40 and sha1_full(val) is not None:
                     parsed = val
