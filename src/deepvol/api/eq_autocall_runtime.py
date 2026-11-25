@@ -2022,7 +2022,7 @@ class EQAutocallRuntime:
                 self._compiled_runner = _CompiledSurrogateRunner(
                     self.surrogate,
                     use_tf32=False,
-                    enable_cudagraphs=True,
+                    enable_cudagraphs=False,
                     enable_inductor=False,
                 )
             except Exception as exc:

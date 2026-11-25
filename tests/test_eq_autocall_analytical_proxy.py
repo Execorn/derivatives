@@ -1051,7 +1051,7 @@ def test_tier1_abi_v2_and_loud_fallback_policy(monkeypatch: pytest.MonkeyPatch) 
     assert int(info_v2.abi_version) == 20261125
     assert int(info_v2.autocall_args_size) == 336 and int(info_v2.autocall_args_align) == 8
     assert int(info_v2.crn_args_size) == 320 and int(info_v2.crn_args_align) == 8
-    assert int(info_v2.platen_sde_aad_args_size) == 216 and int(info_v2.platen_sde_aad_args_align) == 8
+    assert int(info_v2.platen_sde_aad_args_size) == 272 and int(info_v2.platen_sde_aad_args_align) == 8
     assert int(info_v2.sobol_gen_args_size) == 128 and int(info_v2.sobol_gen_args_align) == 8
     assert int(info_v2.vibrato_gamma_args_size) == 392 and int(info_v2.vibrato_gamma_args_align) == 8
     assert ctypes.sizeof(tb.Tier1AbiInfoV2C) == 48 and ctypes.alignment(tb.Tier1AbiInfoV2C) == 4

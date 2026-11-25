@@ -1,3 +1,4 @@
+import gc
 import os
 import sys
 import pytest
@@ -46,6 +47,13 @@ if HAS_TORCH:
         @pytest.fixture(autouse=True)
         def clear_cuda_cache():
             yield
+            gc.collect()
+            try:
+                from deepvol.models.autocall.gpu_cache_manager import GLOBAL_GPU_CACHE_MANAGER
+
+                GLOBAL_GPU_CACHE_MANAGER.clear_all()
+            except ImportError:
+                pass
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 # Reset float32 matmul precision to PyTorch default to prevent state leakage

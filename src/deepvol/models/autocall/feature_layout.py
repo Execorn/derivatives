@@ -185,31 +185,22 @@ def resolve_canonical_tier3_config(
     d_val = int(d_assets)
     m_val = int(m_rem)
     dev_tok = "cuda" if str(device_type).strip().lower().startswith("cuda") else "cpu"
-    short_tenor = 0 < m_val <= 10
-    cpu_very_short = 0 < m_val <= 6
     if n_fallback_paths is not None:
         eff_paths = max(2, int(n_fallback_paths))
-        n_sub = 8 if short_tenor else 4
     elif dev_tok == "cuda":
         eff_paths = 4096 if m_val > 20 else 8192
-        n_sub = 8 if short_tenor else 4
-    elif cpu_very_short:
-        eff_paths = 8192
-        n_sub = 8
     elif m_val > 24:
         eff_paths = 2048
-        n_sub = 4
     elif d_val >= 6 and m_val <= 12:
         eff_paths = 8192
-        n_sub = 4
     else:
         eff_paths = 4096
-        n_sub = 4
+    n_sub = 4
     eff_r = min(max(1, eff_paths // 2), 8 if eff_paths >= 8192 else 4)
     nt, ny = 32, 64
     n_cheap = (
         max(262144, 8 * eff_paths)
-        if (dev_tok == "cuda" or (n_fallback_paths is not None and short_tenor) or (dev_tok == "cpu" and cpu_very_short))
+        if dev_tok == "cuda"
         else (max(16384, 8 * eff_paths) if (dev_tok == "cpu" and d_val * m_val >= 200) else max(32768, 8 * eff_paths))
     )
     return CanonicalTier3Config(

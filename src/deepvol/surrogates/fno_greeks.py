@@ -125,8 +125,13 @@ def compute_greeks(
     # Load normalizers v2 once
     pn_mean, pn_std, yn_mean, yn_std = _load_v2_normalizer_tensors(device)
 
-    # Extract model parameters for functional tracing
-    params_dict = cast(Dict[str, torch.Tensor], dict(model.named_parameters()))
+    # Extract model parameters for functional tracing; detach in eval mode to prevent a 3rd-order weight graph across chunks.
+    if model.training:
+        params_dict = cast(Dict[str, torch.Tensor], dict(model.named_parameters()))
+        p_leaf = params
+    else:
+        params_dict = {k: v.detach() for k, v in model.named_parameters()}
+        p_leaf = params.detach()
 
     # Differentiable forward pass closing over params_dict
     def _iv_flat_fn(p: torch.Tensor) -> torch.Tensor:
@@ -164,7 +169,7 @@ def compute_greeks(
             return cast(torch.Tensor, J[:, SIGMA_IDX])  # shape (chunk,)
 
         # Second-order: jacfwd over the small first-order → (chunk, 6)
-        H_chunk = jacfwd(_dIV_dsigma_chunk, argnums=0)(params)
+        H_chunk = jacfwd(_dIV_dsigma_chunk, argnums=0)(p_leaf)
 
         volga_chunks.append(H_chunk[:, SIGMA_IDX])
         vanna_chunks.append(H_chunk[:, RHO_IDX])

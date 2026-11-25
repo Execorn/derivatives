@@ -321,6 +321,8 @@ class GlobalGpuCacheManager:
         with self._lock:
             existing = self._partitions.get(name)
             if existing is not None:
+                if existing.max_entries < int(max_entries):
+                    existing.resize(max_entries=int(max_entries))
                 if existing.max_bytes > eff_bytes:
                     existing.resize(max_bytes=eff_bytes)
                 if on_evict is not None and existing._on_evict is None:

@@ -126,31 +126,29 @@ class _ThreadSafeLRUCache(Generic[_T]):
 
 
 _CRN_SOBOL_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "sobol_normals", max_entries=48, max_bytes=20 * 1024 * 1024
+    "sobol_normals", max_entries=256, max_bytes=20 * 1024 * 1024
 )
 _CRN_ZCORR_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
     "sobol_normals", max_entries=16, max_bytes=20 * 1024 * 1024
 )
 _CRN_LV_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "lv_table_cache", max_entries=64, max_bytes=16 * 1024 * 1024
+    "lv_table_cache", max_entries=512, max_bytes=16 * 1024 * 1024
 )
-_CRN_VEGA_JAC_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=256)
-_CRN_CURVE_JAC_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=256)
-_CRN_CPU_PREP_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=128)
-_CRN_MF_CHEAP_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "deal_prep_lv_vega", max_entries=128, max_bytes=32 * 1024 * 1024
-)
+_CRN_VEGA_JAC_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=4096)
+_CRN_CURVE_JAC_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=2048)
+_CRN_CPU_PREP_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=512)
+_CRN_MF_CHEAP_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=512)
 _CRN_DEAL_PREP_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "deal_prep_lv_vega", max_entries=128, max_bytes=32 * 1024 * 1024
+    "deal_prep_lv_vega", max_entries=512, max_bytes=32 * 1024 * 1024
 )
 _CRN_STATIC_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "static_constants", max_entries=32, max_bytes=8 * 1024 * 1024
+    "static_constants", max_entries=256, max_bytes=8 * 1024 * 1024
 )
 _CRN_CUDAGRAPH_POOL_PARTITION: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
     "cudagraph_pool", max_entries=8, max_bytes=24 * 1024 * 1024
 )
 _CRN_TRITON_DIRECT_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=256)
-_TRITON_PLAN_CACHE: _ThreadSafeLRUCache[Tuple[Tuple[str, bool, Any], ...]] = _ThreadSafeLRUCache(maxsize=128)
+_TRITON_PLAN_CACHE: _ThreadSafeLRUCache[Tuple[Tuple[str, bool, Any], ...]] = _ThreadSafeLRUCache(maxsize=512)
 
 
 class _CrnGpuViews:
@@ -911,11 +909,11 @@ def _ensure_qmc_cg_scratch_arena(
 ) -> None:
     """Pre-allocates fixed pointer-stable scratch buffers outside CUDAGraph capture so all graphs share one workspace."""
     dev_idx = int(device.index or 0)
-    # Unified canonical high-water budget (c_m_steps * c_d * c_n_chunk <= 160*6*4096) fits both (6,40,r=4) and (6,20,r=8)/(3,40,r=8)/(6,10,r=8).
+    # Unified canonical high-water budget (c_m_steps * c_d * c_n_chunk <= 6*60*4*2*1024) fits (6,60,r=2) and (6,40,r=2)/(6,20,r=4).
     c_d = max(int(max_d), 6)
     c_m = max(int(max_m), 60)
-    c_dm_steps = max(int(max_d) * int(max_m) * int(n_sub) * int(max_r_chunk) * int(n_rep), 6 * 40 * 4 * 4 * 1024)
-    c_dm_per = max(int(max_d) * int(max_m) * int(max_r_chunk) * int(n_rep), 6 * 40 * 4 * 1024)
+    c_dm_steps = max(int(max_d) * int(max_m) * int(n_sub) * int(max_r_chunk) * int(n_rep), 6 * 60 * 4 * 2 * 1024)
+    c_dm_per = max(int(max_d) * int(max_m) * int(max_r_chunk) * int(n_rep), 6 * 60 * 2 * 1024)
     c_dm_th = max(int(max_d) * int(max_m_th) * int(max_r_chunk) * int(n_rep), c_dm_per)
     c_n_chunk = max(int(max_r_chunk) * int(n_rep), 8192)
     c_shards = max(int(n_lv_shards), 128)
@@ -4904,10 +4902,11 @@ if _HAS_TRITON:
                             bp = g_call + g_cpn + g_opt + b_avg * inv_d_rt + tl.where(d == idx_max1, b_wb, zero_vec)
                             tl.store(bar_lx_post_ptr + (m_off + d) * n_total + offs_n, (bp * pd).to(tl.float32), mask=mask_n)
                 else:
-                    if opt_bwd_rt == CALL_CODE:
+                    OPT_BWD_K: tl.constexpr = 0 if IS_LONG else EFF_OPT_CODE
+                    if OPT_BWD_K == CALL_CODE:
                         bar_w_call = bar_w_call + b_wo
                         b_wo = zero_vec
-                    elif opt_bwd_rt == CPN_CODE:
+                    elif OPT_BWD_K == CPN_CODE:
                         bar_w_cpn = bar_w_cpn + b_wo
                         b_wo = zero_vec
                     if IS_LONG:
@@ -4951,11 +4950,11 @@ if _HAS_TRITON:
                                 min1_v, max1_v, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
                                 CPN_CODE,
                             )
-                        if (opt_bwd_rt != CALL_CODE) and (opt_bwd_rt != CPN_CODE):
+                        if (OPT_BWD_K != CALL_CODE) and (OPT_BWD_K != CPN_CODE):
                             bp = _accum_idx_grad_f64(
                                 bp, b_wo, pd, d, d_assets, inv_d_f, ia, ib,
                                 min1_v, max1_v, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
-                                opt_bwd_rt,
+                                OPT_BWD_K,
                             )
                         if IS_LONG and (CALL_CODE != 2) and (CPN_CODE != 2):
                             bp = bp + b_avg * inv_d_f
@@ -11097,7 +11096,7 @@ def compute_qmc_aad_crn_greeks(
             _CRN_SOBOL_CACHE.put(rot_sobol_key, z_indep_full_f32)
     else:
         cpu_rot_key = rot_sobol_key
-        cached_rot_cpu = _CRN_DEAL_PREP_CACHE.get(cpu_rot_key) if n_total <= 16384 else None
+        cached_rot_cpu = _CRN_CPU_PREP_CACHE.get(cpu_rot_key) if n_total <= 16384 else None
         if cached_rot_cpu is not None:
             z_indep_np = cached_rot_cpu
         else:
@@ -11116,7 +11115,7 @@ def compute_qmc_aad_crn_greeks(
                 dtype=np.float64,
             )
             if n_total <= 16384:
-                _CRN_DEAL_PREP_CACHE.put(cpu_rot_key, z_indep_np)
+                _CRN_CPU_PREP_CACHE.put(cpu_rot_key, z_indep_np)
 
     cpp_step_fn, cpp_loo_fn = _get_cpp_crn_fns()
 
@@ -14949,7 +14948,7 @@ def compute_qmc_aad_crn_greeks(
                 )
                 cv_eig_tmp = chol_f32_g_cached.contiguous()
                 mf_per_rep_b = max(m_rem * d_assets * 8 + d_assets * 4, 1) * n_rep_gen_mf
-                r_mf_c_lim = min(eff_r_mf, max(1, (36 * 1024 * 1024) // mf_per_rep_b))
+                r_mf_c_lim = min(eff_r_mf, max(1, (12 * 1024 * 1024) // mf_per_rep_b))
                 m_pow_pre = int(round(math.log2(n_rep_gen_mf)))
                 blk_n_pre = min(256, n_rep_gen_mf)
                 nt_mf_pre = (n_rep_gen_mf + blk_n_pre - 1) // blk_n_pre
@@ -15056,8 +15055,8 @@ def compute_qmc_aad_crn_greeks(
                     payoff_f32_15_g_b = payoff_f64_18_g_b[:15].to(dtype=torch.float32).contiguous()
 
                     if d_pad_b == d_assets:
-                        lv_pad_g_b = lv_f32_g_cached
-                        lv_sp_pm_pad_g_b = lv_sp_pm_g if need_spot_bumps else None
+                        lv_pad_g_b = lv_f32_g_cached.clone()
+                        lv_sp_pm_pad_g_b = lv_sp_pm_g.clone() if (need_spot_bumps and lv_sp_pm_g is not None) else None
                     else:
                         lv_pad_g_b = torch.zeros((d_pad_b, lv_nt, lv_ny), dtype=torch.float32, device=qmc_device)
                         lv_pad_g_b[:d_assets].copy_(lv_f32_g_cached)
@@ -15213,7 +15212,7 @@ def compute_qmc_aad_crn_greeks(
                         1,
                     ) * n_rep
                     _r_env_cap_b = int(os.environ.get("DEEPVOL_R_CAP", "4"))
-                    r_cap_b = 2 if (d_pad_b * m_pad_b > 240) else (_r_env_cap_b if (d_pad_b * m_pad_b * n_sub >= 512) else eff_r)
+                    r_cap_b = 2 if (d_pad_b * m_pad_b >= 240) else (_r_env_cap_b if (d_pad_b * m_pad_b * n_sub >= 256) else eff_r)
                     r_chunk_b = min(eff_r, r_cap_b, max(1, (72 * 1024 * 1024) // per_rep_b))
                     inv_perm_pad_b = torch.arange(d_pad_b, dtype=torch.int64, device=qmc_device)
                     inv_perm_pad_b[:d_assets].copy_(gpu_meta["inv_perm"])
@@ -15226,7 +15225,7 @@ def compute_qmc_aad_crn_greeks(
                     th_cg_flags_g_b = torch.as_tensor(th_cg_flags_np, dtype=torch.int32, device=qmc_device)
                     th_payoff_f64_18_g_b = payoff_f64_18_g_b.clone()
                     if th_on_b and d_pad_b == d_assets and lv_th_g is not None:
-                        lv_th_pad_f32_b = lv_th_g
+                        lv_th_pad_f32_b = lv_th_g.clone()
                     else:
                         lv_th_pad_f32_b = torch.zeros((d_pad_b, lv_nt, lv_ny), dtype=torch.float32, device=qmc_device)
                     fwd_th_pad_f64_b = torch.ones((d_pad_b, m_pad_b), dtype=torch.float64, device=qmc_device)
@@ -17070,7 +17069,7 @@ def compute_qmc_aad_crn_greeks(
                         _CRN_SOBOL_CACHE.put(mf_shift_key, shifts_mf_gpu)
                     cv_eig_f32_g = chol_f32_g_cached.contiguous()
                     mf_per_rep_bytes = max(m_rem * d_assets * 8 + d_assets * 4, 1) * n_rep_gen_mf
-                    r_mf_chunk = min(eff_r_mf, max(1, (36 * 1024 * 1024) // mf_per_rep_bytes))
+                    r_mf_chunk = min(eff_r_mf, max(1, (12 * 1024 * 1024) // mf_per_rep_bytes))
                     m_pow_mf = int(round(math.log2(n_rep_gen_mf)))
                     block_n_mf = min(256, n_rep_gen_mf)
                     n_tiles_mf = (n_rep_gen_mf + block_n_mf - 1) // block_n_mf
@@ -17128,7 +17127,13 @@ def compute_qmc_aad_crn_greeks(
                         cg_stream_ctx.__exit__(None, None, None)
                     GLOBAL_GPU_CACHE_MANAGER.account_pool_capture_bytes(qmc_device, cg_before_stats_qmc)
                     # Detach _CRN_DEAL_PREP_CACHE entry so subsequent deals copying into cg_hit["in_bufs"] cannot mutate cached deal tensors.
-                    if warm_bundle_key is not None:
+                    if use_cg_bucket:
+                        if warm_bundle_key is not None:
+                            warm_hit_c = _CRN_DEAL_PREP_CACHE.get(warm_bundle_key)
+                            if warm_hit_c is not None:
+                                warm_hit_c[1].cg_bucket_pack = None
+                                warm_hit_c[1].cg_meta_cache.clear()
+                    elif warm_bundle_key is not None:
                         _CRN_DEAL_PREP_CACHE.remove(warm_bundle_key)
                     if _warm_gpu is not None:
                         _warm_gpu.cg_bucket_pack = None
