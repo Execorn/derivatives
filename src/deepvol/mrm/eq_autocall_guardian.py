@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from collections.abc import Iterable, Mapping, Sequence
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
 import hashlib
@@ -95,14 +95,16 @@ def _resolve_canonical_tier3_config_impl(
 ) -> Any:
     mod_fn = getattr(_feature_layout_mod, "resolve_canonical_tier3_config", None)
     if callable(mod_fn):
-        return mod_fn(
+        cfg = mod_fn(
+            int(d_assets),
+            int(m_rem),
             device_type=device_type,
-            d_assets=d_assets,
-            m_rem=m_rem,
             n_fallback_paths=n_fallback_paths,
-            n_substeps_per_period=n_substeps_per_period,
             seed=seed,
         )
+        if n_substeps_per_period is not None and int(n_substeps_per_period) != int(cfg.n_substeps):
+            cfg = replace(cfg, n_substeps=int(n_substeps_per_period))
+        return cfg
     eff_paths = int(n_fallback_paths) if n_fallback_paths is not None else (8192 if str(device_type) == "cuda" else 4096)
     eff_r = 8 if (str(device_type) == "cuda" or eff_paths >= 8192) else 4
     n_sub = int(n_substeps_per_period) if n_substeps_per_period is not None else 4

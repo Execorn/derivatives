@@ -27,7 +27,7 @@ import hashlib
 import inspect
 import math
 import threading
-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union, cast
+from typing import Any, List, Literal, Optional, Tuple, Union, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -45,19 +45,10 @@ from deepvol.market.eq_curves import (
 )
 from deepvol.models.autocall.feature_layout import (
     PAIR_ORDER_DEPENDENT_INDICES,
+    CanonicalTier3Config,
     MonitoringIndexCode,
     monitoring_index_to_code,
 )
-
-if TYPE_CHECKING:
-    from deepvol.models.autocall.feature_layout import (  # type: ignore[attr-defined]
-        CanonicalTier3Config,
-    )
-else:
-    try:
-        from deepvol.models.autocall.feature_layout import CanonicalTier3Config
-    except ImportError:
-        CanonicalTier3Config = Any  # type: ignore[misc, assignment]
 from deepvol.models.autocall.seasoned_collapser import (
     CashFlowItem,
     _to_utc_datetime,
