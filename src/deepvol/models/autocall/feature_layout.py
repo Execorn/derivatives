@@ -182,17 +182,36 @@ def resolve_canonical_tier3_config(
     seed: int = 42,
 ) -> CanonicalTier3Config:
     """Deterministic resolver depending strictly on (d_assets, m_rem, device_type, n_fallback_paths), NEVER on Queries."""
-    _ = (int(d_assets), int(m_rem))
+    d_val = int(d_assets)
+    m_val = int(m_rem)
     dev_tok = "cuda" if str(device_type).strip().lower().startswith("cuda") else "cpu"
-    eff_paths = (
-        max(2, int(n_fallback_paths))
-        if n_fallback_paths is not None
-        else (8192 if dev_tok == "cuda" else 4096)
-    )
+    short_tenor = 0 < m_val <= 10
+    cpu_very_short = 0 < m_val <= 6
+    if n_fallback_paths is not None:
+        eff_paths = max(2, int(n_fallback_paths))
+        n_sub = 8 if short_tenor else 4
+    elif dev_tok == "cuda":
+        eff_paths = 8192
+        n_sub = 8 if short_tenor else 4
+    elif cpu_very_short:
+        eff_paths = 8192
+        n_sub = 8
+    elif m_val > 24:
+        eff_paths = 2048
+        n_sub = 4
+    elif d_val >= 6 and m_val <= 12:
+        eff_paths = 8192
+        n_sub = 4
+    else:
+        eff_paths = 4096
+        n_sub = 4
     eff_r = min(max(1, eff_paths // 2), 8 if (dev_tok == "cuda" or eff_paths >= 8192) else 4)
-    n_sub = 4
     nt, ny = 32, 64
-    n_cheap = max(262144, 8 * eff_paths) if dev_tok == "cuda" else max(32768, 8 * eff_paths)
+    n_cheap = (
+        max(262144, 8 * eff_paths)
+        if (dev_tok == "cuda" or (n_fallback_paths is not None and short_tenor) or (dev_tok == "cpu" and cpu_very_short))
+        else max(32768, 8 * eff_paths)
+    )
     return CanonicalTier3Config(
         n_paths=eff_paths,
         n_replicates=eff_r,

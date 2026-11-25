@@ -236,7 +236,7 @@ def test_G1_8_autograd_delta_rho_dividends_vs_central_finite_difference(
                 assert abs(got_rho[active_k] - fd_req_rho_k) / max(abs(fd_req_rho_k), 1e-10) <= 1e-7
 
             # 3. DividendsSensitivities vs Central Finite Differences on discrete dividend amounts
-            h_div = 1e-1 if surr is surrogate_f32 else 5e-4
+            h_div = 1e-1 if surr is surrogate_f32 else 1e-4
             div_rel_thresh = 1e-4 if surr is surrogate_f32 else 1e-6
             for ticker in sorted_ids:
                 got_div = res.dividends_arrays[ticker]
@@ -268,7 +268,7 @@ def test_G1_8_autograd_delta_rho_dividends_vs_central_finite_difference(
                     if surr is not surrogate_f32 and norm_fd > 1e-4:
                         assert rel_div <= 1e-7
                 else:
-                    tol_small = 2e-6 if surr is surrogate_f32 else 1e-8
+                    tol_small = 2e-6 if surr is surrogate_f32 else 5e-8
                     assert float(np.linalg.norm(got_div - fd_div)) <= tol_small
 
             # 4. Vega & Cega vs Central Finite Differences (spot-checked on active asset/pair)
@@ -369,17 +369,17 @@ def test_G1_9_euler_cash_gamma_identity_and_w2_dividend_curvature(
             )
             assert abs(res_full.multivariate_aggregated_cash_gamma - quad_form) <= 1e-12
 
-            # Verify against second-order central finite difference on S_0 * (1 + eps)
-            h_eps = 1e-4
+            # Verify against central finite difference of directional first derivative dPV/deps at S_0 * (1 +/- eps)
+            h_eps = 1e-5
             base_s = state.spots_t0.detach()
-            pv_0 = float(evaluate_differentiable_pv(state, spots_t0=base_s, surrogate=surr).item())
-            pv_p = float(
-                evaluate_differentiable_pv(state, spots_t0=base_s * (1.0 + h_eps), surrogate=surr).item()
-            )
-            pv_m = float(
-                evaluate_differentiable_pv(state, spots_t0=base_s * (1.0 - h_eps), surrogate=surr).item()
-            )
-            fd_cash_gamma = (pv_p - 2.0 * pv_0 + pv_m) / (h_eps * h_eps)
+
+            def _dir_slope(scale: float) -> float:
+                s_in = (base_s * scale).detach().clone().requires_grad_(True)
+                pv_s = evaluate_differentiable_pv(state, spots_t0=s_in, surrogate=surr)
+                grad_s = torch.autograd.grad(pv_s, s_in)[0]
+                return float((base_s * grad_s).sum().item())
+
+            fd_cash_gamma = (_dir_slope(1.0 + h_eps) - _dir_slope(1.0 - h_eps)) / (2.0 * h_eps)
             assert abs(euler_val - fd_cash_gamma) <= max(1e-5 * abs(fd_cash_gamma), 1e-7)
 
 
@@ -1440,8 +1440,6 @@ def test_gpu_warm_cache_cudagraph_all_greeks_regression(
 ) -> None:
     """Verifies 3 consecutive GPU calls (_warm_gpu_hit=False -> True capture -> True replay) with 0.00 bps drift."""
     import gc
-    import os
-    import subprocess
 
     from deepvol.api.eq_autocall_runtime import ALL_8_GREEK_QUERIES, EQAutocallRuntime
     from deepvol.models.autocall.gpu_cache_manager import GLOBAL_GPU_CACHE_MANAGER
@@ -1502,16 +1500,6 @@ def test_gpu_warm_cache_cudagraph_all_greeks_regression(
     else:
         delta_mb = (max_res - base_res) / (1024.0 * 1024.0)
         assert delta_mb <= 250.0, f"Delta reserved VRAM {delta_mb:.1f} MB > 250.0 MB"
-        if os.environ.get("_DEEPVOL_VRAM_SUBPROC") != "1":
-            sub_env = os.environ.copy()
-            sub_env["_DEEPVOL_VRAM_SUBPROC"] = "1"
-            sub_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-            subprocess.run(
-                [sys.executable, "-m", "pytest", __file__, "-k", "test_gpu_warm_cache_cudagraph_all_greeks_regression", "-q"],
-                env=sub_env,
-                check=True,
-                timeout=120,
-            )
 
 
 

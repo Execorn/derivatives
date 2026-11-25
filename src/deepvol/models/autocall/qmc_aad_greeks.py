@@ -19,6 +19,14 @@ import numpy.typing as npt
 import torch
 
 try:
+    import numba  # type: ignore[import-untyped]
+
+    _HAS_NUMBA = True
+except Exception:  # pragma: no cover - optional CPU JIT dependency
+    numba = None
+    _HAS_NUMBA = False
+
+try:
     import triton  # type: ignore[import-untyped]
     import triton.language as tl  # type: ignore[import-untyped]
     from triton import knobs as _triton_knobs
@@ -130,16 +138,16 @@ _CRN_VEGA_JAC_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=256)
 _CRN_CURVE_JAC_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=256)
 _CRN_CPU_PREP_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=128)
 _CRN_MF_CHEAP_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "deal_prep_lv_vega", max_entries=64, max_bytes=32 * 1024 * 1024
+    "deal_prep_lv_vega", max_entries=128, max_bytes=32 * 1024 * 1024
 )
 _CRN_DEAL_PREP_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "deal_prep_lv_vega", max_entries=64, max_bytes=32 * 1024 * 1024
+    "deal_prep_lv_vega", max_entries=128, max_bytes=32 * 1024 * 1024
 )
 _CRN_STATIC_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
     "static_constants", max_entries=32, max_bytes=8 * 1024 * 1024
 )
 _CRN_CUDAGRAPH_POOL_PARTITION: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "cudagraph_pool", max_entries=32, max_bytes=24 * 1024 * 1024
+    "cudagraph_pool", max_entries=8, max_bytes=24 * 1024 * 1024
 )
 _CRN_TRITON_DIRECT_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=256)
 _TRITON_PLAN_CACHE: _ThreadSafeLRUCache[Tuple[Tuple[str, bool, Any], ...]] = _ThreadSafeLRUCache(maxsize=128)
@@ -208,6 +216,8 @@ class _CrnGpuViews:
         "dummy_f32_1",
         "fwd_perf_f32_step_g",
         "inv_dt_f32_val",
+        "cg_bucket_pack",
+        "cg_meta_cache",
     )
 
     gpu_meta: Dict[str, Any]
@@ -269,6 +279,8 @@ class _CrnGpuViews:
     dummy_f32_1: Any
     fwd_perf_f32_step_g: Any
     inv_dt_f32_val: float
+    cg_bucket_pack: Any
+    cg_meta_cache: Dict[Any, Any]
 
 
 class _CrnCpuPrep:
@@ -460,14 +472,18 @@ def _seq_fast_key(v: Any) -> Any:
     return repr(v)
 
 
-def _curve_fast_sig(c_any: Any) -> Any:
+def _curve_fast_sig(c_any: Any, sig_memo: Optional[Dict[int, Any]] = None) -> Any:
     """Fast deterministic content signature for discount/financing/repo curves without full serialization."""
     if c_any is None:
         return None
+    if sig_memo is not None:
+        hit_m = sig_memo.get(id(c_any))
+        if hit_m is not None:
+            return hit_m
     if isinstance(c_any, Mapping):
         rs = c_any.get("RatesSchedule")
         rs_m = rs if isinstance(rs, Mapping) else {}
-        return (
+        sig_out: Any = (
             "dict",
             str(c_any.get("Identifier", c_any.get("identifier", ""))),
             str(c_any.get("DayCountConvention", "")),
@@ -488,6 +504,9 @@ def _curve_fast_sig(c_any: Any) -> Any:
             _seq_fast_key(rs_m.get("Spreads")),
             _seq_fast_key(rs_m.get("DiscountFactors")),
         )
+        if sig_memo is not None:
+            sig_memo[id(c_any)] = sig_out
+        return sig_out
     d_any = getattr(c_any, "__dict__", None)
     if d_any is not None and hasattr(type(c_any), "model_fields"):
         cn = d_any.get("_inner_curve") or c_any
@@ -511,6 +530,39 @@ def _curve_fast_sig(c_any: Any) -> Any:
                 or ("Periods" in d_cn)
                 or (extra_cn is not None and ("DiscountFactors" in extra_cn or "Periods" in extra_cn))
             ):
+                snap_pm = getattr(c_any, "_crn_curve_pm_snap", None)
+                if snap_pm is not None and snap_pm[0] is cn:
+                    _, sig_snap_pm, cn_seq_cur_keys, rs_attr_snap, rs_seq_snap, id_snap, asof_snap = snap_pm
+                    cur_id_pm = _cn_get("Identifier")
+                    if cur_id_pm is None:
+                        cur_id_pm = _cn_get("identifier")
+                    cur_asof_pm = _cn_get("AsOfDate")
+                    if cur_asof_pm is None:
+                        cur_asof_pm = _cn_get("as_of_date", "")
+                    if cur_id_pm == id_snap and cur_asof_pm == asof_snap and rs_attr is rs_attr_snap:
+                        cn_ok_pm = (
+                            _cn_get("Dates") == cn_seq_cur_keys[0]
+                            and _cn_get("Periods") == cn_seq_cur_keys[1]
+                            and _cn_get("DiscountFactors") == cn_seq_cur_keys[2]
+                            and _cn_get("Spreads") == cn_seq_cur_keys[3]
+                        )
+                        if cn_ok_pm:
+                            if rs_attr is None:
+                                if sig_memo is not None:
+                                    sig_memo[id(c_any)] = sig_snap_pm
+                                return sig_snap_pm
+                            d_rs_c = getattr(rs_attr, "__dict__", None) if not isinstance(rs_attr, Mapping) else None
+                            if d_rs_c is not None and not getattr(rs_attr, "__pydantic_extra__", None):
+                                if (
+                                    d_rs_c.get("Dates") == rs_seq_snap[0]
+                                    and d_rs_c.get("Periods") == rs_seq_snap[1]
+                                    and d_rs_c.get("Rates") == rs_seq_snap[2]
+                                    and d_rs_c.get("Spreads") == rs_seq_snap[3]
+                                    and d_rs_c.get("DiscountFactors") == rs_seq_snap[4]
+                                ):
+                                    if sig_memo is not None:
+                                        sig_memo[id(c_any)] = sig_snap_pm
+                                    return sig_snap_pm
                 id_cn = _cn_get("Identifier")
                 if id_cn is None:
                     id_cn = _cn_get("identifier")
@@ -523,26 +575,35 @@ def _curve_fast_sig(c_any: Any) -> Any:
                     asof_cn = _cn_get("as_of_date", "")
                 if rs_attr is not None:
                     if isinstance(rs_attr, Mapping):
-                        rs_get: Callable[..., Any] = rs_attr.get
+                        rs_dates = _seq_fast_key(rs_attr.get("Dates"))
+                        rs_periods = _seq_fast_key(rs_attr.get("Periods"))
+                        rs_rates = _seq_fast_key(rs_attr.get("Rates"))
+                        rs_spreads = _seq_fast_key(rs_attr.get("Spreads"))
+                        rs_dfs = _seq_fast_key(rs_attr.get("DiscountFactors"))
                     elif hasattr(type(rs_attr), "model_fields") and getattr(rs_attr, "__dict__", None) is not None:
                         d_rs = rs_attr.__dict__
                         extra_rs = getattr(rs_attr, "__pydantic_extra__", None)
                         if extra_rs:
-                            def rs_get(k: str, default: Any = None) -> Any:
-                                return d_rs[k] if k in d_rs else extra_rs.get(k, default)
+                            rs_dates = _seq_fast_key(d_rs["Dates"] if "Dates" in d_rs else extra_rs.get("Dates"))
+                            rs_periods = _seq_fast_key(d_rs["Periods"] if "Periods" in d_rs else extra_rs.get("Periods"))
+                            rs_rates = _seq_fast_key(d_rs["Rates"] if "Rates" in d_rs else extra_rs.get("Rates"))
+                            rs_spreads = _seq_fast_key(d_rs["Spreads"] if "Spreads" in d_rs else extra_rs.get("Spreads"))
+                            rs_dfs = _seq_fast_key(d_rs["DiscountFactors"] if "DiscountFactors" in d_rs else extra_rs.get("DiscountFactors"))
                         else:
-                            rs_get = d_rs.get
+                            rs_dates = _seq_fast_key(d_rs.get("Dates"))
+                            rs_periods = _seq_fast_key(d_rs.get("Periods"))
+                            rs_rates = _seq_fast_key(d_rs.get("Rates"))
+                            rs_spreads = _seq_fast_key(d_rs.get("Spreads"))
+                            rs_dfs = _seq_fast_key(d_rs.get("DiscountFactors"))
                     else:
-                        def rs_get(k: str, default: Any = None) -> Any:
-                            return getattr(rs_attr, k, default)
-                    rs_dates = _seq_fast_key(rs_get("Dates"))
-                    rs_periods = _seq_fast_key(rs_get("Periods"))
-                    rs_rates = _seq_fast_key(rs_get("Rates"))
-                    rs_spreads = _seq_fast_key(rs_get("Spreads"))
-                    rs_dfs = _seq_fast_key(rs_get("DiscountFactors"))
+                        rs_dates = _seq_fast_key(getattr(rs_attr, "Dates", None))
+                        rs_periods = _seq_fast_key(getattr(rs_attr, "Periods", None))
+                        rs_rates = _seq_fast_key(getattr(rs_attr, "Rates", None))
+                        rs_spreads = _seq_fast_key(getattr(rs_attr, "Spreads", None))
+                        rs_dfs = _seq_fast_key(getattr(rs_attr, "DiscountFactors", None))
                 else:
                     rs_dates = rs_periods = rs_rates = rs_spreads = rs_dfs = None
-                return (
+                sig_rs: Any = (
                     "model",
                     type(c_any).__name__,
                     type(cn).__name__,
@@ -564,6 +625,54 @@ def _curve_fast_sig(c_any: Any) -> Any:
                     rs_spreads,
                     rs_dfs,
                 )
+                try:
+                    def _copy_seq_snap(v: Any) -> Any:
+                        return list(v) if isinstance(v, list) else v
+
+                    d_rs_snap = (
+                        getattr(rs_attr, "__dict__", None)
+                        if (rs_attr is not None and not isinstance(rs_attr, Mapping) and not getattr(rs_attr, "__pydantic_extra__", None))
+                        else None
+                    )
+                    if (
+                        all(isinstance(x, (type(None), tuple, list)) for x in (_cn_get("Dates"), _cn_get("Periods"), _cn_get("DiscountFactors"), _cn_get("Spreads")))
+                        and (
+                            rs_attr is None
+                            or (
+                                d_rs_snap is not None
+                                and all(isinstance(d_rs_snap.get(k_rs), (type(None), tuple, list)) for k_rs in ("Dates", "Periods", "Rates", "Spreads", "DiscountFactors"))
+                            )
+                        )
+                    ):
+                        cn_snap_t = (
+                            _copy_seq_snap(_cn_get("Dates")),
+                            _copy_seq_snap(_cn_get("Periods")),
+                            _copy_seq_snap(_cn_get("DiscountFactors")),
+                            _copy_seq_snap(_cn_get("Spreads")),
+                        )
+                        rs_snap_t = (
+                            (
+                                _copy_seq_snap(d_rs_snap.get("Dates")),
+                                _copy_seq_snap(d_rs_snap.get("Periods")),
+                                _copy_seq_snap(d_rs_snap.get("Rates")),
+                                _copy_seq_snap(d_rs_snap.get("Spreads")),
+                                _copy_seq_snap(d_rs_snap.get("DiscountFactors")),
+                            )
+                            if d_rs_snap is not None
+                            else ()
+                        )
+                        raw_id_snap = _cn_get("Identifier")
+                        if raw_id_snap is None:
+                            raw_id_snap = _cn_get("identifier")
+                        raw_asof_snap = _cn_get("AsOfDate")
+                        if raw_asof_snap is None:
+                            raw_asof_snap = _cn_get("as_of_date", "")
+                        setattr(c_any, "_crn_curve_pm_snap", (cn, sig_rs, cn_snap_t, rs_attr, rs_snap_t, raw_id_snap, raw_asof_snap))
+                except (AttributeError, TypeError):
+                    pass
+                if sig_memo is not None:
+                    sig_memo[id(c_any)] = sig_rs
+                return sig_rs
     rs_attr = getattr(cn, "RatesSchedule", None)
     if rs_attr is not None or hasattr(cn, "DiscountFactors") or hasattr(cn, "Periods"):
         return (
@@ -590,15 +699,56 @@ def _curve_fast_sig(c_any: Any) -> Any:
         )
     qa = getattr(cn, "_raw_quotes", getattr(cn, "quotes", getattr(cn, "values", getattr(cn, "rates", None))))
     ta = getattr(cn, "tenors", None)
-    dcc_v = str(getattr(cn, "dcc", getattr(c_any, "dcc", "")))
-    sc_v = str(getattr(cn, "space_coords", getattr(c_any, "space_coords", "")))
-    im_v = str(getattr(cn, "_input_mode", getattr(c_any, "_input_mode", "")))
-    qs_v = float(getattr(cn, "quote_scale", getattr(c_any, "quote_scale", 0.01)))
-    interp_v = str(getattr(cn, "interp_method", getattr(cn, "interpolation_method", getattr(c_any, "interp_method", ""))))
-    extrap_v = str(getattr(cn, "extrap_method", getattr(cn, "extrapolation_method", getattr(c_any, "extrap_method", ""))))
-    asof_v = repr(getattr(cn, "as_of_date", getattr(c_any, "as_of_date", None)))
+    snap = d_any.get("_crn_curve_sig_snap") if d_any is not None else getattr(c_any, "_crn_curve_sig_snap", None)
+    if snap is not None and len(snap) == 6 and snap[4] is cn:
+        s_sig, q_snap, t_snap, raw_meta_snap, _, _ = snap
+        raw_meta_cur = (
+            getattr(cn, "dcc", getattr(c_any, "dcc", "")),
+            getattr(cn, "space_coords", getattr(c_any, "space_coords", "")),
+            getattr(cn, "_input_mode", getattr(c_any, "_input_mode", "")),
+            getattr(cn, "quote_scale", getattr(c_any, "quote_scale", 0.01)),
+            getattr(cn, "interp_method", getattr(cn, "interpolation_method", getattr(c_any, "interp_method", ""))),
+            getattr(cn, "extrap_method", getattr(cn, "extrapolation_method", getattr(c_any, "extrap_method", ""))),
+            getattr(cn, "as_of_date", getattr(c_any, "as_of_date", None)),
+        )
+        if raw_meta_cur == raw_meta_snap:
+            if qa is None and q_snap is None:
+                q_ok = True
+            elif isinstance(qa, np.ndarray) and isinstance(q_snap, np.ndarray):
+                q_ok = _arr_bytes_equal(qa, q_snap)
+            elif qa is not None and q_snap is not None:
+                q_ok = bool(np.array_equal(qa, q_snap))
+            else:
+                q_ok = False
+            if q_ok:
+                t_ok = False
+                if ta is None and t_snap is None:
+                    t_ok = True
+                elif isinstance(ta, np.ndarray) and isinstance(t_snap, np.ndarray):
+                    t_ok = _arr_bytes_equal(ta, t_snap)
+                elif (not isinstance(ta, np.ndarray)) and (not isinstance(t_snap, np.ndarray)):
+                    t_ok = bool(ta == t_snap)
+                if t_ok:
+                    if sig_memo is not None:
+                        sig_memo[id(c_any)] = s_sig
+                    return s_sig
+    raw_meta_cur = (
+        getattr(cn, "dcc", getattr(c_any, "dcc", "")),
+        getattr(cn, "space_coords", getattr(c_any, "space_coords", "")),
+        getattr(cn, "_input_mode", getattr(c_any, "_input_mode", "")),
+        getattr(cn, "quote_scale", getattr(c_any, "quote_scale", 0.01)),
+        getattr(cn, "interp_method", getattr(cn, "interpolation_method", getattr(c_any, "interp_method", ""))),
+        getattr(cn, "extrap_method", getattr(cn, "extrapolation_method", getattr(c_any, "extrap_method", ""))),
+        getattr(cn, "as_of_date", getattr(c_any, "as_of_date", None)),
+    )
+    dcc_v = str(raw_meta_cur[0])
+    sc_v = str(raw_meta_cur[1])
+    im_v = str(raw_meta_cur[2])
+    qs_v = float(raw_meta_cur[3])
+    interp_v = str(raw_meta_cur[4])
+    extrap_v = str(raw_meta_cur[5])
+    asof_v = repr(raw_meta_cur[6])
     meta_v = (dcc_v, sc_v, im_v, qs_v, interp_v, extrap_v, asof_v)
-    snap = getattr(c_any, "_crn_curve_sig_snap", None)
     if snap is not None and len(snap) == 4:
         s_sig, q_snap, t_snap, meta_snap = snap
         if meta_snap == meta_v:
@@ -610,12 +760,18 @@ def _curve_fast_sig(c_any: Any) -> Any:
                 q_ok = False
             if q_ok:
                 if ta is None and t_snap is None:
+                    if sig_memo is not None:
+                        sig_memo[id(c_any)] = s_sig
                     return s_sig
                 if isinstance(ta, np.ndarray) and isinstance(t_snap, np.ndarray):
                     if np.array_equal(ta, t_snap):
+                        if sig_memo is not None:
+                            sig_memo[id(c_any)] = s_sig
                         return s_sig
                 elif (not isinstance(ta, np.ndarray)) and (not isinstance(t_snap, np.ndarray)):
                     if ta == t_snap:
+                        if sig_memo is not None:
+                            sig_memo[id(c_any)] = s_sig
                         return s_sig
     q_arr = np.ascontiguousarray(qa, dtype=np.float64) if qa is not None else None
     qb = q_arr.tobytes() if q_arr is not None else b""
@@ -638,7 +794,7 @@ def _curve_fast_sig(c_any: Any) -> Any:
         setattr(
             c_any,
             "_crn_curve_sig_snap",
-            (sig, q_arr.copy() if q_arr is not None else None, ta.copy() if isinstance(ta, np.ndarray) else ta, meta_v),
+            (sig, q_arr.copy() if q_arr is not None else None, ta.copy() if isinstance(ta, np.ndarray) else ta, raw_meta_cur, cn, meta_v),
         )
     except (AttributeError, TypeError):
         return sig
@@ -655,9 +811,27 @@ def clear_qmc_aad_gpu_caches() -> None:
     _CRN_CPU_PREP_CACHE.clear()
     _CRN_MF_CHEAP_CACHE.clear()
     _CRN_QMC_CG_CACHE.clear()
+    _QMC_CG_SCRATCH_ARENA.clear()
+    _QMC_CG_STREAMS.clear()
 
 
-_QMC_CG_MAX_ENTRIES: int = 2
+_QMC_CG_MAX_ENTRIES: int = 8
+
+
+def _resolve_qmc_cg_bucket(d_assets: int, m_rem: int, n_sub: int) -> Optional[Tuple[int, int]]:
+    """Maps heterogeneous `(d_assets, m_rem, n_sub)` deals into <= 7 canonical CUDAGraph buckets."""
+    if d_assets <= 0 or d_assets > 6 or m_rem <= 0 or m_rem > 60:
+        return None
+    if m_rem <= 10 and n_sub == 8:
+        return (6, 10)
+    if n_sub != 4:
+        return None
+    d_pad = 3 if d_assets <= 3 else 6
+    if m_rem <= 20:
+        return (d_pad, 20)
+    if m_rem <= 40:
+        return (d_pad, 40)
+    return (d_pad, 60)
 
 
 class _QmcCudagraphCache:
@@ -679,10 +853,101 @@ class _QmcCudagraphCache:
 
 
 _CRN_QMC_CG_CACHE = _QmcCudagraphCache(max_entries=_QMC_CG_MAX_ENTRIES)
+_QMC_CG_SCRATCH_ARENA: Dict[Tuple[int, str], torch.Tensor] = {}
+_QMC_CG_STREAMS: Dict[int, torch.cuda.Stream] = {}
+
+
+def _get_qmc_cg_stream(device: torch.device) -> torch.cuda.Stream:
+    dev_idx = int(device.index or 0)
+    s = _QMC_CG_STREAMS.get(dev_idx)
+    if s is None or s.device != device:
+        s = torch.cuda.Stream(device=device)  # type: ignore[no-untyped-call]
+        _QMC_CG_STREAMS[dev_idx] = s
+    return s
+
+
+def _alloc_cg_buf(
+    use_arena: bool,
+    device: torch.device,
+    slot: str,
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    *,
+    zero: bool = False,
+) -> torch.Tensor:
+    """Slices a pointer-stable pre-allocated CG scratch buffer when large enough, else falls back to torch alloc."""
+    if use_arena:
+        n_el = 1
+        for d_s in shape:
+            n_el *= int(d_s)
+        elem_sz = 8 if dtype == torch.float64 else 4
+        n_bytes = n_el * elem_sz
+        buf = _QMC_CG_SCRATCH_ARENA.get((int(device.index or 0), slot))
+        if buf is not None and int(buf.numel()) >= n_bytes and buf.device == device:
+            view = buf[:n_bytes].view(dtype).view(shape)
+            if zero:
+                view.zero_()
+            return view
+    return torch.zeros(shape, dtype=dtype, device=device) if zero else torch.empty(shape, dtype=dtype, device=device)
+
+
+def _ensure_qmc_cg_scratch_arena(
+    device: torch.device,
+    max_d: int,
+    max_m: int,
+    n_sub: int,
+    max_r_chunk: int,
+    n_rep: int,
+    lv_nt: int,
+    lv_ny: int,
+    n_lv_shards: int,
+    max_nb: int,
+    n_tiles_eval: int,
+    max_m_th: int,
+    max_d_mf: int,
+) -> None:
+    """Pre-allocates fixed pointer-stable scratch buffers outside CUDAGraph capture so all graphs share one workspace."""
+    dev_idx = int(device.index or 0)
+    # Unified canonical high-water budget (c_m_steps * c_d * c_n_chunk <= 160*6*4096) fits both (6,40,r=4) and (6,20,r=8)/(3,40,r=8)/(6,10,r=8).
+    c_d = max(int(max_d), 6)
+    c_dm_steps = max(int(max_d) * int(max_m) * int(n_sub) * int(max_r_chunk) * int(n_rep), 6 * 40 * 4 * 4 * 1024)
+    c_dm_per = max(int(max_d) * int(max_m) * int(max_r_chunk) * int(n_rep), 6 * 40 * 4 * 1024)
+    c_dm_th = max(int(max_d) * int(max_m_th) * int(max_r_chunk) * int(n_rep), c_dm_per)
+    c_n_chunk = max(int(max_r_chunk) * int(n_rep), 8192)
+    c_shards = max(int(n_lv_shards), 32)
+    c_grid_s2 = max(1, int(max_r_chunk), 8) * max(1, (int(n_rep) + 127) // 128)
+    c_grid_nv = (c_n_chunk + 31) // 32
+    slots_bytes = {
+        # z_raw (inside _get_z_indep_chunk_gpu) and bar_zc (stage-2 bwd) have disjoint lifetimes.
+        "z_raw_or_bzc": c_dm_steps * 4,
+        "z_out": c_dm_steps * 4,
+        "z_corr": c_dm_steps * 4,
+        "lx_period": c_dm_per * 4,
+        "perf_base": c_dm_per * 4,
+        "vib_lx": c_d * c_n_chunk * 4,
+        "vib_j": c_d * c_n_chunk * 4,
+        "vib_sig": c_d * c_n_chunk * 4,
+        "bar_lx_post": c_dm_per * 4,
+        "out_cf_wf": 2 * c_grid_s2 * max(int(max_m), 40) * 8,
+        "bar_q": max(int(max_d) * int(max_m) * int(n_sub), 6 * 40 * 4) * 4,
+        "bar_lv": c_shards * c_d * max(int(lv_nt), 32) * max(int(lv_ny), 64) * 4,
+        "d_ln_surv": (2 * c_d) * c_n_chunk * 4,
+        "h_vib_out": c_grid_nv * c_d * c_d * 8,
+        "frozen_term": 4 * c_n_chunk * 8,
+        "ema_shift": 2 * max(int(max_r_chunk), 8) * max(int(max_m), 40) * max(int(max_d_mf), c_d) * 4,
+        # z_mean_aux (get_z), ws_s2 (stage-2 AAD), perf_sp_pm, and perf_th have disjoint lifetimes within each chunk.
+        "perf_aux": max(2 * c_dm_per * 4, c_dm_th * 4, 7 * max(int(max_m), 40) * max(int(max_r_chunk) * int(n_rep), 4096) * 4),
+        "pv_tiles": max(int(max_nb), 64) * max(int(n_tiles_eval), 32) * 8,
+    }
+    for s_name, s_bytes in slots_bytes.items():
+        k_ar = (dev_idx, s_name)
+        cur = _QMC_CG_SCRATCH_ARENA.get(k_ar)
+        if cur is None or cur.device != device:
+            _QMC_CG_SCRATCH_ARENA[k_ar] = torch.empty((max(256, int(s_bytes)),), dtype=torch.uint8, device=device)
 
 
 class _PlatenSdeAadArgsC(ctypes.Structure):
-    """C++23 ABI v2 arguments for crn_platen_sde_aad_cpp (sizeof == 216)."""
+    """C++23 ABI v2 arguments for crn_platen_sde_aad_cpp (sizeof == 272)."""
 
     _fields_ = [
         ("d_assets", ctypes.c_int64),
@@ -715,6 +980,15 @@ class _PlatenSdeAadArgsC(ctypes.Structure):
         ("compute_chol_aad", ctypes.c_int32),
         ("compute_q_aad", ctypes.c_int32),
         ("has_q_shift_sub", ctypes.c_int32),
+        ("out_lx_pre", ctypes.c_void_p),
+        ("out_j_pre", ctypes.c_void_p),
+        ("out_sig_pre", ctypes.c_void_p),
+        ("vib_period_idx", ctypes.c_int32),
+        ("vib_sub_idx", ctypes.c_int32),
+        ("save_vib_pre", ctypes.c_int32),
+        ("_pad_vib", ctypes.c_int32),
+        ("vib_j_pre_max", ctypes.c_double),
+        ("vib_dsig_dy_max", ctypes.c_double),
     ]
 
 
@@ -807,7 +1081,7 @@ class _VibratoGammaArgsC(ctypes.Structure):
 
 
 if (
-    ctypes.sizeof(_PlatenSdeAadArgsC) != 216
+    ctypes.sizeof(_PlatenSdeAadArgsC) != 272
     or ctypes.sizeof(_SobolGenArgsC) != 128
     or ctypes.sizeof(_VibratoGammaArgsC) != 392
 ):
@@ -815,7 +1089,28 @@ if (
 
 
 _CPP_CRN_V2_FNS: Optional[Tuple[Any, Any, Any]] = None
+_CPP_STEP_SPOT_BUMPS_CPU_FN: Any = None
+_CPP_STEP_SPOT_BUMPS_CHECKED = False
 _CPP_CRN_V2_INIT_LOCK = threading.Lock()
+
+
+def _get_cpp_step_spot_bumps_fn() -> Any:
+    """Returns optional C++23 batched spot-bump trajectory stepper (`crn_step_spot_bumps_cpu`)."""
+    global _CPP_STEP_SPOT_BUMPS_CPU_FN, _CPP_STEP_SPOT_BUMPS_CHECKED
+    if _CPP_STEP_SPOT_BUMPS_CHECKED:
+        return _CPP_STEP_SPOT_BUMPS_CPU_FN
+    with _CPP_CRN_V2_INIT_LOCK:
+        if _CPP_STEP_SPOT_BUMPS_CHECKED:
+            return _CPP_STEP_SPOT_BUMPS_CPU_FN
+        try:
+            from deepvol.models.autocall._tier1_backend import _require_cpp23_backend
+
+            backend = _require_cpp23_backend()
+            _CPP_STEP_SPOT_BUMPS_CPU_FN = getattr(backend, "crn_step_spot_bumps_cpu", None)
+        except Exception:
+            _CPP_STEP_SPOT_BUMPS_CPU_FN = None
+        _CPP_STEP_SPOT_BUMPS_CHECKED = True
+        return _CPP_STEP_SPOT_BUMPS_CPU_FN
 
 
 def _get_cpp_crn_v2_fns() -> Tuple[Any, Any, Any]:
@@ -838,17 +1133,17 @@ def _get_cpp_crn_v2_fns() -> Tuple[Any, Any, Any]:
                 raw_sde = getattr(lib, "crn_platen_sde_aad_cpp", None)
                 if raw_sde is not None:
                     raw_sde.argtypes = [ctypes.POINTER(_PlatenSdeAadArgsC)]
-                    raw_sde.restype = None
+                    raw_sde.restype = ctypes.c_int32
                     sde_fn = raw_sde
                 raw_sob = getattr(lib, "crn_generate_sobol_normals_cpp", None)
                 if raw_sob is not None:
                     raw_sob.argtypes = [ctypes.POINTER(_SobolGenArgsC)]
-                    raw_sob.restype = None
+                    raw_sob.restype = ctypes.c_int32
                     sob_fn = raw_sob
                 raw_vib = getattr(lib, "crn_eval_vibrato_gamma_cpp", None)
                 if raw_vib is not None:
                     raw_vib.argtypes = [ctypes.POINTER(_VibratoGammaArgsC)]
-                    raw_vib.restype = None
+                    raw_vib.restype = ctypes.c_int32
                     vib_fn = raw_vib
         except (OSError, ImportError, AttributeError):
             sde_fn, sob_fn, vib_fn = None, None, None
@@ -857,14 +1152,10 @@ def _get_cpp_crn_v2_fns() -> Tuple[Any, Any, Any]:
 
 
 def _arr_bytes_equal(a: npt.NDArray[Any], b: npt.NDArray[Any]) -> bool:
-    """Fast exact byte comparison for contiguous NumPy arrays of matching shape & dtype."""
-    return (
-        a.shape == b.shape
-        and a.dtype == b.dtype
-        and a.flags.c_contiguous
-        and b.flags.c_contiguous
-        and a.tobytes() == b.tobytes()
-    )
+    """Fast exact byte comparison for contiguous NumPy arrays without allocating temporary bytes objects."""
+    if a.shape != b.shape or a.dtype != b.dtype or not (a.flags.c_contiguous and b.flags.c_contiguous):
+        return False
+    return bool(memoryview(cast(Any, a.ravel().view(np.uint8))) == memoryview(cast(Any, b.ravel().view(np.uint8))))
 
 
 def _np_f64(t: torch.Tensor) -> npt.NDArray[np.float64]:
@@ -1383,16 +1674,28 @@ if _HAS_TRITON:
         out_ptr,
         m_rem,
         d_assets,
-        n_rep: tl.constexpr,
-        n_sub: tl.constexpr,
-        m_pow: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        cg_flags_ptr=None,
+        n_rep: tl.constexpr = 1024,
+        n_sub: tl.constexpr = 4,
+        m_pow: tl.constexpr = 10,
+        BLOCK_N: tl.constexpr = 256,
+        USE_RT_FLAGS: tl.constexpr = False,
+        D_PAD: tl.constexpr = 0,
     ):
         pid_n = tl.program_id(0)
         pid_mr = tl.program_id(1)
         n_replicates = tl.num_programs(1) // m_rem
         pid_r = pid_mr // m_rem
         m_idx = pid_mr % m_rem
+
+        if USE_RT_FLAGS:
+            d_act = tl.load(cg_flags_ptr + 0)
+            m_act = tl.load(cg_flags_ptr + 1)
+            if m_idx >= m_act:
+                return
+        else:
+            d_act = d_assets
+            m_act = m_rem
 
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_n = offs_n < n_rep
@@ -1401,51 +1704,54 @@ if _HAS_TRITON:
 
         inv_sqrt_sub = 1.0 / tl.sqrt(float(n_sub))
         n_dims_total = m_rem * (n_sub + 1) * d_assets
-        coarse_base = m_idx * d_assets
-        fine_base = (m_rem + m_idx * n_sub) * d_assets
+        coarse_base = m_idx * d_act
+        fine_base = (m_act + m_idx * n_sub) * d_act
         n_total = n_replicates * n_rep
 
-        for d in range(d_assets):
-            c_dim = coarse_base + d
-            c_acc = tl.zeros((BLOCK_N,), dtype=tl.uint32)
-            for b in range(m_pow):
-                bit_on = (gray >> b) & 1
-                dir_num = tl.load(sv_ptr + c_dim * 30 + b).to(tl.uint32)
-                c_acc = c_acc ^ tl.where(bit_on != 0, dir_num, tl.zeros((BLOCK_N,), dtype=tl.uint32))
-            c_shift = tl.load(shifts_ptr + pid_r * n_dims_total + c_dim).to(tl.uint32)
-            c_acc = c_acc ^ c_shift
-            cu = (c_acc.to(tl.float32) + 0.5) * (1.0 / 1073741824.0)
-            cu = tl.minimum(tl.maximum(cu, 1e-6), 1.0 - 1e-6)
-            zc = tl.extra.cuda.libdevice.normcdfinv(cu)
+        n_d_loop: tl.constexpr = D_PAD if USE_RT_FLAGS else d_assets
+        for d in range(n_d_loop):
+            d_ok = (d < d_act) if USE_RT_FLAGS else True
+            if d_ok:
+                c_dim = coarse_base + d
+                c_acc = tl.zeros((BLOCK_N,), dtype=tl.uint32)
+                for b in range(m_pow):
+                    bit_on = (gray >> b) & 1
+                    dir_num = tl.load(sv_ptr + c_dim * 30 + b).to(tl.uint32)
+                    c_acc = c_acc ^ tl.where(bit_on != 0, dir_num, tl.zeros((BLOCK_N,), dtype=tl.uint32))
+                c_shift = tl.load(shifts_ptr + pid_r * n_dims_total + c_dim).to(tl.uint32)
+                c_acc = c_acc ^ c_shift
+                cu = (c_acc.to(tl.float32) + 0.5) * (1.0 / 1073741824.0)
+                cu = tl.minimum(tl.maximum(cu, 1e-6), 1.0 - 1e-6)
+                zc = tl.extra.cuda.libdevice.normcdfinv(cu)
 
-            if n_sub == 1:
-                out_off = (m_idx * d_assets + d) * n_total + pid_r * n_rep + offs_n
-                tl.store(out_ptr + out_off, zc, mask=mask_n)
-            else:
-                z_sum = tl.zeros((BLOCK_N,), dtype=tl.float32)
-                for s in range(n_sub):
-                    f_dim = fine_base + s * d_assets + d
-                    f_acc = tl.zeros((BLOCK_N,), dtype=tl.uint32)
-                    for b in range(m_pow):
-                        bit_on = (gray >> b) & 1
-                        dir_num = tl.load(sv_ptr + f_dim * 30 + b).to(tl.uint32)
-                        f_acc = f_acc ^ tl.where(bit_on != 0, dir_num, tl.zeros((BLOCK_N,), dtype=tl.uint32))
-                    f_shift = tl.load(shifts_ptr + pid_r * n_dims_total + f_dim).to(tl.uint32)
-                    f_acc = f_acc ^ f_shift
-                    fu = (f_acc.to(tl.float32) + 0.5) * (1.0 / 1073741824.0)
-                    fu = tl.minimum(tl.maximum(fu, 1e-6), 1.0 - 1e-6)
-                    zs = tl.extra.cuda.libdevice.normcdfinv(fu)
-                    z_sum = z_sum + zs
-                    step_idx = m_idx * n_sub + s
-                    out_off = (step_idx * d_assets + d) * n_total + pid_r * n_rep + offs_n
-                    tl.store(out_ptr + out_off, zs, mask=mask_n)
-                z_mean = z_sum * (1.0 / float(n_sub))
-                delta_z = zc * inv_sqrt_sub - z_mean
-                for s in range(n_sub):
-                    step_idx = m_idx * n_sub + s
-                    out_off = (step_idx * d_assets + d) * n_total + pid_r * n_rep + offs_n
-                    cur = tl.load(out_ptr + out_off, mask=mask_n, other=0.0)
-                    tl.store(out_ptr + out_off, cur + delta_z, mask=mask_n)
+                if n_sub == 1:
+                    out_off = (m_idx * d_assets + d) * n_total + pid_r * n_rep + offs_n
+                    tl.store(out_ptr + out_off, zc, mask=mask_n)
+                else:
+                    z_sum = tl.zeros((BLOCK_N,), dtype=tl.float32)
+                    for s in range(n_sub):
+                        f_dim = fine_base + s * d_act + d
+                        f_acc = tl.zeros((BLOCK_N,), dtype=tl.uint32)
+                        for b in range(m_pow):
+                            bit_on = (gray >> b) & 1
+                            dir_num = tl.load(sv_ptr + f_dim * 30 + b).to(tl.uint32)
+                            f_acc = f_acc ^ tl.where(bit_on != 0, dir_num, tl.zeros((BLOCK_N,), dtype=tl.uint32))
+                        f_shift = tl.load(shifts_ptr + pid_r * n_dims_total + f_dim).to(tl.uint32)
+                        f_acc = f_acc ^ f_shift
+                        fu = (f_acc.to(tl.float32) + 0.5) * (1.0 / 1073741824.0)
+                        fu = tl.minimum(tl.maximum(fu, 1e-6), 1.0 - 1e-6)
+                        zs = tl.extra.cuda.libdevice.normcdfinv(fu)
+                        z_sum = z_sum + zs
+                        step_idx = m_idx * n_sub + s
+                        out_off = (step_idx * d_assets + d) * n_total + pid_r * n_rep + offs_n
+                        tl.store(out_ptr + out_off, zs, mask=mask_n)
+                    z_mean = z_sum * (1.0 / float(n_sub))
+                    delta_z = zc * inv_sqrt_sub - z_mean
+                    for s in range(n_sub):
+                        step_idx = m_idx * n_sub + s
+                        out_off = (step_idx * d_assets + d) * n_total + pid_r * n_rep + offs_n
+                        cur = tl.load(out_ptr + out_off, mask=mask_n, other=0.0)
+                        tl.store(out_ptr + out_off, cur + delta_z, mask=mask_n)
 
     @triton.jit  # type: ignore[untyped-decorator]
     def _triton_lv_bilinear_f32(  # type: ignore[no-untyped-def]
@@ -1481,7 +1787,8 @@ if _HAS_TRITON:
         v0 = (1.0 - wt) * s00 + wt * s10
         v1 = (1.0 - wt) * s01 + wt * s11
         sig = (1.0 - wy) * v0 + wy * v1
-        dsig_dy = tl.where(in_y, (v1 - v0) * inv_dy_d, 0.0)
+        dsig_dy_raw = tl.where(in_y, (v1 - v0) * inv_dy_d, 0.0)
+        dsig_dy = tl.minimum(tl.maximum(dsig_dy_raw, -4.0), 4.0)
         return sig, dsig_dy, it0, it1, wt, iy0, iy1, wy
 
     @triton.jit  # type: ignore[untyped-decorator]
@@ -1534,12 +1841,13 @@ if _HAS_TRITON:
         d_hat_dx = 1.0 + d_a0_dx * dt + d0 * dw
         d_p_dx = 1.0 + d_a0_dx * dt + d0 * sqrt_dt
         d_m_dx = 1.0 + d_a0_dx * dt - d0 * sqrt_dt
-        step_j = (
+        step_j_raw = (
             1.0
             + 0.5 * (d_a0_dx - sigh * dh * d_hat_dx) * dt
             + 0.25 * (dp * d_p_dx + dm * d_m_dx + 2.0 * d0) * dw
             + 0.25 * (dp * d_p_dx - dm * d_m_dx) * sqrt_dt * zc2m1
         )
+        step_j = tl.minimum(tl.maximum(step_j_raw, 0.25), 2.5)
         return lx_next, step_j
 
     @triton.jit  # type: ignore[untyped-decorator]
@@ -1627,6 +1935,68 @@ if _HAS_TRITON:
                 tl.atomic_add(bar_lv_d_ptr + it1 * N_y + ys, acc_y * wt, mask=ymask, sem="relaxed")
 
     @triton.jit  # type: ignore[untyped-decorator]
+    def _triton_lv_direct_scatter_f32(  # type: ignore[no-untyped-def]
+        bar_lv_d_ptr,
+        it0,
+        it1,
+        wt,
+        iy0,
+        iy1,
+        wy,
+        bar_val,
+        N_y: tl.constexpr,
+        mask_act,
+    ):
+        m = mask_act & (tl.abs(bar_val) > 1e-24)
+        w0t = 1.0 - wt
+        row0 = it0 * N_y
+        row1 = it1 * N_y
+        tl.atomic_add(bar_lv_d_ptr + row0 + iy0, bar_val * (w0t * (1.0 - wy)), mask=m, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row0 + iy1, bar_val * (w0t * wy), mask=m, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row1 + iy0, bar_val * (wt * (1.0 - wy)), mask=m, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row1 + iy1, bar_val * (wt * wy), mask=m, sem="relaxed")
+
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _triton_lv_direct_scatter3_f32(  # type: ignore[no-untyped-def]
+        bar_lv_d_ptr,
+        it0,
+        it1,
+        wt,
+        iy0_a,
+        iy1_a,
+        wy_a,
+        bar_a,
+        iy0_b,
+        iy1_b,
+        wy_b,
+        bar_b,
+        iy0_c,
+        iy1_c,
+        wy_c,
+        bar_c,
+        N_y: tl.constexpr,
+        mask_act,
+    ):
+        w0t = 1.0 - wt
+        row0 = it0 * N_y
+        row1 = it1 * N_y
+        ma = mask_act & (tl.abs(bar_a) > 1e-24)
+        tl.atomic_add(bar_lv_d_ptr + row0 + iy0_a, bar_a * (w0t * (1.0 - wy_a)), mask=ma, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row0 + iy1_a, bar_a * (w0t * wy_a), mask=ma, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row1 + iy0_a, bar_a * (wt * (1.0 - wy_a)), mask=ma, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row1 + iy1_a, bar_a * (wt * wy_a), mask=ma, sem="relaxed")
+        mb = mask_act & (tl.abs(bar_b) > 1e-24)
+        tl.atomic_add(bar_lv_d_ptr + row0 + iy0_b, bar_b * (w0t * (1.0 - wy_b)), mask=mb, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row0 + iy1_b, bar_b * (w0t * wy_b), mask=mb, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row1 + iy0_b, bar_b * (wt * (1.0 - wy_b)), mask=mb, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row1 + iy1_b, bar_b * (wt * wy_b), mask=mb, sem="relaxed")
+        mc = mask_act & (tl.abs(bar_c) > 1e-24)
+        tl.atomic_add(bar_lv_d_ptr + row0 + iy0_c, bar_c * (w0t * (1.0 - wy_c)), mask=mc, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row0 + iy1_c, bar_c * (w0t * wy_c), mask=mc, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row1 + iy0_c, bar_c * (wt * (1.0 - wy_c)), mask=mc, sem="relaxed")
+        tl.atomic_add(bar_lv_d_ptr + row1 + iy1_c, bar_c * (wt * wy_c), mask=mc, sem="relaxed")
+
+    @triton.jit  # type: ignore[untyped-decorator]
     def _qmc_fwd_checkpoint_kernel(  # type: ignore[no-untyped-def]
         sv_ptr,
         shifts_ptr,
@@ -1654,17 +2024,20 @@ if _HAS_TRITON:
         n_tiles,
         vib_period_idx,
         vib_sub_idx,
-        n_rep: tl.constexpr,
-        n_sub: tl.constexpr,
-        N_t: tl.constexpr,
-        N_y: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        cg_flags_ptr=None,
+        payoff_f64_ptr=None,
+        n_rep: tl.constexpr = 1024,
+        n_sub: tl.constexpr = 4,
+        N_t: tl.constexpr = 32,
+        N_y: tl.constexpr = 64,
+        BLOCK_N: tl.constexpr = 256,
         period_idx: int = 0,
         FUSE_M: tl.constexpr = False,
         SAVE_VIBRATO: tl.constexpr = False,
         VIB_PERIOD_LEVEL: tl.constexpr = False,
         USE_Z_CORR: tl.constexpr = False,
         EMIT_PERF: tl.constexpr = False,
+        USE_RT_FLAGS: tl.constexpr = False,
     ):
         _u_sh = shifts_ptr
         _u_rn = r_nat_mid_ptr
@@ -1672,6 +2045,21 @@ if _HAS_TRITON:
         pid_dr = tl.program_id(1)
         pid_r = pid_dr // d_assets
         d = pid_dr % d_assets
+        if USE_RT_FLAGS:
+            d_act = tl.load(cg_flags_ptr + 0)
+            m_act = tl.load(cg_flags_ptr + 1)
+            if d >= d_act:
+                return
+            eff_inv_dt = tl.load(payoff_f64_ptr + 17).to(tl.float32)
+            eff_vp_idx = tl.load(cg_flags_ptr + 18)
+            eff_vs_idx = tl.load(cg_flags_ptr + 19)
+            eff_vp_lvl = tl.load(cg_flags_ptr + 22) != 0
+        else:
+            m_act = m_rem
+            eff_inv_dt = inv_dt_grid
+            eff_vp_idx = vib_period_idx
+            eff_vs_idx = vib_sub_idx
+            eff_vp_lvl = VIB_PERIOD_LEVEL
         n_replicates = tl.num_programs(1) // d_assets
         n_total = n_replicates * n_rep
         n_steps_tot = m_rem * n_sub
@@ -1690,9 +2078,9 @@ if _HAS_TRITON:
             lx = tl.zeros((BLOCK_N,), dtype=tl.float32)
             j_lx = tl.full((BLOCK_N,), 1.0, dtype=tl.float32)
             for m_cur in range(m_rem):
-                if SAVE_VIBRATO:
-                    if VIB_PERIOD_LEVEL:
-                        if m_cur == vib_period_idx:
+                if m_cur < m_act:
+                    if SAVE_VIBRATO:
+                        if eff_vp_lvl & (m_cur == eff_vp_idx):
                             v_off = d * n_total + gid_n
                             tl.store(vib_lx_pre_ptr + v_off, lx, mask=mask_n)
                             tl.store(vib_j_pre_ptr + v_off, j_lx, mask=mask_n)
@@ -1702,59 +2090,58 @@ if _HAS_TRITON:
                                 t_mid_k = tl.load(t_prev_ptr + s_idx_k)
                                 q_k = tl.load(q_shift_mid_ptr + d * n_steps_tot + s_idx_k)
                                 sig_k, _dk, _i0k, _i1k, _wtk, _j0k, _j1k, _wyk = _triton_lv_bilinear_f32(
-                                    lv_table_ptr, lv_base, t_mid_k, lx + q_k, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n
+                                    lv_table_ptr, lv_base, t_mid_k, lx + q_k, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n
                                 )
                                 sig_sq_acc = sig_sq_acc + sig_k * sig_k
                             tl.store(vib_sig_pre_ptr + v_off, tl.sqrt(sig_sq_acc * (1.0 / float(n_sub))), mask=mask_n)
 
-                for s in tl.static_range(n_sub):
-                    step_idx = m_cur * n_sub + s
-                    t_mid = tl.load(t_prev_ptr + step_idx)
-                    dt = tl.load(dt_sub_ptr + step_idx)
-                    sqrt_dt = tl.load(sqrt_dt_ptr + step_idx)
-                    t_start = tl.maximum(t_mid - 0.5 * dt, 0.0)
-                    q_s = tl.load(q_shift_mid_ptr + d * n_steps_tot + step_idx)
+                    for s in tl.static_range(n_sub):
+                        step_idx = m_cur * n_sub + s
+                        t_mid = tl.load(t_prev_ptr + step_idx)
+                        dt = tl.load(dt_sub_ptr + step_idx)
+                        sqrt_dt = tl.load(sqrt_dt_ptr + step_idx)
+                        t_start = tl.maximum(t_mid - 0.5 * dt, 0.0)
+                        q_s = tl.load(q_shift_mid_ptr + d * n_steps_tot + step_idx)
 
-                    if SAVE_VIBRATO:
-                        if not VIB_PERIOD_LEVEL:
-                            if (m_cur == vib_period_idx) & (s == vib_sub_idx):
+                        if SAVE_VIBRATO:
+                            if (~eff_vp_lvl) & (m_cur == eff_vp_idx) & (s == eff_vs_idx):
                                 v_off = d * n_total + gid_n
                                 tl.store(vib_lx_pre_ptr + v_off, lx, mask=mask_n)
                                 tl.store(vib_j_pre_ptr + v_off, j_lx, mask=mask_n)
                                 sig_vib, _dv, _i0v, _i1v, _wtv, _j0v, _j1v, _wyv = _triton_lv_bilinear_f32(
-                                    lv_table_ptr, lv_base, t_mid, lx + q_s, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n
+                                    lv_table_ptr, lv_base, t_mid, lx + q_s, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n
                                 )
                                 tl.store(vib_sig_pre_ptr + v_off, sig_vib, mask=mask_n)
 
-                    if USE_Z_CORR:
-                        zc = tl.load(sv_ptr + (step_idx * d_assets + d) * n_total + gid_n, mask=mask_n, other=0.0)
-                    else:
-                        zc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-                        for j in range(d_assets):
-                            l_dj = tl.load(chol_ptr + d * d_assets + j)
-                            zj = tl.load(sv_ptr + (step_idx * d_assets + j) * n_total + gid_n, mask=mask_n, other=0.0)
-                            zc = zc + l_dj * zj
+                        if USE_Z_CORR:
+                            zc = tl.load(sv_ptr + (step_idx * d_assets + d) * n_total + gid_n, mask=mask_n, other=0.0)
+                        else:
+                            zc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+                            for j in range(d_assets):
+                                l_dj = tl.load(chol_ptr + d * d_assets + j)
+                                zj = tl.load(sv_ptr + (step_idx * d_assets + j) * n_total + gid_n, mask=mask_n, other=0.0)
+                                zc = zc + l_dj * zj
 
-                    lx, step_j = _triton_platen_fwd_substep_f32(
-                        lv_table_ptr, lv_base, lx, t_start, dt, sqrt_dt, q_s, zc,
-                        inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
-                    )
+                        lx, step_j = _triton_platen_fwd_substep_f32(
+                            lv_table_ptr, lv_base, lx, t_start, dt, sqrt_dt, q_s, zc,
+                            eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
+                        )
+                        if SAVE_VIBRATO:
+                            j_lx = j_lx * step_j
+
+                    max_lx = tl.max(tl.where(mask_n, lx, -1.0e30), axis=0)
+                    ex_v = tl.where(mask_n, tl.exp(lx - max_lx), 0.0)
+                    mean_rep = tl.maximum(tl.sum(ex_v, axis=0) / float(n_rep), 1.0e-30)
+                    omega = ex_v / (float(n_rep) * mean_rep)
+                    lx = lx - (max_lx + tl.log(mean_rep))
                     if SAVE_VIBRATO:
-                        j_lx = j_lx * step_j
-
-                max_lx = tl.max(tl.where(mask_n, lx, -1.0e30), axis=0)
-                ex_v = tl.where(mask_n, tl.exp(lx - max_lx), 0.0)
-                mean_rep = tl.maximum(tl.sum(ex_v, axis=0) / float(n_rep), 1.0e-30)
-                omega = ex_v / (float(n_rep) * mean_rep)
-                lx = lx - (max_lx + tl.log(mean_rep))
-                if SAVE_VIBRATO:
-                    j_dev = j_lx - 1.0
-                    j_lx = 1.0 + (j_dev - tl.sum(tl.where(mask_n, omega * j_dev, 0.0), axis=0))
-                per_off = (m_cur * d_assets + d) * n_total + gid_n
-                tl.store(lx_period_ptr + per_off, lx, mask=mask_n)
-                if EMIT_PERF:
-                    fp_dm = tl.load(fwd_perf_f32_ptr + d * m_rem + m_cur)
-                    tl.store(perf_out_ptr + per_off, fp_dm * (ex_v / mean_rep), mask=mask_n)
+                        j_dev = tl.minimum(tl.maximum(j_lx, -6.0), 6.0) - 1.0
+                        j_lx = tl.minimum(tl.maximum(1.0 + (j_dev - tl.sum(tl.where(mask_n, omega * j_dev, 0.0), axis=0)), -6.0), 6.0)
+                    per_off = (m_cur * d_assets + d) * n_total + gid_n
+                    tl.store(lx_period_ptr + per_off, lx, mask=mask_n)
+                    if EMIT_PERF:
+                        fp_dm = tl.load(fwd_perf_f32_ptr + d * m_rem + m_cur)
+                        tl.store(perf_out_ptr + per_off, fp_dm * (ex_v / mean_rep), mask=mask_n)
         else:
             has_prev = period_idx > 0
             prev_period = tl.maximum(period_idx - 1, 0)
@@ -1815,7 +2202,7 @@ if _HAS_TRITON:
                     inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
                 )
                 if SAVE_VIBRATO:
-                    j_lx = j_lx * step_j
+                    j_lx = tl.minimum(tl.maximum(j_lx * step_j, -6.0), 6.0)
 
             per_off = (period_idx * d_assets + d) * n_total + gid_n
             tl.store(lx_period_ptr + per_off, lx, mask=mask_n)
@@ -1968,8 +2355,12 @@ if _HAS_TRITON:
         COMPUTE_LV_AAD: tl.constexpr,
         COMPUTE_CHOL_AAD: tl.constexpr,
         USE_Z_CORR: tl.constexpr = False,
+        zc_in=0.0,
+        HAS_ZC_IN: tl.constexpr = False,
     ):
-        if USE_Z_CORR:
+        if HAS_ZC_IN:
+            zc = zc_in
+        elif USE_Z_CORR:
             zc = tl.load(z_corr_ptr + (step_idx * d_assets + d) * n_total + gid_n, mask=mask_n, other=0.0)
         else:
             zc = tl.zeros((BLOCK_N,), dtype=tl.float32)
@@ -2021,16 +2412,16 @@ if _HAS_TRITON:
 
         if COMPUTE_LV_AAD:
             m_act = mask_n & (tl.abs(bar_xm) > 1e-24)
-            _triton_lv_cta_scatter_row_f32(
-                bar_lv_d_ptr, it0_0, it1_0, wt_0, iy0_0, iy1_0, wy_0, bar_lv0, N_y, m_act, 16
+            _triton_lv_direct_scatter_f32(
+                bar_lv_d_ptr, it0_0, it1_0, wt_0, iy0_0, iy1_0, wy_0, bar_lv0, N_y, m_act
             )
-            _triton_lv_cta_scatter_row3_f32(
+            _triton_lv_direct_scatter3_f32(
                 bar_lv_d_ptr,
                 it0_h, it1_h, wt_h,
                 iy0_h, iy1_h, wy_h, bar_lvh,
                 iy0_p, iy1_p, wy_p, bar_lvp,
                 iy0_m, iy1_m, wy_m, bar_lvm,
-                N_y, m_act, 16,
+                N_y, m_act,
             )
 
         bar_y = bar_lv0 * d0 + bar_lx_hat + bar_lx_p + bar_lx_m
@@ -2366,16 +2757,28 @@ if _HAS_TRITON:
         inv_dt_grid,
         d_assets,
         m_rem,
-        n_rep: tl.constexpr,
-        n_sub: tl.constexpr,
-        N_t: tl.constexpr,
-        N_y: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        cg_flags_ptr=None,
+        payoff_f64_ptr=None,
+        n_rep: tl.constexpr = 1024,
+        n_sub: tl.constexpr = 4,
+        N_t: tl.constexpr = 32,
+        N_y: tl.constexpr = 64,
+        BLOCK_N: tl.constexpr = 256,
         USE_Z_CORR: tl.constexpr = False,
+        USE_RT_FLAGS: tl.constexpr = False,
     ):
         pid_dr = tl.program_id(1)
         pid_r = pid_dr // d_assets
         d = pid_dr % d_assets
+        if USE_RT_FLAGS:
+            d_act = tl.load(cg_flags_ptr + 0)
+            m_act = tl.load(cg_flags_ptr + 1)
+            if d >= d_act:
+                return
+            eff_inv_dt = tl.load(payoff_f64_ptr + 17).to(tl.float32)
+        else:
+            m_act = m_rem
+            eff_inv_dt = inv_dt_grid
         n_replicates = tl.num_programs(1) // d_assets
         n_total = n_replicates * n_rep
         n_steps_tot = m_rem * n_sub
@@ -2393,105 +2796,106 @@ if _HAS_TRITON:
         bar_x = tl.zeros((BLOCK_N,), dtype=tl.float32)
         for rev_m in range(m_rem):
             p_cur = m_rem - 1 - rev_m
-            p_off = (p_cur * d_assets + d) * n_total + gid_n
-            bar_tot = tl.where(
-                mask_n, bar_x + tl.load(bar_lx_post_ptr + p_off, mask=mask_n, other=0.0), 0.0
-            )
-            lx_p = tl.load(lx_period_ptr + p_off, mask=mask_n, other=0.0)
-            omega = tl.where(mask_n, tl.exp(lx_p) / float(n_rep), 0.0)
-            omega_sum = tl.sum(bar_tot, axis=0)
-            bar_x = tl.where(mask_n, bar_tot - omega * omega_sum, 0.0)
-            tl.store(bar_lx_post_ptr + p_off, bar_x, mask=mask_n)
-
-            if p_cur > 0:
-                prev_m = p_cur - 1
-                lx_start = tl.load(
-                    lx_period_ptr + (prev_m * d_assets + d) * n_total + gid_n,
-                    mask=mask_n,
-                    other=0.0,
+            if p_cur < m_act:
+                p_off = (p_cur * d_assets + d) * n_total + gid_n
+                bar_tot = tl.where(
+                    mask_n, bar_x + tl.load(bar_lx_post_ptr + p_off, mask=mask_n, other=0.0), 0.0
                 )
-                if n_sub == 4:
-                    b_s = p_cur * 4
-                    ts0, dt0, sd0, qs0, zc0 = _triton_load_step_params_f32(
-                        sv_ptr, chol_ptr, t_prev_ptr, dt_sub_ptr, sqrt_dt_ptr, q_shift_mid_ptr,
-                        b_s + 0, d, d_assets, n_steps_tot, n_total, gid_n, BLOCK_N, mask_n, USE_Z_CORR,
+                lx_p = tl.load(lx_period_ptr + p_off, mask=mask_n, other=0.0)
+                omega = tl.where(mask_n, tl.exp(lx_p) / float(n_rep), 0.0)
+                omega_sum = tl.sum(bar_tot, axis=0)
+                bar_x = tl.where(mask_n, bar_tot - omega * omega_sum, 0.0)
+                tl.store(bar_lx_post_ptr + p_off, bar_x, mask=mask_n)
+
+                if p_cur > 0:
+                    prev_m = p_cur - 1
+                    lx_start = tl.load(
+                        lx_period_ptr + (prev_m * d_assets + d) * n_total + gid_n,
+                        mask=mask_n,
+                        other=0.0,
                     )
-                    lx_1, _sj0_p = _triton_platen_fwd_substep_f32(
-                        lv_table_ptr, lv_base, lx_start, ts0, dt0, sd0, qs0, zc0,
-                        inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
-                    )
-                    ts1, dt1, sd1, qs1, zc1 = _triton_load_step_params_f32(
-                        sv_ptr, chol_ptr, t_prev_ptr, dt_sub_ptr, sqrt_dt_ptr, q_shift_mid_ptr,
-                        b_s + 1, d, d_assets, n_steps_tot, n_total, gid_n, BLOCK_N, mask_n, USE_Z_CORR,
-                    )
-                    lx_2, _sj1_p = _triton_platen_fwd_substep_f32(
-                        lv_table_ptr, lv_base, lx_1, ts1, dt1, sd1, qs1, zc1,
-                        inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
-                    )
-                    ts2, dt2, sd2, qs2, zc2 = _triton_load_step_params_f32(
-                        sv_ptr, chol_ptr, t_prev_ptr, dt_sub_ptr, sqrt_dt_ptr, q_shift_mid_ptr,
-                        b_s + 2, d, d_assets, n_steps_tot, n_total, gid_n, BLOCK_N, mask_n, USE_Z_CORR,
-                    )
-                    lx_3, _sj2_p = _triton_platen_fwd_substep_f32(
-                        lv_table_ptr, lv_base, lx_2, ts2, dt2, sd2, qs2, zc2,
-                        inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
-                    )
-                    tm3 = tl.load(t_prev_ptr + b_s + 3)
-                    dt3 = tl.load(dt_sub_ptr + b_s + 3)
-                    sd3 = tl.load(sqrt_dt_ptr + b_s + 3)
-                    ts3 = tl.maximum(tm3 - 0.5 * dt3, 0.0)
-                    qs3 = tl.load(q_shift_mid_ptr + d * n_steps_tot + b_s + 3)
-                    bar_x, _by3 = _triton_platen_bwd_substep_f32(
-                        lv_table_ptr, lv_base, dummy_ptr, dummy_ptr, dummy_ptr,
-                        sv_ptr, chol_ptr, lx_3, bar_x, ts3, dt3, sd3, qs3, b_s + 3,
-                        d, d_assets, n_total, gid_n, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f,
-                        N_t, N_y, BLOCK_N, mask_n, False, False, False, 0, USE_Z_CORR, sv_ptr,
-                    )
-                    bar_x, _by2 = _triton_platen_bwd_substep_f32(
-                        lv_table_ptr, lv_base, dummy_ptr, dummy_ptr, dummy_ptr,
-                        sv_ptr, chol_ptr, lx_2, bar_x, ts2, dt2, sd2, qs2, b_s + 2,
-                        d, d_assets, n_total, gid_n, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f,
-                        N_t, N_y, BLOCK_N, mask_n, False, False, False, 0, USE_Z_CORR, sv_ptr,
-                    )
-                    bar_x, _by1 = _triton_platen_bwd_substep_f32(
-                        lv_table_ptr, lv_base, dummy_ptr, dummy_ptr, dummy_ptr,
-                        sv_ptr, chol_ptr, lx_1, bar_x, ts1, dt1, sd1, qs1, b_s + 1,
-                        d, d_assets, n_total, gid_n, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f,
-                        N_t, N_y, BLOCK_N, mask_n, False, False, False, 0, USE_Z_CORR, sv_ptr,
-                    )
-                    bar_x, _by0 = _triton_platen_bwd_substep_f32(
-                        lv_table_ptr, lv_base, dummy_ptr, dummy_ptr, dummy_ptr,
-                        sv_ptr, chol_ptr, lx_start, bar_x, ts0, dt0, sd0, qs0, b_s + 0,
-                        d, d_assets, n_total, gid_n, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f,
-                        N_t, N_y, BLOCK_N, mask_n, False, False, False, 0, USE_Z_CORR, sv_ptr,
-                    )
-                else:
-                    for rev_s in tl.static_range(n_sub):
-                        s = n_sub - 1 - rev_s
-                        lx_pre = lx_start
-                        for k in range(n_sub - 1):
-                            if k < s:
-                                k_idx = p_cur * n_sub + k
-                                tsk, dtk, sdk, qk, zck = _triton_load_step_params_f32(
-                                    sv_ptr, chol_ptr, t_prev_ptr, dt_sub_ptr, sqrt_dt_ptr, q_shift_mid_ptr,
-                                    k_idx, d, d_assets, n_steps_tot, n_total, gid_n, BLOCK_N, mask_n, USE_Z_CORR,
-                                )
-                                lx_pre, _sjk = _triton_platen_fwd_substep_f32(
-                                    lv_table_ptr, lv_base, lx_pre, tsk, dtk, sdk, qk, zck,
-                                    inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
-                                )
-                        step_idx = p_cur * n_sub + s
-                        t_mid = tl.load(t_prev_ptr + step_idx)
-                        dt = tl.load(dt_sub_ptr + step_idx)
-                        sqrt_dt = tl.load(sqrt_dt_ptr + step_idx)
-                        t_start = tl.maximum(t_mid - 0.5 * dt, 0.0)
-                        q_s = tl.load(q_shift_mid_ptr + d * n_steps_tot + step_idx)
-                        bar_x, _bys = _triton_platen_bwd_substep_f32(
+                    if n_sub == 4:
+                        b_s = p_cur * 4
+                        ts0, dt0, sd0, qs0, zc0 = _triton_load_step_params_f32(
+                            sv_ptr, chol_ptr, t_prev_ptr, dt_sub_ptr, sqrt_dt_ptr, q_shift_mid_ptr,
+                            b_s + 0, d, d_assets, n_steps_tot, n_total, gid_n, BLOCK_N, mask_n, USE_Z_CORR,
+                        )
+                        lx_1, _sj0_p = _triton_platen_fwd_substep_f32(
+                            lv_table_ptr, lv_base, lx_start, ts0, dt0, sd0, qs0, zc0,
+                            eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
+                        )
+                        ts1, dt1, sd1, qs1, zc1 = _triton_load_step_params_f32(
+                            sv_ptr, chol_ptr, t_prev_ptr, dt_sub_ptr, sqrt_dt_ptr, q_shift_mid_ptr,
+                            b_s + 1, d, d_assets, n_steps_tot, n_total, gid_n, BLOCK_N, mask_n, USE_Z_CORR,
+                        )
+                        lx_2, _sj1_p = _triton_platen_fwd_substep_f32(
+                            lv_table_ptr, lv_base, lx_1, ts1, dt1, sd1, qs1, zc1,
+                            eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
+                        )
+                        ts2, dt2, sd2, qs2, zc2 = _triton_load_step_params_f32(
+                            sv_ptr, chol_ptr, t_prev_ptr, dt_sub_ptr, sqrt_dt_ptr, q_shift_mid_ptr,
+                            b_s + 2, d, d_assets, n_steps_tot, n_total, gid_n, BLOCK_N, mask_n, USE_Z_CORR,
+                        )
+                        lx_3, _sj2_p = _triton_platen_fwd_substep_f32(
+                            lv_table_ptr, lv_base, lx_2, ts2, dt2, sd2, qs2, zc2,
+                            eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
+                        )
+                        tm3 = tl.load(t_prev_ptr + b_s + 3)
+                        dt3 = tl.load(dt_sub_ptr + b_s + 3)
+                        sd3 = tl.load(sqrt_dt_ptr + b_s + 3)
+                        ts3 = tl.maximum(tm3 - 0.5 * dt3, 0.0)
+                        qs3 = tl.load(q_shift_mid_ptr + d * n_steps_tot + b_s + 3)
+                        bar_x, _by3 = _triton_platen_bwd_substep_f32(
                             lv_table_ptr, lv_base, dummy_ptr, dummy_ptr, dummy_ptr,
-                            sv_ptr, chol_ptr, lx_pre, bar_x, t_start, dt, sqrt_dt, q_s, step_idx,
-                            d, d_assets, n_total, gid_n, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f,
+                            sv_ptr, chol_ptr, lx_3, bar_x, ts3, dt3, sd3, qs3, b_s + 3,
+                            d, d_assets, n_total, gid_n, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f,
                             N_t, N_y, BLOCK_N, mask_n, False, False, False, 0, USE_Z_CORR, sv_ptr,
                         )
+                        bar_x, _by2 = _triton_platen_bwd_substep_f32(
+                            lv_table_ptr, lv_base, dummy_ptr, dummy_ptr, dummy_ptr,
+                            sv_ptr, chol_ptr, lx_2, bar_x, ts2, dt2, sd2, qs2, b_s + 2,
+                            d, d_assets, n_total, gid_n, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f,
+                            N_t, N_y, BLOCK_N, mask_n, False, False, False, 0, USE_Z_CORR, sv_ptr,
+                        )
+                        bar_x, _by1 = _triton_platen_bwd_substep_f32(
+                            lv_table_ptr, lv_base, dummy_ptr, dummy_ptr, dummy_ptr,
+                            sv_ptr, chol_ptr, lx_1, bar_x, ts1, dt1, sd1, qs1, b_s + 1,
+                            d, d_assets, n_total, gid_n, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f,
+                            N_t, N_y, BLOCK_N, mask_n, False, False, False, 0, USE_Z_CORR, sv_ptr,
+                        )
+                        bar_x, _by0 = _triton_platen_bwd_substep_f32(
+                            lv_table_ptr, lv_base, dummy_ptr, dummy_ptr, dummy_ptr,
+                            sv_ptr, chol_ptr, lx_start, bar_x, ts0, dt0, sd0, qs0, b_s + 0,
+                            d, d_assets, n_total, gid_n, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f,
+                            N_t, N_y, BLOCK_N, mask_n, False, False, False, 0, USE_Z_CORR, sv_ptr,
+                        )
+                    else:
+                        for rev_s in tl.static_range(n_sub):
+                            s = n_sub - 1 - rev_s
+                            lx_pre = lx_start
+                            for k in range(n_sub - 1):
+                                if k < s:
+                                    k_idx = p_cur * n_sub + k
+                                    tsk, dtk, sdk, qk, zck = _triton_load_step_params_f32(
+                                        sv_ptr, chol_ptr, t_prev_ptr, dt_sub_ptr, sqrt_dt_ptr, q_shift_mid_ptr,
+                                        k_idx, d, d_assets, n_steps_tot, n_total, gid_n, BLOCK_N, mask_n, USE_Z_CORR,
+                                    )
+                                    lx_pre, _sjk = _triton_platen_fwd_substep_f32(
+                                        lv_table_ptr, lv_base, lx_pre, tsk, dtk, sdk, qk, zck,
+                                        eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
+                                    )
+                            step_idx = p_cur * n_sub + s
+                            t_mid = tl.load(t_prev_ptr + step_idx)
+                            dt = tl.load(dt_sub_ptr + step_idx)
+                            sqrt_dt = tl.load(sqrt_dt_ptr + step_idx)
+                            t_start = tl.maximum(t_mid - 0.5 * dt, 0.0)
+                            q_s = tl.load(q_shift_mid_ptr + d * n_steps_tot + step_idx)
+                            bar_x, _bys = _triton_platen_bwd_substep_f32(
+                                lv_table_ptr, lv_base, dummy_ptr, dummy_ptr, dummy_ptr,
+                                sv_ptr, chol_ptr, lx_pre, bar_x, t_start, dt, sqrt_dt, q_s, step_idx,
+                                d, d_assets, n_total, gid_n, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f,
+                                N_t, N_y, BLOCK_N, mask_n, False, False, False, 0, USE_Z_CORR, sv_ptr,
+                            )
 
     @triton.jit  # type: ignore[untyped-decorator]
     def _qmc_bwd_period_scatter_kernel(  # type: ignore[no-untyped-def]
@@ -2514,16 +2918,19 @@ if _HAS_TRITON:
         d_assets,
         m_rem,
         n_replicates,
-        n_rep: tl.constexpr,
-        n_sub: tl.constexpr,
-        N_t: tl.constexpr,
-        N_y: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        N_LV_SHARDS: tl.constexpr,
-        COMPUTE_LV_AAD: tl.constexpr,
-        COMPUTE_CHOL_AAD: tl.constexpr,
-        COMPUTE_Q_AAD: tl.constexpr,
+        cg_flags_ptr=None,
+        payoff_f64_ptr=None,
+        n_rep: tl.constexpr = 1024,
+        n_sub: tl.constexpr = 4,
+        N_t: tl.constexpr = 32,
+        N_y: tl.constexpr = 64,
+        BLOCK_N: tl.constexpr = 128,
+        N_LV_SHARDS: tl.constexpr = 1,
+        COMPUTE_LV_AAD: tl.constexpr = True,
+        COMPUTE_CHOL_AAD: tl.constexpr = True,
+        COMPUTE_Q_AAD: tl.constexpr = True,
         USE_Z_CORR: tl.constexpr = False,
+        USE_RT_FLAGS: tl.constexpr = False,
     ):
         pid_n = tl.program_id(0)
         pid_mrd = tl.program_id(1)
@@ -2533,6 +2940,14 @@ if _HAS_TRITON:
         rem = pid_mrd % rd_tot
         pid_r = rem // d_assets
         d = rem % d_assets
+        if USE_RT_FLAGS:
+            d_act = tl.load(cg_flags_ptr + 0)
+            m_act = tl.load(cg_flags_ptr + 1)
+            if (d >= d_act) | (p_cur >= m_act):
+                return
+            eff_inv_dt = tl.load(payoff_f64_ptr + 17).to(tl.float32)
+        else:
+            eff_inv_dt = inv_dt_grid
 
         offs_rep = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_n = offs_rep < n_rep
@@ -2556,8 +2971,10 @@ if _HAS_TRITON:
         lv_base = d * (N_t * N_y)
 
         _u_tp = n_tiles_p
-        _u_ns = N_LV_SHARDS
-        bar_step_base_ptr = bar_step_shard_ptr + d * (N_t * N_y)
+        n_mr = m_rem * n_replicates
+        mr_idx = pid_mrd // d_assets
+        shard_id = ((pid_n * n_mr + mr_idx) % N_LV_SHARDS) if N_LV_SHARDS > 1 else 0
+        bar_step_base_ptr = bar_step_shard_ptr + (shard_id * d_assets + d) * (N_t * N_y)
         z_load_ptr = z_corr_ptr if USE_Z_CORR else sv_ptr
 
         has_prev = p_cur > 0
@@ -2576,7 +2993,7 @@ if _HAS_TRITON:
             )
             lx_1, _sj0_sc = _triton_platen_fwd_substep_f32(
                 lv_table_ptr, lv_base, lx_start, ts0, dt0, sd0, qs0, zc0,
-                inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
+                eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
             )
             ts1, dt1, sd1, qs1, zc1 = _triton_load_step_params_f32(
                 z_load_ptr, chol_ptr, t_prev_ptr, dt_sub_ptr, sqrt_dt_ptr, q_shift_mid_ptr,
@@ -2584,7 +3001,7 @@ if _HAS_TRITON:
             )
             lx_2, _sj1_sc = _triton_platen_fwd_substep_f32(
                 lv_table_ptr, lv_base, lx_1, ts1, dt1, sd1, qs1, zc1,
-                inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
+                eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
             )
             ts2, dt2, sd2, qs2, zc2 = _triton_load_step_params_f32(
                 z_load_ptr, chol_ptr, t_prev_ptr, dt_sub_ptr, sqrt_dt_ptr, q_shift_mid_ptr,
@@ -2592,7 +3009,7 @@ if _HAS_TRITON:
             )
             lx_3, _sj2_sc = _triton_platen_fwd_substep_f32(
                 lv_table_ptr, lv_base, lx_2, ts2, dt2, sd2, qs2, zc2,
-                inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
+                eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
             )
             tm3 = tl.load(t_prev_ptr + b_s + 3)
             dt3 = tl.load(dt_sub_ptr + b_s + 3)
@@ -2602,7 +3019,7 @@ if _HAS_TRITON:
             bar_x, bar_y3 = _triton_platen_bwd_substep_step_f32(
                 lv_table_ptr, lv_base, bar_step_base_ptr, bar_zc_ptr,
                 sv_ptr, z_corr_ptr, chol_ptr, lx_3, bar_x, ts3, dt3, sd3, qs3, b_s + 3,
-                d, d_assets, n_total, gid_n, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f,
+                d, d_assets, n_total, gid_n, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f,
                 N_t, N_y, BLOCK_N, mask_n, COMPUTE_LV_AAD, COMPUTE_CHOL_AAD, USE_Z_CORR,
             )
             if COMPUTE_Q_AAD:
@@ -2610,24 +3027,24 @@ if _HAS_TRITON:
             bar_x, bar_y2 = _triton_platen_bwd_substep_step_f32(
                 lv_table_ptr, lv_base, bar_step_base_ptr, bar_zc_ptr,
                 sv_ptr, z_corr_ptr, chol_ptr, lx_2, bar_x, ts2, dt2, sd2, qs2, b_s + 2,
-                d, d_assets, n_total, gid_n, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f,
-                N_t, N_y, BLOCK_N, mask_n, COMPUTE_LV_AAD, COMPUTE_CHOL_AAD, USE_Z_CORR,
+                d, d_assets, n_total, gid_n, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f,
+                N_t, N_y, BLOCK_N, mask_n, COMPUTE_LV_AAD, COMPUTE_CHOL_AAD, USE_Z_CORR, zc2, True,
             )
             if COMPUTE_Q_AAD:
                 tl.atomic_add(bar_q_shift_ptr + d * n_steps_tot + b_s + 2, tl.sum(bar_y2, axis=0), sem="relaxed")
             bar_x, bar_y1 = _triton_platen_bwd_substep_step_f32(
                 lv_table_ptr, lv_base, bar_step_base_ptr, bar_zc_ptr,
                 sv_ptr, z_corr_ptr, chol_ptr, lx_1, bar_x, ts1, dt1, sd1, qs1, b_s + 1,
-                d, d_assets, n_total, gid_n, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f,
-                N_t, N_y, BLOCK_N, mask_n, COMPUTE_LV_AAD, COMPUTE_CHOL_AAD, USE_Z_CORR,
+                d, d_assets, n_total, gid_n, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f,
+                N_t, N_y, BLOCK_N, mask_n, COMPUTE_LV_AAD, COMPUTE_CHOL_AAD, USE_Z_CORR, zc1, True,
             )
             if COMPUTE_Q_AAD:
                 tl.atomic_add(bar_q_shift_ptr + d * n_steps_tot + b_s + 1, tl.sum(bar_y1, axis=0), sem="relaxed")
             bar_x, bar_y0 = _triton_platen_bwd_substep_step_f32(
                 lv_table_ptr, lv_base, bar_step_base_ptr, bar_zc_ptr,
                 sv_ptr, z_corr_ptr, chol_ptr, lx_start, bar_x, ts0, dt0, sd0, qs0, b_s + 0,
-                d, d_assets, n_total, gid_n, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f,
-                N_t, N_y, BLOCK_N, mask_n, COMPUTE_LV_AAD, COMPUTE_CHOL_AAD, USE_Z_CORR,
+                d, d_assets, n_total, gid_n, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f,
+                N_t, N_y, BLOCK_N, mask_n, COMPUTE_LV_AAD, COMPUTE_CHOL_AAD, USE_Z_CORR, zc0, True,
             )
             if COMPUTE_Q_AAD:
                 tl.atomic_add(bar_q_shift_ptr + d * n_steps_tot + b_s + 0, tl.sum(bar_y0, axis=0), sem="relaxed")
@@ -2644,7 +3061,7 @@ if _HAS_TRITON:
                         )
                         lx_pre, _sjk_sc = _triton_platen_fwd_substep_f32(
                             lv_table_ptr, lv_base, lx_pre, tsk, dtk, sdk, qk, zck,
-                            inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
+                            eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f, N_t, N_y, mask_n,
                         )
                 step_idx = p_cur * n_sub + s
                 t_mid = tl.load(t_prev_ptr + step_idx)
@@ -2655,7 +3072,7 @@ if _HAS_TRITON:
                 bar_x, bar_y = _triton_platen_bwd_substep_step_f32(
                     lv_table_ptr, lv_base, bar_step_base_ptr, bar_zc_ptr,
                     sv_ptr, z_corr_ptr, chol_ptr, lx_pre, bar_x, t_start, dt, sqrt_dt, q_s, step_idx,
-                    d, d_assets, n_total, gid_n, inv_dt_grid, y_min_d, inv_dy_d, max_t_f, max_y_f,
+                    d, d_assets, n_total, gid_n, eff_inv_dt, y_min_d, inv_dy_d, max_t_f, max_y_f,
                     N_t, N_y, BLOCK_N, mask_n, COMPUTE_LV_AAD, COMPUTE_CHOL_AAD, USE_Z_CORR,
                 )
                 if COMPUTE_Q_AAD:
@@ -2892,16 +3309,18 @@ if _HAS_TRITON:
         b_sz,
         m_total,
         d_z_stride,
-        z_mode: tl.constexpr,
-        n_rep: tl.constexpr,
-        n_sub: tl.constexpr,
-        N_t: tl.constexpr,
-        N_y: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        cg_th_flags_ptr=None,
+        z_mode: tl.constexpr = 2,
+        n_rep: tl.constexpr = 1024,
+        n_sub: tl.constexpr = 4,
+        N_t: tl.constexpr = 32,
+        N_y: tl.constexpr = 64,
+        BLOCK_N: tl.constexpr = 1024,
         Z_LAYOUT_MDN: tl.constexpr = False,
         HAS_FWD_SCALE: tl.constexpr = False,
         OUT_MDN: tl.constexpr = False,
         OUT_F32: tl.constexpr = False,
+        USE_TH_RT_FLAGS: tl.constexpr = False,
     ):
         pid_br = tl.program_id(1)
         n_replicates = tl.num_programs(1) // b_sz
@@ -2923,6 +3342,16 @@ if _HAS_TRITON:
             lv_idx = 0 if z_mode == 1 else b
             r_idx = 0
             z_idx = b if z_mode == 1 else 0
+        if USE_TH_RT_FLAGS:
+            if tl.load(cg_th_flags_ptr + 16) == 0:
+                return
+            if lv_idx >= tl.load(cg_th_flags_ptr + 0):
+                return
+            m_loop_n = tl.load(cg_th_flags_ptr + 1)
+            k_cross_rt = tl.load(cg_th_flags_ptr + 23)
+        else:
+            m_loop_n = m_total
+            k_cross_rt = 0
         t_set = tl.load(meta_tset_ptr + b) if meta_tset_ptr is not None else 0
         y_idx = r_idx if z_mode == 2 else lv_idx
         y_min = tl.load(y_min_vec_ptr + y_idx).to(tl.float32)
@@ -2936,7 +3365,7 @@ if _HAS_TRITON:
         t_prev = tl.zeros((), dtype=tl.float32)
         rt_prev = tl.zeros((), dtype=tl.float32)
         rn_prev = tl.zeros((), dtype=tl.float32)
-        for m_cur in range(m_total):
+        for m_cur in range(m_loop_n):
             t_cur = tl.load(tau_obs_ptr + tau_off + m_cur).to(tl.float32)
             rt_cur = tl.load(r_tot_obs_ptr + r_off + m_cur).to(tl.float32)
             rn_cur = tl.load(r_native_obs_ptr + r_off + m_cur).to(tl.float32)
@@ -2952,12 +3381,13 @@ if _HAS_TRITON:
                 t_start = t_prev + alpha_0 * d_tau
                 q_s = (rt_prev + alpha_s * drt) - (rn_prev + alpha_s * drn)
 
+                m_z = m_cur + k_cross_rt
                 if z_mode == 0:
-                    z_off = (m_cur * n_sub + s) * n_total + gid_n
+                    z_off = (m_z * n_sub + s) * n_total + gid_n
                 elif Z_LAYOUT_MDN:
-                    z_off = ((m_cur * n_sub + s) * d_z_stride + z_idx) * n_total + gid_n
+                    z_off = ((m_z * n_sub + s) * d_z_stride + z_idx) * n_total + gid_n
                 else:
-                    z_off = ((z_idx * m_total + m_cur) * n_sub + s) * n_total + gid_n
+                    z_off = ((z_idx * m_total + m_z) * n_sub + s) * n_total + gid_n
                 zc = tl.load(z_corr_ptr + z_off, mask=mask_n, other=0.0)
 
                 lx, _ = _triton_platen_fwd_substep_f32(
@@ -3116,6 +3546,42 @@ if _HAS_TRITON:
             return tl.where(d_assets > 1, max2, max1)
         return min1
 
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _eval_index_tile_012_helper(  # type: ignore[no-untyped-def]
+        perf_base_ptr,
+        m_off,
+        pa,
+        pb,
+        aa,
+        bb,
+        has_a,
+        has_b,
+        scale_row_ptr,
+        has_sc,
+        offs_n,
+        mask_n,
+        d_act,
+        n_total,
+        D_PAD: tl.constexpr = 8,
+        DTYPE: tl.constexpr = tl.float64,
+    ):
+        big_v: tl.constexpr = 1e30 if DTYPE == tl.float32 else 1e300
+        min1 = tl.full(offs_n.shape, big_v, dtype=DTYPE)
+        max1 = tl.full(offs_n.shape, -big_v, dtype=DTYPE)
+        s1 = tl.zeros(offs_n.shape, dtype=DTYPE)
+        for d in tl.static_range(D_PAD):
+            if d < d_act:
+                p_raw = tl.load(perf_base_ptr + (m_off + d) * n_total + offs_n, mask=mask_n, other=1.0).to(DTYPE)
+                p_d = tl.where(has_a & (d == aa), pa.to(DTYPE), tl.where(has_b & (d == bb), pb.to(DTYPE), p_raw))
+                if scale_row_ptr is not None:
+                    sc_d = tl.load(scale_row_ptr + m_off + d, mask=has_sc, other=1.0).to(DTYPE)
+                    p_d = tl.where(has_sc, p_d * sc_d, p_d)
+                min1 = tl.minimum(min1, p_d)
+                max1 = tl.maximum(max1, p_d)
+                s1 = s1 + p_d
+        inv_d = 1.0 / tl.maximum(tl.zeros((), dtype=DTYPE) + d_act, 1.0)
+        return min1, max1, s1 * inv_d
+
     @triton.jit
     def _triton_c2_s5(t):  # type: ignore[no-untyped-def]
         u = tl.minimum(tl.maximum(t, 0.0), 1.0)
@@ -3159,18 +3625,19 @@ if _HAS_TRITON:
         m_rem,
         n_total,
         tile_start,
-        CALL_CODE: tl.constexpr,
-        CPN_CODE: tl.constexpr,
-        OPT_CODE: tl.constexpr,
-        HAS_KI: tl.constexpr,
-        IS_MEM: tl.constexpr,
-        IS_LONG: tl.constexpr,
-        NO_NOTIONAL: tl.constexpr,
-        FORCE_CPN_AC: tl.constexpr,
-        CPN_DIR_DOWN: tl.constexpr,
-        CPN_TYPE_OUT: tl.constexpr,
-        N_TILE: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        cg_flags_ptr=None,
+        CALL_CODE: tl.constexpr = 0,
+        CPN_CODE: tl.constexpr = 0,
+        OPT_CODE: tl.constexpr = 0,
+        HAS_KI: tl.constexpr = False,
+        IS_MEM: tl.constexpr = False,
+        IS_LONG: tl.constexpr = False,
+        NO_NOTIONAL: tl.constexpr = False,
+        FORCE_CPN_AC: tl.constexpr = False,
+        CPN_DIR_DOWN: tl.constexpr = False,
+        CPN_TYPE_OUT: tl.constexpr = False,
+        N_TILE: tl.constexpr = 128,
+        BLOCK_N: tl.constexpr = 128,
         IS_FULL_BATCH: tl.constexpr = False,
         HAS_ONE_STAR: tl.constexpr = False,
         HAS_LOWER_STRIKE: tl.constexpr = False,
@@ -3179,12 +3646,50 @@ if _HAS_TRITON:
         USE_FROZEN_TERM: tl.constexpr = False,
         HAS_EXT_KI: tl.constexpr = False,
         USE_F32_EVAL: tl.constexpr = False,
+        USE_RT_FLAGS: tl.constexpr = False,
+        D_PAD: tl.constexpr = 0,
+        CG_BUMPS_IDX: tl.constexpr = -1,
     ):
         pid_b = tl.program_id(0)
         pid_t = tl.program_id(1)
         n_t_tiles = tl.num_programs(1)
-        if pid_b >= n_bumps:
-            return
+        if USE_RT_FLAGS:
+            eff_nb = tl.load(cg_flags_ptr + CG_BUMPS_IDX) if CG_BUMPS_IDX >= 0 else n_bumps
+            if pid_b >= eff_nb:
+                return
+            d_act = tl.load(cg_flags_ptr + 0)
+            m_act = tl.load(cg_flags_ptr + 1)
+            rt_call = tl.load(cg_flags_ptr + 2)
+            rt_cpn = tl.load(cg_flags_ptr + 3)
+            rt_opt = tl.load(cg_flags_ptr + 4)
+            f_has_ki = tl.load(cg_flags_ptr + 5) != 0
+            f_has_os = tl.load(cg_flags_ptr + 7) != 0
+            f_is_mem = tl.load(cg_flags_ptr + 8) != 0
+            f_is_long = tl.load(cg_flags_ptr + 9) != 0
+            f_no_not = tl.load(cg_flags_ptr + 10) != 0
+            f_frc_cpn = tl.load(cg_flags_ptr + 11) != 0
+            f_cpn_dn = tl.load(cg_flags_ptr + 12) != 0
+            f_cpn_out = tl.load(cg_flags_ptr + 13) != 0
+            f_has_low = tl.load(cg_flags_ptr + 14) != 0
+            f_has_pc = tl.load(cg_flags_ptr + 15) != 0
+        else:
+            if pid_b >= n_bumps:
+                return
+            d_act = d_assets
+            m_act = m_rem
+            rt_call = CALL_CODE
+            rt_cpn = CPN_CODE
+            rt_opt = OPT_CODE
+            f_has_ki = HAS_KI
+            f_has_os = HAS_ONE_STAR
+            f_is_mem = IS_MEM
+            f_is_long = IS_LONG
+            f_no_not = NO_NOTIONAL
+            f_frc_cpn = FORCE_CPN_AC
+            f_cpn_dn = CPN_DIR_DOWN
+            f_cpn_out = CPN_TYPE_OUT
+            f_has_low = HAS_LOWER_STRIKE
+            f_has_pc = HAS_PART_CALL
         EVAL_DTYPE: tl.constexpr = tl.float32 if USE_F32_EVAL else tl.float64
         tiny_e = tl.zeros((), dtype=EVAL_DTYPE) + 1e-12
         ko_spread = tl.load(scalar_f64_ptr + 0).to(EVAL_DTYPE)
@@ -3239,12 +3744,12 @@ if _HAS_TRITON:
                 scale_row_ptr = scale_mat_ptr
 
         ia = tl.load(inv_lex_perm_ptr + 0).to(tl.int32)
-        ib_idx = tl.where(d_assets > 1, 1, 0)
+        ib_idx = tl.where(d_act > 1, 1, 0)
         ib = tl.load(inv_lex_perm_ptr + ib_idx).to(tl.int32)
-        eff_opt_code: tl.constexpr = 2 if IS_LONG else OPT_CODE
+        eff_opt_rt = tl.where(f_is_long, 2, rt_opt) if USE_RT_FLAGS else (2 if IS_LONG else OPT_CODE)
 
         hard_ko = tl.abs(ko_spread) <= 1e-6
-        eff_cpn_sp = -cpn_spread if CPN_DIR_DOWN else cpn_spread
+        eff_cpn_sp = tl.where(f_cpn_dn, -cpn_spread, cpn_spread) if USE_RT_FLAGS else (-cpn_spread if CPN_DIR_DOWN else cpn_spread)
         hard_cpn = tl.abs(eff_cpn_sp) <= 1e-6
         hard_ki = tl.abs(ki_spread) <= 1e-6
         blo_ki = tl.minimum(ki_barrier, ki_barrier + ki_spread)
@@ -3253,8 +3758,8 @@ if _HAS_TRITON:
         inv_w_ko = 1.0 / tl.maximum(tl.abs(ko_spread), tiny_e)
         inv_w_cp = 1.0 / tl.maximum(tl.abs(eff_cpn_sp), tiny_e)
         inv_os_eps = 1.0 / tl.maximum(one_star_eps, tiny_e)
-        has_one_star = one_star_strike > 0.0
-        has_part_call = (part_call_rate != 0.0) if HAS_PART_CALL else False
+        has_one_star = (f_has_os & (one_star_strike > 0.0)) if USE_RT_FLAGS else (one_star_strike > 0.0)
+        has_part_call = (f_has_pc & (part_call_rate != 0.0)) if USE_RT_FLAGS else ((part_call_rate != 0.0) if HAS_PART_CALL else False)
         inv_N = 1.0 / tl.maximum(tl.zeros((), dtype=tl.float64) + n_total, 1.0)
 
         n_subtiles: tl.constexpr = N_TILE // BLOCK_N
@@ -3262,9 +3767,10 @@ if _HAS_TRITON:
         zero_vec = tl.zeros((BLOCK_N,), dtype=EVAL_DTYPE)
         one_vec = tl.full((BLOCK_N,), 1.0, dtype=EVAL_DTYPE)
         zero_vec_f64 = tl.zeros((BLOCK_N,), dtype=tl.float64)
-        need_tail_opt: tl.constexpr = (eff_opt_code != CALL_CODE) and (eff_opt_code != CPN_CODE)
-        need_tail_best: tl.constexpr = HAS_ONE_STAR and (eff_opt_code != 1) and (CALL_CODE != 1)
-        m_pre_limit = m_rem - 1 if USE_FROZEN_TERM else m_rem
+        need_tail_opt: tl.constexpr = ((2 if IS_LONG else OPT_CODE) != CALL_CODE) and ((2 if IS_LONG else OPT_CODE) != CPN_CODE)
+        need_tail_best: tl.constexpr = HAS_ONE_STAR and ((2 if IS_LONG else OPT_CODE) != 1) and (CALL_CODE != 1)
+        m_pre_limit_rt = (m_act - 1) if USE_FROZEN_TERM else m_act
+        m_pre_loop: tl.constexpr = m_rem if USE_RT_FLAGS else (m_rem - 1 if USE_FROZEN_TERM else m_rem)
 
         for st in tl.static_range(n_subtiles):
             sub_start = eff_tile_start + st * BLOCK_N
@@ -3276,9 +3782,13 @@ if _HAS_TRITON:
             pv_path = zero_vec
             last_wc = zero_vec
             last_wcp = zero_vec
+            last_m1_rt = zero_vec
+            last_x1_rt = zero_vec
+            last_wa_rt = zero_vec
 
-            for m in range(m_pre_limit):
-                if tl.max(surv_prev, axis=0) > 1e-24:
+            for m in range(m_pre_loop):
+                m_ok = (m < m_pre_limit_rt) if USE_RT_FLAGS else True
+                if m_ok & (tl.max(surv_prev, axis=0) > 1e-24):
                     m_off = m * d_assets
                     if (not IS_FULL_BATCH) and (bump_perf_a_ptr is not None):
                         pa = tl.load(
@@ -3300,15 +3810,26 @@ if _HAS_TRITON:
                     is_call_m = tl.load(is_callable_ptr + m) > 0.5
                     is_guar_m = tl.load(is_guar_ptr + m) > 0.5
 
-                    w_call = _eval_index_tile_helper(
-                        p_src_ptr, m_off, pa, pb, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, CALL_CODE, EVAL_DTYPE
-                    )
-                    if CPN_CODE == CALL_CODE:
-                        w_cpn = w_call
-                    else:
-                        w_cpn = _eval_index_tile_helper(
-                            p_src_ptr, m_off, pa, pb, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, CPN_CODE, EVAL_DTYPE
+                    if USE_RT_FLAGS:
+                        m1_t, x1_t, wa_t = _eval_index_tile_012_helper(
+                            p_src_ptr, m_off, pa, pb, aa, bb, has_a, has_b, scale_row_ptr, has_sc, offs_n, mask_n, d_act, n_total, D_PAD, EVAL_DTYPE
                         )
+                        w_call = tl.where(rt_call == 0, m1_t, tl.where(rt_call == 1, x1_t, wa_t))
+                        w_cpn = tl.where(rt_cpn == 0, m1_t, tl.where(rt_cpn == 1, x1_t, wa_t))
+                        is_last_rt = m == (m_act - 1)
+                        last_m1_rt = tl.where(is_last_rt, m1_t, last_m1_rt)
+                        last_x1_rt = tl.where(is_last_rt, x1_t, last_x1_rt)
+                        last_wa_rt = tl.where(is_last_rt, wa_t, last_wa_rt)
+                    else:
+                        w_call = _eval_index_tile_helper(
+                            p_src_ptr, m_off, pa, pb, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, CALL_CODE, EVAL_DTYPE
+                        )
+                        if CPN_CODE == CALL_CODE:
+                            w_cpn = w_call
+                        else:
+                            w_cpn = _eval_index_tile_helper(
+                                p_src_ptr, m_off, pa, pb, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, CPN_CODE, EVAL_DTYPE
+                            )
 
                     b_ko = tl.load(ko_barriers_ptr + m).to(EVAL_DTYPE)
                     b_cp = tl.load(cpn_barriers_ptr + m).to(EVAL_DTYPE)
@@ -3324,11 +3845,15 @@ if _HAS_TRITON:
                         hi_cp_e = tl.where(hard_cpn, b_cp + 0.5 * eps_m, tl.maximum(b_cp, b_cp + eff_cpn_sp))
                         inv_cp_e = 1.0 / tl.maximum(hi_cp_e - lo_cp_e, tiny_e)
                         ramp_c2 = _triton_c2_s5((w_cpn - lo_cp_e) * inv_cp_e)
-                        hit_c2 = (1.0 - ramp_c2) if CPN_DIR_DOWN else ramp_c2
-                        ind_c2 = (1.0 - hit_c2) if CPN_TYPE_OUT else hit_c2
+                        if USE_RT_FLAGS:
+                            hit_c2 = tl.where(f_cpn_dn, 1.0 - ramp_c2, ramp_c2)
+                            ind_c2 = tl.where(f_cpn_out, 1.0 - hit_c2, hit_c2)
+                        else:
+                            hit_c2 = (1.0 - ramp_c2) if CPN_DIR_DOWN else ramp_c2
+                            ind_c2 = (1.0 - hit_c2) if CPN_TYPE_OUT else hit_c2
                         g_cpn = tl.where(is_guar_m, one_vec, ind_c2)
                     elif USE_C2_PRETERM:
-                        if m < m_rem - 1:
+                        if m < m_act - 1:
                             eps_m = tl.load(eps_vec_ptr + m).to(EVAL_DTYPE) if eps_vec_ptr is not None else (tl.zeros((), dtype=EVAL_DTYPE) + 0.02)
                             lo_ko_e = tl.where(hard_ko, b_ko - 0.5 * eps_m, tl.minimum(b_ko, b_ko + ko_spread))
                             hi_ko_e = tl.where(hard_ko, b_ko + 0.5 * eps_m, tl.maximum(b_ko, b_ko + ko_spread))
@@ -3340,8 +3865,12 @@ if _HAS_TRITON:
                             hi_cp_e = tl.where(hard_cpn, b_cp + 0.5 * eps_m, tl.maximum(b_cp, b_cp + eff_cpn_sp))
                             inv_cp_e = 1.0 / tl.maximum(hi_cp_e - lo_cp_e, tiny_e)
                             ramp_c2 = _triton_c2_s5((w_cpn - lo_cp_e) * inv_cp_e)
-                            hit_c2 = (1.0 - ramp_c2) if CPN_DIR_DOWN else ramp_c2
-                            ind_c2 = (1.0 - hit_c2) if CPN_TYPE_OUT else hit_c2
+                            if USE_RT_FLAGS:
+                                hit_c2 = tl.where(f_cpn_dn, 1.0 - ramp_c2, ramp_c2)
+                                ind_c2 = tl.where(f_cpn_out, 1.0 - hit_c2, hit_c2)
+                            else:
+                                hit_c2 = (1.0 - ramp_c2) if CPN_DIR_DOWN else ramp_c2
+                                ind_c2 = (1.0 - hit_c2) if CPN_TYPE_OUT else hit_c2
                             g_cpn = tl.where(is_guar_m, one_vec, ind_c2)
                         else:
                             blo_ko = tl.minimum(b_ko, b_ko + ko_spread)
@@ -3349,12 +3878,20 @@ if _HAS_TRITON:
                             g_ko_raw = tl.where(hard_ko, tl.where(w_call >= b_ko, one_vec, zero_vec), g_ko_ramp)
                             g_ko = tl.where(is_call_m, g_ko_raw, zero_vec)
 
-                            hit_dir = (w_cpn <= b_cp) if CPN_DIR_DOWN else (w_cpn >= b_cp)
-                            g_cpn_hard = tl.where(hit_dir, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
+                            if USE_RT_FLAGS:
+                                hit_dir = tl.where(f_cpn_dn, w_cpn <= b_cp, w_cpn >= b_cp)
+                                g_cpn_hard = tl.where(f_cpn_out, tl.where(hit_dir, zero_vec, one_vec), tl.where(hit_dir, one_vec, zero_vec))
+                            else:
+                                hit_dir = (w_cpn <= b_cp) if CPN_DIR_DOWN else (w_cpn >= b_cp)
+                                g_cpn_hard = tl.where(hit_dir, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
                             blo_cp = tl.minimum(b_cp, b_cp + eff_cpn_sp)
                             ramp_up = tl.minimum(tl.maximum((w_cpn - blo_cp) * inv_w_cp, zero_vec), one_vec)
-                            hit_g = (1.0 - ramp_up) if CPN_DIR_DOWN else ramp_up
-                            g_cpn_soft = (1.0 - hit_g) if CPN_TYPE_OUT else hit_g
+                            if USE_RT_FLAGS:
+                                hit_g = tl.where(f_cpn_dn, 1.0 - ramp_up, ramp_up)
+                                g_cpn_soft = tl.where(f_cpn_out, 1.0 - hit_g, hit_g)
+                            else:
+                                hit_g = (1.0 - ramp_up) if CPN_DIR_DOWN else ramp_up
+                                g_cpn_soft = (1.0 - hit_g) if CPN_TYPE_OUT else hit_g
                             g_cpn_raw = tl.where(hard_cpn, g_cpn_hard, g_cpn_soft)
                             g_cpn = tl.where(is_guar_m, one_vec, g_cpn_raw)
                     else:
@@ -3363,19 +3900,31 @@ if _HAS_TRITON:
                         g_ko_raw = tl.where(hard_ko, tl.where(w_call >= b_ko, one_vec, zero_vec), g_ko_ramp)
                         g_ko = tl.where(is_call_m, g_ko_raw, zero_vec)
 
-                        hit_dir = (w_cpn <= b_cp) if CPN_DIR_DOWN else (w_cpn >= b_cp)
-                        g_cpn_hard = tl.where(hit_dir, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
+                        if USE_RT_FLAGS:
+                            hit_dir = tl.where(f_cpn_dn, w_cpn <= b_cp, w_cpn >= b_cp)
+                            g_cpn_hard = tl.where(f_cpn_out, tl.where(hit_dir, zero_vec, one_vec), tl.where(hit_dir, one_vec, zero_vec))
+                        else:
+                            hit_dir = (w_cpn <= b_cp) if CPN_DIR_DOWN else (w_cpn >= b_cp)
+                            g_cpn_hard = tl.where(hit_dir, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
                         blo_cp = tl.minimum(b_cp, b_cp + eff_cpn_sp)
                         ramp_up = tl.minimum(tl.maximum((w_cpn - blo_cp) * inv_w_cp, zero_vec), one_vec)
-                        hit_g = (1.0 - ramp_up) if CPN_DIR_DOWN else ramp_up
-                        g_cpn_soft = (1.0 - hit_g) if CPN_TYPE_OUT else hit_g
+                        if USE_RT_FLAGS:
+                            hit_g = tl.where(f_cpn_dn, 1.0 - ramp_up, ramp_up)
+                            g_cpn_soft = tl.where(f_cpn_out, 1.0 - hit_g, hit_g)
+                        else:
+                            hit_g = (1.0 - ramp_up) if CPN_DIR_DOWN else ramp_up
+                            g_cpn_soft = (1.0 - hit_g) if CPN_TYPE_OUT else hit_g
                         g_cpn_raw = tl.where(hard_cpn, g_cpn_hard, g_cpn_soft)
                         g_cpn = tl.where(is_guar_m, one_vec, g_cpn_raw)
 
-                    eff_g_cpn = tl.maximum(g_cpn, g_ko) if FORCE_CPN_AC else g_cpn
+                    eff_g_cpn = (tl.where(f_frc_cpn, tl.maximum(g_cpn, g_ko), g_cpn) if USE_RT_FLAGS else (tl.maximum(g_cpn, g_ko) if FORCE_CPN_AC else g_cpn))
                     c_rate = tl.load(cpn_rates_ptr + m).to(EVAL_DTYPE)
                     p_m = surv_prev * g_ko
-                    if IS_MEM:
+                    if USE_RT_FLAGS:
+                        eff_c = tl.where(f_is_mem, c_rate + c_mem, zero_vec + c_rate)
+                        cpn_path = surv_prev * eff_g_cpn * eff_c + p_m * ac_cpn
+                        c_mem = tl.where(f_is_mem, surv_prev * eff_c * (1.0 - eff_g_cpn), c_mem)
+                    elif IS_MEM:
                         eff_c = c_rate + c_mem
                         cpn_path = surv_prev * eff_g_cpn * eff_c + p_m * ac_cpn
                         c_mem = surv_prev * eff_c * (1.0 - eff_g_cpn)
@@ -3383,7 +3932,9 @@ if _HAS_TRITON:
                         cpn_path = surv_prev * eff_g_cpn * c_rate + p_m * ac_cpn
 
                     df_m = tl.load(df_pay_mat_ptr + df_row * m_rem + m).to(EVAL_DTYPE)
-                    if NO_NOTIONAL:
+                    if USE_RT_FLAGS:
+                        pv_path = pv_path + df_m * tl.where(f_no_not, cpn_path, p_m + cpn_path)
+                    elif NO_NOTIONAL:
                         pv_path = pv_path + df_m * cpn_path
                     else:
                         pv_path = pv_path + df_m * (p_m + cpn_path)
@@ -3395,7 +3946,7 @@ if _HAS_TRITON:
                     last_wc = w_call
                     last_wcp = w_cpn
 
-            m_last = m_rem - 1
+            m_last = m_act - 1
             df_last = tl.load(df_pay_mat_ptr + df_row * m_rem + m_last).to(EVAL_DTYPE)
             if USE_FROZEN_TERM:
                 if tl.max(surv_prev, axis=0) > 1e-24:
@@ -3403,73 +3954,87 @@ if _HAS_TRITON:
                     egc_f = tl.load(frozen_term_ptr + 1 * n_total + offs_n, mask=mask_n, other=0.0).to(EVAL_DTYPE)
                     opt_f = tl.load(frozen_term_ptr + 2 * n_total + offs_n, mask=mask_n, other=0.0).to(EVAL_DTYPE)
                     c_last = tl.load(cpn_rates_ptr + m_last).to(EVAL_DTYPE)
-                    eff_c_last = (c_last + c_mem) if IS_MEM else (zero_vec + c_last)
+                    eff_c_last = (tl.where(f_is_mem, c_last + c_mem, zero_vec + c_last) if USE_RT_FLAGS else ((c_last + c_mem) if IS_MEM else (zero_vec + c_last)))
                     pm_last = surv_prev * gk_f
                     cpn_last = surv_prev * egc_f * eff_c_last + pm_last * ac_cpn
                     surv_end = tl.maximum(surv_prev - pm_last, zero_vec)
                     if w_fund_mat_ptr is not None:
                         wf_last = tl.load(w_fund_mat_ptr + wf_row * m_rem + m_last).to(EVAL_DTYPE)
                         pv_path = pv_path - wf_last * surv_prev
-                    term_pay = (pm_last + cpn_last + surv_end * (1.0 + opt_f)) if not NO_NOTIONAL else (cpn_last + surv_end * opt_f)
+                    term_pay = (tl.where(f_no_not, cpn_last + surv_end * opt_f, pm_last + cpn_last + surv_end * (1.0 + opt_f)) if USE_RT_FLAGS else ((pm_last + cpn_last + surv_end * (1.0 + opt_f)) if not NO_NOTIONAL else (cpn_last + surv_end * opt_f)))
                     pv_path = pv_path + df_last * term_pay
             else:
-                if need_tail_opt or need_tail_best:
-                    m_off_last = m_last * d_assets
-                    if (not IS_FULL_BATCH) and (bump_perf_a_ptr is not None):
-                        pa_last = tl.load(
-                            bump_perf_a_ptr + (a_slot * m_rem + m_last) * n_total + offs_n,
-                            mask=mask_n & has_a,
-                            other=1.0,
-                        ).to(EVAL_DTYPE)
+                if USE_RT_FLAGS:
+                    last_avg = last_wa_rt
+                    last_wo = tl.where(f_is_long, last_m1_rt, tl.where(eff_opt_rt == 0, last_m1_rt, tl.where(eff_opt_rt == 1, last_x1_rt, last_wa_rt)))
+                    last_wb = tl.where(f_has_os, last_x1_rt, zero_vec)
+                else:
+                    if need_tail_opt or need_tail_best:
+                        m_off_last = m_last * d_assets
+                        if (not IS_FULL_BATCH) and (bump_perf_a_ptr is not None):
+                            pa_last = tl.load(
+                                bump_perf_a_ptr + (a_slot * m_rem + m_last) * n_total + offs_n,
+                                mask=mask_n & has_a,
+                                other=1.0,
+                            ).to(EVAL_DTYPE)
+                        else:
+                            pa_last = zero_vec
+                        if (not IS_FULL_BATCH) and (bump_perf_b_ptr is not None):
+                            pb_last = tl.load(
+                                bump_perf_b_ptr + (b_slot * m_rem + m_last) * n_total + offs_n,
+                                mask=mask_n & has_b,
+                                other=1.0,
+                            ).to(EVAL_DTYPE)
+                        else:
+                            pb_last = zero_vec
                     else:
+                        m_off_last = 0
                         pa_last = zero_vec
-                    if (not IS_FULL_BATCH) and (bump_perf_b_ptr is not None):
-                        pb_last = tl.load(
-                            bump_perf_b_ptr + (b_slot * m_rem + m_last) * n_total + offs_n,
-                            mask=mask_n & has_b,
-                            other=1.0,
-                        ).to(EVAL_DTYPE)
-                    else:
                         pb_last = zero_vec
-                else:
-                    m_off_last = 0
-                    pa_last = zero_vec
-                    pb_last = zero_vec
 
-                if IS_LONG:
-                    last_avg = last_wc if CALL_CODE == 2 else (
-                        last_wcp if CPN_CODE == 2 else _eval_index_tile_helper(
-                            p_src_ptr, m_off_last, pa_last, pb_last, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, 2, EVAL_DTYPE
+                    if IS_LONG:
+                        last_avg = last_wc if CALL_CODE == 2 else (
+                            last_wcp if CPN_CODE == 2 else _eval_index_tile_helper(
+                                p_src_ptr, m_off_last, pa_last, pb_last, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, 2, EVAL_DTYPE
+                            )
                         )
-                    )
-                    last_wo = last_wc if CALL_CODE == 0 else (
-                        last_wcp if CPN_CODE == 0 else _eval_index_tile_helper(
-                            p_src_ptr, m_off_last, pa_last, pb_last, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, 0, EVAL_DTYPE
+                        last_wo = last_wc if CALL_CODE == 0 else (
+                            last_wcp if CPN_CODE == 0 else _eval_index_tile_helper(
+                                p_src_ptr, m_off_last, pa_last, pb_last, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, 0, EVAL_DTYPE
+                            )
                         )
-                    )
-                else:
-                    last_avg = zero_vec
-                    if eff_opt_code == CALL_CODE:
-                        last_wo = last_wc
-                    elif eff_opt_code == CPN_CODE:
-                        last_wo = last_wcp
                     else:
-                        last_wo = _eval_index_tile_helper(
-                            p_src_ptr, m_off_last, pa_last, pb_last, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, eff_opt_code, EVAL_DTYPE
+                        last_avg = zero_vec
+                        if OPT_CODE == CALL_CODE:
+                            last_wo = last_wc
+                        elif OPT_CODE == CPN_CODE:
+                            last_wo = last_wcp
+                        else:
+                            last_wo = _eval_index_tile_helper(
+                                p_src_ptr, m_off_last, pa_last, pb_last, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, OPT_CODE, EVAL_DTYPE
+                            )
+                    if not HAS_ONE_STAR:
+                        last_wb = zero_vec
+                    elif (not IS_LONG) and (OPT_CODE == 1):
+                        last_wb = last_wo
+                    elif CALL_CODE == 1:
+                        last_wb = last_wc
+                    else:
+                        last_wb = _eval_index_tile_helper(
+                            p_src_ptr, m_off_last, pa_last, pb_last, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, 1, EVAL_DTYPE
                         )
-                if not HAS_ONE_STAR:
-                    last_wb = zero_vec
-                elif (not IS_LONG) and (eff_opt_code == 1):
-                    last_wb = last_wo
-                elif CALL_CODE == 1:
-                    last_wb = last_wc
-                else:
-                    last_wb = _eval_index_tile_helper(
-                        p_src_ptr, m_off_last, pa_last, pb_last, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, 1, EVAL_DTYPE
-                    )
 
                 if HAS_EXT_KI and (i_ki_ext_ptr is not None):
                     ki_gate = tl.load(i_ki_ext_ptr + offs_n, mask=mask_n, other=i_ki_past).to(EVAL_DTYPE)
+                elif USE_RT_FLAGS:
+                    b_ki_eff = tl.where(f_is_long, strike, ki_barrier)
+                    blo_klb = tl.minimum(b_ki_eff, b_ki_eff + ki_spread)
+                    bhi_klb = tl.maximum(b_ki_eff, b_ki_eff + ki_spread)
+                    inv_wklb = 1.0 / tl.maximum(bhi_klb - blo_klb, tiny_e)
+                    g_ki_hard = tl.where(last_wo < b_ki_eff, one_vec, zero_vec)
+                    g_ki_soft = tl.minimum(tl.maximum((bhi_klb - last_wo) * inv_wklb, zero_vec), one_vec)
+                    g_ki = tl.where(hard_ki, g_ki_hard, g_ki_soft)
+                    ki_gate = tl.where(f_has_ki, tl.maximum(i_ki_past, g_ki), one_vec)
                 elif HAS_KI:
                     if IS_LONG:
                         blo_klb = tl.minimum(strike, strike + ki_spread)
@@ -3491,7 +4056,15 @@ if _HAS_TRITON:
                 star_ind = tl.where(has_one_star, tl.where(one_star_eps <= 1e-6, star_hard, star_soft), zero_vec)
 
                 opt_val = zero_vec
-                if IS_LONG:
+                if USE_RT_FLAGS:
+                    opt_long = opt_val - (1.0 - last_avg) * ki_gate * (1.0 - star_ind)
+                    put_intr_low = tl.maximum(strike - last_wo, zero_vec) - tl.maximum(lower_strike - last_wo, zero_vec)
+                    put_intr_plain = tl.maximum(strike - last_wo, zero_vec)
+                    put_intr = tl.where(f_has_low, put_intr_low, put_intr_plain)
+                    put_mask = tl.where(f_has_low, (strike > lower_strike) & (option_gearing > 0.0), option_gearing > 0.0)
+                    opt_short = tl.where(put_mask, opt_val - option_gearing * ki_gate * (1.0 - star_ind) * put_intr, opt_val)
+                    opt_val = tl.where(f_is_long, opt_long, opt_short)
+                elif IS_LONG:
                     opt_val = opt_val - (1.0 - last_avg) * ki_gate * (1.0 - star_ind)
                 else:
                     if HAS_LOWER_STRIKE:
@@ -3506,7 +4079,9 @@ if _HAS_TRITON:
                 os_mask = has_one_star & (one_star_coupon != 0.0)
                 opt_val = tl.where(os_mask, opt_val + star_ind * one_star_coupon, opt_val)
 
-                if NO_NOTIONAL:
+                if USE_RT_FLAGS:
+                    pv_path = pv_path + df_last * tl.where(f_no_not, surv_prev * opt_val, surv_prev * (1.0 + opt_val))
+                elif NO_NOTIONAL:
                     pv_path = pv_path + df_last * (surv_prev * opt_val)
                 else:
                     pv_path = pv_path + df_last * (surv_prev * (1.0 + opt_val))
@@ -3711,6 +4286,36 @@ if _HAS_TRITON:
         return bp
 
     @triton.jit  # type: ignore[untyped-decorator]
+    def _eval_idx_base_stats_012_f64(  # type: ignore[no-untyped-def]
+        perf_ptr,
+        m_off,
+        offs_n,
+        mask_n,
+        d_act,
+        n_total,
+        D_PAD: tl.constexpr,
+        DTYPE: tl.constexpr = tl.float64,
+    ):
+        big_v: tl.constexpr = 1e30 if DTYPE == tl.float32 else 1e300
+        min1 = tl.full(offs_n.shape, big_v, dtype=DTYPE)
+        idx_min1 = tl.zeros(offs_n.shape, dtype=tl.int32)
+        max1 = tl.full(offs_n.shape, -big_v, dtype=DTYPE)
+        idx_max1 = tl.zeros(offs_n.shape, dtype=tl.int32)
+        s1 = tl.zeros(offs_n.shape, dtype=DTYPE)
+        for d in range(D_PAD):
+            if d < d_act:
+                pd = tl.load(perf_ptr + (m_off + d) * n_total + offs_n, mask=mask_n, other=1.0).to(DTYPE)
+                lt1 = pd < min1
+                min1 = tl.where(lt1, pd, min1)
+                idx_min1 = tl.where(lt1, d, idx_min1)
+                gt1 = pd > max1
+                max1 = tl.where(gt1, pd, max1)
+                idx_max1 = tl.where(gt1, d, idx_max1)
+                s1 = s1 + pd
+        inv_d = 1.0 / tl.maximum(tl.zeros((), dtype=DTYPE) + d_act, 1.0)
+        return min1, idx_min1, max1, idx_max1, s1 * inv_d, inv_d
+
+    @triton.jit  # type: ignore[untyped-decorator]
     def _payoff_aad_state_adjoints_f64_kernel(  # type: ignore[no-untyped-def]
         perf_ptr,
         ws_ptr,
@@ -3731,26 +4336,29 @@ if _HAS_TRITON:
         d_assets,
         m_rem,
         n_total,
-        n_rep: tl.constexpr,
-        blocks_per_rep: tl.constexpr,
-        CALL_CODE: tl.constexpr,
-        CPN_CODE: tl.constexpr,
-        EFF_OPT_CODE: tl.constexpr,
-        HAS_KI: tl.constexpr,
-        KI_ACTIVE: tl.constexpr,
-        HAS_ONE_STAR: tl.constexpr,
-        IS_MEM: tl.constexpr,
-        NO_NOTIONAL: tl.constexpr,
-        FORCE_CPN_AC: tl.constexpr,
-        CPN_DIR_DOWN: tl.constexpr,
-        CPN_TYPE_OUT: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        cg_flags_ptr=None,
+        n_rep: tl.constexpr = 1024,
+        blocks_per_rep: tl.constexpr = 1,
+        CALL_CODE: tl.constexpr = 0,
+        CPN_CODE: tl.constexpr = 0,
+        EFF_OPT_CODE: tl.constexpr = 0,
+        HAS_KI: tl.constexpr = False,
+        KI_ACTIVE: tl.constexpr = False,
+        HAS_ONE_STAR: tl.constexpr = False,
+        IS_MEM: tl.constexpr = False,
+        NO_NOTIONAL: tl.constexpr = False,
+        FORCE_CPN_AC: tl.constexpr = False,
+        CPN_DIR_DOWN: tl.constexpr = False,
+        CPN_TYPE_OUT: tl.constexpr = False,
+        BLOCK_N: tl.constexpr = 256,
         HAS_LOWER_STRIKE: tl.constexpr = True,
         HAS_PART_CALL: tl.constexpr = False,
         EMIT_STAGE1: tl.constexpr = False,
         HAS_EXT_KI: tl.constexpr = False,
         USE_F32_INNER: tl.constexpr = False,
         IS_LONG: tl.constexpr = False,
+        USE_RT_FLAGS: tl.constexpr = False,
+        D_PAD: tl.constexpr = 0,
     ):
         pid_n = tl.program_id(0)
         rep_id = pid_n // blocks_per_rep
@@ -3758,6 +4366,40 @@ if _HAS_TRITON:
         local_n = tile_in_rep * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_n = rep_id * n_rep + local_n
         mask_n = (local_n < n_rep) & (offs_n < n_total)
+        if USE_RT_FLAGS:
+            d_act = tl.load(cg_flags_ptr + 0)
+            m_act = tl.load(cg_flags_ptr + 1)
+            rt_call = tl.load(cg_flags_ptr + 2)
+            rt_cpn = tl.load(cg_flags_ptr + 3)
+            rt_opt = tl.load(cg_flags_ptr + 4)
+            f_has_ki = tl.load(cg_flags_ptr + 5) != 0
+            f_ki_act = tl.load(cg_flags_ptr + 6) != 0
+            f_has_os = tl.load(cg_flags_ptr + 7) != 0
+            f_is_mem = tl.load(cg_flags_ptr + 8) != 0
+            f_is_long = tl.load(cg_flags_ptr + 9) != 0
+            f_no_not = tl.load(cg_flags_ptr + 10) != 0
+            f_frc_cpn = tl.load(cg_flags_ptr + 11) != 0
+            f_cpn_dn = tl.load(cg_flags_ptr + 12) != 0
+            f_cpn_out = tl.load(cg_flags_ptr + 13) != 0
+            f_has_low = tl.load(cg_flags_ptr + 14) != 0
+            f_has_pc = tl.load(cg_flags_ptr + 15) != 0
+        else:
+            d_act = d_assets
+            m_act = m_rem
+            rt_call = CALL_CODE
+            rt_cpn = CPN_CODE
+            rt_opt = EFF_OPT_CODE
+            f_has_ki = HAS_KI
+            f_ki_act = KI_ACTIVE
+            f_has_os = HAS_ONE_STAR
+            f_is_mem = IS_MEM
+            f_is_long = IS_LONG
+            f_no_not = NO_NOTIONAL
+            f_frc_cpn = FORCE_CPN_AC
+            f_cpn_dn = CPN_DIR_DOWN
+            f_cpn_out = CPN_TYPE_OUT
+            f_has_low = HAS_LOWER_STRIKE
+            f_has_pc = HAS_PART_CALL
 
         INNER_DTYPE: tl.constexpr = tl.float32 if USE_F32_INNER else tl.float64
         tiny_i = tl.zeros((), dtype=INNER_DTYPE) + 1e-12
@@ -3778,7 +4420,7 @@ if _HAS_TRITON:
         one_star_coupon = tl.load(scalar_f64_ptr + 14).to(INNER_DTYPE)
 
         ia = tl.load(inv_perm_ptr + 0).to(tl.int32)
-        ib_idx = tl.where(d_assets > 1, 1, 0)
+        ib_idx = tl.where(d_act > 1, 1, 0)
         ib = tl.load(inv_perm_ptr + ib_idx).to(tl.int32)
 
         zero_vec = tl.zeros((BLOCK_N,), dtype=INNER_DTYPE)
@@ -3787,7 +4429,7 @@ if _HAS_TRITON:
         inv_rep_f64 = 1.0 / float(n_rep)
         scale = 1.0 / (tl.zeros((), dtype=INNER_DTYPE) + n_total)
         stride_mn = m_rem * n_total
-        inv_d_f = 1.0 / (tl.zeros((), dtype=INNER_DTYPE) + d_assets)
+        inv_d_f = 1.0 / tl.maximum(tl.zeros((), dtype=INNER_DTYPE) + d_act, 1.0)
 
         need_min1_k: tl.constexpr = (
             IS_LONG
@@ -3818,9 +4460,13 @@ if _HAS_TRITON:
         )
 
         hard_ko_sp = tl.abs(ko_spread) > 1e-6
-        eff_csp = -cpn_spread if CPN_DIR_DOWN else cpn_spread
+        eff_csp = tl.where(f_cpn_dn, -cpn_spread, cpn_spread) if USE_RT_FLAGS else (-cpn_spread if CPN_DIR_DOWN else cpn_spread)
         hard_cpn_sp = tl.abs(eff_csp) > 1e-6
-        sign_cpn: tl.constexpr = (-1.0 if CPN_DIR_DOWN else 1.0) * (-1.0 if CPN_TYPE_OUT else 1.0)
+        if USE_RT_FLAGS:
+            sign_cpn_rt = tl.where(f_cpn_dn, -1.0, 1.0) * tl.where(f_cpn_out, -1.0, 1.0)
+        else:
+            sign_cpn: tl.constexpr = (-1.0 if CPN_DIR_DOWN else 1.0) * (-1.0 if CPN_TYPE_OUT else 1.0)
+            sign_cpn_rt = tl.zeros((), dtype=INNER_DTYPE) + sign_cpn
         inv_w_ko_s1 = 1.0 / tl.maximum(tl.abs(ko_spread), tiny_i)
         inv_w_cp_s1 = 1.0 / tl.maximum(tl.abs(eff_csp), tiny_i)
 
@@ -3836,119 +4482,157 @@ if _HAS_TRITON:
         n_s1_cols = 3 * m_rem + 6
 
         for m in range(m_rem):
-            m_off = m * d_assets
-            min1, min2, min3, _, _, _, max1, max2, _, _, s1, s2, pa_r, pb_r = _eval_idx_base_stats_f64(
-                perf_ptr, m_off, ia, ib, offs_n, mask_n, d_assets, n_total,
-                need_min1_k or need_min2_k or need_min3_k,
-                need_min2_k,
-                need_min3_k,
-                need_max1_k or need_max2_k,
-                need_max2_k,
-                need_sum1_k or need_sum2_k,
-                need_sum2_k,
-                need_ratio_k,
-                INNER_DTYPE,
-            )
-            w_call = _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa_r, pb_r, inv_d_f, d_assets, CALL_CODE)
-            if CPN_CODE == CALL_CODE:
-                w_cpn = w_call
-            else:
-                w_cpn = _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa_r, pb_r, inv_d_f, d_assets, CPN_CODE)
-            if m == m_rem - 1:
-                last_wo_pre = min1 if IS_LONG else _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa_r, pb_r, inv_d_f, d_assets, EFF_OPT_CODE)
-                last_avg_pre = (s1 * inv_d_f) if IS_LONG else zero_vec
-                last_wb_pre = max1 if HAS_ONE_STAR else zero_vec
-
-            eps_m = tl.load(eps_vec_ptr + m).to(INNER_DTYPE)
-            half_eps = 0.5 * eps_m
-
-            b_ko = tl.load(ko_bar_ptr + m).to(INNER_DTYPE)
-            lo_ko = tl.where(hard_ko_sp, tl.minimum(b_ko, b_ko + ko_spread), b_ko - half_eps)
-            hi_ko = tl.where(hard_ko_sp, tl.maximum(b_ko, b_ko + ko_spread), b_ko + half_eps)
-            inv_w_ko = 1.0 / tl.maximum(hi_ko - lo_ko, tiny_i)
-            u_ko = (w_call - lo_ko) * inv_w_ko
-            g_ko_raw = tl.minimum(tl.maximum(u_ko, zero_vec), one_vec)
-            dgk_raw = tl.where((u_ko > 0.0) & (u_ko < 1.0), inv_w_ko, zero_vec)
-            is_call_m = tl.load(is_call_ptr + m) > 0.5
-            g_k = tl.where(is_call_m, g_ko_raw, zero_vec)
-            dgk = tl.where(is_call_m, dgk_raw, zero_vec)
-
-            b_cp = tl.load(cpn_bar_ptr + m).to(INNER_DTYPE)
-            lo_cp = tl.where(hard_cpn_sp, tl.minimum(b_cp, b_cp + eff_csp), b_cp - half_eps)
-            hi_cp = tl.where(hard_cpn_sp, tl.maximum(b_cp, b_cp + eff_csp), b_cp + half_eps)
-            inv_w_cp = 1.0 / tl.maximum(hi_cp - lo_cp, tiny_i)
-            u_cp = (w_cpn - lo_cp) * inv_w_cp
-            ramp_cp = tl.minimum(tl.maximum(u_cp, zero_vec), one_vec)
-            dramp_cp = tl.where((u_cp > 0.0) & (u_cp < 1.0), inv_w_cp, zero_vec)
-            hit_cp = (1.0 - ramp_cp) if CPN_DIR_DOWN else ramp_cp
-            ind_cp = (1.0 - hit_cp) if CPN_TYPE_OUT else hit_cp
-            is_guar_m = tl.load(is_guar_ptr + m) > 0.5
-            g_c_raw = tl.where(is_guar_m, one_vec, ind_cp)
-            dgc_raw = tl.where(is_guar_m, zero_vec, dramp_cp * sign_cpn)
-
-            if FORCE_CPN_AC:
-                eff_g_c = tl.maximum(g_c_raw, g_k)
-                w_c_max = tl.where(g_c_raw > g_k, one_vec, tl.where(g_c_raw < g_k, zero_vec, 0.5 * one_vec))
-                w_k_max = 1.0 - w_c_max
-            else:
-                eff_g_c = g_c_raw
-                w_c_max = one_vec
-                w_k_max = zero_vec
-
-            c_rate = tl.load(cpn_rates_ptr + m).to(INNER_DTYPE)
-            eff_c = (c_rate + c_mem) if IS_MEM else (zero_vec + c_rate)
-
-            mn_off = m * n_total + offs_n
-            tl.store(ws_ptr + 0 * stride_mn + mn_off, surv, mask=mask_n)
-            tl.store(ws_ptr + 1 * stride_mn + mn_off, g_k, mask=mask_n)
-            tl.store(ws_ptr + 2 * stride_mn + mn_off, eff_g_c, mask=mask_n)
-            tl.store(ws_ptr + 3 * stride_mn + mn_off, eff_c, mask=mask_n)
-            tl.store(ws_ptr + 4 * stride_mn + mn_off, dgk, mask=mask_n)
-            tl.store(ws_ptr + 5 * stride_mn + mn_off, w_c_max * dgc_raw, mask=mask_n)
-            tl.store(ws_ptr + 6 * stride_mn + mn_off, w_k_max * dgk, mask=mask_n)
-
-            if IS_MEM:
-                c_mem = surv * eff_c * (1.0 - eff_g_c)
-            surv = tl.maximum(surv - surv * g_k, zero_vec)
-
-            if EMIT_STAGE1 and (out_stage1_rep_ptr is not None):
-                gk_s1 = tl.where(
-                    is_call_m,
-                    tl.where(
-                        hard_ko_sp,
-                        tl.minimum(tl.maximum((w_call - tl.minimum(b_ko, b_ko + ko_spread)) * inv_w_ko_s1, zero_vec), one_vec),
-                        tl.where(w_call >= b_ko, one_vec, zero_vec),
-                    ),
-                    zero_vec,
-                )
-                hit_h_s1 = (w_cpn <= b_cp) if CPN_DIR_DOWN else (w_cpn >= b_cp)
-                gc_hard_s1 = tl.where(hit_h_s1, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
-                blo_cp_s1 = tl.minimum(b_cp, b_cp + eff_csp)
-                r_up_s1 = tl.minimum(tl.maximum((w_cpn - blo_cp_s1) * inv_w_cp_s1, zero_vec), one_vec)
-                hit_s1 = (1.0 - r_up_s1) if CPN_DIR_DOWN else r_up_s1
-                gc_soft_s1 = (1.0 - hit_s1) if CPN_TYPE_OUT else hit_s1
-                gc_s1 = tl.where(is_guar_m, one_vec, tl.where(hard_cpn_sp, gc_soft_s1, gc_hard_s1))
-                eff_gc_s1 = tl.maximum(gc_s1, gk_s1) if FORCE_CPN_AC else gc_s1
-                pm_s1 = surv_s1 * gk_s1
-                eff_c_s1 = (c_rate + c_mem_s1) if IS_MEM else (zero_vec + c_rate)
-                cpn_cf_s1 = surv_s1 * eff_gc_s1 * eff_c_s1 + pm_s1 * ac_cpn
-                if IS_MEM:
-                    c_mem_s1 = surv_s1 * eff_c_s1 * (1.0 - eff_gc_s1)
-                df_m_s1 = tl.load(df_pay_ptr + m).to(INNER_DTYPE)
-                wf_m_s1 = tl.load(w_fund_ptr + m).to(INNER_DTYPE) if w_fund_ptr is not None else (tl.zeros((), dtype=INNER_DTYPE))
-                if NO_NOTIONAL:
-                    pv_s1 = pv_s1 + df_m_s1 * cpn_cf_s1 - wf_m_s1 * surv_s1
+            m_ok_f = (m < m_act) if USE_RT_FLAGS else True
+            if m_ok_f:
+                m_off = m * d_assets
+                if USE_RT_FLAGS:
+                    min1, _, max1, _, w_avg_0, _ = _eval_idx_base_stats_012_f64(
+                        perf_ptr, m_off, offs_n, mask_n, d_act, n_total, D_PAD, INNER_DTYPE
+                    )
+                    w_call = tl.where(rt_call == 0, min1, tl.where(rt_call == 1, max1, w_avg_0))
+                    w_cpn = tl.where(rt_cpn == 0, min1, tl.where(rt_cpn == 1, max1, w_avg_0))
+                    is_last_f = m == (m_act - 1)
+                    wo_cand = tl.where(f_is_long, min1, tl.where(rt_opt == 0, min1, tl.where(rt_opt == 1, max1, w_avg_0)))
+                    last_wo_pre = tl.where(is_last_f, wo_cand, last_wo_pre)
+                    last_avg_pre = tl.where(is_last_f & f_is_long, w_avg_0, last_avg_pre)
+                    last_wb_pre = tl.where(is_last_f & f_has_os, max1, last_wb_pre)
                 else:
-                    pv_s1 = pv_s1 + df_m_s1 * (pm_s1 + cpn_cf_s1) - wf_m_s1 * surv_s1
-                p_stop_sum_r = tl.sum(tl.where(mask_n, pm_s1, zero_vec).to(tl.float64), axis=0) * inv_rep_f64
-                q_cpn_sum_r = tl.sum(tl.where(mask_n, surv_s1 * eff_gc_s1, zero_vec).to(tl.float64), axis=0) * inv_rep_f64
-                cpn_cf_sum_r = tl.sum(tl.where(mask_n, cpn_cf_s1, zero_vec).to(tl.float64), axis=0) * inv_rep_f64
-                tl.atomic_add(out_stage1_rep_ptr + rep_id * n_s1_cols + m, p_stop_sum_r)
-                tl.atomic_add(out_stage1_rep_ptr + rep_id * n_s1_cols + m_rem + m, q_cpn_sum_r)
-                tl.atomic_add(out_stage1_rep_ptr + rep_id * n_s1_cols + 2 * m_rem + m, cpn_cf_sum_r)
-                surv_s1 = tl.maximum(surv_s1 - pm_s1, zero_vec)
+                    min1, min2, min3, _, _, _, max1, max2, _, _, s1, s2, pa_r, pb_r = _eval_idx_base_stats_f64(
+                        perf_ptr, m_off, ia, ib, offs_n, mask_n, d_assets, n_total,
+                        need_min1_k or need_min2_k or need_min3_k,
+                        need_min2_k,
+                        need_min3_k,
+                        need_max1_k or need_max2_k,
+                        need_max2_k,
+                        need_sum1_k or need_sum2_k,
+                        need_sum2_k,
+                        need_ratio_k,
+                        INNER_DTYPE,
+                    )
+                    w_call = _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa_r, pb_r, inv_d_f, d_assets, CALL_CODE)
+                    if CPN_CODE == CALL_CODE:
+                        w_cpn = w_call
+                    else:
+                        w_cpn = _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa_r, pb_r, inv_d_f, d_assets, CPN_CODE)
+                    if m == m_rem - 1:
+                        last_wo_pre = min1 if IS_LONG else _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa_r, pb_r, inv_d_f, d_assets, EFF_OPT_CODE)
+                        last_avg_pre = (s1 * inv_d_f) if IS_LONG else zero_vec
+                        last_wb_pre = max1 if HAS_ONE_STAR else zero_vec
 
-        m_last = m_rem - 1
+                eps_m = tl.load(eps_vec_ptr + m).to(INNER_DTYPE)
+                half_eps = 0.5 * eps_m
+
+                b_ko = tl.load(ko_bar_ptr + m).to(INNER_DTYPE)
+                lo_ko = tl.where(hard_ko_sp, tl.minimum(b_ko, b_ko + ko_spread), b_ko - half_eps)
+                hi_ko = tl.where(hard_ko_sp, tl.maximum(b_ko, b_ko + ko_spread), b_ko + half_eps)
+                inv_w_ko = 1.0 / tl.maximum(hi_ko - lo_ko, tiny_i)
+                u_ko = (w_call - lo_ko) * inv_w_ko
+                g_ko_raw = tl.minimum(tl.maximum(u_ko, zero_vec), one_vec)
+                dgk_raw = tl.where((u_ko > 0.0) & (u_ko < 1.0), inv_w_ko, zero_vec)
+                is_call_m = tl.load(is_call_ptr + m) > 0.5
+                g_k = tl.where(is_call_m, g_ko_raw, zero_vec)
+                dgk = tl.where(is_call_m, dgk_raw, zero_vec)
+
+                b_cp = tl.load(cpn_bar_ptr + m).to(INNER_DTYPE)
+                lo_cp = tl.where(hard_cpn_sp, tl.minimum(b_cp, b_cp + eff_csp), b_cp - half_eps)
+                hi_cp = tl.where(hard_cpn_sp, tl.maximum(b_cp, b_cp + eff_csp), b_cp + half_eps)
+                inv_w_cp = 1.0 / tl.maximum(hi_cp - lo_cp, tiny_i)
+                u_cp = (w_cpn - lo_cp) * inv_w_cp
+                ramp_cp = tl.minimum(tl.maximum(u_cp, zero_vec), one_vec)
+                dramp_cp = tl.where((u_cp > 0.0) & (u_cp < 1.0), inv_w_cp, zero_vec)
+                if USE_RT_FLAGS:
+                    hit_cp = tl.where(f_cpn_dn, 1.0 - ramp_cp, ramp_cp)
+                    ind_cp = tl.where(f_cpn_out, 1.0 - hit_cp, hit_cp)
+                else:
+                    hit_cp = (1.0 - ramp_cp) if CPN_DIR_DOWN else ramp_cp
+                    ind_cp = (1.0 - hit_cp) if CPN_TYPE_OUT else hit_cp
+                is_guar_m = tl.load(is_guar_ptr + m) > 0.5
+                g_c_raw = tl.where(is_guar_m, one_vec, ind_cp)
+                dgc_raw = tl.where(is_guar_m, zero_vec, dramp_cp * sign_cpn_rt)
+
+                if USE_RT_FLAGS:
+                    w_c_max = tl.where(f_frc_cpn, tl.where(g_c_raw > g_k, one_vec, tl.where(g_c_raw < g_k, zero_vec, 0.5 * one_vec)), one_vec)
+                    w_k_max = 1.0 - w_c_max
+                    eff_g_c = tl.where(f_frc_cpn, tl.maximum(g_c_raw, g_k), g_c_raw)
+                elif FORCE_CPN_AC:
+                    eff_g_c = tl.maximum(g_c_raw, g_k)
+                    w_c_max = tl.where(g_c_raw > g_k, one_vec, tl.where(g_c_raw < g_k, zero_vec, 0.5 * one_vec))
+                    w_k_max = 1.0 - w_c_max
+                else:
+                    eff_g_c = g_c_raw
+                    w_c_max = one_vec
+                    w_k_max = zero_vec
+
+                c_rate = tl.load(cpn_rates_ptr + m).to(INNER_DTYPE)
+                eff_c = (tl.where(f_is_mem, c_rate + c_mem, zero_vec + c_rate) if USE_RT_FLAGS else ((c_rate + c_mem) if IS_MEM else (zero_vec + c_rate)))
+
+                mn_off = m * n_total + offs_n
+                tl.store(ws_ptr + 0 * stride_mn + mn_off, surv, mask=mask_n)
+                tl.store(ws_ptr + 1 * stride_mn + mn_off, g_k, mask=mask_n)
+                tl.store(ws_ptr + 2 * stride_mn + mn_off, eff_g_c, mask=mask_n)
+                tl.store(ws_ptr + 3 * stride_mn + mn_off, eff_c, mask=mask_n)
+                tl.store(ws_ptr + 4 * stride_mn + mn_off, dgk, mask=mask_n)
+                tl.store(ws_ptr + 5 * stride_mn + mn_off, w_c_max * dgc_raw, mask=mask_n)
+                tl.store(ws_ptr + 6 * stride_mn + mn_off, w_k_max * dgk, mask=mask_n)
+
+                if USE_RT_FLAGS:
+                    c_mem = tl.where(f_is_mem, surv * eff_c * (1.0 - eff_g_c), c_mem)
+                elif IS_MEM:
+                    c_mem = surv * eff_c * (1.0 - eff_g_c)
+                surv = tl.maximum(surv - surv * g_k, zero_vec)
+
+                if EMIT_STAGE1 and (out_stage1_rep_ptr is not None):
+                    gk_s1 = tl.where(
+                        is_call_m,
+                        tl.where(
+                            hard_ko_sp,
+                            tl.minimum(tl.maximum((w_call - tl.minimum(b_ko, b_ko + ko_spread)) * inv_w_ko_s1, zero_vec), one_vec),
+                            tl.where(w_call >= b_ko, one_vec, zero_vec),
+                        ),
+                        zero_vec,
+                    )
+                    if USE_RT_FLAGS:
+                        hit_h_s1 = tl.where(f_cpn_dn, w_cpn <= b_cp, w_cpn >= b_cp)
+                        gc_hard_s1 = tl.where(f_cpn_out, tl.where(hit_h_s1, zero_vec, one_vec), tl.where(hit_h_s1, one_vec, zero_vec))
+                    else:
+                        hit_h_s1 = (w_cpn <= b_cp) if CPN_DIR_DOWN else (w_cpn >= b_cp)
+                        gc_hard_s1 = tl.where(hit_h_s1, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
+                    blo_cp_s1 = tl.minimum(b_cp, b_cp + eff_csp)
+                    r_up_s1 = tl.minimum(tl.maximum((w_cpn - blo_cp_s1) * inv_w_cp_s1, zero_vec), one_vec)
+                    if USE_RT_FLAGS:
+                        hit_s1 = tl.where(f_cpn_dn, 1.0 - r_up_s1, r_up_s1)
+                        gc_soft_s1 = tl.where(f_cpn_out, 1.0 - hit_s1, hit_s1)
+                        gc_s1 = tl.where(is_guar_m, one_vec, tl.where(hard_cpn_sp, gc_soft_s1, gc_hard_s1))
+                        eff_gc_s1 = tl.where(f_frc_cpn, tl.maximum(gc_s1, gk_s1), gc_s1)
+                    else:
+                        hit_s1 = (1.0 - r_up_s1) if CPN_DIR_DOWN else r_up_s1
+                        gc_soft_s1 = (1.0 - hit_s1) if CPN_TYPE_OUT else hit_s1
+                        gc_s1 = tl.where(is_guar_m, one_vec, tl.where(hard_cpn_sp, gc_soft_s1, gc_hard_s1))
+                        eff_gc_s1 = tl.maximum(gc_s1, gk_s1) if FORCE_CPN_AC else gc_s1
+                    pm_s1 = surv_s1 * gk_s1
+                    eff_c_s1 = (tl.where(f_is_mem, c_rate + c_mem_s1, zero_vec + c_rate) if USE_RT_FLAGS else ((c_rate + c_mem_s1) if IS_MEM else (zero_vec + c_rate)))
+                    cpn_cf_s1 = surv_s1 * eff_gc_s1 * eff_c_s1 + pm_s1 * ac_cpn
+                    if USE_RT_FLAGS:
+                        c_mem_s1 = tl.where(f_is_mem, surv_s1 * eff_c_s1 * (1.0 - eff_gc_s1), c_mem_s1)
+                    elif IS_MEM:
+                        c_mem_s1 = surv_s1 * eff_c_s1 * (1.0 - eff_gc_s1)
+                    df_m_s1 = tl.load(df_pay_ptr + m).to(INNER_DTYPE)
+                    wf_m_s1 = tl.load(w_fund_ptr + m).to(INNER_DTYPE) if w_fund_ptr is not None else (tl.zeros((), dtype=INNER_DTYPE))
+                    if USE_RT_FLAGS:
+                        pv_s1 = pv_s1 + df_m_s1 * tl.where(f_no_not, cpn_cf_s1, pm_s1 + cpn_cf_s1) - wf_m_s1 * surv_s1
+                    elif NO_NOTIONAL:
+                        pv_s1 = pv_s1 + df_m_s1 * cpn_cf_s1 - wf_m_s1 * surv_s1
+                    else:
+                        pv_s1 = pv_s1 + df_m_s1 * (pm_s1 + cpn_cf_s1) - wf_m_s1 * surv_s1
+                    p_stop_sum_r = tl.sum(tl.where(mask_n, pm_s1, zero_vec).to(tl.float64), axis=0) * inv_rep_f64
+                    q_cpn_sum_r = tl.sum(tl.where(mask_n, surv_s1 * eff_gc_s1, zero_vec).to(tl.float64), axis=0) * inv_rep_f64
+                    cpn_cf_sum_r = tl.sum(tl.where(mask_n, cpn_cf_s1, zero_vec).to(tl.float64), axis=0) * inv_rep_f64
+                    tl.atomic_add(out_stage1_rep_ptr + rep_id * n_s1_cols + m, p_stop_sum_r)
+                    tl.atomic_add(out_stage1_rep_ptr + rep_id * n_s1_cols + m_rem + m, q_cpn_sum_r)
+                    tl.atomic_add(out_stage1_rep_ptr + rep_id * n_s1_cols + 2 * m_rem + m, cpn_cf_sum_r)
+                    surv_s1 = tl.maximum(surv_s1 - pm_s1, zero_vec)
+
+        m_last = m_act - 1
         last_wo = last_wo_pre
         last_wb = last_wb_pre
         eps_term = tl.load(eps_vec_ptr + m_last).to(INNER_DTYPE)
@@ -3956,6 +4640,17 @@ if _HAS_TRITON:
             ki_gate = tl.load(i_ki_ext_ptr + offs_n, mask=mask_n, other=i_ki_past).to(INNER_DTYPE)
             d_iki_dwo = zero_vec
             ki_gate_s1 = ki_gate
+        elif USE_RT_FLAGS:
+            sp_ki_pos = tl.abs(ki_spread) > 1e-6
+            blo_k = tl.minimum(ki_barrier, ki_barrier + ki_spread)
+            bhi_k = tl.where(sp_ki_pos, tl.maximum(ki_barrier, ki_barrier + ki_spread), ki_barrier + 0.5 * eps_term)
+            inv_wk = 1.0 / tl.maximum(tl.where(sp_ki_pos, bhi_k - blo_k, eps_term), tiny_i)
+            u_ki = (bhi_k - last_wo) * inv_wk
+            i_ki = tl.minimum(tl.maximum(u_ki, zero_vec), one_vec)
+            d_iki_dwo = tl.where(f_ki_act & (u_ki > 0.0) & (u_ki < 1.0), -inv_wk, zero_vec)
+            ki_gate_off = tl.where(f_has_ki, zero_vec + i_ki_past, one_vec)
+            ki_gate = tl.where(f_ki_act, i_ki, ki_gate_off)
+            ki_gate_s1 = tl.where(f_ki_act, tl.where(sp_ki_pos, i_ki, tl.where(last_wo < ki_barrier, one_vec, zero_vec)), ki_gate_off)
         elif KI_ACTIVE:
             sp_ki_pos = tl.abs(ki_spread) > 1e-6
             blo_k = tl.minimum(ki_barrier, ki_barrier + ki_spread)
@@ -3974,7 +4669,13 @@ if _HAS_TRITON:
             ki_gate = (zero_vec + i_ki_past) if HAS_KI else one_vec
             ki_gate_s1 = ki_gate
 
-        if HAS_ONE_STAR:
+        if USE_RT_FLAGS:
+            os_soft = one_star_eps > 1e-6
+            inv_wos = 1.0 / tl.maximum(one_star_eps, tiny_i)
+            u_os = (last_wb - (one_star_strike - 0.5 * one_star_eps)) * inv_wos
+            star_ind = tl.where(f_has_os, tl.where(os_soft, tl.minimum(tl.maximum(u_os, zero_vec), one_vec), tl.where(last_wb >= one_star_strike, one_vec, zero_vec)), zero_vec)
+            d_star = tl.where(f_has_os & os_soft & (u_os > 0.0) & (u_os < 1.0), inv_wos, zero_vec)
+        elif HAS_ONE_STAR:
             os_soft = one_star_eps > 1e-6
             inv_wos = 1.0 / tl.maximum(one_star_eps, tiny_i)
             u_os = (last_wb - (one_star_strike - 0.5 * one_star_eps)) * inv_wos
@@ -3988,7 +4689,41 @@ if _HAS_TRITON:
         d_opt_d_wo = zero_vec
         d_opt_d_avg = zero_vec
         d_opt_d_wb = zero_vec
-        if IS_LONG:
+        if USE_RT_FLAGS:
+            sp_ki_ilb = tl.where(tl.abs(ki_spread) > 1e-6, ki_spread, -eps_term)
+            lo_k_ilb = tl.minimum(strike, strike + sp_ki_ilb)
+            hi_k_ilb = tl.maximum(strike, strike + sp_ki_ilb)
+            inv_wk_ilb = 1.0 / tl.maximum(hi_k_ilb - lo_k_ilb, tiny_i)
+            u_ki_ilb = (hi_k_ilb - last_wo) * inv_wk_ilb
+            g_ki_ilb = tl.minimum(tl.maximum(u_ki_ilb, zero_vec), one_vec)
+            ki_gate_ilb_act = tl.maximum(i_ki_past, g_ki_ilb)
+            ki_gate_ilb = tl.where(f_ki_act, ki_gate_ilb_act, one_vec)
+            d_iki_dwo_ilb = tl.where(f_ki_act & (u_ki_ilb > 0.0) & (u_ki_ilb < 1.0) & (g_ki_ilb >= i_ki_past), -inv_wk_ilb, zero_vec)
+            ki_gate_ilb_s1 = tl.where(
+                f_ki_act,
+                tl.where(tl.abs(ki_spread) > 1e-6, ki_gate_ilb_act, tl.maximum(i_ki_past, tl.where(last_wo < strike, one_vec, zero_vec))),
+                one_vec,
+            )
+            opt_l_val = -(1.0 - last_avg_pre) * ki_gate_ilb * (1.0 - star_ind)
+            put_intr_l = tl.maximum(strike - last_wo, zero_vec) - tl.maximum(lower_strike - last_wo, zero_vec)
+            put_intr_p = tl.maximum(strike - last_wo, zero_vec)
+            put_intr = tl.where(f_has_low, put_intr_l, put_intr_p)
+            d_put_l = tl.where(last_wo < strike, -one_vec, zero_vec) - tl.where(last_wo < lower_strike, -one_vec, zero_vec)
+            d_put_p = tl.where(last_wo < strike, -one_vec, zero_vec)
+            d_put_dwo = tl.where(f_has_low, d_put_l, d_put_p)
+            put_mask = tl.where(f_has_low, (strike > lower_strike) & (option_gearing > 0.0), option_gearing > 0.0)
+            opt_s_val = tl.where(put_mask, -option_gearing * ki_gate * (1.0 - star_ind) * put_intr, zero_vec)
+            opt_pay = tl.where(f_is_long, opt_l_val, opt_s_val)
+            d_opt_d_avg = tl.where(f_is_long, ki_gate_ilb * (1.0 - star_ind), zero_vec)
+            d_wo_l = -(1.0 - last_avg_pre) * (1.0 - star_ind) * d_iki_dwo_ilb
+            d_wo_s = tl.where(put_mask, -option_gearing * (1.0 - star_ind) * (d_iki_dwo * put_intr + ki_gate * d_put_dwo), zero_vec)
+            d_opt_d_wo = tl.where(f_is_long, d_wo_l, d_wo_s)
+            d_wb_l = (1.0 - last_avg_pre) * ki_gate_ilb * d_star
+            d_wb_s = tl.where(put_mask, option_gearing * ki_gate * put_intr * d_star, zero_vec)
+            d_opt_d_wb = tl.where(f_is_long, d_wb_l, d_wb_s)
+            ki_gate_ilb_s1 = tl.where(f_is_long, ki_gate_ilb_s1, ki_gate_s1)
+            put_mask = tl.where(f_is_long, zero_vec > 1.0, put_mask)
+        elif IS_LONG:
             if HAS_EXT_KI and (i_ki_ext_ptr is not None):
                 ki_gate_ilb = ki_gate
                 ki_gate_ilb_s1 = ki_gate_s1
@@ -4036,32 +4771,45 @@ if _HAS_TRITON:
             d_opt_d_wb = tl.where(put_mask, d_opt_d_wb + option_gearing * ki_gate * put_intr * d_star, d_opt_d_wb)
             ki_gate_ilb_s1 = ki_gate_s1
 
-        has_pc = (part_call_rate != 0.0) if HAS_PART_CALL else False
+        has_pc = (f_has_pc & (part_call_rate != 0.0)) if USE_RT_FLAGS else ((part_call_rate != 0.0) if HAS_PART_CALL else False)
         call_intr = tl.maximum(last_wo - part_call_strike, zero_vec)
         opt_pay = tl.where(has_pc, opt_pay + part_call_rate * call_intr, opt_pay)
         d_opt_d_wo = tl.where(has_pc & (last_wo > part_call_strike), d_opt_d_wo + part_call_rate, d_opt_d_wo)
 
-        os_cpn_mask = (one_star_coupon != 0.0) if HAS_ONE_STAR else False
+        os_cpn_mask = (f_has_os & (one_star_coupon != 0.0)) if USE_RT_FLAGS else ((one_star_coupon != 0.0) if HAS_ONE_STAR else False)
         opt_pay = tl.where(os_cpn_mask, opt_pay + star_ind * one_star_coupon, opt_pay)
         d_opt_d_wb = tl.where(os_cpn_mask, d_opt_d_wb + d_star * one_star_coupon, d_opt_d_wb)
 
         df_last = tl.load(df_pay_ptr + m_last).to(INNER_DTYPE)
         if EMIT_STAGE1 and (out_stage1_rep_ptr is not None):
-            if IS_LONG:
-                u_put_s1 = surv_s1 * ki_gate_ilb_s1 * (1.0 - star_ind) * (1.0 - last_avg_pre)
-                put_term_s1 = -u_put_s1
+            if USE_RT_FLAGS:
+                u_put_s1 = tl.where(
+                    f_is_long,
+                    surv_s1 * ki_gate_ilb_s1 * (1.0 - star_ind) * (1.0 - last_avg_pre),
+                    tl.where(put_mask, surv_s1 * ki_gate_s1 * (1.0 - star_ind) * put_intr, zero_vec),
+                )
+                put_term_s1 = tl.where(f_is_long, -u_put_s1, -option_gearing * u_put_s1)
+                u_call_s1 = tl.where(has_pc, surv_s1 * call_intr, zero_vec)
+                p_os_s1 = tl.where(f_has_os, surv_s1 * star_ind, zero_vec)
+                l_os_s1 = tl.where(os_cpn_mask, p_os_s1 * one_star_coupon, zero_vec)
+                opt_s1 = put_term_s1 + tl.where(has_pc, part_call_rate * u_call_s1, zero_vec) + l_os_s1
+                term_s1 = (surv_s1 * tl.where(f_no_not, 0.0, 1.0)) + opt_s1
             else:
-                u_put_s1 = tl.where(put_mask, surv_s1 * ki_gate_s1 * (1.0 - star_ind) * put_intr, zero_vec)
-                put_term_s1 = -option_gearing * u_put_s1
-            u_call_s1 = tl.where(has_pc, surv_s1 * call_intr, zero_vec)
-            p_os_s1 = tl.where(HAS_ONE_STAR, surv_s1 * star_ind, zero_vec)
-            l_os_s1 = tl.where(os_cpn_mask, p_os_s1 * one_star_coupon, zero_vec)
-            opt_s1 = (
-                put_term_s1
-                + (part_call_rate * u_call_s1 if has_pc else zero_vec)
-                + l_os_s1
-            )
-            term_s1 = (surv_s1 * (0.0 if NO_NOTIONAL else 1.0)) + opt_s1
+                if IS_LONG:
+                    u_put_s1 = surv_s1 * ki_gate_ilb_s1 * (1.0 - star_ind) * (1.0 - last_avg_pre)
+                    put_term_s1 = -u_put_s1
+                else:
+                    u_put_s1 = tl.where(put_mask, surv_s1 * ki_gate_s1 * (1.0 - star_ind) * put_intr, zero_vec)
+                    put_term_s1 = -option_gearing * u_put_s1
+                u_call_s1 = tl.where(has_pc, surv_s1 * call_intr, zero_vec)
+                p_os_s1 = tl.where(HAS_ONE_STAR, surv_s1 * star_ind, zero_vec)
+                l_os_s1 = tl.where(os_cpn_mask, p_os_s1 * one_star_coupon, zero_vec)
+                opt_s1 = (
+                    put_term_s1
+                    + (part_call_rate * u_call_s1 if has_pc else zero_vec)
+                    + l_os_s1
+                )
+                term_s1 = (surv_s1 * (0.0 if NO_NOTIONAL else 1.0)) + opt_s1
             pv_s1 = pv_s1 + df_last * term_s1
             pv_s1_f64 = pv_s1.to(tl.float64)
             base_c = rep_id * n_s1_cols + 3 * m_rem
@@ -4072,121 +4820,138 @@ if _HAS_TRITON:
             tl.atomic_add(out_stage1_rep_ptr + base_c + 4, tl.sum(tl.where(mask_n, pv_s1_f64, 0.0), axis=0) * inv_rep_f64)
             tl.atomic_add(out_stage1_rep_ptr + base_c + 5, tl.sum(tl.where(mask_n, pv_s1_f64 * pv_s1_f64, 0.0), axis=0) * inv_rep_f64)
 
-        term_not = tl.zeros((), dtype=INNER_DTYPE) + (0.0 if NO_NOTIONAL else 1.0)
+        term_not = (tl.where(f_no_not, 0.0, 1.0).to(INNER_DTYPE) if USE_RT_FLAGS else (tl.zeros((), dtype=INNER_DTYPE) + (0.0 if NO_NOTIONAL else 1.0)))
         bar_surv = scale * df_last * (term_not + opt_pay)
         bar_last_wo = scale * df_last * surv * d_opt_d_wo
         bar_last_avg = scale * df_last * surv * d_opt_d_avg
         bar_last_wb = scale * df_last * surv * d_opt_d_wb
         bar_c_mem = zero_vec
-        cf_tail_vec = surv * (opt_pay if NO_NOTIONAL else (1.0 + opt_pay))
+        cf_tail_vec = surv * (tl.where(f_no_not, opt_pay, 1.0 + opt_pay) if USE_RT_FLAGS else (opt_pay if NO_NOTIONAL else (1.0 + opt_pay)))
         n_blk_n = tl.num_programs(0)
-        opt_bwd_code: tl.constexpr = 0 if IS_LONG else EFF_OPT_CODE
+        opt_bwd_rt = tl.where(f_is_long, 0, rt_opt) if USE_RT_FLAGS else (0 if IS_LONG else EFF_OPT_CODE)
 
         for rev_m in range(m_rem):
-            m = m_last - rev_m
-            mn_off = m * n_total + offs_n
-            surv_pre = tl.load(ws_ptr + 0 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
-            g_k = tl.load(ws_ptr + 1 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
-            eff_g_c = tl.load(ws_ptr + 2 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
-            eff_c = tl.load(ws_ptr + 3 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
-            dgk = tl.load(ws_ptr + 4 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
-            dgc_from_cpn = tl.load(ws_ptr + 5 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
-            dgc_from_ko = tl.load(ws_ptr + 6 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
+            m = (m_last - rev_m) if not USE_RT_FLAGS else (m_rem - 1 - rev_m)
+            m_ok_b = (m < m_act) if USE_RT_FLAGS else True
+            if m_ok_b:
+                mn_off = m * n_total + offs_n
+                surv_pre = tl.load(ws_ptr + 0 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
+                g_k = tl.load(ws_ptr + 1 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
+                eff_g_c = tl.load(ws_ptr + 2 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
+                eff_c = tl.load(ws_ptr + 3 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
+                dgk = tl.load(ws_ptr + 4 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
+                dgc_from_cpn = tl.load(ws_ptr + 5 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
+                dgc_from_ko = tl.load(ws_ptr + 6 * stride_mn + mn_off, mask=mask_n, other=0.0).to(INNER_DTYPE)
 
-            df_m = tl.load(df_pay_ptr + m).to(INNER_DTYPE)
-            is_last = m == m_last
-            if out_cf_wf_ptr is not None:
-                p_m_val = surv_pre * g_k
-                cpn_val = surv_pre * eff_g_c * eff_c + p_m_val * ac_cpn
-                cf_path = cpn_val if NO_NOTIONAL else (p_m_val + cpn_val)
-                cf_path = tl.where(is_last, cf_path + cf_tail_vec, cf_path)
-                cf_m_sum = tl.sum(tl.where(mask_n, cf_path, zero_vec).to(tl.float64), axis=0) * scale_f64
-                surv_m_sum = tl.sum(tl.where(mask_n, surv_pre, zero_vec).to(tl.float64), axis=0) * scale_f64
-                tl.store(out_cf_wf_ptr + pid_n * m_rem + m, cf_m_sum)
-                tl.store(out_cf_wf_ptr + (n_blk_n + pid_n) * m_rem + m, surv_m_sum)
-            surv_next_pos = (surv_pre - surv_pre * g_k) > 0.0
-            bar_surv_eff = tl.where(surv_next_pos, bar_surv, zero_vec)
-            bar_p_m = scale * df_m * (term_not + ac_cpn) - bar_surv_eff
-            bar_eff_g_c = scale * df_m * surv_pre * eff_c - (bar_c_mem * surv_pre * eff_c if IS_MEM else zero_vec)
+                df_m = tl.load(df_pay_ptr + m).to(INNER_DTYPE)
+                is_last = m == m_last
+                if out_cf_wf_ptr is not None:
+                    p_m_val = surv_pre * g_k
+                    cpn_val = surv_pre * eff_g_c * eff_c + p_m_val * ac_cpn
+                    cf_path = (tl.where(f_no_not, cpn_val, p_m_val + cpn_val) if USE_RT_FLAGS else (cpn_val if NO_NOTIONAL else (p_m_val + cpn_val)))
+                    cf_path = tl.where(is_last, cf_path + cf_tail_vec, cf_path)
+                    cf_m_sum = tl.sum(tl.where(mask_n, cf_path, zero_vec).to(tl.float64), axis=0) * scale_f64
+                    surv_m_sum = tl.sum(tl.where(mask_n, surv_pre, zero_vec).to(tl.float64), axis=0) * scale_f64
+                    tl.store(out_cf_wf_ptr + pid_n * m_rem + m, cf_m_sum)
+                    tl.store(out_cf_wf_ptr + (n_blk_n + pid_n) * m_rem + m, surv_m_sum)
+                surv_next_pos = (surv_pre - surv_pre * g_k) > 0.0
+                bar_surv_eff = tl.where(surv_next_pos, bar_surv, zero_vec)
+                bar_p_m = scale * df_m * (term_not + ac_cpn) - bar_surv_eff
+                bar_eff_g_c = scale * df_m * surv_pre * eff_c - (tl.where(f_is_mem, bar_c_mem * surv_pre * eff_c, zero_vec) if USE_RT_FLAGS else (bar_c_mem * surv_pre * eff_c if IS_MEM else zero_vec))
 
-            wf_m = tl.load(w_fund_ptr + m).to(INNER_DTYPE) if w_fund_ptr is not None else (tl.zeros((), dtype=INNER_DTYPE))
-            bar_surv = (
-                bar_surv_eff
-                + bar_p_m * g_k
-                + scale * df_m * eff_g_c * eff_c
-                - scale * wf_m
-                + (bar_c_mem * eff_c * (1.0 - eff_g_c) if IS_MEM else zero_vec)
-            )
-            if IS_MEM:
-                bar_c_mem = scale * df_m * surv_pre * eff_g_c + bar_c_mem * surv_pre * (1.0 - eff_g_c)
-
-            bar_g_k = bar_p_m * surv_pre
-            bar_w_call = bar_g_k * dgk + bar_eff_g_c * dgc_from_ko
-            bar_w_cpn = bar_eff_g_c * dgc_from_cpn
-
-            b_wo = tl.where(is_last, bar_last_wo, zero_vec)
-            b_avg = tl.where(is_last, bar_last_avg, zero_vec) if IS_LONG else zero_vec
-            b_wb = tl.where(is_last, bar_last_wb, zero_vec)
-            if opt_bwd_code == CALL_CODE:
-                bar_w_call = bar_w_call + b_wo
-                b_wo = zero_vec
-            elif opt_bwd_code == CPN_CODE:
-                bar_w_cpn = bar_w_cpn + b_wo
-                b_wo = zero_vec
-            if IS_LONG:
-                if CALL_CODE == 2:
-                    bar_w_call = bar_w_call + b_avg
-                    b_avg = zero_vec
-                elif CPN_CODE == 2:
-                    bar_w_cpn = bar_w_cpn + b_avg
-                    b_avg = zero_vec
-            if CALL_CODE == 1:
-                bar_w_call = bar_w_call + b_wb
-                b_wb = zero_vec
-
-            m_off = m * d_assets
-            min1_v, _, _, idx_min1, idx_min2, idx_min3, max1_v, _, idx_max1, idx_max2, s1_v, s2_v, pa_r, pb_r = _eval_idx_base_stats_f64(
-                perf_ptr, m_off, ia, ib, offs_n, mask_n, d_assets, n_total,
-                need_min1_k or need_min2_k or need_min3_k,
-                need_min2_k,
-                need_min3_k,
-                need_max1_k or need_max2_k,
-                need_max2_k,
-                need_sum1_k or need_sum2_k,
-                need_sum2_k,
-                need_ratio_k,
-                INNER_DTYPE,
-            )
-            w_avg_v = s1_v * inv_d_f
-            w_disp_v = tl.sqrt(tl.maximum(s2_v * inv_d_f - w_avg_v * w_avg_v, 0.0))
-            eff_wc_tot = bar_w_call + (bar_w_cpn if CPN_CODE == CALL_CODE else zero_vec)
-
-            for d in range(d_assets):
-                pd = tl.load(perf_ptr + (m_off + d) * n_total + offs_n, mask=mask_n, other=1.0).to(INNER_DTYPE)
-                bp = zero_vec
-                bp = _accum_idx_grad_f64(
-                    bp, eff_wc_tot, pd, d, d_assets, inv_d_f, ia, ib,
-                    min1_v, max1_v, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
-                    CALL_CODE,
+                wf_m = tl.load(w_fund_ptr + m).to(INNER_DTYPE) if w_fund_ptr is not None else (tl.zeros((), dtype=INNER_DTYPE))
+                bar_surv = (
+                    bar_surv_eff
+                    + bar_p_m * g_k
+                    + scale * df_m * eff_g_c * eff_c
+                    - scale * wf_m
+                    + (tl.where(f_is_mem, bar_c_mem * eff_c * (1.0 - eff_g_c), zero_vec) if USE_RT_FLAGS else (bar_c_mem * eff_c * (1.0 - eff_g_c) if IS_MEM else zero_vec))
                 )
-                if CPN_CODE != CALL_CODE:
-                    bp = _accum_idx_grad_f64(
-                        bp, bar_w_cpn, pd, d, d_assets, inv_d_f, ia, ib,
-                        min1_v, max1_v, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
-                        CPN_CODE,
-                    )
-                if (opt_bwd_code != CALL_CODE) and (opt_bwd_code != CPN_CODE):
-                    bp = _accum_idx_grad_f64(
-                        bp, b_wo, pd, d, d_assets, inv_d_f, ia, ib,
-                        min1_v, max1_v, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
-                        opt_bwd_code,
-                    )
-                if IS_LONG and (CALL_CODE != 2) and (CPN_CODE != 2):
-                    bp = bp + b_avg * inv_d_f
-                if HAS_ONE_STAR and (CALL_CODE != 1):
-                    bp = tl.where(d == idx_max1, bp + b_wb, bp)
+                if USE_RT_FLAGS:
+                    bar_c_mem = tl.where(f_is_mem, scale * df_m * surv_pre * eff_g_c + bar_c_mem * surv_pre * (1.0 - eff_g_c), bar_c_mem)
+                elif IS_MEM:
+                    bar_c_mem = scale * df_m * surv_pre * eff_g_c + bar_c_mem * surv_pre * (1.0 - eff_g_c)
 
-                tl.store(bar_lx_post_ptr + (m_off + d) * n_total + offs_n, (bp * pd).to(tl.float32), mask=mask_n)
+                bar_g_k = bar_p_m * surv_pre
+                bar_w_call = bar_g_k * dgk + bar_eff_g_c * dgc_from_ko
+                bar_w_cpn = bar_eff_g_c * dgc_from_cpn
+
+                b_wo = tl.where(is_last, bar_last_wo, zero_vec)
+                b_avg = (tl.where(is_last & f_is_long, bar_last_avg, zero_vec) if USE_RT_FLAGS else (tl.where(is_last, bar_last_avg, zero_vec) if IS_LONG else zero_vec))
+                b_wb = tl.where(is_last, bar_last_wb, zero_vec)
+                m_off = m * d_assets
+                if USE_RT_FLAGS:
+                    _, idx_min1, _, idx_max1, _, inv_d_rt = _eval_idx_base_stats_012_f64(
+                        perf_ptr, m_off, offs_n, mask_n, d_act, n_total, D_PAD, INNER_DTYPE
+                    )
+                    for d in range(D_PAD):
+                        if d < d_act:
+                            pd = tl.load(perf_ptr + (m_off + d) * n_total + offs_n, mask=mask_n, other=1.0).to(INNER_DTYPE)
+                            g_call = tl.where(rt_call == 0, tl.where(d == idx_min1, bar_w_call, zero_vec), tl.where(rt_call == 1, tl.where(d == idx_max1, bar_w_call, zero_vec), bar_w_call * inv_d_rt))
+                            g_cpn = tl.where(rt_cpn == 0, tl.where(d == idx_min1, bar_w_cpn, zero_vec), tl.where(rt_cpn == 1, tl.where(d == idx_max1, bar_w_cpn, zero_vec), bar_w_cpn * inv_d_rt))
+                            g_opt = tl.where(opt_bwd_rt == 0, tl.where(d == idx_min1, b_wo, zero_vec), tl.where(opt_bwd_rt == 1, tl.where(d == idx_max1, b_wo, zero_vec), b_wo * inv_d_rt))
+                            bp = g_call + g_cpn + g_opt + b_avg * inv_d_rt + tl.where(d == idx_max1, b_wb, zero_vec)
+                            tl.store(bar_lx_post_ptr + (m_off + d) * n_total + offs_n, (bp * pd).to(tl.float32), mask=mask_n)
+                else:
+                    if opt_bwd_rt == CALL_CODE:
+                        bar_w_call = bar_w_call + b_wo
+                        b_wo = zero_vec
+                    elif opt_bwd_rt == CPN_CODE:
+                        bar_w_cpn = bar_w_cpn + b_wo
+                        b_wo = zero_vec
+                    if IS_LONG:
+                        if CALL_CODE == 2:
+                            bar_w_call = bar_w_call + b_avg
+                            b_avg = zero_vec
+                        elif CPN_CODE == 2:
+                            bar_w_cpn = bar_w_cpn + b_avg
+                            b_avg = zero_vec
+                    if CALL_CODE == 1:
+                        bar_w_call = bar_w_call + b_wb
+                        b_wb = zero_vec
+
+                    min1_v, _, _, idx_min1, idx_min2, idx_min3, max1_v, _, idx_max1, idx_max2, s1_v, s2_v, pa_r, pb_r = _eval_idx_base_stats_f64(
+                        perf_ptr, m_off, ia, ib, offs_n, mask_n, d_assets, n_total,
+                        need_min1_k or need_min2_k or need_min3_k,
+                        need_min2_k,
+                        need_min3_k,
+                        need_max1_k or need_max2_k,
+                        need_max2_k,
+                        need_sum1_k or need_sum2_k,
+                        need_sum2_k,
+                        need_ratio_k,
+                        INNER_DTYPE,
+                    )
+                    w_avg_v = s1_v * inv_d_f
+                    w_disp_v = tl.sqrt(tl.maximum(s2_v * inv_d_f - w_avg_v * w_avg_v, 0.0))
+                    eff_wc_tot = bar_w_call + (bar_w_cpn if CPN_CODE == CALL_CODE else zero_vec)
+
+                    for d in range(d_assets):
+                        pd = tl.load(perf_ptr + (m_off + d) * n_total + offs_n, mask=mask_n, other=1.0).to(INNER_DTYPE)
+                        bp = zero_vec
+                        bp = _accum_idx_grad_f64(
+                            bp, eff_wc_tot, pd, d, d_assets, inv_d_f, ia, ib,
+                            min1_v, max1_v, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
+                            CALL_CODE,
+                        )
+                        if CPN_CODE != CALL_CODE:
+                            bp = _accum_idx_grad_f64(
+                                bp, bar_w_cpn, pd, d, d_assets, inv_d_f, ia, ib,
+                                min1_v, max1_v, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
+                                CPN_CODE,
+                            )
+                        if (opt_bwd_rt != CALL_CODE) and (opt_bwd_rt != CPN_CODE):
+                            bp = _accum_idx_grad_f64(
+                                bp, b_wo, pd, d, d_assets, inv_d_f, ia, ib,
+                                min1_v, max1_v, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
+                                opt_bwd_rt,
+                            )
+                        if IS_LONG and (CALL_CODE != 2) and (CPN_CODE != 2):
+                            bp = bp + b_avg * inv_d_f
+                        if HAS_ONE_STAR and (CALL_CODE != 1):
+                            bp = tl.where(d == idx_max1, bp + b_wb, bp)
+
+                        tl.store(bar_lx_post_ptr + (m_off + d) * n_total + offs_n, (bp * pd).to(tl.float32), mask=mask_n)
 
     @triton.jit  # type: ignore[untyped-decorator]
     def _mf_gbm_ema_shift_f32_kernel(  # type: ignore[no-untyped-def]
@@ -4198,12 +4963,21 @@ if _HAS_TRITON:
         m_rem,
         n_rep_in,
         z_scale,
-        ANTITHETIC: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        cg_flags_ptr=None,
+        ANTITHETIC: tl.constexpr = False,
+        BLOCK_N: tl.constexpr = 256,
         LAYOUT_MDN: tl.constexpr = False,
+        USE_RT_FLAGS: tl.constexpr = False,
     ):
         pid_rs = tl.program_id(0)
         d = tl.program_id(1)
+        if USE_RT_FLAGS:
+            d_act = tl.load(cg_flags_ptr + 0)
+            m_act = tl.load(cg_flags_ptr + 1)
+            if d >= d_act:
+                return
+        else:
+            m_act = m_rem
         n_sgn: tl.constexpr = 2 if ANTITHETIC else 1
         sgn_id = pid_rs % n_sgn
         r_idx = pid_rs // n_sgn
@@ -4214,19 +4988,20 @@ if _HAS_TRITON:
         n_tot_z = n_r * n_rep_in
         lx = tl.zeros((BLOCK_N,), dtype=tl.float32)
         for m in range(m_rem):
-            dv = tl.load(d_var_f32_ptr + d * m_rem + m)
-            sdv = tl.sqrt(tl.maximum(dv, 0.0))
-            if LAYOUT_MDN:
-                z_off_e = (m * d_assets + d) * n_tot_z + r_idx * n_rep_in + offs_n
-            else:
-                z_off_e = ((r_idx * m_rem + m) * d_assets + d) * n_rep_in + offs_n
-            z_val = tl.load(z_coarse_corr_ptr + z_off_e, mask=mask_n, other=0.0) * z_sign
-            lx_raw = lx - 0.5 * dv + sdv * z_val
-            mx = tl.max(tl.where(mask_n, lx_raw, -1.0e30), axis=0)
-            ex_sum = tl.sum(tl.where(mask_n, tl.exp(lx_raw - mx), 0.0), axis=0)
-            lse = mx + tl.log(tl.maximum(ex_sum * inv_rep, 1.0e-30))
-            tl.store(ema_shift_ptr + ((sgn_id * n_r + r_idx) * m_rem + m) * d_assets + d, lse)
-            lx = lx_raw - lse
+            if m < m_act:
+                dv = tl.load(d_var_f32_ptr + d * m_rem + m)
+                sdv = tl.sqrt(tl.maximum(dv, 0.0))
+                if LAYOUT_MDN:
+                    z_off_e = (m * d_assets + d) * n_tot_z + r_idx * n_rep_in + offs_n
+                else:
+                    z_off_e = ((r_idx * m_rem + m) * d_assets + d) * n_rep_in + offs_n
+                z_val = tl.load(z_coarse_corr_ptr + z_off_e, mask=mask_n, other=0.0) * z_sign
+                lx_raw = lx - 0.5 * dv + sdv * z_val
+                mx = tl.max(tl.where(mask_n, lx_raw, -1.0e30), axis=0)
+                ex_sum = tl.sum(tl.where(mask_n, tl.exp(lx_raw - mx), 0.0), axis=0)
+                lse = mx + tl.log(tl.maximum(ex_sum * inv_rep, 1.0e-30))
+                tl.store(ema_shift_ptr + ((sgn_id * n_r + r_idx) * m_rem + m) * d_assets + d, lse)
+                lx = lx_raw - lse
 
     @triton.jit  # type: ignore[untyped-decorator]
     def _mf_gbm_fused_f32_kernel(  # type: ignore[no-untyped-def]
@@ -4250,19 +5025,20 @@ if _HAS_TRITON:
         m_rem,
         n_rep_in,
         z_scale,
-        D_PAD: tl.constexpr,
-        CALL_CODE: tl.constexpr,
-        CPN_CODE: tl.constexpr,
-        EFF_OPT_CODE: tl.constexpr,
-        HAS_KI: tl.constexpr,
-        KI_ACTIVE: tl.constexpr,
-        HAS_ONE_STAR: tl.constexpr,
-        IS_MEM: tl.constexpr,
-        NO_NOTIONAL: tl.constexpr,
-        FORCE_CPN_AC: tl.constexpr,
-        CPN_DIR_DOWN: tl.constexpr,
-        CPN_TYPE_OUT: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        cg_flags_ptr=None,
+        D_PAD: tl.constexpr = 8,
+        CALL_CODE: tl.constexpr = 0,
+        CPN_CODE: tl.constexpr = 0,
+        EFF_OPT_CODE: tl.constexpr = 0,
+        HAS_KI: tl.constexpr = False,
+        KI_ACTIVE: tl.constexpr = False,
+        HAS_ONE_STAR: tl.constexpr = False,
+        IS_MEM: tl.constexpr = False,
+        NO_NOTIONAL: tl.constexpr = False,
+        FORCE_CPN_AC: tl.constexpr = False,
+        CPN_DIR_DOWN: tl.constexpr = False,
+        CPN_TYPE_OUT: tl.constexpr = False,
+        BLOCK_N: tl.constexpr = 256,
         HAS_LOWER_STRIKE: tl.constexpr = True,
         HAS_PART_CALL: tl.constexpr = False,
         COMPUTE_CF_SURV: tl.constexpr = False,
@@ -4272,6 +5048,7 @@ if _HAS_TRITON:
         APPLY_EMA: tl.constexpr = False,
         LAYOUT_MDN: tl.constexpr = False,
         IS_LONG: tl.constexpr = False,
+        USE_RT_FLAGS: tl.constexpr = False,
     ):
         pid_r = tl.program_id(0)
         n_r = tl.num_programs(0)
@@ -4280,8 +5057,43 @@ if _HAS_TRITON:
         mask_n = offs_n < n_rep_in
         n_tot_z = n_r * n_rep_in
 
+        if USE_RT_FLAGS:
+            d_act = tl.load(cg_flags_ptr + 0)
+            m_act = tl.load(cg_flags_ptr + 1)
+            rt_call = tl.load(cg_flags_ptr + 2)
+            rt_cpn = tl.load(cg_flags_ptr + 3)
+            rt_opt = tl.load(cg_flags_ptr + 4)
+            f_has_ki = tl.load(cg_flags_ptr + 5) != 0
+            f_ki_act = tl.load(cg_flags_ptr + 6) != 0
+            f_has_os = tl.load(cg_flags_ptr + 7) != 0
+            f_is_mem = tl.load(cg_flags_ptr + 8) != 0
+            f_is_long = tl.load(cg_flags_ptr + 9) != 0
+            f_no_not = tl.load(cg_flags_ptr + 10) != 0
+            f_frc_cpn = tl.load(cg_flags_ptr + 11) != 0
+            f_cpn_dn = tl.load(cg_flags_ptr + 12) != 0
+            f_cpn_out = tl.load(cg_flags_ptr + 13) != 0
+            f_has_low = tl.load(cg_flags_ptr + 14) != 0
+            f_has_pc = tl.load(cg_flags_ptr + 15) != 0
+        else:
+            d_act = d_assets
+            m_act = m_rem
+            rt_call = CALL_CODE
+            rt_cpn = CPN_CODE
+            rt_opt = EFF_OPT_CODE
+            f_has_ki = HAS_KI
+            f_ki_act = KI_ACTIVE
+            f_has_os = HAS_ONE_STAR
+            f_is_mem = IS_MEM
+            f_is_long = IS_LONG
+            f_no_not = NO_NOTIONAL
+            f_frc_cpn = FORCE_CPN_AC
+            f_cpn_dn = CPN_DIR_DOWN
+            f_cpn_out = CPN_TYPE_OUT
+            f_has_low = HAS_LOWER_STRIKE
+            f_has_pc = HAS_PART_CALL
+
         offs_d = tl.arange(0, D_PAD)[:, None]
-        mask_d = offs_d < d_assets
+        mask_d = offs_d < d_act
 
         ko_spread = tl.load(scalar_f32_ptr + 0)
         cpn_spread = tl.load(scalar_f32_ptr + 1)
@@ -4300,30 +5112,30 @@ if _HAS_TRITON:
         one_star_coupon = tl.load(scalar_f32_ptr + 14)
 
         ia = tl.load(inv_perm_ptr + 0).to(tl.int32)
-        ib_idx = tl.where(d_assets > 1, 1, 0)
+        ib_idx = tl.where(d_act > 1, 1, 0)
         ib = tl.load(inv_perm_ptr + ib_idx).to(tl.int32)
 
         zero_vec = tl.zeros((BLOCK_N,), dtype=tl.float32)
         one_vec = tl.full((BLOCK_N,), 1.0, dtype=tl.float32)
-        inv_d_f = 1.0 / (tl.zeros((), dtype=tl.float32) + d_assets)
+        inv_d_f = 1.0 / tl.maximum(tl.zeros((), dtype=tl.float32) + d_act, 1.0)
 
-        need_min2_k: tl.constexpr = (CALL_CODE == 15) or (CPN_CODE == 15) or (EFF_OPT_CODE == 15)
-        need_min3_k: tl.constexpr = (CALL_CODE == 16) or (CPN_CODE == 16) or (EFF_OPT_CODE == 16)
-        need_max2_k: tl.constexpr = (CALL_CODE == 17) or (CPN_CODE == 17) or (EFF_OPT_CODE == 17)
-        need_sum2_k: tl.constexpr = (CALL_CODE == 3) or (CPN_CODE == 3) or (EFF_OPT_CODE == 3)
-        need_ratio_k: tl.constexpr = (
+        need_min2_k: tl.constexpr = False if USE_RT_FLAGS else ((CALL_CODE == 15) or (CPN_CODE == 15) or (EFF_OPT_CODE == 15))
+        need_min3_k: tl.constexpr = False if USE_RT_FLAGS else ((CALL_CODE == 16) or (CPN_CODE == 16) or (EFF_OPT_CODE == 16))
+        need_max2_k: tl.constexpr = False if USE_RT_FLAGS else ((CALL_CODE == 17) or (CPN_CODE == 17) or (EFF_OPT_CODE == 17))
+        need_sum2_k: tl.constexpr = False if USE_RT_FLAGS else ((CALL_CODE == 3) or (CPN_CODE == 3) or (EFF_OPT_CODE == 3))
+        need_ratio_k: tl.constexpr = False if USE_RT_FLAGS else (
             (CALL_CODE == 4) or (CALL_CODE == 5) or (CALL_CODE == 9) or (CALL_CODE == 10)
             or (CPN_CODE == 4) or (CPN_CODE == 5) or (CPN_CODE == 9) or (CPN_CODE == 10)
             or (EFF_OPT_CODE == 4) or (EFF_OPT_CODE == 5) or (EFF_OPT_CODE == 9) or (EFF_OPT_CODE == 10)
         )
 
         hard_ko_sp = tl.abs(ko_spread) > 1e-6
-        eff_csp = -cpn_spread if CPN_DIR_DOWN else cpn_spread
+        eff_csp = tl.where(f_cpn_dn, -cpn_spread, cpn_spread) if USE_RT_FLAGS else (-cpn_spread if CPN_DIR_DOWN else cpn_spread)
         hard_cpn_sp = tl.abs(eff_csp) > 1e-6
         inv_w_ko_s1 = 1.0 / tl.maximum(tl.abs(ko_spread), 1e-12)
         inv_w_cp_s1 = 1.0 / tl.maximum(tl.abs(eff_csp), 1e-12)
         n_s1_cols = 3 * m_rem + 5
-        m_last = m_rem - 1
+        m_last = m_act - 1
         df_last = tl.load(df_pay_f32_ptr + m_last)
         eps_term = tl.load(eps_vec_f32_ptr + m_last)
         n_sgn_f: tl.constexpr = 2 if ANTITHETIC else 1
@@ -4345,10 +5157,11 @@ if _HAS_TRITON:
             last_cf_sm = zero_vec
 
             for m in range(m_rem):
+                m_ok_f = (m < m_act) if USE_RT_FLAGS else True
                 tile_alive = tl.max(tl.where(mask_n, surv_s1, zero_vec), axis=0) > 1e-24
                 if COMPUTE_CF_SURV:
                     tile_alive = tile_alive or (tl.max(tl.where(mask_n, surv_sm, zero_vec), axis=0) > 1e-24)
-                if tile_alive:
+                if m_ok_f & tile_alive:
                     dv = tl.load(d_var_f32_ptr + offs_d * m_rem + m, mask=mask_d, other=0.0)
                     sdv = tl.sqrt(tl.maximum(dv, 0.0))
                     if LAYOUT_MDN:
@@ -4395,16 +5208,26 @@ if _HAS_TRITON:
                     pa = tl.sum(tl.where(mask_d & (offs_d == ia), p_mat, 0.0), axis=0) if need_ratio_k else zero_vec
                     pb = tl.sum(tl.where(mask_d & (offs_d == ib), p_mat, 0.0), axis=0) if need_ratio_k else one_vec
 
-                    w_call = _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa, pb, inv_d_f, d_assets, CALL_CODE)
-                    w_cpn = w_call if CPN_CODE == CALL_CODE else _select_idx_from_stats_f64(
-                        min1, min2, min3, max1, max2, s1, s2, pa, pb, inv_d_f, d_assets, CPN_CODE
-                    )
-                    if m == m_rem - 1:
-                        last_wo = min1 if IS_LONG else _select_idx_from_stats_f64(
-                            min1, min2, min3, max1, max2, s1, s2, pa, pb, inv_d_f, d_assets, EFF_OPT_CODE
+                    if USE_RT_FLAGS:
+                        w_avg_mf = s1 * inv_d_f
+                        w_call = tl.where(rt_call == 0, min1, tl.where(rt_call == 1, max1, w_avg_mf))
+                        w_cpn = tl.where(rt_cpn == 0, min1, tl.where(rt_cpn == 1, max1, w_avg_mf))
+                        is_last_mf = m == m_last
+                        wo_cand_mf = tl.where(f_is_long, min1, tl.where(rt_opt == 0, min1, tl.where(rt_opt == 1, max1, w_avg_mf)))
+                        last_wo = tl.where(is_last_mf, wo_cand_mf, last_wo)
+                        last_avg = tl.where(is_last_mf & f_is_long, w_avg_mf, last_avg)
+                        last_wb = tl.where(is_last_mf & f_has_os, max1, last_wb)
+                    else:
+                        w_call = _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa, pb, inv_d_f, d_assets, CALL_CODE)
+                        w_cpn = w_call if CPN_CODE == CALL_CODE else _select_idx_from_stats_f64(
+                            min1, min2, min3, max1, max2, s1, s2, pa, pb, inv_d_f, d_assets, CPN_CODE
                         )
-                        last_avg = (s1 * inv_d_f) if IS_LONG else zero_vec
-                        last_wb = max1 if HAS_ONE_STAR else zero_vec
+                        if m == m_rem - 1:
+                            last_wo = min1 if IS_LONG else _select_idx_from_stats_f64(
+                                min1, min2, min3, max1, max2, s1, s2, pa, pb, inv_d_f, d_assets, EFF_OPT_CODE
+                            )
+                            last_avg = (s1 * inv_d_f) if IS_LONG else zero_vec
+                            last_wb = max1 if HAS_ONE_STAR else zero_vec
 
                     b_ko = tl.load(ko_bar_f32_ptr + m)
                     is_call_m = tl.load(is_call_f32_ptr + m) > 0.5
@@ -4419,24 +5242,38 @@ if _HAS_TRITON:
                     )
                     b_cp = tl.load(cpn_bar_f32_ptr + m)
                     is_guar_m = tl.load(is_guar_f32_ptr + m) > 0.5
-                    hit_h_s1 = (w_cpn <= b_cp) if CPN_DIR_DOWN else (w_cpn >= b_cp)
-                    gc_hard_s1 = tl.where(hit_h_s1, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
+                    if USE_RT_FLAGS:
+                        hit_h_s1 = tl.where(f_cpn_dn, w_cpn <= b_cp, w_cpn >= b_cp)
+                        gc_hard_s1 = tl.where(f_cpn_out, tl.where(hit_h_s1, zero_vec, one_vec), tl.where(hit_h_s1, one_vec, zero_vec))
+                    else:
+                        hit_h_s1 = (w_cpn <= b_cp) if CPN_DIR_DOWN else (w_cpn >= b_cp)
+                        gc_hard_s1 = tl.where(hit_h_s1, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
                     blo_cp_s1 = tl.minimum(b_cp, b_cp + eff_csp)
                     r_up_s1 = tl.minimum(tl.maximum((w_cpn - blo_cp_s1) * inv_w_cp_s1, zero_vec), one_vec)
-                    hit_s1 = (1.0 - r_up_s1) if CPN_DIR_DOWN else r_up_s1
-                    gc_soft_s1 = (1.0 - hit_s1) if CPN_TYPE_OUT else hit_s1
-                    gc_s1 = tl.where(is_guar_m, one_vec, tl.where(hard_cpn_sp, gc_soft_s1, gc_hard_s1))
-                    eff_gc_s1 = tl.maximum(gc_s1, gk_s1) if FORCE_CPN_AC else gc_s1
+                    if USE_RT_FLAGS:
+                        hit_s1 = tl.where(f_cpn_dn, 1.0 - r_up_s1, r_up_s1)
+                        gc_soft_s1 = tl.where(f_cpn_out, 1.0 - hit_s1, hit_s1)
+                        gc_s1 = tl.where(is_guar_m, one_vec, tl.where(hard_cpn_sp, gc_soft_s1, gc_hard_s1))
+                        eff_gc_s1 = tl.where(f_frc_cpn, tl.maximum(gc_s1, gk_s1), gc_s1)
+                    else:
+                        hit_s1 = (1.0 - r_up_s1) if CPN_DIR_DOWN else r_up_s1
+                        gc_soft_s1 = (1.0 - hit_s1) if CPN_TYPE_OUT else hit_s1
+                        gc_s1 = tl.where(is_guar_m, one_vec, tl.where(hard_cpn_sp, gc_soft_s1, gc_hard_s1))
+                        eff_gc_s1 = tl.maximum(gc_s1, gk_s1) if FORCE_CPN_AC else gc_s1
 
                     c_rate = tl.load(cpn_rates_f32_ptr + m)
                     pm_s1 = surv_s1 * gk_s1
-                    eff_c_s1 = (c_rate + c_mem_s1) if IS_MEM else (zero_vec + c_rate)
+                    eff_c_s1 = (tl.where(f_is_mem, c_rate + c_mem_s1, zero_vec + c_rate) if USE_RT_FLAGS else ((c_rate + c_mem_s1) if IS_MEM else (zero_vec + c_rate)))
                     cpn_cf_s1 = surv_s1 * eff_gc_s1 * eff_c_s1 + pm_s1 * ac_cpn
-                    if IS_MEM:
+                    if USE_RT_FLAGS:
+                        c_mem_s1 = tl.where(f_is_mem, surv_s1 * eff_c_s1 * (1.0 - eff_gc_s1), c_mem_s1)
+                    elif IS_MEM:
                         c_mem_s1 = surv_s1 * eff_c_s1 * (1.0 - eff_gc_s1)
                     df_m = tl.load(df_pay_f32_ptr + m)
                     wf_m = tl.load(w_fund_f32_ptr + m) if w_fund_f32_ptr is not None else 0.0
-                    if NO_NOTIONAL:
+                    if USE_RT_FLAGS:
+                        pv_s1 = pv_s1 + df_m * tl.where(f_no_not, cpn_cf_s1, pm_s1 + cpn_cf_s1) - wf_m * surv_s1
+                    elif NO_NOTIONAL:
                         pv_s1 = pv_s1 + df_m * cpn_cf_s1 - wf_m * surv_s1
                     else:
                         pv_s1 = pv_s1 + df_m * (pm_s1 + cpn_cf_s1) - wf_m * surv_s1
@@ -4464,30 +5301,48 @@ if _HAS_TRITON:
                         lo_cp = tl.where(hard_cpn_sp, tl.minimum(b_cp, b_cp + eff_csp), b_cp - half_eps)
                         hi_cp = tl.where(hard_cpn_sp, tl.maximum(b_cp, b_cp + eff_csp), b_cp + half_eps)
                         ramp_cp = tl.minimum(tl.maximum((w_cpn - lo_cp) / tl.maximum(hi_cp - lo_cp, 1e-12), zero_vec), one_vec)
-                        hit_cp = (1.0 - ramp_cp) if CPN_DIR_DOWN else ramp_cp
-                        ind_cp = (1.0 - hit_cp) if CPN_TYPE_OUT else hit_cp
-                        g_c_sm = tl.where(is_guar_m, one_vec, ind_cp)
-                        eff_gc_sm = tl.maximum(g_c_sm, g_k_sm) if FORCE_CPN_AC else g_c_sm
+                        if USE_RT_FLAGS:
+                            hit_cp = tl.where(f_cpn_dn, 1.0 - ramp_cp, ramp_cp)
+                            ind_cp = tl.where(f_cpn_out, 1.0 - hit_cp, hit_cp)
+                            g_c_sm = tl.where(is_guar_m, one_vec, ind_cp)
+                            eff_gc_sm = tl.where(f_frc_cpn, tl.maximum(g_c_sm, g_k_sm), g_c_sm)
+                        else:
+                            hit_cp = (1.0 - ramp_cp) if CPN_DIR_DOWN else ramp_cp
+                            ind_cp = (1.0 - hit_cp) if CPN_TYPE_OUT else hit_cp
+                            g_c_sm = tl.where(is_guar_m, one_vec, ind_cp)
+                            eff_gc_sm = tl.maximum(g_c_sm, g_k_sm) if FORCE_CPN_AC else g_c_sm
                         p_m_sm = surv_sm * g_k_sm
-                        eff_c_sm = (c_rate + c_mem_sm) if IS_MEM else (zero_vec + c_rate)
+                        eff_c_sm = (tl.where(f_is_mem, c_rate + c_mem_sm, zero_vec + c_rate) if USE_RT_FLAGS else ((c_rate + c_mem_sm) if IS_MEM else (zero_vec + c_rate)))
                         cpn_sm = surv_sm * eff_gc_sm * eff_c_sm + p_m_sm * ac_cpn
-                        cf_sm = cpn_sm if NO_NOTIONAL else (p_m_sm + cpn_sm)
+                        cf_sm = (tl.where(f_no_not, cpn_sm, p_m_sm + cpn_sm) if USE_RT_FLAGS else (cpn_sm if NO_NOTIONAL else (p_m_sm + cpn_sm)))
                         tl.atomic_add(
                             out_cf_surv_ptr + (pid_r * 2 + 1) * m_rem + m,
                             tl.sum(tl.where(mask_n, surv_sm, zero_vec), axis=0).to(tl.float64) * inv_rep_f64,
                         )
-                        if m == m_rem - 1:
+                        if m == m_last:
                             last_cf_sm = cf_sm
                         else:
                             tl.atomic_add(
                                 out_cf_surv_ptr + (pid_r * 2 + 0) * m_rem + m,
                                 tl.sum(tl.where(mask_n, cf_sm, zero_vec), axis=0).to(tl.float64) * inv_rep_f64,
                             )
-                        if IS_MEM:
+                        if USE_RT_FLAGS:
+                            c_mem_sm = tl.where(f_is_mem, surv_sm * eff_c_sm * (1.0 - eff_gc_sm), c_mem_sm)
+                        elif IS_MEM:
                             c_mem_sm = surv_sm * eff_c_sm * (1.0 - eff_gc_sm)
                         surv_sm = tl.maximum(surv_sm - p_m_sm, zero_vec)
 
-            if KI_ACTIVE:
+            if USE_RT_FLAGS:
+                sp_ki_pos = tl.abs(ki_spread) > 1e-6
+                b_ki_mf = tl.where(f_is_long, strike, ki_barrier)
+                blo_k = tl.minimum(b_ki_mf, b_ki_mf + ki_spread)
+                bhi_k = tl.where(sp_ki_pos, tl.maximum(b_ki_mf, b_ki_mf + ki_spread), b_ki_mf + 0.5 * eps_term)
+                inv_wk = 1.0 / tl.maximum(tl.where(sp_ki_pos, bhi_k - blo_k, eps_term), 1e-12)
+                i_ki_act = tl.minimum(tl.maximum((bhi_k - last_wo) * inv_wk, zero_vec), one_vec)
+                ki_off = tl.where(f_has_ki, zero_vec + i_ki_past, one_vec)
+                i_ki = tl.where(f_ki_act, i_ki_act, ki_off)
+                ki_gate_s1 = tl.where(f_ki_act, tl.where(sp_ki_pos, i_ki_act, tl.where(last_wo < b_ki_mf, one_vec, zero_vec)), ki_off)
+            elif KI_ACTIVE:
                 sp_ki_pos = tl.abs(ki_spread) > 1e-6
                 if IS_LONG:
                     blo_k = tl.minimum(strike, strike + ki_spread)
@@ -4505,7 +5360,12 @@ if _HAS_TRITON:
                 i_ki = (zero_vec + i_ki_past) if HAS_KI else one_vec
                 ki_gate_s1 = i_ki
 
-            if HAS_ONE_STAR:
+            if USE_RT_FLAGS:
+                os_soft = one_star_eps > 1e-6
+                inv_wos = 1.0 / tl.maximum(one_star_eps, 1e-12)
+                u_os = (last_wb - (one_star_strike - 0.5 * one_star_eps)) * inv_wos
+                star_ind = tl.where(f_has_os, tl.where(os_soft, tl.minimum(tl.maximum(u_os, zero_vec), one_vec), tl.where(last_wb >= one_star_strike, one_vec, zero_vec)), zero_vec)
+            elif HAS_ONE_STAR:
                 os_soft = one_star_eps > 1e-6
                 inv_wos = 1.0 / tl.maximum(one_star_eps, 1e-12)
                 u_os = (last_wb - (one_star_strike - 0.5 * one_star_eps)) * inv_wos
@@ -4517,30 +5377,45 @@ if _HAS_TRITON:
             else:
                 star_ind = zero_vec
 
-            has_pc = (part_call_rate != 0.0) if HAS_PART_CALL else False
+            has_pc = (f_has_pc & (part_call_rate != 0.0)) if USE_RT_FLAGS else ((part_call_rate != 0.0) if HAS_PART_CALL else False)
             call_intr = tl.maximum(last_wo - part_call_strike, zero_vec)
-            os_cpn_mask = (one_star_coupon != 0.0) if HAS_ONE_STAR else False
+            os_cpn_mask = (f_has_os & (one_star_coupon != 0.0)) if USE_RT_FLAGS else ((one_star_coupon != 0.0) if HAS_ONE_STAR else False)
 
-            if IS_LONG:
-                u_put_s1 = surv_s1 * ki_gate_s1 * (1.0 - star_ind) * (1.0 - last_avg)
-                put_term_s1 = -u_put_s1
-                put_mask = zero_vec > 1.0
-                put_intr = zero_vec
+            if USE_RT_FLAGS:
+                u_put_long = surv_s1 * ki_gate_s1 * (1.0 - star_ind) * (1.0 - last_avg)
+                put_intr_s = tl.where(f_has_low, tl.maximum(strike - last_wo, zero_vec) - tl.maximum(lower_strike - last_wo, zero_vec), tl.maximum(strike - last_wo, zero_vec))
+                put_mask_s = tl.where(f_has_low, (strike > lower_strike) & (option_gearing > 0.0), option_gearing > 0.0)
+                u_put_short = tl.where(put_mask_s, surv_s1 * ki_gate_s1 * (1.0 - star_ind) * put_intr_s, zero_vec)
+                u_put_s1 = tl.where(f_is_long, u_put_long, u_put_short)
+                put_term_s1 = tl.where(f_is_long, -u_put_long, -option_gearing * u_put_short)
+                put_mask = tl.where(f_is_long, zero_vec > 1.0, put_mask_s)
+                put_intr = tl.where(f_is_long, zero_vec, put_intr_s)
+                u_call_s1 = tl.where(has_pc, surv_s1 * call_intr, zero_vec)
+                p_os_s1 = tl.where(f_has_os, surv_s1 * star_ind, zero_vec)
+                l_os_s1 = tl.where(os_cpn_mask, p_os_s1 * one_star_coupon, zero_vec)
+                opt_s1 = put_term_s1 + tl.where(has_pc, part_call_rate * u_call_s1, zero_vec) + l_os_s1
+                term_s1 = (surv_s1 * tl.where(f_no_not, 0.0, 1.0)) + opt_s1
             else:
-                if HAS_LOWER_STRIKE:
-                    put_mask = (strike > lower_strike) & (option_gearing > 0.0)
-                    put_intr = tl.maximum(strike - last_wo, zero_vec) - tl.maximum(lower_strike - last_wo, zero_vec)
+                if IS_LONG:
+                    u_put_s1 = surv_s1 * ki_gate_s1 * (1.0 - star_ind) * (1.0 - last_avg)
+                    put_term_s1 = -u_put_s1
+                    put_mask = zero_vec > 1.0
+                    put_intr = zero_vec
                 else:
-                    put_mask = option_gearing > 0.0
-                    put_intr = tl.maximum(strike - last_wo, zero_vec)
-                u_put_s1 = tl.where(put_mask, surv_s1 * ki_gate_s1 * (1.0 - star_ind) * put_intr, zero_vec)
-                put_term_s1 = -option_gearing * u_put_s1
+                    if HAS_LOWER_STRIKE:
+                        put_mask = (strike > lower_strike) & (option_gearing > 0.0)
+                        put_intr = tl.maximum(strike - last_wo, zero_vec) - tl.maximum(lower_strike - last_wo, zero_vec)
+                    else:
+                        put_mask = option_gearing > 0.0
+                        put_intr = tl.maximum(strike - last_wo, zero_vec)
+                    u_put_s1 = tl.where(put_mask, surv_s1 * ki_gate_s1 * (1.0 - star_ind) * put_intr, zero_vec)
+                    put_term_s1 = -option_gearing * u_put_s1
 
-            u_call_s1 = tl.where(has_pc, surv_s1 * call_intr, zero_vec)
-            p_os_s1 = tl.where(HAS_ONE_STAR, surv_s1 * star_ind, zero_vec)
-            l_os_s1 = tl.where(os_cpn_mask, p_os_s1 * one_star_coupon, zero_vec)
-            opt_s1 = put_term_s1 + (part_call_rate * u_call_s1 if has_pc else zero_vec) + l_os_s1
-            term_s1 = (surv_s1 * (0.0 if NO_NOTIONAL else 1.0)) + opt_s1
+                u_call_s1 = tl.where(has_pc, surv_s1 * call_intr, zero_vec)
+                p_os_s1 = tl.where(HAS_ONE_STAR, surv_s1 * star_ind, zero_vec)
+                l_os_s1 = tl.where(os_cpn_mask, p_os_s1 * one_star_coupon, zero_vec)
+                opt_s1 = put_term_s1 + (part_call_rate * u_call_s1 if has_pc else zero_vec) + l_os_s1
+                term_s1 = (surv_s1 * (0.0 if NO_NOTIONAL else 1.0)) + opt_s1
             pv_s1 = pv_s1 + df_last * term_s1
 
             base_c = pid_r * n_s1_cols + 3 * m_rem
@@ -4552,13 +5427,15 @@ if _HAS_TRITON:
 
             if COMPUTE_CF_SURV and (out_cf_surv_ptr is not None):
                 opt_sm = zero_vec
-                if IS_LONG:
+                if USE_RT_FLAGS:
+                    opt_sm = tl.where(f_is_long, opt_sm - (1.0 - last_avg) * i_ki * (1.0 - star_ind), tl.where(put_mask, opt_sm - option_gearing * i_ki * (1.0 - star_ind) * put_intr, opt_sm))
+                elif IS_LONG:
                     opt_sm = opt_sm - (1.0 - last_avg) * i_ki * (1.0 - star_ind)
                 else:
                     opt_sm = tl.where(put_mask, opt_sm - option_gearing * i_ki * (1.0 - star_ind) * put_intr, opt_sm)
                 opt_sm = tl.where(has_pc, opt_sm + part_call_rate * call_intr, opt_sm)
                 opt_sm = tl.where(os_cpn_mask, opt_sm + star_ind * one_star_coupon, opt_sm)
-                cf_tail = surv_sm * (opt_sm if NO_NOTIONAL else (1.0 + opt_sm))
+                cf_tail = surv_sm * (tl.where(f_no_not, opt_sm, 1.0 + opt_sm) if USE_RT_FLAGS else (opt_sm if NO_NOTIONAL else (1.0 + opt_sm)))
                 tl.atomic_add(
                     out_cf_surv_ptr + (pid_r * 2 + 0) * m_rem + m_last,
                     tl.sum(tl.where(mask_n, last_cf_sm + cf_tail, zero_vec), axis=0).to(tl.float64) * inv_rep_f64,
@@ -4595,22 +5472,26 @@ if _HAS_TRITON:
         d_assets,
         m_rem,
         n_total,
-        CALL_CODE: tl.constexpr,
-        CPN_CODE: tl.constexpr,
-        EFF_OPT_CODE: tl.constexpr,
-        HAS_KI: tl.constexpr,
-        KI_ACTIVE: tl.constexpr,
-        HAS_ONE_STAR: tl.constexpr,
-        IS_MEM: tl.constexpr,
-        NO_NOTIONAL: tl.constexpr,
-        FORCE_CPN_AC: tl.constexpr,
-        CPN_DIR_DOWN: tl.constexpr,
-        CPN_TYPE_OUT: tl.constexpr,
-        HAS_LOWER_STRIKE: tl.constexpr,
-        HAS_PART_CALL: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        cg_flags_ptr=None,
+        CALL_CODE: tl.constexpr = 0,
+        CPN_CODE: tl.constexpr = 0,
+        EFF_OPT_CODE: tl.constexpr = 0,
+        HAS_KI: tl.constexpr = False,
+        KI_ACTIVE: tl.constexpr = False,
+        HAS_ONE_STAR: tl.constexpr = False,
+        IS_MEM: tl.constexpr = False,
+        NO_NOTIONAL: tl.constexpr = False,
+        FORCE_CPN_AC: tl.constexpr = False,
+        CPN_DIR_DOWN: tl.constexpr = False,
+        CPN_TYPE_OUT: tl.constexpr = False,
+        HAS_LOWER_STRIKE: tl.constexpr = True,
+        HAS_PART_CALL: tl.constexpr = False,
+        BLOCK_N: tl.constexpr = 128,
         USE_F32_PRE: tl.constexpr = False,
         IS_LONG: tl.constexpr = False,
+        USE_RT_FLAGS: tl.constexpr = False,
+        D_PAD: tl.constexpr = 0,
+        N_SUB_PAD: tl.constexpr = 8,
     ):
         pid_n = tl.program_id(0)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -4618,7 +5499,49 @@ if _HAS_TRITON:
         zero_vec = tl.zeros((BLOCK_N,), dtype=tl.float64)
         one_vec = tl.full((BLOCK_N,), 1.0, dtype=tl.float64)
         scale = 1.0 / (tl.zeros((), dtype=tl.float64) + n_total)
-        inv_d_f = 1.0 / (tl.zeros((), dtype=tl.float64) + d_assets)
+        if USE_RT_FLAGS:
+            d_act = tl.load(cg_flags_ptr + 0)
+            m_act = tl.load(cg_flags_ptr + 1)
+            rt_call = tl.load(cg_flags_ptr + 2)
+            rt_cpn = tl.load(cg_flags_ptr + 3)
+            rt_opt = tl.load(cg_flags_ptr + 4)
+            f_has_ki = tl.load(cg_flags_ptr + 5) != 0
+            f_ki_act = tl.load(cg_flags_ptr + 6) != 0
+            f_has_os = tl.load(cg_flags_ptr + 7) != 0
+            f_is_mem = tl.load(cg_flags_ptr + 8) != 0
+            f_is_long = tl.load(cg_flags_ptr + 9) != 0
+            f_no_not = tl.load(cg_flags_ptr + 10) != 0
+            f_frc_cpn = tl.load(cg_flags_ptr + 11) != 0
+            f_cpn_dn = tl.load(cg_flags_ptr + 12) != 0
+            f_cpn_out = tl.load(cg_flags_ptr + 13) != 0
+            f_has_low = tl.load(cg_flags_ptr + 14) != 0
+            f_has_pc = tl.load(cg_flags_ptr + 15) != 0
+            eff_vib_start = tl.load(cg_flags_ptr + 20)
+            eff_vib_n = tl.load(cg_flags_ptr + 21)
+            eff_df_last = tl.load(scalar_f64_ptr + 15)
+            eff_h_vib = tl.load(scalar_f64_ptr + 16)
+        else:
+            d_act = d_assets
+            m_act = m_rem
+            rt_call = CALL_CODE
+            rt_cpn = CPN_CODE
+            rt_opt = EFF_OPT_CODE
+            f_has_ki = HAS_KI
+            f_ki_act = KI_ACTIVE
+            f_has_os = HAS_ONE_STAR
+            f_is_mem = IS_MEM
+            f_is_long = IS_LONG
+            f_no_not = NO_NOTIONAL
+            f_frc_cpn = FORCE_CPN_AC
+            f_cpn_dn = CPN_DIR_DOWN
+            f_cpn_out = CPN_TYPE_OUT
+            f_has_low = HAS_LOWER_STRIKE
+            f_has_pc = HAS_PART_CALL
+            eff_vib_start = vib_step_start
+            eff_vib_n = vib_n_steps
+            eff_df_last = df_last
+            eff_h_vib = h_vib
+        inv_d_f = 1.0 / tl.maximum(tl.zeros((), dtype=tl.float64) + d_act, 1.0)
 
         ko_spread = tl.load(scalar_f64_ptr + 0)
         cpn_spread = tl.load(scalar_f64_ptr + 1)
@@ -4637,11 +5560,11 @@ if _HAS_TRITON:
         one_star_coupon = tl.load(scalar_f64_ptr + 14)
 
         ia = tl.load(inv_perm_ptr + 0).to(tl.int32)
-        ib_idx = tl.where(d_assets > 1, 1, 0)
+        ib_idx = tl.where(d_act > 1, 1, 0)
         ib = tl.load(inv_perm_ptr + ib_idx).to(tl.int32)
 
         hard_ko_sp = tl.abs(ko_spread) > 1e-6
-        eff_csp = -cpn_spread if CPN_DIR_DOWN else cpn_spread
+        eff_csp = tl.where(f_cpn_dn, -cpn_spread, cpn_spread) if USE_RT_FLAGS else (-cpn_spread if CPN_DIR_DOWN else cpn_spread)
         hard_cpn_sp = tl.abs(eff_csp) > 1e-6
         hard_ki_sp = tl.abs(ki_spread) > 1e-6
         blo_ki_k = tl.minimum(ki_barrier, ki_barrier + ki_spread)
@@ -4682,31 +5605,40 @@ if _HAS_TRITON:
         zero_p = tl.zeros((BLOCK_N,), dtype=PRE_DTYPE)
         one_p = tl.full((BLOCK_N,), 1.0, dtype=PRE_DTYPE)
         tiny_p = tl.zeros((), dtype=PRE_DTYPE) + 1e-12
-        inv_d_p = 1.0 / (tl.zeros((), dtype=PRE_DTYPE) + d_assets)
+        inv_d_p = 1.0 / tl.maximum(tl.zeros((), dtype=PRE_DTYPE) + d_act, 1.0)
         ko_sp_p = ko_spread.to(PRE_DTYPE)
         eff_csp_p = eff_csp.to(PRE_DTYPE)
         surv_pre_p = one_p
         c_mem_p = tl.full((BLOCK_N,), c_mem_0.to(PRE_DTYPE), dtype=PRE_DTYPE)
-        m_last = m_rem - 1
-        for d_init in range(2 * d_assets if IS_MEM else d_assets):
+        m_last = m_act - 1
+        n_init_d: tl.constexpr = (2 * D_PAD) if USE_RT_FLAGS else (2 * d_assets if IS_MEM else d_assets)
+        for d_init in range(n_init_d):
             tl.store(d_ln_surv_tmp_ptr + d_init * n_total + offs_n, zero_p, mask=mask_n)
 
-        for m in range(m_last):
-            if tl.max(surv_pre_p, axis=0) > 1e-24:
+        for m in range(m_rem - 1):
+            m_ok_p = (m < m_last) if USE_RT_FLAGS else True
+            if m_ok_p & (tl.max(surv_pre_p, axis=0) > 1e-24):
                 m_off = m * d_assets
-                min1, min2, min3, idx_min1, idx_min2, idx_min3, max1, max2, idx_max1, idx_max2, s1, s2, pa_r, pb_r = _eval_idx_base_stats_f64(
-                    perf_ptr, m_off, ia, ib, offs_n, mask_n, d_assets, n_total,
-                    need_min1_k or need_min2_k or need_min3_k,
-                    need_min2_k, need_min3_k,
-                    need_max1_k or need_max2_k,
-                    need_max2_k,
-                    need_sum1_k or need_sum2_k,
-                    need_sum2_k,
-                    need_ratio_k,
-                    PRE_DTYPE,
-                )
-                w_call = _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa_r, pb_r, inv_d_p, d_assets, CALL_CODE)
-                w_cpn = w_call if CPN_CODE == CALL_CODE else _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa_r, pb_r, inv_d_p, d_assets, CPN_CODE)
+                if USE_RT_FLAGS:
+                    min1, idx_min1, max1, idx_max1, w_avg_p0, _ = _eval_idx_base_stats_012_f64(
+                        perf_ptr, m_off, offs_n, mask_n, d_act, n_total, D_PAD, PRE_DTYPE
+                    )
+                    w_call = tl.where(rt_call == 0, min1, tl.where(rt_call == 1, max1, w_avg_p0))
+                    w_cpn = tl.where(rt_cpn == 0, min1, tl.where(rt_cpn == 1, max1, w_avg_p0))
+                else:
+                    min1, min2, min3, idx_min1, idx_min2, idx_min3, max1, max2, idx_max1, idx_max2, s1, s2, pa_r, pb_r = _eval_idx_base_stats_f64(
+                        perf_ptr, m_off, ia, ib, offs_n, mask_n, d_assets, n_total,
+                        need_min1_k or need_min2_k or need_min3_k,
+                        need_min2_k, need_min3_k,
+                        need_max1_k or need_max2_k,
+                        need_max2_k,
+                        need_sum1_k or need_sum2_k,
+                        need_sum2_k,
+                        need_ratio_k,
+                        PRE_DTYPE,
+                    )
+                    w_call = _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa_r, pb_r, inv_d_p, d_assets, CALL_CODE)
+                    w_cpn = w_call if CPN_CODE == CALL_CODE else _select_idx_from_stats_f64(min1, min2, min3, max1, max2, s1, s2, pa_r, pb_r, inv_d_p, d_assets, CPN_CODE)
 
                 eps_m = tl.load(eps_vec_ptr + m).to(PRE_DTYPE)
                 b_ko = tl.load(ko_bar_ptr + m).to(PRE_DTYPE)
@@ -4726,13 +5658,23 @@ if _HAS_TRITON:
                 t_cp = (w_cpn - lo_cp) * inv_w_cp
                 ramp_c2 = _triton_c2_s5(t_cp)
                 dramp_c2_dw = _triton_c2_ds5(t_cp) * inv_w_cp
-                hit_c2 = (1.0 - ramp_c2) if CPN_DIR_DOWN else ramp_c2
-                ind_c2 = (1.0 - hit_c2) if CPN_TYPE_OUT else hit_c2
+                if USE_RT_FLAGS:
+                    hit_c2 = tl.where(f_cpn_dn, 1.0 - ramp_c2, ramp_c2)
+                    ind_c2 = tl.where(f_cpn_out, 1.0 - hit_c2, hit_c2)
+                    sign_cpn_k_rt = (tl.where(f_cpn_dn, -1.0, 1.0) * tl.where(f_cpn_out, -1.0, 1.0)).to(PRE_DTYPE)
+                else:
+                    hit_c2 = (1.0 - ramp_c2) if CPN_DIR_DOWN else ramp_c2
+                    ind_c2 = (1.0 - hit_c2) if CPN_TYPE_OUT else hit_c2
+                    sign_cpn_k: tl.constexpr = (-1.0 if CPN_DIR_DOWN else 1.0) * (-1.0 if CPN_TYPE_OUT else 1.0)
+                    sign_cpn_k_rt = tl.zeros((), dtype=PRE_DTYPE) + sign_cpn_k
                 is_guar_m = tl.load(is_guar_ptr + m) > 0.5
                 g_c = tl.where(is_guar_m, one_p, ind_c2)
-                sign_cpn_k: tl.constexpr = (-1.0 if CPN_DIR_DOWN else 1.0) * (-1.0 if CPN_TYPE_OUT else 1.0)
-                dg_c_dw = tl.where(is_guar_m, zero_p, dramp_c2_dw * sign_cpn_k)
-                if FORCE_CPN_AC:
+                dg_c_dw = tl.where(is_guar_m, zero_p, dramp_c2_dw * sign_cpn_k_rt)
+                if USE_RT_FLAGS:
+                    w_c_max_m = tl.where(f_frc_cpn, tl.where(g_c > g_k, one_p, tl.where(g_c < g_k, zero_p, 0.5 * one_p)), one_p)
+                    w_k_max_m = 1.0 - w_c_max_m
+                    eff_gc = tl.where(f_frc_cpn, tl.maximum(g_c, g_k), g_c)
+                elif FORCE_CPN_AC:
                     eff_gc = tl.maximum(g_c, g_k)
                     w_c_max_m = tl.where(g_c > g_k, one_p, tl.where(g_c < g_k, zero_p, 0.5 * one_p))
                     w_k_max_m = 1.0 - w_c_max_m
@@ -4741,68 +5683,103 @@ if _HAS_TRITON:
                     w_c_max_m = one_p
                     w_k_max_m = zero_p
                 c_rate = tl.load(cpn_rates_ptr + m).to(PRE_DTYPE)
-                eff_c_m = (c_rate + c_mem_p) if IS_MEM else zero_p
-                if IS_MEM:
+                eff_c_m = (tl.where(f_is_mem, c_rate + c_mem_p, zero_p) if USE_RT_FLAGS else ((c_rate + c_mem_p) if IS_MEM else zero_p))
+                if USE_RT_FLAGS:
+                    c_mem_p = tl.where(f_is_mem, eff_c_m * (1.0 - eff_gc), c_mem_p)
+                elif IS_MEM:
                     c_mem_p = eff_c_m * (1.0 - eff_gc)
                 surv_pre_p = tl.maximum(surv_pre_p - surv_pre_p * g_k, zero_p)
 
-                w_avg_v = s1 * inv_d_p
-                w_disp_v = tl.sqrt(tl.maximum(s2 * inv_d_p - w_avg_v * w_avg_v, 0.0))
-                for d in range(d_assets):
-                    pd = tl.load(perf_ptr + (m_off + d) * n_total + offs_n, mask=mask_n, other=1.0).to(PRE_DTYPE)
-                    cdl_md = tl.load(cdl_m_ptr + m * d_assets + d).to(PRE_DTYPE)
-                    bp_d = _accum_idx_grad_f64(
-                        zero_p, coef_surv_m, pd, d, d_assets, inv_d_p, ia, ib,
-                        min1, max1, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
-                        CALL_CODE,
-                    )
-                    prev_dlns = tl.load(d_ln_surv_tmp_ptr + d * n_total + offs_n, mask=mask_n, other=0.0).to(PRE_DTYPE)
-                    tl.store(d_ln_surv_tmp_ptr + d * n_total + offs_n, prev_dlns + bp_d * pd * cdl_md, mask=mask_n)
-                    if IS_MEM:
-                        if CPN_CODE == CALL_CODE:
-                            bar_wc_cm = (w_c_max_m * dg_c_dw + w_k_max_m * dg_k_dw) if FORCE_CPN_AC else dg_c_dw
-                            bp_cm = _accum_idx_grad_f64(
-                                zero_p, bar_wc_cm, pd, d, d_assets, inv_d_p, ia, ib,
-                                min1, max1, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
-                                CALL_CODE,
-                            )
-                        else:
-                            bp_cm = _accum_idx_grad_f64(
-                                zero_p, w_c_max_m * dg_c_dw, pd, d, d_assets, inv_d_p, ia, ib,
-                                min1, max1, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
-                                CPN_CODE,
-                            )
-                            if FORCE_CPN_AC:
+                if USE_RT_FLAGS:
+                    for d in range(D_PAD):
+                        if d < d_act:
+                            pd = tl.load(perf_ptr + (m_off + d) * n_total + offs_n, mask=mask_n, other=1.0).to(PRE_DTYPE)
+                            cdl_md = tl.load(cdl_m_ptr + m * d_assets + d).to(PRE_DTYPE)
+                            bp_d = tl.where(rt_call == 0, tl.where(d == idx_min1, coef_surv_m, zero_p), tl.where(rt_call == 1, tl.where(d == idx_max1, coef_surv_m, zero_p), coef_surv_m * inv_d_p))
+                            prev_dlns = tl.load(d_ln_surv_tmp_ptr + d * n_total + offs_n, mask=mask_n, other=0.0).to(PRE_DTYPE)
+                            tl.store(d_ln_surv_tmp_ptr + d * n_total + offs_n, prev_dlns + bp_d * pd * cdl_md, mask=mask_n)
+                            if f_is_mem:
+                                w_c_cm = w_c_max_m * dg_c_dw
+                                w_k_cm = w_k_max_m * dg_k_dw
+                                bp_cm = (
+                                    tl.where(rt_cpn == 0, tl.where(d == idx_min1, w_c_cm, zero_p), tl.where(rt_cpn == 1, tl.where(d == idx_max1, w_c_cm, zero_p), w_c_cm * inv_d_p))
+                                    + tl.where(rt_call == 0, tl.where(d == idx_min1, w_k_cm, zero_p), tl.where(rt_call == 1, tl.where(d == idx_max1, w_k_cm, zero_p), w_k_cm * inv_d_p))
+                                )
+                                d_eff_gc_d = bp_cm * pd * cdl_md
+                                prev_dcm = tl.load(d_ln_surv_tmp_ptr + (d_assets + d) * n_total + offs_n, mask=mask_n, other=0.0).to(PRE_DTYPE)
+                                tl.store(
+                                    d_ln_surv_tmp_ptr + (d_assets + d) * n_total + offs_n,
+                                    prev_dcm * (1.0 - eff_gc) - eff_c_m * d_eff_gc_d,
+                                    mask=mask_n,
+                                )
+                else:
+                    w_avg_v = s1 * inv_d_p
+                    w_disp_v = tl.sqrt(tl.maximum(s2 * inv_d_p - w_avg_v * w_avg_v, 0.0))
+                    for d in range(d_assets):
+                        pd = tl.load(perf_ptr + (m_off + d) * n_total + offs_n, mask=mask_n, other=1.0).to(PRE_DTYPE)
+                        cdl_md = tl.load(cdl_m_ptr + m * d_assets + d).to(PRE_DTYPE)
+                        bp_d = _accum_idx_grad_f64(
+                            zero_p, coef_surv_m, pd, d, d_assets, inv_d_p, ia, ib,
+                            min1, max1, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
+                            CALL_CODE,
+                        )
+                        prev_dlns = tl.load(d_ln_surv_tmp_ptr + d * n_total + offs_n, mask=mask_n, other=0.0).to(PRE_DTYPE)
+                        tl.store(d_ln_surv_tmp_ptr + d * n_total + offs_n, prev_dlns + bp_d * pd * cdl_md, mask=mask_n)
+                        if IS_MEM:
+                            if CPN_CODE == CALL_CODE:
+                                bar_wc_cm = (w_c_max_m * dg_c_dw + w_k_max_m * dg_k_dw) if FORCE_CPN_AC else dg_c_dw
                                 bp_cm = _accum_idx_grad_f64(
-                                    bp_cm, w_k_max_m * dg_k_dw, pd, d, d_assets, inv_d_p, ia, ib,
+                                    zero_p, bar_wc_cm, pd, d, d_assets, inv_d_p, ia, ib,
                                     min1, max1, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
                                     CALL_CODE,
                                 )
-                        d_eff_gc_d = bp_cm * pd * cdl_md
-                        prev_dcm = tl.load(d_ln_surv_tmp_ptr + (d_assets + d) * n_total + offs_n, mask=mask_n, other=0.0).to(PRE_DTYPE)
-                        tl.store(
-                            d_ln_surv_tmp_ptr + (d_assets + d) * n_total + offs_n,
-                            prev_dcm * (1.0 - eff_gc) - eff_c_m * d_eff_gc_d,
-                            mask=mask_n,
-                        )
+                            else:
+                                bp_cm = _accum_idx_grad_f64(
+                                    zero_p, w_c_max_m * dg_c_dw, pd, d, d_assets, inv_d_p, ia, ib,
+                                    min1, max1, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
+                                    CPN_CODE,
+                                )
+                                if FORCE_CPN_AC:
+                                    bp_cm = _accum_idx_grad_f64(
+                                        bp_cm, w_k_max_m * dg_k_dw, pd, d, d_assets, inv_d_p, ia, ib,
+                                        min1, max1, w_avg_v, w_disp_v, idx_min1, idx_min2, idx_min3, idx_max1, idx_max2, pa_r, pb_r,
+                                        CALL_CODE,
+                                    )
+                            d_eff_gc_d = bp_cm * pd * cdl_md
+                            prev_dcm = tl.load(d_ln_surv_tmp_ptr + (d_assets + d) * n_total + offs_n, mask=mask_n, other=0.0).to(PRE_DTYPE)
+                            tl.store(
+                                d_ln_surv_tmp_ptr + (d_assets + d) * n_total + offs_n,
+                                prev_dcm * (1.0 - eff_gc) - eff_c_m * d_eff_gc_d,
+                                mask=mask_n,
+                            )
         surv_pre = surv_pre_p.to(tl.float64)
         c_mem = c_mem_p.to(tl.float64)
 
         if frozen_term_out_ptr is not None:
-            if m_rem > 1:
+            if m_act > 1:
                 m_off_last = m_last * d_assets
-                min1_b, min2_b, min3_b, _, _, _, max1_b, max2_b, _, _, s1_b, s2_b, pa_b, pb_b = _eval_idx_base_stats_f64(
-                    perf_ptr, m_off_last, ia, ib, offs_n, mask_n, d_assets, n_total,
-                    need_min1_k or need_min2_k or need_min3_k,
-                    need_min2_k, need_min3_k,
-                    need_max1_k or need_max2_k, need_max2_k,
-                    need_sum1_k or need_sum2_k, need_sum2_k, need_ratio_k,
-                )
-                wc_b = _select_idx_from_stats_f64(min1_b, min2_b, min3_b, max1_b, max2_b, s1_b, s2_b, pa_b, pb_b, inv_d_f, d_assets, CALL_CODE)
-                wcp_b = wc_b if CPN_CODE == CALL_CODE else _select_idx_from_stats_f64(min1_b, min2_b, min3_b, max1_b, max2_b, s1_b, s2_b, pa_b, pb_b, inv_d_f, d_assets, CPN_CODE)
-                wo_b = min1_b if IS_LONG else (wc_b if EFF_OPT_CODE == CALL_CODE else (wcp_b if EFF_OPT_CODE == CPN_CODE else _select_idx_from_stats_f64(min1_b, min2_b, min3_b, max1_b, max2_b, s1_b, s2_b, pa_b, pb_b, inv_d_f, d_assets, EFF_OPT_CODE)))
-                avg_b = (s1_b * inv_d_f) if IS_LONG else zero_vec
-                wb_b = max1_b if HAS_ONE_STAR else zero_vec
+                if USE_RT_FLAGS:
+                    min1_b, _, max1_b, _, w_avg_b, _ = _eval_idx_base_stats_012_f64(
+                        perf_ptr, m_off_last, offs_n, mask_n, d_act, n_total, D_PAD, tl.float64
+                    )
+                    wc_b = tl.where(rt_call == 0, min1_b, tl.where(rt_call == 1, max1_b, w_avg_b))
+                    wcp_b = tl.where(rt_cpn == 0, min1_b, tl.where(rt_cpn == 1, max1_b, w_avg_b))
+                    wo_b = tl.where(f_is_long, min1_b, tl.where(rt_opt == 0, min1_b, tl.where(rt_opt == 1, max1_b, w_avg_b)))
+                    avg_b = tl.where(f_is_long, w_avg_b, zero_vec)
+                    wb_b = tl.where(f_has_os, max1_b, zero_vec)
+                else:
+                    min1_b, min2_b, min3_b, _, _, _, max1_b, max2_b, _, _, s1_b, s2_b, pa_b, pb_b = _eval_idx_base_stats_f64(
+                        perf_ptr, m_off_last, ia, ib, offs_n, mask_n, d_assets, n_total,
+                        need_min1_k or need_min2_k or need_min3_k,
+                        need_min2_k, need_min3_k,
+                        need_max1_k or need_max2_k, need_max2_k,
+                        need_sum1_k or need_sum2_k, need_sum2_k, need_ratio_k,
+                    )
+                    wc_b = _select_idx_from_stats_f64(min1_b, min2_b, min3_b, max1_b, max2_b, s1_b, s2_b, pa_b, pb_b, inv_d_f, d_assets, CALL_CODE)
+                    wcp_b = wc_b if CPN_CODE == CALL_CODE else _select_idx_from_stats_f64(min1_b, min2_b, min3_b, max1_b, max2_b, s1_b, s2_b, pa_b, pb_b, inv_d_f, d_assets, CPN_CODE)
+                    wo_b = min1_b if IS_LONG else (wc_b if EFF_OPT_CODE == CALL_CODE else (wcp_b if EFF_OPT_CODE == CPN_CODE else _select_idx_from_stats_f64(min1_b, min2_b, min3_b, max1_b, max2_b, s1_b, s2_b, pa_b, pb_b, inv_d_f, d_assets, EFF_OPT_CODE)))
+                    avg_b = (s1_b * inv_d_f) if IS_LONG else zero_vec
+                    wb_b = max1_b if HAS_ONE_STAR else zero_vec
 
                 b_ko_l = tl.load(ko_bar_ptr + m_last)
                 is_c_l = tl.load(is_call_ptr + m_last) > 0.5
@@ -4813,58 +5790,87 @@ if _HAS_TRITON:
                 )
                 b_cp_l = tl.load(cpn_bar_ptr + m_last)
                 is_g_l = tl.load(is_guar_ptr + m_last) > 0.5
-                hit_hl = (wcp_b <= b_cp_l) if CPN_DIR_DOWN else (wcp_b >= b_cp_l)
-                gc_hl = tl.where(hit_hl, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
-                blo_cpl = tl.minimum(b_cp_l, b_cp_l + eff_csp)
-                r_upl = tl.minimum(tl.maximum((wcp_b - blo_cpl) * inv_sp_cp, zero_vec), one_vec)
-                hit_sl = (1.0 - r_upl) if CPN_DIR_DOWN else r_upl
-                gc_sl = (1.0 - hit_sl) if CPN_TYPE_OUT else hit_sl
-                gc_l = tl.where(is_g_l, one_vec, tl.where(hard_cpn_sp, gc_sl, gc_hl))
-                egc_l = tl.maximum(gc_l, gk_l) if FORCE_CPN_AC else gc_l
+                if USE_RT_FLAGS:
+                    hit_hl = tl.where(f_cpn_dn, wcp_b <= b_cp_l, wcp_b >= b_cp_l)
+                    gc_hl = tl.where(f_cpn_out, tl.where(hit_hl, zero_vec, one_vec), tl.where(hit_hl, one_vec, zero_vec))
+                    blo_cpl = tl.minimum(b_cp_l, b_cp_l + eff_csp)
+                    r_upl = tl.minimum(tl.maximum((wcp_b - blo_cpl) * inv_sp_cp, zero_vec), one_vec)
+                    hit_sl = tl.where(f_cpn_dn, 1.0 - r_upl, r_upl)
+                    gc_sl = tl.where(f_cpn_out, 1.0 - hit_sl, hit_sl)
+                    gc_l = tl.where(is_g_l, one_vec, tl.where(hard_cpn_sp, gc_sl, gc_hl))
+                    egc_l = tl.where(f_frc_cpn, tl.maximum(gc_l, gk_l), gc_l)
 
-                if IS_LONG and KI_ACTIVE:
-                    blo_kl = tl.minimum(strike, strike + ki_spread)
-                    bhi_kl = tl.maximum(strike, strike + ki_spread)
+                    b_kil = tl.where(f_is_long, strike, ki_barrier)
+                    blo_kl = tl.minimum(b_kil, b_kil + ki_spread)
+                    bhi_kl = tl.maximum(b_kil, b_kil + ki_spread)
                     inv_wkl = 1.0 / tl.maximum(bhi_kl - blo_kl, 1e-12)
-                    ki_g_l = tl.where(hard_ki_sp, tl.minimum(tl.maximum((bhi_kl - wo_b) * inv_wkl, zero_vec), one_vec), tl.where(wo_b < strike, one_vec, zero_vec))
+                    ki_act_l = tl.where(hard_ki_sp, tl.minimum(tl.maximum((bhi_kl - wo_b) * inv_wkl, zero_vec), one_vec), tl.where(wo_b < b_kil, one_vec, zero_vec))
+                    ki_g_l = tl.where(f_ki_act, ki_act_l, tl.where(f_has_ki, zero_vec + i_ki_past, one_vec))
                 else:
-                    ki_g_l = (
-                        (tl.where(hard_ki_sp, tl.minimum(tl.maximum((bhi_ki_k - wo_b) * inv_sp_ki, zero_vec), one_vec), tl.where(wo_b < ki_barrier, one_vec, zero_vec)))
-                        if KI_ACTIVE else ((zero_vec + i_ki_past) if HAS_KI else one_vec)
-                    )
+                    hit_hl = (wcp_b <= b_cp_l) if CPN_DIR_DOWN else (wcp_b >= b_cp_l)
+                    gc_hl = tl.where(hit_hl, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
+                    blo_cpl = tl.minimum(b_cp_l, b_cp_l + eff_csp)
+                    r_upl = tl.minimum(tl.maximum((wcp_b - blo_cpl) * inv_sp_cp, zero_vec), one_vec)
+                    hit_sl = (1.0 - r_upl) if CPN_DIR_DOWN else r_upl
+                    gc_sl = (1.0 - hit_sl) if CPN_TYPE_OUT else hit_sl
+                    gc_l = tl.where(is_g_l, one_vec, tl.where(hard_cpn_sp, gc_sl, gc_hl))
+                    egc_l = tl.maximum(gc_l, gk_l) if FORCE_CPN_AC else gc_l
+
+                    if IS_LONG and KI_ACTIVE:
+                        blo_kl = tl.minimum(strike, strike + ki_spread)
+                        bhi_kl = tl.maximum(strike, strike + ki_spread)
+                        inv_wkl = 1.0 / tl.maximum(bhi_kl - blo_kl, 1e-12)
+                        ki_g_l = tl.where(hard_ki_sp, tl.minimum(tl.maximum((bhi_kl - wo_b) * inv_wkl, zero_vec), one_vec), tl.where(wo_b < strike, one_vec, zero_vec))
+                    else:
+                        ki_g_l = (
+                            (tl.where(hard_ki_sp, tl.minimum(tl.maximum((bhi_ki_k - wo_b) * inv_sp_ki, zero_vec), one_vec), tl.where(wo_b < ki_barrier, one_vec, zero_vec)))
+                            if KI_ACTIVE else ((zero_vec + i_ki_past) if HAS_KI else one_vec)
+                        )
                 half_os_l = 0.5 * one_star_eps
                 os_l = tl.where(
-                    HAS_ONE_STAR,
+                    f_has_os,
                     tl.where(one_star_eps <= 1e-6, tl.where(wb_b >= one_star_strike, one_vec, zero_vec), tl.minimum(tl.maximum((wb_b - (one_star_strike - half_os_l)) * inv_sp_os, zero_vec), one_vec)),
                     zero_vec,
                 )
                 opt_l = zero_vec
-                if IS_LONG:
-                    opt_l = opt_l - (1.0 - avg_b) * ki_g_l * (1.0 - os_l)
+                if USE_RT_FLAGS:
+                    opt_l_long = -(1.0 - avg_b) * ki_g_l * (1.0 - os_l)
+                    put_intr_l = tl.where(f_has_low, tl.maximum(strike - wo_b, zero_vec) - tl.maximum(lower_strike - wo_b, zero_vec), tl.maximum(strike - wo_b, zero_vec))
+                    put_m_l = tl.where(f_has_low, (strike > lower_strike) & (option_gearing > 0.0), option_gearing > 0.0)
+                    opt_l_short = tl.where(put_m_l, -option_gearing * ki_g_l * (1.0 - os_l) * put_intr_l, zero_vec)
+                    opt_l = tl.where(f_is_long, opt_l_long, opt_l_short)
+                    opt_l = tl.where(f_has_pc & (part_call_rate != 0.0), opt_l + part_call_rate * tl.maximum(wo_b - part_call_strike, zero_vec), opt_l)
+                    opt_l = tl.where(f_has_os & (one_star_coupon != 0.0), opt_l + os_l * one_star_coupon, opt_l)
                 else:
-                    put_intr_l = (tl.maximum(strike - wo_b, zero_vec) - tl.maximum(lower_strike - wo_b, zero_vec)) if HAS_LOWER_STRIKE else tl.maximum(strike - wo_b, zero_vec)
-                    put_m_l = ((strike > lower_strike) & (option_gearing > 0.0)) if HAS_LOWER_STRIKE else (option_gearing > 0.0)
-                    opt_l = tl.where(put_m_l, opt_l - option_gearing * ki_g_l * (1.0 - os_l) * put_intr_l, opt_l)
-                if HAS_PART_CALL:
-                    if part_call_rate != 0.0:
-                        opt_l = opt_l + part_call_rate * tl.maximum(wo_b - part_call_strike, zero_vec)
-                if HAS_ONE_STAR:
-                    if one_star_coupon != 0.0:
-                        opt_l = opt_l + os_l * one_star_coupon
+                    if IS_LONG:
+                        opt_l = opt_l - (1.0 - avg_b) * ki_g_l * (1.0 - os_l)
+                    else:
+                        put_intr_l = (tl.maximum(strike - wo_b, zero_vec) - tl.maximum(lower_strike - wo_b, zero_vec)) if HAS_LOWER_STRIKE else tl.maximum(strike - wo_b, zero_vec)
+                        put_m_l = ((strike > lower_strike) & (option_gearing > 0.0)) if HAS_LOWER_STRIKE else (option_gearing > 0.0)
+                        opt_l = tl.where(put_m_l, opt_l - option_gearing * ki_g_l * (1.0 - os_l) * put_intr_l, opt_l)
+                    if HAS_PART_CALL:
+                        if part_call_rate != 0.0:
+                            opt_l = opt_l + part_call_rate * tl.maximum(wo_b - part_call_strike, zero_vec)
+                    if HAS_ONE_STAR:
+                        if one_star_coupon != 0.0:
+                            opt_l = opt_l + os_l * one_star_coupon
                 tl.store(frozen_term_out_ptr + 0 * n_total + offs_n, gk_l, mask=mask_n)
                 tl.store(frozen_term_out_ptr + 1 * n_total + offs_n, egc_l, mask=mask_n)
                 tl.store(frozen_term_out_ptr + 2 * n_total + offs_n, opt_l, mask=mask_n)
                 tl.store(frozen_term_out_ptr + 3 * n_total + offs_n, os_l, mask=mask_n)
 
+        n_d_vib: tl.constexpr = D_PAD if USE_RT_FLAGS else d_assets
         if tl.max(surv_pre, axis=0) <= 1e-24:
-            for i in range(d_assets):
-                for j in range(i, d_assets):
-                    tl.store(h_vib_out_ptr + (pid_n * d_assets + i) * d_assets + j, 0.0)
-                    if i != j:
-                        tl.store(h_vib_out_ptr + (pid_n * d_assets + j) * d_assets + i, 0.0)
+            for i in range(n_d_vib):
+                if (i < d_act) if USE_RT_FLAGS else True:
+                    for j in range(n_d_vib):
+                        if ((j >= i) & (j < d_act)) if USE_RT_FLAGS else (j >= i):
+                            tl.store(h_vib_out_ptr + (pid_n * d_assets + i) * d_assets + j, 0.0)
+                            if i != j:
+                                tl.store(h_vib_out_ptr + (pid_n * d_assets + j) * d_assets + i, 0.0)
         else:
-            sqrt_h_vib = tl.sqrt(h_vib)
-            inv_sqrt_n = 1.0 / tl.sqrt(tl.zeros((), dtype=tl.float64) + vib_n_steps)
+            sqrt_h_vib = tl.sqrt(eff_h_vib)
+            inv_sqrt_n = 1.0 / tl.sqrt(tl.zeros((), dtype=tl.float64) + eff_vib_n)
             f0 = zero_vec
             fp = zero_vec
             fm = zero_vec
@@ -4875,8 +5881,8 @@ if _HAS_TRITON:
             b_cp_l = tl.load(cpn_bar_ptr + m_last)
             is_g_l = tl.load(is_guar_ptr + m_last) > 0.5
             c_rate_l = tl.load(cpn_rates_ptr + m_last)
-            eff_c_l = (c_rate_l + c_mem) if IS_MEM else (zero_vec + c_rate_l)
-            term_not = 0.0 if NO_NOTIONAL else 1.0
+            eff_c_l = (tl.where(f_is_mem, c_rate_l + c_mem, zero_vec + c_rate_l) if USE_RT_FLAGS else ((c_rate_l + c_mem) if IS_MEM else (zero_vec + c_rate_l)))
+            term_not = (tl.where(f_no_not, 0.0, 1.0) if USE_RT_FLAGS else (0.0 if NO_NOTIONAL else 1.0))
 
             for sgn in tl.static_range(3):
                 mult = 0.0 if sgn == 0 else (1.0 if sgn == 1 else -1.0)
@@ -4889,102 +5895,145 @@ if _HAS_TRITON:
                 s2_s = zero_vec
                 pa_s = zero_vec
                 pb_s = one_vec
-                for d in range(d_assets):
-                    lxp = tl.load(lx_pre_ptr + d * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
-                    sigp = tl.maximum(tl.load(sig_pre_ptr + d * n_total + offs_n, mask=mask_n, other=0.2).to(tl.float64), 1e-4)
-                    if sgn == 0:
-                        xd = lxp - 0.5 * sigp * sigp * h_vib
-                    else:
-                        zc_d = zero_vec
-                        for k in range(d_assets):
-                            l_dk = tl.load(chol_ptr + d * d_assets + k)
-                            zk_sum = zero_vec
-                            for s_v in range(vib_n_steps):
-                                st_i = vib_step_start + s_v
-                                zk_sum = zk_sum + tl.load(sv_ptr + (st_i * d_assets + k) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
-                            zc_d = zc_d + l_dk * (zk_sum * inv_sqrt_n)
-                        xd = lxp - 0.5 * sigp * sigp * h_vib + mult * sigp * sqrt_h_vib * zc_d
-                    fwd_d = tl.load(fwd_term_ptr + d)
-                    pd = fwd_d * tl.exp(tl.minimum(tl.maximum(xd, -30.0), 30.0))
-                    if need_min3_k:
-                        lt1 = pd < min1_s
-                        lt2 = (~lt1) & (pd < min2_s)
-                        lt3 = (~lt1) & (~lt2) & (pd < min3_s)
-                        min3_s = tl.where(lt1, min2_s, tl.where(lt2, min2_s, tl.where(lt3, pd, min3_s)))
-                        min2_s = tl.where(lt1, min1_s, tl.where(lt2, pd, min2_s))
-                        min1_s = tl.where(lt1, pd, min1_s)
-                    elif need_min2_k:
-                        lt1 = pd < min1_s
-                        lt2 = (~lt1) & (pd < min2_s)
-                        min2_s = tl.where(lt1, min1_s, tl.where(lt2, pd, min2_s))
-                        min1_s = tl.where(lt1, pd, min1_s)
-                    elif need_min1_k:
-                        min1_s = tl.minimum(min1_s, pd)
-                    if need_max2_k:
-                        gt1 = pd > max1_s
-                        gt2 = (~gt1) & (pd > max2_s)
-                        max2_s = tl.where(gt1, max1_s, tl.where(gt2, pd, max2_s))
-                        max1_s = tl.where(gt1, pd, max1_s)
-                    elif need_max1_k:
-                        max1_s = tl.maximum(max1_s, pd)
-                    if need_sum1_k:
-                        s1_s = s1_s + pd
-                    if need_sum2_k:
-                        s2_s = s2_s + pd * pd
-                    if d == ia:
-                        pa_s = pd
-                    if d == ib:
-                        pb_s = pd
+                for d in range(n_d_vib):
+                    if (d < d_act) if USE_RT_FLAGS else True:
+                        lxp = tl.load(lx_pre_ptr + d * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
+                        sigp = tl.maximum(tl.load(sig_pre_ptr + d * n_total + offs_n, mask=mask_n, other=0.2).to(tl.float64), 1e-4)
+                        if sgn == 0:
+                            xd = lxp - 0.5 * sigp * sigp * eff_h_vib
+                        else:
+                            zc_d = zero_vec
+                            for k in range(n_d_vib):
+                                if (k < d_act) if USE_RT_FLAGS else True:
+                                    l_dk = tl.load(chol_ptr + d * d_assets + k)
+                                    zk_sum = zero_vec
+                                    n_sv_loop: tl.constexpr = N_SUB_PAD if USE_RT_FLAGS else vib_n_steps
+                                    for s_v in range(n_sv_loop):
+                                        if (s_v < eff_vib_n) if USE_RT_FLAGS else True:
+                                            st_i = eff_vib_start + s_v
+                                            zk_sum = zk_sum + tl.load(sv_ptr + (st_i * d_assets + k) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
+                                    zc_d = zc_d + l_dk * (zk_sum * inv_sqrt_n)
+                            xd = lxp - 0.5 * sigp * sigp * eff_h_vib + mult * sigp * sqrt_h_vib * zc_d
+                        fwd_d = tl.load(fwd_term_ptr + (d * m_rem + m_last if USE_RT_FLAGS else d))
+                        pd = fwd_d * tl.exp(tl.minimum(tl.maximum(xd, -30.0), 30.0))
+                        if USE_RT_FLAGS:
+                            min1_s = tl.minimum(min1_s, pd)
+                            max1_s = tl.maximum(max1_s, pd)
+                            s1_s = s1_s + pd
+                        else:
+                            if need_min3_k:
+                                lt1 = pd < min1_s
+                                lt2 = (~lt1) & (pd < min2_s)
+                                lt3 = (~lt1) & (~lt2) & (pd < min3_s)
+                                min3_s = tl.where(lt1, min2_s, tl.where(lt2, min2_s, tl.where(lt3, pd, min3_s)))
+                                min2_s = tl.where(lt1, min1_s, tl.where(lt2, pd, min2_s))
+                                min1_s = tl.where(lt1, pd, min1_s)
+                            elif need_min2_k:
+                                lt1 = pd < min1_s
+                                lt2 = (~lt1) & (pd < min2_s)
+                                min2_s = tl.where(lt1, min1_s, tl.where(lt2, pd, min2_s))
+                                min1_s = tl.where(lt1, pd, min1_s)
+                            elif need_min1_k:
+                                min1_s = tl.minimum(min1_s, pd)
+                            if need_max2_k:
+                                gt1 = pd > max1_s
+                                gt2 = (~gt1) & (pd > max2_s)
+                                max2_s = tl.where(gt1, max1_s, tl.where(gt2, pd, max2_s))
+                                max1_s = tl.where(gt1, pd, max1_s)
+                            elif need_max1_k:
+                                max1_s = tl.maximum(max1_s, pd)
+                            if need_sum1_k:
+                                s1_s = s1_s + pd
+                            if need_sum2_k:
+                                s2_s = s2_s + pd * pd
+                            if d == ia:
+                                pa_s = pd
+                            if d == ib:
+                                pb_s = pd
 
-                wc_s = _select_idx_from_stats_f64(min1_s, min2_s, min3_s, max1_s, max2_s, s1_s, s2_s, pa_s, pb_s, inv_d_f, d_assets, CALL_CODE)
-                wcp_s = wc_s if CPN_CODE == CALL_CODE else _select_idx_from_stats_f64(min1_s, min2_s, min3_s, max1_s, max2_s, s1_s, s2_s, pa_s, pb_s, inv_d_f, d_assets, CPN_CODE)
-                wo_s = min1_s if IS_LONG else (wc_s if EFF_OPT_CODE == CALL_CODE else (wcp_s if EFF_OPT_CODE == CPN_CODE else _select_idx_from_stats_f64(min1_s, min2_s, min3_s, max1_s, max2_s, s1_s, s2_s, pa_s, pb_s, inv_d_f, d_assets, EFF_OPT_CODE)))
-                avg_s = (s1_s * inv_d_f) if IS_LONG else zero_vec
-                wb_s = max1_s if HAS_ONE_STAR else zero_vec
+                if USE_RT_FLAGS:
+                    w_avg_s = s1_s * inv_d_f
+                    wc_s = tl.where(rt_call == 0, min1_s, tl.where(rt_call == 1, max1_s, w_avg_s))
+                    wcp_s = tl.where(rt_cpn == 0, min1_s, tl.where(rt_cpn == 1, max1_s, w_avg_s))
+                    wo_s = tl.where(f_is_long, min1_s, tl.where(rt_opt == 0, min1_s, tl.where(rt_opt == 1, max1_s, w_avg_s)))
+                    avg_s = tl.where(f_is_long, w_avg_s, zero_vec)
+                    wb_s = tl.where(f_has_os, max1_s, zero_vec)
+                else:
+                    wc_s = _select_idx_from_stats_f64(min1_s, min2_s, min3_s, max1_s, max2_s, s1_s, s2_s, pa_s, pb_s, inv_d_f, d_assets, CALL_CODE)
+                    wcp_s = wc_s if CPN_CODE == CALL_CODE else _select_idx_from_stats_f64(min1_s, min2_s, min3_s, max1_s, max2_s, s1_s, s2_s, pa_s, pb_s, inv_d_f, d_assets, CPN_CODE)
+                    wo_s = min1_s if IS_LONG else (wc_s if EFF_OPT_CODE == CALL_CODE else (wcp_s if EFF_OPT_CODE == CPN_CODE else _select_idx_from_stats_f64(min1_s, min2_s, min3_s, max1_s, max2_s, s1_s, s2_s, pa_s, pb_s, inv_d_f, d_assets, EFF_OPT_CODE)))
+                    avg_s = (s1_s * inv_d_f) if IS_LONG else zero_vec
+                    wb_s = max1_s if HAS_ONE_STAR else zero_vec
 
                 gk_s = tl.where(
                     is_c_l,
                     tl.where(hard_ko_sp, tl.minimum(tl.maximum((wc_s - tl.minimum(b_ko_l, b_ko_l + ko_spread)) * inv_sp_ko, zero_vec), one_vec), tl.where(wc_s >= b_ko_l, one_vec, zero_vec)),
                     zero_vec,
                 )
-                hit_hs = (wcp_s <= b_cp_l) if CPN_DIR_DOWN else (wcp_s >= b_cp_l)
-                gc_hs = tl.where(hit_hs, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
-                blo_cps = tl.minimum(b_cp_l, b_cp_l + eff_csp)
-                r_ups = tl.minimum(tl.maximum((wcp_s - blo_cps) * inv_sp_cp, zero_vec), one_vec)
-                hit_ss = (1.0 - r_ups) if CPN_DIR_DOWN else r_ups
-                gc_ss = (1.0 - hit_ss) if CPN_TYPE_OUT else hit_ss
-                gc_s = tl.where(is_g_l, one_vec, tl.where(hard_cpn_sp, gc_ss, gc_hs))
-                egc_s = tl.maximum(gc_s, gk_s) if FORCE_CPN_AC else gc_s
+                if USE_RT_FLAGS:
+                    hit_hs = tl.where(f_cpn_dn, wcp_s <= b_cp_l, wcp_s >= b_cp_l)
+                    gc_hs = tl.where(f_cpn_out, tl.where(hit_hs, zero_vec, one_vec), tl.where(hit_hs, one_vec, zero_vec))
+                    blo_cps = tl.minimum(b_cp_l, b_cp_l + eff_csp)
+                    r_ups = tl.minimum(tl.maximum((wcp_s - blo_cps) * inv_sp_cp, zero_vec), one_vec)
+                    hit_ss = tl.where(f_cpn_dn, 1.0 - r_ups, r_ups)
+                    gc_ss = tl.where(f_cpn_out, 1.0 - hit_ss, hit_ss)
+                    gc_s = tl.where(is_g_l, one_vec, tl.where(hard_cpn_sp, gc_ss, gc_hs))
+                    egc_s = tl.where(f_frc_cpn, tl.maximum(gc_s, gk_s), gc_s)
 
-                if IS_LONG and KI_ACTIVE:
-                    blo_ks = tl.minimum(strike, strike + ki_spread)
-                    bhi_ks = tl.maximum(strike, strike + ki_spread)
+                    b_kis = tl.where(f_is_long, strike, ki_barrier)
+                    blo_ks = tl.minimum(b_kis, b_kis + ki_spread)
+                    bhi_ks = tl.maximum(b_kis, b_kis + ki_spread)
                     inv_wks = 1.0 / tl.maximum(bhi_ks - blo_ks, 1e-12)
-                    ki_g_s = tl.where(hard_ki_sp, tl.minimum(tl.maximum((bhi_ks - wo_s) * inv_wks, zero_vec), one_vec), tl.where(wo_s < strike, one_vec, zero_vec))
+                    ki_act_s = tl.where(hard_ki_sp, tl.minimum(tl.maximum((bhi_ks - wo_s) * inv_wks, zero_vec), one_vec), tl.where(wo_s < b_kis, one_vec, zero_vec))
+                    ki_g_s = tl.where(f_ki_act, ki_act_s, tl.where(f_has_ki, zero_vec + i_ki_past, one_vec))
                 else:
-                    ki_g_s = (
-                        (tl.where(hard_ki_sp, tl.minimum(tl.maximum((bhi_ki_k - wo_s) * inv_sp_ki, zero_vec), one_vec), tl.where(wo_s < ki_barrier, one_vec, zero_vec)))
-                        if KI_ACTIVE else ((zero_vec + i_ki_past) if HAS_KI else one_vec)
-                    )
+                    hit_hs = (wcp_s <= b_cp_l) if CPN_DIR_DOWN else (wcp_s >= b_cp_l)
+                    gc_hs = tl.where(hit_hs, zero_vec if CPN_TYPE_OUT else one_vec, one_vec if CPN_TYPE_OUT else zero_vec)
+                    blo_cps = tl.minimum(b_cp_l, b_cp_l + eff_csp)
+                    r_ups = tl.minimum(tl.maximum((wcp_s - blo_cps) * inv_sp_cp, zero_vec), one_vec)
+                    hit_ss = (1.0 - r_ups) if CPN_DIR_DOWN else r_ups
+                    gc_ss = (1.0 - hit_ss) if CPN_TYPE_OUT else hit_ss
+                    gc_s = tl.where(is_g_l, one_vec, tl.where(hard_cpn_sp, gc_ss, gc_hs))
+                    egc_s = tl.maximum(gc_s, gk_s) if FORCE_CPN_AC else gc_s
+
+                    if IS_LONG and KI_ACTIVE:
+                        blo_ks = tl.minimum(strike, strike + ki_spread)
+                        bhi_ks = tl.maximum(strike, strike + ki_spread)
+                        inv_wks = 1.0 / tl.maximum(bhi_ks - blo_ks, 1e-12)
+                        ki_g_s = tl.where(hard_ki_sp, tl.minimum(tl.maximum((bhi_ks - wo_s) * inv_wks, zero_vec), one_vec), tl.where(wo_s < strike, one_vec, zero_vec))
+                    else:
+                        ki_g_s = (
+                            (tl.where(hard_ki_sp, tl.minimum(tl.maximum((bhi_ki_k - wo_s) * inv_sp_ki, zero_vec), one_vec), tl.where(wo_s < ki_barrier, one_vec, zero_vec)))
+                            if KI_ACTIVE else ((zero_vec + i_ki_past) if HAS_KI else one_vec)
+                        )
                 half_oss = 0.5 * one_star_eps
                 os_s = tl.where(
-                    HAS_ONE_STAR,
+                    f_has_os,
                     tl.where(one_star_eps <= 1e-6, tl.where(wb_s >= one_star_strike, one_vec, zero_vec), tl.minimum(tl.maximum((wb_s - (one_star_strike - half_oss)) * inv_sp_os, zero_vec), one_vec)),
                     zero_vec,
                 )
                 opt_s = zero_vec
-                if IS_LONG:
-                    opt_s = opt_s - (1.0 - avg_s) * ki_g_s * (1.0 - os_s)
+                if USE_RT_FLAGS:
+                    opt_s_long = -(1.0 - avg_s) * ki_g_s * (1.0 - os_s)
+                    put_intr_s = tl.where(f_has_low, tl.maximum(strike - wo_s, zero_vec) - tl.maximum(lower_strike - wo_s, zero_vec), tl.maximum(strike - wo_s, zero_vec))
+                    put_m_s = tl.where(f_has_low, (strike > lower_strike) & (option_gearing > 0.0), option_gearing > 0.0)
+                    opt_s_short = tl.where(put_m_s, -option_gearing * ki_g_s * (1.0 - os_s) * put_intr_s, zero_vec)
+                    opt_s = tl.where(f_is_long, opt_s_long, opt_s_short)
+                    opt_s = tl.where(f_has_pc & (part_call_rate != 0.0), opt_s + part_call_rate * tl.maximum(wo_s - part_call_strike, zero_vec), opt_s)
+                    opt_s = tl.where(f_has_os & (one_star_coupon != 0.0), opt_s + os_s * one_star_coupon, opt_s)
                 else:
-                    put_intr_s = (tl.maximum(strike - wo_s, zero_vec) - tl.maximum(lower_strike - wo_s, zero_vec)) if HAS_LOWER_STRIKE else tl.maximum(strike - wo_s, zero_vec)
-                    put_m_s = ((strike > lower_strike) & (option_gearing > 0.0)) if HAS_LOWER_STRIKE else (option_gearing > 0.0)
-                    opt_s = tl.where(put_m_s, opt_s - option_gearing * ki_g_s * (1.0 - os_s) * put_intr_s, opt_s)
-                if HAS_PART_CALL:
-                    if part_call_rate != 0.0:
-                        opt_s = opt_s + part_call_rate * tl.maximum(wo_s - part_call_strike, zero_vec)
-                if HAS_ONE_STAR:
-                    if one_star_coupon != 0.0:
-                        opt_s = opt_s + os_s * one_star_coupon
+                    if IS_LONG:
+                        opt_s = opt_s - (1.0 - avg_s) * ki_g_s * (1.0 - os_s)
+                    else:
+                        put_intr_s = (tl.maximum(strike - wo_s, zero_vec) - tl.maximum(lower_strike - wo_s, zero_vec)) if HAS_LOWER_STRIKE else tl.maximum(strike - wo_s, zero_vec)
+                        put_m_s = ((strike > lower_strike) & (option_gearing > 0.0)) if HAS_LOWER_STRIKE else (option_gearing > 0.0)
+                        opt_s = tl.where(put_m_s, opt_s - option_gearing * ki_g_s * (1.0 - os_s) * put_intr_s, opt_s)
+                    if HAS_PART_CALL:
+                        if part_call_rate != 0.0:
+                            opt_s = opt_s + part_call_rate * tl.maximum(wo_s - part_call_strike, zero_vec)
+                    if HAS_ONE_STAR:
+                        if one_star_coupon != 0.0:
+                            opt_s = opt_s + os_s * one_star_coupon
 
                 f_val = gk_s * (term_not + ac_cpn) + egc_s * eff_c_l + (1.0 - gk_s) * (term_not + opt_s)
                 if sgn == 0:
@@ -4998,52 +6047,67 @@ if _HAS_TRITON:
 
             df_diff = 0.5 * (fp - fm)
             df_hess = 0.5 * (fp + fm) - f0
-            degc_diff = 0.5 * (egc_p - egc_m) if IS_MEM else zero_vec
-            for i in range(d_assets):
-                sig_i = tl.maximum(tl.load(sig_pre_ptr + i * n_total + offs_n, mask=mask_n, other=0.2).to(tl.float64), 1e-4)
-                inv_si = 1.0 / tl.maximum(sig_i * sqrt_h_vib, 1e-6)
-                j_pre_i = tl.load(j_pre_ptr + i * n_total + offs_n, mask=mask_n, other=1.0).to(tl.float64)
-                j_i = j_pre_i * tl.load(cdl_m_ptr + m_last * d_assets + i)
-                cdl2_i = tl.load(cdl2_last_ptr + i)
-                dlns_i = tl.load(d_ln_surv_tmp_ptr + i * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
-                dcm_i = tl.load(d_ln_surv_tmp_ptr + (d_assets + i) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64) if IS_MEM else zero_vec
-                xi_i = zero_vec
-                for k in range(d_assets):
-                    lit_ik = tl.load(l_inv_t_ptr + i * d_assets + k)
-                    zk_s = zero_vec
-                    for s_v in range(vib_n_steps):
-                        st_i = vib_step_start + s_v
-                        zk_s = zk_s + tl.load(sv_ptr + (st_i * d_assets + k) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
-                    xi_i = xi_i + lit_ik * (zk_s * inv_sqrt_n)
-                w1_raw_i = df_diff * xi_i * inv_si * j_pre_i
-                w1_i = df_diff * xi_i * inv_si * j_i
-                w1_egc_i = degc_diff * xi_i * inv_si * j_i if IS_MEM else zero_vec
+            degc_diff = (tl.where(f_is_mem, 0.5 * (egc_p - egc_m), zero_vec) if USE_RT_FLAGS else (0.5 * (egc_p - egc_m) if IS_MEM else zero_vec))
+            for i in range(n_d_vib):
+                if (i < d_act) if USE_RT_FLAGS else True:
+                    sig_i = tl.maximum(tl.load(sig_pre_ptr + i * n_total + offs_n, mask=mask_n, other=0.2).to(tl.float64), 1e-4)
+                    inv_si = 1.0 / tl.maximum(sig_i * sqrt_h_vib, 1e-6)
+                    j_pre_i = tl.minimum(
+                        tl.maximum(tl.load(j_pre_ptr + i * n_total + offs_n, mask=mask_n, other=1.0).to(tl.float64), -8.0),
+                        8.0,
+                    )
+                    j_i = j_pre_i * tl.load(cdl_m_ptr + m_last * d_assets + i)
+                    cdl2_i = tl.load(cdl2_last_ptr + i)
+                    dlns_i = tl.load(d_ln_surv_tmp_ptr + i * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
+                    dcm_i = (tl.where(f_is_mem, tl.load(d_ln_surv_tmp_ptr + (d_assets + i) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64), zero_vec) if USE_RT_FLAGS else (tl.load(d_ln_surv_tmp_ptr + (d_assets + i) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64) if IS_MEM else zero_vec))
+                    xi_i = zero_vec
+                    for k in range(n_d_vib):
+                        if (k < d_act) if USE_RT_FLAGS else True:
+                            lit_ik = tl.load(l_inv_t_ptr + i * d_assets + k)
+                            zk_s = zero_vec
+                            n_sv_i: tl.constexpr = N_SUB_PAD if USE_RT_FLAGS else vib_n_steps
+                            for s_v in range(n_sv_i):
+                                if (s_v < eff_vib_n) if USE_RT_FLAGS else True:
+                                    st_i = eff_vib_start + s_v
+                                    zk_s = zk_s + tl.load(sv_ptr + (st_i * d_assets + k) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
+                            xi_i = xi_i + lit_ik * (zk_s * inv_sqrt_n)
+                    w1_raw_i = df_diff * xi_i * inv_si * j_pre_i
+                    w1_i = df_diff * xi_i * inv_si * j_i
+                    w1_egc_i = degc_diff * xi_i * inv_si * j_i
 
-                for j in range(i, d_assets):
-                    sig_j = tl.maximum(tl.load(sig_pre_ptr + j * n_total + offs_n, mask=mask_n, other=0.2).to(tl.float64), 1e-4)
-                    inv_sj = 1.0 / tl.maximum(sig_j * sqrt_h_vib, 1e-6)
-                    j_j = tl.load(j_pre_ptr + j * n_total + offs_n, mask=mask_n, other=1.0).to(tl.float64) * tl.load(cdl_m_ptr + m_last * d_assets + j)
-                    dlns_j = tl.load(d_ln_surv_tmp_ptr + j * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
-                    dcm_j = tl.load(d_ln_surv_tmp_ptr + (d_assets + j) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64) if IS_MEM else zero_vec
-                    xi_j = zero_vec
-                    for k in range(d_assets):
-                        lit_jk = tl.load(l_inv_t_ptr + j * d_assets + k)
-                        zk_s = zero_vec
-                        for s_v in range(vib_n_steps):
-                            st_i = vib_step_start + s_v
-                            zk_s = zk_s + tl.load(sv_ptr + (st_i * d_assets + k) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
-                        xi_j = xi_j + lit_jk * (zk_s * inv_sqrt_n)
-                    w1_j = df_diff * xi_j * inv_sj * j_j
-                    w1_egc_j = degc_diff * xi_j * inv_sj * j_j if IS_MEM else zero_vec
-                    cinv_ij = tl.load(c_inv_ptr + i * d_assets + j)
-                    w2_ij = df_hess * (xi_i * xi_j - cinv_ij) * inv_si * inv_sj * j_i * j_j
-                    cmem_cross = (dcm_i * w1_egc_j + dcm_j * w1_egc_i) if IS_MEM else zero_vec
-                    diag_corr = tl.where(i == j, w1_raw_i * cdl2_i, zero_vec)
-                    h_ij = df_last * surv_pre * (w2_ij + dlns_i * w1_j + dlns_j * w1_i + cmem_cross + diag_corr)
-                    h_sum = tl.sum(tl.where(mask_n, h_ij, zero_vec), axis=0) * scale
-                    tl.store(h_vib_out_ptr + (pid_n * d_assets + i) * d_assets + j, h_sum)
-                    if i != j:
-                        tl.store(h_vib_out_ptr + (pid_n * d_assets + j) * d_assets + i, h_sum)
+                    for j in range(n_d_vib):
+                        if ((j >= i) & (j < d_act)) if USE_RT_FLAGS else (j >= i):
+                            sig_j = tl.maximum(tl.load(sig_pre_ptr + j * n_total + offs_n, mask=mask_n, other=0.2).to(tl.float64), 1e-4)
+                            inv_sj = 1.0 / tl.maximum(sig_j * sqrt_h_vib, 1e-6)
+                            j_pre_j = tl.minimum(
+                                tl.maximum(tl.load(j_pre_ptr + j * n_total + offs_n, mask=mask_n, other=1.0).to(tl.float64), -8.0),
+                                8.0,
+                            )
+                            j_j = j_pre_j * tl.load(cdl_m_ptr + m_last * d_assets + j)
+                            dlns_j = tl.load(d_ln_surv_tmp_ptr + j * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
+                            dcm_j = (tl.where(f_is_mem, tl.load(d_ln_surv_tmp_ptr + (d_assets + j) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64), zero_vec) if USE_RT_FLAGS else (tl.load(d_ln_surv_tmp_ptr + (d_assets + j) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64) if IS_MEM else zero_vec))
+                            xi_j = zero_vec
+                            for k in range(n_d_vib):
+                                if (k < d_act) if USE_RT_FLAGS else True:
+                                    lit_jk = tl.load(l_inv_t_ptr + j * d_assets + k)
+                                    zk_s = zero_vec
+                                    n_sv_j: tl.constexpr = N_SUB_PAD if USE_RT_FLAGS else vib_n_steps
+                                    for s_v in range(n_sv_j):
+                                        if (s_v < eff_vib_n) if USE_RT_FLAGS else True:
+                                            st_i = eff_vib_start + s_v
+                                            zk_s = zk_s + tl.load(sv_ptr + (st_i * d_assets + k) * n_total + offs_n, mask=mask_n, other=0.0).to(tl.float64)
+                                    xi_j = xi_j + lit_jk * (zk_s * inv_sqrt_n)
+                            w1_j = df_diff * xi_j * inv_sj * j_j
+                            w1_egc_j = degc_diff * xi_j * inv_sj * j_j
+                            cinv_ij = tl.load(c_inv_ptr + i * d_assets + j)
+                            w2_ij = df_hess * (xi_i * xi_j - cinv_ij) * inv_si * inv_sj * j_i * j_j
+                            cmem_cross = dcm_i * w1_egc_j + dcm_j * w1_egc_i
+                            diag_corr = tl.where(i == j, w1_raw_i * cdl2_i, zero_vec)
+                            h_ij = eff_df_last * surv_pre * (w2_ij + dlns_i * w1_j + dlns_j * w1_i + cmem_cross + diag_corr)
+                            h_sum = tl.sum(tl.where(mask_n, h_ij, zero_vec), axis=0) * scale
+                            tl.store(h_vib_out_ptr + (pid_n * d_assets + i) * d_assets + j, h_sum)
+                            if i != j:
+                                tl.store(h_vib_out_ptr + (pid_n * d_assets + j) * d_assets + i, h_sum)
 
 
 def _eval_index_batch_torch(
@@ -5618,6 +6682,1531 @@ def _compute_payoff_aad_state_adjoints_torch(
     return bar_lx_post.to(dtype=torch.float32), bar_ln_fwd.to(dtype=torch.float64), bar_lv_cont
 
 
+if _HAS_NUMBA:
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_eval_index_and_weights(
+        perf_m_d_n: npt.NDArray[np.float64],
+        code: int,
+    ) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.int32]]:
+        m_rem, d_assets, n_tot = perf_m_d_n.shape
+        w_out = np.empty((m_rem, n_tot), dtype=np.float64)
+        idx_out = np.empty((m_rem, n_tot), dtype=np.int32)
+        inv_d = 1.0 / float(d_assets)
+        for mn in numba.prange(m_rem * n_tot):
+            m = mn // n_tot
+            n = mn - m * n_tot
+            if code == 0:
+                best_v = perf_m_d_n[m, 0, n]
+                best_k = 0
+                for d in range(1, d_assets):
+                    v = perf_m_d_n[m, d, n]
+                    if v < best_v:
+                        best_v = v
+                        best_k = d
+                w_out[m, n] = best_v
+                idx_out[m, n] = best_k
+            elif code == 1:
+                best_v = perf_m_d_n[m, 0, n]
+                best_k = 0
+                for d in range(1, d_assets):
+                    v = perf_m_d_n[m, d, n]
+                    if v > best_v:
+                        best_v = v
+                        best_k = d
+                w_out[m, n] = best_v
+                idx_out[m, n] = best_k
+            else:
+                acc = 0.0
+                for d in range(d_assets):
+                    acc += perf_m_d_n[m, d, n]
+                w_out[m, n] = acc * inv_d
+                idx_out[m, n] = 0
+        return w_out, idx_out
+
+
+def _eval_index_and_weights_np(
+    perf_m_d_n: npt.NDArray[np.float64],
+    code: int,
+) -> Tuple[npt.NDArray[np.float64], Optional[npt.NDArray[np.int32]]]:
+    """Vectorized NumPy/Numba evaluator for codes {0: WorstOf, 1: BestOf, 2: AverageOf}."""
+    if _HAS_NUMBA and code in (0, 1, 2):
+        w_out, idx_out = _nb_eval_index_and_weights(perf_m_d_n, int(code))
+        return w_out, (idx_out if code in (0, 1) else None)
+    if code == 0:
+        idx = np.argmin(perf_m_d_n, axis=1)
+        return np.take_along_axis(perf_m_d_n, idx[:, None, :], axis=1)[:, 0, :], idx.astype(np.int32, copy=False)
+    if code == 1:
+        idx = np.argmax(perf_m_d_n, axis=1)
+        return np.take_along_axis(perf_m_d_n, idx[:, None, :], axis=1)[:, 0, :], idx.astype(np.int32, copy=False)
+    return np.mean(perf_m_d_n, axis=1), None
+
+
+if _HAS_NUMBA:
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_payoff_aad_bwd_and_s1(
+        perf_m_d_n: npt.NDArray[np.float64],
+        g_ko_all: npt.NDArray[np.float64],
+        dg_ko_all: npt.NDArray[np.float64],
+        eff_g_cpn_all: npt.NDArray[np.float64],
+        dgc_from_cpn: npt.NDArray[np.float64],
+        dgc_from_ko: npt.NDArray[np.float64],
+        surv_pre_arr: npt.NDArray[np.float64],
+        eff_c_arr: npt.NDArray[np.float64],
+        surv_end: npt.NDArray[np.float64],
+        opt_pay: npt.NDArray[np.float64],
+        d_opt_d_wo: npt.NDArray[np.float64],
+        d_opt_d_avg: npt.NDArray[np.float64],
+        d_opt_d_wb: npt.NDArray[np.float64],
+        d_opt_d_iki: npt.NDArray[np.float64],
+        d_iki_dwo_last: npt.NDArray[np.float64],
+        d_iki_dwo_arr: npt.NDArray[np.float64],
+        has_d_iki_arr: bool,
+        df_pay: npt.NDArray[np.float64],
+        w_fund_arr: npt.NDArray[np.float64],
+        has_w_fund: bool,
+        idx_call: npt.NDArray[np.int32],
+        has_idx_call: bool,
+        idx_cpn: npt.NDArray[np.int32],
+        has_idx_cpn: bool,
+        idx_opt: npt.NDArray[np.int32],
+        has_idx_opt: bool,
+        idx_best_last: npt.NDArray[np.int32],
+        has_idx_best: bool,
+        call_code: int,
+        cpn_code: int,
+        eff_opt_code: int,
+        is_long_basket: bool,
+        is_memory: bool,
+        no_notional: bool,
+        has_os: bool,
+        ac_c: float,
+        bar_lx_post_np: npt.NDArray[np.float64],
+        bar_ln_fwd_np: npt.NDArray[np.float64],
+    ) -> None:
+        m_rem, d_assets, n_tot = perf_m_d_n.shape
+        m_last = m_rem - 1
+        scale = 1.0 / float(n_tot)
+        inv_d = 1.0 / float(d_assets)
+        df_last = float(df_pay[m_last])
+        same_cpn_call = cpn_code == call_code
+        tile_n = 128
+        n_tiles = (n_tot + tile_n - 1) // tile_n
+        bar_ln_tiles = np.zeros((n_tiles, d_assets, m_rem), dtype=np.float64)
+
+        for t_i in numba.prange(n_tiles):
+            n_start = t_i * tile_n
+            n_end = min(n_start + tile_n, n_tot)
+            n_len = n_end - n_start
+            bar_surv = np.empty(n_len, dtype=np.float64)
+            bar_c_mem = np.zeros(n_len, dtype=np.float64)
+            bar_last_wo = np.empty(n_len, dtype=np.float64)
+            bar_last_avg = np.empty(n_len, dtype=np.float64)
+            bar_last_wb = np.empty(n_len, dtype=np.float64)
+            bar_iki_disc = np.empty(n_len, dtype=np.float64)
+            for k in range(n_len):
+                n = n_start + k
+                op = opt_pay[n]
+                se = surv_end[n]
+                term_mult = op if no_notional else (1.0 + op)
+                bar_surv[k] = scale * df_last * term_mult
+                d_iki_term = 0.0 if has_d_iki_arr else (d_opt_d_iki[n] * d_iki_dwo_last[n])
+                s_df_se = scale * df_last * se
+                bar_last_wo[k] = s_df_se * (d_opt_d_wo[n] + d_iki_term)
+                bar_last_avg[k] = s_df_se * d_opt_d_avg[n]
+                bar_last_wb[k] = s_df_se * d_opt_d_wb[n]
+                bar_iki_disc[k] = s_df_se * d_opt_d_iki[n]
+
+            for m in range(m_rem - 1, -1, -1):
+                df_m = float(df_pay[m])
+                wf_m = float(w_fund_arr[m]) if has_w_fund else 0.0
+                s_df_m = scale * df_m
+                s_wf_m = scale * wf_m
+                pm_off = (0.0 if no_notional else s_df_m) + s_df_m * ac_c
+                is_last = m == m_last
+                for k in range(n_len):
+                    n = n_start + k
+                    surv_pre = surv_pre_arr[m, n]
+                    g_k = g_ko_all[m, n]
+                    eff_g_c = eff_g_cpn_all[m, n]
+                    eff_c = eff_c_arr[m, n]
+                    bs = bar_surv[k]
+                    bcm = bar_c_mem[k]
+
+                    bar_pm = pm_off - bs
+                    bar_eff_g_c = s_df_m * surv_pre * eff_c
+                    if is_memory:
+                        bar_eff_g_c -= bcm * surv_pre * eff_c
+
+                    bs_next = bs + bar_pm * g_k + s_df_m * eff_g_c * eff_c - s_wf_m
+                    if is_memory:
+                        bs_next += bcm * eff_c * (1.0 - eff_g_c)
+                        bar_c_mem[k] = s_df_m * surv_pre * eff_g_c + bcm * surv_pre * (1.0 - eff_g_c)
+                    bar_surv[k] = bs_next
+
+                    bw_call = (bar_pm * surv_pre) * dg_ko_all[m, n] + bar_eff_g_c * dgc_from_ko[m, n]
+                    bw_cpn = bar_eff_g_c * dgc_from_cpn[m, n]
+                    bw_opt = (bar_iki_disc[k] * d_iki_dwo_arr[m, n]) if has_d_iki_arr else 0.0
+                    bw_avg = 0.0
+                    bw_wb = 0.0
+                    if is_last:
+                        bw_opt += bar_last_wo[k]
+                        if is_long_basket:
+                            bw_avg = bar_last_avg[k]
+                        if has_os:
+                            bw_wb = bar_last_wb[k]
+
+                    eff_wc_tot = bw_call + (bw_cpn if same_cpn_call else 0.0)
+                    uni_w = 0.0
+                    if call_code == 2:
+                        uni_w += eff_wc_tot * inv_d
+                    if (not same_cpn_call) and cpn_code == 2:
+                        uni_w += bw_cpn * inv_d
+                    if is_long_basket:
+                        uni_w += bw_avg * inv_d
+                    elif eff_opt_code == 2:
+                        uni_w += bw_opt * inv_d
+
+                    for d in range(d_assets):
+                        bp = uni_w
+                        if has_idx_call and idx_call[m, n] == d:
+                            bp += eff_wc_tot
+                        if (not same_cpn_call) and has_idx_cpn and idx_cpn[m, n] == d:
+                            bp += bw_cpn
+                        if has_idx_opt and idx_opt[m, n] == d:
+                            bp += bw_opt
+                        if is_last and has_os and has_idx_best and idx_best_last[n] == d:
+                            bp += bw_wb
+                        lx_v = bp * perf_m_d_n[m, d, n]
+                        bar_lx_post_np[m, d, n] = lx_v
+                        bar_ln_tiles[t_i, d, m] += lx_v
+
+        for t_i in range(n_tiles):
+            for d in range(d_assets):
+                for m in range(m_rem):
+                    bar_ln_fwd_np[d, m] += bar_ln_tiles[t_i, d, m]
+
+    @numba.njit(cache=True)  # type: ignore[untyped-decorator]
+    def _nb_payoff_aad_s1_loop(
+        gk_s1_all: npt.NDArray[np.float64],
+        egc_s1_all: npt.NDArray[np.float64],
+        cpn_rates: npt.NDArray[np.float64],
+        df_pay: npt.NDArray[np.float64],
+        w_fund_arr: npt.NDArray[np.float64],
+        has_w_fund: bool,
+        ki_s1: npt.NDArray[np.float64],
+        star_ind: npt.NDArray[np.float64],
+        put_intr: npt.NDArray[np.float64],
+        call_intr: npt.NDArray[np.float64],
+        w_avg_last: npt.NDArray[np.float64],
+        s1_mat: npt.NDArray[np.float64],
+        cf_wf_out: npt.NDArray[np.float64],
+        want_cf_wf: bool,
+        n_rep: int,
+        c_mem_0: float,
+        ac_cpn: float,
+        option_gearing: float,
+        part_call_rate: float,
+        one_star_coupon: float,
+        is_memory: bool,
+        no_notional: bool,
+        is_long_basket: bool,
+        put_active: bool,
+        has_pc: bool,
+        has_os: bool,
+    ) -> None:
+        m_rem, n_tot = gk_s1_all.shape
+        n_r_blk = max(n_tot // n_rep, 1)
+        m_last = m_rem - 1
+        inv_n_tot = 1.0 / float(n_tot)
+        inv_rep = 1.0 / float(n_rep)
+        surv_s1 = np.ones(n_tot, dtype=np.float64)
+        cmem_s1 = np.full(n_tot, c_mem_0, dtype=np.float64)
+        pv_s1 = np.zeros(n_tot, dtype=np.float64)
+
+        for m in range(m_rem):
+            c_r = float(cpn_rates[m])
+            df_m = float(df_pay[m])
+            wf_m = float(w_fund_arr[m]) if has_w_fund else 0.0
+            cf_sum = 0.0
+            sv_sum = 0.0
+            for r_i in range(n_r_blk):
+                base_n = r_i * n_rep
+                pm_sum = 0.0
+                qc_sum = 0.0
+                ccf_sum = 0.0
+                for k in range(n_rep):
+                    n = base_n + k
+                    sv = surv_s1[n]
+                    gk = gk_s1_all[m, n]
+                    egc = egc_s1_all[m, n]
+                    pm = sv * gk
+                    qc = sv * egc
+                    if is_memory:
+                        ec = c_r + cmem_s1[n]
+                        ccf = qc * ec + pm * ac_cpn
+                        cmem_s1[n] = sv * ec * (1.0 - egc)
+                    else:
+                        ccf = qc * c_r + pm * ac_cpn
+                    cf_m = ccf if no_notional else (pm + ccf)
+                    pv_s1[n] += df_m * cf_m - wf_m * sv
+                    rem_s = sv - pm
+                    surv_s1[n] = rem_s if rem_s > 0.0 else 0.0
+                    pm_sum += pm
+                    qc_sum += qc
+                    ccf_sum += ccf
+                    cf_sum += cf_m
+                    sv_sum += sv
+                s1_mat[r_i, m] = pm_sum * inv_rep
+                s1_mat[r_i, m_rem + m] = qc_sum * inv_rep
+                s1_mat[r_i, 2 * m_rem + m] = ccf_sum * inv_rep
+            if want_cf_wf:
+                cf_wf_out[0, m] = cf_sum * inv_n_tot
+                cf_wf_out[1, m] = sv_sum * inv_n_tot
+
+        df_last = float(df_pay[m_last])
+        c0 = 3 * m_rem
+        term_cf_sum = 0.0
+        for r_i in range(n_r_blk):
+            base_n = r_i * n_rep
+            s_uput = 0.0
+            s_ucall = 0.0
+            s_los = 0.0
+            s_pos = 0.0
+            s_pv = 0.0
+            s_pv2 = 0.0
+            for k in range(n_rep):
+                n = base_n + k
+                sv = surv_s1[n]
+                st_n = star_ind[n]
+                if is_long_basket:
+                    u_put = sv * ki_s1[n] * (1.0 - st_n) * (1.0 - w_avg_last[n])
+                    put_t = -u_put
+                else:
+                    u_put = (sv * ki_s1[n] * (1.0 - st_n) * put_intr[n]) if put_active else 0.0
+                    put_t = -option_gearing * u_put
+                u_call = (sv * call_intr[n]) if has_pc else 0.0
+                p_os = (sv * st_n) if has_os else 0.0
+                l_os = (p_os * one_star_coupon) if (has_os and one_star_coupon != 0.0) else 0.0
+                opt_t = put_t + (part_call_rate * u_call if has_pc else 0.0) + l_os
+                term_t = opt_t if no_notional else (sv + opt_t)
+                pv_n = pv_s1[n] + df_last * term_t
+                s_uput += u_put
+                s_ucall += u_call
+                s_los += l_os
+                s_pos += p_os
+                s_pv += pv_n
+                s_pv2 += pv_n * pv_n
+                term_cf_sum += term_t
+            s1_mat[r_i, c0 + 0] = s_uput * inv_rep
+            s1_mat[r_i, c0 + 1] = s_ucall * inv_rep
+            s1_mat[r_i, c0 + 2] = s_los * inv_rep
+            s1_mat[r_i, c0 + 3] = s_pos * inv_rep
+            s1_mat[r_i, c0 + 4] = s_pv * inv_rep
+            s1_mat[r_i, c0 + 5] = s_pv2 * inv_rep
+        if want_cf_wf:
+            cf_wf_out[0, m_last] += term_cf_sum * inv_n_tot
+
+
+def _compute_payoff_aad_state_adjoints_cpu_np(
+    perf_m_d_n: npt.NDArray[np.float64],
+    *,
+    ko_barriers: npt.NDArray[np.float64],
+    is_callable: npt.NDArray[np.float64],
+    cpn_barriers: npt.NDArray[np.float64],
+    is_guar: npt.NDArray[np.float64],
+    cpn_rates: npt.NDArray[np.float64],
+    df_pay: npt.NDArray[np.float64],
+    w_fund: Optional[npt.NDArray[np.float64]],
+    call_code: int,
+    cpn_code: int,
+    opt_code: int,
+    ko_spread: float,
+    cpn_spread: float,
+    ki_spread: float,
+    cpn_dir_down: bool,
+    cpn_type_out: bool,
+    is_memory: bool,
+    force_cpn_ac: bool,
+    no_notional: bool,
+    is_long_basket: bool,
+    has_ki: bool,
+    ki_barrier: float,
+    i_ki_past: float,
+    ki_monitoring_type: str,
+    tau_obs: npt.NDArray[np.float64],
+    vol_atm_obs: Optional[npt.NDArray[np.float64]],
+    strike: float,
+    lower_strike: Optional[float],
+    option_gearing: float,
+    ac_cpn: float,
+    c_mem_0: float,
+    part_call_strike: Optional[float],
+    part_call_rate: float,
+    one_star_strike: Optional[float],
+    one_star_coupon: float,
+    one_star_eps: float,
+    barrier_eps_min: float,
+    barrier_eps_max: float,
+    n_rep: int,
+    emit_stage1: bool = False,
+    compute_grads: bool = True,
+    want_cf_wf: bool = False,
+) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], Optional[npt.NDArray[np.float64]], Optional[npt.NDArray[np.float64]]]:
+    """Closed-form float64 analytical payoff AAD & Stage-1 evaluation in pure NumPy for codes {0,1,2}."""
+    m_rem, d_assets, n_tot = perf_m_d_n.shape
+    eff_opt_code = int(opt_code)
+    w_call, idx_call = _eval_index_and_weights_np(perf_m_d_n, call_code)
+    if cpn_code == call_code:
+        w_cpn, idx_cpn = w_call, idx_call
+    else:
+        w_cpn, idx_cpn = _eval_index_and_weights_np(perf_m_d_n, cpn_code)
+
+    w_avg_opt: Optional[npt.NDArray[np.float64]] = None
+    if is_long_basket:
+        w_opt, idx_opt = (w_call, idx_call) if call_code == 0 else ((w_cpn, idx_cpn) if cpn_code == 0 else _eval_index_and_weights_np(perf_m_d_n, 0))
+        w_avg_opt = w_call if call_code == 2 else (w_cpn if cpn_code == 2 else _eval_index_and_weights_np(perf_m_d_n, 2)[0])
+    elif eff_opt_code == call_code:
+        w_opt, idx_opt = w_call, idx_call
+    elif eff_opt_code == cpn_code:
+        w_opt, idx_opt = w_cpn, idx_cpn
+    else:
+        w_opt, idx_opt = _eval_index_and_weights_np(perf_m_d_n, eff_opt_code)
+
+    tau_prev = np.concatenate([[0.0], tau_obs[:-1]])
+    dt_period = np.maximum(tau_obs - tau_prev, 1e-8)
+    sig_est = np.maximum(np.mean(vol_atm_obs, axis=0), 0.05) if vol_atm_obs is not None else np.full(m_rem, 0.25, dtype=np.float64)
+    eps_vec_np = np.clip(
+        0.65 * sig_est * np.sqrt(dt_period),
+        max(float(barrier_eps_min), 0.015),
+        max(float(barrier_eps_max), 0.08),
+    )[:, None]
+
+    hard_ko = abs(ko_spread) <= 1e-6
+    eff_csp = -cpn_spread if cpn_dir_down else cpn_spread
+    hard_cpn = abs(eff_csp) <= 1e-6
+
+    lo_ko = np.minimum(ko_barriers, ko_barriers + ko_spread)[:, None] if not hard_ko else (ko_barriers[:, None] - 0.5 * eps_vec_np)
+    hi_ko = np.maximum(ko_barriers, ko_barriers + ko_spread)[:, None] if not hard_ko else (ko_barriers[:, None] + 0.5 * eps_vec_np)
+    inv_w_ko = 1.0 / np.maximum(hi_ko - lo_ko, 1e-12)
+    u_ko = (w_call - lo_ko) * inv_w_ko
+    ko_raw = np.clip(u_ko, 0.0, 1.0)
+    call_mask_m = (is_callable > 0.5)[:, None]
+    g_ko_all = np.where(call_mask_m, ko_raw, 0.0)
+    dg_ko_all = np.where(call_mask_m & (u_ko > 0.0) & (u_ko < 1.0), inv_w_ko, 0.0) if compute_grads else np.empty(0, dtype=np.float64)
+
+    lo_cp = np.minimum(cpn_barriers, cpn_barriers + eff_csp)[:, None] if not hard_cpn else (cpn_barriers[:, None] - 0.5 * eps_vec_np)
+    hi_cp = np.maximum(cpn_barriers, cpn_barriers + eff_csp)[:, None] if not hard_cpn else (cpn_barriers[:, None] + 0.5 * eps_vec_np)
+    inv_w_cp = 1.0 / np.maximum(hi_cp - lo_cp, 1e-12)
+    u_cp = (w_cpn - lo_cp) * inv_w_cp
+    ramp_cp = np.clip(u_cp, 0.0, 1.0)
+    hit_cp = (1.0 - ramp_cp) if cpn_dir_down else ramp_cp
+    ind_cp = (1.0 - hit_cp) if cpn_type_out else hit_cp
+    guar_mask_m = (is_guar > 0.5)[:, None]
+    g_cpn_raw = np.where(guar_mask_m, 1.0, ind_cp)
+    sign_cpn = (-1.0 if cpn_dir_down else 1.0) * (-1.0 if cpn_type_out else 1.0)
+    dg_cpn_raw = np.where((~guar_mask_m) & (u_cp > 0.0) & (u_cp < 1.0), inv_w_cp * sign_cpn, 0.0) if compute_grads else np.empty(0, dtype=np.float64)
+
+    if force_cpn_ac:
+        eff_g_cpn_all = np.maximum(g_cpn_raw, g_ko_all)
+        if compute_grads:
+            w_c_max = np.where(g_cpn_raw > g_ko_all, 1.0, np.where(g_cpn_raw < g_ko_all, 0.0, 0.5))
+            dgc_from_cpn = w_c_max * dg_cpn_raw
+            dgc_from_ko = (1.0 - w_c_max) * dg_ko_all
+        else:
+            dgc_from_cpn = np.empty(0, dtype=np.float64)
+            dgc_from_ko = np.empty(0, dtype=np.float64)
+    else:
+        eff_g_cpn_all = g_cpn_raw
+        dgc_from_cpn = dg_cpn_raw
+        dgc_from_ko = np.zeros_like(dg_ko_all) if compute_grads else np.empty(0, dtype=np.float64)
+
+    surv_pre_arr = np.empty((m_rem, n_tot), dtype=np.float64)
+    eff_c_arr = np.empty((m_rem, n_tot), dtype=np.float64)
+    surv = np.ones(n_tot, dtype=np.float64)
+    c_mem = np.full(n_tot, float(c_mem_0), dtype=np.float64)
+    for m in range(m_rem):
+        surv_pre_arr[m] = surv
+        if is_memory:
+            eff_c = cpn_rates[m] + c_mem
+            eff_c_arr[m] = eff_c
+            c_mem = surv * eff_c * (1.0 - eff_g_cpn_all[m])
+        else:
+            eff_c_arr[m] = cpn_rates[m]
+        surv = np.maximum(surv - surv * g_ko_all[m], 0.0)
+    surv_end = surv
+
+    ki_mode_norm = str(ki_monitoring_type or "Discrete").strip().lower()
+    m_last = m_rem - 1
+    d_iki_dwo_arr: Optional[npt.NDArray[np.float64]] = None
+    d_iki_dwo_last = np.zeros(n_tot, dtype=np.float64)
+    if has_ki and ki_barrier > 0.0 and i_ki_past < 0.5:
+        b_ki_base = float(strike) if is_long_basket else float(ki_barrier)
+        if ki_mode_norm == "discrete":
+            if abs(ki_spread) > 1e-6:
+                blo_k = min(b_ki_base, b_ki_base + float(ki_spread))
+                bhi_k = max(b_ki_base, b_ki_base + float(ki_spread))
+                inv_wk = np.full((m_rem, 1), 1.0 / max(bhi_k - blo_k, 1e-12), dtype=np.float64)
+            else:
+                bhi_k = b_ki_base + 0.5 * eps_vec_np
+                inv_wk = 1.0 / np.maximum(eps_vec_np, 1e-12)
+            u_ki_m = (bhi_k - w_opt) * inv_wk
+            g_k_m = np.clip(u_ki_m, 0.0, 1.0)
+            one_m_g = 1.0 - g_k_m
+            p_noki_d = np.prod(one_m_g, axis=0)
+            i_ki_t = 1.0 - p_noki_d
+            if compute_grads:
+                dg_k_m = np.where((u_ki_m > 0.0) & (u_ki_m < 1.0), -inv_wk, 0.0)
+                pref = np.ones((m_rem, n_tot), dtype=np.float64)
+                suff = np.ones((m_rem, n_tot), dtype=np.float64)
+                for m_k in range(1, m_rem):
+                    pref[m_k] = pref[m_k - 1] * one_m_g[m_k - 1]
+                for m_k in range(m_rem - 2, -1, -1):
+                    suff[m_k] = suff[m_k + 1] * one_m_g[m_k + 1]
+                d_iki_dwo_arr = -pref * suff * dg_k_m
+        else:
+            if abs(ki_spread) > 1e-6:
+                blo_k = min(b_ki_base, b_ki_base + float(ki_spread))
+                bhi_k = max(b_ki_base, b_ki_base + float(ki_spread))
+                inv_wk_f = 1.0 / max(bhi_k - blo_k, 1e-12)
+            else:
+                eps_term = float(eps_vec_np[-1, 0])
+                bhi_k = b_ki_base + 0.5 * eps_term
+                inv_wk_f = 1.0 / max(eps_term, 1e-12)
+            u_ki = (bhi_k - w_opt[m_last]) * inv_wk_f
+            i_ki_t = np.clip(u_ki, 0.0, 1.0)
+            if compute_grads:
+                d_iki_dwo_last = np.where((u_ki > 0.0) & (u_ki < 1.0), -inv_wk_f, 0.0)
+    else:
+        i_ki_t = np.full(n_tot, float(i_ki_past), dtype=np.float64)
+
+    has_os = one_star_strike is not None and float(one_star_strike) > 0.0
+    if has_os and one_star_strike is not None:
+        w_best_last, idx_best_last = (
+            (w_opt[m_last], idx_opt[m_last] if idx_opt is not None else None)
+            if ((not is_long_basket) and eff_opt_code == 1)
+            else (
+                np.max(perf_m_d_n[m_last], axis=0),
+                np.argmax(perf_m_d_n[m_last], axis=0),
+            )
+        )
+        k_os = float(one_star_strike)
+        if one_star_eps <= 1e-6:
+            star_ind = (w_best_last >= k_os).astype(np.float64)
+            d_star = np.zeros(n_tot, dtype=np.float64)
+        else:
+            half_os = 0.5 * one_star_eps
+            u_os = (w_best_last - (k_os - half_os)) / one_star_eps
+            star_ind = np.clip(u_os, 0.0, 1.0)
+            d_star = np.where((u_os > 0.0) & (u_os < 1.0), 1.0 / one_star_eps, 0.0)
+    else:
+        idx_best_last = None
+        star_ind = np.zeros(n_tot, dtype=np.float64)
+        d_star = np.zeros(n_tot, dtype=np.float64)
+
+    opt_pay = np.zeros(n_tot, dtype=np.float64)
+    d_opt_d_wo = np.zeros(n_tot, dtype=np.float64)
+    d_opt_d_avg = np.zeros(n_tot, dtype=np.float64)
+    d_opt_d_wb = np.zeros(n_tot, dtype=np.float64)
+    d_opt_d_iki = np.zeros(n_tot, dtype=np.float64)
+    ki_gate = i_ki_t if has_ki else 1.0
+    if is_long_basket:
+        assert w_avg_opt is not None
+        opt_pay = opt_pay - (1.0 - w_avg_opt[m_last]) * ki_gate * (1.0 - star_ind)
+        put_active = False
+        put_intr = np.zeros(n_tot, dtype=np.float64)
+        if compute_grads:
+            d_opt_d_avg = (ki_gate if has_ki else 1.0) * (1.0 - star_ind)
+            if has_ki:
+                d_opt_d_iki = -(1.0 - w_avg_opt[m_last]) * (1.0 - star_ind)
+            d_opt_d_wb = (1.0 - w_avg_opt[m_last]) * ki_gate * d_star
+    else:
+        if lower_strike is not None:
+            k_low = float(lower_strike)
+            put_active = float(strike) > k_low and float(option_gearing) > 0.0
+            put_intr = np.maximum(float(strike) - w_opt[m_last], 0.0) - np.maximum(k_low - w_opt[m_last], 0.0)
+            if compute_grads and put_active:
+                d_put = np.where(w_opt[m_last] < float(strike), -1.0, 0.0) - np.where(w_opt[m_last] < k_low, -1.0, 0.0)
+            else:
+                d_put = np.zeros(n_tot, dtype=np.float64)
+        else:
+            put_active = float(option_gearing) > 0.0
+            put_intr = np.maximum(float(strike) - w_opt[m_last], 0.0)
+            if compute_grads and put_active:
+                d_put = np.where(w_opt[m_last] < float(strike), -1.0, 0.0)
+            else:
+                d_put = np.zeros(n_tot, dtype=np.float64)
+        if put_active:
+            opt_pay = opt_pay - float(option_gearing) * ki_gate * (1.0 - star_ind) * put_intr
+            if compute_grads:
+                if has_ki:
+                    d_opt_d_iki = -float(option_gearing) * (1.0 - star_ind) * put_intr
+                d_opt_d_wo = d_opt_d_wo - float(option_gearing) * ki_gate * (1.0 - star_ind) * d_put
+                d_opt_d_wb = float(option_gearing) * ki_gate * put_intr * d_star
+
+    has_pc = part_call_strike is not None and float(part_call_strike) >= 0.0 and float(part_call_rate) != 0.0
+    call_intr = np.maximum(w_opt[m_last] - float(part_call_strike), 0.0) if (has_pc and part_call_strike is not None) else np.zeros(n_tot, dtype=np.float64)
+    if has_pc and part_call_strike is not None:
+        opt_pay = opt_pay + float(part_call_rate) * call_intr
+        if compute_grads:
+            d_opt_d_wo = d_opt_d_wo + np.where(w_opt[m_last] > float(part_call_strike), float(part_call_rate), 0.0)
+    if has_os and float(one_star_coupon) != 0.0:
+        opt_pay = opt_pay + star_ind * float(one_star_coupon)
+        if compute_grads:
+            d_opt_d_wb = d_opt_d_wb + d_star * float(one_star_coupon)
+
+    bar_lx_post_np = np.zeros((m_rem, d_assets, n_tot), dtype=np.float64)
+    bar_ln_fwd_np = np.zeros((d_assets, m_rem), dtype=np.float64)
+    use_nb_pa = bool(_HAS_NUMBA and call_code in (0, 1, 2) and cpn_code in (0, 1, 2) and eff_opt_code in (0, 1, 2))
+    wf_nb_pa = np.ascontiguousarray(w_fund, dtype=np.float64) if w_fund is not None else np.zeros(m_rem, dtype=np.float64)
+    if compute_grads and use_nb_pa:
+        dummy_i2d = np.empty((1, 1), dtype=np.int32)
+        dummy_i1d = np.empty(1, dtype=np.int32)
+        dummy_f2d = np.empty((1, 1), dtype=np.float64)
+        _nb_payoff_aad_bwd_and_s1(
+            np.ascontiguousarray(perf_m_d_n, dtype=np.float64),
+            np.ascontiguousarray(g_ko_all, dtype=np.float64),
+            np.ascontiguousarray(dg_ko_all, dtype=np.float64),
+            np.ascontiguousarray(eff_g_cpn_all, dtype=np.float64),
+            np.ascontiguousarray(dgc_from_cpn, dtype=np.float64),
+            np.ascontiguousarray(dgc_from_ko, dtype=np.float64),
+            np.ascontiguousarray(surv_pre_arr, dtype=np.float64),
+            np.ascontiguousarray(eff_c_arr, dtype=np.float64),
+            np.ascontiguousarray(surv_end, dtype=np.float64),
+            np.ascontiguousarray(opt_pay, dtype=np.float64),
+            np.ascontiguousarray(d_opt_d_wo, dtype=np.float64),
+            np.ascontiguousarray(d_opt_d_avg, dtype=np.float64),
+            np.ascontiguousarray(d_opt_d_wb, dtype=np.float64),
+            np.ascontiguousarray(d_opt_d_iki, dtype=np.float64),
+            np.ascontiguousarray(d_iki_dwo_last, dtype=np.float64),
+            np.ascontiguousarray(d_iki_dwo_arr, dtype=np.float64) if d_iki_dwo_arr is not None else dummy_f2d,
+            d_iki_dwo_arr is not None,
+            np.ascontiguousarray(df_pay, dtype=np.float64),
+            wf_nb_pa,
+            w_fund is not None,
+            np.ascontiguousarray(idx_call, dtype=np.int32) if idx_call is not None else dummy_i2d,
+            idx_call is not None,
+            np.ascontiguousarray(idx_cpn, dtype=np.int32) if idx_cpn is not None else dummy_i2d,
+            idx_cpn is not None,
+            np.ascontiguousarray(idx_opt, dtype=np.int32) if idx_opt is not None else dummy_i2d,
+            idx_opt is not None,
+            np.ascontiguousarray(idx_best_last, dtype=np.int32) if idx_best_last is not None else dummy_i1d,
+            idx_best_last is not None,
+            int(call_code),
+            int(cpn_code),
+            int(eff_opt_code),
+            bool(is_long_basket),
+            bool(is_memory),
+            bool(no_notional),
+            bool(has_os),
+            float(ac_cpn),
+            bar_lx_post_np,
+            bar_ln_fwd_np,
+        )
+    elif compute_grads:
+        scale = 1.0 / float(n_tot)
+        df_last = float(df_pay[m_last])
+        term_mult = opt_pay if no_notional else (1.0 + opt_pay)
+        bar_surv = scale * df_last * term_mult
+        bar_c_mem = np.zeros(n_tot, dtype=np.float64)
+        bar_last_wo = scale * df_last * surv_end * (d_opt_d_wo + (d_opt_d_iki * d_iki_dwo_last if d_iki_dwo_arr is None else 0.0))
+        bar_last_avg = scale * df_last * surv_end * d_opt_d_avg
+        bar_last_wb = scale * df_last * surv_end * d_opt_d_wb
+        bar_iki_disc = (scale * df_last * surv_end * d_opt_d_iki) if d_iki_dwo_arr is not None else None
+        inv_d = 1.0 / float(d_assets)
+        ac_c = float(ac_cpn)
+
+        for m in range(m_rem - 1, -1, -1):
+            surv_pre = surv_pre_arr[m]
+            g_k = g_ko_all[m]
+            eff_g_c = eff_g_cpn_all[m]
+            eff_c = eff_c_arr[m]
+            df_m = float(df_pay[m])
+            wf_m = float(w_fund[m]) if w_fund is not None else 0.0
+
+            bar_pm = -bar_surv
+            if not no_notional:
+                bar_pm = bar_pm + scale * df_m
+            bar_pm = bar_pm + scale * df_m * ac_c
+            bar_eff_g_c = scale * df_m * surv_pre * eff_c
+            if is_memory:
+                bar_eff_g_c = bar_eff_g_c - bar_c_mem * surv_pre * eff_c
+
+            bar_surv_next = bar_surv + bar_pm * g_k + scale * df_m * eff_g_c * eff_c - scale * wf_m
+            if is_memory:
+                bar_surv_next = bar_surv_next + bar_c_mem * eff_c * (1.0 - eff_g_c)
+            bar_surv = bar_surv_next
+            if is_memory:
+                bar_c_mem = scale * df_m * surv_pre * eff_g_c + bar_c_mem * surv_pre * (1.0 - eff_g_c)
+
+            bar_g_k = bar_pm * surv_pre
+            bar_w_call = bar_g_k * dg_ko_all[m] + bar_eff_g_c * dgc_from_ko[m]
+            bar_w_cpn = bar_eff_g_c * dgc_from_cpn[m]
+
+            bar_w_opt = np.zeros(n_tot, dtype=np.float64)
+            bar_w_avg = np.zeros(n_tot, dtype=np.float64)
+            bar_w_wb = np.zeros(n_tot, dtype=np.float64)
+            if bar_iki_disc is not None and d_iki_dwo_arr is not None:
+                bar_w_opt = bar_iki_disc * d_iki_dwo_arr[m]
+            if m == m_last:
+                bar_w_opt = bar_w_opt + bar_last_wo
+                if is_long_basket:
+                    bar_w_avg = bar_last_avg
+                if has_os:
+                    bar_w_wb = bar_last_wb
+
+            # Merge index sensitivities with identical codes before scattering across assets.
+            bp_m = np.zeros((d_assets, n_tot), dtype=np.float64)
+            eff_wc_tot = bar_w_call + (bar_w_cpn if cpn_code == call_code else 0.0)
+            if call_code == 2:
+                bp_m += eff_wc_tot * inv_d
+            elif idx_call is not None:
+                np.add.at(bp_m, (idx_call[m], np.arange(n_tot)), eff_wc_tot)
+            if cpn_code != call_code:
+                if cpn_code == 2:
+                    bp_m += bar_w_cpn * inv_d
+                elif idx_cpn is not None:
+                    np.add.at(bp_m, (idx_cpn[m], np.arange(n_tot)), bar_w_cpn)
+            if is_long_basket:
+                if idx_opt is not None:
+                    np.add.at(bp_m, (idx_opt[m], np.arange(n_tot)), bar_w_opt)
+                bp_m += bar_w_avg * inv_d
+            else:
+                if eff_opt_code == 2:
+                    bp_m += bar_w_opt * inv_d
+                elif idx_opt is not None:
+                    np.add.at(bp_m, (idx_opt[m], np.arange(n_tot)), bar_w_opt)
+            if has_os and m == m_last and idx_best_last is not None:
+                np.add.at(bp_m, (idx_best_last, np.arange(n_tot)), bar_w_wb)
+
+            lx_m = bp_m * perf_m_d_n[m]
+            bar_lx_post_np[m] = lx_m
+            bar_ln_fwd_np[:, m] = lx_m.sum(axis=1)
+
+    stage1_rep_out: Optional[npt.NDArray[np.float64]] = None
+    cf_wf_out: Optional[npt.NDArray[np.float64]] = None
+    if emit_stage1 and n_rep > 0:
+        n_r_blk = max(n_tot // n_rep, 1)
+        s1_mat = np.zeros((n_r_blk, 3 * m_rem + 6), dtype=np.float64)
+        cf_wf_out = np.zeros((2, m_rem), dtype=np.float64) if want_cf_wf else None
+        gk_s1_all = g_ko_all if not hard_ko else np.where(call_mask_m, (w_call >= ko_barriers[:, None]).astype(np.float64), 0.0)
+        if not hard_cpn:
+            egc_s1_all = eff_g_cpn_all
+        else:
+            h_cpn = (w_cpn <= cpn_barriers[:, None]) if cpn_dir_down else (w_cpn >= cpn_barriers[:, None])
+            ind_h = (1.0 - h_cpn.astype(np.float64)) if cpn_type_out else h_cpn.astype(np.float64)
+            gc_s1 = np.where(guar_mask_m, 1.0, ind_h)
+            egc_s1_all = np.maximum(gc_s1, gk_s1_all) if force_cpn_ac else gc_s1
+        if has_ki and ki_barrier > 0.0 and i_ki_past < 0.5:
+            if ki_mode_norm == "discrete" or abs(ki_spread) > 1e-6:
+                ki_s1 = i_ki_t
+            else:
+                b_ki_s1 = float(strike) if is_long_basket else float(ki_barrier)
+                ki_s1 = (w_opt[m_last] < b_ki_s1).astype(np.float64)
+        else:
+            ki_s1 = np.ones(n_tot, dtype=np.float64) if not has_ki else np.full(n_tot, float(i_ki_past), dtype=np.float64)
+
+        if use_nb_pa:
+            cf_nb_pa = cf_wf_out if cf_wf_out is not None else np.zeros((2, m_rem), dtype=np.float64)
+            w_avg_l_nb = np.ascontiguousarray(w_avg_opt[m_last], dtype=np.float64) if (is_long_basket and w_avg_opt is not None) else np.empty(1, dtype=np.float64)
+            _nb_payoff_aad_s1_loop(
+                np.ascontiguousarray(gk_s1_all, dtype=np.float64),
+                np.ascontiguousarray(egc_s1_all, dtype=np.float64),
+                np.ascontiguousarray(cpn_rates, dtype=np.float64),
+                np.ascontiguousarray(df_pay, dtype=np.float64),
+                wf_nb_pa,
+                w_fund is not None,
+                np.ascontiguousarray(ki_s1, dtype=np.float64),
+                np.ascontiguousarray(star_ind, dtype=np.float64),
+                np.ascontiguousarray(put_intr, dtype=np.float64),
+                np.ascontiguousarray(call_intr, dtype=np.float64),
+                w_avg_l_nb,
+                s1_mat,
+                cf_nb_pa,
+                bool(want_cf_wf),
+                int(n_rep),
+                float(c_mem_0),
+                float(ac_cpn),
+                float(option_gearing),
+                float(part_call_rate),
+                float(one_star_coupon),
+                bool(is_memory),
+                bool(no_notional),
+                bool(is_long_basket),
+                bool(put_active),
+                bool(has_pc and part_call_strike is not None),
+                bool(has_os),
+            )
+            stage1_rep_out = s1_mat
+        else:
+            surv_s1 = np.ones(n_tot, dtype=np.float64)
+            cmem_s1 = np.full(n_tot, float(c_mem_0), dtype=np.float64)
+            pv_s1 = np.zeros(n_tot, dtype=np.float64)
+            inv_n_tot = 1.0 / float(n_tot)
+            for m in range(m_rem):
+                pm_s1 = surv_s1 * gk_s1_all[m]
+                qc_s1 = surv_s1 * egc_s1_all[m]
+                if is_memory:
+                    ec_s1 = cpn_rates[m] + cmem_s1
+                    ccf_s1 = qc_s1 * ec_s1 + pm_s1 * float(ac_cpn)
+                    cmem_s1 = surv_s1 * ec_s1 * (1.0 - egc_s1_all[m])
+                else:
+                    ccf_s1 = qc_s1 * cpn_rates[m] + pm_s1 * float(ac_cpn)
+                wf_m_s1 = float(w_fund[m]) if w_fund is not None else 0.0
+                cf_m_s1 = ccf_s1 if no_notional else (pm_s1 + ccf_s1)
+                pv_s1 = pv_s1 + float(df_pay[m]) * cf_m_s1 - wf_m_s1 * surv_s1
+                if cf_wf_out is not None:
+                    cf_wf_out[0, m] = float(cf_m_s1.sum() * inv_n_tot)
+                    cf_wf_out[1, m] = float(surv_s1.sum() * inv_n_tot)
+                s1_mat[:, m] = pm_s1.reshape(n_r_blk, n_rep).mean(axis=1)
+                s1_mat[:, m_rem + m] = qc_s1.reshape(n_r_blk, n_rep).mean(axis=1)
+                s1_mat[:, 2 * m_rem + m] = ccf_s1.reshape(n_r_blk, n_rep).mean(axis=1)
+                surv_s1 = np.maximum(surv_s1 - pm_s1, 0.0)
+
+            if is_long_basket:
+                assert w_avg_opt is not None
+                u_put_s1 = surv_s1 * ki_s1 * (1.0 - star_ind) * (1.0 - w_avg_opt[m_last])
+                put_term_s1 = -u_put_s1
+            else:
+                u_put_s1 = (surv_s1 * ki_s1 * (1.0 - star_ind) * put_intr) if put_active else np.zeros(n_tot, dtype=np.float64)
+                put_term_s1 = -float(option_gearing) * u_put_s1
+            u_call_s1 = (surv_s1 * call_intr) if (has_pc and part_call_strike is not None) else np.zeros(n_tot, dtype=np.float64)
+            p_os_s1 = (surv_s1 * star_ind) if has_os else np.zeros(n_tot, dtype=np.float64)
+            l_os_s1 = (p_os_s1 * float(one_star_coupon)) if (has_os and float(one_star_coupon) != 0.0) else np.zeros(n_tot, dtype=np.float64)
+            opt_s1 = put_term_s1 + (float(part_call_rate) * u_call_s1 if has_pc else 0.0) + l_os_s1
+            term_s1 = opt_s1 if no_notional else (surv_s1 + opt_s1)
+            pv_s1 = pv_s1 + float(df_pay[m_last]) * term_s1
+            c0 = 3 * m_rem
+            s1_mat[:, c0 + 0] = u_put_s1.reshape(n_r_blk, n_rep).mean(axis=1)
+            s1_mat[:, c0 + 1] = u_call_s1.reshape(n_r_blk, n_rep).mean(axis=1)
+            s1_mat[:, c0 + 2] = l_os_s1.reshape(n_r_blk, n_rep).mean(axis=1)
+            s1_mat[:, c0 + 3] = p_os_s1.reshape(n_r_blk, n_rep).mean(axis=1)
+            s1_mat[:, c0 + 4] = pv_s1.reshape(n_r_blk, n_rep).mean(axis=1)
+            s1_mat[:, c0 + 5] = (pv_s1 * pv_s1).reshape(n_r_blk, n_rep).mean(axis=1)
+            stage1_rep_out = s1_mat
+            if cf_wf_out is not None:
+                cf_wf_out[0, m_last] += float(term_s1.sum() * inv_n_tot)
+
+    return bar_lx_post_np, bar_ln_fwd_np, stage1_rep_out, cf_wf_out
+
+
+if _HAS_NUMBA:
+    @numba.njit(inline="always")  # type: ignore[untyped-decorator]
+    def _nb_c2_s5(x: float, lo_v: float, inv_w: float) -> float:
+        u = (x - lo_v) * inv_w
+        if u < 0.0:
+            u = 0.0
+        elif u > 1.0:
+            u = 1.0
+        return ((6.0 * u - 15.0) * u + 10.0) * u * u * u
+
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_c2_precompute_stats(
+        p_pre: npt.NDArray[np.float64],
+        pm_sp: npt.NDArray[np.float64],
+        need_min: bool,
+        need_max: bool,
+        need_sum: bool,
+    ) -> Tuple[
+        npt.NDArray[np.int32],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int32],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int32],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int32],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int32],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int32],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+    ]:
+        m_pre, d_assets, n_tot = p_pre.shape
+        mn_shape = (m_pre, n_tot) if need_min else (1, 1)
+        mx_shape = (m_pre, n_tot) if need_max else (1, 1)
+        sm_shape = (m_pre, n_tot) if need_sum else (1, 1)
+        mk1 = np.empty(mn_shape, dtype=np.int32)
+        mv1 = np.empty(mn_shape, dtype=np.float64)
+        mk2 = np.empty(mn_shape, dtype=np.int32)
+        mv2 = np.empty(mn_shape, dtype=np.float64)
+        mk3 = np.empty(mn_shape, dtype=np.int32)
+        mv3 = np.empty(mn_shape, dtype=np.float64)
+        min_p = np.empty(mn_shape, dtype=np.float64)
+        min_m = np.empty(mn_shape, dtype=np.float64)
+        xk1 = np.empty(mx_shape, dtype=np.int32)
+        xv1 = np.empty(mx_shape, dtype=np.float64)
+        xk2 = np.empty(mx_shape, dtype=np.int32)
+        xv2 = np.empty(mx_shape, dtype=np.float64)
+        xk3 = np.empty(mx_shape, dtype=np.int32)
+        xv3 = np.empty(mx_shape, dtype=np.float64)
+        max_p = np.empty(mx_shape, dtype=np.float64)
+        max_m = np.empty(mx_shape, dtype=np.float64)
+        sum_b = np.empty(sm_shape, dtype=np.float64)
+        sum_sp_p = np.empty(sm_shape, dtype=np.float64)
+        sum_sp_m = np.empty(sm_shape, dtype=np.float64)
+        inv_d = 1.0 / float(d_assets)
+
+        for mn in numba.prange(m_pre * n_tot):
+            m = mn // n_tot
+            n = mn - m * n_tot
+            if need_min:
+                k1, k2, k3 = 0, 0, 0
+                v1, v2, v3 = 1e300, 1e300, 1e300
+                mp = 1e300
+                mm = 1e300
+                for d in range(d_assets):
+                    v = p_pre[m, d, n]
+                    if v < v1:
+                        k3, v3 = k2, v2
+                        k2, v2 = k1, v1
+                        k1, v1 = d, v
+                    elif v < v2:
+                        k3, v3 = k2, v2
+                        k2, v2 = d, v
+                    elif v < v3:
+                        k3, v3 = d, v
+                    vp = pm_sp[d, m, n]
+                    vm = pm_sp[d_assets + d, m, n]
+                    if vp < mp:
+                        mp = vp
+                    if vm < mm:
+                        mm = vm
+                # Identity sentinel (1e300) ensures d_assets==1/2 leave-one/two-out excludes all bumped assets.
+                mk1[m, n], mv1[m, n] = k1, v1
+                mk2[m, n], mv2[m, n] = k2, v2
+                mk3[m, n], mv3[m, n] = k3, v3
+                min_p[m, n], min_m[m, n] = mp, mm
+            if need_max:
+                k1, k2, k3 = 0, 0, 0
+                v1, v2, v3 = -1e300, -1e300, -1e300
+                xp = -1e300
+                xm = -1e300
+                for d in range(d_assets):
+                    v = p_pre[m, d, n]
+                    if v > v1:
+                        k3, v3 = k2, v2
+                        k2, v2 = k1, v1
+                        k1, v1 = d, v
+                    elif v > v2:
+                        k3, v3 = k2, v2
+                        k2, v2 = d, v
+                    elif v > v3:
+                        k3, v3 = d, v
+                    vp = pm_sp[d, m, n]
+                    vm = pm_sp[d_assets + d, m, n]
+                    if vp > xp:
+                        xp = vp
+                    if vm > xm:
+                        xm = vm
+                # Identity sentinel (-1e300) ensures d_assets==1/2 leave-one/two-out excludes all bumped assets.
+                xk1[m, n], xv1[m, n] = k1, v1
+                xk2[m, n], xv2[m, n] = k2, v2
+                xk3[m, n], xv3[m, n] = k3, v3
+                max_p[m, n], max_m[m, n] = xp, xm
+            if need_sum:
+                sb, spp, spm = 0.0, 0.0, 0.0
+                for d in range(d_assets):
+                    sb += p_pre[m, d, n]
+                    spp += pm_sp[d, m, n]
+                    spm += pm_sp[d_assets + d, m, n]
+                sum_b[m, n] = sb
+                sum_sp_p[m, n] = spp * inv_d
+                sum_sp_m[m, n] = spm * inv_d
+
+        return (
+            mk1, mv1, mk2, mv2, mk3, mv3, min_p, min_m,
+            xk1, xv1, xk2, xv2, xk3, xv3, max_p, max_m,
+            sum_b, sum_sp_p, sum_sp_m,
+        )
+
+    @numba.njit(inline="always")  # type: ignore[untyped-decorator]
+    def _nb_fill_idx_slice(
+        code_idx: int,
+        aa_i: int,
+        ab_i: int,
+        asl_i: int,
+        bsl_i: int,
+        m: int,
+        n_start: int,
+        n_len: int,
+        inv_d: float,
+        p_pre: npt.NDArray[np.float64],
+        pm_sp: npt.NDArray[np.float64],
+        mk1: npt.NDArray[np.int32],
+        mv1: npt.NDArray[np.float64],
+        mk2: npt.NDArray[np.int32],
+        mv2: npt.NDArray[np.float64],
+        mv3: npt.NDArray[np.float64],
+        min_p: npt.NDArray[np.float64],
+        min_m: npt.NDArray[np.float64],
+        xk1: npt.NDArray[np.int32],
+        xv1: npt.NDArray[np.float64],
+        xk2: npt.NDArray[np.int32],
+        xv2: npt.NDArray[np.float64],
+        xv3: npt.NDArray[np.float64],
+        max_p: npt.NDArray[np.float64],
+        max_m: npt.NDArray[np.float64],
+        sum_b: npt.NDArray[np.float64],
+        sum_sp_p: npt.NDArray[np.float64],
+        sum_sp_m: npt.NDArray[np.float64],
+        out_w: npt.NDArray[np.float64],
+    ) -> None:
+        n_end = n_start + n_len
+        if code_idx == 2:
+            if aa_i == -2:
+                src_s = sum_sp_p[m, n_start:n_end] if asl_i == 0 else sum_sp_m[m, n_start:n_end]
+                for k in range(n_len):
+                    out_w[k] = src_s[k]
+            elif aa_i == -1:
+                sb_m = sum_b[m, n_start:n_end]
+                for k in range(n_len):
+                    out_w[k] = sb_m[k] * inv_d
+            elif ab_i < 0:
+                sb_m = sum_b[m, n_start:n_end]
+                pa_m = p_pre[m, aa_i, n_start:n_end]
+                sp_a = pm_sp[asl_i, m, n_start:n_end]
+                for k in range(n_len):
+                    out_w[k] = (sb_m[k] - pa_m[k] + sp_a[k]) * inv_d
+            else:
+                sb_m = sum_b[m, n_start:n_end]
+                pa_m = p_pre[m, aa_i, n_start:n_end]
+                pb_m = p_pre[m, ab_i, n_start:n_end]
+                sp_a = pm_sp[asl_i, m, n_start:n_end]
+                sp_b = pm_sp[bsl_i, m, n_start:n_end]
+                for k in range(n_len):
+                    out_w[k] = (sb_m[k] - pa_m[k] - pb_m[k] + sp_a[k] + sp_b[k]) * inv_d
+        elif code_idx == 0:
+            if aa_i == -2:
+                src_s = min_p[m, n_start:n_end] if asl_i == 0 else min_m[m, n_start:n_end]
+                for k in range(n_len):
+                    out_w[k] = src_s[k]
+            elif aa_i == -1:
+                v1_m = mv1[m, n_start:n_end]
+                for k in range(n_len):
+                    out_w[k] = v1_m[k]
+            elif ab_i < 0:
+                k1_m = mk1[m, n_start:n_end]
+                v1_m = mv1[m, n_start:n_end]
+                v2_m = mv2[m, n_start:n_end]
+                sp_a = pm_sp[asl_i, m, n_start:n_end]
+                for k in range(n_len):
+                    bv = v2_m[k] if k1_m[k] == aa_i else v1_m[k]
+                    sv = sp_a[k]
+                    out_w[k] = bv if bv < sv else sv
+            else:
+                k1_m = mk1[m, n_start:n_end]
+                k2_m = mk2[m, n_start:n_end]
+                v1_m = mv1[m, n_start:n_end]
+                v2_m = mv2[m, n_start:n_end]
+                v3_m = mv3[m, n_start:n_end]
+                sp_a = pm_sp[asl_i, m, n_start:n_end]
+                sp_b = pm_sp[bsl_i, m, n_start:n_end]
+                for k in range(n_len):
+                    k1n = k1_m[k]
+                    k2n = k2_m[k]
+                    m1 = (k1n == aa_i) or (k1n == ab_i)
+                    m2 = (k2n == aa_i) or (k2n == ab_i)
+                    bv = v3_m[k] if (m1 and m2) else (v2_m[k] if m1 else v1_m[k])
+                    s1v = sp_a[k]
+                    s2v = sp_b[k]
+                    sv = s1v if s1v < s2v else s2v
+                    out_w[k] = bv if bv < sv else sv
+        else:
+            if aa_i == -2:
+                src_s = max_p[m, n_start:n_end] if asl_i == 0 else max_m[m, n_start:n_end]
+                for k in range(n_len):
+                    out_w[k] = src_s[k]
+            elif aa_i == -1:
+                v1_m = xv1[m, n_start:n_end]
+                for k in range(n_len):
+                    out_w[k] = v1_m[k]
+            elif ab_i < 0:
+                k1_m = xk1[m, n_start:n_end]
+                v1_m = xv1[m, n_start:n_end]
+                v2_m = xv2[m, n_start:n_end]
+                sp_a = pm_sp[asl_i, m, n_start:n_end]
+                for k in range(n_len):
+                    bv = v2_m[k] if k1_m[k] == aa_i else v1_m[k]
+                    sv = sp_a[k]
+                    out_w[k] = bv if bv > sv else sv
+            else:
+                k1_m = xk1[m, n_start:n_end]
+                k2_m = xk2[m, n_start:n_end]
+                v1_m = xv1[m, n_start:n_end]
+                v2_m = xv2[m, n_start:n_end]
+                v3_m = xv3[m, n_start:n_end]
+                sp_a = pm_sp[asl_i, m, n_start:n_end]
+                sp_b = pm_sp[bsl_i, m, n_start:n_end]
+                for k in range(n_len):
+                    k1n = k1_m[k]
+                    k2n = k2_m[k]
+                    m1 = (k1n == aa_i) or (k1n == ab_i)
+                    m2 = (k2n == aa_i) or (k2n == ab_i)
+                    bv = v3_m[k] if (m1 and m2) else (v2_m[k] if m1 else v1_m[k])
+                    s1v = sp_a[k]
+                    s2v = sp_b[k]
+                    sv = s1v if s1v > s2v else s2v
+                    out_w[k] = bv if bv > sv else sv
+
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_c2_preterm_eval(
+        p_pre: npt.NDArray[np.float64],
+        pm_sp: npt.NDArray[np.float64],
+        frozen_term: npt.NDArray[np.float64],
+        aa_pre: npt.NDArray[np.int32],
+        ab_pre: npt.NDArray[np.int32],
+        asl_pre: npt.NDArray[np.int32],
+        bsl_pre: npt.NDArray[np.int32],
+        ko_barriers: npt.NDArray[np.float64],
+        is_callable: npt.NDArray[np.float64],
+        cpn_barriers: npt.NDArray[np.float64],
+        is_guar: npt.NDArray[np.float64],
+        cpn_rates: npt.NDArray[np.float64],
+        df_pay: npt.NDArray[np.float64],
+        w_fund_arr: npt.NDArray[np.float64],
+        has_w_fund: bool,
+        eps_vec: npt.NDArray[np.float64],
+        mk1: npt.NDArray[np.int32],
+        mv1: npt.NDArray[np.float64],
+        mk2: npt.NDArray[np.int32],
+        mv2: npt.NDArray[np.float64],
+        mk3: npt.NDArray[np.int32],
+        mv3: npt.NDArray[np.float64],
+        min_p: npt.NDArray[np.float64],
+        min_m: npt.NDArray[np.float64],
+        xk1: npt.NDArray[np.int32],
+        xv1: npt.NDArray[np.float64],
+        xk2: npt.NDArray[np.int32],
+        xv2: npt.NDArray[np.float64],
+        xk3: npt.NDArray[np.int32],
+        xv3: npt.NDArray[np.float64],
+        max_p: npt.NDArray[np.float64],
+        max_m: npt.NDArray[np.float64],
+        sum_b: npt.NDArray[np.float64],
+        sum_sp_p: npt.NDArray[np.float64],
+        sum_sp_m: npt.NDArray[np.float64],
+        call_code: int,
+        cpn_code: int,
+        hard_ko: bool,
+        hard_cpn: bool,
+        ko_spread: float,
+        eff_csp: float,
+        cpn_dir_down: bool,
+        cpn_type_out: bool,
+        is_memory: bool,
+        force_cpn_ac: bool,
+        no_notional: bool,
+        ac_cpn: float,
+        c_mem_0: float,
+    ) -> npt.NDArray[np.float64]:
+        m_pre, d_assets, n_tot = p_pre.shape
+        n_rows = len(aa_pre)
+        inv_d = 1.0 / float(d_assets)
+        m_last = m_pre
+        c_last = float(cpn_rates[m_last])
+        df_last = float(df_pay[m_last])
+        wf_last = float(w_fund_arr[m_last]) if has_w_fund else 0.0
+        gk_f = frozen_term[0]
+        egc_f = frozen_term[1]
+        opt_f = frozen_term[2]
+        out_pv = np.empty(n_rows, dtype=np.float64)
+        flip_cpn = cpn_dir_down != cpn_type_out
+        tile_n = 512
+        n_tiles = max(1, (n_tot + tile_n - 1) // tile_n)
+        tile_pv = np.zeros((n_rows, n_tiles), dtype=np.float64)
+
+        for task_i in numba.prange(n_rows * n_tiles):
+            row_i = task_i // n_tiles
+            tile_i = task_i - row_i * n_tiles
+            n_start = tile_i * tile_n
+            n_end = min(n_start + tile_n, n_tot)
+            n_len = n_end - n_start
+            aa_i = int(aa_pre[row_i])
+            ab_i = int(ab_pre[row_i])
+            asl_i = int(asl_pre[row_i])
+            bsl_i = int(bsl_pre[row_i])
+            surv_arr = np.ones(n_len, dtype=np.float64)
+            cmem_arr = np.full(n_len, c_mem_0, dtype=np.float64)
+            pv_arr = np.zeros(n_len, dtype=np.float64)
+            wc_buf = np.empty(n_len, dtype=np.float64)
+            wcp_buf = np.empty(n_len, dtype=np.float64)
+
+            for m in range(m_pre):
+                eps_m = float(eps_vec[m])
+                callable_m = is_callable[m] > 0.5
+                guar_m = is_guar[m] > 0.5
+                bk = float(ko_barriers[m])
+                lo_k = (bk - 0.5 * eps_m) if hard_ko else min(bk, bk + ko_spread)
+                hi_k = (bk + 0.5 * eps_m) if hard_ko else max(bk, bk + ko_spread)
+                inv_wk = 1.0 / max(hi_k - lo_k, 1e-12)
+                bc = float(cpn_barriers[m])
+                lo_c = (bc - 0.5 * eps_m) if hard_cpn else min(bc, bc + eff_csp)
+                hi_c = (bc + 0.5 * eps_m) if hard_cpn else max(bc, bc + eff_csp)
+                inv_wc = 1.0 / max(hi_c - lo_c, 1e-12)
+                c_rate = float(cpn_rates[m])
+                df_m = float(df_pay[m])
+                wf_m = float(w_fund_arr[m]) if has_w_fund else 0.0
+
+                if callable_m:
+                    _nb_fill_idx_slice(
+                        call_code, aa_i, ab_i, asl_i, bsl_i, m, n_start, n_len, inv_d,
+                        p_pre, pm_sp, mk1, mv1, mk2, mv2, mv3, min_p, min_m,
+                        xk1, xv1, xk2, xv2, xv3, max_p, max_m, sum_b, sum_sp_p, sum_sp_m, wc_buf,
+                    )
+                if (not guar_m) and not (callable_m and cpn_code == call_code):
+                    _nb_fill_idx_slice(
+                        cpn_code, aa_i, ab_i, asl_i, bsl_i, m, n_start, n_len, inv_d,
+                        p_pre, pm_sp, mk1, mv1, mk2, mv2, mv3, min_p, min_m,
+                        xk1, xv1, xk2, xv2, xv3, max_p, max_m, sum_b, sum_sp_p, sum_sp_m, wcp_buf,
+                    )
+                    wcp_src = wcp_buf
+                else:
+                    wcp_src = wc_buf
+
+                for k in range(n_len):
+                    gk = _nb_c2_s5(wc_buf[k], lo_k, inv_wk) if callable_m else 0.0
+                    if guar_m:
+                        gc = 1.0
+                    else:
+                        gc = _nb_c2_s5(wcp_src[k], lo_c, inv_wc)
+                        if flip_cpn:
+                            gc = 1.0 - gc
+                        if callable_m and force_cpn_ac and gk > gc:
+                            gc = gk
+                    surv = surv_arr[k]
+                    pm = surv * gk if callable_m else 0.0
+                    if is_memory:
+                        u_m = cmem_arr[k] + c_rate
+                        tmp = surv * gc * u_m + (pm * ac_cpn if callable_m else 0.0)
+                        cmem_arr[k] = (1.0 - gc) * surv * u_m
+                    else:
+                        tmp = surv * gc * c_rate + (pm * ac_cpn if callable_m else 0.0)
+                    if callable_m and (not no_notional):
+                        tmp += pm
+                    pv_cur = pv_arr[k] + df_m * tmp
+                    if has_w_fund:
+                        pv_cur -= wf_m * surv
+                    pv_arr[k] = pv_cur
+                    if callable_m:
+                        rem_s = surv - pm
+                        surv_arr[k] = rem_s if rem_s > 0.0 else 0.0
+
+            pv_sum = 0.0
+            for k in range(n_len):
+                n = n_start + k
+                surv = surv_arr[k]
+                eff_c_last = (c_last + cmem_arr[k]) if is_memory else c_last
+                pm = surv * gk_f[n]
+                cpn_last = surv * egc_f[n] * eff_c_last + pm * ac_cpn
+                rem_s = surv - pm
+                if rem_s < 0.0:
+                    rem_s = 0.0
+                pv_cur = pv_arr[k] - (wf_last * surv if has_w_fund else 0.0)
+                term_pay = (
+                    (cpn_last + rem_s * opt_f[n])
+                    if no_notional
+                    else (pm + cpn_last + rem_s * (1.0 + opt_f[n]))
+                )
+                pv_sum += pv_cur + df_last * term_pay
+            tile_pv[row_i, tile_i] = pv_sum
+
+        inv_n = 1.0 / float(n_tot)
+        for row_i in range(n_rows):
+            s_r = 0.0
+            for tile_i in range(n_tiles):
+                s_r += tile_pv[row_i, tile_i]
+            out_pv[row_i] = s_r * inv_n
+
+        return out_pv
+
+
+def _eval_c2_preterm_cpu_np(
+    perf_base_m_d_n: npt.NDArray[np.float64],
+    perf_sp_p: npt.NDArray[np.float64],
+    perf_sp_m: npt.NDArray[np.float64],
+    frozen_term: npt.NDArray[np.float64],
+    *,
+    aa_pre: npt.NDArray[np.int32],
+    ab_pre: npt.NDArray[np.int32],
+    asl_pre: npt.NDArray[np.int32],
+    bsl_pre: npt.NDArray[np.int32],
+    ko_barriers: npt.NDArray[np.float64],
+    is_callable: npt.NDArray[np.float64],
+    cpn_barriers: npt.NDArray[np.float64],
+    is_guar: npt.NDArray[np.float64],
+    cpn_rates: npt.NDArray[np.float64],
+    df_pay: npt.NDArray[np.float64],
+    w_fund: Optional[npt.NDArray[np.float64]],
+    eps_vec: npt.NDArray[np.float64],
+    call_code: int,
+    cpn_code: int,
+    ko_spread: float,
+    cpn_spread: float,
+    cpn_dir_down: bool,
+    cpn_type_out: bool,
+    is_memory: bool,
+    force_cpn_ac: bool,
+    no_notional: bool,
+    ac_cpn: float,
+    c_mem_0: float,
+    want_gamma: bool,
+) -> npt.NDArray[np.float64]:
+    """L2-cached in-place C^2 quintic-ramp LOO/L2O PreTerm evaluator for CPU Vibrato Gamma (`M > 1`)."""
+    m_rem, d_assets, n_tot = perf_base_m_d_n.shape
+    m_pre = m_rem - 1
+    n_rows = int(len(aa_pre))
+    p_pre = np.ascontiguousarray(perf_base_m_d_n[:m_pre], dtype=np.float64)
+    pm_sp = np.ascontiguousarray(
+        np.concatenate([perf_sp_p[:, :m_pre, :], perf_sp_m[:, :m_pre, :]], axis=0),
+        dtype=np.float64,
+    )
+
+    need_min = (call_code == 0) or (cpn_code == 0)
+    need_max = (call_code == 1) or (cpn_code == 1)
+    need_sum = (call_code == 2) or (cpn_code == 2)
+    hard_ko = abs(ko_spread) <= 1e-6
+    eff_csp = -cpn_spread if cpn_dir_down else cpn_spread
+    hard_cpn = abs(eff_csp) <= 1e-6
+    if _HAS_NUMBA and call_code in (0, 1, 2) and cpn_code in (0, 1, 2):
+        _ = want_gamma
+        mk1, mv1, mk2, mv2, mk3, mv3, min_p, min_m, xk1, xv1, xk2, xv2, xk3, xv3, max_p, max_m, sum_b, sum_sp_p, sum_sp_m = (
+            _nb_c2_precompute_stats(p_pre, pm_sp, need_min, need_max, need_sum)
+        )
+        wf_arr = (
+            np.ascontiguousarray(w_fund, dtype=np.float64)
+            if w_fund is not None
+            else np.zeros(m_rem, dtype=np.float64)
+        )
+        return cast(
+            npt.NDArray[np.float64],
+            _nb_c2_preterm_eval(
+                p_pre,
+                pm_sp,
+                np.ascontiguousarray(frozen_term, dtype=np.float64),
+                np.ascontiguousarray(aa_pre, dtype=np.int32),
+                np.ascontiguousarray(ab_pre, dtype=np.int32),
+                np.ascontiguousarray(asl_pre, dtype=np.int32),
+                np.ascontiguousarray(bsl_pre, dtype=np.int32),
+                np.ascontiguousarray(ko_barriers, dtype=np.float64),
+                np.ascontiguousarray(is_callable, dtype=np.float64),
+                np.ascontiguousarray(cpn_barriers, dtype=np.float64),
+                np.ascontiguousarray(is_guar, dtype=np.float64),
+                np.ascontiguousarray(cpn_rates, dtype=np.float64),
+                np.ascontiguousarray(df_pay, dtype=np.float64),
+                wf_arr,
+                w_fund is not None,
+                np.ascontiguousarray(eps_vec, dtype=np.float64),
+                mk1, mv1, mk2, mv2, mk3, mv3, min_p, min_m,
+                xk1, xv1, xk2, xv2, xk3, xv3, max_p, max_m,
+                sum_b, sum_sp_p, sum_sp_m,
+                int(call_code),
+                int(cpn_code),
+                bool(hard_ko),
+                bool(hard_cpn),
+                float(ko_spread),
+                float(eff_csp),
+                bool(cpn_dir_down),
+                bool(cpn_type_out),
+                bool(is_memory),
+                bool(force_cpn_ac),
+                bool(no_notional),
+                float(ac_cpn),
+                float(c_mem_0),
+            ),
+        )
+    need_sort = need_min or need_max
+    order = np.argsort(p_pre, axis=1) if need_sort else np.empty(0, dtype=np.intp)
+    sum_base = p_pre.sum(axis=1) if (call_code == 2 or cpn_code == 2) else np.empty(0, dtype=np.float64)
+    inv_d = 1.0 / float(d_assets)
+    ar_m = np.arange(m_pre)[:, None]
+    ar_n = np.arange(n_tot)[None, :]
+
+    min_pack: Optional[Tuple[Any, ...]] = None
+    max_pack: Optional[Tuple[Any, ...]] = None
+    if need_min:
+        mk1 = order[:, 0, :]
+        mv1 = p_pre[ar_m, mk1, ar_n]
+        mk2 = order[:, 1, :] if d_assets > 1 else mk1
+        mv2 = p_pre[ar_m, mk2, ar_n] if d_assets > 1 else np.full_like(mv1, 1e300)
+        mk3 = order[:, 2, :] if d_assets > 2 else mk2
+        mv3 = p_pre[ar_m, mk3, ar_n] if d_assets > 2 else np.full_like(mv1, 1e300)
+        min_pack = (mk1, mv1, mk2, mv2, mk3, mv3, pm_sp[:d_assets].min(axis=0), pm_sp[d_assets:].min(axis=0))
+    if need_max:
+        xk1 = order[:, d_assets - 1, :]
+        xv1 = p_pre[ar_m, xk1, ar_n]
+        xk2 = order[:, d_assets - 2, :] if d_assets > 1 else xk1
+        xv2 = p_pre[ar_m, xk2, ar_n] if d_assets > 1 else np.full_like(xv1, -1e300)
+        xk3 = order[:, d_assets - 3, :] if d_assets > 2 else xk2
+        xv3 = p_pre[ar_m, xk3, ar_n] if d_assets > 2 else np.full_like(xv1, -1e300)
+        max_pack = (xk1, xv1, xk2, xv2, xk3, xv3, pm_sp[:d_assets].max(axis=0), pm_sp[d_assets:].max(axis=0))
+    sum_sp_p = pm_sp[:d_assets].sum(axis=0) * inv_d if (call_code == 2 or cpn_code == 2) else np.empty(0, dtype=np.float64)
+    sum_sp_m = pm_sp[d_assets:].sum(axis=0) * inv_d if (call_code == 2 or cpn_code == 2) else np.empty(0, dtype=np.float64)
+
+    def _fill_idx_slice(code_idx: int, b_s: int, b_e: int, m: int, out_buf: npt.NDArray[np.float64], tmp_b: npt.NDArray[np.float64]) -> None:
+        if code_idx == 2:
+            sb_m = sum_base[m]
+            pm_m = p_pre[m]
+            for bi, row_i in enumerate(range(b_s, b_e)):
+                aa_i = int(aa_pre[row_i])
+                ab_i = int(ab_pre[row_i])
+                if aa_i == -2:
+                    out_buf[bi] = sum_sp_p[m] if asl_pre[row_i] == 0 else sum_sp_m[m]
+                elif aa_i == -1:
+                    np.multiply(sb_m, inv_d, out=out_buf[bi])
+                elif ab_i < 0:
+                    np.subtract(sb_m, pm_m[aa_i], out=tmp_b[bi])
+                    tmp_b[bi] += pm_sp[int(asl_pre[row_i]), m]
+                    np.multiply(tmp_b[bi], inv_d, out=out_buf[bi])
+                else:
+                    np.subtract(sb_m, pm_m[aa_i], out=tmp_b[bi])
+                    tmp_b[bi] -= pm_m[ab_i]
+                    tmp_b[bi] += pm_sp[int(asl_pre[row_i]), m]
+                    tmp_b[bi] += pm_sp[int(bsl_pre[row_i]), m]
+                    np.multiply(tmp_b[bi], inv_d, out=out_buf[bi])
+            return
+        is_min = code_idx == 0
+        pk = min_pack if is_min else max_pack
+        assert pk is not None
+        k1, v1, k2, v2, k3, v3, all_p, all_m = pk
+        k1_m, v1_m, k2_m, v2_m, v3_m = k1[m], v1[m], k2[m], v2[m], v3[m]
+        comb_fn = np.minimum if is_min else np.maximum
+        for bi, row_i in enumerate(range(b_s, b_e)):
+            aa_i = int(aa_pre[row_i])
+            ab_i = int(ab_pre[row_i])
+            if aa_i == -2:
+                out_buf[bi] = all_p[m] if asl_pre[row_i] == 0 else all_m[m]
+            elif aa_i == -1:
+                out_buf[bi] = v1_m
+            elif ab_i < 0:
+                np.copyto(tmp_b[bi], v2_m, where=(k1_m == aa_i))
+                np.copyto(tmp_b[bi], v1_m, where=(k1_m != aa_i))
+                comb_fn(tmp_b[bi], pm_sp[int(asl_pre[row_i]), m], out=out_buf[bi])
+            else:
+                m1 = (k1_m == aa_i) | (k1_m == ab_i)
+                m2 = (k2_m == aa_i) | (k2_m == ab_i)
+                np.copyto(tmp_b[bi], v1_m)
+                np.copyto(tmp_b[bi], v2_m, where=m1)
+                np.copyto(tmp_b[bi], v3_m, where=m1 & m2)
+                comb_fn(pm_sp[int(asl_pre[row_i]), m], pm_sp[int(bsl_pre[row_i]), m], out=out_buf[bi])
+                comb_fn(tmp_b[bi], out_buf[bi], out=out_buf[bi])
+
+    def _c2_s5_inplace(x_in: npt.NDArray[np.float64], lo_v: float, inv_w: float, out_buf: npt.NDArray[np.float64], u_buf: npt.NDArray[np.float64]) -> None:
+        np.subtract(x_in, lo_v, out=u_buf)
+        u_buf *= inv_w
+        np.clip(u_buf, 0.0, 1.0, out=u_buf)
+        np.multiply(6.0, u_buf, out=out_buf)
+        out_buf -= 15.0
+        out_buf *= u_buf
+        out_buf += 10.0
+        out_buf *= u_buf
+        out_buf *= u_buf
+        out_buf *= u_buf
+
+    hard_ko = abs(ko_spread) <= 1e-6
+    eff_csp = -cpn_spread if cpn_dir_down else cpn_spread
+    hard_cpn = abs(eff_csp) <= 1e-6
+    m_last = m_rem - 1
+    c_last = float(cpn_rates[m_last])
+    df_last = float(df_pay[m_last])
+    wf_last = float(w_fund[m_last]) if w_fund is not None else 0.0
+    gk_f = frozen_term[0][None, :]
+    egc_f = frozen_term[1][None, :]
+    opt_f = frozen_term[2][None, :]
+    out_pv = np.empty(n_rows, dtype=np.float64)
+
+    r_blk = 8
+    for b_s in range(0, n_rows, r_blk):
+        b_e = min(n_rows, b_s + r_blk)
+        nb = b_e - b_s
+        surv_prev = np.ones((nb, n_tot), dtype=np.float64)
+        c_mem = np.full((nb, n_tot), float(c_mem_0), dtype=np.float64) if is_memory else np.empty(0, dtype=np.float64)
+        pv_path = np.zeros((nb, n_tot), dtype=np.float64)
+        w_buf = np.empty((nb, n_tot), dtype=np.float64)
+        w_cpn_buf = np.empty((nb, n_tot), dtype=np.float64)
+        gk_buf = np.empty((nb, n_tot), dtype=np.float64)
+        gc_buf = np.empty((nb, n_tot), dtype=np.float64)
+        u_buf = np.empty((nb, n_tot), dtype=np.float64)
+        pm_buf = np.empty((nb, n_tot), dtype=np.float64)
+        tmp_buf = np.empty((nb, n_tot), dtype=np.float64)
+
+        for m in range(m_pre):
+            eps_m = float(eps_vec[m])
+            callable_m = is_callable[m] > 0.5
+            guar_m = is_guar[m] > 0.5
+            if callable_m:
+                _fill_idx_slice(call_code, b_s, b_e, m, w_buf, tmp_buf)
+                bk = float(ko_barriers[m])
+                lo_k = (bk - 0.5 * eps_m) if hard_ko else min(bk, bk + ko_spread)
+                hi_k = (bk + 0.5 * eps_m) if hard_ko else max(bk, bk + ko_spread)
+                _c2_s5_inplace(w_buf, lo_k, 1.0 / max(hi_k - lo_k, 1e-12), gk_buf, u_buf)
+            if not guar_m:
+                if callable_m and cpn_code == call_code:
+                    w_c_src = w_buf
+                else:
+                    _fill_idx_slice(cpn_code, b_s, b_e, m, w_cpn_buf, tmp_buf)
+                    w_c_src = w_cpn_buf
+                bc = float(cpn_barriers[m])
+                lo_c = (bc - 0.5 * eps_m) if hard_cpn else min(bc, bc + eff_csp)
+                hi_c = (bc + 0.5 * eps_m) if hard_cpn else max(bc, bc + eff_csp)
+                _c2_s5_inplace(w_c_src, lo_c, 1.0 / max(hi_c - lo_c, 1e-12), gc_buf, u_buf)
+                if cpn_dir_down != cpn_type_out:
+                    np.subtract(1.0, gc_buf, out=gc_buf)
+                if callable_m and force_cpn_ac:
+                    np.maximum(gc_buf, gk_buf, out=gc_buf)
+            else:
+                gc_buf.fill(1.0)
+
+            c_rate = float(cpn_rates[m])
+            df_m = float(df_pay[m])
+            if callable_m:
+                np.multiply(surv_prev, gk_buf, out=pm_buf)
+            else:
+                pm_buf.fill(0.0)
+            if is_memory:
+                np.add(c_mem, c_rate, out=u_buf)
+                np.multiply(surv_prev, gc_buf, out=tmp_buf)
+                tmp_buf *= u_buf
+                if callable_m:
+                    tmp_buf += pm_buf * float(ac_cpn)
+                np.subtract(1.0, gc_buf, out=c_mem)
+                c_mem *= surv_prev
+                c_mem *= u_buf
+            else:
+                np.multiply(surv_prev, gc_buf, out=tmp_buf)
+                tmp_buf *= c_rate
+                if callable_m:
+                    tmp_buf += pm_buf * float(ac_cpn)
+            if callable_m and (not no_notional):
+                tmp_buf += pm_buf
+            tmp_buf *= df_m
+            pv_path += tmp_buf
+            if w_fund is not None:
+                pv_path -= float(w_fund[m]) * surv_prev
+            if callable_m:
+                surv_prev -= pm_buf
+                np.maximum(surv_prev, 0.0, out=surv_prev)
+
+        eff_c_last = (c_last + c_mem) if is_memory else c_last
+        np.multiply(surv_prev, gk_f, out=pm_buf)
+        cpn_last = surv_prev * egc_f * eff_c_last + pm_buf * float(ac_cpn)
+        np.subtract(surv_prev, pm_buf, out=tmp_buf)
+        np.maximum(tmp_buf, 0.0, out=tmp_buf)
+        if w_fund is not None:
+            pv_path -= wf_last * surv_prev
+        term_pay = (cpn_last + tmp_buf * opt_f) if no_notional else (pm_buf + cpn_last + tmp_buf * (1.0 + opt_f))
+        pv_path += df_last * term_pay
+        out_pv[b_s:b_e] = pv_path.mean(axis=1)
+
+    _ = want_gamma
+    return out_pv
+
+
 def _compute_payoff_aad_state_adjoints_triton(
     perf_m_d_n: torch.Tensor,
     *,
@@ -5655,6 +8244,10 @@ def _compute_payoff_aad_state_adjoints_triton(
     i_ki_ext_g: Optional[torch.Tensor] = None,
     out_stage1_rep_g: Optional[torch.Tensor] = None,
     is_long_basket: bool = False,
+    cg_flags_g: Optional[torch.Tensor] = None,
+    use_rt_flags: bool = False,
+    d_pad_k: int = 0,
+    use_cg_arena: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Triton forward+reverse pathwise payoff adjoints w.r.t. log_perf (M, D, N) and fwd_perf (D, M)."""
     m_rem, d_assets, n_tot = perf_m_d_n.shape
@@ -5678,18 +8271,40 @@ def _compute_payoff_aad_state_adjoints_triton(
         if (perf_m_d_n.dtype == target_p_dt and perf_m_d_n.is_contiguous())
         else perf_m_d_n.to(dtype=target_p_dt).contiguous()
     )
-    ws_g = torch.empty(
+    eff_rt_flags = bool(use_rt_flags and cg_flags_g is not None and d_pad_k > 0)
+    ws_g = _alloc_cg_buf(
+        use_cg_arena,
+        dev,
+        "perf_aux",
         (7, m_rem, n_tot),
-        dtype=torch.float32 if use_f32_aad else torch.float64,
-        device=dev,
+        torch.float32 if use_f32_aad else torch.float64,
+        zero=eff_rt_flags,
     )
-    bar_lx_post_g = torch.empty((m_rem, d_assets, n_tot), dtype=torch.float32, device=dev)
+    bar_lx_post_g = _alloc_cg_buf(
+        use_cg_arena,
+        dev,
+        "bar_lx_post",
+        (m_rem, d_assets, n_tot),
+        torch.float32,
+        zero=eff_rt_flags,
+    )
     eff_n_rep = n_rep if n_rep > 0 else n_tot
     eff_r_cnt = max(n_tot // eff_n_rep, 1)
     block_n = min(128, max(32, _next_power_of_two_int(eff_n_rep)))
     blocks_per_rep = (eff_n_rep + block_n - 1) // block_n
     grid_n = eff_r_cnt * blocks_per_rep
-    out_cf_wf_g = torch.empty((2, grid_n, m_rem), dtype=torch.float64, device=dev) if compute_cf_wf else None
+    out_cf_wf_g = (
+        _alloc_cg_buf(
+            use_cg_arena,
+            dev,
+            "out_cf_wf",
+            (2, grid_n, m_rem),
+            torch.float64,
+            zero=eff_rt_flags,
+        )
+        if compute_cf_wf
+        else None
+    )
     if emit_stage1 and out_stage1_rep_g is not None:
         out_stage1_rep_g.zero_()
     _fast_triton_launch(
@@ -5714,26 +8329,29 @@ def _compute_payoff_aad_state_adjoints_triton(
         d_assets,
         m_rem,
         n_tot,
+        cg_flags_ptr=cg_flags_g if eff_rt_flags else None,
         n_rep=eff_n_rep,
         blocks_per_rep=blocks_per_rep,
-        CALL_CODE=call_code,
-        CPN_CODE=cpn_code,
-        EFF_OPT_CODE=eff_opt_code,
-        HAS_KI=has_ki,
-        KI_ACTIVE=bool(has_ki and ki_barrier > 0.0 and i_ki_past < 0.5),
-        HAS_ONE_STAR=has_one_star,
-        IS_MEM=is_memory,
-        NO_NOTIONAL=no_notional,
-        FORCE_CPN_AC=force_cpn_ac,
-        CPN_DIR_DOWN=cpn_dir_down,
-        CPN_TYPE_OUT=cpn_type_out,
+        CALL_CODE=0 if eff_rt_flags else call_code,
+        CPN_CODE=0 if eff_rt_flags else cpn_code,
+        EFF_OPT_CODE=0 if eff_rt_flags else eff_opt_code,
+        HAS_KI=False if eff_rt_flags else has_ki,
+        KI_ACTIVE=False if eff_rt_flags else bool(has_ki and ki_barrier > 0.0 and i_ki_past < 0.5),
+        HAS_ONE_STAR=False if eff_rt_flags else has_one_star,
+        IS_MEM=False if eff_rt_flags else is_memory,
+        NO_NOTIONAL=False if eff_rt_flags else no_notional,
+        FORCE_CPN_AC=False if eff_rt_flags else force_cpn_ac,
+        CPN_DIR_DOWN=False if eff_rt_flags else cpn_dir_down,
+        CPN_TYPE_OUT=False if eff_rt_flags else cpn_type_out,
         BLOCK_N=block_n,
-        HAS_LOWER_STRIKE=has_lower_strike,
-        HAS_PART_CALL=has_part_call,
+        HAS_LOWER_STRIKE=True if eff_rt_flags else has_lower_strike,
+        HAS_PART_CALL=False if eff_rt_flags else has_part_call,
         EMIT_STAGE1=bool(emit_stage1 and out_stage1_rep_g is not None),
         HAS_EXT_KI=bool(i_ki_ext_g is not None),
         USE_F32_INNER=use_f32_aad,
-        IS_LONG=is_long_basket,
+        IS_LONG=False if eff_rt_flags else is_long_basket,
+        USE_RT_FLAGS=eff_rt_flags,
+        D_PAD=d_pad_k if eff_rt_flags else 0,
         num_warps=4,
     )
     bar_ln_fwd = bar_lx_post_g.sum(dim=2, dtype=torch.float64).T.contiguous()
@@ -6102,11 +8720,13 @@ def _lv_chain_weights_np(lv_cache: Dict[str, Any]) -> Tuple[
     c_loc_var = np.where(lv_cache["active_lv"], lv_cache["sqrt_dt_ratio"], 0.0) / (
         2.0 * np.maximum(lv_dcc, 1e-12)
     )
+    denom_raw = np.asarray(lv_cache["denom"], dtype=np.float64)
     denom_safe = lv_cache["denom_safe"]
-    c_wt = c_loc_var / denom_safe
+    denom_jac = np.where(denom_raw >= 0.25, denom_safe, np.maximum(denom_safe, 0.25))
+    c_wt = c_loc_var / denom_jac
     c_den = np.where(
-        lv_cache["denom"] > 0.05,
-        -c_loc_var * lv_cache["dw_dt_y"] / (denom_safe * denom_safe),
+        denom_raw > 0.05,
+        -c_loc_var * lv_cache["dw_dt_y"] / (denom_jac * denom_jac),
         0.0,
     )
     y = lv_cache["y"]
@@ -6134,62 +8754,89 @@ def _pullback_lv_to_r_nat_and_div(
     if m_len <= 0 or float(np.max(np.abs(bar_lv))) <= 0.0:
         return bar_r_obs, bar_div_obs
 
-    c_w, c_wt, c_wy, c_wyy, _ = _lv_chain_weights_np(lv_cache)
-    s_mat = lv_cache["s_mat"]
-    f_t = lv_cache["f_t"]
-    is_bnd = lv_cache["is_bnd"][:, None]
-    alpha = lv_cache["alpha"]
-    dt_inv = lv_cache["dt_inv"]
-    t0, t1 = lv_cache["t0"], lv_cache["t1"]
-    v0, dv0, d2v0, d3v0, cl0 = lv_cache["v0"], lv_cache["dv0"], lv_cache["d2v0"], lv_cache["d3v0"], lv_cache["cl0"]
-    v1, dv1, d2v1, d3v1, cl1 = lv_cache["v1"], lv_cache["dv1"], lv_cache["d2v1"], lv_cache["d3v1"], lv_cache["cl1"]
-    dw_dk = lv_cache["dw_dk"]
-    dw0_dk = lv_cache["dw0_dk"]
-    dw1_dk = lv_cache["dw1_dk"]
-    d2w_dk2 = lv_cache["d2w_dk2"]
+    pb_rn = lv_cache.get("_rn_div_pullback")
+    if pb_rn is None:
+        c_w, c_wt, c_wy, c_wyy, _ = _lv_chain_weights_np(lv_cache)
+        s_mat = lv_cache["s_mat"]
+        f_t = lv_cache["f_t"]
+        is_bnd = lv_cache["is_bnd"][:, None]
+        alpha = lv_cache["alpha"]
+        dt_inv = lv_cache["dt_inv"]
+        t0, t1 = lv_cache["t0"], lv_cache["t1"]
+        v0, dv0, d2v0, d3v0, cl0 = lv_cache["v0"], lv_cache["dv0"], lv_cache["d2v0"], lv_cache["d3v0"], lv_cache["cl0"]
+        v1, dv1, d2v1, d3v1, cl1 = lv_cache["v1"], lv_cache["dv1"], lv_cache["d2v1"], lv_cache["d3v1"], lv_cache["cl1"]
+        dw_dk = lv_cache["dw_dk"]
+        dw0_dk = lv_cache["dw0_dk"]
+        dw1_dk = lv_cache["dw1_dk"]
+        d2w_dk2 = lv_cache["d2w_dk2"]
 
-    d3w0_dk3 = np.where(cl0, 0.0, 2.0 * t0 * (3.0 * dv0 * d2v0 + v0 * d3v0))
-    d3w1_dk3 = np.where(cl1, 0.0, 2.0 * t1 * (3.0 * dv1 * d2v1 + v1 * d3v1))
-    d3w_dk3 = np.where(is_bnd, d3w0_dk3, (1.0 - alpha) * d3w0_dk3 + alpha * d3w1_dk3)
+        d3w0_dk3 = np.where(cl0, 0.0, 2.0 * t0 * (3.0 * dv0 * d2v0 + v0 * d3v0))
+        d3w1_dk3 = np.where(cl1, 0.0, 2.0 * t1 * (3.0 * dv1 * d2v1 + v1 * d3v1))
+        d3w_dk3 = np.where(is_bnd, d3w0_dk3, (1.0 - alpha) * d3w0_dk3 + alpha * d3w1_dk3)
 
-    s_act = (s_mat > 1e-4) & (f_t[:, None] > 1e-4)
-    s_m = np.where(s_act, s_mat, 0.0)
-    dw_dlnf = lv_cache["dw_dy"]
-    dwy_dlnf = s_m * (dw_dk + s_m * d2w_dk2)
-    dwyy_dlnf = (s_m * s_m * s_m) * d3w_dk3 + 3.0 * (s_m * s_m) * d2w_dk2 + s_m * dw_dk
-    dwt_bnd = np.where(cl0, 0.0, 2.0 * v0 * (s_m * dv0))
-    dwt_int = s_m * (dw1_dk - dw0_dk) * dt_inv
-    dwt_dlnf = np.where(is_bnd, dwt_bnd, dwt_int)
-    dwty_dlnf = dwt_dlnf + lv_cache["mu_eff_grid"][:, None] * dwy_dlnf
+        s_act = (s_mat > 1e-4) & (f_t[:, None] > 1e-4)
+        s_m = np.where(s_act, s_mat, 0.0)
+        dw_dlnf = lv_cache["dw_dy"]
+        dwy_dlnf = s_m * (dw_dk + s_m * d2w_dk2)
+        dwyy_dlnf = (s_m * s_m * s_m) * d3w_dk3 + 3.0 * (s_m * s_m) * d2w_dk2 + s_m * dw_dk
+        dwt_bnd = np.where(cl0, 0.0, 2.0 * v0 * (s_m * dv0))
+        dwt_int = s_m * (dw1_dk - dw0_dk) * dt_inv
+        dwt_dlnf = np.where(is_bnd, dwt_bnd, dwt_int)
+        dwty_dlnf = dwt_dlnf + lv_cache["mu_eff_grid"][:, None] * dwy_dlnf
 
-    bar_ln_f = np.sum(
-        bar_lv * (c_w * dw_dlnf + c_wy * dwy_dlnf + c_wyy * dwyy_dlnf + c_wt * dwty_dlnf),
-        axis=1,
-    )
-    bar_mu_eff = np.sum(bar_lv * c_wt * lv_cache["dw_dy"], axis=1)
+        w_lnf = np.ascontiguousarray(c_w * dw_dlnf + c_wy * dwy_dlnf + c_wyy * dwyy_dlnf + c_wt * dwty_dlnf, dtype=np.float64)
+        w_mu = np.ascontiguousarray(c_wt * lv_cache["dw_dy"], dtype=np.float64)
 
-    k_idx = lv_cache["k_idx"]
-    alpha_k = lv_cache["alpha_k"]
-    dt_k = lv_cache["dt_k"]
-    bar_r_knots = np.zeros(m_len + 1, dtype=np.float64)
-    np.add.at(bar_r_knots, k_idx, bar_ln_f * (1.0 - alpha_k) - bar_mu_eff / dt_k)
-    np.add.at(bar_r_knots, k_idx + 1, bar_ln_f * alpha_k + bar_mu_eff / dt_k)
-    bar_r_obs = bar_r_knots[1:]
+        k_idx = np.asarray(lv_cache["k_idx"], dtype=np.int64)
+        alpha_k = np.asarray(lv_cache["alpha_k"], dtype=np.float64)
+        dt_k = np.asarray(lv_cache["dt_k"], dtype=np.float64)
+        lv_nt_l = int(w_lnf.shape[0])
+        t_idx = np.arange(lv_nt_l, dtype=np.int64)
+        r_knot_lnf = np.zeros((m_len + 1, lv_nt_l), dtype=np.float64)
+        r_knot_mu = np.zeros((m_len + 1, lv_nt_l), dtype=np.float64)
+        r_knot_lnf[k_idx, t_idx] += 1.0 - alpha_k
+        r_knot_lnf[k_idx + 1, t_idx] += alpha_k
+        inv_dt_k = 1.0 / dt_k
+        r_knot_mu[k_idx, t_idx] -= inv_dt_k
+        r_knot_mu[k_idx + 1, t_idx] += inv_dt_k
+        s_r_lnf = np.ascontiguousarray(r_knot_lnf[1:], dtype=np.float64)
+        s_r_mu = np.ascontiguousarray(r_knot_mu[1:], dtype=np.float64)
 
-    esc_knots = lv_cache.get("esc_knots")
-    dpv_knots = lv_cache.get("dpv_knots")
-    if esc_knots is not None and dpv_knots is not None:
-        w_esc = np.maximum(lv_cache["t_eff"] - lv_cache["tau0"], 0.0) / dt_k
-        bar_ln_esc = np.zeros(m_len + 1, dtype=np.float64)
-        np.add.at(bar_ln_esc, k_idx, bar_ln_f * (1.0 - w_esc) - bar_mu_eff / dt_k)
-        np.add.at(bar_ln_esc, k_idx + 1, bar_ln_f * w_esc + bar_mu_eff / dt_k)
-        sp0_safe = float(lv_cache["sp0_safe"])
-        floor_sp = 0.01 * sp0_safe
-        scale_sp = max(floor_sp, 1e-12)
-        z_esc = (sp0_safe - dpv_knots[1:] - floor_sp) / scale_sp
-        sig_z = np.where(z_esc >= 0.0, 1.0 / (1.0 + np.exp(-np.minimum(z_esc, 40.0))), np.exp(np.maximum(z_esc, -40.0)) / (1.0 + np.exp(np.maximum(z_esc, -40.0))))
-        bar_div_obs = bar_ln_esc[1:] * (-sig_z / np.maximum(esc_knots[1:], 1e-12))
+        s_div_lnf: Optional[npt.NDArray[np.float64]] = None
+        s_div_mu: Optional[npt.NDArray[np.float64]] = None
+        esc_knots = lv_cache.get("esc_knots")
+        dpv_knots = lv_cache.get("dpv_knots")
+        if esc_knots is not None and dpv_knots is not None:
+            w_esc = np.maximum(lv_cache["t_eff"] - lv_cache["tau0"], 0.0) / dt_k
+            esc_lnf = np.zeros((m_len + 1, lv_nt_l), dtype=np.float64)
+            esc_mu = np.zeros((m_len + 1, lv_nt_l), dtype=np.float64)
+            esc_lnf[k_idx, t_idx] += 1.0 - w_esc
+            esc_lnf[k_idx + 1, t_idx] += w_esc
+            esc_mu[k_idx, t_idx] -= inv_dt_k
+            esc_mu[k_idx + 1, t_idx] += inv_dt_k
+            sp0_safe = float(lv_cache["sp0_safe"])
+            floor_sp = 0.01 * sp0_safe
+            scale_sp = max(floor_sp, 1e-12)
+            z_esc = (sp0_safe - dpv_knots[1:] - floor_sp) / scale_sp
+            sig_z = np.where(
+                z_esc >= 0.0,
+                1.0 / (1.0 + np.exp(-np.minimum(z_esc, 40.0))),
+                np.exp(np.maximum(z_esc, -40.0)) / (1.0 + np.exp(np.maximum(z_esc, -40.0))),
+            )
+            div_scale = (-sig_z / np.maximum(esc_knots[1:], 1e-12))[:, None]
+            s_div_lnf = np.ascontiguousarray(esc_lnf[1:] * div_scale, dtype=np.float64)
+            s_div_mu = np.ascontiguousarray(esc_mu[1:] * div_scale, dtype=np.float64)
 
+        pb_rn = (w_lnf, w_mu, s_r_lnf, s_r_mu, s_div_lnf, s_div_mu)
+        lv_cache["_rn_div_pullback"] = pb_rn
+
+    w_lnf, w_mu, s_r_lnf, s_r_mu, s_div_lnf, s_div_mu = pb_rn
+    bar_lv_arr = np.asarray(bar_lv, dtype=np.float64)
+    bar_ln_f = (bar_lv_arr * w_lnf).sum(axis=1)
+    bar_mu_eff = (bar_lv_arr * w_mu).sum(axis=1)
+    bar_r_obs = s_r_lnf @ bar_ln_f + s_r_mu @ bar_mu_eff
+    if s_div_lnf is not None and s_div_mu is not None:
+        bar_div_obs = s_div_lnf @ bar_ln_f + s_div_mu @ bar_mu_eff
     return bar_r_obs, bar_div_obs
 
 
@@ -6326,7 +8973,7 @@ def _cpu_lv_bilinear_np(
     v0 = (1.0 - wt) * lv_table_d[it0, iy0] + wt * lv_table_d[it1, iy0]
     v1 = (1.0 - wt) * lv_table_d[it0, iy1] + wt * lv_table_d[it1, iy1]
     sig_out = np.asarray((1.0 - wy) * v0 + wy * v1, dtype=np.float64)
-    dsig_dy = np.asarray(np.where(in_y, (v1 - v0) * inv_dy_d, 0.0), dtype=np.float64)
+    dsig_dy = np.asarray(np.clip(np.where(in_y, (v1 - v0) * inv_dy_d, 0.0), -4.0, 4.0), dtype=np.float64)
     return sig_out, dsig_dy, it0, it1, wt, iy0, iy1, np.asarray(wy, dtype=np.float64)
 
 
@@ -6798,6 +9445,7 @@ def _raw_repo_sigs(
     state: Any,
     request: Any,
     sorted_ids: Sequence[str],
+    sig_memo: Optional[Dict[int, Any]] = None,
 ) -> Tuple[Any, ...]:
     """Extracts deterministic content signatures for all repo curves referenced by request or state."""
     req_repos: Any = None
@@ -6829,9 +9477,9 @@ def _raw_repo_sigs(
         c_req = req_map.get(tk) if req_map is not None else None
         c_st = st_map.get(tk) if st_map is not None else None
         c_ds = ds_map.get(tk) if ds_map is not None else None
-        s_req = _curve_fast_sig(c_req) if c_req is not None else None
-        s_st = s_req if (c_st is c_req) else (_curve_fast_sig(c_st) if c_st is not None else None)
-        s_ds = s_st if (c_ds is c_st) else (s_req if (c_ds is c_req) else (_curve_fast_sig(c_ds) if c_ds is not None else None))
+        s_req = _curve_fast_sig(c_req, sig_memo) if c_req is not None else None
+        s_st = s_req if (c_st is c_req) else (_curve_fast_sig(c_st, sig_memo) if c_st is not None else None)
+        s_ds = s_st if (c_ds is c_st) else (s_req if (c_ds is c_req) else (_curve_fast_sig(c_ds, sig_memo) if c_ds is not None else None))
         sigs.append((s_req, s_st, s_ds))
     return tuple(sigs)
 
@@ -6882,6 +9530,263 @@ def _compute_mf_dvar_gbm_np(
     return d_var_gbm_np
 
 
+if _HAS_NUMBA:
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_eval_mf_gbm_batch(
+        z_corr_rmnd: npt.NDArray[np.float64],
+        sqrt_dv: npt.NDArray[np.float64],
+        d_var_gbm: npt.NDArray[np.float64],
+        fwd_perf_np: npt.NDArray[np.float64],
+        df_pay_np: npt.NDArray[np.float64],
+        w_fund_arr: npt.NDArray[np.float64],
+        has_w_fund: bool,
+        ko_arr: npt.NDArray[np.float64],
+        is_call_arr: npt.NDArray[np.float64],
+        cpn_arr: npt.NDArray[np.float64],
+        is_guar_arr: npt.NDArray[np.float64],
+        cpn_rates_arr: npt.NDArray[np.float64],
+        s1_out: npt.NDArray[np.float64],
+        cf_surv_out: npt.NDArray[np.float64],
+        call_code: int,
+        cpn_code: int,
+        opt_code: int,
+        ko_spread: float,
+        eff_csp: float,
+        ki_spread: float,
+        k_os: float,
+        one_star_eps: float,
+        k_put: float,
+        k_low: float,
+        b_ki: float,
+        option_gearing: float,
+        ac_cpn: float,
+        c_mem_0: float,
+        i_ki_past: float,
+        k_call: float,
+        part_call_rate: float,
+        os_cpn: float,
+        has_ki: bool,
+        ki_active: bool,
+        is_memory: bool,
+        is_long_basket: bool,
+        no_notional: bool,
+        force_cpn_ac: bool,
+        dir_down: bool,
+        type_out: bool,
+        has_lower_strike: bool,
+        has_part_call: bool,
+        has_os: bool,
+        antithetic: bool,
+        compute_cf_surv: bool,
+    ) -> None:
+        r_b, m_rem, n_rep, d_assets = z_corr_rmnd.shape
+        n_signs = 2 if antithetic else 1
+        wt_sign = 0.5 if antithetic else 1.0
+        inv_n = 1.0 / float(n_rep)
+        inv_d = 1.0 / float(d_assets)
+        hard_ko = abs(ko_spread) <= 1e-6
+        bl_k = min(0.0, ko_spread)
+        bh_k = max(0.0, ko_spread)
+        hard_cpn = abs(eff_csp) <= 1e-6
+        hard_ki = abs(ki_spread) <= 1e-6
+        b_ki_eff = k_put if is_long_basket else b_ki
+        blk_ki = min(b_ki_eff, b_ki_eff + ki_spread)
+        bhk_ki = max(b_ki_eff, b_ki_eff + ki_spread)
+        inv_w_ki = 1.0 / max(bhk_ki - blk_ki, 1e-12)
+        put_act = (k_put > k_low and option_gearing > 0.0) if has_lower_strike else (option_gearing > 0.0)
+        df_last = float(df_pay_np[m_rem - 1])
+
+        for r_idx in numba.prange(r_b):
+            for s_idx in range(n_signs):
+                sgn = 1.0 if s_idx == 0 else -1.0
+                lx = np.zeros((d_assets, n_rep), dtype=np.float64)
+                p_cur = np.empty((d_assets, n_rep), dtype=np.float64)
+                surv = np.ones(n_rep, dtype=np.float64)
+                cmem = np.full(n_rep, c_mem_0, dtype=np.float64)
+                pv = np.zeros(n_rep, dtype=np.float64)
+
+                for m in range(m_rem):
+                    for d in range(d_assets):
+                        sdv = sgn * sqrt_dv[d, m]
+                        half_dv = 0.5 * d_var_gbm[d, m]
+                        max_lx = -1e300
+                        for n in range(n_rep):
+                            v = lx[d, n] - half_dv + sdv * z_corr_rmnd[r_idx, m, n, d]
+                            lx[d, n] = v
+                            if v > max_lx:
+                                max_lx = v
+                        sum_ex = 0.0
+                        for n in range(n_rep):
+                            ex = math.exp(lx[d, n] - max_lx)
+                            p_cur[d, n] = ex
+                            sum_ex += ex
+                        mean_ex = sum_ex * inv_n
+                        if mean_ex < 1e-30:
+                            mean_ex = 1e-30
+                        shift = max_lx + math.log(mean_ex)
+                        scale_fwd = fwd_perf_np[d, m] / mean_ex
+                        for n in range(n_rep):
+                            lx[d, n] -= shift
+                            p_cur[d, n] *= scale_fwd
+
+                    callable_m = is_call_arr[m] > 0.5
+                    guar_m = is_guar_arr[m] > 0.5
+                    bk = float(ko_arr[m])
+                    bc = float(cpn_arr[m])
+                    blc = min(bc, bc + eff_csp)
+                    bhc = max(bc, bc + eff_csp)
+                    inv_wc = 1.0 / max(bhc - blc, 1e-12)
+                    inv_wk = 1.0 / max(bk + bh_k - (bk + bl_k), 1e-12)
+                    cr = float(cpn_rates_arr[m])
+                    wf_m = float(w_fund_arr[m]) if has_w_fund else 0.0
+                    df_m = float(df_pay_np[m])
+
+                    sum_pm = 0.0
+                    sum_qc = 0.0
+                    sum_ccf = 0.0
+                    sum_surv_pre = 0.0
+                    is_last = m == (m_rem - 1)
+                    sum_uput = 0.0
+                    sum_ucall = 0.0
+                    sum_los = 0.0
+                    sum_pos = 0.0
+                    sum_tcf = 0.0
+                    sum_pv = 0.0
+
+                    for n in range(n_rep):
+                        mn_p = p_cur[0, n]
+                        mx_p = mn_p
+                        sm_p = mn_p
+                        for d in range(1, d_assets):
+                            pv_d = p_cur[d, n]
+                            sm_p += pv_d
+                            if pv_d < mn_p:
+                                mn_p = pv_d
+                            if pv_d > mx_p:
+                                mx_p = pv_d
+                        avg_p = sm_p * inv_d
+                        wc_v = mn_p if call_code == 0 else (mx_p if call_code == 1 else avg_p)
+                        wcp_v = mn_p if cpn_code == 0 else (mx_p if cpn_code == 1 else avg_p)
+
+                        if callable_m:
+                            if hard_ko:
+                                gk = 1.0 if wc_v >= bk else 0.0
+                            else:
+                                uk = (wc_v - (bk + bl_k)) * inv_wk
+                                gk = 0.0 if uk < 0.0 else (1.0 if uk > 1.0 else uk)
+                        else:
+                            gk = 0.0
+
+                        if guar_m:
+                            gc = 1.0
+                        else:
+                            if hard_cpn:
+                                hd = (wcp_v <= bc) if dir_down else (wcp_v >= bc)
+                                hd_f = 1.0 if hd else 0.0
+                                gc = (1.0 - hd_f) if type_out else hd_f
+                            else:
+                                uc = (wcp_v - blc) * inv_wc
+                                ru = 0.0 if uc < 0.0 else (1.0 if uc > 1.0 else uc)
+                                hg = (1.0 - ru) if dir_down else ru
+                                gc = (1.0 - hg) if type_out else hg
+
+                        egc = gk if (force_cpn_ac and gk > gc) else gc
+                        sv_n = surv[n]
+                        pm = sv_n * gk
+                        qc = sv_n * egc
+                        if is_memory:
+                            ec = cr + cmem[n]
+                            ccf = qc * ec + pm * ac_cpn
+                            cmem[n] = sv_n * ec * (1.0 - egc)
+                        else:
+                            ccf = qc * cr + pm * ac_cpn
+
+                        cf_m = ccf + (0.0 if no_notional else pm)
+                        pv_n = pv[n] + df_m * cf_m - wf_m * sv_n
+                        sum_pm += pm
+                        sum_qc += qc
+                        sum_ccf += ccf
+                        sum_surv_pre += sv_n
+                        rem_s = sv_n - pm
+                        if rem_s < 0.0:
+                            rem_s = 0.0
+                        surv[n] = rem_s
+
+                        if not is_last:
+                            pv[n] = pv_n
+                        else:
+                            wo_v = mn_p if opt_code == 0 else (mx_p if opt_code == 1 else avg_p)
+                            if ki_active:
+                                if hard_ki:
+                                    g_ki = 1.0 if wo_v < b_ki_eff else 0.0
+                                else:
+                                    uki = (bhk_ki - wo_v) * inv_w_ki
+                                    g_ki = 0.0 if uki < 0.0 else (1.0 if uki > 1.0 else uki)
+                                ki_ind = i_ki_past if i_ki_past > g_ki else g_ki
+                            else:
+                                ki_ind = 1.0 if (not has_ki) else i_ki_past
+
+                            if has_os:
+                                if one_star_eps <= 1e-6:
+                                    star_ind = 1.0 if mx_p >= k_os else 0.0
+                                else:
+                                    uos = (mx_p - (k_os - 0.5 * one_star_eps)) / one_star_eps
+                                    star_ind = 0.0 if uos < 0.0 else (1.0 if uos > 1.0 else uos)
+                            else:
+                                star_ind = 0.0
+
+                            if is_long_basket:
+                                u_put = rem_s * ki_ind * (1.0 - star_ind) * (1.0 - avg_p)
+                                put_term = -u_put
+                            elif put_act:
+                                dk_hi = k_put - wo_v
+                                p_hi = dk_hi if dk_hi > 0.0 else 0.0
+                                if has_lower_strike:
+                                    dk_lo = k_low - wo_v
+                                    p_lo = dk_lo if dk_lo > 0.0 else 0.0
+                                else:
+                                    p_lo = 0.0
+                                u_put = rem_s * ki_ind * (1.0 - star_ind) * (p_hi - p_lo)
+                                put_term = -option_gearing * u_put
+                            else:
+                                u_put = 0.0
+                                put_term = 0.0
+
+                            if has_part_call:
+                                dc = wo_v - k_call
+                                u_call = rem_s * (dc if dc > 0.0 else 0.0)
+                            else:
+                                u_call = 0.0
+                            p_os = (rem_s * star_ind) if has_os else 0.0
+                            l_os = (p_os * os_cpn) if (has_os and os_cpn != 0.0) else 0.0
+                            opt_term = put_term + (part_call_rate * u_call if has_part_call else 0.0) + l_os
+                            term_cf = opt_term if no_notional else (rem_s + opt_term)
+                            pv_n += df_last * term_cf
+                            sum_uput += u_put
+                            sum_ucall += u_call
+                            sum_los += l_os
+                            sum_pos += p_os
+                            sum_tcf += term_cf
+                            sum_pv += pv_n
+
+                    s1_out[r_idx, m] += wt_sign * (sum_pm * inv_n)
+                    s1_out[r_idx, m_rem + m] += wt_sign * (sum_qc * inv_n)
+                    s1_out[r_idx, 2 * m_rem + m] += wt_sign * (sum_ccf * inv_n)
+                    if compute_cf_surv:
+                        t_cf_m = sum_ccf + (0.0 if no_notional else sum_pm)
+                        cf_surv_out[r_idx, 0, m] += wt_sign * (t_cf_m * inv_n)
+                        cf_surv_out[r_idx, 1, m] += wt_sign * (sum_surv_pre * inv_n)
+                    if is_last:
+                        c0 = 3 * m_rem
+                        s1_out[r_idx, c0 + 0] += wt_sign * (sum_uput * inv_n)
+                        s1_out[r_idx, c0 + 1] += wt_sign * (sum_ucall * inv_n)
+                        s1_out[r_idx, c0 + 2] += wt_sign * (sum_los * inv_n)
+                        s1_out[r_idx, c0 + 3] += wt_sign * (sum_pos * inv_n)
+                        s1_out[r_idx, c0 + 4] += wt_sign * (sum_pv * inv_n)
+                        if compute_cf_surv:
+                            cf_surv_out[r_idx, 0, m] += wt_sign * (sum_tcf * inv_n)
+
+
 def _eval_mf_gbm_batch_cpu(
     z_corr_rmnd: npt.NDArray[np.float64],
     d_var_gbm: npt.NDArray[np.float64],
@@ -6929,6 +9834,65 @@ def _eval_mf_gbm_batch_cpu(
     r_b, m_rem, n_rep, d_assets = z_corr_rmnd.shape
     s1_out = np.zeros((r_b, 3 * m_rem + 5), dtype=np.float64)
     cf_surv_out = np.zeros((r_b, 2, m_rem), dtype=np.float64) if compute_cf_surv else None
+    sqrt_dv = np.ascontiguousarray(np.sqrt(np.maximum(d_var_gbm, 1e-18)), dtype=np.float64)
+    eff_csp = -cpn_spread if dir_down else cpn_spread
+    has_os = bool(k_os > 0.0)
+    ki_active = bool(has_ki and b_ki > 0.0 and i_ki_past < 0.5)
+    if _HAS_NUMBA and call_code in (0, 1, 2) and cpn_code in (0, 1, 2) and opt_code in (0, 1, 2):
+        cf_nb = cf_surv_out if cf_surv_out is not None else np.zeros((1, 2, 1), dtype=np.float64)
+        wf_nb = (
+            np.ascontiguousarray(w_fund_np, dtype=np.float64)
+            if w_fund_np is not None
+            else np.zeros(m_rem, dtype=np.float64)
+        )
+        _nb_eval_mf_gbm_batch(
+            np.ascontiguousarray(z_corr_rmnd, dtype=np.float64),
+            sqrt_dv,
+            np.ascontiguousarray(d_var_gbm, dtype=np.float64),
+            np.ascontiguousarray(fwd_perf_np, dtype=np.float64),
+            np.ascontiguousarray(df_pay_np, dtype=np.float64),
+            wf_nb,
+            w_fund_np is not None,
+            np.ascontiguousarray(ko_arr, dtype=np.float64),
+            np.ascontiguousarray(is_call_arr, dtype=np.float64),
+            np.ascontiguousarray(cpn_arr, dtype=np.float64),
+            np.ascontiguousarray(is_guar_arr, dtype=np.float64),
+            np.ascontiguousarray(cpn_rates_arr, dtype=np.float64),
+            s1_out,
+            cf_nb,
+            int(call_code),
+            int(cpn_code),
+            int(opt_code),
+            float(ko_spread),
+            float(eff_csp),
+            float(ki_spread),
+            float(k_os),
+            float(one_star_eps),
+            float(k_put),
+            float(k_low),
+            float(b_ki),
+            float(option_gearing),
+            float(ac_cpn),
+            float(c_mem_0),
+            float(i_ki_past),
+            float(k_call),
+            float(part_call_rate),
+            float(os_cpn),
+            bool(has_ki),
+            bool(ki_active),
+            bool(is_memory),
+            bool(is_long_basket),
+            bool(no_notional),
+            bool(force_cpn_ac),
+            bool(dir_down),
+            bool(type_out),
+            bool(has_lower_strike),
+            bool(has_part_call),
+            bool(has_os),
+            bool(antithetic),
+            bool(compute_cf_surv),
+        )
+        return s1_out, cf_surv_out
 
     def _idx_from_perf(p_arr: npt.NDArray[np.float64], code: int) -> npt.NDArray[np.float64]:
         if code == 0:
@@ -7159,7 +10123,6 @@ def compute_qmc_aad_crn_greeks(
     orig_ids = list(state.original_identifiers)
     sorted_ids = list(state.sorted_identifiers)
     inv_perm = list(state.inv_lex_perm)
-    inv_idx_t = torch.tensor(inv_perm, dtype=torch.long, device=out_device)
 
     use_gpu_triton = qmc_device.type == "cuda" and _HAS_TRITON
     engine_label = "qmc_aad_triton" if use_gpu_triton else "qmc_aad_cpp"
@@ -7169,7 +10132,6 @@ def compute_qmc_aad_crn_greeks(
     base_se = 0.0
     base_postproc: Any = None
 
-    base_spots = state.spots_t0.detach().to(dtype=torch.float64, device=out_device)
     as_of_orig = state.seasoned_state.as_of_date
     disc_curve = _normalize_curve_obj(state.discount_curve, as_of_date=as_of_orig)
     disc_id = str(getattr(disc_curve, "identifier", state.discount_curve_id or "DEFAULT"))
@@ -7363,7 +10325,7 @@ def compute_qmc_aad_crn_greeks(
         )
 
     tau_obs_np = _np_f64(state.tau_obs)
-    spots_np = _np_f64(base_spots)
+    spots_np = _np_f64(state.spots_t0)
     ref_spots_np = _np_f64(state.ref_spots)
     div_pv_np = _np_f64(state.dividend_schedule.div_pv)
     fwd_perf_np = _np_f64(state.forward_perf)
@@ -7415,8 +10377,9 @@ def compute_qmc_aad_crn_greeks(
         and ki_monitoring_type == "Continuous"
     )
     cpp_sde_v2_fn, cpp_sob_v2_fn, cpp_vib_v2_fn = _get_cpp_crn_v2_fns()
+    cpp_step_sp_v2_fn = _get_cpp_step_spot_bumps_fn() if (not use_gpu_triton) else None
     use_vibrato_gamma = bool(
-        use_gpu_triton
+        (use_gpu_triton or (cpp_sde_v2_fn is not None and cpp_vib_v2_fn is not None))
         and (want_gamma or want_cash_gamma)
         and (ki_monitoring_type == "European" or not has_ki or float(state.i_ki_past) >= 0.5)
     )
@@ -7509,6 +10472,19 @@ def compute_qmc_aad_crn_greeks(
             obs0_sig_dt = state.seasoned_state.future_obs_dates[0]
             spots_roll_sig = tuple(_extract_fixing_value(fix_sig_obj, tk, obs0_sig_dt) for tk in sorted_ids)
 
+    curve_sig_memo: Dict[int, Any] = {}
+
+    def _csig(c_obj_s: Any) -> Any:
+        if c_obj_s is None:
+            return None
+        cid = id(c_obj_s)
+        hit = curve_sig_memo.get(cid)
+        if hit is not None:
+            return hit
+        val = _curve_fast_sig(c_obj_s, curve_sig_memo)
+        curve_sig_memo[cid] = val
+        return val
+
     def _funding_leg_sig_local() -> Any:
         if state.funding_leg is None:
             return None
@@ -7520,7 +10496,7 @@ def compute_qmc_aad_crn_greeks(
             else tuple(ff_raw)
         )
         return (
-            _curve_fast_sig(fl_s.get("funding_curve")),
+            _csig(fl_s.get("funding_curve")),
             fl_s.get("funding_curve_id"),
             fl_s.get("rate_identifier"),
             float(fl_s.get("funding_spread") or 0.0),
@@ -7549,21 +10525,50 @@ def compute_qmc_aad_crn_greeks(
         )
 
     def _div_sched_sig_local() -> Tuple[Any, ...]:
+        ds_obj = state.dividend_schedule
+        ds_snap = getattr(ds_obj, "_crn_div_sched_sig_snap", None)
+        t_ids = tuple(sorted_ids)
+        if ds_snap is not None and ds_snap[0] == t_ids:
+            _, s_tuple, ev_snap, arr_snaps = ds_snap
+            ok_ds = True
+            for idx_d, tk in enumerate(sorted_ids):
+                evs_s = ds_obj.dividend_events.get(tk, ())
+                if tuple((ev.ex_date, ev.payment_date) for ev in evs_s) != ev_snap[idx_d]:
+                    ok_ds = False
+                    break
+                if evs_s:
+                    a0, a1, a2 = arr_snaps[idx_d]
+                    if not (
+                        _arr_bytes_equal(_np_f64(ds_obj.dividend_amount_tensors[tk]), a0)
+                        and _arr_bytes_equal(_np_f64(ds_obj.dividend_pv_weights[tk]), a1)
+                        and _arr_bytes_equal(_np_f64(ds_obj.dividend_obs_incidence[tk]), a2)
+                    ):
+                        ok_ds = False
+                        break
+            if ok_ds:
+                return cast(Tuple[Any, ...], s_tuple)
         d_parts: List[Any] = []
+        ev_recs: List[Any] = []
+        arr_recs: List[Any] = []
         for tk in sorted_ids:
-            evs_s = state.dividend_schedule.dividend_events.get(tk, ())
+            evs_s = ds_obj.dividend_events.get(tk, ())
+            ev_t = tuple((ev.ex_date, ev.payment_date) for ev in evs_s)
+            ev_recs.append(ev_t)
             if evs_s:
-                d_parts.append(
-                    (
-                        tuple((ev.ex_date, ev.payment_date) for ev in evs_s),
-                        _np_f64(state.dividend_schedule.dividend_amount_tensors[tk]).tobytes(),
-                        _np_f64(state.dividend_schedule.dividend_pv_weights[tk]).tobytes(),
-                        _np_f64(state.dividend_schedule.dividend_obs_incidence[tk]).tobytes(),
-                    )
-                )
+                a0 = _np_f64(ds_obj.dividend_amount_tensors[tk])
+                a1 = _np_f64(ds_obj.dividend_pv_weights[tk])
+                a2 = _np_f64(ds_obj.dividend_obs_incidence[tk])
+                arr_recs.append((a0.copy(), a1.copy(), a2.copy()))
+                d_parts.append((ev_t, a0.tobytes(), a1.tobytes(), a2.tobytes()))
             else:
+                arr_recs.append(None)
                 d_parts.append(None)
-        return tuple(d_parts)
+        res_ds = tuple(d_parts)
+        try:
+            setattr(ds_obj, "_crn_div_sched_sig_snap", (t_ids, res_ds, tuple(ev_recs), tuple(arr_recs)))
+        except (AttributeError, TypeError):
+            pass
+        return res_ds
 
     def _past_itr_sig_local() -> Tuple[Any, Any]:
         past_cfs_s = getattr(state.seasoned_state, "past_cashflows", ())
@@ -7596,7 +10601,7 @@ def compute_qmc_aad_crn_greeks(
         )
         r_nat_sig_b = _np_f64(r_native_attr).tobytes() if r_native_attr is not None else b""
         f_leg_sig = _funding_leg_sig_local()
-        disc_sig = _curve_fast_sig(state.discount_curve) if (want_rho or want_theta or state.funding_leg is not None) else None
+        disc_sig = _csig(state.discount_curve) if (want_rho or want_theta or state.funding_leg is not None) else None
         q_meta_sig = _quanto_meta_sig_local()
         rho_th_sig: Any = None
         if want_rho or want_theta:
@@ -7605,12 +10610,12 @@ def compute_qmc_aad_crn_greeks(
             if want_rho:
                 b_map = _extract_request_mkt_attr(request, "RatesCurvesBundles", "rates_curves_bundles")
                 if isinstance(b_map, Mapping):
-                    unref_sig = tuple((str(bk), _curve_fast_sig(bc)) for bk, bc in b_map.items())
+                    unref_sig = tuple((str(bk), _csig(bc)) for bk, bc in b_map.items())
             rho_th_sig = (
                 tuple(state.seasoned_state.future_obs_dates),
                 tuple(state.seasoned_state.future_pay_dates),
-                tuple(_curve_fast_sig((state.asset_financing_curves or {}).get(tk)) for tk in sorted_ids),
-                _raw_repo_sigs(state, request, sorted_ids),
+                tuple(_csig((state.asset_financing_curves or {}).get(tk)) for tk in sorted_ids),
+                _raw_repo_sigs(state, request, sorted_ids, curve_sig_memo),
                 est_sig,
                 itr_rec_sig,
                 unref_sig,
@@ -7992,49 +10997,91 @@ def compute_qmc_aad_crn_greeks(
                 shifts_sobol_gpu = torch.from_numpy(shifts_np).to(device=qmc_device, dtype=torch.int32)
                 _CRN_SOBOL_CACHE.put(shift_cache_key, shifts_sobol_gpu)
 
-        def _get_z_indep_chunk_gpu(r_start_c: int, r_end_c: int, allow_full_cache: bool = True) -> torch.Tensor:
-            if allow_full_cache and z_indep_full_f32 is not None:
+        def _get_z_indep_chunk_gpu(
+            r_start_c: int,
+            r_end_c: int,
+            allow_full_cache: bool = True,
+            *,
+            shifts_ov: Optional[torch.Tensor] = None,
+            u_rot_ov: Optional[torch.Tensor] = None,
+            m_pad_ov: Optional[int] = None,
+            d_pad_ov: Optional[int] = None,
+            cg_flags_ov: Optional[torch.Tensor] = None,
+            use_rt_flags: bool = False,
+            use_cg_arena: bool = False,
+        ) -> torch.Tensor:
+            eff_m_z = int(m_pad_ov) if m_pad_ov is not None else m_rem
+            eff_d_z = int(d_pad_ov) if d_pad_ov is not None else d_assets
+            eff_sh_z = shifts_ov if shifts_ov is not None else shifts_sobol_gpu
+            eff_urot_z = u_rot_ov if u_rot_ov is not None else u_rot_gpu
+            eff_rt_z = bool(use_rt_flags and cg_flags_ov is not None and d_pad_ov is not None)
+            if (not eff_rt_z) and allow_full_cache and z_indep_full_f32 is not None:
                 if r_start_c == 0 and r_end_c == eff_r:
                     return z_indep_full_f32
                 return z_indep_full_f32[:, :, r_start_c * n_rep : r_end_c * n_rep].contiguous()
             r_cnt_c = r_end_c - r_start_c
             n_tot_c = r_cnt_c * n_rep
-            if can_triton_sobol and sv_sobol_gpu is not None and shifts_sobol_gpu is not None:
-                z_raw_c = torch.empty((m_rem * n_sub, d_assets, n_tot_c), dtype=torch.float32, device=qmc_device)
+            if can_triton_sobol and sv_sobol_gpu is not None and eff_sh_z is not None:
+                z_raw_c = _alloc_cg_buf(
+                    use_cg_arena,
+                    qmc_device,
+                    "z_raw_or_bzc",
+                    (eff_m_z * n_sub, eff_d_z, n_tot_c),
+                    torch.float32,
+                    zero=eff_rt_z,
+                )
                 m_pow_r = int(round(math.log2(n_rep)))
                 block_n_s = min(256, n_rep)
                 n_tiles_r_s = (n_rep + block_n_s - 1) // block_n_s
                 _fast_triton_launch(
                     _sobol_bridge_normals_kernel,
-                    (n_tiles_r_s, m_rem * r_cnt_c),
+                    (n_tiles_r_s, eff_m_z * r_cnt_c),
                     sv_sobol_gpu,
-                    shifts_sobol_gpu[r_start_c:r_end_c],
+                    eff_sh_z[r_start_c:r_end_c],
                     z_raw_c,
-                    m_rem,
-                    d_assets,
+                    eff_m_z,
+                    eff_d_z,
+                    cg_flags_ptr=cg_flags_ov if eff_rt_z else None,
                     n_rep=n_rep,
                     n_sub=n_sub,
                     m_pow=m_pow_r,
                     BLOCK_N=block_n_s,
+                    USE_RT_FLAGS=eff_rt_z,
+                    D_PAD=eff_d_z if eff_rt_z else 0,
                     num_warps=4,
                 )
             else:
                 z_raw_cpu = _gen_sobol_cpu_slice(r_start_c, r_end_c)
                 z_raw_c = torch.from_numpy(
-                    np.ascontiguousarray(z_raw_cpu.transpose(0, 1, 4, 2, 3).reshape(m_rem * n_sub, d_assets, n_tot_c))
+                    np.ascontiguousarray(z_raw_cpu.transpose(0, 1, 4, 2, 3).reshape(eff_m_z * n_sub, eff_d_z, n_tot_c))
                 ).to(device=qmc_device, dtype=torch.float32)
-            assert u_rot_gpu is not None
-            z_4d_c = z_raw_c.view(m_rem, n_sub, d_assets, n_tot_c)
-            z_mean_c = z_4d_c.mean(dim=1)
-            z_mean_rot_c = torch.matmul(
-                u_rot_gpu,
-                z_mean_c.view(m_rem, d_assets * n_tot_c),
-            ).view(m_rem, d_assets, n_tot_c)
-            z_out_c = (z_4d_c + (z_mean_rot_c - z_mean_c).unsqueeze(1)).reshape(m_rem * n_sub, d_assets, n_tot_c).contiguous()
+            assert eff_urot_z is not None
+            z_4d_c = z_raw_c.view(eff_m_z, n_sub, eff_d_z, n_tot_c)
+            if use_cg_arena:
+                z_mean_c = _alloc_cg_buf(True, qmc_device, "perf_aux", (eff_m_z, eff_d_z, n_tot_c), torch.float32)
+                torch.mean(z_4d_c, dim=1, out=z_mean_c)
+                z_mean_rot_c = _alloc_cg_buf(True, qmc_device, "lx_period", (eff_m_z, eff_d_z, n_tot_c), torch.float32)
+                torch.matmul(eff_urot_z, z_mean_c.view(eff_m_z, eff_d_z * n_tot_c), out=z_mean_rot_c.view(eff_m_z, eff_d_z * n_tot_c))
+                torch.sub(z_mean_rot_c, z_mean_c, out=z_mean_rot_c)
+                z_out_c = _alloc_cg_buf(True, qmc_device, "z_out", (eff_m_z * n_sub, eff_d_z, n_tot_c), torch.float32)
+                torch.add(z_4d_c, z_mean_rot_c.unsqueeze(1), out=z_out_c.view(eff_m_z, n_sub, eff_d_z, n_tot_c))
+            else:
+                z_mean_c = z_4d_c.mean(dim=1)
+                z_mean_rot_c = torch.matmul(
+                    eff_urot_z,
+                    z_mean_c.view(eff_m_z, eff_d_z * n_tot_c),
+                ).view(eff_m_z, eff_d_z, n_tot_c)
+                z_out_c = (z_4d_c + (z_mean_rot_c - z_mean_c).unsqueeze(1)).reshape(eff_m_z * n_sub, eff_d_z, n_tot_c).contiguous()
             del z_raw_c
             return z_out_c
 
-        if z_indep_full_f32 is None and z_full_bytes <= 18 * 1024 * 1024:
+        will_cg_eager_skip = bool(
+            os.environ.get("DEEPVOL_QMC_CG", "1") != "0"
+            and can_triton_sobol
+            and (not is_cont_ki_active)
+            and (need_stage2_aad or use_vibrato_gamma or need_spot_bumps)
+        )
+        if z_indep_full_f32 is None and z_full_bytes <= 18 * 1024 * 1024 and (not will_cg_eager_skip):
             z_indep_full_f32 = _get_z_indep_chunk_gpu(0, eff_r)
             _CRN_SOBOL_CACHE.put(rot_sobol_key, z_indep_full_f32)
     else:
@@ -8083,6 +11130,10 @@ def compute_qmc_aad_crn_greeks(
         fwd_perf_scale_t: Optional[torch.Tensor] = None,
         out_mdn: bool = False,
         out_f32: bool = False,
+        use_cg_arena: bool = False,
+        cg_arena_slot: str = "perf_aux",
+        cg_th_flags_g: Optional[torch.Tensor] = None,
+        use_th_rt_flags: bool = False,
     ) -> torch.Tensor:
         eff_m = int(m_periods if m_periods is not None else m_rem)
         n_tot_in = int(z_corr_1d.shape[-1])
@@ -8098,7 +11149,7 @@ def compute_qmc_aad_crn_greeks(
         use_f32_k = bool(n_rep <= 2048 and lv_b_t.dtype == torch.float32)
         out_dt = torch.float32 if (use_f32_k and out_f32) else torch.float64
         out_shape = (eff_m, b_sz, n_tot_in) if (use_f32_k and out_mdn) else (b_sz, eff_m, n_tot_in)
-        norm_x_res = torch.empty(out_shape, dtype=out_dt, device=qmc_device)
+        norm_x_res = _alloc_cg_buf(use_cg_arena, qmc_device, cg_arena_slot, out_shape, out_dt)
         if n_rep <= 2048:
             block_n = n_rep
             n_tiles = 1
@@ -8125,6 +11176,7 @@ def compute_qmc_aad_crn_greeks(
                     b_sz,
                     eff_m,
                     d_z_st,
+                    cg_th_flags_ptr=cg_th_flags_g if use_th_rt_flags else None,
                     z_mode=z_mode,
                     n_rep=n_rep,
                     n_sub=n_sub,
@@ -8135,6 +11187,7 @@ def compute_qmc_aad_crn_greeks(
                     HAS_FWD_SCALE=bool(fwd_perf_scale_t is not None),
                     OUT_MDN=out_mdn,
                     OUT_F32=out_f32,
+                    USE_TH_RT_FLAGS=use_th_rt_flags,
                     num_warps=nw_step,
                 )
                 return norm_x_res
@@ -8293,6 +11346,7 @@ def compute_qmc_aad_crn_greeks(
         is_guar_ov: Optional[torch.Tensor] = None,
         cpn_rates_ov: Optional[torch.Tensor] = None,
         payoff_f64_ov: Optional[torch.Tensor] = None,
+        inv_perm_ov: Optional[torch.Tensor] = None,
         eps_vec_g: Optional[torch.Tensor] = None,
         frozen_term_g: Optional[torch.Tensor] = None,
         i_ki_ext_g: Optional[torch.Tensor] = None,
@@ -8300,8 +11354,14 @@ def compute_qmc_aad_crn_greeks(
         use_frozen_term: bool = False,
         use_f32_eval: Optional[bool] = None,
         out_pv_g: Optional[torch.Tensor] = None,
+        d_pad_rt: int = 0,
+        cg_flags_g: Optional[torch.Tensor] = None,
+        use_rt_flags: bool = False,
+        cg_bumps_idx: int = -1,
+        use_cg_arena: bool = False,
     ) -> Any:
         eff_m_eval = int(m_periods if m_periods is not None else m_rem)
+        eff_d_eval = int(d_pad_rt) if (use_rt_flags and d_pad_rt > 0) else d_assets
         n_b = static_gpu_pack[0] if static_gpu_pack is not None else int(len(asset_a_np))
         if n_b == 0:
             return torch.empty((0,), dtype=torch.float64, device=qmc_device) if return_gpu else np.empty(0, dtype=np.float64)
@@ -8389,7 +11449,15 @@ def compute_qmc_aad_crn_greeks(
             n_tile = min(l2o_bn_cap, max(64, _next_power_of_two_int(n_tot_eval)))
             block_n = n_tile
             n_t_tiles = (n_tot_eval + n_tile - 1) // n_tile
-            pv_tiles_gpu = torch.empty((n_b, n_t_tiles), dtype=torch.float64, device=qmc_device)
+            eff_rt_loo = bool(use_rt_flags and cg_flags_g is not None and d_pad_rt > 0)
+            pv_tiles_gpu = _alloc_cg_buf(
+                use_cg_arena,
+                qmc_device,
+                "pv_tiles",
+                (n_b, n_t_tiles),
+                torch.float64,
+                zero=eff_rt_loo,
+            )
             _fast_triton_launch(
                 _crn_loo_l2o_payoff_f64_kernel,
                 (n_b, n_t_tiles),
@@ -8413,36 +11481,40 @@ def compute_qmc_aad_crn_greeks(
                 cpn_ov if cpn_ov is not None else gpu_meta["cpn"],
                 is_guar_ov if is_guar_ov is not None else gpu_meta["is_guar"],
                 cpn_rates_ov if cpn_rates_ov is not None else gpu_meta["cpn_rates"],
-                gpu_meta["inv_perm"],
+                inv_perm_ov if inv_perm_ov is not None else gpu_meta["inv_perm"],
                 eps_vec_g,
                 frozen_term_g,
                 i_ki_ext_g,
                 payoff_f64_ov if payoff_f64_ov is not None else gpu_meta["payoff_f64"],
                 n_b,
-                d_assets,
+                eff_d_eval,
                 eff_m_eval,
                 n_tot_eval,
                 0,
-                CALL_CODE=call_code,
-                CPN_CODE=cpn_code,
-                OPT_CODE=opt_code,
-                HAS_KI=has_ki,
-                IS_MEM=is_memory,
-                IS_LONG=is_long_flag,
-                NO_NOTIONAL=no_notional,
-                FORCE_CPN_AC=force_cpn_ac,
-                CPN_DIR_DOWN=dir_down,
-                CPN_TYPE_OUT=type_out,
+                cg_flags_ptr=cg_flags_g if eff_rt_loo else None,
+                CALL_CODE=0 if eff_rt_loo else call_code,
+                CPN_CODE=0 if eff_rt_loo else cpn_code,
+                OPT_CODE=0 if eff_rt_loo else opt_code,
+                HAS_KI=False if eff_rt_loo else has_ki,
+                IS_MEM=False if eff_rt_loo else is_memory,
+                IS_LONG=False if eff_rt_loo else is_long_flag,
+                NO_NOTIONAL=False if eff_rt_loo else no_notional,
+                FORCE_CPN_AC=False if eff_rt_loo else force_cpn_ac,
+                CPN_DIR_DOWN=False if eff_rt_loo else dir_down,
+                CPN_TYPE_OUT=False if eff_rt_loo else type_out,
                 N_TILE=n_tile,
                 BLOCK_N=block_n,
                 IS_FULL_BATCH=is_full_batch,
-                HAS_ONE_STAR=bool(k_os > 0.0),
-                HAS_LOWER_STRIKE=has_lower_strike_flag,
-                HAS_PART_CALL=has_part_call_flag,
+                HAS_ONE_STAR=False if eff_rt_loo else bool(k_os > 0.0),
+                HAS_LOWER_STRIKE=True if eff_rt_loo else has_lower_strike_flag,
+                HAS_PART_CALL=False if eff_rt_loo else has_part_call_flag,
                 USE_C2_PRETERM=use_c2_preterm,
                 USE_FROZEN_TERM=use_frozen_term,
                 HAS_EXT_KI=bool(i_ki_ext_g is not None),
                 USE_F32_EVAL=eff_f32_eval,
+                USE_RT_FLAGS=eff_rt_loo,
+                D_PAD=d_pad_rt if eff_rt_loo else 0,
+                CG_BUMPS_IDX=cg_bumps_idx if eff_rt_loo else -1,
                 num_warps=l2o_nw,
             )
             if out_pv_g is not None and pure_mc:
@@ -8751,9 +11823,9 @@ def compute_qmc_aad_crn_greeks(
             lv_ny,
             str(out_device),
             spots_roll_sig,
-            _curve_fast_sig(state.discount_curve),
-            tuple(_curve_fast_sig((state.asset_financing_curves or {}).get(tk)) for tk in sorted_ids),
-            _raw_repo_sigs(state, request, sorted_ids),
+            _csig(state.discount_curve),
+            tuple(_csig((state.asset_financing_curves or {}).get(tk)) for tk in sorted_ids),
+            _raw_repo_sigs(state, request, sorted_ids, curve_sig_memo),
         )
         th_prep = _CRN_STATIC_CACHE.get(th_cache_key)
     if (not _warm_gpu_hit) and want_theta and th_prep is None:
@@ -9208,7 +12280,7 @@ def compute_qmc_aad_crn_greeks(
             "cpn": cpn_g,
             "is_guar": is_guar_g,
             "cpn_rates": cpn_rates_g,
-            "inv_perm": inv_idx_t.to(dtype=torch.int64, device=qmc_device).contiguous(),
+            "inv_perm": torch.tensor(inv_perm, dtype=torch.int64, device=qmc_device).contiguous(),
             "tau": tau_step_g[:m_rem],
             "rn": rn_step_g[: d_assets * m_rem].view(d_assets, m_rem),
             "rt": rt_step_g[: d_assets * m_rem].view(d_assets, m_rem),
@@ -9223,11 +12295,31 @@ def compute_qmc_aad_crn_greeks(
         }
     elif not use_gpu_triton:
         assert z_indep_np is not None
-        z_corr_base_np = np.ascontiguousarray(np.matmul(z_indep_np, chol_base.T), dtype=np.float64)
+        z_corr_base_np = (
+            np.ascontiguousarray(np.matmul(z_indep_np, chol_base.T), dtype=np.float64)
+            if (need_spot_bumps or cpp_sde_v2_fn is None)
+            else None
+        )
         norm_x_base_np = np.empty((d_assets, m_rem, n_total), dtype=np.float64)
         lx_period_cpu: Optional[npt.NDArray[np.float64]] = None
         lx_norm_cpu: Optional[npt.NDArray[np.float64]] = None
+        cpu_vib_lx_pre: Optional[npt.NDArray[np.float64]] = None
+        cpu_vib_j_pre: Optional[npt.NDArray[np.float64]] = None
+        cpu_vib_sig_pre: Optional[npt.NDArray[np.float64]] = None
+        vib_tau_prev_c = np.concatenate([[0.0], tau_obs_np[:-1]])
+        vib_d_tau_c = np.maximum(tau_obs_np - vib_tau_prev_c, 1e-10)
+        vib_period_level_c = bool(m_rem == 1)
+        vib_period_idx_c = m_rem - 1
+        vib_sub_idx_c = n_sub - 1
+        vib_step_start_c = vib_period_idx_c * n_sub if vib_period_level_c else (m_rem * n_sub - 1)
+        vib_n_steps_c = n_sub if vib_period_level_c else 1
+        h_vib_val_c = float(vib_d_tau_c[-1]) if vib_period_level_c else float(vib_d_tau_c[-1] / float(n_sub))
+        df_last_val_c = float(df_pay_np[-1])
         if cpp_sde_v2_fn is not None:
+            if use_vibrato_gamma:
+                cpu_vib_lx_pre = np.empty((d_assets, n_total), dtype=np.float64)
+                cpu_vib_j_pre = np.empty((d_assets, n_total), dtype=np.float64)
+                cpu_vib_sig_pre = np.empty((d_assets, n_total), dtype=np.float64)
             if callable(getattr(cpp_sde_v2_fn, "__call__", None)) and not hasattr(cpp_sde_v2_fn, "argtypes"):
                 lx_period_cpu, norm_x_m_v2, _, _, _ = cpp_sde_v2_fn(
                     lv_tables=base_lv_tables,
@@ -9244,6 +12336,14 @@ def compute_qmc_aad_crn_greeks(
                     n_rep=n_rep,
                     run_forward=True,
                     run_backward=False,
+                    out_lx_pre=cpu_vib_lx_pre,
+                    out_j_pre=cpu_vib_j_pre,
+                    out_sig_pre=cpu_vib_sig_pre,
+                    vib_period_idx=vib_period_idx_c,
+                    vib_sub_idx=vib_sub_idx_c,
+                    save_vib_pre=(2 if vib_period_level_c else 1) if use_vibrato_gamma else 0,
+                    vib_j_pre_max=6.0,
+                    vib_dsig_dy_max=4.0,
                 )
                 assert norm_x_m_v2 is not None
                 lx_norm_cpu = lx_period_cpu
@@ -9251,6 +12351,15 @@ def compute_qmc_aad_crn_greeks(
             else:
                 lx_p_arr = np.empty((m_rem, d_assets, n_total), dtype=np.float64)
                 nx_p_arr = np.empty((m_rem, d_assets, n_total), dtype=np.float64)
+                lv_c64 = np.ascontiguousarray(base_lv_tables, dtype=np.float64)
+                z_c64 = np.ascontiguousarray(z_indep_np, dtype=np.float64)
+                ch_c64 = np.ascontiguousarray(chol_base, dtype=np.float64)
+                tau_c64 = np.ascontiguousarray(tau_obs_np, dtype=np.float64)
+                rn_c64 = np.ascontiguousarray(r_native_obs_np, dtype=np.float64)
+                rt_c64 = np.ascontiguousarray(r_tot_obs_np, dtype=np.float64)
+                lvt_c64 = np.ascontiguousarray(lv_t_grid, dtype=np.float64)
+                lvy0_c64 = np.ascontiguousarray(lv_y_min_vec, dtype=np.float64)
+                lvy1_c64 = np.ascontiguousarray(lv_y_max_vec, dtype=np.float64)
                 sde_args_fwd = _PlatenSdeAadArgsC(
                     d_assets=d_assets,
                     m_rem=m_rem,
@@ -9259,15 +12368,15 @@ def compute_qmc_aad_crn_greeks(
                     n_rep=n_rep,
                     lv_nt=lv_nt,
                     lv_ny=lv_ny,
-                    lv_tables=np.ascontiguousarray(base_lv_tables, dtype=np.float64).ctypes.data,
-                    z_indep=np.ascontiguousarray(z_indep_np, dtype=np.float64).ctypes.data,
-                    chol_base=np.ascontiguousarray(chol_base, dtype=np.float64).ctypes.data,
-                    tau_obs=np.ascontiguousarray(tau_obs_np, dtype=np.float64).ctypes.data,
-                    r_native_obs=np.ascontiguousarray(r_native_obs_np, dtype=np.float64).ctypes.data,
-                    r_tot_obs=np.ascontiguousarray(r_tot_obs_np, dtype=np.float64).ctypes.data,
-                    lv_t_grid=np.ascontiguousarray(lv_t_grid, dtype=np.float64).ctypes.data,
-                    lv_y_min=np.ascontiguousarray(lv_y_min_vec, dtype=np.float64).ctypes.data,
-                    lv_y_max=np.ascontiguousarray(lv_y_max_vec, dtype=np.float64).ctypes.data,
+                    lv_tables=lv_c64.ctypes.data,
+                    z_indep=z_c64.ctypes.data,
+                    chol_base=ch_c64.ctypes.data,
+                    tau_obs=tau_c64.ctypes.data,
+                    r_native_obs=rn_c64.ctypes.data,
+                    r_tot_obs=rt_c64.ctypes.data,
+                    lv_t_grid=lvt_c64.ctypes.data,
+                    lv_y_min=lvy0_c64.ctypes.data,
+                    lv_y_max=lvy1_c64.ctypes.data,
                     bar_lx_post=0,
                     lx_norm_in=0,
                     q_shift_sub=0,
@@ -9282,6 +12391,15 @@ def compute_qmc_aad_crn_greeks(
                     compute_chol_aad=0,
                     compute_q_aad=0,
                     has_q_shift_sub=0,
+                    out_lx_pre=cpu_vib_lx_pre.ctypes.data if cpu_vib_lx_pre is not None else 0,
+                    out_j_pre=cpu_vib_j_pre.ctypes.data if cpu_vib_j_pre is not None else 0,
+                    out_sig_pre=cpu_vib_sig_pre.ctypes.data if cpu_vib_sig_pre is not None else 0,
+                    vib_period_idx=vib_period_idx_c,
+                    vib_sub_idx=vib_sub_idx_c,
+                    save_vib_pre=(2 if vib_period_level_c else 1) if use_vibrato_gamma else 0,
+                    _pad_vib=0,
+                    vib_j_pre_max=6.0,
+                    vib_dsig_dy_max=4.0,
                 )
                 cpp_sde_v2_fn(ctypes.byref(sde_args_fwd))
                 lx_period_cpu = lx_p_arr
@@ -9309,25 +12427,253 @@ def compute_qmc_aad_crn_greeks(
         norm_x_base_dev = norm_x_base_np
         perf_base_dev = perf_base_m_d_n_np
 
+        use_cpu_np_aad = bool(
+            (not is_cont_ki_active)
+            and call_code in (0, 1, 2)
+            and cpn_code in (0, 1, 2)
+            and opt_code in (0, 1, 2)
+            and str(ki_monitoring_type or "Discrete").strip().lower() in ("european", "discrete")
+            and os.environ.get("DEEPVOL_CPU_NP_AAD", "1") != "0"
+        )
         if need_stage2_aad or ("ProductValue" in q_set) or ("CashFlows" in q_set) or return_cashflows:
             s1_cpu_box: List[torch.Tensor] = []
             cf_wf_cpu_box: List[torch.Tensor] = []
             if need_stage2_aad or is_cont_ki_active or ("ProductValue" in q_set) or ("CashFlows" in q_set) or return_cashflows:
                 if need_stage2_aad:
                     assert lx_period_cpu is not None and lx_norm_cpu is not None
-                    perf_cpu_t = torch.from_numpy(perf_base_m_d_n_np)
-                    wf_cpu = torch.from_numpy(w_fund_base_np) if w_fund_base_np is not None else None
-                    perf_cpu_m_d_n = perf_cpu_t
-                    bar_lx_post_cpu, bar_ln_fwd_t, bar_lv_cont_cpu = _compute_payoff_aad_state_adjoints_torch(
-                        perf_cpu_m_d_n,
-                        ko_barriers=torch.from_numpy(ko_arr_np),
-                        is_callable=torch.from_numpy(is_call_np),
-                        cpn_barriers=torch.from_numpy(cpn_arr_np),
-                        is_guar=torch.from_numpy(is_guar_np),
-                        cpn_rates=torch.from_numpy(cpn_rates_np),
-                        df_pay=torch.from_numpy(df_pay_np),
-                        w_fund=wf_cpu,
-                        inv_perm=inv_perm,
+                    if use_cpu_np_aad:
+                        bar_lx_post_np, bar_ln_fwd_np, s1_np_out, cf_wf_np_out = _compute_payoff_aad_state_adjoints_cpu_np(
+                            perf_base_m_d_n_np,
+                            ko_barriers=ko_arr_np,
+                            is_callable=is_call_np,
+                            cpn_barriers=cpn_arr_np,
+                            is_guar=is_guar_np,
+                            cpn_rates=cpn_rates_np,
+                            df_pay=df_pay_np,
+                            w_fund=w_fund_base_np,
+                            call_code=call_code,
+                            cpn_code=cpn_code,
+                            opt_code=opt_code,
+                            ko_spread=ko_spread,
+                            cpn_spread=cpn_spread,
+                            ki_spread=ki_spread,
+                            cpn_dir_down=dir_down,
+                            cpn_type_out=type_out,
+                            is_memory=is_memory,
+                            force_cpn_ac=force_cpn_ac,
+                            no_notional=no_notional,
+                            is_long_basket=is_long_flag,
+                            has_ki=has_ki,
+                            ki_barrier=b_ki,
+                            i_ki_past=float(state.i_ki_past),
+                            ki_monitoring_type=ki_monitoring_type,
+                            tau_obs=tau_obs_np,
+                            vol_atm_obs=vol_atm_obs,
+                            strike=k_put,
+                            lower_strike=state.lower_strike,
+                            option_gearing=float(state.option_gearing),
+                            ac_cpn=float(state.autocall_coupon),
+                            c_mem_0=float(state.c_mem_0),
+                            part_call_strike=state.participation_call_strike,
+                            part_call_rate=part_call_rate,
+                            one_star_strike=(k_os if k_os > 0.0 else state.one_star_strike),
+                            one_star_coupon=os_cpn,
+                            one_star_eps=one_star_eps,
+                            barrier_eps_min=barrier_eps_min,
+                            barrier_eps_max=barrier_eps_max,
+                            n_rep=n_rep,
+                            emit_stage1=True,
+                            compute_grads=True,
+                            want_cf_wf=bool(use_pathwise_rate_adj or want_theta),
+                        )
+                        bar_lv_cont_cpu = None
+                        if s1_np_out is not None:
+                            stage1_rep_np = s1_np_out
+                        if cf_wf_np_out is not None:
+                            bar_cf_np = cf_wf_np_out[0]
+                            bar_surv_np = cf_wf_np_out[1]
+                    else:
+                        perf_cpu_t = torch.from_numpy(perf_base_m_d_n_np)
+                        wf_cpu = torch.from_numpy(w_fund_base_np) if w_fund_base_np is not None else None
+                        perf_cpu_m_d_n = perf_cpu_t
+                        bar_lx_post_cpu, bar_ln_fwd_t, bar_lv_cont_cpu = _compute_payoff_aad_state_adjoints_torch(
+                            perf_cpu_m_d_n,
+                            ko_barriers=torch.from_numpy(ko_arr_np),
+                            is_callable=torch.from_numpy(is_call_np),
+                            cpn_barriers=torch.from_numpy(cpn_arr_np),
+                            is_guar=torch.from_numpy(is_guar_np),
+                            cpn_rates=torch.from_numpy(cpn_rates_np),
+                            df_pay=torch.from_numpy(df_pay_np),
+                            w_fund=wf_cpu,
+                            inv_perm=inv_perm,
+                            call_code=call_code,
+                            cpn_code=cpn_code,
+                            opt_code=opt_code,
+                            ko_spread=ko_spread,
+                            cpn_spread=cpn_spread,
+                            ki_spread=ki_spread,
+                            cpn_dir_down=dir_down,
+                            cpn_type_out=type_out,
+                            is_memory=is_memory,
+                            force_cpn_ac=force_cpn_ac,
+                            no_notional=no_notional,
+                            is_long_basket=is_long_flag,
+                            has_ki=has_ki,
+                            ki_barrier=b_ki,
+                            i_ki_past=float(state.i_ki_past),
+                            ki_monitoring_type=ki_monitoring_type,
+                            tau_obs=tau_obs_np,
+                            vol_atm_obs=vol_atm_obs,
+                            strike=k_put,
+                            lower_strike=state.lower_strike,
+                            option_gearing=float(state.option_gearing),
+                            ac_cpn=float(state.autocall_coupon),
+                            c_mem_0=float(state.c_mem_0),
+                            part_call_strike=state.participation_call_strike,
+                            part_call_rate=part_call_rate,
+                            one_star_strike=(k_os if k_os > 0.0 else state.one_star_strike),
+                            one_star_coupon=os_cpn,
+                            one_star_eps=one_star_eps,
+                            barrier_eps_min=barrier_eps_min,
+                            barrier_eps_max=barrier_eps_max,
+                            lv_tables_t=torch.from_numpy(base_lv_tables),
+                            corr_t=torch.from_numpy(corr_np),
+                            fwd_perf_t=torch.from_numpy(fwd_perf_np),
+                            y_min=lv_y_min_vec,
+                            y_max=lv_y_max_vec,
+                            n_sub=n_sub,
+                            corr_grad_out=corr_grad_cont_list if want_cega else None,
+                            n_rep=n_rep,
+                            emit_stage1=True,
+                            out_stage1_rep=s1_cpu_box,
+                            out_cf_wf=cf_wf_cpu_box if (use_pathwise_rate_adj or want_theta) else None,
+                        )
+                        bar_lx_post_np = np.ascontiguousarray(bar_lx_post_cpu.to(dtype=torch.float64).numpy(), dtype=np.float64)
+                        bar_ln_fwd_np = bar_ln_fwd_t.numpy()
+                    if cpp_sde_v2_fn is not None:
+                        need_lv_c = bool(want_vega or want_rho or want_divs or want_theta)
+                        need_chol_c = bool(want_cega and d_assets > 1)
+                        need_q_c = bool(quanto_meta and (want_vega or want_theta))
+                        if callable(getattr(cpp_sde_v2_fn, "__call__", None)) and not hasattr(cpp_sde_v2_fn, "argtypes"):
+                            _, _, b_lv_c, b_ch_c, b_q_c = cpp_sde_v2_fn(
+                                lv_tables=base_lv_tables,
+                                z_indep=z_indep_np,
+                                chol_base=chol_base,
+                                tau_obs=tau_obs_np,
+                                r_native_obs=r_native_obs_np,
+                                r_tot_obs=r_tot_obs_np,
+                                lv_t_grid=lv_t_grid,
+                                lv_y_min=lv_y_min_vec,
+                                lv_y_max=lv_y_max_vec,
+                                n_sub=n_sub,
+                                eff_r=eff_r,
+                                n_rep=n_rep,
+                                bar_lx_post=bar_lx_post_np,
+                                lx_norm_in=lx_norm_cpu,
+                                run_forward=False,
+                                run_backward=True,
+                                compute_lv_aad=need_lv_c,
+                                compute_chol_aad=need_chol_c,
+                                compute_q_aad=need_q_c,
+                                vib_j_pre_max=6.0,
+                                vib_dsig_dy_max=4.0,
+                            )
+                            bar_lv_np = b_lv_c if b_lv_c is not None else np.zeros_like(base_lv_tables)
+                            bar_chol_aad = b_ch_c if b_ch_c is not None else np.zeros_like(chol_base)
+                            bar_q_shift_np = b_q_c if b_q_c is not None else np.zeros((d_assets, m_rem * n_sub), dtype=np.float64)
+                        else:
+                            b_lv_c = np.empty_like(base_lv_tables) if need_lv_c else np.zeros((1,), dtype=np.float64)
+                            b_ch_c = np.empty_like(chol_base) if need_chol_c else np.zeros((1,), dtype=np.float64)
+                            b_q_c = np.empty((d_assets, m_rem * n_sub), dtype=np.float64) if need_q_c else np.zeros((1,), dtype=np.float64)
+                            lv_b64 = np.ascontiguousarray(base_lv_tables, dtype=np.float64)
+                            z_b64 = np.ascontiguousarray(z_indep_np, dtype=np.float64)
+                            ch_b64 = np.ascontiguousarray(chol_base, dtype=np.float64)
+                            tau_b64 = np.ascontiguousarray(tau_obs_np, dtype=np.float64)
+                            rn_b64 = np.ascontiguousarray(r_native_obs_np, dtype=np.float64)
+                            rt_b64 = np.ascontiguousarray(r_tot_obs_np, dtype=np.float64)
+                            lvt_b64 = np.ascontiguousarray(lv_t_grid, dtype=np.float64)
+                            lvy0_b64 = np.ascontiguousarray(lv_y_min_vec, dtype=np.float64)
+                            lvy1_b64 = np.ascontiguousarray(lv_y_max_vec, dtype=np.float64)
+                            lxn_b64 = np.ascontiguousarray(lx_norm_cpu, dtype=np.float64)
+                            sde_args_bwd = _PlatenSdeAadArgsC(
+                                d_assets=d_assets,
+                                m_rem=m_rem,
+                                n_sub=n_sub,
+                                eff_r=eff_r,
+                                n_rep=n_rep,
+                                lv_nt=lv_nt,
+                                lv_ny=lv_ny,
+                                lv_tables=lv_b64.ctypes.data,
+                                z_indep=z_b64.ctypes.data,
+                                chol_base=ch_b64.ctypes.data,
+                                tau_obs=tau_b64.ctypes.data,
+                                r_native_obs=rn_b64.ctypes.data,
+                                r_tot_obs=rt_b64.ctypes.data,
+                                lv_t_grid=lvt_b64.ctypes.data,
+                                lv_y_min=lvy0_b64.ctypes.data,
+                                lv_y_max=lvy1_b64.ctypes.data,
+                                bar_lx_post=bar_lx_post_np.ctypes.data,
+                                lx_norm_in=lxn_b64.ctypes.data,
+                                q_shift_sub=0,
+                                lx_period_out=0,
+                                norm_x_out=0,
+                                bar_lv_out=b_lv_c.ctypes.data if need_lv_c else 0,
+                                bar_chol_out=b_ch_c.ctypes.data if need_chol_c else 0,
+                                bar_q_shift_out=b_q_c.ctypes.data if need_q_c else 0,
+                                run_forward=0,
+                                run_backward=1,
+                                compute_lv_aad=1 if need_lv_c else 0,
+                                compute_chol_aad=1 if need_chol_c else 0,
+                                compute_q_aad=1 if need_q_c else 0,
+                                has_q_shift_sub=0,
+                                out_lx_pre=0,
+                                out_j_pre=0,
+                                out_sig_pre=0,
+                                vib_period_idx=0,
+                                vib_sub_idx=0,
+                                save_vib_pre=0,
+                                _pad_vib=0,
+                                vib_j_pre_max=6.0,
+                                vib_dsig_dy_max=4.0,
+                            )
+                            cpp_sde_v2_fn(ctypes.byref(sde_args_bwd))
+                            bar_lv_np = b_lv_c if need_lv_c else np.zeros_like(base_lv_tables)
+                            bar_chol_aad = b_ch_c if need_chol_c else np.zeros_like(chol_base)
+                            bar_q_shift_np = b_q_c if need_q_c else np.zeros((d_assets, m_rem * n_sub), dtype=np.float64)
+                    else:
+                        bar_lv_np, bar_chol_aad, bar_q_shift_np = _cpu_bwd_sde_aad(
+                            lx_period_cpu,
+                            lx_norm_cpu,
+                            bar_lx_post_np,
+                            base_lv_tables,
+                            z_indep_np,
+                            chol_base,
+                            tau_obs_np,
+                            r_native_obs_np,
+                            r_tot_obs_np,
+                            lv_t_grid,
+                            lv_y_min_vec,
+                            lv_y_max_vec,
+                            n_sub,
+                            eff_r,
+                            n_rep,
+                        )
+                    if bar_lv_cont_cpu is not None:
+                        bar_lv_np = bar_lv_np + bar_lv_cont_cpu.numpy()
+                    if cf_wf_cpu_box:
+                        cf_wf_cpu_np = np.asarray(cf_wf_cpu_box[0].detach().cpu().numpy(), dtype=np.float64)
+                        bar_cf_np = cf_wf_cpu_np[0]
+                        bar_surv_np = cf_wf_cpu_np[1]
+                elif use_cpu_np_aad:
+                    _, _, s1_np_out, _ = _compute_payoff_aad_state_adjoints_cpu_np(
+                        perf_base_m_d_n_np,
+                        ko_barriers=ko_arr_np,
+                        is_callable=is_call_np,
+                        cpn_barriers=cpn_arr_np,
+                        is_guar=is_guar_np,
+                        cpn_rates=cpn_rates_np,
+                        df_pay=df_pay_np,
+                        w_fund=w_fund_base_np,
                         call_code=call_code,
                         cpn_code=cpn_code,
                         opt_code=opt_code,
@@ -9358,113 +12704,12 @@ def compute_qmc_aad_crn_greeks(
                         one_star_eps=one_star_eps,
                         barrier_eps_min=barrier_eps_min,
                         barrier_eps_max=barrier_eps_max,
-                        lv_tables_t=torch.from_numpy(base_lv_tables),
-                        corr_t=torch.from_numpy(corr_np),
-                        fwd_perf_t=torch.from_numpy(fwd_perf_np),
-                        y_min=lv_y_min_vec,
-                        y_max=lv_y_max_vec,
-                        n_sub=n_sub,
-                        corr_grad_out=corr_grad_cont_list if want_cega else None,
                         n_rep=n_rep,
                         emit_stage1=True,
-                        out_stage1_rep=s1_cpu_box,
-                        out_cf_wf=cf_wf_cpu_box if (use_pathwise_rate_adj or want_theta) else None,
+                        compute_grads=False,
                     )
-                    bar_lx_post_np = np.ascontiguousarray(bar_lx_post_cpu.to(dtype=torch.float64).numpy(), dtype=np.float64)
-                    if cpp_sde_v2_fn is not None:
-                        need_lv_c = bool(want_vega or want_rho or want_divs or want_theta)
-                        need_chol_c = bool(want_cega and d_assets > 1)
-                        need_q_c = bool(quanto_meta and (want_vega or want_theta))
-                        if callable(getattr(cpp_sde_v2_fn, "__call__", None)) and not hasattr(cpp_sde_v2_fn, "argtypes"):
-                            _, _, b_lv_c, b_ch_c, b_q_c = cpp_sde_v2_fn(
-                                lv_tables=base_lv_tables,
-                                z_indep=z_indep_np,
-                                chol_base=chol_base,
-                                tau_obs=tau_obs_np,
-                                r_native_obs=r_native_obs_np,
-                                r_tot_obs=r_tot_obs_np,
-                                lv_t_grid=lv_t_grid,
-                                lv_y_min=lv_y_min_vec,
-                                lv_y_max=lv_y_max_vec,
-                                n_sub=n_sub,
-                                eff_r=eff_r,
-                                n_rep=n_rep,
-                                bar_lx_post=bar_lx_post_np,
-                                lx_norm_in=lx_norm_cpu,
-                                run_forward=False,
-                                run_backward=True,
-                                compute_lv_aad=need_lv_c,
-                                compute_chol_aad=need_chol_c,
-                                compute_q_aad=need_q_c,
-                            )
-                            bar_lv_np = b_lv_c if b_lv_c is not None else np.zeros_like(base_lv_tables)
-                            bar_chol_aad = b_ch_c if b_ch_c is not None else np.zeros_like(chol_base)
-                            bar_q_shift_np = b_q_c if b_q_c is not None else np.zeros((d_assets, m_rem * n_sub), dtype=np.float64)
-                        else:
-                            b_lv_c = np.empty_like(base_lv_tables) if need_lv_c else np.zeros((1,), dtype=np.float64)
-                            b_ch_c = np.empty_like(chol_base) if need_chol_c else np.zeros((1,), dtype=np.float64)
-                            b_q_c = np.empty((d_assets, m_rem * n_sub), dtype=np.float64) if need_q_c else np.zeros((1,), dtype=np.float64)
-                            sde_args_bwd = _PlatenSdeAadArgsC(
-                                d_assets=d_assets,
-                                m_rem=m_rem,
-                                n_sub=n_sub,
-                                eff_r=eff_r,
-                                n_rep=n_rep,
-                                lv_nt=lv_nt,
-                                lv_ny=lv_ny,
-                                lv_tables=np.ascontiguousarray(base_lv_tables, dtype=np.float64).ctypes.data,
-                                z_indep=np.ascontiguousarray(z_indep_np, dtype=np.float64).ctypes.data,
-                                chol_base=np.ascontiguousarray(chol_base, dtype=np.float64).ctypes.data,
-                                tau_obs=np.ascontiguousarray(tau_obs_np, dtype=np.float64).ctypes.data,
-                                r_native_obs=np.ascontiguousarray(r_native_obs_np, dtype=np.float64).ctypes.data,
-                                r_tot_obs=np.ascontiguousarray(r_tot_obs_np, dtype=np.float64).ctypes.data,
-                                lv_t_grid=np.ascontiguousarray(lv_t_grid, dtype=np.float64).ctypes.data,
-                                lv_y_min=np.ascontiguousarray(lv_y_min_vec, dtype=np.float64).ctypes.data,
-                                lv_y_max=np.ascontiguousarray(lv_y_max_vec, dtype=np.float64).ctypes.data,
-                                bar_lx_post=bar_lx_post_np.ctypes.data,
-                                lx_norm_in=np.ascontiguousarray(lx_norm_cpu, dtype=np.float64).ctypes.data,
-                                q_shift_sub=0,
-                                lx_period_out=0,
-                                norm_x_out=0,
-                                bar_lv_out=b_lv_c.ctypes.data if need_lv_c else 0,
-                                bar_chol_out=b_ch_c.ctypes.data if need_chol_c else 0,
-                                bar_q_shift_out=b_q_c.ctypes.data if need_q_c else 0,
-                                run_forward=0,
-                                run_backward=1,
-                                compute_lv_aad=1 if need_lv_c else 0,
-                                compute_chol_aad=1 if need_chol_c else 0,
-                                compute_q_aad=1 if need_q_c else 0,
-                                has_q_shift_sub=0,
-                            )
-                            cpp_sde_v2_fn(ctypes.byref(sde_args_bwd))
-                            bar_lv_np = b_lv_c if need_lv_c else np.zeros_like(base_lv_tables)
-                            bar_chol_aad = b_ch_c if need_chol_c else np.zeros_like(chol_base)
-                            bar_q_shift_np = b_q_c if need_q_c else np.zeros((d_assets, m_rem * n_sub), dtype=np.float64)
-                    else:
-                        bar_lv_np, bar_chol_aad, bar_q_shift_np = _cpu_bwd_sde_aad(
-                            lx_period_cpu,
-                            lx_norm_cpu,
-                            bar_lx_post_np,
-                            base_lv_tables,
-                            z_indep_np,
-                            chol_base,
-                            tau_obs_np,
-                            r_native_obs_np,
-                            r_tot_obs_np,
-                            lv_t_grid,
-                            lv_y_min_vec,
-                            lv_y_max_vec,
-                            n_sub,
-                            eff_r,
-                            n_rep,
-                        )
-                    if bar_lv_cont_cpu is not None:
-                        bar_lv_np = bar_lv_np + bar_lv_cont_cpu.numpy()
-                    bar_ln_fwd_np = bar_ln_fwd_t.numpy()
-                    if cf_wf_cpu_box:
-                        cf_wf_cpu_np = np.asarray(cf_wf_cpu_box[0].detach().cpu().numpy(), dtype=np.float64)
-                        bar_cf_np = cf_wf_cpu_np[0]
-                        bar_surv_np = cf_wf_cpu_np[1]
+                    if s1_np_out is not None:
+                        stage1_rep_np = s1_np_out
                 else:
                     wf_cpu = torch.from_numpy(w_fund_base_np) if w_fund_base_np is not None else None
                     _compute_payoff_aad_state_adjoints_torch(
@@ -9517,6 +12762,7 @@ def compute_qmc_aad_crn_greeks(
                         n_rep=n_rep,
                         emit_stage1=True,
                         out_stage1_rep=s1_cpu_box,
+                        compute_grads=False,
                     )
             if s1_cpu_box:
                 stage1_rep_np = np.asarray(s1_cpu_box[0].detach().cpu().numpy(), dtype=np.float64)
@@ -9661,6 +12907,7 @@ def compute_qmc_aad_crn_greeks(
                         z_cheap_rmnd = np.ascontiguousarray(np.transpose(zc_mf_out[:, 0], (1, 0, 2, 3)), dtype=np.float64)
                     else:
                         zc_mf_raw = np.empty((m_rem, 1, eff_r_mf_cpu, n_rep_mf_cpu, d_assets), dtype=np.float64)
+                        u_time_mf64 = np.ascontiguousarray(u_time_np, dtype=np.float64)
                         sob_mf_args = _SobolGenArgsC(
                             d_assets=d_assets,
                             m_rem=m_rem,
@@ -9671,7 +12918,7 @@ def compute_qmc_aad_crn_greeks(
                             n_bits=30,
                             dir_numbers=sv_cpu_mf.ctypes.data,
                             digital_shifts=sh_mf_c.ctypes.data,
-                            bb_ortho_mat=np.ascontiguousarray(u_time_np, dtype=np.float64).ctypes.data,
+                            bb_ortho_mat=u_time_mf64.ctypes.data,
                             chol_mat=cv_chol_c.ctypes.data,
                             z_indep_out=0,
                             z_corr_out=zc_mf_raw.ctypes.data,
@@ -9972,42 +13219,68 @@ def compute_qmc_aad_crn_greeks(
             ) / h_sum_v
             cdl2_last_np = (spots_np * spots_np) * d2_last
 
+    pv0_1d = 0.0
+    pv_preterm_np = np.empty(0, dtype=np.float64)
+    pv_th_fused_np = np.empty(0, dtype=np.float64)
+    h_vib_np: Optional[npt.NDArray[np.float64]] = None
+    cross_pairs_vib: List[Tuple[int, int]] = []
     if (not _warm_gpu_hit) and need_spot_bumps:
         assert fwd_sp_p_np is not None and fwd_sp_m_np is not None
         if not use_gpu_triton:
-            nx_sp_p_np = np.empty((d_assets, m_rem, n_total), dtype=np.float64)
-            nx_sp_m_np = np.empty((d_assets, m_rem, n_total), dtype=np.float64)
             assert z_corr_base_np is not None and z_indep_np is not None
-            for i in range(d_assets):
-                lv_pm_np = np.stack([sp_p_lv_list[i], sp_m_lv_list[i]], axis=0)
-                if cpp_step_fn is not None and lv_ny <= 128:
-                    out_pm = np.empty((2, m_rem, n_total), dtype=np.float64)
-                    _cpp_step_1d_np(
-                        2,
-                        m_rem,
-                        0,
-                        lv_pm_np,
-                        z_corr_base_np[..., i],
-                        tau_obs_np,
-                        r_native_obs_np[i],
-                        r_tot_obs_np[i],
-                        out_pm,
-                        y_min_v=float(lv_y_min_vec[i]),
-                        y_max_v=float(lv_y_max_vec[i]),
-                    )
-                    nx_sp_p_np[i], nx_sp_m_np[i] = out_pm[0], out_pm[1]
-                else:
-                    _, _, out_p = _cpu_step_and_ckpt_sde(
-                        sp_p_lv_list[i][None], z_indep_np[..., i : i + 1], np.ones((1, 1)),
-                        tau_obs_np, r_native_obs_np[i : i + 1], r_tot_obs_np[i : i + 1],
-                        lv_t_grid, lv_y_min_vec[i : i + 1], lv_y_max_vec[i : i + 1], n_sub, eff_r, n_rep,
-                    )
-                    _, _, out_m = _cpu_step_and_ckpt_sde(
-                        sp_m_lv_list[i][None], z_indep_np[..., i : i + 1], np.ones((1, 1)),
-                        tau_obs_np, r_native_obs_np[i : i + 1], r_tot_obs_np[i : i + 1],
-                        lv_t_grid, lv_y_min_vec[i : i + 1], lv_y_max_vec[i : i + 1], n_sub, eff_r, n_rep,
-                    )
-                    nx_sp_p_np[i], nx_sp_m_np[i] = out_p[:, 0, :], out_m[:, 0, :]
+            if cpp_step_sp_v2_fn is not None and lv_ny <= 128:
+                lv_pm_batch_np = np.ascontiguousarray(
+                    np.stack([np.stack([sp_p_lv_list[i], sp_m_lv_list[i]], axis=0) for i in range(d_assets)], axis=0),
+                    dtype=np.float64,
+                )
+                out_nx_pm_cpu = cpp_step_sp_v2_fn(
+                    lv_tables_pm=lv_pm_batch_np,
+                    z_corr=z_corr_base_np,
+                    tau_obs=tau_obs_np,
+                    r_native_obs=r_native_obs_np,
+                    r_tot_obs=r_tot_obs_np,
+                    lv_t_grid=lv_t_grid,
+                    lv_y_min=lv_y_min_vec,
+                    lv_y_max=lv_y_max_vec,
+                    n_sub=n_sub,
+                    eff_r=eff_r,
+                    n_rep=n_rep,
+                )
+                nx_sp_p_np = out_nx_pm_cpu[0]
+                nx_sp_m_np = out_nx_pm_cpu[1]
+            else:
+                nx_sp_p_np = np.empty((d_assets, m_rem, n_total), dtype=np.float64)
+                nx_sp_m_np = np.empty((d_assets, m_rem, n_total), dtype=np.float64)
+                for i in range(d_assets):
+                    lv_pm_np = np.stack([sp_p_lv_list[i], sp_m_lv_list[i]], axis=0)
+                    if cpp_step_fn is not None and lv_ny <= 128:
+                        out_pm = np.empty((2, m_rem, n_total), dtype=np.float64)
+                        _cpp_step_1d_np(
+                            2,
+                            m_rem,
+                            0,
+                            lv_pm_np,
+                            z_corr_base_np[..., i],
+                            tau_obs_np,
+                            r_native_obs_np[i],
+                            r_tot_obs_np[i],
+                            out_pm,
+                            y_min_v=float(lv_y_min_vec[i]),
+                            y_max_v=float(lv_y_max_vec[i]),
+                        )
+                        nx_sp_p_np[i], nx_sp_m_np[i] = out_pm[0], out_pm[1]
+                    else:
+                        _, _, out_p = _cpu_step_and_ckpt_sde(
+                            sp_p_lv_list[i][None], z_indep_np[..., i : i + 1], np.ones((1, 1)),
+                            tau_obs_np, r_native_obs_np[i : i + 1], r_tot_obs_np[i : i + 1],
+                            lv_t_grid, lv_y_min_vec[i : i + 1], lv_y_max_vec[i : i + 1], n_sub, eff_r, n_rep,
+                        )
+                        _, _, out_m = _cpu_step_and_ckpt_sde(
+                            sp_m_lv_list[i][None], z_indep_np[..., i : i + 1], np.ones((1, 1)),
+                            tau_obs_np, r_native_obs_np[i : i + 1], r_tot_obs_np[i : i + 1],
+                            lv_t_grid, lv_y_min_vec[i : i + 1], lv_y_max_vec[i : i + 1], n_sub, eff_r, n_rep,
+                        )
+                        nx_sp_p_np[i], nx_sp_m_np[i] = out_p[:, 0, :], out_m[:, 0, :]
             perf_sp_p_dev = nx_sp_p_np * fwd_sp_p_np[:, :, None]
             perf_sp_m_dev = nx_sp_m_np * fwd_sp_m_np[:, :, None]
 
@@ -10084,6 +13357,163 @@ def compute_qmc_aad_crn_greeks(
                 )
             sp_task_meta = {"mode": "cg", "tok": tok_epm}
 
+    if (
+        not use_gpu_triton
+        and use_vibrato_gamma
+        and cpp_vib_v2_fn is not None
+        and cpu_vib_lx_pre is not None
+        and cpu_vib_j_pre is not None
+        and cpu_vib_sig_pre is not None
+    ):
+        assert cdl_m_np is not None and cdl2_last_np is not None
+        assert z_indep_np is not None
+        sig_est_cpu_v = (
+            np.maximum(np.mean(vol_atm_obs, axis=0), 0.05)
+            if vol_atm_obs is not None
+            else np.full(m_rem, 0.25, dtype=np.float64)
+        )
+        eps_cpu_vib = np.ascontiguousarray(
+            np.clip(
+                0.65 * sig_est_cpu_v * np.sqrt(vib_d_tau_c),
+                max(float(barrier_eps_min), 0.035),
+                max(float(barrier_eps_max), 0.08),
+            ),
+            dtype=np.float64,
+        )
+        l_inv_t_cpu = np.ascontiguousarray(np.linalg.pinv(chol_base, rcond=1e-12).T, dtype=np.float64)
+        c_inv_cpu = np.ascontiguousarray(l_inv_t_cpu @ l_inv_t_cpu.T, dtype=np.float64)
+        inv_perm_c64 = np.ascontiguousarray(inv_perm, dtype=np.int64)
+        h_vib_out_c = np.zeros((d_assets, d_assets), dtype=np.float64)
+        frozen_term_cpu = np.zeros((4, n_total), dtype=np.float64) if m_rem > 1 else np.zeros((1,), dtype=np.float64)
+        z_vib_c64 = np.ascontiguousarray(z_indep_np, dtype=np.float64)
+        ch_vib_c64 = np.ascontiguousarray(chol_base, dtype=np.float64)
+        fwd_term_c64 = np.ascontiguousarray(fwd_perf_np[:, m_rem - 1], dtype=np.float64)
+        cdl_m_c64 = np.ascontiguousarray(cdl_m_np, dtype=np.float64)
+        cdl2_last_c64 = np.ascontiguousarray(cdl2_last_np, dtype=np.float64)
+        vib_c_args = _VibratoGammaArgsC(
+            d_assets=d_assets,
+            m_rem=m_rem,
+            n_paths_total=n_total,
+            vib_step_start=int(vib_step_start_c),
+            vib_n_steps=int(vib_n_steps_c),
+            perf_mat=perf_base_m_d_n_np.ctypes.data,
+            lx_pre=cpu_vib_lx_pre.ctypes.data,
+            j_pre=cpu_vib_j_pre.ctypes.data,
+            sig_pre=cpu_vib_sig_pre.ctypes.data,
+            sv_vib=z_vib_c64.ctypes.data,
+            chol_mat=ch_vib_c64.ctypes.data,
+            l_inv_t=l_inv_t_cpu.ctypes.data,
+            c_inv=c_inv_cpu.ctypes.data,
+            fwd_term=fwd_term_c64.ctypes.data,
+            cdl_m=cdl_m_c64.ctypes.data,
+            cdl2_last=cdl2_last_c64.ctypes.data,
+            ko_barriers=ko_arr_np.ctypes.data,
+            is_callable=is_call_np.ctypes.data,
+            cpn_barriers=cpn_arr_np.ctypes.data,
+            is_guaranteed_cpn=is_guar_np.ctypes.data,
+            coupon_rates=cpn_rates_np.ctypes.data,
+            eps_vec=eps_cpu_vib.ctypes.data,
+            inv_lex_perm=inv_perm_c64.ctypes.data,
+            frozen_term_out=frozen_term_cpu.ctypes.data if m_rem > 1 else 0,
+            h_vib_out=h_vib_out_c.ctypes.data,
+            df_last=float(df_last_val_c),
+            h_vib=float(h_vib_val_c),
+            ko_spread=float(ko_spread),
+            cpn_spread=float(cpn_spread),
+            ki_spread=float(ki_spread),
+            one_star_strike=float(k_os),
+            one_star_eps=float(one_star_eps),
+            strike=float(k_put),
+            lower_strike=float(k_low),
+            ki_barrier=float(b_ki),
+            option_gearing=float(state.option_gearing),
+            autocall_coupon=float(state.autocall_coupon),
+            c_mem_0=float(state.c_mem_0),
+            i_ki_past=float(state.i_ki_past),
+            part_call_strike=float(k_call),
+            part_call_rate=float(part_call_rate),
+            one_star_coupon=float(os_cpn),
+            call_code=int(call_code),
+            cpn_code=int(cpn_code),
+            opt_code=int(eff_opt_code_s2),
+            has_ki=1 if has_ki else 0,
+            ki_active=1 if (has_ki and b_ki > 0.0 and float(state.i_ki_past) < 0.5) else 0,
+            has_one_star=1 if k_os > 0.0 else 0,
+            is_memory=1 if is_memory else 0,
+            is_long_basket=1 if is_long_flag else 0,
+            no_notional=1 if no_notional else 0,
+            force_cpn_ac=1 if force_cpn_ac else 0,
+            cpn_dir_down=1 if dir_down else 0,
+            cpn_type_out=1 if type_out else 0,
+            has_lower_strike=1 if has_lower_strike_flag else 0,
+            has_part_call=1 if has_part_call_flag else 0,
+        )
+        cpp_vib_v2_fn(ctypes.byref(vib_c_args))
+        h_vib_np = h_vib_out_c
+        if m_rem > 1:
+            assert perf_sp_p_dev is not None and perf_sp_m_dev is not None
+            if want_gamma:
+                if d_assets > 1:
+                    for i_v in range(d_assets):
+                        for j_v in range(i_v + 1, d_assets):
+                            cross_pairs_vib.append((i_v, j_v))
+                n_pre_c = 2 * d_assets + 2 * len(cross_pairs_vib) + 1
+                aa_pre_c = np.empty(n_pre_c, dtype=np.int32)
+                ab_pre_c = np.full(n_pre_c, -1, dtype=np.int32)
+                asl_pre_c = np.zeros(n_pre_c, dtype=np.int32)
+                bsl_pre_c = np.full(n_pre_c, -1, dtype=np.int32)
+                for i_v in range(d_assets):
+                    aa_pre_c[2 * i_v] = i_v
+                    aa_pre_c[2 * i_v + 1] = i_v
+                    asl_pre_c[2 * i_v] = i_v
+                    asl_pre_c[2 * i_v + 1] = d_assets + i_v
+                for c_v, (i_v, j_v) in enumerate(cross_pairs_vib):
+                    b0_v = 2 * d_assets + 2 * c_v
+                    aa_pre_c[b0_v] = i_v
+                    ab_pre_c[b0_v] = j_v
+                    asl_pre_c[b0_v] = i_v
+                    bsl_pre_c[b0_v] = j_v
+                    aa_pre_c[b0_v + 1] = i_v
+                    ab_pre_c[b0_v + 1] = j_v
+                    asl_pre_c[b0_v + 1] = d_assets + i_v
+                    bsl_pre_c[b0_v + 1] = d_assets + j_v
+                aa_pre_c[-1] = -1
+            else:
+                aa_pre_c = np.array([-2, -2, -1], dtype=np.int32)
+                ab_pre_c = np.array([-1, -1, -1], dtype=np.int32)
+                asl_pre_c = np.array([0, 1, 0], dtype=np.int32)
+                bsl_pre_c = np.full(3, -1, dtype=np.int32)
+            pv_preterm_np = _eval_c2_preterm_cpu_np(
+                perf_base_m_d_n_np,
+                perf_sp_p_dev,
+                perf_sp_m_dev,
+                frozen_term_cpu,
+                aa_pre=aa_pre_c,
+                ab_pre=ab_pre_c,
+                asl_pre=asl_pre_c,
+                bsl_pre=bsl_pre_c,
+                ko_barriers=ko_arr_np,
+                is_callable=is_call_np,
+                cpn_barriers=cpn_arr_np,
+                is_guar=is_guar_np,
+                cpn_rates=cpn_rates_np,
+                df_pay=df_pay_np,
+                w_fund=w_fund_base_np,
+                eps_vec=eps_cpu_vib,
+                call_code=call_code,
+                cpn_code=cpn_code,
+                ko_spread=ko_spread,
+                cpn_spread=cpn_spread,
+                cpn_dir_down=dir_down,
+                cpn_type_out=type_out,
+                is_memory=is_memory,
+                force_cpn_ac=force_cpn_ac,
+                no_notional=no_notional,
+                ac_cpn=float(state.autocall_coupon),
+                c_mem_0=float(state.c_mem_0),
+                want_gamma=want_gamma,
+            )
+
     # Step 4: Rho & RepoRho with vectorized curve/funding/in-transit pillar evaluation.
     if not _warm_gpu_hit:
         rho_tasks = []
@@ -10104,7 +13534,7 @@ def compute_qmc_aad_crn_greeks(
         local_c_norm_meta: Dict[Any, Tuple[Any, Any, Any, Any]] = {}
 
         def _curve_sig_local(c_any: Any) -> Any:
-            return _curve_fast_sig(c_any)
+            return _curve_fast_sig(c_any, curve_sig_memo)
 
         def _curve_mult_mat_np(c_any: Any, dts: Sequence[Any], n_pil: int) -> npt.NDArray[np.float64]:
             if len(dts) == 0 or n_pil <= 0:
@@ -10625,12 +14055,6 @@ def compute_qmc_aad_crn_greeks(
             fxc_tasks.append((ticker, fx_id, tok_fxc, h_fxc))
 
     # Execute unified chunked GPU Monte Carlo + AAD + Vibrato + PreTerm + Theta and sync via one D2H copy.
-    pv0_1d = 0.0
-    pv_preterm_np = np.empty(0, dtype=np.float64)
-    pv_th_fused_np = np.empty(0, dtype=np.float64)
-    h_vib_np: Optional[npt.NDArray[np.float64]] = None
-    cross_pairs_vib: List[Tuple[int, int]] = []
-
     if use_gpu_triton:
         th_chunk_in_step1 = bool(
             th_prep is not None and not th_prep["eff_autocalled"] and int(th_prep["k_cross"]) < m_rem
@@ -10670,7 +14094,8 @@ def compute_qmc_aad_crn_greeks(
                 m_rem * d_assets * (n_sub * 4 + 8 + (4 if need_stage2_aad else 0) + (8 if need_spot_bumps else 0)),
                 1,
             ) * n_rep
-            r_chunk_cap = 4 if (d_assets * m_rem * n_sub >= 128) else eff_r
+            _r_env_cap = int(os.environ.get("DEEPVOL_R_CAP", "4"))
+            r_chunk_cap = _r_env_cap if (d_assets * m_rem * n_sub >= 512) else eff_r
             r_chunk = min(eff_r, r_chunk_cap, max(1, (72 * 1024 * 1024) // per_rep_bytes))
             fuse_m_sde = bool(n_rep <= 1024 and m_rem <= 64)
             if n_rep <= 1024:
@@ -10855,19 +14280,50 @@ def compute_qmc_aad_crn_greeks(
                 n_rep_ov: Optional[int] = None,
                 z_scale_val: float = 1.0,
                 pre_zeroed: bool = False,
+                d_pad_ov: Optional[int] = None,
+                m_pad_ov: Optional[int] = None,
+                d_var_ov: Optional[torch.Tensor] = None,
+                fwd_ov: Optional[torch.Tensor] = None,
+                df_ov: Optional[torch.Tensor] = None,
+                wf_ov: Optional[torch.Tensor] = None,
+                ko_ov: Optional[torch.Tensor] = None,
+                ic_ov: Optional[torch.Tensor] = None,
+                cp_ov: Optional[torch.Tensor] = None,
+                ig_ov: Optional[torch.Tensor] = None,
+                cr_ov: Optional[torch.Tensor] = None,
+                eps_ov: Optional[torch.Tensor] = None,
+                payoff_ov: Optional[torch.Tensor] = None,
+                cg_flags_ov: Optional[torch.Tensor] = None,
+                use_rt_flags: bool = False,
+                inv_perm_ov: Optional[torch.Tensor] = None,
+                use_cg_arena: bool = False,
             ) -> None:
+                eff_dv_mf = d_var_ov if d_var_ov is not None else d_var_f32_g
+                eff_fwd_mf = fwd_ov if fwd_ov is not None else fwd_perf_f32_g
+                eff_df_mf = df_ov if df_ov is not None else df_pay_f32_g
+                eff_wf_mf = wf_ov if wf_ov is not None else w_fund_f32_g
+                eff_ko_mf = ko_ov if ko_ov is not None else ko_f32_g
+                eff_ic_mf = ic_ov if ic_ov is not None else is_call_f32_g
+                eff_cp_mf = cp_ov if cp_ov is not None else cpn_f32_g
+                eff_ig_mf = ig_ov if ig_ov is not None else is_guar_f32_g
+                eff_cr_mf = cr_ov if cr_ov is not None else cpn_rates_f32_g
+                eff_eps_mf = eps_ov if eps_ov is not None else eps_f32_g
+                eff_pf_mf = payoff_ov if payoff_ov is not None else payoff_f32_g
                 assert (
-                    d_var_f32_g is not None
-                    and fwd_perf_f32_g is not None
-                    and df_pay_f32_g is not None
-                    and ko_f32_g is not None
-                    and is_call_f32_g is not None
-                    and cpn_f32_g is not None
-                    and is_guar_f32_g is not None
-                    and cpn_rates_f32_g is not None
-                    and eps_f32_g is not None
-                    and payoff_f32_g is not None
+                    eff_dv_mf is not None
+                    and eff_fwd_mf is not None
+                    and eff_df_mf is not None
+                    and eff_ko_mf is not None
+                    and eff_ic_mf is not None
+                    and eff_cp_mf is not None
+                    and eff_ig_mf is not None
+                    and eff_cr_mf is not None
+                    and eff_eps_mf is not None
+                    and eff_pf_mf is not None
                 )
+                eff_d_mf = int(d_pad_ov) if d_pad_ov is not None else d_assets
+                eff_m_mf = int(m_pad_ov) if m_pad_ov is not None else m_rem
+                eff_rt_mf = bool(use_rt_flags and cg_flags_ov is not None)
                 if layout_mdn:
                     assert r_b_ov is not None and n_rep_ov is not None
                     r_b = int(r_b_ov)
@@ -10879,7 +14335,7 @@ def compute_qmc_aad_crn_greeks(
                     s1_out_g.zero_()
                     if cf_surv_out_g is not None:
                         cf_surv_out_g.zero_()
-                d_pad_mf = max(1, _next_power_of_two_int(d_assets))
+                d_pad_mf = max(1, _next_power_of_two_int(eff_d_mf))
                 mf_bn_cap = int(os.environ.get("DEEPVOL_MF_BN", "256"))
                 block_mf = min(mf_bn_cap, max(128, _next_power_of_two_int(n_rep_in)))
                 n_tiles_mf_k = (n_rep_in + block_mf - 1) // block_mf
@@ -10890,70 +14346,80 @@ def compute_qmc_aad_crn_greeks(
                 ema_shift_g: Optional[torch.Tensor] = None
                 if do_ema_k:
                     n_sgn_e = 2 if antithetic else 1
-                    ema_shift_g = torch.empty((n_sgn_e, r_b, m_rem, d_assets), dtype=torch.float32, device=qmc_device)
+                    ema_shift_g = _alloc_cg_buf(
+                        use_cg_arena,
+                        qmc_device,
+                        "ema_shift",
+                        (n_sgn_e, r_b, eff_m_mf, eff_d_mf),
+                        torch.float32,
+                    )
                     block_ema = max(32, _next_power_of_two_int(n_rep_in))
                     nw_ema = 8 if block_ema >= 1024 else (4 if block_ema >= 256 else 2)
                     _fast_triton_launch(
                         _mf_gbm_ema_shift_f32_kernel,
-                        (r_b * n_sgn_e, d_assets),
+                        (r_b * n_sgn_e, eff_d_mf),
                         z_coarse_corr_in,
-                        d_var_f32_g,
+                        eff_dv_mf,
                         ema_shift_g,
                         r_b,
-                        d_assets,
-                        m_rem,
+                        eff_d_mf,
+                        eff_m_mf,
                         n_rep_in,
                         float(z_scale_val),
+                        cg_flags_ptr=cg_flags_ov if eff_rt_mf else None,
                         ANTITHETIC=antithetic,
                         BLOCK_N=block_ema,
                         LAYOUT_MDN=layout_mdn,
+                        USE_RT_FLAGS=eff_rt_mf,
                         num_warps=nw_ema,
                     )
                 _fast_triton_launch(
                     _mf_gbm_fused_f32_kernel,
                     (r_b, n_tiles_mf_k),
                     z_coarse_corr_in,
-                    d_var_f32_g,
-                    fwd_perf_f32_g,
-                    df_pay_f32_g,
-                    w_fund_f32_g,
-                    ko_f32_g,
-                    is_call_f32_g,
-                    cpn_f32_g,
-                    is_guar_f32_g,
-                    cpn_rates_f32_g,
-                    eps_f32_g,
-                    gpu_meta["inv_perm"],
-                    payoff_f32_g,
+                    eff_dv_mf,
+                    eff_fwd_mf,
+                    eff_df_mf,
+                    eff_wf_mf,
+                    eff_ko_mf,
+                    eff_ic_mf,
+                    eff_cp_mf,
+                    eff_ig_mf,
+                    eff_cr_mf,
+                    eff_eps_mf,
+                    inv_perm_ov if inv_perm_ov is not None else gpu_meta["inv_perm"],
+                    eff_pf_mf,
                     s1_out_g,
                     cf_surv_out_g,
                     ema_shift_g,
-                    d_assets,
-                    m_rem,
+                    eff_d_mf,
+                    eff_m_mf,
                     n_rep_in,
                     float(z_scale_val),
+                    cg_flags_ptr=cg_flags_ov if eff_rt_mf else None,
                     D_PAD=d_pad_mf,
-                    CALL_CODE=call_code,
-                    CPN_CODE=cpn_code,
-                    EFF_OPT_CODE=eff_opt_code_s2,
-                    HAS_KI=has_ki,
-                    KI_ACTIVE=ki_active_mf,
-                    HAS_ONE_STAR=has_os_mf,
-                    IS_MEM=is_memory,
-                    IS_LONG=is_long_flag,
-                    NO_NOTIONAL=no_notional,
-                    FORCE_CPN_AC=force_cpn_ac,
-                    CPN_DIR_DOWN=dir_down,
-                    CPN_TYPE_OUT=type_out,
+                    CALL_CODE=0 if eff_rt_mf else call_code,
+                    CPN_CODE=0 if eff_rt_mf else cpn_code,
+                    EFF_OPT_CODE=0 if eff_rt_mf else eff_opt_code_s2,
+                    HAS_KI=False if eff_rt_mf else has_ki,
+                    KI_ACTIVE=False if eff_rt_mf else ki_active_mf,
+                    HAS_ONE_STAR=False if eff_rt_mf else has_os_mf,
+                    IS_MEM=False if eff_rt_mf else is_memory,
+                    IS_LONG=False if eff_rt_mf else is_long_flag,
+                    NO_NOTIONAL=False if eff_rt_mf else no_notional,
+                    FORCE_CPN_AC=False if eff_rt_mf else force_cpn_ac,
+                    CPN_DIR_DOWN=False if eff_rt_mf else dir_down,
+                    CPN_TYPE_OUT=False if eff_rt_mf else type_out,
                     BLOCK_N=block_mf,
-                    HAS_LOWER_STRIKE=has_lower_strike_flag,
-                    HAS_PART_CALL=has_part_call_flag,
+                    HAS_LOWER_STRIKE=True if eff_rt_mf else has_lower_strike_flag,
+                    HAS_PART_CALL=False if eff_rt_mf else has_part_call_flag,
                     COMPUTE_CF_SURV=has_cf_mf,
                     Z_SIGN=1.0,
                     OUT_SCALE=1.0,
                     ANTITHETIC=antithetic,
                     APPLY_EMA=do_ema_k,
                     LAYOUT_MDN=layout_mdn,
+                    USE_RT_FLAGS=eff_rt_mf,
                     num_warps=4,
                 )
 
@@ -11371,6 +14837,8 @@ def compute_qmc_aad_crn_greeks(
                     gpu_v.dummy_f32_1 = dummy_f32_1
                     gpu_v.fwd_perf_f32_step_g = fwd_perf_f32_step_g
                     gpu_v.inv_dt_f32_val = inv_dt_f32_val
+                    gpu_v.cg_bucket_pack = None
+                    gpu_v.cg_meta_cache = {}
 
                     backing_gpu = _dedup_gpu_tensors(
                         (
@@ -11424,207 +14892,783 @@ def compute_qmc_aad_crn_greeks(
                 and os.environ.get("DEEPVOL_L2O_F32", "1") != "0"
                 and os.environ.get("DEEPVOL_AAD_F32", "1") == "1"
             )
-
-            # Allocate a single contiguous float64 output buffer sliced into all GPU result views.
-            out_layout: List[Tuple[str, Tuple[int, ...]]] = []
-            if emit_stage1_gpu:
-                out_layout.append(("stage1", (eff_r, 3 * m_rem + 6)))
-            if gpu_eval_rows_total > 0:
-                out_layout.append(("eval_pv", (gpu_eval_rows_total,)))
-            if use_vibrato_gamma and m_rem > 1 and n_pre_rows > 0:
-                out_layout.append(("preterm", (n_pre_rows,)))
-            if th_chunk_in_step1 and th_pack is not None:
-                out_layout.append(("th_fused", (1,)))
-            if use_vibrato_gamma:
-                out_layout.append(("h_vib", (d_assets, d_assets)))
-            if want_chol_aad_sde:
-                out_layout.append(("bar_chol", (d_assets, d_assets)))
-            if want_chol_aad_sde and is_cont_ki_active:
-                out_layout.append(("bar_sigma_cont", (d_assets, d_assets)))
-            if want_lv_aad_sde or (need_stage2_aad and is_cont_ki_active):
-                out_layout.append(("bar_lv", (d_assets, lv_nt, lv_ny)))
-            if want_q_aad_sde:
-                out_layout.append(("bar_q", (d_assets, n_steps_tot_g)))
-            if need_stage2_aad:
-                out_layout.append(("bar_lnf", (d_assets, m_rem)))
-            if want_cf_wf_aad:
-                out_layout.append(("bar_cf_wf", (2, m_rem)))
-            if use_mf_cv:
-                out_layout.append(("s1_gbm_crn", (eff_r, 3 * m_rem + 5)))
-                if mf_cheap_hit is None:
-                    out_layout.append(("s1_gbm_cheap", (eff_r_mf * ema_group_mf, 3 * m_rem + 5)))
-                if want_cf_wf_aad:
-                    out_layout.append(("cf_surv_gbm_crn", (eff_r, 2, m_rem)))
-                    if mf_cheap_hit is None:
-                        out_layout.append(("cf_surv_gbm_cheap", (eff_r_mf * ema_group_mf, 2, m_rem)))
-
-            pack_spans: Dict[str, Tuple[int, int, Tuple[int, ...]]] = {}
-            tot_out_el = 0
-            for o_tag, o_shape in out_layout:
-                o_el = 1
-                for o_dim in o_shape:
-                    o_el *= o_dim
-                if o_el > 0:
-                    pack_spans[o_tag] = (tot_out_el, tot_out_el + o_el, o_shape)
-                    tot_out_el += o_el
-
-            can_cg_qmc = bool(
-                tot_out_el > 0
+            cg_bucket_dm = _resolve_qmc_cg_bucket(d_assets, m_rem, n_sub)
+            use_cg_bucket = bool(
+                cg_bucket_dm is not None
+                and os.environ.get("DEEPVOL_QMC_CG", "1") != "0"
                 and can_triton_sobol
+                and use_f32_step1
+                and fuse_m_sde
+                and use_triton_aad_s2
+                and use_f32_perf_direct
                 and (not dyn_entries)
                 and (not is_cont_ki_active)
-                and ((not use_mf_cv) or (mf_cheap_hit is not None))
+                and (not need_sp_cg_alt_g)
+                and (stat_pack is None or stat_pack[2] is None)
+                and call_code in (0, 1, 2)
+                and cpn_code in (0, 1, 2)
+                and eff_opt_code_s2 in (0, 1, 2)
+                and (need_stage2_aad or use_vibrato_gamma or need_spot_bumps)
+                and ((not use_vibrato_gamma) or want_gamma or m_rem == 1)
                 and (not torch.cuda.is_current_stream_capturing())  # type: ignore[no-untyped-call]
-                and os.environ.get("DEEPVOL_QMC_CG", "1") != "0"
+            )
+            if use_cg_bucket:
+                assert cg_bucket_dm is not None
+                d_pad_b, m_pad_b = cg_bucket_dm
+                if not (
+                    (n_stat_rows == 0 or n_stat_rows <= 2 * d_pad_b + 2)
+                    and n_pre_rows <= d_pad_b * (d_pad_b + 1) + 1
+                ):
+                    use_cg_bucket = False
+
+            if use_cg_bucket and use_mf_cv and mf_cheap_hit is None and sv_sobol_gpu is not None:
+                assert u_rot_gpu is not None and n_rep_gen_mf > 0
+                mf_shift_key_pre = ("sobol_mf_shifts_v3", eff_r_mf, n_rep_gen_mf, m_rem, d_assets, seed + 99991, dev_norm_str)
+                shifts_mf_pre = _CRN_SOBOL_CACHE.get(mf_shift_key_pre)
+                if shifts_mf_pre is None:
+                    rng_mf_pre = np.random.default_rng(seed + 99991)
+                    shifts_mf_np_pre = rng_mf_pre.integers(0, 1 << 30, size=(eff_r_mf, m_rem * 2 * d_assets), dtype=np.int32)
+                    shifts_mf_pre = torch.from_numpy(shifts_mf_np_pre).to(device=qmc_device, dtype=torch.int32)
+                    _CRN_SOBOL_CACHE.put(mf_shift_key_pre, shifts_mf_pre)
+                s1_cheap_tmp = torch.zeros((eff_r_mf * ema_group_mf, 3 * m_rem + 5), dtype=torch.float64, device=qmc_device)
+                cf_cheap_tmp = (
+                    torch.zeros((eff_r_mf * ema_group_mf, 2, m_rem), dtype=torch.float64, device=qmc_device)
+                    if want_cf_wf_aad
+                    else None
+                )
+                cv_eig_tmp = chol_f32_g_cached.contiguous()
+                mf_per_rep_b = max(m_rem * d_assets * 8 + d_assets * 4, 1) * n_rep_gen_mf
+                r_mf_c_lim = min(eff_r_mf, max(1, (36 * 1024 * 1024) // mf_per_rep_b))
+                m_pow_pre = int(round(math.log2(n_rep_gen_mf)))
+                blk_n_pre = min(256, n_rep_gen_mf)
+                nt_mf_pre = (n_rep_gen_mf + blk_n_pre - 1) // blk_n_pre
+                for r_mf_s in range(0, eff_r_mf, r_mf_c_lim):
+                    r_mf_e = min(eff_r_mf, r_mf_s + r_mf_c_lim)
+                    r_mf_c = r_mf_e - r_mf_s
+                    n_mf_t = r_mf_c * n_rep_gen_mf
+                    z_raw_pre = torch.empty((m_rem, d_assets, n_mf_t), dtype=torch.float32, device=qmc_device)
+                    _fast_triton_launch(
+                        _sobol_bridge_normals_kernel,
+                        (nt_mf_pre, m_rem * r_mf_c),
+                        sv_sobol_gpu,
+                        shifts_mf_pre[r_mf_s:r_mf_e],
+                        z_raw_pre,
+                        m_rem,
+                        d_assets,
+                        n_rep=n_rep_gen_mf,
+                        n_sub=1,
+                        m_pow=m_pow_pre,
+                        BLOCK_N=blk_n_pre,
+                        num_warps=4,
+                    )
+                    tmp_pre = torch.matmul(cv_eig_tmp, z_raw_pre).view(m_rem, d_assets * n_mf_t)
+                    del z_raw_pre
+                    z_corr_pre = torch.matmul(u_rot_gpu, tmp_pre).view(m_rem, d_assets, n_mf_t)
+                    del tmp_pre
+                    sb_s = r_mf_s * ema_group_mf
+                    sb_e = r_mf_e * ema_group_mf
+                    _run_mf_gbm_batch(
+                        z_corr_pre,
+                        s1_cheap_tmp[sb_s:sb_e],
+                        cf_cheap_tmp[sb_s:sb_e] if cf_cheap_tmp is not None else None,
+                        antithetic=True,
+                        layout_mdn=True,
+                        r_b_ov=r_mf_c * ema_group_mf,
+                        n_rep_ov=n_rep_mf,
+                        z_scale_val=1.0,
+                        pre_zeroed=True,
+                    )
+                    del z_corr_pre
+                del cv_eig_tmp
+                s1_ch_np = np.asarray(s1_cheap_tmp.detach().cpu().numpy(), dtype=np.float64)
+                cf_ch_np = np.asarray(cf_cheap_tmp.detach().cpu().numpy(), dtype=np.float64) if cf_cheap_tmp is not None else None
+                del s1_cheap_tmp, cf_cheap_tmp
+                if ema_group_mf > 1:
+                    s1_ch_np = np.ascontiguousarray(s1_ch_np.reshape(eff_r_mf, ema_group_mf, -1).mean(axis=1))
+                    if cf_ch_np is not None:
+                        cf_ch_np = np.ascontiguousarray(cf_ch_np.reshape(eff_r_mf, ema_group_mf, 2, m_rem).mean(axis=1))
+                n_mf_rc = int(s1_ch_np.shape[0])
+                var_c_pre = float(np.var(s1_ch_np[:, 3 * m_rem + 4], ddof=1)) / float(n_mf_rc) if n_mf_rc > 1 else 0.0
+                se_pre = math.sqrt(max(var_c_pre, 0.0)) if math.isfinite(var_c_pre) else 0.0
+                mf_cheap_hit = (s1_ch_np, cf_ch_np, se_pre)
+                if mf_cheap_digest:
+                    _CRN_MF_CHEAP_CACHE.put(mf_cheap_digest, mf_cheap_hit)
+
+            bpk: Optional[Dict[str, Any]] = None
+            if use_cg_bucket:
+                assert cg_bucket_dm is not None
+                d_pad_b, m_pad_b = cg_bucket_dm
+                if _warm_gpu_hit and _warm_gpu is not None and _warm_gpu.cg_bucket_pack is not None:
+                    bpk = _warm_gpu.cg_bucket_pack
+                else:
+                    n_steps_pad_b = m_pad_b * n_sub
+                    n_stat_pad_b = (2 * d_pad_b + 2) if n_stat_rows > 0 else 0
+                    n_pre_pad_b = (d_pad_b * (d_pad_b + 1) + 1) if use_vibrato_gamma else 0
+                    n_pre_act_b = n_pre_rows if (use_vibrato_gamma and m_rem > 1) else 0
+                    cg_flags_np = np.array(
+                        [
+                            d_assets,
+                            m_rem,
+                            call_code,
+                            cpn_code,
+                            eff_opt_code_s2,
+                            int(has_ki),
+                            int(bool(has_ki and b_ki > 0.0 and float(state.i_ki_past) < 0.5)),
+                            int(bool(k_os > 0.0)),
+                            int(is_memory),
+                            int(is_long_flag),
+                            int(no_notional),
+                            int(force_cpn_ac),
+                            int(dir_down),
+                            int(type_out),
+                            int(has_lower_strike_flag),
+                            int(has_part_call_flag),
+                            n_stat_rows,
+                            n_pre_act_b,
+                            m_rem - 1,
+                            n_sub - 1,
+                            ((m_rem - 1) * n_sub) if m_rem == 1 else (m_rem * n_sub - 1),
+                            n_sub if m_rem == 1 else 1,
+                            1 if m_rem == 1 else 0,
+                            0,
+                        ],
+                        dtype=np.int32,
+                    )
+                    cg_flags_g_b = torch.as_tensor(cg_flags_np, dtype=torch.int32, device=qmc_device)
+                    payoff_f64_18_g_b = torch.cat(
+                        [
+                            gpu_meta["payoff_f64"],
+                            torch.tensor([df_last_val, h_vib_val, inv_dt_f32_val], dtype=torch.float64, device=qmc_device),
+                        ],
+                        dim=0,
+                    ).contiguous()
+                    payoff_f32_15_g_b = payoff_f64_18_g_b[:15].to(dtype=torch.float32).contiguous()
+
+                    if d_pad_b == d_assets:
+                        lv_pad_g_b = lv_f32_g_cached
+                        lv_sp_pm_pad_g_b = lv_sp_pm_g if need_spot_bumps else None
+                    else:
+                        lv_pad_g_b = torch.zeros((d_pad_b, lv_nt, lv_ny), dtype=torch.float32, device=qmc_device)
+                        lv_pad_g_b[:d_assets].copy_(lv_f32_g_cached)
+                        lv_sp_pm_pad_g_b = None
+                        if need_spot_bumps and lv_sp_pm_g is not None:
+                            lv_sp_pm_pad_g_b = torch.zeros((2 * d_pad_b, lv_nt, lv_ny), dtype=torch.float32, device=qmc_device)
+                            lv_sp_pm_pad_g_b[:d_assets].copy_(lv_sp_pm_g[:d_assets])
+                            lv_sp_pm_pad_g_b[d_pad_b : d_pad_b + d_assets].copy_(lv_sp_pm_g[d_assets : 2 * d_assets])
+
+                    chol_pad_f64_g_b = torch.eye(d_pad_b, dtype=torch.float64, device=qmc_device)
+                    chol_pad_f64_g_b[:d_assets, :d_assets].copy_(chol_f64_g)
+                    chol_pad_f32_g_b = chol_pad_f64_g_b.to(dtype=torch.float32).contiguous()
+                    chol_scaled_pad_f32_g_b = (chol_pad_f32_g_b * math.sqrt(float(n_sub))).contiguous()
+
+                    y_min_pad_f64_b = torch.zeros((d_pad_b,), dtype=torch.float64, device=qmc_device)
+                    y_min_pad_f64_b[:d_assets].copy_(y_min_base_g)
+                    inv_dy_pad_f64_b = torch.ones((d_pad_b,), dtype=torch.float64, device=qmc_device)
+                    inv_dy_pad_f64_b[:d_assets].copy_(inv_dy_base_g)
+                    inv_dt_pad_f64_b = inv_dt_base_g[:1].clone()
+                    tau_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    tau_pad_f64_b[:m_rem].copy_(tau_step_g[:m_rem])
+                    rn_pad_f64_b = torch.zeros((d_pad_b, m_pad_b), dtype=torch.float64, device=qmc_device)
+                    rn_pad_f64_b[:d_assets, :m_rem].copy_(rn_step_g[: d_assets * m_rem].view(d_assets, m_rem))
+                    rt_pad_f64_b = torch.zeros((d_pad_b, m_pad_b), dtype=torch.float64, device=qmc_device)
+                    rt_pad_f64_b[:d_assets, :m_rem].copy_(rt_step_g[: d_assets * m_rem].view(d_assets, m_rem))
+
+                    fwd_pad_f64_b = torch.ones((d_pad_b, m_pad_b), dtype=torch.float64, device=qmc_device)
+                    fwd_pad_f64_b[:d_assets, :m_rem].copy_(fwd_perf_g)
+                    fwd_pad_f32_b = fwd_pad_f64_b.to(dtype=torch.float32).contiguous()
+                    fwd_sp_pm_pad_f64_b: Optional[torch.Tensor] = None
+                    if need_spot_bumps and fwd_sp_pm_g is not None:
+                        fwd_sp_pm_pad_f64_b = torch.ones((2 * d_pad_b, m_pad_b), dtype=torch.float64, device=qmc_device)
+                        fwd_sp_pm_pad_f64_b[:d_assets, :m_rem].copy_(fwd_sp_pm_g[:d_assets])
+                        fwd_sp_pm_pad_f64_b[d_pad_b : d_pad_b + d_assets, :m_rem].copy_(fwd_sp_pm_g[d_assets : 2 * d_assets])
+
+                    id_d_pad_b = torch.arange(d_pad_b, dtype=torch.int32, device=qmc_device)
+                    sp_pm_meta_pad_b: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+                    if need_spot_bumps:
+                        id_2d_b = torch.arange(2 * d_pad_b, dtype=torch.int32, device=qmc_device)
+                        zr_2d_b = torch.cat([id_d_pad_b, id_d_pad_b], dim=0)
+                        sp_pm_meta_pad_b = (id_2d_b, zr_2d_b, zr_2d_b)
+
+                    # Pad schedule buffer cleanly: [t_mid(M*S), dt(M*S), sqrt_dt(M*S), q_shift(D*M*S), y_min(D), inv_dy(D)].
+                    n_steps_act = m_rem * n_sub
+                    sched_pad_f32_b = torch.zeros((3 * n_steps_pad_b + d_pad_b * n_steps_pad_b + 2 * d_pad_b,), dtype=torch.float32, device=qmc_device)
+                    sched_pad_f32_b[0:n_steps_act].copy_(sched_f32_g[0:n_steps_act])
+                    sched_pad_f32_b[n_steps_pad_b : n_steps_pad_b + n_steps_act].copy_(sched_f32_g[n_steps_act : 2 * n_steps_act])
+                    sched_pad_f32_b[2 * n_steps_pad_b : 2 * n_steps_pad_b + n_steps_act].copy_(sched_f32_g[2 * n_steps_act : 3 * n_steps_act])
+                    q_act_src = sched_f32_g[3 * n_steps_act : 3 * n_steps_act + d_assets * n_steps_act].view(d_assets, n_steps_act)
+                    q_pad_dst = sched_pad_f32_b[3 * n_steps_pad_b : 3 * n_steps_pad_b + d_pad_b * n_steps_pad_b].view(d_pad_b, n_steps_pad_b)
+                    q_pad_dst[:d_assets, :n_steps_act].copy_(q_act_src)
+                    y_src_off = 3 * n_steps_act + d_assets * n_steps_act
+                    y_dst_off = 3 * n_steps_pad_b + d_pad_b * n_steps_pad_b
+                    sched_pad_f32_b[y_dst_off : y_dst_off + d_assets].copy_(sched_f32_g[y_src_off : y_src_off + d_assets])
+                    sched_pad_f32_b[y_dst_off + d_pad_b : y_dst_off + d_pad_b + d_assets].copy_(
+                        sched_f32_g[y_src_off + d_assets : y_src_off + 2 * d_assets]
+                    )
+                    sched_pad_f32_b[y_dst_off + d_pad_b + d_assets : y_dst_off + 2 * d_pad_b].fill_(1.0)
+
+                    u_rot_pad_b = torch.eye(m_pad_b, dtype=torch.float32, device=qmc_device)
+                    assert u_rot_gpu is not None
+                    u_rot_pad_b[:m_rem, :m_rem].copy_(u_rot_gpu)
+                    assert shifts_sobol_gpu is not None
+                    n_dims_act_b = int(shifts_sobol_gpu.shape[1])
+                    n_dims_pad_b = m_pad_b * (n_sub + 1) * d_pad_b
+                    shifts_pad_b = torch.zeros((eff_r, n_dims_pad_b), dtype=torch.int32, device=qmc_device)
+                    shifts_pad_b[:, :n_dims_act_b].copy_(shifts_sobol_gpu)
+
+                    df_pay_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    df_pay_pad_f64_b[:m_rem].copy_(gpu_meta["df_pay"])
+                    w_fund_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    if gpu_meta["w_fund"] is not None:
+                        w_fund_pad_f64_b[:m_rem].copy_(gpu_meta["w_fund"])
+                    ko_pad_f64_b = torch.full((m_pad_b,), 1.0e9, dtype=torch.float64, device=qmc_device)
+                    ko_pad_f64_b[:m_rem].copy_(gpu_meta["ko"])
+                    ic_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    ic_pad_f64_b[:m_rem].copy_(gpu_meta["is_call"])
+                    cp_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    cp_pad_f64_b[:m_rem].copy_(gpu_meta["cpn"])
+                    ig_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    ig_pad_f64_b[:m_rem].copy_(gpu_meta["is_guar"])
+                    cr_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    cr_pad_f64_b[:m_rem].copy_(gpu_meta["cpn_rates"])
+                    eps_pad_f64_b = torch.full((m_pad_b,), 0.04, dtype=torch.float64, device=qmc_device)
+                    eps_pad_f64_b[:m_rem].copy_(eps_aad_g)
+
+                    d_var_pad_f32_b: Optional[torch.Tensor] = None
+                    if use_mf_cv and d_var_f32_g is not None:
+                        d_var_pad_f32_b = torch.zeros((d_pad_b, m_pad_b), dtype=torch.float32, device=qmc_device)
+                        d_var_pad_f32_b[:d_assets, :m_rem].copy_(d_var_f32_g)
+                    df_pay_pad_f32_b = df_pay_pad_f64_b.to(dtype=torch.float32).contiguous()
+                    w_fund_pad_f32_b = w_fund_pad_f64_b.to(dtype=torch.float32).contiguous()
+                    ko_pad_f32_b = ko_pad_f64_b.to(dtype=torch.float32).contiguous()
+                    ic_pad_f32_b = ic_pad_f64_b.to(dtype=torch.float32).contiguous()
+                    cp_pad_f32_b = cp_pad_f64_b.to(dtype=torch.float32).contiguous()
+                    ig_pad_f32_b = ig_pad_f64_b.to(dtype=torch.float32).contiguous()
+                    cr_pad_f32_b = cr_pad_f64_b.to(dtype=torch.float32).contiguous()
+                    eps_pad_f32_b = eps_pad_f64_b.to(dtype=torch.float32).contiguous()
+
+                    l_inv_t_pad_b: Optional[torch.Tensor] = None
+                    c_inv_pad_b: Optional[torch.Tensor] = None
+                    cdl_m_pad_b: Optional[torch.Tensor] = None
+                    cdl2_last_pad_b: Optional[torch.Tensor] = None
+                    if use_vibrato_gamma:
+                        l_inv_t_pad_b = torch.eye(d_pad_b, dtype=torch.float64, device=qmc_device)
+                        c_inv_pad_b = torch.eye(d_pad_b, dtype=torch.float64, device=qmc_device)
+                        cdl_m_pad_b = torch.ones((m_pad_b, d_pad_b), dtype=torch.float64, device=qmc_device)
+                        cdl2_last_pad_b = torch.zeros((d_pad_b,), dtype=torch.float64, device=qmc_device)
+                        if l_inv_t_g is not None and c_inv_g is not None and cdl_m_g is not None and cdl2_last_g is not None:
+                            l_inv_t_pad_b[:d_assets, :d_assets].copy_(l_inv_t_g)
+                            c_inv_pad_b[:d_assets, :d_assets].copy_(c_inv_g)
+                            cdl_m_pad_b[:m_rem, :d_assets].copy_(cdl_m_g)
+                            cdl2_last_pad_b[:d_assets].copy_(cdl2_last_g)
+
+                    def _remap_spot_slots(slots_t: torch.Tensor) -> torch.Tensor:
+                        return torch.where(slots_t >= d_assets, d_pad_b + (slots_t - d_assets), slots_t)
+
+                    stat_pack_pad_b: Optional[Tuple[Any, ...]] = None
+                    if stat_pack is not None and n_stat_pad_b > 0:
+                        _, _, _, st_idx_s, st_df_s, st_wf_s, st_itr_s = stat_pack
+                        st_idx_pad = torch.full((7, n_stat_pad_b), -1, dtype=torch.int32, device=qmc_device)
+                        st_idx_pad[:, :n_stat_rows].copy_(st_idx_s)
+                        st_idx_pad[2, :n_stat_rows] = _remap_spot_slots(st_idx_pad[2, :n_stat_rows])
+                        st_idx_pad[3, :n_stat_rows] = _remap_spot_slots(st_idx_pad[3, :n_stat_rows])
+                        st_idx_pad[5, n_stat_rows:] = 0
+                        st_idx_pad[6, n_stat_rows:] = 0
+                        st_df_pad = torch.zeros((n_stat_pad_b, m_pad_b), dtype=torch.float64, device=qmc_device)
+                        st_df_pad[:n_stat_rows, :m_rem].copy_(st_df_s)
+                        st_wf_pad = torch.zeros((n_stat_pad_b, m_pad_b), dtype=torch.float64, device=qmc_device)
+                        if st_wf_s is not None:
+                            st_wf_pad[:n_stat_rows, :m_rem].copy_(st_wf_s)
+                        st_itr_pad = torch.zeros((n_stat_pad_b,), dtype=torch.float64, device=qmc_device)
+                        st_itr_pad[:n_stat_rows].copy_(st_itr_s)
+                        stat_pack_pad_b = (n_stat_pad_b, False, None, st_idx_pad, st_df_pad, st_wf_pad, st_itr_pad)
+
+                    pre_pack_pad_b: Optional[Tuple[Any, ...]] = None
+                    if use_vibrato_gamma and n_pre_pad_b > 0:
+                        pr_idx_pad = torch.full((7, n_pre_pad_b), -1, dtype=torch.int32, device=qmc_device)
+                        pr_idx_pad[5].zero_()
+                        pr_idx_pad[6].zero_()
+                        if pre_pack is not None and n_pre_act_b > 0:
+                            _, _, _, pr_idx_s, _, _, _ = pre_pack
+                            pr_idx_pad[:, :n_pre_act_b].copy_(pr_idx_s)
+                            pr_idx_pad[2, :n_pre_act_b] = _remap_spot_slots(pr_idx_pad[2, :n_pre_act_b])
+                            pr_idx_pad[3, :n_pre_act_b] = _remap_spot_slots(pr_idx_pad[3, :n_pre_act_b])
+                        pr_df_pad = df_pay_pad_f64_b.unsqueeze(0)
+                        pr_wf_pad = w_fund_pad_f64_b.unsqueeze(0)
+                        pr_itr_pad = torch.zeros((n_pre_pad_b,), dtype=torch.float64, device=qmc_device)
+                        pre_pack_pad_b = (n_pre_pad_b, False, None, pr_idx_pad, pr_df_pad, pr_wf_pad, pr_itr_pad)
+
+                    per_rep_b = max(
+                        m_pad_b * d_pad_b * (n_sub * 4 + 8 + (4 if need_stage2_aad else 0) + (8 if need_spot_bumps else 0)),
+                        1,
+                    ) * n_rep
+                    _r_env_cap_b = int(os.environ.get("DEEPVOL_R_CAP", "4"))
+                    r_cap_b = _r_env_cap_b if (d_pad_b * m_pad_b * n_sub >= 512) else eff_r
+                    r_chunk_b = min(eff_r, r_cap_b, max(1, (72 * 1024 * 1024) // per_rep_b))
+                    inv_perm_pad_b = torch.arange(d_pad_b, dtype=torch.int64, device=qmc_device)
+                    inv_perm_pad_b[:d_assets].copy_(gpu_meta["inv_perm"])
+
+                    th_on_b = bool(th_chunk_in_step1 and th_pack is not None and th_prep is not None)
+                    th_cg_flags_np = cg_flags_np.copy()
+                    th_cg_flags_np[1] = int(m_rem_th_g) if th_on_b else 1
+                    th_cg_flags_np[16] = 1 if th_on_b else 0
+                    th_cg_flags_np[23] = int(k_cross_g) if th_on_b else 0
+                    th_cg_flags_g_b = torch.as_tensor(th_cg_flags_np, dtype=torch.int32, device=qmc_device)
+                    th_payoff_f64_18_g_b = payoff_f64_18_g_b.clone()
+                    if th_on_b and d_pad_b == d_assets and lv_th_g is not None:
+                        lv_th_pad_f32_b = lv_th_g
+                    else:
+                        lv_th_pad_f32_b = torch.zeros((d_pad_b, lv_nt, lv_ny), dtype=torch.float32, device=qmc_device)
+                    fwd_th_pad_f64_b = torch.ones((d_pad_b, m_pad_b), dtype=torch.float64, device=qmc_device)
+                    tau_th_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    rn_th_pad_f64_b = torch.zeros((d_pad_b, m_pad_b), dtype=torch.float64, device=qmc_device)
+                    rt_th_pad_f64_b = torch.zeros((d_pad_b, m_pad_b), dtype=torch.float64, device=qmc_device)
+                    inv_dt_th_pad_f64_b = (
+                        inv_dt_base_g[1:2] if int(inv_dt_base_g.shape[0]) > 1 else inv_dt_base_g[:1]
+                    ).clone()
+                    ko_th_pad_f64_b = torch.full((m_pad_b,), 1.0e9, dtype=torch.float64, device=qmc_device)
+                    ic_th_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    cp_th_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    ig_th_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    cr_th_pad_f64_b = torch.zeros((m_pad_b,), dtype=torch.float64, device=qmc_device)
+                    eps_th_pad_f64_b = torch.full((m_pad_b,), 0.04, dtype=torch.float64, device=qmc_device)
+                    df_th_pad_f64_b = torch.zeros((1, m_pad_b), dtype=torch.float64, device=qmc_device)
+                    wf_th_pad_f64_b = torch.zeros((1, m_pad_b), dtype=torch.float64, device=qmc_device)
+                    if th_on_b:
+                        assert payoff_th_g is not None and lv_th_g is not None and fwd_th_g is not None
+                        assert ko_th_g is not None and ic_th_g is not None and cp_th_g is not None and ig_th_g is not None
+                        assert cr_th_g is not None and eps_th_g is not None and df_th_g is not None
+                        th_payoff_f64_18_g_b[:15].copy_(payoff_th_g)
+                        if d_pad_b != d_assets:
+                            lv_th_pad_f32_b[:d_assets].copy_(lv_th_g)
+                        fwd_th_pad_f64_b[:d_assets, :m_rem_th_g].copy_(fwd_th_g)
+                        tau_th_pad_f64_b[:m_rem_th_g].copy_(tau_step_g[m_rem : m_rem + m_rem_th_g])
+                        rn_th_pad_f64_b[:d_assets, :m_rem_th_g].copy_(
+                            rn_step_g[d_assets * m_rem : d_assets * (m_rem + m_rem_th_g)].view(d_assets, m_rem_th_g)
+                        )
+                        rt_th_pad_f64_b[:d_assets, :m_rem_th_g].copy_(
+                            rt_step_g[d_assets * m_rem : d_assets * (m_rem + m_rem_th_g)].view(d_assets, m_rem_th_g)
+                        )
+                        ko_th_pad_f64_b[:m_rem_th_g].copy_(ko_th_g)
+                        ic_th_pad_f64_b[:m_rem_th_g].copy_(ic_th_g)
+                        cp_th_pad_f64_b[:m_rem_th_g].copy_(cp_th_g)
+                        ig_th_pad_f64_b[:m_rem_th_g].copy_(ig_th_g)
+                        cr_th_pad_f64_b[:m_rem_th_g].copy_(cr_th_g)
+                        eps_th_pad_f64_b[:m_rem_th_g].copy_(eps_th_g)
+                        df_th_pad_f64_b[0, :m_rem_th_g].copy_(df_th_g[0])
+                        if wf_th_g is not None:
+                            wf_th_pad_f64_b[0, :m_rem_th_g].copy_(wf_th_g[0])
+                    th_idx_pad_g = torch.as_tensor(
+                        np.array([[-1], [-1], [-1], [-1], [-1], [0], [0]], dtype=np.int32),
+                        dtype=torch.int32,
+                        device=qmc_device,
+                    )
+                    th_itr_zero_pad_g = torch.zeros((1,), dtype=torch.float64, device=qmc_device)
+                    th_pack_pad_b = (1, False, None, th_idx_pad_g, df_th_pad_f64_b, wf_th_pad_f64_b, th_itr_zero_pad_g)
+                    bpk = {
+                        "d_pad": d_pad_b,
+                        "m_pad": m_pad_b,
+                        "n_steps_pad": n_steps_pad_b,
+                        "r_chunk": r_chunk_b,
+                        "n_stat_pad": n_stat_pad_b,
+                        "n_pre_pad": n_pre_pad_b,
+                        "cg_flags": cg_flags_g_b,
+                        "payoff_f64_18": payoff_f64_18_g_b,
+                        "payoff_f32_15": payoff_f32_15_g_b,
+                        "lv_f32": lv_pad_g_b,
+                        "lv_sp_pm_f32": lv_sp_pm_pad_g_b,
+                        "chol_f64": chol_pad_f64_g_b,
+                        "chol_f32": chol_pad_f32_g_b,
+                        "chol_scaled_f32": chol_scaled_pad_f32_g_b,
+                        "y_min_f64": y_min_pad_f64_b,
+                        "inv_dy_f64": inv_dy_pad_f64_b,
+                        "inv_dt_f64": inv_dt_pad_f64_b,
+                        "tau_f64": tau_pad_f64_b,
+                        "rn_f64": rn_pad_f64_b,
+                        "rt_f64": rt_pad_f64_b,
+                        "fwd_pad_f64": fwd_pad_f64_b,
+                        "fwd_pad_f32": fwd_pad_f32_b,
+                        "fwd_sp_pm_f64": fwd_sp_pm_pad_f64_b,
+                        "id_d": id_d_pad_b,
+                        "sp_pm_meta": sp_pm_meta_pad_b,
+                        "sched_f32": sched_pad_f32_b,
+                        "t_mid_ptr": sched_pad_f32_b[0:n_steps_pad_b],
+                        "dt_sub_ptr": sched_pad_f32_b[n_steps_pad_b : 2 * n_steps_pad_b],
+                        "sqrt_dt_ptr": sched_pad_f32_b[2 * n_steps_pad_b : 3 * n_steps_pad_b],
+                        "q_shift_ptr": sched_pad_f32_b[3 * n_steps_pad_b : y_dst_off],
+                        "y_min_f32": sched_pad_f32_b[y_dst_off : y_dst_off + d_pad_b],
+                        "inv_dy_f32": sched_pad_f32_b[y_dst_off + d_pad_b : y_dst_off + 2 * d_pad_b],
+                        "u_rot": u_rot_pad_b,
+                        "shifts": shifts_pad_b,
+                        "df_pay_f64": df_pay_pad_f64_b,
+                        "w_fund_f64": w_fund_pad_f64_b,
+                        "ko_f64": ko_pad_f64_b,
+                        "is_call_f64": ic_pad_f64_b,
+                        "cpn_f64": cp_pad_f64_b,
+                        "is_guar_f64": ig_pad_f64_b,
+                        "cpn_rates_f64": cr_pad_f64_b,
+                        "eps_f64": eps_pad_f64_b,
+                        "d_var_f32": d_var_pad_f32_b,
+                        "df_pay_f32": df_pay_pad_f32_b,
+                        "w_fund_f32": w_fund_pad_f32_b,
+                        "ko_f32": ko_pad_f32_b,
+                        "is_call_f32": ic_pad_f32_b,
+                        "cpn_f32": cp_pad_f32_b,
+                        "is_guar_f32": ig_pad_f32_b,
+                        "cpn_rates_f32": cr_pad_f32_b,
+                        "eps_f32": eps_pad_f32_b,
+                        "l_inv_t": l_inv_t_pad_b,
+                        "c_inv": c_inv_pad_b,
+                        "cdl_m": cdl_m_pad_b,
+                        "cdl2_last": cdl2_last_pad_b,
+                        "stat_pack": stat_pack_pad_b,
+                        "pre_pack": pre_pack_pad_b,
+                        "inv_perm": inv_perm_pad_b,
+                        "th_cg_flags": th_cg_flags_g_b,
+                        "th_payoff_f64_18": th_payoff_f64_18_g_b,
+                        "lv_th_f32": lv_th_pad_f32_b,
+                        "fwd_th_f64": fwd_th_pad_f64_b,
+                        "tau_th_f64": tau_th_pad_f64_b,
+                        "rn_th_f64": rn_th_pad_f64_b,
+                        "rt_th_f64": rt_th_pad_f64_b,
+                        "inv_dt_th_f64": inv_dt_th_pad_f64_b,
+                        "ko_th_f64": ko_th_pad_f64_b,
+                        "ic_th_f64": ic_th_pad_f64_b,
+                        "cp_th_f64": cp_th_pad_f64_b,
+                        "ig_th_f64": ig_th_pad_f64_b,
+                        "cr_th_f64": cr_th_pad_f64_b,
+                        "eps_th_f64": eps_th_pad_f64_b,
+                        "th_pack": th_pack_pad_b,
+                    }
+                    bpk_src: List[torch.Tensor] = []
+                    for bv_k in bpk.values():
+                        if isinstance(bv_k, torch.Tensor):
+                            bpk_src.append(bv_k)
+                        elif isinstance(bv_k, tuple):
+                            for sv_k in bv_k:
+                                if isinstance(sv_k, torch.Tensor):
+                                    bpk_src.append(sv_k)
+                    bpk["src_tensors"] = _dedup_gpu_tensors(tuple(bpk_src))
+                    if _warm_gpu is not None:
+                        _warm_gpu.cg_bucket_pack = bpk
+                    elif warm_bundle_key is not None:
+                        warm_hit_check = _CRN_DEAL_PREP_CACHE.get(warm_bundle_key)
+                        if warm_hit_check is not None:
+                            warm_hit_check[1].cg_bucket_pack = bpk
+
+            # Allocate a single contiguous float64 output buffer sliced into all GPU result views.
+            q_mask = (
+                bool(want_delta),
+                bool(want_gamma),
+                bool(want_cash_gamma),
+                bool(want_vega),
+                bool(want_rho),
+                bool(want_divs),
+                bool(want_theta),
+                bool(want_cega),
+            )
+            cg_meta_key_w: Any = (
+                q_mask,
+                bool(return_cashflows),
+                bool(use_cg_bucket),
+                bool(use_mf_cv),
+                mf_cheap_hit is not None,
+                bool(want_q_aad_sde),
+                bool(want_lv_aad_sde),
+                bool(want_chol_aad_sde),
+                bool(want_cf_wf_aad),
+                bool(need_stage2_aad),
+                bool(emit_stage1_gpu),
+                bool(th_chunk_in_step1),
+            )
+            cg_meta_cached_w = (
+                _warm_gpu.cg_meta_cache.get(cg_meta_key_w)
+                if (_warm_gpu_hit and _warm_gpu is not None and not dyn_entries and not is_cont_ki_active)
+                else None
             )
             cg_fast_d2h_np: Optional[npt.NDArray[np.float64]] = None
-            cg_shape_key: Any = None
             cg_capturing_now = False
             cg_stream_entered = False
             cg_obj: Any = None
             cg_stream_ctx: Any = None
             cg_pool_lock: Any = None
-            cg_src_tensors: List[torch.Tensor] = []
+            cur_sig_cg_cached: Optional[Tuple[int, ...]] = None
+            out_layout: List[Tuple[str, Tuple[int, ...]]]
+            pack_spans: Dict[str, Tuple[int, int, Tuple[int, ...]]]
+            cg_shape_key: Any
+            cg_src_tensors: List[torch.Tensor]
+            if cg_meta_cached_w is not None:
+                (
+                    out_layout,
+                    pack_spans,
+                    tot_out_el,
+                    can_cg_qmc,
+                    cg_shape_key,
+                    cg_src_tensors,
+                    cur_sig_cg_cached,
+                ) = cg_meta_cached_w
+            else:
+                out_layout = []
+                if use_cg_bucket and bpk is not None:
+                    d_out_b = int(bpk["d_pad"])
+                    m_out_b = int(bpk["m_pad"])
+                    ns_out_b = int(bpk["n_stat_pad"])
+                    np_out_b = int(bpk["n_pre_pad"])
+                    if emit_stage1_gpu:
+                        out_layout.append(("stage1", (eff_r, 3 * m_out_b + 6)))
+                    if ns_out_b > 0:
+                        out_layout.append(("eval_pv", (ns_out_b,)))
+                    if np_out_b > 0:
+                        out_layout.append(("preterm", (np_out_b,)))
+                    out_layout.append(("th_fused", (1,)))
+                    if use_vibrato_gamma:
+                        out_layout.append(("h_vib", (d_out_b, d_out_b)))
+                    if want_cega or need_stage2_aad:
+                        out_layout.append(("bar_chol", (d_out_b, d_out_b)))
+                    if want_lv_aad_sde:
+                        out_layout.append(("bar_lv", (d_out_b, lv_nt, lv_ny)))
+                    if want_q_aad_sde or need_stage2_aad:
+                        out_layout.append(("bar_q", (d_out_b, m_out_b * n_sub)))
+                    if need_stage2_aad:
+                        out_layout.append(("bar_lnf", (d_out_b, m_out_b)))
+                    if want_cf_wf_aad:
+                        out_layout.append(("bar_cf_wf", (2, m_out_b)))
+                    if use_mf_cv:
+                        out_layout.append(("s1_gbm_crn", (eff_r, 3 * m_out_b + 5)))
+                        if want_cf_wf_aad:
+                            out_layout.append(("cf_surv_gbm_crn", (eff_r, 2, m_out_b)))
+                else:
+                    if emit_stage1_gpu:
+                        out_layout.append(("stage1", (eff_r, 3 * m_rem + 6)))
+                    if gpu_eval_rows_total > 0:
+                        out_layout.append(("eval_pv", (gpu_eval_rows_total,)))
+                    if use_vibrato_gamma and m_rem > 1 and n_pre_rows > 0:
+                        out_layout.append(("preterm", (n_pre_rows,)))
+                    if (th_chunk_in_step1 and th_pack is not None) or (use_cg_bucket and bpk is not None):
+                        out_layout.append(("th_fused", (1,)))
+                    if use_vibrato_gamma:
+                        out_layout.append(("h_vib", (d_assets, d_assets)))
+                    if want_chol_aad_sde:
+                        out_layout.append(("bar_chol", (d_assets, d_assets)))
+                    if want_chol_aad_sde and is_cont_ki_active:
+                        out_layout.append(("bar_sigma_cont", (d_assets, d_assets)))
+                    if want_lv_aad_sde or (need_stage2_aad and is_cont_ki_active):
+                        out_layout.append(("bar_lv", (d_assets, lv_nt, lv_ny)))
+                    if want_q_aad_sde:
+                        out_layout.append(("bar_q", (d_assets, n_steps_tot_g)))
+                    if need_stage2_aad:
+                        out_layout.append(("bar_lnf", (d_assets, m_rem)))
+                    if want_cf_wf_aad:
+                        out_layout.append(("bar_cf_wf", (2, m_rem)))
+                    if use_mf_cv:
+                        out_layout.append(("s1_gbm_crn", (eff_r, 3 * m_rem + 5)))
+                        if mf_cheap_hit is None:
+                            out_layout.append(("s1_gbm_cheap", (eff_r_mf * ema_group_mf, 3 * m_rem + 5)))
+                        if want_cf_wf_aad:
+                            out_layout.append(("cf_surv_gbm_crn", (eff_r, 2, m_rem)))
+                            if mf_cheap_hit is None:
+                                out_layout.append(("cf_surv_gbm_cheap", (eff_r_mf * ema_group_mf, 2, m_rem)))
+
+                pack_spans = {}
+                tot_out_el = 0
+                for o_tag, o_shape in out_layout:
+                    o_el = 1
+                    for o_dim in o_shape:
+                        o_el *= o_dim
+                    if o_el > 0:
+                        pack_spans[o_tag] = (tot_out_el, tot_out_el + o_el, o_shape)
+                        tot_out_el += o_el
+
+                can_cg_qmc = bool(
+                    tot_out_el > 0
+                    and (need_stage2_aad or use_vibrato_gamma or need_spot_bumps)
+                    and can_triton_sobol
+                    and (not dyn_entries)
+                    and (not is_cont_ki_active)
+                    and ((not use_mf_cv) or (mf_cheap_hit is not None))
+                    and (not torch.cuda.is_current_stream_capturing())  # type: ignore[no-untyped-call]
+                    and os.environ.get("DEEPVOL_QMC_CG", "1") != "0"
+                )
+                cg_shape_key = None
+                cg_src_tensors = []
+
+                if can_cg_qmc:
+                    if use_cg_bucket and bpk is not None:
+                        cg_shape_key = (
+                            "cg_bucket_v1",
+                            int(qmc_device.index or 0),
+                            int(bpk["d_pad"]),
+                            int(bpk["m_pad"]),
+                            n_total,
+                            n_sub,
+                            eff_r,
+                            n_rep,
+                            lv_nt,
+                            lv_ny,
+                            int(bpk["r_chunk"]),
+                            int(bpk["n_stat_pad"]),
+                            int(bpk["n_pre_pad"]),
+                            bool(use_mf_cv),
+                            bool(emit_stage1_gpu),
+                            bool(need_stage2_aad),
+                            bool(want_cf_wf_aad),
+                            bool(want_lv_aad_sde),
+                            bool(want_cega or need_stage2_aad),
+                            bool(want_q_aad_sde or need_stage2_aad),
+                            bool(use_vibrato_gamma),
+                            bool(need_spot_bumps),
+                        )
+                        cg_src_tensors = list(bpk["src_tensors"])
+                    else:
+                        cg_shape_key = (
+                            int(qmc_device.index or 0),
+                            d_assets,
+                            m_rem,
+                            n_total,
+                            n_sub,
+                            eff_r,
+                            n_rep,
+                            lv_nt,
+                            lv_ny,
+                            r_chunk,
+                            q_mask,
+                            tuple(out_layout),
+                            n_stat_rows,
+                            n_pre_rows,
+                            bool(th_chunk_in_step1),
+                            int(m_rem_th_g),
+                            bool(use_f32_step1),
+                            bool(fuse_m_sde),
+                            bool(use_vibrato_gamma),
+                            bool(vib_period_level),
+                            bool(want_lv_aad_sde),
+                            bool(want_chol_aad_sde),
+                            bool(want_q_aad_sde),
+                            bool(want_cf_wf_aad),
+                            bool(use_mf_cv),
+                            bool(apply_ema_mf),
+                            int(eff_r_mf),
+                            int(ema_group_mf),
+                            int(n_rep_mf),
+                            bool(need_spot_bumps),
+                            bool(need_sp_cg_alt_g),
+                            bool(use_f32_perf_direct),
+                            call_code,
+                            cpn_code,
+                            eff_opt_code_s2,
+                            bool(has_ki),
+                            bool(k_os > 0.0),
+                            bool(is_memory),
+                            bool(is_long_flag),
+                            bool(no_notional),
+                            bool(force_cpn_ac),
+                            bool(dir_down),
+                            bool(type_out),
+                            bool(has_lower_strike_flag),
+                            bool(has_part_call_flag),
+                            bool(gpu_meta["w_fund"] is not None),
+                            int(stat_pack[2].shape[0]) if (stat_pack is not None and stat_pack[2] is not None) else -1,
+                            bool(stat_pack is not None and stat_pack[5] is not None),
+                        )
+                        cg_src_candidates: List[Any] = [
+                            lv_f32_g_cached,
+                            chol_f32_g_cached,
+                            chol_f64_g,
+                            tau_step_g,
+                            rn_step_g,
+                            rt_step_g,
+                            fwd_perf_g,
+                            fwd_perf_f32_step_g,
+                            sched_f32_g,
+                            eps_aad_g,
+                            u_rot_gpu,
+                            v_rot_gpu,
+                            shifts_sobol_gpu,
+                            gpu_meta.get("ko"),
+                            gpu_meta.get("is_call"),
+                            gpu_meta.get("cpn"),
+                            gpu_meta.get("is_guar"),
+                            gpu_meta.get("cpn_rates"),
+                            gpu_meta.get("inv_perm"),
+                            gpu_meta.get("payoff_f64"),
+                            gpu_meta.get("corr"),
+                            d_var_f32_g,
+                            fwd_perf_f32_g,
+                            df_pay_f32_g,
+                            w_fund_f32_g,
+                            ko_f32_g,
+                            is_call_f32_g,
+                            cpn_f32_g,
+                            is_guar_f32_g,
+                            cpn_rates_f32_g,
+                            eps_f32_g,
+                            payoff_f32_g,
+                            chol_scaled_f32_g,
+                            l_inv_t_g,
+                            c_inv_g,
+                            cdl_m_g,
+                            cdl2_last_g,
+                            lv_sp_pm_g,
+                            fwd_sp_pm_g,
+                            lv_th_g,
+                            fwd_th_g,
+                            ko_th_g,
+                            ic_th_g,
+                            cp_th_g,
+                            ig_th_g,
+                            cr_th_g,
+                            payoff_th_g,
+                            eps_th_g,
+                            df_th_g,
+                            wf_th_g,
+                        ]
+                        for pk in (stat_pack, pre_pack, th_pack):
+                            if pk is not None:
+                                for item_p in pk:
+                                    if isinstance(item_p, torch.Tensor):
+                                        cg_src_candidates.append(item_p)
+                        cg_src_tensors = [t_c for t_c in cg_src_candidates if isinstance(t_c, torch.Tensor)]
+                cur_sig_cg_cached = tuple(s.data_ptr() for s in cg_src_tensors) if can_cg_qmc else None
+                if _warm_gpu is not None and not dyn_entries and not is_cont_ki_active and ((not use_mf_cv) or (mf_cheap_hit is not None)):
+                    _warm_gpu.cg_meta_cache[cg_meta_key_w] = (
+                        out_layout,
+                        pack_spans,
+                        tot_out_el,
+                        can_cg_qmc,
+                        cg_shape_key,
+                        cg_src_tensors,
+                        cur_sig_cg_cached,
+                    )
 
             if can_cg_qmc:
-                q_mask = (
-                    bool(want_delta),
-                    bool(want_gamma),
-                    bool(want_cash_gamma),
-                    bool(want_vega),
-                    bool(want_rho),
-                    bool(want_divs),
-                    bool(want_theta),
-                    bool(want_cega),
-                )
-                cg_shape_key = (
-                    int(qmc_device.index or 0),
-                    d_assets,
-                    m_rem,
-                    n_total,
-                    n_sub,
-                    eff_r,
-                    n_rep,
-                    lv_nt,
-                    lv_ny,
-                    r_chunk,
-                    q_mask,
-                    tuple(out_layout),
-                    n_stat_rows,
-                    n_pre_rows,
-                    bool(th_chunk_in_step1),
-                    int(m_rem_th_g),
-                    bool(use_f32_step1),
-                    bool(fuse_m_sde),
-                    bool(use_vibrato_gamma),
-                    bool(vib_period_level),
-                    bool(want_lv_aad_sde),
-                    bool(want_chol_aad_sde),
-                    bool(want_q_aad_sde),
-                    bool(want_cf_wf_aad),
-                    bool(use_mf_cv),
-                    bool(apply_ema_mf),
-                    int(eff_r_mf),
-                    int(ema_group_mf),
-                    int(n_rep_mf),
-                    bool(need_spot_bumps),
-                    bool(need_sp_cg_alt_g),
-                    bool(use_f32_perf_direct),
-                    call_code,
-                    cpn_code,
-                    eff_opt_code_s2,
-                    bool(has_ki),
-                    bool(k_os > 0.0),
-                    bool(is_memory),
-                    bool(is_long_flag),
-                    bool(no_notional),
-                    bool(force_cpn_ac),
-                    bool(dir_down),
-                    bool(type_out),
-                    bool(has_lower_strike_flag),
-                    bool(has_part_call_flag),
-                    bool(gpu_meta["w_fund"] is not None),
-                    int(stat_pack[2].shape[0]) if (stat_pack is not None and stat_pack[2] is not None) else -1,
-                    bool(stat_pack is not None and stat_pack[5] is not None),
-                )
-                cg_src_candidates: List[Any] = [
-                    lv_f32_g_cached,
-                    chol_f32_g_cached,
-                    chol_f64_g,
-                    tau_step_g,
-                    rn_step_g,
-                    rt_step_g,
-                    fwd_perf_g,
-                    fwd_perf_f32_step_g,
-                    sched_f32_g,
-                    eps_aad_g,
-                    u_rot_gpu,
-                    v_rot_gpu,
-                    shifts_sobol_gpu,
-                    gpu_meta.get("ko"),
-                    gpu_meta.get("is_call"),
-                    gpu_meta.get("cpn"),
-                    gpu_meta.get("is_guar"),
-                    gpu_meta.get("cpn_rates"),
-                    gpu_meta.get("inv_perm"),
-                    gpu_meta.get("payoff_f64"),
-                    gpu_meta.get("corr"),
-                    d_var_f32_g,
-                    fwd_perf_f32_g,
-                    df_pay_f32_g,
-                    w_fund_f32_g,
-                    ko_f32_g,
-                    is_call_f32_g,
-                    cpn_f32_g,
-                    is_guar_f32_g,
-                    cpn_rates_f32_g,
-                    eps_f32_g,
-                    payoff_f32_g,
-                    chol_scaled_f32_g,
-                    l_inv_t_g,
-                    c_inv_g,
-                    cdl_m_g,
-                    cdl2_last_g,
-                    lv_sp_pm_g,
-                    fwd_sp_pm_g,
-                    lv_th_g,
-                    fwd_th_g,
-                    ko_th_g,
-                    ic_th_g,
-                    cp_th_g,
-                    ig_th_g,
-                    cr_th_g,
-                    payoff_th_g,
-                    eps_th_g,
-                    df_th_g,
-                    wf_th_g,
-                ]
-                for pk in (stat_pack, pre_pack, th_pack):
-                    if pk is not None:
-                        for item_p in pk:
-                            if isinstance(item_p, torch.Tensor):
-                                cg_src_candidates.append(item_p)
-                cg_src_tensors = [t_c for t_c in cg_src_candidates if isinstance(t_c, torch.Tensor)]
-
                 cg_pool_lock = GLOBAL_GPU_CACHE_MANAGER.get_shared_graph_pool_lock(qmc_device)
                 cg_pool_lock.acquire()
                 try:
                     cg_hit = _CRN_QMC_CG_CACHE.get(cg_shape_key)
                     if cg_hit is not None:
                         cg_in_bufs = cg_hit["in_bufs"]
-                        if len(cg_in_bufs) == len(cg_src_tensors) and all(
+                        if cur_sig_cg_cached is not None and cg_hit.get("last_ptrs") == cur_sig_cg_cached:
+                            cg_hit["cg"].replay()
+                            out_pin = cg_hit.get("out_pin")
+                            if out_pin is None or out_pin.shape != cg_hit["out_flat_g"].shape:
+                                out_pin = torch.empty_like(cg_hit["out_flat_g"], device="cpu", pin_memory=True)
+                                cg_hit["out_pin"] = out_pin
+                            out_pin.copy_(cg_hit["out_flat_g"], non_blocking=False)
+                            cg_fast_d2h_np = out_pin.numpy().copy()
+                        elif len(cg_in_bufs) == len(cg_src_tensors) and all(
                             b.shape == s.shape and b.dtype == s.dtype for b, s in zip(cg_in_bufs, cg_src_tensors)
                         ):
-                            cur_sig_cg = tuple(s.data_ptr() for s in cg_src_tensors)
+                            cur_sig_cg = cur_sig_cg_cached if cur_sig_cg_cached is not None else tuple(s.data_ptr() for s in cg_src_tensors)
                             if cg_hit.get("last_ptrs") != cur_sig_cg:
                                 for b_dst, s_src in zip(cg_in_bufs, cg_src_tensors):
                                     b_dst.copy_(s_src)
                                 cg_hit["last_ptrs"] = cur_sig_cg
                             cg_hit["cg"].replay()
-                            cg_fast_d2h_np = np.asarray(
-                                cg_hit["out_flat_g"].clone().detach().cpu().numpy(),
-                                dtype=np.float64,
-                            )
+                            out_pin = cg_hit.get("out_pin")
+                            if out_pin is None or out_pin.shape != cg_hit["out_flat_g"].shape:
+                                out_pin = torch.empty_like(cg_hit["out_flat_g"], device="cpu", pin_memory=True)
+                                cg_hit["out_pin"] = out_pin
+                            out_pin.copy_(cg_hit["out_flat_g"], non_blocking=False)
+                            cg_fast_d2h_np = out_pin.numpy().copy()
                 except Exception:
                     if cg_pool_lock is not None:
                         cg_pool_lock.release()
@@ -11664,21 +15708,130 @@ def compute_qmc_aad_crn_greeks(
                 s1_gbm_cheap_g = _out_view("s1_gbm_cheap")
                 cf_surv_gbm_crn_g = _out_view("cf_surv_gbm_crn")
                 cf_surv_gbm_cheap_g = _out_view("cf_surv_gbm_cheap")
-                stat_direct_alias = bool((not dyn_entries) and n_stat_rows > 0 and gpu_eval_pv_g is not None and n_stat_rows == gpu_eval_rows_total)
+                stat_direct_alias = bool(
+                    (not dyn_entries)
+                    and n_stat_rows > 0
+                    and gpu_eval_pv_g is not None
+                    and (
+                        (use_cg_bucket and bpk is not None and n_stat_rows == gpu_eval_rows_total)
+                        or ((not use_cg_bucket) and n_stat_rows == gpu_eval_rows_total)
+                    )
+                )
                 stat_acc_g: Optional[torch.Tensor] = (
                     gpu_eval_pv_g
                     if stat_direct_alias
-                    else (torch.zeros((n_stat_rows,), dtype=torch.float64, device=qmc_device) if (n_stat_rows > 0 and cg_fast_d2h_np is None) else None)
+                    else (
+                        torch.zeros(
+                            (int(bpk["n_stat_pad"]) if (use_cg_bucket and bpk is not None) else n_stat_rows,),
+                            dtype=torch.float64,
+                            device=qmc_device,
+                        )
+                        if (n_stat_rows > 0 and cg_fast_d2h_np is None)
+                        else None
+                    )
                 )
+
+                d_eff_k = int(bpk["d_pad"]) if (use_cg_bucket and bpk is not None) else d_assets
+                m_eff_k = int(bpk["m_pad"]) if (use_cg_bucket and bpk is not None) else m_rem
+                n_steps_eff_k = m_eff_k * n_sub
+                r_chunk_eff = int(bpk["r_chunk"]) if (use_cg_bucket and bpk is not None) else r_chunk
+                lv_f32_eff = bpk["lv_f32"] if (use_cg_bucket and bpk is not None) else lv_f32_g_cached
+                chol_f32_eff = bpk["chol_f32"] if (use_cg_bucket and bpk is not None) else chol_f32_g_cached
+                chol_f64_eff = bpk["chol_f64"] if (use_cg_bucket and bpk is not None) else chol_f64_g
+                y_min_f32_eff = bpk["y_min_f32"] if (use_cg_bucket and bpk is not None) else y_min_f32_g
+                inv_dy_f32_eff = bpk["inv_dy_f32"] if (use_cg_bucket and bpk is not None) else inv_dy_f32_g
+                t_mid_eff = bpk["t_mid_ptr"] if (use_cg_bucket and bpk is not None) else t_mid_ptr_g
+                dt_sub_eff = bpk["dt_sub_ptr"] if (use_cg_bucket and bpk is not None) else dt_sub_ptr_g
+                sqrt_dt_eff = bpk["sqrt_dt_ptr"] if (use_cg_bucket and bpk is not None) else sqrt_dt_ptr_g
+                q_shift_eff = bpk["q_shift_ptr"] if (use_cg_bucket and bpk is not None) else q_shift_mid_ptr_g
+                fwd_f32_eff = bpk["fwd_pad_f32"] if (use_cg_bucket and bpk is not None) else fwd_perf_f32_step_g
+                fwd_f64_eff = bpk["fwd_pad_f64"] if (use_cg_bucket and bpk is not None) else fwd_perf_g
+                cg_flags_eff = bpk["cg_flags"] if (use_cg_bucket and bpk is not None) else None
+                pf64_eff = bpk["payoff_f64_18"] if (use_cg_bucket and bpk is not None) else gpu_meta["payoff_f64"]
+                ko_eff = bpk["ko_f64"] if (use_cg_bucket and bpk is not None) else gpu_meta["ko"]
+                ic_eff = bpk["is_call_f64"] if (use_cg_bucket and bpk is not None) else gpu_meta["is_call"]
+                cp_eff = bpk["cpn_f64"] if (use_cg_bucket and bpk is not None) else gpu_meta["cpn"]
+                ig_eff = bpk["is_guar_f64"] if (use_cg_bucket and bpk is not None) else gpu_meta["is_guar"]
+                cr_eff = bpk["cpn_rates_f64"] if (use_cg_bucket and bpk is not None) else gpu_meta["cpn_rates"]
+                df_eff = bpk["df_pay_f64"] if (use_cg_bucket and bpk is not None) else gpu_meta["df_pay"]
+                wf_eff = bpk["w_fund_f64"] if (use_cg_bucket and bpk is not None) else gpu_meta["w_fund"]
+                eps_eff = bpk["eps_f64"] if (use_cg_bucket and bpk is not None) else eps_aad_g
+                inv_perm_eff = bpk["inv_perm"] if (use_cg_bucket and bpk is not None) else gpu_meta["inv_perm"]
+                l_inv_t_eff = bpk["l_inv_t"] if (use_cg_bucket and bpk is not None) else l_inv_t_g
+                c_inv_eff = bpk["c_inv"] if (use_cg_bucket and bpk is not None) else c_inv_g
+                cdl_m_eff = bpk["cdl_m"] if (use_cg_bucket and bpk is not None) else cdl_m_g
+                cdl2_last_eff = bpk["cdl2_last"] if (use_cg_bucket and bpk is not None) else cdl2_last_g
+                lv_sp_pm_eff = bpk["lv_sp_pm_f32"] if (use_cg_bucket and bpk is not None) else lv_sp_pm_g
+                fwd_sp_pm_eff = bpk["fwd_sp_pm_f64"] if (use_cg_bucket and bpk is not None) else fwd_sp_pm_g
+                sp_pm_meta_eff = bpk["sp_pm_meta"] if (use_cg_bucket and bpk is not None) else sp_pm_meta_g
+                y_min_f64_eff = bpk["y_min_f64"] if (use_cg_bucket and bpk is not None) else y_min_base_g
+                inv_dy_f64_eff = bpk["inv_dy_f64"] if (use_cg_bucket and bpk is not None) else inv_dy_base_g
+                inv_dt_f64_eff = bpk["inv_dt_f64"] if (use_cg_bucket and bpk is not None) else inv_dt_base_g[0:1]
+                tau_f64_eff = bpk["tau_f64"] if (use_cg_bucket and bpk is not None) else tau_step_g[:m_rem]
+                rn_f64_eff = bpk["rn_f64"] if (use_cg_bucket and bpk is not None) else rn_step_g[: d_assets * m_rem].view(d_assets, m_rem)
+                rt_f64_eff = bpk["rt_f64"] if (use_cg_bucket and bpk is not None) else rt_step_g[: d_assets * m_rem].view(d_assets, m_rem)
+                stat_pack_eff = bpk["stat_pack"] if (use_cg_bucket and bpk is not None) else stat_pack
+                pre_pack_eff = bpk["pre_pack"] if (use_cg_bucket and bpk is not None) else pre_pack
 
                 if can_cg_qmc and cg_fast_d2h_np is None and out_flat_g is not None and cg_pool_lock is not None:
                     try:
-                        cg_stream = torch.cuda.Stream(device=qmc_device)  # type: ignore[no-untyped-call]
+                        cg_stream = _get_qmc_cg_stream(qmc_device)
+                        _n_sh_ar = int(os.environ.get("DEEPVOL_LV_SHARDS", "128")) if want_lv_aad_sde else 1
+                        _nb_ar = max(
+                            64,
+                            n_stat_rows,
+                            n_pre_rows,
+                            int(bpk["n_stat_pad"]) if (use_cg_bucket and bpk is not None) else 0,
+                            int(bpk["n_pre_pad"]) if (use_cg_bucket and bpk is not None) else 0,
+                        )
+                        _nt_ev_ar = max(16, (r_chunk_eff * n_rep + 63) // 64)
+                        _ensure_qmc_cg_scratch_arena(
+                            qmc_device,
+                            d_eff_k,
+                            m_eff_k,
+                            n_sub,
+                            r_chunk_eff,
+                            n_rep,
+                            lv_nt,
+                            lv_ny,
+                            _n_sh_ar,
+                            _nb_ar,
+                            _nt_ev_ar,
+                            max(m_eff_k, int(m_rem_th_g)),
+                            max(d_eff_k, 16),
+                        )
                         cg_stream.wait_stream(torch.cuda.current_stream(qmc_device))
                         with torch.cuda.stream(cg_stream):
-                            _warm_z_cg = _get_z_indep_chunk_gpu(0, min(eff_r, r_chunk), allow_full_cache=False)
+                            if use_cg_bucket and bpk is not None:
+                                _warm_z_cg = _get_z_indep_chunk_gpu(
+                                    0,
+                                    min(eff_r, r_chunk_eff),
+                                    allow_full_cache=False,
+                                    shifts_ov=bpk["shifts"],
+                                    u_rot_ov=bpk["u_rot"],
+                                    m_pad_ov=m_eff_k,
+                                    d_pad_ov=d_eff_k,
+                                    cg_flags_ov=cg_flags_eff,
+                                    use_rt_flags=True,
+                                    use_cg_arena=True,
+                                )
+                            else:
+                                _warm_z_cg = _get_z_indep_chunk_gpu(
+                                    0,
+                                    min(eff_r, r_chunk_eff),
+                                    allow_full_cache=False,
+                                    use_cg_arena=True,
+                                )
                             if use_f32_step1 and (need_fwd_ckpt or need_spot_bumps or th_chunk_in_step1 or use_mf_cv):
-                                _ = torch.matmul(chol_f32_g_cached, _warm_z_cg)
+                                _warm_zc_cg = _alloc_cg_buf(
+                                    True,
+                                    qmc_device,
+                                    "z_corr",
+                                    (m_eff_k * n_sub, d_eff_k, min(eff_r, r_chunk_eff) * n_rep),
+                                    torch.float32,
+                                )
+                                torch.matmul(chol_f32_eff, _warm_z_cg, out=_warm_zc_cg)
+                                del _warm_zc_cg
                             del _warm_z_cg
                         cg_stream.synchronize()
                         torch.cuda.empty_cache()
@@ -11719,7 +15872,8 @@ def compute_qmc_aad_crn_greeks(
                 z_corr_full_f32: Optional[torch.Tensor] = None
                 z_corr_coarse_f32: Optional[torch.Tensor] = None
                 if (
-                    (not cg_capturing_now)
+                    (not use_cg_bucket)
+                    and (not cg_capturing_now)
                     and cg_fast_d2h_np is None
                     and use_f32_step1
                     and z_indep_full_f32 is not None
@@ -11745,14 +15899,41 @@ def compute_qmc_aad_crn_greeks(
                             )
                             _CRN_ZCORR_CACHE.put(z_corr_key, (z_corr_full_f32, z_corr_coarse_f32))
 
-                single_chunk = bool(eff_r <= r_chunk)
+                single_chunk = bool(eff_r <= r_chunk_eff)
+                defer_bwd_shard_sum = bool(
+                    fuse_m_sde
+                    and (not is_cont_ki_active)
+                    and (eff_r > r_chunk_eff)
+                    and (eff_r % r_chunk_eff == 0)
+                )
+                bar_q_acc_c: Optional[torch.Tensor] = None
+                bar_lv_acc_f32_c: Optional[torch.Tensor] = None
                 inv_sqrt_nsub_val = 1.0 / math.sqrt(float(n_sub))
-                for r_start in ([] if cg_fast_d2h_np is not None else range(0, eff_r, r_chunk)):
-                    r_end = min(eff_r, r_start + r_chunk)
+                for r_start in ([] if cg_fast_d2h_np is not None else range(0, eff_r, r_chunk_eff)):
+                    r_end = min(eff_r, r_start + r_chunk_eff)
                     r_cnt_c = r_end - r_start
                     n_chunk = r_cnt_c * n_rep
                     w_chunk = float(r_cnt_c) / float(eff_r)
-                    z_indep_f32_c = _get_z_indep_chunk_gpu(r_start, r_end, allow_full_cache=(not cg_capturing_now))
+                    if use_cg_bucket and bpk is not None:
+                        z_indep_f32_c = _get_z_indep_chunk_gpu(
+                            r_start,
+                            r_end,
+                            allow_full_cache=False,
+                            shifts_ov=bpk["shifts"],
+                            u_rot_ov=bpk["u_rot"],
+                            m_pad_ov=m_eff_k,
+                            d_pad_ov=d_eff_k,
+                            cg_flags_ov=cg_flags_eff,
+                            use_rt_flags=True,
+                            use_cg_arena=cg_capturing_now,
+                        )
+                    else:
+                        z_indep_f32_c = _get_z_indep_chunk_gpu(
+                            r_start,
+                            r_end,
+                            allow_full_cache=(not cg_capturing_now),
+                            use_cg_arena=cg_capturing_now,
+                        )
 
                     lx_period_c: Optional[torch.Tensor] = None
                     vib_lx_pre_c: Optional[torch.Tensor] = None
@@ -11768,7 +15949,14 @@ def compute_qmc_aad_crn_greeks(
                                 else z_corr_full_f32[:, :, r_start * n_rep : r_end * n_rep].contiguous()
                             )
                         else:
-                            z_corr_f32_mdn_c = torch.matmul(chol_f32_g_cached, z_indep_f32_c)
+                            z_corr_f32_mdn_c = _alloc_cg_buf(
+                                cg_capturing_now,
+                                qmc_device,
+                                "z_corr",
+                                (m_eff_k * n_sub, d_eff_k, n_chunk),
+                                torch.float32,
+                            )
+                            torch.matmul(chol_f32_eff, z_indep_f32_c, out=z_corr_f32_mdn_c)
                         if not (want_chol_aad_sde or use_vibrato_gamma or (need_stage2_aad and not fuse_m_sde)):
                             del z_indep_f32_c
                             z_indep_f32_c = dummy_f32_1
@@ -11776,13 +15964,20 @@ def compute_qmc_aad_crn_greeks(
                     perf_base_c: Optional[torch.Tensor] = None
                     norm_x_c: Optional[torch.Tensor] = None
                     if need_fwd_ckpt:
-                        lx_period_c = torch.empty((m_rem, d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
+                        lx_period_c = _alloc_cg_buf(
+                            cg_capturing_now,
+                            qmc_device,
+                            "lx_period",
+                            (m_eff_k, d_eff_k, n_chunk),
+                            torch.float32,
+                            zero=False,
+                        )
                         if use_vibrato_gamma:
-                            vib_lx_pre_c = torch.empty((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
-                            vib_j_pre_c = torch.empty((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
-                            vib_sig_pre_c = torch.empty((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
+                            vib_lx_pre_c = _alloc_cg_buf(cg_capturing_now, qmc_device, "vib_lx", (d_eff_k, n_chunk), torch.float32, zero=False)
+                            vib_j_pre_c = _alloc_cg_buf(cg_capturing_now, qmc_device, "vib_j", (d_eff_k, n_chunk), torch.float32, zero=False)
+                            vib_sig_pre_c = _alloc_cg_buf(cg_capturing_now, qmc_device, "vib_sig", (d_eff_k, n_chunk), torch.float32, zero=False)
                             vib_j_state_c = (
-                                torch.ones((d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
+                                torch.ones((d_eff_k, n_chunk), dtype=torch.float32, device=qmc_device)
                                 if not fuse_m_sde
                                 else dummy_f32_1
                             )
@@ -11792,20 +15987,27 @@ def compute_qmc_aad_crn_greeks(
                         z_fwd_in = z_corr_f32_mdn_c if z_corr_f32_mdn_c is not None else z_indep_f32_c
                         if fuse_m_sde:
                             if use_f32_perf_direct:
-                                perf_base_c = torch.empty((m_rem, d_assets, n_chunk), dtype=torch.float32, device=qmc_device)
+                                perf_base_c = _alloc_cg_buf(
+                                    cg_capturing_now,
+                                    qmc_device,
+                                    "perf_base",
+                                    (m_eff_k, d_eff_k, n_chunk),
+                                    torch.float32,
+                                    zero=False,
+                                )
                             _fast_triton_launch(
                                 _qmc_fwd_checkpoint_kernel,
-                                (1, r_cnt_c * d_assets),
+                                (1, r_cnt_c * d_eff_k),
                                 z_fwd_in,
                                 dummy_shifts_g,
-                                chol_f32_g_cached,
-                                lv_f32_g_cached,
-                                y_min_f32_g,
-                                inv_dy_f32_g,
-                                t_mid_ptr_g,
-                                dt_sub_ptr_g,
-                                sqrt_dt_ptr_g,
-                                q_shift_mid_ptr_g,
+                                chol_f32_eff,
+                                lv_f32_eff,
+                                y_min_f32_eff,
+                                inv_dy_f32_eff,
+                                t_mid_eff,
+                                dt_sub_eff,
+                                sqrt_dt_eff,
+                                q_shift_eff,
                                 dummy_shifts_g,
                                 dummy_f32_1,
                                 dummy_f32_1,
@@ -11814,14 +16016,16 @@ def compute_qmc_aad_crn_greeks(
                                 vib_j_pre_c if vib_j_pre_c is not None else dummy_f32_1,
                                 vib_sig_pre_c if vib_sig_pre_c is not None else dummy_f32_1,
                                 vib_j_state_c,
-                                fwd_perf_f32_step_g,
+                                fwd_f32_eff,
                                 perf_base_c if perf_base_c is not None else dummy_f32_1,
                                 inv_dt_f32_val,
-                                d_assets,
-                                m_rem,
+                                d_eff_k,
+                                m_eff_k,
                                 1,
                                 vib_period_idx,
                                 vib_sub_idx,
+                                cg_flags_ptr=cg_flags_eff,
+                                payoff_f64_ptr=pf64_eff if use_cg_bucket else None,
                                 n_rep=n_rep,
                                 n_sub=n_sub,
                                 N_t=lv_nt,
@@ -11830,9 +16034,10 @@ def compute_qmc_aad_crn_greeks(
                                 period_idx=0,
                                 FUSE_M=True,
                                 SAVE_VIBRATO=use_vibrato_gamma,
-                                VIB_PERIOD_LEVEL=vib_period_level,
+                                VIB_PERIOD_LEVEL=False if use_cg_bucket else vib_period_level,
                                 USE_Z_CORR=use_zc_fwd,
                                 EMIT_PERF=use_f32_perf_direct,
+                                USE_RT_FLAGS=use_cg_bucket,
                                 num_warps=nw_sde,
                             )
                         else:
@@ -11895,9 +16100,9 @@ def compute_qmc_aad_crn_greeks(
                         if perf_base_c is None:
                             if need_norm_x_kept:
                                 norm_x_c = torch.exp(lx_period_c.to(dtype=torch.float64)).transpose(0, 1).contiguous()
-                                perf_base_c = (norm_x_c * fwd_perf_g.unsqueeze(-1)).permute(1, 0, 2).contiguous()
+                                perf_base_c = (norm_x_c * fwd_f64_eff.unsqueeze(-1)).permute(1, 0, 2).contiguous()
                             else:
-                                perf_base_c = (torch.exp(lx_period_c.to(dtype=torch.float64)) * fwd_perf_g.T.unsqueeze(-1)).contiguous()
+                                perf_base_c = (torch.exp(lx_period_c.to(dtype=torch.float64)) * fwd_f64_eff.T.unsqueeze(-1)).contiguous()
                         if not need_stage2_aad:
                             del lx_period_c
                             lx_period_c = None
@@ -12002,15 +16207,15 @@ def compute_qmc_aad_crn_greeks(
                         )
                         bar_lx_post_c, bar_ln_fwd_c, bar_cf_wf_c = _compute_payoff_aad_state_adjoints_triton(
                             perf_base_c,
-                            ko_barriers=gpu_meta["ko"],
-                            is_callable=gpu_meta["is_call"],
-                            cpn_barriers=gpu_meta["cpn"],
-                            is_guar=gpu_meta["is_guar"],
-                            cpn_rates=gpu_meta["cpn_rates"],
-                            df_pay=gpu_meta["df_pay"],
-                            w_fund=gpu_meta["w_fund"],
-                            inv_perm_g=gpu_meta["inv_perm"],
-                            payoff_f64_g=gpu_meta["payoff_f64"],
+                            ko_barriers=ko_eff,
+                            is_callable=ic_eff,
+                            cpn_barriers=cp_eff,
+                            is_guar=ig_eff,
+                            cpn_rates=cr_eff,
+                            df_pay=df_eff,
+                            w_fund=wf_eff,
+                            inv_perm_g=inv_perm_eff,
+                            payoff_f64_g=pf64_eff,
                             call_code=call_code,
                             cpn_code=cpn_code,
                             eff_opt_code=eff_opt_code_s2,
@@ -12029,23 +16234,27 @@ def compute_qmc_aad_crn_greeks(
                             barrier_eps_min=barrier_eps_min,
                             barrier_eps_max=barrier_eps_max,
                             compute_cf_wf=want_cf_wf_aad,
-                            eps_g_cached=eps_aad_g,
+                            eps_g_cached=eps_eff,
                             n_rep=n_rep,
                             has_lower_strike=has_lower_strike_flag,
                             has_part_call=has_part_call_flag,
                             emit_stage1=emit_stage1_gpu,
                             out_stage1_rep_g=s1_chunk_g,
+                            cg_flags_g=cg_flags_eff,
+                            use_rt_flags=use_cg_bucket,
+                            d_pad_k=d_eff_k,
+                            use_cg_arena=cg_capturing_now,
                         )
                         if bar_ln_fwd_tot_g is not None:
                             if single_chunk:
                                 bar_ln_fwd_tot_g.copy_(bar_ln_fwd_c)
                             else:
-                                bar_ln_fwd_tot_g += w_chunk * bar_ln_fwd_c
+                                bar_ln_fwd_tot_g.add_(bar_ln_fwd_c, alpha=w_chunk)
                         if bar_cf_wf_tot_g is not None and bar_cf_wf_c is not None:
                             if single_chunk:
                                 bar_cf_wf_tot_g.copy_(bar_cf_wf_c)
                             else:
-                                bar_cf_wf_tot_g += w_chunk * bar_cf_wf_c
+                                bar_cf_wf_tot_g.add_(bar_cf_wf_c, alpha=w_chunk)
                         if not need_stage2_aad:
                             del bar_lx_post_c
                             bar_lx_post_c = None
@@ -12054,99 +16263,155 @@ def compute_qmc_aad_crn_greeks(
 
                     # Backpropagate bar_lx_post_c through rematerialized Platen substeps using parallel period shards.
                     if need_stage2_aad and bar_lx_post_c is not None and lx_period_c is not None:
-                        bar_q_c = (
-                            torch.zeros((d_assets, n_steps_tot_g), dtype=torch.float32, device=qmc_device)
-                            if want_q_aad_sde
-                            else dummy_f32_1
-                        )
-                        if fuse_m_sde:
-                            bar_lv_f32_c = (
-                                torch.zeros((d_assets, lv_nt, lv_ny), dtype=torch.float32, device=qmc_device)
-                                if want_lv_aad_sde
+                        want_q_launch = bool(want_q_aad_sde or (use_cg_bucket and bar_q_tot_g is not None))
+                        want_chol_launch = bool(want_chol_aad_sde or (use_cg_bucket and bar_chol_tot_g is not None))
+                        if defer_bwd_shard_sum:
+                            if bar_q_acc_c is None and want_q_launch:
+                                bar_q_acc_c = _alloc_cg_buf(
+                                    cg_capturing_now,
+                                    qmc_device,
+                                    "bar_q",
+                                    (d_eff_k, n_steps_eff_k),
+                                    torch.float32,
+                                    zero=True,
+                                )
+                            bar_q_c = bar_q_acc_c if (want_q_launch and bar_q_acc_c is not None) else dummy_f32_1
+                        else:
+                            bar_q_c = (
+                                _alloc_cg_buf(cg_capturing_now, qmc_device, "bar_q", (d_eff_k, n_steps_eff_k), torch.float32, zero=True)
+                                if want_q_launch
                                 else dummy_f32_1
                             )
-                            bar_zc_c = (
-                                torch.empty(
-                                    (n_steps_tot_g, d_assets, n_chunk),
-                                    dtype=torch.float32,
-                                    device=qmc_device,
+                        if fuse_m_sde:
+                            n_lv_shards_bwd = int(os.environ.get("DEEPVOL_LV_SHARDS", "128")) if want_lv_aad_sde else 1
+                            if defer_bwd_shard_sum:
+                                if bar_lv_acc_f32_c is None and want_lv_aad_sde:
+                                    bar_lv_acc_f32_c = _alloc_cg_buf(
+                                        cg_capturing_now,
+                                        qmc_device,
+                                        "bar_lv",
+                                        (n_lv_shards_bwd, d_eff_k, lv_nt, lv_ny),
+                                        torch.float32,
+                                        zero=True,
+                                    )
+                                bar_lv_f32_c = bar_lv_acc_f32_c if (want_lv_aad_sde and bar_lv_acc_f32_c is not None) else dummy_f32_1
+                            else:
+                                bar_lv_f32_c = (
+                                    _alloc_cg_buf(
+                                        cg_capturing_now,
+                                        qmc_device,
+                                        "bar_lv",
+                                        (n_lv_shards_bwd, d_eff_k, lv_nt, lv_ny),
+                                        torch.float32,
+                                        zero=True,
+                                    )
+                                    if want_lv_aad_sde
+                                    else dummy_f32_1
                                 )
-                                if want_chol_aad_sde
+                            bar_zc_c = (
+                                _alloc_cg_buf(
+                                    cg_capturing_now,
+                                    qmc_device,
+                                    "z_raw_or_bzc",
+                                    (n_steps_eff_k, d_eff_k, n_chunk),
+                                    torch.float32,
+                                    zero=use_cg_bucket,
+                                )
+                                if want_chol_launch
                                 else dummy_f32_1
                             )
                             use_zc_bwd = bool(z_corr_f32_mdn_c is not None)
                             z_bwd_prop_in = z_corr_f32_mdn_c if z_corr_f32_mdn_c is not None else z_indep_f32_c
                             _fast_triton_launch(
                                 _qmc_bwd_state_prop_kernel,
-                                (1, r_cnt_c * d_assets),
+                                (1, r_cnt_c * d_eff_k),
                                 z_bwd_prop_in,
-                                chol_f32_g_cached,
-                                lv_f32_g_cached,
-                                y_min_f32_g,
-                                inv_dy_f32_g,
-                                t_mid_ptr_g,
-                                dt_sub_ptr_g,
-                                sqrt_dt_ptr_g,
-                                q_shift_mid_ptr_g,
+                                chol_f32_eff,
+                                lv_f32_eff,
+                                y_min_f32_eff,
+                                inv_dy_f32_eff,
+                                t_mid_eff,
+                                dt_sub_eff,
+                                sqrt_dt_eff,
+                                q_shift_eff,
                                 bar_lx_post_c,
                                 lx_period_c,
                                 dummy_f32_1,
                                 inv_dt_f32_val,
-                                d_assets,
-                                m_rem,
+                                d_eff_k,
+                                m_eff_k,
+                                cg_flags_ptr=cg_flags_eff,
+                                payoff_f64_ptr=pf64_eff if use_cg_bucket else None,
                                 n_rep=n_rep,
                                 n_sub=n_sub,
                                 N_t=lv_nt,
                                 N_y=lv_ny,
                                 BLOCK_N=block_n_sde,
                                 USE_Z_CORR=use_zc_bwd,
+                                USE_RT_FLAGS=use_cg_bucket,
                                 num_warps=nw_sde,
                             )
-                            if want_lv_aad_sde or want_chol_aad_sde or want_q_aad_sde:
+                            if want_lv_aad_sde or want_chol_launch or want_q_launch:
                                 bwd_bn_cap = int(os.environ.get("DEEPVOL_BWD_BN", "128"))
                                 bwd_nw = int(os.environ.get("DEEPVOL_BWD_NW", "4"))
                                 block_p2_sde = min(bwd_bn_cap, max(32, _next_power_of_two_int(n_rep)))
                                 n_tiles_p2_sde = (n_rep + block_p2_sde - 1) // block_p2_sde
                                 _fast_triton_launch(
                                     _qmc_bwd_period_scatter_kernel,
-                                    (n_tiles_p2_sde, m_rem * r_cnt_c * d_assets),
+                                    (n_tiles_p2_sde, m_eff_k * r_cnt_c * d_eff_k),
                                     z_indep_f32_c,
                                     z_bwd_prop_in,
-                                    chol_f32_g_cached,
-                                    lv_f32_g_cached,
-                                    y_min_f32_g,
-                                    inv_dy_f32_g,
-                                    t_mid_ptr_g,
-                                    dt_sub_ptr_g,
-                                    sqrt_dt_ptr_g,
-                                    q_shift_mid_ptr_g,
+                                    chol_f32_eff,
+                                    lv_f32_eff,
+                                    y_min_f32_eff,
+                                    inv_dy_f32_eff,
+                                    t_mid_eff,
+                                    dt_sub_eff,
+                                    sqrt_dt_eff,
+                                    q_shift_eff,
                                     bar_lx_post_c,
                                     lx_period_c,
                                     bar_lv_f32_c,
                                     bar_zc_c,
                                     bar_q_c,
                                     inv_dt_f32_val,
-                                    d_assets,
-                                    m_rem,
+                                    d_eff_k,
+                                    m_eff_k,
                                     r_cnt_c,
+                                    cg_flags_ptr=cg_flags_eff,
+                                    payoff_f64_ptr=pf64_eff if use_cg_bucket else None,
                                     n_rep=n_rep,
                                     n_sub=n_sub,
                                     N_t=lv_nt,
                                     N_y=lv_ny,
                                     BLOCK_N=block_p2_sde,
-                                    N_LV_SHARDS=1,
+                                    N_LV_SHARDS=n_lv_shards_bwd,
                                     COMPUTE_LV_AAD=want_lv_aad_sde,
-                                    COMPUTE_CHOL_AAD=want_chol_aad_sde,
-                                    COMPUTE_Q_AAD=want_q_aad_sde,
+                                    COMPUTE_CHOL_AAD=want_chol_launch,
+                                    COMPUTE_Q_AAD=want_q_launch,
                                     USE_Z_CORR=use_zc_bwd,
+                                    USE_RT_FLAGS=use_cg_bucket,
                                     num_warps=bwd_nw,
                                 )
                             if want_lv_aad_sde and bar_lv_tot_g is not None:
-                                if single_chunk and (not is_cont_ki_active):
-                                    bar_lv_tot_g.copy_(bar_lv_f32_c)
+                                if defer_bwd_shard_sum:
+                                    if r_end == eff_r:
+                                        if n_lv_shards_bwd > 1:
+                                            torch.sum(bar_lv_f32_c, dim=0, dtype=torch.float64, out=bar_lv_tot_g)
+                                        else:
+                                            bar_lv_tot_g.copy_(bar_lv_f32_c[0])
+                                        bar_lv_tot_g.mul_(w_chunk)
+                                        bar_lv_acc_f32_c = None
+                                elif n_lv_shards_bwd > 1:
+                                    if single_chunk and (not is_cont_ki_active):
+                                        torch.sum(bar_lv_f32_c, dim=0, dtype=torch.float64, out=bar_lv_tot_g)
+                                    else:
+                                        bar_lv_tot_g += w_chunk * bar_lv_f32_c.sum(dim=0, dtype=torch.float64)
+                                elif single_chunk and (not is_cont_ki_active):
+                                    bar_lv_tot_g.copy_(bar_lv_f32_c[0])
                                 else:
-                                    bar_lv_tot_g += w_chunk * bar_lv_f32_c.to(dtype=torch.float64)
-                            if want_chol_aad_sde and bar_chol_tot_g is not None:
+                                    bar_lv_tot_g += w_chunk * bar_lv_f32_c[0].to(dtype=torch.float64)
+                            if want_chol_launch and bar_chol_tot_g is not None:
                                 if single_chunk:
                                     torch.sum(
                                         torch.bmm(bar_zc_c, z_indep_f32_c.transpose(1, 2)),
@@ -12155,9 +16420,10 @@ def compute_qmc_aad_crn_greeks(
                                         out=bar_chol_tot_g,
                                     )
                                 else:
-                                    bar_chol_tot_g += w_chunk * torch.bmm(
-                                        bar_zc_c, z_indep_f32_c.transpose(1, 2)
-                                    ).sum(dim=0, dtype=torch.float64)
+                                    bar_chol_tot_g.add_(
+                                        torch.bmm(bar_zc_c, z_indep_f32_c.transpose(1, 2)).sum(dim=0, dtype=torch.float64),
+                                        alpha=w_chunk,
+                                    )
                             del bar_lv_f32_c, bar_zc_c
                         else:
                             bar_lv_f32_c = (
@@ -12216,8 +16482,16 @@ def compute_qmc_aad_crn_greeks(
                             if want_chol_aad_sde and bar_chol_tot_g is not None:
                                 bar_chol_tot_g += w_chunk * bar_chol_c.to(dtype=torch.float64)
                             del bar_lv_f32_c, bar_chol_c
-                        if want_q_aad_sde and bar_q_tot_g is not None:
-                            bar_q_tot_g += w_chunk * bar_q_c.to(dtype=torch.float64)
+                        if want_q_launch and bar_q_tot_g is not None:
+                            if defer_bwd_shard_sum:
+                                if r_end == eff_r:
+                                    bar_q_tot_g.copy_(bar_q_c)
+                                    bar_q_tot_g.mul_(w_chunk)
+                                    bar_q_acc_c = None
+                            elif single_chunk:
+                                bar_q_tot_g.copy_(bar_q_c)
+                            else:
+                                bar_q_tot_g += w_chunk * bar_q_c.to(dtype=torch.float64)
                         del bar_q_c
                     if bar_lx_post_c is not None:
                         del bar_lx_post_c
@@ -12228,19 +16502,36 @@ def compute_qmc_aad_crn_greeks(
                     frozen_term_c: Optional[torch.Tensor] = None
                     if use_vibrato_gamma:
                         assert vib_lx_pre_c is not None and vib_j_pre_c is not None and vib_sig_pre_c is not None
-                        assert l_inv_t_g is not None and c_inv_g is not None and cdl_m_g is not None and cdl2_last_g is not None
+                        assert l_inv_t_eff is not None and c_inv_eff is not None and cdl_m_eff is not None and cdl2_last_eff is not None
                         assert h_vib_tot_g is not None
                         block_nv = min(128, max(32, _next_power_of_two_int(n_chunk)))
                         grid_nv = (n_chunk + block_nv - 1) // block_nv
                         use_f32_vib_pre = bool(os.environ.get("DEEPVOL_VIB_F32", "1") == "1")
-                        d_ln_surv_tmp_c = torch.empty(
-                            ((2 * d_assets if is_memory else d_assets), n_chunk),
-                            dtype=torch.float32 if use_f32_vib_pre else torch.float64,
-                            device=qmc_device,
+                        d_ln_surv_tmp_c = _alloc_cg_buf(
+                            cg_capturing_now,
+                            qmc_device,
+                            "d_ln_surv",
+                            ((2 * d_eff_k if (use_cg_bucket or is_memory) else d_eff_k), n_chunk),
+                            torch.float32 if use_f32_vib_pre else torch.float64,
+                            zero=False,
                         )
-                        h_vib_out_c = torch.empty((grid_nv, d_assets, d_assets), dtype=torch.float64, device=qmc_device)
-                        if m_rem > 1:
-                            frozen_term_c = torch.empty((4, n_chunk), dtype=torch.float64, device=qmc_device)
+                        h_vib_out_g = _alloc_cg_buf(
+                            cg_capturing_now,
+                            qmc_device,
+                            "h_vib_out",
+                            (grid_nv, d_eff_k, d_eff_k),
+                            torch.float64,
+                            zero=use_cg_bucket,
+                        )
+                        if use_cg_bucket or m_rem > 1:
+                            frozen_term_c = _alloc_cg_buf(
+                                cg_capturing_now,
+                                qmc_device,
+                                "frozen_term",
+                                (4, n_chunk),
+                                torch.float64,
+                                zero=False,
+                            )
                         _fast_triton_launch(
                             _vibrato_gamma_f64_kernel,
                             (grid_nv,),
@@ -12249,56 +16540,97 @@ def compute_qmc_aad_crn_greeks(
                             vib_j_pre_c,
                             vib_sig_pre_c,
                             z_indep_f32_c,
-                            chol_f64_g,
-                            l_inv_t_g,
-                            c_inv_g,
-                            fwd_perf_g[:, m_rem - 1].contiguous(),
-                            cdl_m_g,
-                            cdl2_last_g,
-                            gpu_meta["ko"],
-                            gpu_meta["is_call"],
-                            gpu_meta["cpn"],
-                            gpu_meta["is_guar"],
-                            gpu_meta["cpn_rates"],
-                            eps_aad_g,
-                            gpu_meta["inv_perm"],
-                            gpu_meta["payoff_f64"],
+                            chol_f64_eff,
+                            l_inv_t_eff,
+                            c_inv_eff,
+                            fwd_f64_eff if use_cg_bucket else fwd_perf_g[:, m_rem - 1].contiguous(),
+                            cdl_m_eff,
+                            cdl2_last_eff,
+                            ko_eff,
+                            ic_eff,
+                            cp_eff,
+                            ig_eff,
+                            cr_eff,
+                            eps_eff,
+                            inv_perm_eff,
+                            pf64_eff,
                             d_ln_surv_tmp_c,
                             frozen_term_c,
-                            h_vib_out_c,
+                            h_vib_out_g,
                             df_last_val,
                             h_vib_val,
                             vib_step_start,
                             vib_n_steps,
-                            d_assets,
-                            m_rem,
+                            d_eff_k,
+                            m_eff_k,
                             n_chunk,
-                            CALL_CODE=call_code,
-                            CPN_CODE=cpn_code,
-                            EFF_OPT_CODE=eff_opt_code_s2,
-                            HAS_KI=has_ki,
-                            KI_ACTIVE=bool(has_ki and b_ki > 0.0 and float(state.i_ki_past) < 0.5),
-                            HAS_ONE_STAR=bool(k_os > 0.0),
-                            IS_MEM=is_memory,
-                            IS_LONG=is_long_flag,
-                            NO_NOTIONAL=no_notional,
-                            FORCE_CPN_AC=force_cpn_ac,
-                            CPN_DIR_DOWN=dir_down,
-                            CPN_TYPE_OUT=type_out,
-                            HAS_LOWER_STRIKE=has_lower_strike_flag,
-                            HAS_PART_CALL=has_part_call_flag,
+                            cg_flags_ptr=cg_flags_eff,
+                            CALL_CODE=0 if use_cg_bucket else call_code,
+                            CPN_CODE=0 if use_cg_bucket else cpn_code,
+                            EFF_OPT_CODE=0 if use_cg_bucket else eff_opt_code_s2,
+                            HAS_KI=False if use_cg_bucket else has_ki,
+                            KI_ACTIVE=False if use_cg_bucket else bool(has_ki and b_ki > 0.0 and float(state.i_ki_past) < 0.5),
+                            HAS_ONE_STAR=False if use_cg_bucket else bool(k_os > 0.0),
+                            IS_MEM=False if use_cg_bucket else is_memory,
+                            IS_LONG=False if use_cg_bucket else is_long_flag,
+                            NO_NOTIONAL=False if use_cg_bucket else no_notional,
+                            FORCE_CPN_AC=False if use_cg_bucket else force_cpn_ac,
+                            CPN_DIR_DOWN=False if use_cg_bucket else dir_down,
+                            CPN_TYPE_OUT=False if use_cg_bucket else type_out,
+                            HAS_LOWER_STRIKE=True if use_cg_bucket else has_lower_strike_flag,
+                            HAS_PART_CALL=False if use_cg_bucket else has_part_call_flag,
                             BLOCK_N=block_nv,
                             USE_F32_PRE=use_f32_vib_pre,
+                            USE_RT_FLAGS=use_cg_bucket,
+                            D_PAD=d_eff_k if use_cg_bucket else 0,
+                            N_SUB_PAD=n_sub,
                             num_warps=4,
                         )
                         if single_chunk:
-                            torch.sum(h_vib_out_c, dim=0, out=h_vib_tot_g)
+                            torch.sum(h_vib_out_g, dim=0, out=h_vib_tot_g)
                         else:
-                            h_vib_tot_g += w_chunk * h_vib_out_c.sum(dim=0)
-                        del d_ln_surv_tmp_c, h_vib_out_c, vib_lx_pre_c, vib_j_pre_c, vib_sig_pre_c
+                            h_vib_tot_g.add_(h_vib_out_g.sum(dim=0), alpha=w_chunk)
+                        del d_ln_surv_tmp_c, h_vib_out_g, vib_lx_pre_c, vib_j_pre_c, vib_sig_pre_c
 
                     if use_mf_cv and s1_gbm_crn_g is not None and chol_scaled_f32_g is not None:
-                        if z_corr_coarse_f32 is not None:
+                        if use_cg_bucket and bpk is not None and z_corr_f32_mdn_c is not None:
+                            zc_crn_mdn = _alloc_cg_buf(
+                                cg_capturing_now,
+                                qmc_device,
+                                "lx_period",
+                                (m_eff_k, d_eff_k, n_chunk),
+                                torch.float32,
+                            )
+                            torch.sum(z_corr_f32_mdn_c.view(m_eff_k, n_sub, d_eff_k, n_chunk), dim=1, out=zc_crn_mdn)
+                            _run_mf_gbm_batch(
+                                zc_crn_mdn,
+                                s1_gbm_crn_g[r_start:r_end],
+                                cf_surv_gbm_crn_g[r_start:r_end] if cf_surv_gbm_crn_g is not None else None,
+                                layout_mdn=True,
+                                r_b_ov=r_cnt_c,
+                                n_rep_ov=n_rep,
+                                z_scale_val=inv_sqrt_nsub_val,
+                                pre_zeroed=True,
+                                d_pad_ov=d_eff_k,
+                                m_pad_ov=m_eff_k,
+                                d_var_ov=bpk["d_var_f32"],
+                                fwd_ov=bpk["fwd_pad_f32"],
+                                df_ov=bpk["df_pay_f32"],
+                                wf_ov=bpk["w_fund_f32"],
+                                ko_ov=bpk["ko_f32"],
+                                ic_ov=bpk["is_call_f32"],
+                                cp_ov=bpk["cpn_f32"],
+                                ig_ov=bpk["is_guar_f32"],
+                                cr_ov=bpk["cpn_rates_f32"],
+                                eps_ov=bpk["eps_f32"],
+                                payoff_ov=bpk["payoff_f32_15"],
+                                cg_flags_ov=cg_flags_eff,
+                                use_rt_flags=True,
+                                inv_perm_ov=bpk["inv_perm"],
+                                use_cg_arena=cg_capturing_now,
+                            )
+                            del zc_crn_mdn
+                        elif z_corr_coarse_f32 is not None:
                             zc_crn_mdn = (
                                 z_corr_coarse_f32
                                 if single_chunk
@@ -12352,22 +16684,28 @@ def compute_qmc_aad_crn_greeks(
                     perf_sp_pm_c: Optional[torch.Tensor] = None
                     alt_sp_cg_c: Optional[torch.Tensor] = None
                     if need_spot_bumps:
-                        assert sp_pm_meta_g is not None and lv_sp_pm_g is not None and fwd_sp_pm_g is not None
+                        assert sp_pm_meta_eff is not None and lv_sp_pm_eff is not None and fwd_sp_pm_eff is not None
                         if z_corr_f32_mdn_c is not None:
                             perf_sp_pm_c = _gpu_step_1d_f64(
-                                lv_sp_pm_g,
+                                lv_sp_pm_eff,
                                 z_corr_f32_mdn_c,
-                                tau_step_g[:m_rem],
-                                rn_step_g[: d_assets * m_rem].view(d_assets, m_rem),
-                                rt_step_g[: d_assets * m_rem].view(d_assets, m_rem),
+                                tau_f64_eff,
+                                rn_f64_eff,
+                                rt_f64_eff,
                                 2,
-                                meta_lv_t=sp_pm_meta_g[0],
-                                meta_r_t=sp_pm_meta_g[1],
-                                meta_z_t=sp_pm_meta_g[2],
+                                m_periods=m_eff_k,
+                                meta_lv_t=sp_pm_meta_eff[0],
+                                meta_r_t=sp_pm_meta_eff[1],
+                                meta_z_t=sp_pm_meta_eff[2],
+                                y_min_vec_t=y_min_f64_eff,
+                                inv_dy_vec_t=inv_dy_f64_eff,
+                                inv_dt_vec_t=inv_dt_f64_eff,
                                 z_layout_mdn=True,
-                                fwd_perf_scale_t=fwd_sp_pm_g,
+                                fwd_perf_scale_t=fwd_sp_pm_eff,
                                 out_mdn=False,
                                 out_f32=use_f32_perf_direct,
+                                use_cg_arena=cg_capturing_now,
+                                cg_arena_slot="perf_aux",
                             )
                         else:
                             assert z_corr_c is not None
@@ -12384,7 +16722,7 @@ def compute_qmc_aad_crn_greeks(
                             )
                             perf_sp_pm_c = (nx_sp_c * fwd_sp_pm_g.unsqueeze(-1)).contiguous()
                             del nx_sp_c
-                        if need_sp_cg_alt_g or (pre_pack is not None and not want_gamma):
+                        if (not use_cg_bucket) and (need_sp_cg_alt_g or (pre_pack is not None and not want_gamma)):
                             alt_sp_cg_c = torch.stack(
                                 [
                                     perf_sp_pm_c[:d_assets].permute(1, 0, 2),
@@ -12393,7 +16731,7 @@ def compute_qmc_aad_crn_greeks(
                                 dim=0,
                             ).contiguous()
 
-                    if stat_pack is not None and stat_acc_g is not None:
+                    if stat_pack_eff is not None and stat_acc_g is not None:
                         stat_mc_c = _run_loo_l2o_eval(
                             perf_base_c,
                             perf_sp_pm_c,
@@ -12406,14 +16744,28 @@ def compute_qmc_aad_crn_greeks(
                             alt_perf=alt_sp_cg_c if need_sp_cg_alt_g else None,
                             return_gpu=True,
                             pure_mc=True,
-                            static_gpu_pack=stat_pack,
+                            static_gpu_pack=stat_pack_eff,
+                            m_periods=m_eff_k,
+                            ko_ov=ko_eff,
+                            is_call_ov=ic_eff,
+                            cpn_ov=cp_eff,
+                            is_guar_ov=ig_eff,
+                            cpn_rates_ov=cr_eff,
+                            payoff_f64_ov=pf64_eff,
+                            inv_perm_ov=inv_perm_eff,
+                            eps_vec_g=eps_eff,
                             i_ki_ext_g=i_ki_ext_c,
                             out_pv_g=stat_acc_g if single_chunk else None,
+                            d_pad_rt=d_eff_k,
+                            cg_flags_g=cg_flags_eff,
+                            use_rt_flags=use_cg_bucket,
+                            cg_bumps_idx=16 if use_cg_bucket else -1,
+                            use_cg_arena=cg_capturing_now,
                         )
                         if not single_chunk:
-                            stat_acc_g += w_chunk * stat_mc_c
+                            stat_acc_g.add_(stat_mc_c, alpha=w_chunk)
 
-                    if pre_pack is not None and pv_preterm_g is not None and frozen_term_c is not None:
+                    if pre_pack_eff is not None and pv_preterm_g is not None and frozen_term_c is not None:
                         pre_mc_c = _run_loo_l2o_eval(
                             perf_base_c,
                             perf_sp_pm_c if want_gamma else None,
@@ -12426,15 +16778,28 @@ def compute_qmc_aad_crn_greeks(
                             alt_perf=alt_sp_cg_c if (not want_gamma) else None,
                             return_gpu=True,
                             pure_mc=True,
-                            static_gpu_pack=pre_pack,
-                            eps_vec_g=eps_aad_g,
+                            static_gpu_pack=pre_pack_eff,
+                            m_periods=m_eff_k,
+                            ko_ov=ko_eff,
+                            is_call_ov=ic_eff,
+                            cpn_ov=cp_eff,
+                            is_guar_ov=ig_eff,
+                            cpn_rates_ov=cr_eff,
+                            payoff_f64_ov=pf64_eff,
+                            inv_perm_ov=inv_perm_eff,
+                            eps_vec_g=eps_eff,
                             frozen_term_g=frozen_term_c,
                             use_c2_preterm=True,
                             use_frozen_term=True,
                             out_pv_g=pv_preterm_g if single_chunk else None,
+                            d_pad_rt=d_eff_k,
+                            cg_flags_g=cg_flags_eff,
+                            use_rt_flags=use_cg_bucket,
+                            cg_bumps_idx=17 if use_cg_bucket else -1,
+                            use_cg_arena=cg_capturing_now,
                         )
                         if not single_chunk:
-                            pv_preterm_g += w_chunk * pre_mc_c
+                            pv_preterm_g.add_(pre_mc_c, alpha=w_chunk)
 
                     if dyn_entries and gpu_eval_pv_g is not None:
                         assert norm_x_c is not None
@@ -12488,7 +16853,64 @@ def compute_qmc_aad_crn_greeks(
                         del i_ki_ext_c
                     del perf_base_c
 
-                    if th_chunk_in_step1 and th_pack is not None and pv_th_fused_g is not None and th_prep is not None:
+                    if use_cg_bucket and bpk is not None and pv_th_fused_g is not None and z_corr_f32_mdn_c is not None:
+                        perf_th_c = _gpu_step_1d_f64(
+                            bpk["lv_th_f32"],
+                            z_corr_f32_mdn_c,
+                            bpk["tau_th_f64"],
+                            bpk["rn_th_f64"],
+                            bpk["rt_th_f64"],
+                            2,
+                            m_periods=m_eff_k,
+                            meta_lv_t=bpk["id_d"],
+                            meta_r_t=bpk["id_d"],
+                            meta_z_t=bpk["id_d"],
+                            y_min_vec_t=y_min_f64_eff,
+                            inv_dy_vec_t=inv_dy_f64_eff,
+                            inv_dt_vec_t=bpk["inv_dt_th_f64"],
+                            z_layout_mdn=True,
+                            fwd_perf_scale_t=bpk["fwd_th_f64"],
+                            out_mdn=True,
+                            out_f32=use_f32_perf_direct,
+                            use_cg_arena=cg_capturing_now,
+                            cg_arena_slot="perf_aux",
+                            cg_th_flags_g=bpk["th_cg_flags"],
+                            use_th_rt_flags=True,
+                        )
+                        del z_corr_f32_mdn_c
+                        z_corr_f32_mdn_c = None
+                        th_mc_c = _run_loo_l2o_eval(
+                            perf_th_c,
+                            None,
+                            None,
+                            np.empty(0, dtype=np.int32),
+                            np.empty(0, dtype=np.int32),
+                            None,
+                            None,
+                            None,
+                            return_gpu=True,
+                            pure_mc=True,
+                            static_gpu_pack=bpk["th_pack"],
+                            m_periods=m_eff_k,
+                            ko_ov=bpk["ko_th_f64"],
+                            is_call_ov=bpk["ic_th_f64"],
+                            cpn_ov=bpk["cp_th_f64"],
+                            is_guar_ov=bpk["ig_th_f64"],
+                            cpn_rates_ov=bpk["cr_th_f64"],
+                            payoff_f64_ov=bpk["th_payoff_f64_18"],
+                            inv_perm_ov=bpk["inv_perm"],
+                            eps_vec_g=bpk["eps_th_f64"],
+                            out_pv_g=pv_th_fused_g if single_chunk else None,
+                            d_pad_rt=d_eff_k,
+                            cg_flags_g=bpk["th_cg_flags"],
+                            use_rt_flags=True,
+                            cg_bumps_idx=16,
+                            use_cg_arena=cg_capturing_now,
+                        )
+                        if not single_chunk:
+                            pv_th_fused_g.add_(th_mc_c, alpha=w_chunk)
+                        del perf_th_c
+                    elif th_chunk_in_step1 and th_pack is not None and pv_th_fused_g is not None and th_prep is not None:
                         assert lv_th_g is not None and fwd_th_g is not None
                         if z_corr_f32_mdn_c is not None:
                             z_th_mdn = z_corr_f32_mdn_c if k_cross_g == 0 else z_corr_f32_mdn_c[k_cross_g * n_sub :]
@@ -12510,6 +16932,8 @@ def compute_qmc_aad_crn_greeks(
                                 fwd_perf_scale_t=fwd_th_g,
                                 out_mdn=True,
                                 out_f32=use_f32_perf_direct,
+                                use_cg_arena=cg_capturing_now,
+                                cg_arena_slot="perf_aux",
                             )
                             del z_th_mdn
                         else:
@@ -12612,9 +17036,10 @@ def compute_qmc_aad_crn_greeks(
                             eps_vec_g=eps_th_g,
                             i_ki_ext_g=i_ki_th_c,
                             out_pv_g=pv_th_fused_g if single_chunk else None,
+                            use_cg_arena=cg_capturing_now,
                         )
                         if not single_chunk:
-                            pv_th_fused_g += w_chunk * th_mc_c
+                            pv_th_fused_g.add_(th_mc_c, alpha=w_chunk)
                         del perf_th_c
                         if i_ki_th_c is not None:
                             del i_ki_th_c
@@ -12691,6 +17116,12 @@ def compute_qmc_aad_crn_greeks(
                         cg_stream_entered = False
                         cg_stream_ctx.__exit__(None, None, None)
                     GLOBAL_GPU_CACHE_MANAGER.account_pool_capture_bytes(qmc_device, cg_before_stats_qmc)
+                    # Detach _CRN_DEAL_PREP_CACHE entry so subsequent deals copying into cg_hit["in_bufs"] cannot mutate cached deal tensors.
+                    if warm_bundle_key is not None:
+                        _CRN_DEAL_PREP_CACHE.remove(warm_bundle_key)
+                    if _warm_gpu is not None:
+                        _warm_gpu.cg_bucket_pack = None
+                        _warm_gpu.cg_meta_cache.clear()
                     _CRN_QMC_CG_CACHE.put(
                         cg_shape_key,
                         {
@@ -12745,19 +17176,36 @@ def compute_qmc_aad_crn_greeks(
                     sp_t = pack_spans.get(tag)
                     if sp_t is None:
                         return None
-                    return flat_d2h_np[sp_t[0] : sp_t[1]].reshape(sp_t[2]).copy()
+                    return flat_d2h_np[sp_t[0] : sp_t[1]].reshape(sp_t[2])
+
+                def _compact_s1_arr(arr: npt.NDArray[np.float64], tail_k: int) -> npt.NDArray[np.float64]:
+                    if (not use_cg_bucket) or m_eff_k == m_rem:
+                        return arr
+                    return np.ascontiguousarray(
+                        np.concatenate(
+                            [
+                                arr[:, :m_rem],
+                                arr[:, m_eff_k : m_eff_k + m_rem],
+                                arr[:, 2 * m_eff_k : 2 * m_eff_k + m_rem],
+                                arr[:, 3 * m_eff_k : 3 * m_eff_k + tail_k],
+                            ],
+                            axis=1,
+                        )
+                    )
 
                 s1_arr_out = _take_d2h("stage1")
                 if s1_arr_out is not None:
-                    stage1_rep_np = s1_arr_out
+                    stage1_rep_np = _compact_s1_arr(s1_arr_out, 6)
                 ev_arr_out = _take_d2h("eval_pv")
                 if ev_arr_out is not None:
+                    if use_cg_bucket:
+                        ev_arr_out = ev_arr_out[:gpu_eval_rows_total]
                     if stat_direct_alias and stat_itr_np is not None:
                         ev_arr_out = ev_arr_out + stat_itr_np
                     pq_chunks.append(ev_arr_out)
                 pt_arr_out = _take_d2h("preterm")
-                if pt_arr_out is not None:
-                    pv_preterm_np = pt_arr_out
+                if pt_arr_out is not None and use_vibrato_gamma and m_rem > 1 and n_pre_rows > 0:
+                    pv_preterm_np = pt_arr_out[:n_pre_rows] if use_cg_bucket else pt_arr_out
                 th_arr_out = _take_d2h("th_fused")
                 if th_arr_out is not None:
                     if th_prep is not None:
@@ -12765,28 +17213,31 @@ def compute_qmc_aad_crn_greeks(
                     pv_th_fused_np = th_arr_out
                 hv_arr_out = _take_d2h("h_vib")
                 if hv_arr_out is not None:
-                    h_vib_np = hv_arr_out
+                    h_vib_np = hv_arr_out[:d_assets, :d_assets] if use_cg_bucket else hv_arr_out
                 bc_arr_out = _take_d2h("bar_chol")
-                if bc_arr_out is not None:
-                    bar_chol_aad = bc_arr_out
+                if bc_arr_out is not None and want_chol_aad_sde:
+                    bar_chol_aad = bc_arr_out[:d_assets, :d_assets] if use_cg_bucket else bc_arr_out
                 bsc_arr_out = _take_d2h("bar_sigma_cont")
                 if bsc_arr_out is not None:
                     bar_sigma_cont_np = bsc_arr_out
                 blv_arr_out = _take_d2h("bar_lv")
-                if blv_arr_out is not None:
-                    bar_lv_np = blv_arr_out
+                if blv_arr_out is not None and (want_lv_aad_sde or (need_stage2_aad and is_cont_ki_active)):
+                    bar_lv_np = blv_arr_out[:d_assets, :, :] if use_cg_bucket else blv_arr_out
                 bq_arr_out = _take_d2h("bar_q")
-                if bq_arr_out is not None:
-                    bar_q_shift_np = bq_arr_out
+                if bq_arr_out is not None and want_q_aad_sde:
+                    bar_q_shift_np = bq_arr_out[:d_assets, :n_steps_tot_g] if use_cg_bucket else bq_arr_out
                 blf_arr_out = _take_d2h("bar_lnf")
                 if blf_arr_out is not None:
-                    bar_ln_fwd_np = blf_arr_out
+                    bar_ln_fwd_np = blf_arr_out[:d_assets, :m_rem] if use_cg_bucket else blf_arr_out
                 bcf_arr_out = _take_d2h("bar_cf_wf")
                 if bcf_arr_out is not None:
-                    bar_cf_np = bcf_arr_out[0]
-                    bar_surv_np = bcf_arr_out[1]
-                s1_gbm_crn_np = _take_d2h("s1_gbm_crn")
-                cf_surv_crn_out = _take_d2h("cf_surv_gbm_crn")
+                    bcf_sl = bcf_arr_out[:, :m_rem] if use_cg_bucket else bcf_arr_out
+                    bar_cf_np = bcf_sl[0]
+                    bar_surv_np = bcf_sl[1]
+                s1_gbm_crn_raw = _take_d2h("s1_gbm_crn")
+                s1_gbm_crn_np = _compact_s1_arr(s1_gbm_crn_raw, 5) if s1_gbm_crn_raw is not None else None
+                cf_surv_crn_raw = _take_d2h("cf_surv_gbm_crn")
+                cf_surv_crn_out = cf_surv_crn_raw[:, :, :m_rem].copy() if (cf_surv_crn_raw is not None and use_cg_bucket) else cf_surv_crn_raw
                 se_mu_mf_cached: Optional[float] = None
                 if mf_cheap_hit is not None:
                     s1_gbm_cheap_np, cf_surv_cheap_out, se_mu_mf_cached = mf_cheap_hit
@@ -12845,18 +17296,31 @@ def compute_qmc_aad_crn_greeks(
         if s1_gbm_crn_np is not None and s1_gbm_cheap_np is not None:
             s1_crn_mean = np.mean(s1_gbm_crn_np, axis=0)
             s1_cheap_mean = np.mean(s1_gbm_cheap_np, axis=0)
-            s1_mean[:n_cv_cols] = s1_mean[:n_cv_cols] + (s1_cheap_mean - s1_crn_mean)
+            beta_cv = 1.0
+            if eff_r >= 4:
+                x_cv = s1_gbm_crn_np[:, c0_s1 + 4]
+                y_cv = stage1_rep_np[:, c0_s1 + 4]
+                var_x_cv = float(np.var(x_cv, ddof=1))
+                if var_x_cv > 1e-18:
+                    xc = x_cv - float(np.mean(x_cv))
+                    yc = y_cv - float(np.mean(y_cv))
+                    cov_xy_cv = float(np.sum(xc * yc) / float(eff_r - 1))
+                    # On eff_r >= 8 (e.g. 53391858 GPU), disable unit CV when variance actually increases (cov < 0.5 * var_x);
+                    # on smaller eff_r=4 runs (noisy df=3 covariance), only zero when strictly anti-correlated.
+                    if cov_xy_cv < 0.0 or (eff_r >= 8 and cov_xy_cv < 0.5 * var_x_cv):
+                        beta_cv = 0.0
+            s1_mean[:n_cv_cols] = s1_mean[:n_cv_cols] + beta_cv * (s1_cheap_mean - s1_crn_mean)
             if se_mu_mf_cached is not None and math.isfinite(se_mu_mf_cached):
-                var_cheap = se_mu_mf_cached * se_mu_mf_cached
+                var_cheap = (beta_cv * beta_cv) * (se_mu_mf_cached * se_mu_mf_cached)
             else:
                 n_mf_rows = int(s1_gbm_cheap_np.shape[0])
                 var_cheap = (
-                    float(np.var(s1_gbm_cheap_np[:, c0_s1 + 4], ddof=1)) / float(n_mf_rows)
+                    (beta_cv * beta_cv) * float(np.var(s1_gbm_cheap_np[:, c0_s1 + 4], ddof=1)) / float(n_mf_rows)
                     if n_mf_rows > 1
                     else 0.0
                 )
             if eff_r > 1:
-                pv_reps_s1 = (stage1_rep_np[:, c0_s1 + 4] - s1_gbm_crn_np[:, c0_s1 + 4]) + float(
+                pv_reps_s1 = (stage1_rep_np[:, c0_s1 + 4] - beta_cv * s1_gbm_crn_np[:, c0_s1 + 4]) + beta_cv * float(
                     s1_cheap_mean[c0_s1 + 4]
                 ) + float(state.pv_in_transit)
                 var_crn = float(np.var(pv_reps_s1, ddof=1)) / float(eff_r) if pv_reps_s1.shape[0] > 1 else 0.0
@@ -12876,12 +17340,13 @@ def compute_qmc_aad_crn_greeks(
             eff_gearing_s1 = float(state.option_gearing)
             if abs(eff_gearing_s1) > 1e-12:
                 l_put_s1_val /= eff_gearing_s1
+        cpu_post_dev = torch.device("cpu")
         base_postproc = assemble_autocall_cashflows_and_pv(
             state,
-            p_stop=torch.as_tensor(s1_mean[:m_rem], dtype=torch.float64, device=out_device),
-            q_cpn=torch.as_tensor(s1_mean[m_rem : 2 * m_rem], dtype=torch.float64, device=out_device),
-            l_put=torch.tensor(l_put_s1_val, dtype=torch.float64, device=out_device),
-            l_call=torch.tensor(float(s1_mean[c0_s1 + 1]), dtype=torch.float64, device=out_device),
+            p_stop=torch.as_tensor(s1_mean[:m_rem], dtype=torch.float64, device=cpu_post_dev),
+            q_cpn=torch.as_tensor(s1_mean[m_rem : 2 * m_rem], dtype=torch.float64, device=cpu_post_dev),
+            l_put=torch.tensor(l_put_s1_val, dtype=torch.float64, device=cpu_post_dev),
+            l_call=torch.tensor(float(s1_mean[c0_s1 + 1]), dtype=torch.float64, device=cpu_post_dev),
             l_onestar=float(s1_mean[c0_s1 + 2]),
             p_onestar=float(s1_mean[c0_s1 + 3]),
             coupon_cf_undisc=s1_mean[2 * m_rem : 3 * m_rem],
@@ -12901,14 +17366,12 @@ def compute_qmc_aad_crn_greeks(
         pv0_1d = float(pv0) - float(state.cash_to_settle_today)
 
     bar_r_nat_from_q = np.zeros((d_assets, m_rem), dtype=np.float64)
-    if need_stage2_aad:
-        for m in range(m_rem):
-            for s in range(n_sub):
-                a_s = (float(s) + 0.5) / float(n_sub)
-                step_idx = m * n_sub + s
-                bar_r_nat_from_q[:, m] -= a_s * bar_q_shift_np[:, step_idx]
-                if m > 0:
-                    bar_r_nat_from_q[:, m - 1] -= (1.0 - a_s) * bar_q_shift_np[:, step_idx]
+    if want_vega and quanto_meta and need_stage2_aad:
+        a_vec_q = (np.arange(n_sub, dtype=np.float64) + 0.5) / float(n_sub)
+        bq3 = bar_q_shift_np.reshape(d_assets, m_rem, n_sub)
+        bar_r_nat_from_q = -np.einsum("dms,s->dm", bq3, a_vec_q)
+        if m_rem > 1:
+            bar_r_nat_from_q[:, :-1] -= np.einsum("dms,s->dm", bq3[:, 1:, :], 1.0 - a_vec_q)
 
     lv_rn_dpv_grads: Dict[int, Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]] = {}
 
@@ -13192,59 +17655,89 @@ def compute_qmc_aad_crn_greeks(
         if th_prep["eff_autocalled"] or int(th_prep["k_cross"]) >= m_rem:
             pv_th_qmc = float(th_prep["in_tr"]) + float(th_prep["crossed_pv"])
         elif can_analytical_theta and bar_cf_np is not None:
-            df_pay_th_np = th_prep["df_pay"]
-            w_fund_th_np = th_prep["w_fund"]
-            fwd_perf_th_np = th_prep["fwd_perf"]
-            r_nat_th_np = th_prep["r_nat"]
-            r_tot_th_np = th_prep["r_tot"]
-            lv_t_grid_th = th_prep["lv_t_grid"]
-            lv_th_tables = th_prep["lv_tables"]
-
-            dv_df_fund = float(np.sum((df_pay_th_np - df_pay_np) * bar_cf_np))
-            if w_fund_th_np is not None and w_fund_base_np is not None and bar_surv_np is not None:
-                dv_df_fund -= float(np.sum((w_fund_th_np - w_fund_base_np) * bar_surv_np))
-            dv_in_transit = float(th_prep["in_tr"]) - float(state.pv_in_transit) + float(th_prep["crossed_pv"])
-            dv_quanto_fwd = float(
-                np.sum(np.log(np.maximum(fwd_perf_th_np / np.maximum(fwd_perf_np, 1e-12), 1e-30)) * bar_ln_fwd_np)
-            )
-            if quanto_meta:
-                q_diff_base = r_tot_obs_np - r_native_obs_np
-                q_diff_th = r_tot_th_np - r_nat_th_np
-                a_s_th = (np.arange(n_sub, dtype=np.float64) + 0.5) / float(n_sub)
-                q_prev_b = np.concatenate([np.zeros((d_assets, 1), dtype=np.float64), q_diff_base[:, :-1]], axis=1)
-                q_prev_t = np.concatenate([np.zeros((d_assets, 1), dtype=np.float64), q_diff_th[:, :-1]], axis=1)
-                dq_shift = (
-                    (q_prev_t - q_prev_b)[:, :, None]
-                    + ((q_diff_th - q_prev_t) - (q_diff_base - q_prev_b))[:, :, None] * a_s_th[None, None, :]
-                ).reshape(d_assets, m_rem * n_sub)
-                dv_quanto_fwd += float(np.sum(dq_shift * bar_q_shift_np))
-
-            tau0_b = max(float(tau_obs_np[0]), 1e-6)
-            t_query_lv = np.where(
-                lv_t_grid <= tau0_b,
-                lv_t_grid * max((tau0_b - dt_shift_th) / tau0_b, 0.0),
-                lv_t_grid - dt_shift_th,
-            )
-            t_query_lv = np.clip(t_query_lv, float(lv_t_grid_th[0]), float(lv_t_grid_th[-1]))
-            u_tq = np.interp(t_query_lv, lv_t_grid_th, np.arange(lv_nt, dtype=np.float64))
-            it0_q = np.clip(np.floor(u_tq).astype(np.int64), 0, lv_nt - 1)
-            it1_q = np.clip(it0_q + 1, 0, lv_nt - 1)
-            wt_q = (u_tq - it0_q)[:, None]
-
-            dv_lv_roll = 0.0
-            dv_tau_accrual = 0.0
-            sig_scale_tau0 = math.sqrt(max(1.0 - dt_shift_th / tau0_b, 0.0)) - 1.0
-            if lv_nt > 1:
-                dt_g_half = 0.5 * (t_max / float(lv_nt - 1))
-                w_p0_t = np.clip((tau0_b + dt_g_half - lv_t_grid) / max(2.0 * dt_g_half, 1e-12), 0.0, 1.0)[:, None]
+            anal_c = th_prep.get("_anal_cache")
+            if anal_c is not None and (
+                _arr_bytes_equal(anal_c[0], df_pay_np)
+                and _arr_bytes_equal(anal_c[1], fwd_perf_np)
+                and _arr_bytes_equal(anal_c[2], base_lv_tables)
+                and ((anal_c[3] is None and w_fund_base_np is None) or (anal_c[3] is not None and w_fund_base_np is not None and _arr_bytes_equal(anal_c[3], w_fund_base_np)))
+            ):
+                d_df_th, d_wf_th, d_log_fwd_th, dq_shift_th, dlv_eff_th = anal_c[4]
             else:
-                w_p0_t = np.ones((1, 1), dtype=np.float64)
-            for i_lv in range(d_assets):
-                lv_th_interp = (1.0 - wt_q) * lv_th_tables[i_lv, it0_q, :] + wt_q * lv_th_tables[i_lv, it1_q, :]
-                dv_lv_roll += float(np.sum(bar_lv_np[i_lv] * (lv_th_interp - base_lv_tables[i_lv])))
-                dv_tau_accrual += float(np.sum(bar_lv_np[i_lv] * (sig_scale_tau0 * w_p0_t * base_lv_tables[i_lv])))
+                df_pay_th_np = th_prep["df_pay"]
+                w_fund_th_np = th_prep["w_fund"]
+                fwd_perf_th_np = th_prep["fwd_perf"]
+                r_nat_th_np = th_prep["r_nat"]
+                r_tot_th_np = th_prep["r_tot"]
+                lv_t_grid_th = th_prep["lv_t_grid"]
+                lv_th_tables = th_prep["lv_tables"]
 
-            pv_th_qmc = pv0_1d + dv_df_fund + dv_lv_roll + dv_tau_accrual + dv_in_transit + dv_quanto_fwd
+                d_df_th = np.ascontiguousarray(df_pay_th_np - df_pay_np, dtype=np.float64)
+                d_wf_th = (
+                    np.ascontiguousarray(w_fund_th_np - w_fund_base_np, dtype=np.float64)
+                    if (w_fund_th_np is not None and w_fund_base_np is not None)
+                    else None
+                )
+                d_log_fwd_th = np.ascontiguousarray(
+                    np.log(np.maximum(fwd_perf_th_np / np.maximum(fwd_perf_np, 1e-12), 1e-30)),
+                    dtype=np.float64,
+                )
+                if quanto_meta:
+                    q_diff_base = r_tot_obs_np - r_native_obs_np
+                    q_diff_th = r_tot_th_np - r_nat_th_np
+                    a_s_th = (np.arange(n_sub, dtype=np.float64) + 0.5) / float(n_sub)
+                    q_prev_b = np.concatenate([np.zeros((d_assets, 1), dtype=np.float64), q_diff_base[:, :-1]], axis=1)
+                    q_prev_t = np.concatenate([np.zeros((d_assets, 1), dtype=np.float64), q_diff_th[:, :-1]], axis=1)
+                    dq_shift_th = np.ascontiguousarray(
+                        (
+                            (q_prev_t - q_prev_b)[:, :, None]
+                            + ((q_diff_th - q_prev_t) - (q_diff_base - q_prev_b))[:, :, None] * a_s_th[None, None, :]
+                        ).reshape(d_assets, m_rem * n_sub),
+                        dtype=np.float64,
+                    )
+                else:
+                    dq_shift_th = None
+
+                tau0_b = max(float(tau_obs_np[0]), 1e-6)
+                t_query_lv = np.where(
+                    lv_t_grid <= tau0_b,
+                    lv_t_grid * max((tau0_b - dt_shift_th) / tau0_b, 0.0),
+                    lv_t_grid - dt_shift_th,
+                )
+                t_query_lv = np.clip(t_query_lv, float(lv_t_grid_th[0]), float(lv_t_grid_th[-1]))
+                u_tq = np.interp(t_query_lv, lv_t_grid_th, np.arange(lv_nt, dtype=np.float64))
+                it0_q = np.clip(np.floor(u_tq).astype(np.int64), 0, lv_nt - 1)
+                it1_q = np.clip(it0_q + 1, 0, lv_nt - 1)
+                wt_q = (u_tq - it0_q)[None, :, None]
+                sig_scale_tau0 = math.sqrt(max(1.0 - dt_shift_th / tau0_b, 0.0)) - 1.0
+                if lv_nt > 1:
+                    dt_g_half = 0.5 * (t_max / float(lv_nt - 1))
+                    w_p0_t = np.clip((tau0_b + dt_g_half - lv_t_grid) / max(2.0 * dt_g_half, 1e-12), 0.0, 1.0)[None, :, None]
+                else:
+                    w_p0_t = np.ones((1, 1, 1), dtype=np.float64)
+                lv_th_interp_all = (1.0 - wt_q) * lv_th_tables[:, it0_q, :] + wt_q * lv_th_tables[:, it1_q, :]
+                dlv_eff_th = np.ascontiguousarray(
+                    (lv_th_interp_all - base_lv_tables) + (sig_scale_tau0 * w_p0_t) * base_lv_tables,
+                    dtype=np.float64,
+                )
+                th_prep["_anal_cache"] = (
+                    df_pay_np.copy(),
+                    fwd_perf_np.copy(),
+                    base_lv_tables.copy(),
+                    w_fund_base_np.copy() if w_fund_base_np is not None else None,
+                    (d_df_th, d_wf_th, d_log_fwd_th, dq_shift_th, dlv_eff_th),
+                )
+
+            dv_df_fund = float(np.dot(d_df_th, bar_cf_np))
+            if d_wf_th is not None and bar_surv_np is not None:
+                dv_df_fund -= float(np.dot(d_wf_th, bar_surv_np))
+            dv_in_transit = float(th_prep["in_tr"]) - float(state.pv_in_transit) + float(th_prep["crossed_pv"])
+            dv_quanto_fwd = float(np.sum(d_log_fwd_th * bar_ln_fwd_np))
+            if dq_shift_th is not None:
+                dv_quanto_fwd += float(np.sum(dq_shift_th * bar_q_shift_np))
+            dv_lv_roll_and_tau = float(np.sum(bar_lv_np * dlv_eff_th))
+
+            pv_th_qmc = pv0_1d + dv_df_fund + dv_lv_roll_and_tau + dv_in_transit + dv_quanto_fwd
         elif use_gpu_triton and pv_th_fused_np.size > 0:
             pv_th_qmc = float(pv_th_fused_np[0])
         else:
@@ -13263,7 +17756,7 @@ def compute_qmc_aad_crn_greeks(
             eff_cmem_th = float(th_prep["eff_cmem"])
             crossed_pv = float(th_prep["crossed_pv"])
 
-            assert z_corr_base_np is not None and z_indep_np is not None
+            assert z_indep_np is not None
             norm_x_th_np = np.empty((d_assets, m_rem_th, n_total), dtype=np.float64)
             if cpp_sde_v2_fn is not None:
                 z_th_indep = np.ascontiguousarray(z_indep_np[k_cross:], dtype=np.float64)
@@ -13289,6 +17782,14 @@ def compute_qmc_aad_crn_greeks(
                 else:
                     lx_p_th = np.empty((m_rem_th, d_assets, n_total), dtype=np.float64)
                     nx_p_th = np.empty((m_rem_th, d_assets, n_total), dtype=np.float64)
+                    lv_th64 = np.ascontiguousarray(lv_th_tables, dtype=np.float64)
+                    ch_th64 = np.ascontiguousarray(chol_base, dtype=np.float64)
+                    tau_th64 = np.ascontiguousarray(tau_obs_th_np, dtype=np.float64)
+                    rn_th64 = np.ascontiguousarray(r_nat_th_np, dtype=np.float64)
+                    rt_th64 = np.ascontiguousarray(r_tot_th_np, dtype=np.float64)
+                    lvt_th64 = np.ascontiguousarray(lv_t_grid_th, dtype=np.float64)
+                    lvy0_th64 = np.ascontiguousarray(lv_y_min_vec, dtype=np.float64)
+                    lvy1_th64 = np.ascontiguousarray(lv_y_max_vec, dtype=np.float64)
                     sde_th_args = _PlatenSdeAadArgsC(
                         d_assets=d_assets,
                         m_rem=m_rem_th,
@@ -13297,15 +17798,15 @@ def compute_qmc_aad_crn_greeks(
                         n_rep=n_rep,
                         lv_nt=lv_nt,
                         lv_ny=lv_ny,
-                        lv_tables=np.ascontiguousarray(lv_th_tables, dtype=np.float64).ctypes.data,
+                        lv_tables=lv_th64.ctypes.data,
                         z_indep=z_th_indep.ctypes.data,
-                        chol_base=np.ascontiguousarray(chol_base, dtype=np.float64).ctypes.data,
-                        tau_obs=np.ascontiguousarray(tau_obs_th_np, dtype=np.float64).ctypes.data,
-                        r_native_obs=np.ascontiguousarray(r_nat_th_np, dtype=np.float64).ctypes.data,
-                        r_tot_obs=np.ascontiguousarray(r_tot_th_np, dtype=np.float64).ctypes.data,
-                        lv_t_grid=np.ascontiguousarray(lv_t_grid_th, dtype=np.float64).ctypes.data,
-                        lv_y_min=np.ascontiguousarray(lv_y_min_vec, dtype=np.float64).ctypes.data,
-                        lv_y_max=np.ascontiguousarray(lv_y_max_vec, dtype=np.float64).ctypes.data,
+                        chol_base=ch_th64.ctypes.data,
+                        tau_obs=tau_th64.ctypes.data,
+                        r_native_obs=rn_th64.ctypes.data,
+                        r_tot_obs=rt_th64.ctypes.data,
+                        lv_t_grid=lvt_th64.ctypes.data,
+                        lv_y_min=lvy0_th64.ctypes.data,
+                        lv_y_max=lvy1_th64.ctypes.data,
                         bar_lx_post=0,
                         lx_norm_in=0,
                         q_shift_sub=0,
