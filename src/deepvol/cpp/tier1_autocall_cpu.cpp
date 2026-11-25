@@ -109,12 +109,23 @@ struct PlatenSdeAadArgs {
     std::int32_t compute_chol_aad;
     std::int32_t compute_q_aad;
     std::int32_t has_q_shift_sub;
+    double* out_lx_pre;
+    double* out_j_pre;
+    double* out_sig_pre;
+    std::int32_t vib_period_idx;
+    std::int32_t vib_sub_idx;
+    std::int32_t save_vib_pre;
+    std::int32_t _pad_vib;
+    double vib_j_pre_max;
+    double vib_dsig_dy_max;
 };
 
 static_assert(alignof(PlatenSdeAadArgs) == 8, "PlatenSdeAadArgs must be 8-byte aligned");
-static_assert(sizeof(PlatenSdeAadArgs) == 216, "Exact 216B PlatenSdeAadArgs ABI");
+static_assert(sizeof(PlatenSdeAadArgs) == 272, "Exact 272B PlatenSdeAadArgs ABI");
 static_assert(offsetof(PlatenSdeAadArgs, lv_tables) == 56, "Pointer block at 56B");
 static_assert(offsetof(PlatenSdeAadArgs, run_forward) == 192, "Flag block at 192B");
+static_assert(offsetof(PlatenSdeAadArgs, out_lx_pre) == 216, "Vibrato tail block at 216B");
+static_assert(offsetof(PlatenSdeAadArgs, vib_j_pre_max) == 256, "Vibrato clamp block at 256B");
 
 struct SobolGenArgs {
     std::int64_t d_assets;
@@ -4588,6 +4599,290 @@ void crn_step_1d_trajectories_cpp(
     }
 }
 
+std::int32_t crn_step_spot_bumps_cpp(
+    std::int32_t d_assets,
+    std::int32_t lv_nt,
+    std::int32_t lv_ny,
+    std::int32_t m_rem,
+    std::int32_t n_sub,
+    std::int32_t eff_r,
+    std::int32_t n_rep,
+    const double* lv_tables_pm,
+    const double* z_corr,
+    const double* tau_obs,
+    const double* r_native_obs,
+    const double* r_tot_obs,
+    const double* lv_t_grid,
+    const double* lv_y_min,
+    const double* lv_y_max,
+    double* out_norm_x_pm
+) noexcept {
+    if (d_assets <= 0 || lv_nt <= 0 || lv_ny <= 0 || m_rem <= 0 || n_sub <= 0 ||
+        eff_r <= 0 || n_rep <= 0 || lv_tables_pm == nullptr || z_corr == nullptr ||
+        tau_obs == nullptr || r_native_obs == nullptr || r_tot_obs == nullptr ||
+        lv_t_grid == nullptr || lv_y_min == nullptr || lv_y_max == nullptr ||
+        out_norm_x_pm == nullptr) {
+        return -1;
+    }
+    const int D = static_cast<int>(d_assets);
+    const int M = static_cast<int>(m_rem);
+    const int S = static_cast<int>(n_sub);
+    const int R = static_cast<int>(eff_r);
+    const int N_rep = static_cast<int>(n_rep);
+
+    const std::size_t Du = static_cast<std::size_t>(D);
+    const std::size_t Mu = static_cast<std::size_t>(M);
+    const std::size_t Su = static_cast<std::size_t>(S);
+    const std::size_t Ru = static_cast<std::size_t>(R);
+    const std::size_t n_rep_sz = static_cast<std::size_t>(N_rep);
+    const std::size_t n_tot_sz = Ru * n_rep_sz;
+    const std::size_t lv_ny_sz = static_cast<std::size_t>(lv_ny);
+    const std::size_t lv_plane_sz = static_cast<std::size_t>(lv_nt) * lv_ny_sz;
+    const std::size_t out_asset_stride = Mu * n_tot_sz;
+    const std::size_t out_pm_stride = Du * out_asset_stride;
+
+    const double t_max = lv_t_grid[lv_nt - 1];
+    const double inv_dt_grid = (lv_nt > 1) ? (static_cast<double>(lv_nt - 1) / std::max(t_max, 1e-12)) : 0.0;
+    const double max_u_t = std::max(0.0, static_cast<double>(lv_nt - 1) - 1e-6);
+    const double max_u_y = std::max(0.0, static_cast<double>(lv_ny - 1) - 1e-6);
+
+    OmpCallGuard omp_guard(D * R >= 2);
+    #pragma omp parallel if(omp_guard.active) num_threads(omp_guard.n_threads)
+    {
+        std::vector<double> lx_p(n_rep_sz, 0.0);
+        std::vector<double> lx_m(n_rep_sz, 0.0);
+        std::vector<double> ex_p(n_rep_sz, 0.0);
+        std::vector<double> ex_m(n_rep_sz, 0.0);
+        std::vector<double> zd_buf(n_rep_sz, 0.0);
+        std::vector<double> sl0_p(lv_ny_sz + 4, 0.0);
+        std::vector<double> sl1_p(lv_ny_sz + 4, 0.0);
+        std::vector<double> sl0_m(lv_ny_sz + 4, 0.0);
+        std::vector<double> sl1_m(lv_ny_sz + 4, 0.0);
+
+        auto fill_lv_slice = [&](const double* lv_b, double t_val, double* dst_slice) noexcept {
+            const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+            const int it0 = static_cast<int>(u_t);
+            const int it1 = std::min(it0 + 1, lv_nt - 1);
+            const double wt = (lv_nt > 1) ? (u_t - static_cast<double>(it0)) : 0.0;
+            const double* row0 = lv_b + static_cast<std::size_t>(it0) * lv_ny_sz;
+            const double* row1 = lv_b + static_cast<std::size_t>(it1) * lv_ny_sz;
+            const double omt = 1.0 - wt;
+            #pragma omp simd
+            for (int iy = 0; iy < lv_ny; ++iy) {
+                dst_slice[iy] = omt * row0[iy] + wt * row1[iy];
+            }
+            const double top_sig = dst_slice[lv_ny - 1];
+            for (int pad = 0; pad < 4; ++pad) {
+                dst_slice[lv_ny + pad] = top_sig;
+            }
+        };
+
+        #pragma omp for collapse(2) schedule(static)
+        for (int d = 0; d < D; ++d) {
+            for (int r = 0; r < R; ++r) {
+                const std::size_t du = static_cast<std::size_t>(d);
+                const std::size_t ru = static_cast<std::size_t>(r);
+                const double y_min_d = lv_y_min[du];
+                const double y_max_d = lv_y_max[du];
+                const double inv_dy_grid = (lv_ny > 1)
+                    ? (static_cast<double>(lv_ny - 1) / std::max(y_max_d - y_min_d, 1e-12))
+                    : 0.0;
+                const double* lv_p = lv_tables_pm + (2u * du + 0u) * lv_plane_sz;
+                const double* lv_m = lv_tables_pm + (2u * du + 1u) * lv_plane_sz;
+                const double* rn_d = r_native_obs + du * Mu;
+                const double* rt_d = r_tot_obs + du * Mu;
+
+                std::fill(lx_p.begin(), lx_p.end(), 0.0);
+                std::fill(lx_m.begin(), lx_m.end(), 0.0);
+
+                double t_prev = 0.0;
+                double rt_prev = 0.0;
+                double rn_prev = 0.0;
+
+                for (int m = 0; m < M; ++m) {
+                    const std::size_t mu = static_cast<std::size_t>(m);
+                    const double t_cur = tau_obs[mu];
+                    const double rt_cur = rt_d[mu];
+                    const double rn_cur = rn_d[mu];
+                    const double d_tau = std::max(t_cur - t_prev, 1e-10);
+                    const double dt = d_tau / static_cast<double>(S);
+                    const double sqrt_dt = std::sqrt(dt);
+                    const double drt = rt_cur - rt_prev;
+                    const double drn = rn_cur - rn_prev;
+
+                    for (int s = 0; s < S; ++s) {
+                        const std::size_t su = static_cast<std::size_t>(s);
+                        const double alpha_s = (static_cast<double>(s) + 0.5) / static_cast<double>(S);
+                        const double t_mid = t_prev + alpha_s * d_tau;
+                        const double t_start = std::max(t_mid - 0.5 * dt, 0.0);
+                        const double t_end = t_start + dt;
+                        const double q_shift_mid = (rt_prev + alpha_s * drt) - (rn_prev + alpha_s * drn);
+
+                        fill_lv_slice(lv_p, t_start, sl0_p.data());
+                        fill_lv_slice(lv_p, t_end, sl1_p.data());
+                        fill_lv_slice(lv_m, t_start, sl0_m.data());
+                        fill_lv_slice(lv_m, t_end, sl1_m.data());
+
+                        // Gather z_corr[(m, s, r, n, d)] into unit-stride zd_buf.
+                        const double* z_base = z_corr + (((mu * Su + su) * Ru + ru) * n_rep_sz) * Du + du;
+                        for (int n = 0; n < N_rep; ++n) {
+                            zd_buf[static_cast<std::size_t>(n)] = z_base[static_cast<std::size_t>(n) * Du];
+                        }
+
+                        int n = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                        const __m256d v_y_min = _mm256_set1_pd(y_min_d);
+                        const __m256d v_inv_dy = _mm256_set1_pd(inv_dy_grid);
+                        const __m256d v_zero = _mm256_setzero_pd();
+                        const __m256d v_max_uy = _mm256_set1_pd(max_u_y);
+                        const __m256d v_q_mid = _mm256_set1_pd(q_shift_mid);
+                        const __m256d v_dt = _mm256_set1_pd(dt);
+                        const __m256d v_sqrt_dt = _mm256_set1_pd(sqrt_dt);
+                        const __m256d v_half = _mm256_set1_pd(0.5);
+                        const __m256d v_neg_half = _mm256_set1_pd(-0.5);
+                        const __m256d v_quarter = _mm256_set1_pd(0.25);
+                        const __m256d v_two = _mm256_set1_pd(2.0);
+                        const __m256d v_one = _mm256_set1_pd(1.0);
+
+                        auto lookup_slice_pd = [&](const double* slice_ptr, __m256d y_v) noexcept -> __m256d {
+                            if (lv_ny <= 1) return _mm256_set1_pd(slice_ptr[0]);
+                            __m256d uy_raw = _mm256_mul_pd(_mm256_sub_pd(y_v, v_y_min), v_inv_dy);
+                            __m256d u_y = _mm256_min_pd(_mm256_max_pd(uy_raw, v_zero), v_max_uy);
+                            __m256d u_floor = _mm256_floor_pd(u_y);
+                            __m128i iy0 = _mm256_cvttpd_epi32(u_floor);
+                            __m256d wy = _mm256_sub_pd(u_y, u_floor);
+                            __m256d s0 = _mm256_i32gather_pd(slice_ptr, iy0, 8);
+                            __m256d s1 = _mm256_i32gather_pd(slice_ptr + 1, iy0, 8);
+                            return _mm256_fmadd_pd(wy, _mm256_sub_pd(s1, s0), s0);
+                        };
+
+                        for (; n + 4 <= N_rep; n += 4) {
+                            const __m256d zd = _mm256_loadu_pd(zd_buf.data() + n);
+                            const __m256d dw = _mm256_mul_pd(v_sqrt_dt, zd);
+                            const __m256d z2m1 = _mm256_fmsub_pd(zd, zd, v_one);
+                            const __m256d sdt_z2m1 = _mm256_mul_pd(v_sqrt_dt, z2m1);
+
+                            // +h trajectory
+                            const __m256d lxp = _mm256_loadu_pd(lx_p.data() + n);
+                            const __m256d y0p = _mm256_add_pd(lxp, v_q_mid);
+                            const __m256d sig0p = lookup_slice_pd(sl0_p.data(), y0p);
+                            const __m256d a0p = _mm256_mul_pd(v_neg_half, _mm256_mul_pd(sig0p, sig0p));
+                            const __m256d s0p_sdt = _mm256_mul_pd(sig0p, v_sqrt_dt);
+                            const __m256d base_yp = _mm256_fmadd_pd(a0p, v_dt, y0p);
+                            const __m256d sighp = lookup_slice_pd(sl1_p.data(), _mm256_fmadd_pd(sig0p, dw, base_yp));
+                            const __m256d sigpp = lookup_slice_pd(sl1_p.data(), _mm256_add_pd(base_yp, s0p_sdt));
+                            const __m256d sigmp = lookup_slice_pd(sl1_p.data(), _mm256_sub_pd(base_yp, s0p_sdt));
+                            const __m256d ahp = _mm256_mul_pd(v_neg_half, _mm256_mul_pd(sighp, sighp));
+                            const __m256d driftp = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_add_pd(a0p, ahp), v_dt));
+                            const __m256d diffp = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_add_pd(_mm256_add_pd(sigpp, sigmp), _mm256_mul_pd(v_two, sig0p)), dw));
+                            const __m256d milp = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_sub_pd(sigpp, sigmp), sdt_z2m1));
+                            _mm256_storeu_pd(lx_p.data() + n, _mm256_add_pd(lxp, _mm256_add_pd(driftp, _mm256_add_pd(diffp, milp))));
+
+                            // -h trajectory
+                            const __m256d lxm = _mm256_loadu_pd(lx_m.data() + n);
+                            const __m256d y0m = _mm256_add_pd(lxm, v_q_mid);
+                            const __m256d sig0m = lookup_slice_pd(sl0_m.data(), y0m);
+                            const __m256d a0m = _mm256_mul_pd(v_neg_half, _mm256_mul_pd(sig0m, sig0m));
+                            const __m256d s0m_sdt = _mm256_mul_pd(sig0m, v_sqrt_dt);
+                            const __m256d base_ym = _mm256_fmadd_pd(a0m, v_dt, y0m);
+                            const __m256d sighm = lookup_slice_pd(sl1_m.data(), _mm256_fmadd_pd(sig0m, dw, base_ym));
+                            const __m256d sigpm = lookup_slice_pd(sl1_m.data(), _mm256_add_pd(base_ym, s0m_sdt));
+                            const __m256d sigmm = lookup_slice_pd(sl1_m.data(), _mm256_sub_pd(base_ym, s0m_sdt));
+                            const __m256d ahm = _mm256_mul_pd(v_neg_half, _mm256_mul_pd(sighm, sighm));
+                            const __m256d driftm = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_add_pd(a0m, ahm), v_dt));
+                            const __m256d diffm = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_add_pd(_mm256_add_pd(sigpm, sigmm), _mm256_mul_pd(v_two, sig0m)), dw));
+                            const __m256d milm = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_sub_pd(sigpm, sigmm), sdt_z2m1));
+                            _mm256_storeu_pd(lx_m.data() + n, _mm256_add_pd(lxm, _mm256_add_pd(driftm, _mm256_add_pd(diffm, milm))));
+                        }
+#endif
+                        auto lookup_scalar = [&](const double* slice_ptr, double y_val) noexcept -> double {
+                            if (lv_ny <= 1) return slice_ptr[0];
+                            const double u_raw = (y_val - y_min_d) * inv_dy_grid;
+                            const double u_y = std::clamp(u_raw, 0.0, max_u_y);
+                            const int iy0 = static_cast<int>(u_y);
+                            const int iy1 = std::min(iy0 + 1, lv_ny - 1);
+                            const double wy = u_y - static_cast<double>(iy0);
+                            return (1.0 - wy) * slice_ptr[iy0] + wy * slice_ptr[iy1];
+                        };
+                        for (; n < N_rep; ++n) {
+                            const double zd = zd_buf[static_cast<std::size_t>(n)];
+                            const double dw = sqrt_dt * zd;
+                            const double z2m1 = zd * zd - 1.0;
+
+                            const double lxp = lx_p[static_cast<std::size_t>(n)];
+                            const double sig0p = lookup_scalar(sl0_p.data(), lxp + q_shift_mid);
+                            const double a0p = -0.5 * sig0p * sig0p;
+                            const double base_yp = lxp + a0p * dt + q_shift_mid;
+                            const double sighp = lookup_scalar(sl1_p.data(), base_yp + sig0p * dw);
+                            const double sigpp = lookup_scalar(sl1_p.data(), base_yp + sig0p * sqrt_dt);
+                            const double sigmp = lookup_scalar(sl1_p.data(), base_yp - sig0p * sqrt_dt);
+                            lx_p[static_cast<std::size_t>(n)] = lxp
+                                + 0.5 * (a0p - 0.5 * sighp * sighp) * dt
+                                + 0.25 * (sigpp + sigmp + 2.0 * sig0p) * dw
+                                + 0.25 * (sigpp - sigmp) * sqrt_dt * z2m1;
+
+                            const double lxm = lx_m[static_cast<std::size_t>(n)];
+                            const double sig0m = lookup_scalar(sl0_m.data(), lxm + q_shift_mid);
+                            const double a0m = -0.5 * sig0m * sig0m;
+                            const double base_ym = lxm + a0m * dt + q_shift_mid;
+                            const double sighm = lookup_scalar(sl1_m.data(), base_ym + sig0m * dw);
+                            const double sigpm = lookup_scalar(sl1_m.data(), base_ym + sig0m * sqrt_dt);
+                            const double sigmm = lookup_scalar(sl1_m.data(), base_ym - sig0m * sqrt_dt);
+                            lx_m[static_cast<std::size_t>(n)] = lxm
+                                + 0.5 * (a0m - 0.5 * sighm * sighm) * dt
+                                + 0.25 * (sigpm + sigmm + 2.0 * sig0m) * dw
+                                + 0.25 * (sigpm - sigmm) * sqrt_dt * z2m1;
+                        }
+                    }
+
+                    auto martingalize_buf = [&](std::vector<double>& lxb, std::vector<double>& exb, double* out_ptr) noexcept {
+                        double max_lx = -std::numeric_limits<double>::infinity();
+                        for (int n = 0; n < N_rep; ++n) {
+                            max_lx = std::max(max_lx, lxb[static_cast<std::size_t>(n)]);
+                        }
+                        double sum_ex = 0.0;
+                        int n = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                        const __m256d v_max_lx = _mm256_set1_pd(max_lx);
+                        __m256d v_sum = _mm256_setzero_pd();
+                        for (; n + 4 <= N_rep; n += 4) {
+                            __m256d ex = v_exp_pd(_mm256_sub_pd(_mm256_loadu_pd(lxb.data() + n), v_max_lx));
+                            _mm256_storeu_pd(exb.data() + n, ex);
+                            v_sum = _mm256_add_pd(v_sum, ex);
+                        }
+                        alignas(32) double s4[4];
+                        _mm256_store_pd(s4, v_sum);
+                        sum_ex = s4[0] + s4[1] + s4[2] + s4[3];
+#endif
+                        for (; n < N_rep; ++n) {
+                            const double ex = std::exp(lxb[static_cast<std::size_t>(n)] - max_lx);
+                            exb[static_cast<std::size_t>(n)] = ex;
+                            sum_ex += ex;
+                        }
+                        const double mean_rep = std::max(sum_ex / static_cast<double>(N_rep), 1e-30);
+                        const double inv_mean = 1.0 / mean_rep;
+                        const double shift_log = max_lx + std::log(mean_rep);
+                        #pragma omp simd
+                        for (int n_s = 0; n_s < N_rep; ++n_s) {
+                            out_ptr[n_s] = exb[static_cast<std::size_t>(n_s)] * inv_mean;
+                            lxb[static_cast<std::size_t>(n_s)] -= shift_log;
+                        }
+                    };
+
+                    const std::size_t out_off = du * out_asset_stride + mu * n_tot_sz + ru * n_rep_sz;
+                    martingalize_buf(lx_p, ex_p, out_norm_x_pm + 0u * out_pm_stride + out_off);
+                    martingalize_buf(lx_m, ex_m, out_norm_x_pm + 1u * out_pm_stride + out_off);
+
+                    t_prev = t_cur;
+                    rt_prev = rt_cur;
+                    rn_prev = rn_cur;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 }  // extern "C"
 
 namespace {
@@ -5912,6 +6207,18 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
     if (run_fwd && args->lx_period_out == nullptr) {
         return -1;
     }
+    const int vib_mode = (run_fwd && args->save_vib_pre != 0)
+        ? ((args->save_vib_pre == 2 || args->vib_sub_idx < 0) ? 2 : 1)
+        : 0;
+    if (vib_mode != 0) {
+        if (args->out_lx_pre == nullptr || args->out_j_pre == nullptr || args->out_sig_pre == nullptr ||
+            args->vib_period_idx < 0 || args->vib_period_idx >= args->m_rem) {
+            return -1;
+        }
+        if (vib_mode == 1 && (args->vib_sub_idx < 0 || args->vib_sub_idx >= args->n_sub)) {
+            return -1;
+        }
+    }
     const double* lx_norm = (args->lx_norm_in != nullptr) ? args->lx_norm_in : args->lx_period_out;
     if (run_bwd && (args->bar_lx_post == nullptr || lx_norm == nullptr)) {
         return -1;
@@ -5932,6 +6239,12 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
     const int n_rep = static_cast<int>(args->n_rep);
     const int lv_nt = static_cast<int>(args->lv_nt);
     const int lv_ny = static_cast<int>(args->lv_ny);
+    const int vib_period_idx = (vib_mode != 0) ? static_cast<int>(args->vib_period_idx) : -1;
+    const int vib_sub_idx = (vib_mode != 0) ? static_cast<int>(args->vib_sub_idx) : -1;
+    const double vib_j_pre_max = (args->vib_j_pre_max > 0.0) ? args->vib_j_pre_max : ((args->vib_j_pre_max < 0.0) ? 0.0 : 6.0);
+    const double vib_dsig_dy_max = (args->vib_dsig_dy_max > 0.0) ? args->vib_dsig_dy_max : ((args->vib_dsig_dy_max < 0.0) ? 0.0 : 4.0);
+    const bool clamp_vib_j = vib_j_pre_max > 0.0;
+    const bool clamp_vib_dsig = vib_dsig_dy_max > 0.0;
 
     const std::size_t Du = static_cast<std::size_t>(D);
     const std::size_t Mu = static_cast<std::size_t>(M);
@@ -5991,8 +6304,11 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
         {
             std::vector<double> lx(Nrep_u);
             std::vector<double> ex_s(Nrep_u);
-            std::vector<double> lv_slice_start(lv_ny_u);
-            std::vector<double> lv_slice_end(lv_ny_u);
+            std::vector<double> j_lx(vib_mode != 0 ? Nrep_u : 0u, 1.0);
+            std::vector<double> lv_slice_start(lv_ny_u + 4u);
+            std::vector<double> lv_slice_end(lv_ny_u + 4u);
+            std::vector<double> lv_slice_mid(vib_mode != 0 ? (lv_ny_u + 4u) : 0u);
+            std::vector<double> sig_sq_acc(vib_mode == 2 ? Nrep_u : 0u, 0.0);
 
             #pragma omp for collapse(2) schedule(static)
             for (int d = 0; d < D; ++d) {
@@ -6007,16 +6323,50 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                         const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
                         const int it0 = static_cast<int>(u_t);
                         const int it1 = std::min(it0 + 1, lv_nt - 1);
-                        const double wt = u_t - static_cast<double>(it0);
+                        const double wt = (lv_nt > 1) ? (u_t - static_cast<double>(it0)) : 0.0;
                         const double omt = 1.0 - wt;
                         const double* r0 = lv_d + static_cast<std::size_t>(it0) * lv_ny_u;
                         const double* r1 = lv_d + static_cast<std::size_t>(it1) * lv_ny_u;
+                        #pragma omp simd
                         for (int iy = 0; iy < lv_ny; ++iy) {
                             dst[iy] = omt * r0[iy] + wt * r1[iy];
                         }
+                        const double top_sig = dst[lv_ny - 1];
+                        for (int pad = 0; pad < 4; ++pad) {
+                            dst[lv_ny + pad] = top_sig;
+                        }
+                    };
+
+                    auto lookup_scalar = [&](const double* sl, double y_v) noexcept -> double {
+                        if (lv_ny <= 1) return sl[0];
+                        const double u_y = std::clamp((y_v - y_min_d) * inv_dy_d, 0.0, max_u_y);
+                        const int iy0 = static_cast<int>(u_y);
+                        const int iy1 = std::min(iy0 + 1, lv_ny - 1);
+                        const double wy = u_y - static_cast<double>(iy0);
+                        return (1.0 - wy) * sl[iy0] + wy * sl[iy1];
+                    };
+
+                    auto lookup_scalar_with_deriv = [&](const double* sl, double y_v, double& d_out) noexcept -> double {
+                        if (lv_ny <= 1) {
+                            d_out = 0.0;
+                            return sl[0];
+                        }
+                        const double u_raw = (y_v - y_min_d) * inv_dy_d;
+                        const bool in_y = (u_raw > 0.0) && (u_raw < max_u_y);
+                        const double u_y = std::clamp(u_raw, 0.0, max_u_y);
+                        const int iy0 = static_cast<int>(u_y);
+                        const int iy1 = std::min(iy0 + 1, lv_ny - 1);
+                        const double wy = u_y - static_cast<double>(iy0);
+                        const double s0 = sl[iy0];
+                        const double s1 = sl[iy1];
+                        d_out = in_y ? ((s1 - s0) * inv_dy_d) : 0.0;
+                        return s0 + wy * (s1 - s0);
                     };
 
                     std::fill(lx.begin(), lx.end(), 0.0);
+                    if (vib_mode != 0) {
+                        std::fill(j_lx.begin(), j_lx.end(), 1.0);
+                    }
                     double t_prev = 0.0;
                     double rt_prev = 0.0;
                     double rn_prev = 0.0;
@@ -6032,6 +6382,36 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                         const double drt = rt_cur - rt_prev;
                         const double drn = rn_cur - rn_prev;
 
+                        const bool track_j_m = (vib_mode == 1 && m <= vib_period_idx) || (vib_mode == 2 && m < vib_period_idx);
+
+                        if (vib_mode == 2 && m == vib_period_idx) {
+                            const std::size_t v_off = du * Ntot_u + ru * Nrep_u;
+                            double* v_lx_dst = args->out_lx_pre + v_off;
+                            double* v_j_dst = args->out_j_pre + v_off;
+                            double* v_sig_dst = args->out_sig_pre + v_off;
+                            std::fill(sig_sq_acc.begin(), sig_sq_acc.end(), 0.0);
+                            for (int sv_k = 0; sv_k < n_sub; ++sv_k) {
+                                const double alpha_k = (static_cast<double>(sv_k) + 0.5) / static_cast<double>(n_sub);
+                                const double t_mid_k = t_prev + alpha_k * d_tau;
+                                const double q_k = has_q_sub
+                                    ? args->q_shift_sub[(du * Mu + mu) * Su + static_cast<std::size_t>(sv_k)]
+                                    : ((rt_prev + alpha_k * drt) - (rn_prev + alpha_k * drn));
+                                fill_lv_slice(t_mid_k, lv_slice_mid.data());
+                                for (int n = 0; n < n_rep; ++n) {
+                                    const double sk = lookup_scalar(lv_slice_mid.data(), lx[static_cast<std::size_t>(n)] + q_k);
+                                    sig_sq_acc[static_cast<std::size_t>(n)] += sk * sk;
+                                }
+                            }
+                            const double inv_nsub_f = 1.0 / static_cast<double>(n_sub);
+                            for (int n = 0; n < n_rep; ++n) {
+                                const std::size_t nu = static_cast<std::size_t>(n);
+                                v_lx_dst[n] = lx[nu];
+                                const double jv = j_lx[nu];
+                                v_j_dst[n] = clamp_vib_j ? std::clamp(jv, -vib_j_pre_max, vib_j_pre_max) : jv;
+                                v_sig_dst[n] = std::sqrt(sig_sq_acc[nu] * inv_nsub_f);
+                            }
+                        }
+
                         for (int s = 0; s < n_sub; ++s) {
                             const double alpha_s = (static_cast<double>(s) + 0.5) / static_cast<double>(n_sub);
                             const double t_mid = t_prev + alpha_s * d_tau;
@@ -6041,11 +6421,28 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                 ? args->q_shift_sub[(du * Mu + mu) * Su + static_cast<std::size_t>(s)]
                                 : ((rt_prev + alpha_s * drt) - (rn_prev + alpha_s * drn));
 
+                            if (vib_mode == 1 && m == vib_period_idx && s == vib_sub_idx) {
+                                fill_lv_slice(t_mid, lv_slice_mid.data());
+                                const std::size_t v_off = du * Ntot_u + ru * Nrep_u;
+                                double* v_lx_dst = args->out_lx_pre + v_off;
+                                double* v_j_dst = args->out_j_pre + v_off;
+                                double* v_sig_dst = args->out_sig_pre + v_off;
+                                for (int n = 0; n < n_rep; ++n) {
+                                    const std::size_t nu = static_cast<std::size_t>(n);
+                                    const double lxv = lx[nu];
+                                    const double jv = j_lx[nu];
+                                    v_lx_dst[n] = lxv;
+                                    v_j_dst[n] = clamp_vib_j ? std::clamp(jv, -vib_j_pre_max, vib_j_pre_max) : jv;
+                                    v_sig_dst[n] = lookup_scalar(lv_slice_mid.data(), lxv + q_mid);
+                                }
+                            }
+
                             fill_lv_slice(t_start, lv_slice_start.data());
                             fill_lv_slice(t_end, lv_slice_end.data());
 
                             const double* zd_ptr = z_corr.data() +
                                 ((mu * Su + static_cast<std::size_t>(s)) * Du + du) * Ntot_u + ru * Nrep_u;
+                            const bool track_j_step = track_j_m && !(vib_mode == 1 && m == vib_period_idx && s >= vib_sub_idx);
 
                             int n = 0;
 #if defined(__AVX2__) && defined(__FMA__)
@@ -6076,52 +6473,151 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                 return _mm256_fmadd_pd(wy, _mm256_sub_pd(s1, s0), s0);
                             };
 
-                            for (; n + 4 <= n_rep; n += 4) {
-                                __m256d lx_v = _mm256_loadu_pd(lx.data() + n);
-                                __m256d zd = _mm256_loadu_pd(zd_ptr + n);
-                                __m256d y0 = _mm256_add_pd(lx_v, v_q_mid);
-                                __m256d sig0 = lookup_slice_pd(sl0, y0);
-                                __m256d a0 = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sig0, sig0));
-                                __m256d dw = _mm256_mul_pd(v_sdt, zd);
-                                __m256d sig0_sdt = _mm256_mul_pd(sig0, v_sdt);
-                                __m256d base_y = _mm256_fmadd_pd(a0, v_dt, y0);
-                                __m256d sigh = lookup_slice_pd(sl1, _mm256_fmadd_pd(sig0, dw, base_y));
-                                __m256d sigp = lookup_slice_pd(sl1, _mm256_add_pd(base_y, sig0_sdt));
-                                __m256d sigm = lookup_slice_pd(sl1, _mm256_sub_pd(base_y, sig0_sdt));
-                                __m256d ah = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sigh, sigh));
-                                __m256d drift = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_add_pd(a0, ah), v_dt));
-                                __m256d sum_sig = _mm256_add_pd(_mm256_add_pd(sigp, sigm), _mm256_mul_pd(v_two, sig0));
-                                __m256d diff = _mm256_mul_pd(v_quarter, _mm256_mul_pd(sum_sig, dw));
-                                __m256d mil = _mm256_mul_pd(
-                                    v_quarter,
-                                    _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_sdt, _mm256_fmsub_pd(zd, zd, v_one)))
-                                );
-                                _mm256_storeu_pd(lx.data() + n, _mm256_add_pd(lx_v, _mm256_add_pd(drift, _mm256_add_pd(diff, mil))));
+                            if (!track_j_step) {
+                                for (; n + 4 <= n_rep; n += 4) {
+                                    __m256d lx_v = _mm256_loadu_pd(lx.data() + n);
+                                    __m256d zd = _mm256_loadu_pd(zd_ptr + n);
+                                    __m256d y0 = _mm256_add_pd(lx_v, v_q_mid);
+                                    __m256d sig0 = lookup_slice_pd(sl0, y0);
+                                    __m256d a0 = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sig0, sig0));
+                                    __m256d dw = _mm256_mul_pd(v_sdt, zd);
+                                    __m256d sig0_sdt = _mm256_mul_pd(sig0, v_sdt);
+                                    __m256d base_y = _mm256_fmadd_pd(a0, v_dt, y0);
+                                    __m256d sigh = lookup_slice_pd(sl1, _mm256_fmadd_pd(sig0, dw, base_y));
+                                    __m256d sigp = lookup_slice_pd(sl1, _mm256_add_pd(base_y, sig0_sdt));
+                                    __m256d sigm = lookup_slice_pd(sl1, _mm256_sub_pd(base_y, sig0_sdt));
+                                    __m256d ah = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sigh, sigh));
+                                    __m256d drift = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_add_pd(a0, ah), v_dt));
+                                    __m256d sum_sig = _mm256_add_pd(_mm256_add_pd(sigp, sigm), _mm256_mul_pd(v_two, sig0));
+                                    __m256d diff = _mm256_mul_pd(v_quarter, _mm256_mul_pd(sum_sig, dw));
+                                    __m256d mil = _mm256_mul_pd(
+                                        v_quarter,
+                                        _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_sdt, _mm256_fmsub_pd(zd, zd, v_one)))
+                                    );
+                                    _mm256_storeu_pd(lx.data() + n, _mm256_add_pd(lx_v, _mm256_add_pd(drift, _mm256_add_pd(diff, mil))));
+                                }
+                            } else {
+                                const __m256d v_dsig_hi = _mm256_set1_pd(vib_dsig_dy_max);
+                                const __m256d v_dsig_lo = _mm256_set1_pd(-vib_dsig_dy_max);
+                                const __m256d v_j_hi = _mm256_set1_pd(vib_j_pre_max);
+                                const __m256d v_j_lo = _mm256_set1_pd(-vib_j_pre_max);
+                                auto lookup_slice_pd_deriv = [&](const double* sl, __m256d y_v, __m256d& d_out) noexcept -> __m256d {
+                                    if (lv_ny <= 1) {
+                                        d_out = v_zero;
+                                        return _mm256_set1_pd(sl[0]);
+                                    }
+                                    __m256d uy_raw = _mm256_mul_pd(_mm256_sub_pd(y_v, v_y_min), v_inv_dy);
+                                    __m256d in_y = _mm256_and_pd(
+                                        _mm256_cmp_pd(uy_raw, v_zero, _CMP_GT_OQ),
+                                        _mm256_cmp_pd(uy_raw, v_max_uy, _CMP_LT_OQ)
+                                    );
+                                    __m256d u_y = _mm256_min_pd(_mm256_max_pd(uy_raw, v_zero), v_max_uy);
+                                    __m256d u_fl = _mm256_floor_pd(u_y);
+                                    __m128i iy0 = _mm256_cvttpd_epi32(u_fl);
+                                    __m256d wy = _mm256_sub_pd(u_y, u_fl);
+                                    __m256d s0 = _mm256_i32gather_pd(sl, iy0, 8);
+                                    __m256d s1 = _mm256_i32gather_pd(sl + 1, iy0, 8);
+                                    __m256d ds = _mm256_sub_pd(s1, s0);
+                                    __m256d d_raw = _mm256_and_pd(in_y, _mm256_mul_pd(ds, v_inv_dy));
+                                    d_out = clamp_vib_dsig ? _mm256_min_pd(_mm256_max_pd(d_raw, v_dsig_lo), v_dsig_hi) : d_raw;
+                                    return _mm256_fmadd_pd(wy, ds, s0);
+                                };
+                                for (; n + 4 <= n_rep; n += 4) {
+                                    __m256d lx_v = _mm256_loadu_pd(lx.data() + n);
+                                    __m256d zd = _mm256_loadu_pd(zd_ptr + n);
+                                    __m256d y0 = _mm256_add_pd(lx_v, v_q_mid);
+                                    __m256d d0, dh, dp, dm;
+                                    __m256d sig0 = lookup_slice_pd_deriv(sl0, y0, d0);
+                                    __m256d a0 = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sig0, sig0));
+                                    __m256d dw = _mm256_mul_pd(v_sdt, zd);
+                                    __m256d sig0_sdt = _mm256_mul_pd(sig0, v_sdt);
+                                    __m256d base_y = _mm256_fmadd_pd(a0, v_dt, y0);
+                                    __m256d sigh = lookup_slice_pd_deriv(sl1, _mm256_fmadd_pd(sig0, dw, base_y), dh);
+                                    __m256d sigp = lookup_slice_pd_deriv(sl1, _mm256_add_pd(base_y, sig0_sdt), dp);
+                                    __m256d sigm = lookup_slice_pd_deriv(sl1, _mm256_sub_pd(base_y, sig0_sdt), dm);
+                                    __m256d ah = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sigh, sigh));
+                                    __m256d zc2m1 = _mm256_fmsub_pd(zd, zd, v_one);
+                                    __m256d drift = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_add_pd(a0, ah), v_dt));
+                                    __m256d sum_sig = _mm256_add_pd(_mm256_add_pd(sigp, sigm), _mm256_mul_pd(v_two, sig0));
+                                    __m256d diff = _mm256_mul_pd(v_quarter, _mm256_mul_pd(sum_sig, dw));
+                                    __m256d mil = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_sdt, zc2m1)));
+                                    _mm256_storeu_pd(lx.data() + n, _mm256_add_pd(lx_v, _mm256_add_pd(drift, _mm256_add_pd(diff, mil))));
+
+                                    __m256d d_a0_dx = _mm256_mul_pd(_mm256_sub_pd(v_zero, sig0), d0);
+                                    __m256d d_base = _mm256_fmadd_pd(d_a0_dx, v_dt, v_one);
+                                    __m256d d_hat_dx = _mm256_fmadd_pd(d0, dw, d_base);
+                                    __m256d d_p_dx = _mm256_fmadd_pd(d0, v_sdt, d_base);
+                                    __m256d d_m_dx = _mm256_fnmadd_pd(d0, v_sdt, d_base);
+                                    __m256d dp_x = _mm256_mul_pd(dp, d_p_dx);
+                                    __m256d dm_x = _mm256_mul_pd(dm, d_m_dx);
+                                    __m256d j_t1 = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_fnmadd_pd(_mm256_mul_pd(sigh, dh), d_hat_dx, d_a0_dx), v_dt));
+                                    __m256d j_t2 = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_add_pd(_mm256_add_pd(dp_x, dm_x), _mm256_mul_pd(v_two, d0)), dw));
+                                    __m256d j_t3 = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_sub_pd(dp_x, dm_x), _mm256_mul_pd(v_sdt, zc2m1)));
+                                    __m256d step_j = _mm256_add_pd(v_one, _mm256_add_pd(j_t1, _mm256_add_pd(j_t2, j_t3)));
+                                    if (clamp_vib_j) {
+                                        step_j = _mm256_min_pd(_mm256_max_pd(step_j, _mm256_set1_pd(0.25)), _mm256_set1_pd(2.5));
+                                    }
+                                    __m256d j_next = _mm256_mul_pd(_mm256_loadu_pd(j_lx.data() + n), step_j);
+                                    if (clamp_vib_j) {
+                                        j_next = _mm256_min_pd(_mm256_max_pd(j_next, v_j_lo), v_j_hi);
+                                    }
+                                    _mm256_storeu_pd(j_lx.data() + n, j_next);
+                                }
                             }
 #endif
-                            auto lookup_scalar = [&](const double* sl, double y_v) noexcept -> double {
-                                if (lv_ny <= 1) return sl[0];
-                                const double u_y = std::clamp((y_v - y_min_d) * inv_dy_d, 0.0, max_u_y);
-                                const int iy0 = static_cast<int>(u_y);
-                                const int iy1 = std::min(iy0 + 1, lv_ny - 1);
-                                const double wy = u_y - static_cast<double>(iy0);
-                                return (1.0 - wy) * sl[iy0] + wy * sl[iy1];
-                            };
                             for (; n < n_rep; ++n) {
                                 const double zd = zd_ptr[n];
                                 const double lx_v = lx[static_cast<std::size_t>(n)];
-                                const double sig0 = lookup_scalar(lv_slice_start.data(), lx_v + q_mid);
-                                const double a0 = -0.5 * sig0 * sig0;
                                 const double dw = sqrt_dt * zd;
-                                const double base_y = lx_v + a0 * dt + q_mid;
-                                const double sigh = lookup_scalar(lv_slice_end.data(), base_y + sig0 * dw);
-                                const double sigp = lookup_scalar(lv_slice_end.data(), base_y + sig0 * sqrt_dt);
-                                const double sigm = lookup_scalar(lv_slice_end.data(), base_y - sig0 * sqrt_dt);
-                                const double ah = -0.5 * sigh * sigh;
-                                lx[static_cast<std::size_t>(n)] = lx_v
-                                    + 0.5 * (a0 + ah) * dt
-                                    + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
-                                    + 0.25 * (sigp - sigm) * sqrt_dt * (zd * zd - 1.0);
+                                const double zc2m1 = zd * zd - 1.0;
+                                if (!track_j_step) {
+                                    const double sig0 = lookup_scalar(lv_slice_start.data(), lx_v + q_mid);
+                                    const double a0 = -0.5 * sig0 * sig0;
+                                    const double base_y = lx_v + a0 * dt + q_mid;
+                                    const double sigh = lookup_scalar(lv_slice_end.data(), base_y + sig0 * dw);
+                                    const double sigp = lookup_scalar(lv_slice_end.data(), base_y + sig0 * sqrt_dt);
+                                    const double sigm = lookup_scalar(lv_slice_end.data(), base_y - sig0 * sqrt_dt);
+                                    const double ah = -0.5 * sigh * sigh;
+                                    lx[static_cast<std::size_t>(n)] = lx_v
+                                        + 0.5 * (a0 + ah) * dt
+                                        + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
+                                        + 0.25 * (sigp - sigm) * sqrt_dt * zc2m1;
+                                } else {
+                                    double d0 = 0.0, dh = 0.0, dp = 0.0, dm = 0.0;
+                                    const double sig0 = lookup_scalar_with_deriv(lv_slice_start.data(), lx_v + q_mid, d0);
+                                    const double a0 = -0.5 * sig0 * sig0;
+                                    const double base_y = lx_v + a0 * dt + q_mid;
+                                    const double sigh = lookup_scalar_with_deriv(lv_slice_end.data(), base_y + sig0 * dw, dh);
+                                    const double sigp = lookup_scalar_with_deriv(lv_slice_end.data(), base_y + sig0 * sqrt_dt, dp);
+                                    const double sigm = lookup_scalar_with_deriv(lv_slice_end.data(), base_y - sig0 * sqrt_dt, dm);
+                                    if (clamp_vib_dsig) {
+                                        d0 = std::clamp(d0, -vib_dsig_dy_max, vib_dsig_dy_max);
+                                        dh = std::clamp(dh, -vib_dsig_dy_max, vib_dsig_dy_max);
+                                        dp = std::clamp(dp, -vib_dsig_dy_max, vib_dsig_dy_max);
+                                        dm = std::clamp(dm, -vib_dsig_dy_max, vib_dsig_dy_max);
+                                    }
+                                    const double ah = -0.5 * sigh * sigh;
+                                    lx[static_cast<std::size_t>(n)] = lx_v
+                                        + 0.5 * (a0 + ah) * dt
+                                        + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
+                                        + 0.25 * (sigp - sigm) * sqrt_dt * zc2m1;
+
+                                    const double d_a0_dx = -sig0 * d0;
+                                    const double d_hat_dx = 1.0 + d_a0_dx * dt + d0 * dw;
+                                    const double d_p_dx = 1.0 + d_a0_dx * dt + d0 * sqrt_dt;
+                                    const double d_m_dx = 1.0 + d_a0_dx * dt - d0 * sqrt_dt;
+                                    double step_j = 1.0
+                                        + 0.5 * (d_a0_dx - sigh * dh * d_hat_dx) * dt
+                                        + 0.25 * (dp * d_p_dx + dm * d_m_dx + 2.0 * d0) * dw
+                                        + 0.25 * (dp * d_p_dx - dm * d_m_dx) * sqrt_dt * zc2m1;
+                                    if (clamp_vib_j) {
+                                        step_j = std::clamp(step_j, 0.25, 2.5);
+                                    }
+                                    const double j_next = j_lx[static_cast<std::size_t>(n)] * step_j;
+                                    j_lx[static_cast<std::size_t>(n)] = clamp_vib_j
+                                        ? std::clamp(j_next, -vib_j_pre_max, vib_j_pre_max)
+                                        : j_next;
+                                }
                             }
                         }
 
@@ -6130,7 +6626,20 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                             max_lx = std::max(max_lx, lx[static_cast<std::size_t>(n)]);
                         }
                         double sum_ex = 0.0;
-                        for (int n = 0; n < n_rep; ++n) {
+                        int n = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                        const __m256d v_max_lx = _mm256_set1_pd(max_lx);
+                        __m256d v_sum_ex = _mm256_setzero_pd();
+                        for (; n + 4 <= n_rep; n += 4) {
+                            __m256d ex = v_exp_pd(_mm256_sub_pd(_mm256_loadu_pd(lx.data() + n), v_max_lx));
+                            _mm256_storeu_pd(ex_s.data() + n, ex);
+                            v_sum_ex = _mm256_add_pd(v_sum_ex, ex);
+                        }
+                        alignas(32) double s4_ex[4];
+                        _mm256_store_pd(s4_ex, v_sum_ex);
+                        sum_ex = s4_ex[0] + s4_ex[1] + s4_ex[2] + s4_ex[3];
+#endif
+                        for (; n < n_rep; ++n) {
                             const double ev = std::exp(lx[static_cast<std::size_t>(n)] - max_lx);
                             ex_s[static_cast<std::size_t>(n)] = ev;
                             sum_ex += ev;
@@ -6141,12 +6650,28 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                         double* lp_dst = args->lx_period_out + out_off;
                         double* nx_dst = (args->norm_x_out != nullptr) ? (args->norm_x_out + out_off) : nullptr;
                         const double inv_mean = 1.0 / mean_rep;
-                        for (int n = 0; n < n_rep; ++n) {
-                            const double normed = lx[static_cast<std::size_t>(n)] - shift;
-                            lx[static_cast<std::size_t>(n)] = normed;
-                            lp_dst[n] = normed;
+                        #pragma omp simd
+                        for (int n_s = 0; n_s < n_rep; ++n_s) {
+                            const double normed = lx[static_cast<std::size_t>(n_s)] - shift;
+                            lx[static_cast<std::size_t>(n_s)] = normed;
+                            lp_dst[n_s] = normed;
                             if (nx_dst != nullptr) {
-                                nx_dst[n] = ex_s[static_cast<std::size_t>(n)] * inv_mean;
+                                nx_dst[n_s] = ex_s[static_cast<std::size_t>(n_s)] * inv_mean;
+                            }
+                        }
+                        if (track_j_m && m < vib_period_idx) {
+                            const double inv_rep = 1.0 / static_cast<double>(n_rep);
+                            const double omega_scale = inv_mean * inv_rep;
+                            double mean_j_dev = 0.0;
+                            for (int n_j = 0; n_j < n_rep; ++n_j) {
+                                const std::size_t nu = static_cast<std::size_t>(n_j);
+                                mean_j_dev += ex_s[nu] * (j_lx[nu] - 1.0);
+                            }
+                            mean_j_dev *= omega_scale;
+                            for (int n_j = 0; n_j < n_rep; ++n_j) {
+                                const std::size_t nu = static_cast<std::size_t>(n_j);
+                                const double j_norm = 1.0 + ((j_lx[nu] - 1.0) - mean_j_dev);
+                                j_lx[nu] = clamp_vib_j ? std::clamp(j_norm, -vib_j_pre_max, vib_j_pre_max) : j_norm;
                             }
                         }
                         t_prev = t_cur;
@@ -6183,6 +6708,10 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
             std::vector<double> bar_tot(Nrep_u);
             std::vector<double> lx_sub_pre(Su * Nrep_u);
             std::vector<double> lx_run(Nrep_u);
+            std::vector<double> lv_slice_start(lv_ny_u + 4u);
+            std::vector<double> lv_slice_end(lv_ny_u + 4u);
+            std::vector<double> bar_sl0(compute_lv ? lv_ny_u : 0u, 0.0);
+            std::vector<double> bar_sl1(compute_lv ? lv_ny_u : 0u, 0.0);
 
             #pragma omp for collapse(2) schedule(static)
             for (int d = 0; d < D; ++d) {
@@ -6193,6 +6722,27 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                     double* thr_lv_d = compute_lv ? (thr_lv + du * lv_asset_stride) : nullptr;
                     const double y_min_d = args->lv_y_min[d];
                     const double inv_dy_d = inv_dy_vec[du];
+
+                    auto fill_lv_slice_meta = [&](double t_val, double* dst, int& it0_out, int& it1_out, double& wt_out) noexcept {
+                        const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+                        const int it0 = static_cast<int>(u_t);
+                        const int it1 = std::min(it0 + 1, lv_nt - 1);
+                        const double wt = (lv_nt > 1) ? (u_t - static_cast<double>(it0)) : 0.0;
+                        const double omt = 1.0 - wt;
+                        const double* r0 = lv_d + static_cast<std::size_t>(it0) * lv_ny_u;
+                        const double* r1 = lv_d + static_cast<std::size_t>(it1) * lv_ny_u;
+                        #pragma omp simd
+                        for (int iy = 0; iy < lv_ny; ++iy) {
+                            dst[iy] = omt * r0[iy] + wt * r1[iy];
+                        }
+                        const double top_sig = dst[lv_ny - 1];
+                        for (int pad = 0; pad < 4; ++pad) {
+                            dst[lv_ny + pad] = top_sig;
+                        }
+                        it0_out = it0;
+                        it1_out = it1;
+                        wt_out = wt;
+                    };
 
                     std::fill(bar_x.begin(), bar_x.end(), 0.0);
 
@@ -6221,9 +6771,20 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                             bar_tot[static_cast<std::size_t>(n)] = bt;
                             sum_bar_tot += bt;
                         }
-                        for (int n = 0; n < n_rep; ++n) {
-                            const double omega = std::exp(lx_norm_m[n]) * inv_n_rep;
-                            bar_x[static_cast<std::size_t>(n)] = bar_tot[static_cast<std::size_t>(n)] - omega * sum_bar_tot;
+                        {
+                            int n_o = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                            const __m256d v_sum_tot = _mm256_set1_pd(sum_bar_tot * inv_n_rep);
+                            for (; n_o + 4 <= n_rep; n_o += 4) {
+                                const __m256d bt_v = _mm256_loadu_pd(bar_tot.data() + n_o);
+                                const __m256d ex_v = v_exp_pd(_mm256_loadu_pd(lx_norm_m + n_o));
+                                _mm256_storeu_pd(bar_x.data() + n_o, _mm256_fnmadd_pd(ex_v, v_sum_tot, bt_v));
+                            }
+#endif
+                            for (; n_o < n_rep; ++n_o) {
+                                const double omega = std::exp(lx_norm_m[n_o]) * inv_n_rep;
+                                bar_x[static_cast<std::size_t>(n_o)] = bar_tot[static_cast<std::size_t>(n_o)] - omega * sum_bar_tot;
+                            }
                         }
 
                         if (m == 0) {
@@ -6233,7 +6794,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                             std::copy(prev_norm, prev_norm + Nrep_u, lx_run.begin());
                         }
 
-                        // Forward rematerialization of substep pre-states within period m.
+                        // Forward rematerialization of substep pre-states within period m (AVX2).
                         for (int s = 0; s < n_sub; ++s) {
                             const std::size_t su = static_cast<std::size_t>(s);
                             std::copy(lx_run.begin(), lx_run.end(), lx_sub_pre.data() + su * Nrep_u);
@@ -6244,16 +6805,82 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                 ? args->q_shift_sub[(du * Mu + mu) * Su + su]
                                 : ((rt_prev + alpha_s * drt) - (rn_prev + alpha_s * drn));
                             const double* zd_ptr = z_corr.data() + ((mu * Su + su) * Du + du) * Ntot_u + ru * Nrep_u;
-                            for (int n = 0; n < n_rep; ++n) {
+
+                            int it0_tmp = 0, it1_tmp = 0;
+                            double wt_tmp = 0.0;
+                            fill_lv_slice_meta(t_start, lv_slice_start.data(), it0_tmp, it1_tmp, wt_tmp);
+                            fill_lv_slice_meta(t_end, lv_slice_end.data(), it0_tmp, it1_tmp, wt_tmp);
+
+                            int n = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                            const __m256d v_y_min = _mm256_set1_pd(y_min_d);
+                            const __m256d v_inv_dy = _mm256_set1_pd(inv_dy_d);
+                            const __m256d v_zero = _mm256_setzero_pd();
+                            const __m256d v_max_uy = _mm256_set1_pd(max_u_y);
+                            const __m256d v_q_mid = _mm256_set1_pd(q_mid);
+                            const __m256d v_dt = _mm256_set1_pd(dt);
+                            const __m256d v_sdt = _mm256_set1_pd(sqrt_dt);
+                            const __m256d v_half = _mm256_set1_pd(0.5);
+                            const __m256d v_nhalf = _mm256_set1_pd(-0.5);
+                            const __m256d v_quarter = _mm256_set1_pd(0.25);
+                            const __m256d v_two = _mm256_set1_pd(2.0);
+                            const __m256d v_one = _mm256_set1_pd(1.0);
+                            const double* sl0 = lv_slice_start.data();
+                            const double* sl1 = lv_slice_end.data();
+
+                            auto lookup_slice_pd = [&](const double* sl, __m256d y_v) noexcept -> __m256d {
+                                if (lv_ny <= 1) return _mm256_set1_pd(sl[0]);
+                                __m256d uy_raw = _mm256_mul_pd(_mm256_sub_pd(y_v, v_y_min), v_inv_dy);
+                                __m256d u_y = _mm256_min_pd(_mm256_max_pd(uy_raw, v_zero), v_max_uy);
+                                __m256d u_fl = _mm256_floor_pd(u_y);
+                                __m128i iy0 = _mm256_cvttpd_epi32(u_fl);
+                                __m256d wy = _mm256_sub_pd(u_y, u_fl);
+                                __m256d s0 = _mm256_i32gather_pd(sl, iy0, 8);
+                                __m256d s1 = _mm256_i32gather_pd(sl + 1, iy0, 8);
+                                return _mm256_fmadd_pd(wy, _mm256_sub_pd(s1, s0), s0);
+                            };
+
+                            for (; n + 4 <= n_rep; n += 4) {
+                                __m256d lxv = _mm256_loadu_pd(lx_run.data() + n);
+                                __m256d zd = _mm256_loadu_pd(zd_ptr + n);
+                                __m256d y0 = _mm256_add_pd(lxv, v_q_mid);
+                                __m256d sig0 = lookup_slice_pd(sl0, y0);
+                                __m256d a0 = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sig0, sig0));
+                                __m256d dw = _mm256_mul_pd(v_sdt, zd);
+                                __m256d sig0_sdt = _mm256_mul_pd(sig0, v_sdt);
+                                __m256d base_y = _mm256_fmadd_pd(a0, v_dt, y0);
+                                __m256d sigh = lookup_slice_pd(sl1, _mm256_fmadd_pd(sig0, dw, base_y));
+                                __m256d sigp = lookup_slice_pd(sl1, _mm256_add_pd(base_y, sig0_sdt));
+                                __m256d sigm = lookup_slice_pd(sl1, _mm256_sub_pd(base_y, sig0_sdt));
+                                __m256d ah = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sigh, sigh));
+                                __m256d drift = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_add_pd(a0, ah), v_dt));
+                                __m256d sum_sig = _mm256_add_pd(_mm256_add_pd(sigp, sigm), _mm256_mul_pd(v_two, sig0));
+                                __m256d diff = _mm256_mul_pd(v_quarter, _mm256_mul_pd(sum_sig, dw));
+                                __m256d mil = _mm256_mul_pd(
+                                    v_quarter,
+                                    _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_sdt, _mm256_fmsub_pd(zd, zd, v_one)))
+                                );
+                                _mm256_storeu_pd(lx_run.data() + n, _mm256_add_pd(lxv, _mm256_add_pd(drift, _mm256_add_pd(diff, mil))));
+                            }
+#endif
+                            auto lookup_scalar_bwd = [&](const double* sl, double y_v) noexcept -> double {
+                                if (lv_ny <= 1) return sl[0];
+                                const double u_y = std::clamp((y_v - y_min_d) * inv_dy_d, 0.0, max_u_y);
+                                const int iy0 = static_cast<int>(u_y);
+                                const int iy1 = std::min(iy0 + 1, lv_ny - 1);
+                                const double wy = u_y - static_cast<double>(iy0);
+                                return (1.0 - wy) * sl[iy0] + wy * sl[iy1];
+                            };
+                            for (; n < n_rep; ++n) {
                                 const double lxv = lx_run[static_cast<std::size_t>(n)];
                                 const double zd = zd_ptr[n];
                                 const double dw = sqrt_dt * zd;
-                                const double sig0 = eval_lv_bilinear_val(lv_d, lv_nt, lv_ny, t_start, lxv + q_mid, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+                                const double sig0 = lookup_scalar_bwd(lv_slice_start.data(), lxv + q_mid);
                                 const double a0 = -0.5 * sig0 * sig0;
                                 const double base_y = lxv + a0 * dt + q_mid;
-                                const double sigh = eval_lv_bilinear_val(lv_d, lv_nt, lv_ny, t_end, base_y + sig0 * dw, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
-                                const double sigp = eval_lv_bilinear_val(lv_d, lv_nt, lv_ny, t_end, base_y + sig0 * sqrt_dt, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
-                                const double sigm = eval_lv_bilinear_val(lv_d, lv_nt, lv_ny, t_end, base_y - sig0 * sqrt_dt, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+                                const double sigh = lookup_scalar_bwd(lv_slice_end.data(), base_y + sig0 * dw);
+                                const double sigp = lookup_scalar_bwd(lv_slice_end.data(), base_y + sig0 * sqrt_dt);
+                                const double sigm = lookup_scalar_bwd(lv_slice_end.data(), base_y - sig0 * sqrt_dt);
                                 lx_run[static_cast<std::size_t>(n)] = lxv
                                     + 0.5 * (a0 - 0.5 * sigh * sigh) * dt
                                     + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
@@ -6261,7 +6888,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                             }
                         }
 
-                        // Reverse-mode substep adjoints.
+                        // Reverse-mode substep adjoints (AVX2 + slice-buffered LV scatter).
                         for (int s = n_sub - 1; s >= 0; --s) {
                             const std::size_t su = static_cast<std::size_t>(s);
                             const double* lx_pre = lx_sub_pre.data() + su * Nrep_u;
@@ -6274,37 +6901,230 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                             const double* zd_ptr = z_corr.data() + ((mu * Su + su) * Du + du) * Ntot_u + ru * Nrep_u;
                             const double* zin_step = z_indep + ((mu * Su + su) * Ru + ru) * Nrep_u * Du;
 
+                            int it0_0 = 0, it1_0 = 0, it0_1 = 0, it1_1 = 0;
+                            double wt_0 = 0.0, wt_1 = 0.0;
+                            fill_lv_slice_meta(t_start, lv_slice_start.data(), it0_0, it1_0, wt_0);
+                            fill_lv_slice_meta(t_end, lv_slice_end.data(), it0_1, it1_1, wt_1);
+                            if (compute_lv) {
+                                std::fill(bar_sl0.begin(), bar_sl0.end(), 0.0);
+                                std::fill(bar_sl1.begin(), bar_sl1.end(), 0.0);
+                            }
+
                             double q_acc_step = 0.0;
-                            for (int n = 0; n < n_rep; ++n) {
+                            int n = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                            const __m256d v_y_min = _mm256_set1_pd(y_min_d);
+                            const __m256d v_inv_dy = _mm256_set1_pd(inv_dy_d);
+                            const __m256d v_zero = _mm256_setzero_pd();
+                            const __m256d v_max_uy = _mm256_set1_pd(max_u_y);
+                            const __m256d v_q_mid = _mm256_set1_pd(q_mid);
+                            const __m256d v_dt = _mm256_set1_pd(dt);
+                            const __m256d v_sdt = _mm256_set1_pd(sqrt_dt);
+                            const __m256d v_half = _mm256_set1_pd(0.5);
+                            const __m256d v_nhalf = _mm256_set1_pd(-0.5);
+                            const __m256d v_quarter = _mm256_set1_pd(0.25);
+                            const __m256d v_two = _mm256_set1_pd(2.0);
+                            const __m256d v_one = _mm256_set1_pd(1.0);
+                            const __m256d v_dsig_hi = _mm256_set1_pd(vib_dsig_dy_max);
+                            const __m256d v_dsig_lo = _mm256_set1_pd(-vib_dsig_dy_max);
+                            const double* sl0 = lv_slice_start.data();
+                            const double* sl1 = lv_slice_end.data();
+                            __m256d v_q_acc = _mm256_setzero_pd();
+
+                            auto eval_slice_bwd_pd = [&](
+                                const double* sl,
+                                __m256d y_v,
+                                __m256d& dy_out,
+                                __m128i& iy0_out,
+                                __m256d& wy_out
+                            ) noexcept -> __m256d {
+                                if (lv_ny <= 1) {
+                                    dy_out = v_zero;
+                                    iy0_out = _mm_setzero_si128();
+                                    wy_out = v_zero;
+                                    return _mm256_set1_pd(sl[0]);
+                                }
+                                __m256d uy_raw = _mm256_mul_pd(_mm256_sub_pd(y_v, v_y_min), v_inv_dy);
+                                __m256d in_y = _mm256_and_pd(
+                                    _mm256_cmp_pd(uy_raw, v_zero, _CMP_GT_OQ),
+                                    _mm256_cmp_pd(uy_raw, v_max_uy, _CMP_LT_OQ)
+                                );
+                                __m256d u_y = _mm256_min_pd(_mm256_max_pd(uy_raw, v_zero), v_max_uy);
+                                __m256d u_fl = _mm256_floor_pd(u_y);
+                                iy0_out = _mm256_cvttpd_epi32(u_fl);
+                                wy_out = _mm256_sub_pd(u_y, u_fl);
+                                __m256d s0 = _mm256_i32gather_pd(sl, iy0_out, 8);
+                                __m256d s1 = _mm256_i32gather_pd(sl + 1, iy0_out, 8);
+                                __m256d ds = _mm256_sub_pd(s1, s0);
+                                __m256d d_raw = _mm256_and_pd(in_y, _mm256_mul_pd(ds, v_inv_dy));
+                                dy_out = clamp_vib_dsig ? _mm256_min_pd(_mm256_max_pd(d_raw, v_dsig_lo), v_dsig_hi) : d_raw;
+                                return _mm256_fmadd_pd(wy_out, ds, s0);
+                            };
+
+                            for (; n + 4 <= n_rep; n += 4) {
+                                const __m256d lxp = _mm256_loadu_pd(lx_pre + n);
+                                const __m256d zd = _mm256_loadu_pd(zd_ptr + n);
+                                const __m256d dw = _mm256_mul_pd(v_sdt, zd);
+                                const __m256d y0 = _mm256_add_pd(lxp, v_q_mid);
+
+                                __m256d dy0, wy0;
+                                __m128i iy0_0;
+                                const __m256d sig0 = eval_slice_bwd_pd(sl0, y0, dy0, iy0_0, wy0);
+                                const __m256d a0 = _mm256_mul_pd(v_nhalf, _mm256_mul_pd(sig0, sig0));
+                                const __m256d base_y = _mm256_fmadd_pd(a0, v_dt, y0);
+                                const __m256d sig0_sdt = _mm256_mul_pd(sig0, v_sdt);
+
+                                __m256d dyh, wyh, dyp, wyp, dym, wym;
+                                __m128i iy0_h, iy0_p, iy0_m;
+                                const __m256d sigh = eval_slice_bwd_pd(sl1, _mm256_fmadd_pd(sig0, dw, base_y), dyh, iy0_h, wyh);
+                                const __m256d sigp = eval_slice_bwd_pd(sl1, _mm256_add_pd(base_y, sig0_sdt), dyp, iy0_p, wyp);
+                                const __m256d sigm = eval_slice_bwd_pd(sl1, _mm256_sub_pd(base_y, sig0_sdt), dym, iy0_m, wym);
+
+                                const __m256d bx = _mm256_loadu_pd(bar_x.data() + n);
+                                const __m256d zc2m1 = _mm256_fmsub_pd(zd, zd, v_one);
+                                const __m256d bar_lvh = _mm256_mul_pd(bx, _mm256_mul_pd(v_nhalf, _mm256_mul_pd(v_dt, sigh)));
+                                const __m256d sdt_z = _mm256_mul_pd(v_sdt, zc2m1);
+                                const __m256d bar_lvp = _mm256_mul_pd(bx, _mm256_mul_pd(v_quarter, _mm256_add_pd(dw, sdt_z)));
+                                const __m256d bar_lvm = _mm256_mul_pd(bx, _mm256_mul_pd(v_quarter, _mm256_sub_pd(dw, sdt_z)));
+                                const __m256d bar_lv0_dir = _mm256_mul_pd(bx, _mm256_fmadd_pd(_mm256_mul_pd(v_nhalf, v_dt), sig0, _mm256_mul_pd(v_half, dw)));
+
+                                const __m256d bar_lx_hat = _mm256_mul_pd(bar_lvh, dyh);
+                                const __m256d bar_lx_p = _mm256_mul_pd(bar_lvp, dyp);
+                                const __m256d bar_lx_m = _mm256_mul_pd(bar_lvm, dym);
+
+                                if (compute_chol) {
+                                    const __m256d sum_pm = _mm256_add_pd(_mm256_add_pd(sigp, sigm), _mm256_mul_pd(v_two, sig0));
+                                    const __m256d diff_pm = _mm256_sub_pd(sigp, sigm);
+                                    const __m256d t_zc = _mm256_fmadd_pd(
+                                        _mm256_mul_pd(v_quarter, sum_pm), v_sdt,
+                                        _mm256_mul_pd(_mm256_mul_pd(v_half, diff_pm), _mm256_mul_pd(v_sdt, zd))
+                                    );
+                                    const __m256d bar_zc = _mm256_fmadd_pd(bx, t_zc, _mm256_mul_pd(bar_lx_hat, sig0_sdt));
+                                    alignas(32) double bzc_arr[4];
+                                    _mm256_store_pd(bzc_arr, bar_zc);
+                                    double* chol_row = thr_chol + du * Du;
+                                    for (int lane = 0; lane < 4; ++lane) {
+                                        const double bzc_l = bzc_arr[lane];
+                                        const double* zin_n = zin_step + static_cast<std::size_t>(n + lane) * Du;
+                                        for (int j = 0; j < D; ++j) {
+                                            chol_row[j] += bzc_l * zin_n[j];
+                                        }
+                                    }
+                                }
+
+                                const __m256d bar_a0 = _mm256_mul_pd(v_dt, _mm256_add_pd(bar_lx_hat, _mm256_add_pd(bar_lx_p, bar_lx_m)));
+                                const __m256d bar_lv0 = _mm256_add_pd(
+                                    _mm256_fnmadd_pd(bar_a0, sig0, bar_lv0_dir),
+                                    _mm256_fmadd_pd(bar_lx_hat, dw, _mm256_mul_pd(_mm256_sub_pd(bar_lx_p, bar_lx_m), v_sdt))
+                                );
+
+                                if (compute_lv) {
+                                    alignas(16) std::int32_t i0_a[4], ih_a[4], ip_a[4], im_a[4];
+                                    alignas(32) double w0_a[4], wh_a[4], wp_a[4], wm_a[4];
+                                    alignas(32) double b0_a[4], bh_a[4], bp_a[4], bm_a[4];
+                                    _mm_store_si128(reinterpret_cast<__m128i*>(i0_a), iy0_0);
+                                    _mm_store_si128(reinterpret_cast<__m128i*>(ih_a), iy0_h);
+                                    _mm_store_si128(reinterpret_cast<__m128i*>(ip_a), iy0_p);
+                                    _mm_store_si128(reinterpret_cast<__m128i*>(im_a), iy0_m);
+                                    _mm256_store_pd(w0_a, wy0);
+                                    _mm256_store_pd(wh_a, wyh);
+                                    _mm256_store_pd(wp_a, wyp);
+                                    _mm256_store_pd(wm_a, wym);
+                                    _mm256_store_pd(b0_a, bar_lv0);
+                                    _mm256_store_pd(bh_a, bar_lvh);
+                                    _mm256_store_pd(bp_a, bar_lvp);
+                                    _mm256_store_pd(bm_a, bar_lvm);
+                                    const int iy_inc = (lv_ny > 1) ? 1 : 0;
+                                    for (int lane = 0; lane < 4; ++lane) {
+                                        const std::size_t c0_0 = static_cast<std::size_t>(i0_a[lane]);
+                                        const std::size_t c1_0 = c0_0 + static_cast<std::size_t>(iy_inc);
+                                        const double bv0 = b0_a[lane];
+                                        const double wyv0 = w0_a[lane];
+                                        bar_sl0[c0_0] += bv0 * (1.0 - wyv0);
+                                        bar_sl0[c1_0] += bv0 * wyv0;
+
+                                        const std::size_t c0_h = static_cast<std::size_t>(ih_a[lane]);
+                                        const std::size_t c1_h = c0_h + static_cast<std::size_t>(iy_inc);
+                                        const double bvh = bh_a[lane];
+                                        const double wyvh = wh_a[lane];
+                                        bar_sl1[c0_h] += bvh * (1.0 - wyvh);
+                                        bar_sl1[c1_h] += bvh * wyvh;
+
+                                        const std::size_t c0_p = static_cast<std::size_t>(ip_a[lane]);
+                                        const std::size_t c1_p = c0_p + static_cast<std::size_t>(iy_inc);
+                                        const double bvp = bp_a[lane];
+                                        const double wyvp = wp_a[lane];
+                                        bar_sl1[c0_p] += bvp * (1.0 - wyvp);
+                                        bar_sl1[c1_p] += bvp * wyvp;
+
+                                        const std::size_t c0_m = static_cast<std::size_t>(im_a[lane]);
+                                        const std::size_t c1_m = c0_m + static_cast<std::size_t>(iy_inc);
+                                        const double bvm = bm_a[lane];
+                                        const double wyvm = wm_a[lane];
+                                        bar_sl1[c0_m] += bvm * (1.0 - wyvm);
+                                        bar_sl1[c1_m] += bvm * wyvm;
+                                    }
+                                }
+
+                                const __m256d bar_y = _mm256_fmadd_pd(bar_lv0, dy0, _mm256_add_pd(bar_lx_hat, _mm256_add_pd(bar_lx_p, bar_lx_m)));
+                                if (compute_q) {
+                                    v_q_acc = _mm256_add_pd(v_q_acc, bar_y);
+                                }
+                                _mm256_storeu_pd(bar_x.data() + n, _mm256_add_pd(bx, bar_y));
+                            }
+                            if (compute_q) {
+                                alignas(32) double q4[4];
+                                _mm256_store_pd(q4, v_q_acc);
+                                q_acc_step += q4[0] + q4[1] + q4[2] + q4[3];
+                            }
+#endif
+                            auto eval_slice_bwd_scalar = [&](const double* sl, double y_v, double& dy_out, int& iy0_out, int& iy1_out, double& wy_out) noexcept -> double {
+                                if (lv_ny <= 1) {
+                                    dy_out = 0.0;
+                                    iy0_out = 0;
+                                    iy1_out = 0;
+                                    wy_out = 0.0;
+                                    return sl[0];
+                                }
+                                const double u_raw = (y_v - y_min_d) * inv_dy_d;
+                                const bool in_y = (u_raw > 0.0) && (u_raw < max_u_y);
+                                const double u_y = std::clamp(u_raw, 0.0, max_u_y);
+                                iy0_out = static_cast<int>(u_y);
+                                iy1_out = std::min(iy0_out + 1, lv_ny - 1);
+                                wy_out = u_y - static_cast<double>(iy0_out);
+                                const double s0 = sl[iy0_out];
+                                const double s1 = sl[iy1_out];
+                                const double d_raw = in_y ? ((s1 - s0) * inv_dy_d) : 0.0;
+                                dy_out = clamp_vib_dsig ? std::clamp(d_raw, -vib_dsig_dy_max, vib_dsig_dy_max) : d_raw;
+                                return s0 + wy_out * (s1 - s0);
+                            };
+                            for (; n < n_rep; ++n) {
                                 const double lxp = lx_pre[n];
                                 const double zd = zd_ptr[n];
                                 const double dw = sqrt_dt * zd;
-                                const BilinearLvEval e0 = eval_lv_bilinear_with_deriv(
-                                    lv_d, lv_nt, lv_ny, t_start, lxp + q_mid, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
-                                const double sig0 = e0.val;
+                                double dy0 = 0.0, wy0 = 0.0, dyh = 0.0, wyh = 0.0, dyp = 0.0, wyp = 0.0, dym = 0.0, wym = 0.0;
+                                int iy0_0 = 0, iy1_0 = 0, iy0_h = 0, iy1_h = 0, iy0_p = 0, iy1_p = 0, iy0_m = 0, iy1_m = 0;
+                                const double sig0 = eval_slice_bwd_scalar(lv_slice_start.data(), lxp + q_mid, dy0, iy0_0, iy1_0, wy0);
                                 const double a0 = -0.5 * sig0 * sig0;
                                 const double base_y = lxp + a0 * dt + q_mid;
-                                const BilinearLvEval eh = eval_lv_bilinear_with_deriv(
-                                    lv_d, lv_nt, lv_ny, t_end, base_y + sig0 * dw, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
-                                const BilinearLvEval ep = eval_lv_bilinear_with_deriv(
-                                    lv_d, lv_nt, lv_ny, t_end, base_y + sig0 * sqrt_dt, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
-                                const BilinearLvEval em = eval_lv_bilinear_with_deriv(
-                                    lv_d, lv_nt, lv_ny, t_end, base_y - sig0 * sqrt_dt, inv_dt_grid, y_min_d, inv_dy_d, max_u_t, max_u_y);
+                                const double sigh = eval_slice_bwd_scalar(lv_slice_end.data(), base_y + sig0 * dw, dyh, iy0_h, iy1_h, wyh);
+                                const double sigp = eval_slice_bwd_scalar(lv_slice_end.data(), base_y + sig0 * sqrt_dt, dyp, iy0_p, iy1_p, wyp);
+                                const double sigm = eval_slice_bwd_scalar(lv_slice_end.data(), base_y - sig0 * sqrt_dt, dym, iy0_m, iy1_m, wym);
 
                                 const double bx = bar_x[static_cast<std::size_t>(n)];
                                 const double zc2m1 = zd * zd - 1.0;
-                                const double bar_lvh = bx * (-0.5 * dt * eh.val);
+                                const double bar_lvh = bx * (-0.5 * dt * sigh);
                                 const double bar_lvp = bx * (0.25 * (dw + sqrt_dt * zc2m1));
                                 const double bar_lvm = bx * (0.25 * (dw - sqrt_dt * zc2m1));
                                 const double bar_lv0_dir = bx * (-0.5 * dt * sig0 + 0.5 * dw);
 
-                                const double bar_lx_hat = bar_lvh * eh.dy;
-                                const double bar_lx_p = bar_lvp * ep.dy;
-                                const double bar_lx_m = bar_lvm * em.dy;
+                                const double bar_lx_hat = bar_lvh * dyh;
+                                const double bar_lx_p = bar_lvp * dyp;
+                                const double bar_lx_m = bar_lvm * dym;
 
                                 if (compute_chol) {
                                     const double bar_zc =
-                                        bx * (0.25 * (ep.val + em.val + 2.0 * sig0) * sqrt_dt + 0.5 * (ep.val - em.val) * sqrt_dt * zd)
+                                        bx * (0.25 * (sigp + sigm + 2.0 * sig0) * sqrt_dt + 0.5 * (sigp - sigm) * sqrt_dt * zd)
                                         + bar_lx_hat * (sig0 * sqrt_dt);
                                     const double* zin_n = zin_step + static_cast<std::size_t>(n) * Du;
                                     double* chol_row = thr_chol + du * Du;
@@ -6317,29 +7137,38 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                 const double bar_lv0 = bar_lv0_dir + bar_a0 * (-sig0) + bar_lx_hat * dw + (bar_lx_p - bar_lx_m) * sqrt_dt;
 
                                 if (compute_lv) {
-                                    auto scatter_lv = [&](double bval, const BilinearLvEval& ev) noexcept {
-                                        const std::size_t r0 = static_cast<std::size_t>(ev.it0) * lv_ny_u;
-                                        const std::size_t r1 = static_cast<std::size_t>(ev.it1) * lv_ny_u;
-                                        const std::size_t c0 = static_cast<std::size_t>(ev.iy0);
-                                        const std::size_t c1 = static_cast<std::size_t>(ev.iy1);
-                                        const double omt = 1.0 - ev.wt;
-                                        const double omy = 1.0 - ev.wy;
-                                        thr_lv_d[r0 + c0] += bval * omt * omy;
-                                        thr_lv_d[r0 + c1] += bval * omt * ev.wy;
-                                        thr_lv_d[r1 + c0] += bval * ev.wt * omy;
-                                        thr_lv_d[r1 + c1] += bval * ev.wt * ev.wy;
-                                    };
-                                    scatter_lv(bar_lv0, e0);
-                                    scatter_lv(bar_lvh, eh);
-                                    scatter_lv(bar_lvp, ep);
-                                    scatter_lv(bar_lvm, em);
+                                    bar_sl0[static_cast<std::size_t>(iy0_0)] += bar_lv0 * (1.0 - wy0);
+                                    bar_sl0[static_cast<std::size_t>(iy1_0)] += bar_lv0 * wy0;
+                                    bar_sl1[static_cast<std::size_t>(iy0_h)] += bar_lvh * (1.0 - wyh);
+                                    bar_sl1[static_cast<std::size_t>(iy1_h)] += bar_lvh * wyh;
+                                    bar_sl1[static_cast<std::size_t>(iy0_p)] += bar_lvp * (1.0 - wyp);
+                                    bar_sl1[static_cast<std::size_t>(iy1_p)] += bar_lvp * wyp;
+                                    bar_sl1[static_cast<std::size_t>(iy0_m)] += bar_lvm * (1.0 - wym);
+                                    bar_sl1[static_cast<std::size_t>(iy1_m)] += bar_lvm * wym;
                                 }
 
-                                const double bar_y = bar_lv0 * e0.dy + bar_lx_hat + bar_lx_p + bar_lx_m;
+                                const double bar_y = bar_lv0 * dy0 + bar_lx_hat + bar_lx_p + bar_lx_m;
                                 if (compute_q) {
                                     q_acc_step += bar_y;
                                 }
                                 bar_x[static_cast<std::size_t>(n)] = bx + bar_y;
+                            }
+
+                            if (compute_lv) {
+                                const double omt0 = 1.0 - wt_0;
+                                double* dst0_a = thr_lv_d + static_cast<std::size_t>(it0_0) * lv_ny_u;
+                                double* dst0_b = thr_lv_d + static_cast<std::size_t>(it1_0) * lv_ny_u;
+                                const double omt1 = 1.0 - wt_1;
+                                double* dst1_a = thr_lv_d + static_cast<std::size_t>(it0_1) * lv_ny_u;
+                                double* dst1_b = thr_lv_d + static_cast<std::size_t>(it1_1) * lv_ny_u;
+                                for (int iy = 0; iy < lv_ny; ++iy) {
+                                    const double v0 = bar_sl0[static_cast<std::size_t>(iy)];
+                                    dst0_a[iy] += v0 * omt0;
+                                    dst0_b[iy] += v0 * wt_0;
+                                    const double v1 = bar_sl1[static_cast<std::size_t>(iy)];
+                                    dst1_a[iy] += v1 * omt1;
+                                    dst1_b[iy] += v1 * wt_1;
+                                }
                             }
                             if (compute_q) {
                                 thr_q[(du * Mu + mu) * Su + su] += q_acc_step;
@@ -7067,7 +7896,7 @@ std::int32_t crn_eval_vibrato_gamma_cpp(const VibratoGammaArgs* args) noexcept {
                 const std::size_t iu = static_cast<std::size_t>(i);
                 const double sig_i = std::max(args->sig_pre[iu * N + n], 1e-4);
                 const double isi = 1.0 / std::max(sig_i * sqrt_h_vib, 1e-6);
-                const double jp = args->j_pre[iu * N + n];
+                const double jp = std::clamp(args->j_pre[iu * N + n], -8.0, 8.0);
                 const double ji = jp * args->cdl_m[m_last_off + iu];
                 const double* lrow = args->l_inv_t + iu * Du;
                 double xi_i = 0.0;

@@ -2929,6 +2929,15 @@ class PlatenSdeAadArgsC(ctypes.Structure):
         ("compute_chol_aad", ctypes.c_int32),
         ("compute_q_aad", ctypes.c_int32),
         ("has_q_shift_sub", ctypes.c_int32),
+        ("out_lx_pre", ctypes.c_void_p),
+        ("out_j_pre", ctypes.c_void_p),
+        ("out_sig_pre", ctypes.c_void_p),
+        ("vib_period_idx", ctypes.c_int32),
+        ("vib_sub_idx", ctypes.c_int32),
+        ("save_vib_pre", ctypes.c_int32),
+        ("_pad_vib", ctypes.c_int32),
+        ("vib_j_pre_max", ctypes.c_double),
+        ("vib_dsig_dy_max", ctypes.c_double),
     ]
 
 
@@ -3017,7 +3026,7 @@ class VibratoGammaArgsC(ctypes.Structure):
 
 
 assert ctypes.sizeof(Tier1AbiInfoV2C) == 48 and ctypes.alignment(Tier1AbiInfoV2C) == 4
-assert ctypes.sizeof(PlatenSdeAadArgsC) == 216 and ctypes.alignment(PlatenSdeAadArgsC) == 8
+assert ctypes.sizeof(PlatenSdeAadArgsC) == 272 and ctypes.alignment(PlatenSdeAadArgsC) == 8
 assert ctypes.sizeof(SobolGenArgsC) == 128 and ctypes.alignment(SobolGenArgsC) == 8
 assert ctypes.sizeof(VibratoGammaArgsC) == 392 and ctypes.alignment(VibratoGammaArgsC) == 8
 
@@ -3058,7 +3067,7 @@ class Cpp23Tier1Backend:
             or int(abi_v2.autocall_args_align) != 8
             or int(abi_v2.crn_args_size) != 320
             or int(abi_v2.crn_args_align) != 8
-            or int(abi_v2.platen_sde_aad_args_size) != 216
+            or int(abi_v2.platen_sde_aad_args_size) != 272
             or int(abi_v2.platen_sde_aad_args_align) != 8
             or int(abi_v2.sobol_gen_args_size) != 128
             or int(abi_v2.sobol_gen_args_align) != 8
@@ -3200,12 +3209,33 @@ class Cpp23Tier1Backend:
         lib.crn_eval_vibrato_gamma_cpp.argtypes = [c_vp]
         lib.crn_eval_vibrato_gamma_cpp.restype = ctypes.c_int32
 
+        lib.crn_step_spot_bumps_cpp.argtypes = [
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+        ]
+        lib.crn_step_spot_bumps_cpp.restype = ctypes.c_int32
+
         self._fn_coeffs = lib.tier1_clamped_cubic_coeffs_1d
         self._fn_eval_cubic = lib.tier1_eval_cubic_with_derivs
         self._fn_bridge = lib.tier1_eval_autocall_bridge_cpu
         self._fn_struct = lib.tier1_eval_autocall_struct_cpu
         self._fn_index_moments = lib.tier1_eval_index_moments_cpu
         self._fn_crn_step_1d = lib.crn_step_1d_trajectories_cpp
+        self._fn_crn_step_spot_bumps = lib.crn_step_spot_bumps_cpp
         self._fn_crn_loo_l2o = lib.crn_eval_payoff_loo_l2o_cpp
         self._fn_platen_sde_aad = lib.crn_platen_sde_aad_cpp
         self._fn_sobol_gen = lib.crn_generate_sobol_normals_cpp
@@ -3239,6 +3269,14 @@ class Cpp23Tier1Backend:
         compute_lv_aad: bool = True,
         compute_chol_aad: bool = True,
         compute_q_aad: bool = True,
+        out_lx_pre: Optional[npt.NDArray[np.float64]] = None,
+        out_j_pre: Optional[npt.NDArray[np.float64]] = None,
+        out_sig_pre: Optional[npt.NDArray[np.float64]] = None,
+        vib_period_idx: int = 0,
+        vib_sub_idx: int = 0,
+        save_vib_pre: int | bool = 0,
+        vib_j_pre_max: float = 0.0,
+        vib_dsig_dy_max: float = 0.0,
     ) -> Tuple[
         Optional[npt.NDArray[np.float64]],
         Optional[npt.NDArray[np.float64]],
@@ -3273,6 +3311,29 @@ class Cpp23Tier1Backend:
             raise ValueError("bar_lx_post is required when run_backward=True.")
         if run_backward and lx_norm_c is None and lx_period_out is None:
             raise ValueError("lx_norm_in is required when run_backward=True and run_forward=False.")
+
+        save_vib_flag = int(save_vib_pre) if isinstance(save_vib_pre, bool) else int(save_vib_pre)
+        if not run_forward:
+            save_vib_flag = 0
+        if save_vib_flag != 0:
+            if out_lx_pre is None or out_j_pre is None or out_sig_pre is None:
+                raise ValueError("out_lx_pre, out_j_pre, and out_sig_pre are required when save_vib_pre != 0.")
+            expected_vib_shape = (d_assets, n_total)
+            for name_buf, arr_buf in (
+                ("out_lx_pre", out_lx_pre),
+                ("out_j_pre", out_j_pre),
+                ("out_sig_pre", out_sig_pre),
+            ):
+                if (
+                    not isinstance(arr_buf, np.ndarray)
+                    or arr_buf.dtype != _F64_DTYPE
+                    or not arr_buf.flags.c_contiguous
+                    or arr_buf.shape != expected_vib_shape
+                ):
+                    raise ValueError(
+                        f"{name_buf} must be C-contiguous float64 of shape {expected_vib_shape}, "
+                        f"got {getattr(arr_buf, 'shape', None)} dtype={getattr(arr_buf, 'dtype', None)}"
+                    )
 
         bar_lv_out = np.empty((d_assets, lv_nt, lv_ny), dtype=np.float64) if (run_backward and compute_lv_aad) else None
         bar_chol_out = np.empty((d_assets, d_assets), dtype=np.float64) if (run_backward and compute_chol_aad) else None
@@ -3309,11 +3370,83 @@ class Cpp23Tier1Backend:
             compute_chol_aad=1 if compute_chol_aad else 0,
             compute_q_aad=1 if compute_q_aad else 0,
             has_q_shift_sub=1 if has_q_sub else 0,
+            out_lx_pre=out_lx_pre.ctypes.data if (save_vib_flag != 0 and out_lx_pre is not None) else 0,
+            out_j_pre=out_j_pre.ctypes.data if (save_vib_flag != 0 and out_j_pre is not None) else 0,
+            out_sig_pre=out_sig_pre.ctypes.data if (save_vib_flag != 0 and out_sig_pre is not None) else 0,
+            vib_period_idx=int(vib_period_idx),
+            vib_sub_idx=int(vib_sub_idx),
+            save_vib_pre=save_vib_flag,
+            _pad_vib=0,
+            vib_j_pre_max=float(vib_j_pre_max),
+            vib_dsig_dy_max=float(vib_dsig_dy_max),
         )
         rc = int(self._fn_platen_sde_aad(ctypes.byref(c_args)))
         if rc != 0:
             raise RuntimeError(f"crn_platen_sde_aad_cpp failed with status code {rc}.")
         return lx_period_out, norm_x_out, bar_lv_out, bar_chol_out, bar_q_out
+
+    def crn_step_spot_bumps_cpu(
+        self,
+        *,
+        lv_tables_pm: npt.NDArray[np.float64],
+        z_corr: npt.NDArray[np.float64],
+        tau_obs: npt.NDArray[np.float64],
+        r_native_obs: npt.NDArray[np.float64],
+        r_tot_obs: npt.NDArray[np.float64],
+        lv_t_grid: npt.NDArray[np.float64],
+        lv_y_min: float | npt.NDArray[np.float64],
+        lv_y_max: float | npt.NDArray[np.float64],
+        n_sub: int,
+        eff_r: int,
+        n_rep: int,
+        out_norm_x_pm: Optional[npt.NDArray[np.float64]] = None,
+    ) -> npt.NDArray[np.float64]:
+        lv_c = _ensure_f64_c(lv_tables_pm)
+        z_c = _ensure_f64_c(z_corr)
+        tau_c = _ensure_f64_c(tau_obs)
+        rn_c = _ensure_f64_c(r_native_obs)
+        rt_c = _ensure_f64_c(r_tot_obs)
+        tgrid_c = _ensure_f64_c(lv_t_grid)
+        d_assets, _, lv_nt, lv_ny = (int(lv_c.shape[0]), int(lv_c.shape[1]), int(lv_c.shape[2]), int(lv_c.shape[3]))
+        m_rem = int(tau_c.shape[0])
+        n_total = int(eff_r) * int(n_rep)
+        y_min_c = _ensure_f64_c(np.broadcast_to(np.asarray(lv_y_min, dtype=np.float64), (d_assets,)))
+        y_max_c = _ensure_f64_c(np.broadcast_to(np.asarray(lv_y_max, dtype=np.float64), (d_assets,)))
+        out_shape = (2, d_assets, m_rem, n_total)
+        if out_norm_x_pm is None:
+            out_arr = np.empty(out_shape, dtype=np.float64)
+        else:
+            if (
+                not isinstance(out_norm_x_pm, np.ndarray)
+                or out_norm_x_pm.dtype != _F64_DTYPE
+                or not out_norm_x_pm.flags.c_contiguous
+                or out_norm_x_pm.shape != out_shape
+            ):
+                raise ValueError(f"out_norm_x_pm must be C-contiguous float64 of shape {out_shape}")
+            out_arr = out_norm_x_pm
+        rc = int(
+            self._fn_crn_step_spot_bumps(
+                d_assets,
+                lv_nt,
+                lv_ny,
+                m_rem,
+                int(n_sub),
+                int(eff_r),
+                int(n_rep),
+                lv_c.ctypes.data,
+                z_c.ctypes.data,
+                tau_c.ctypes.data,
+                rn_c.ctypes.data,
+                rt_c.ctypes.data,
+                tgrid_c.ctypes.data,
+                y_min_c.ctypes.data,
+                y_max_c.ctypes.data,
+                out_arr.ctypes.data,
+            )
+        )
+        if rc != 0:
+            raise RuntimeError(f"crn_step_spot_bumps_cpp failed with status code {rc}.")
+        return out_arr
 
     def crn_generate_sobol_normals_cpu(
         self,
@@ -3942,6 +4075,14 @@ def crn_platen_sde_aad_cpu(
     compute_lv_aad: bool = True,
     compute_chol_aad: bool = True,
     compute_q_aad: bool = True,
+    out_lx_pre: Optional[npt.NDArray[np.float64]] = None,
+    out_j_pre: Optional[npt.NDArray[np.float64]] = None,
+    out_sig_pre: Optional[npt.NDArray[np.float64]] = None,
+    vib_period_idx: int = 0,
+    vib_sub_idx: int = 0,
+    save_vib_pre: int | bool = 0,
+    vib_j_pre_max: float = 0.0,
+    vib_dsig_dy_max: float = 0.0,
 ) -> Tuple[
     Optional[npt.NDArray[np.float64]],
     Optional[npt.NDArray[np.float64]],
@@ -3971,6 +4112,46 @@ def crn_platen_sde_aad_cpu(
         compute_lv_aad=compute_lv_aad,
         compute_chol_aad=compute_chol_aad,
         compute_q_aad=compute_q_aad,
+        out_lx_pre=out_lx_pre,
+        out_j_pre=out_j_pre,
+        out_sig_pre=out_sig_pre,
+        vib_period_idx=vib_period_idx,
+        vib_sub_idx=vib_sub_idx,
+        save_vib_pre=save_vib_pre,
+        vib_j_pre_max=vib_j_pre_max,
+        vib_dsig_dy_max=vib_dsig_dy_max,
+    )
+
+
+def crn_step_spot_bumps_cpu(
+    *,
+    lv_tables_pm: npt.NDArray[np.float64],
+    z_corr: npt.NDArray[np.float64],
+    tau_obs: npt.NDArray[np.float64],
+    r_native_obs: npt.NDArray[np.float64],
+    r_tot_obs: npt.NDArray[np.float64],
+    lv_t_grid: npt.NDArray[np.float64],
+    lv_y_min: float | npt.NDArray[np.float64],
+    lv_y_max: float | npt.NDArray[np.float64],
+    n_sub: int,
+    eff_r: int,
+    n_rep: int,
+    out_norm_x_pm: Optional[npt.NDArray[np.float64]] = None,
+) -> npt.NDArray[np.float64]:
+    """Dispatches batched +/- spot-bump 1D Platen Weak-2.0 stepping to C++23 AVX2/OpenMP."""
+    return _require_cpp23_backend().crn_step_spot_bumps_cpu(
+        lv_tables_pm=lv_tables_pm,
+        z_corr=z_corr,
+        tau_obs=tau_obs,
+        r_native_obs=r_native_obs,
+        r_tot_obs=r_tot_obs,
+        lv_t_grid=lv_t_grid,
+        lv_y_min=lv_y_min,
+        lv_y_max=lv_y_max,
+        n_sub=n_sub,
+        eff_r=eff_r,
+        n_rep=n_rep,
+        out_norm_x_pm=out_norm_x_pm,
     )
 
 
@@ -4138,6 +4319,7 @@ __all__ = [
     "crn_eval_vibrato_gamma_cpu",
     "crn_generate_sobol_normals_cpu",
     "crn_platen_sde_aad_cpu",
+    "crn_step_spot_bumps_cpu",
     "get_tier1_backend",
     "is_exact_analytical_index",
     "monitoring_index_to_code",
