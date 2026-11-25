@@ -295,7 +295,15 @@ class GlobalGpuCacheManager:
         self._pool_locks: Dict[Tuple[str, int], threading.Lock] = {}
         self._pool_events: Dict[Tuple[str, int], Optional[Any]] = {}
         self._pool_page_bytes: Dict[Tuple[str, int], int] = {}
+        self._pool_anchors: Dict[Tuple[str, int], Tuple[Any, torch.Tensor]] = {}
+        self._on_clear_callbacks: List[Callable[[], None]] = []
         self._canonical_models: Dict[Tuple[str, Tuple[str, int], torch.dtype], Tuple[int, nn.Module]] = {}
+
+    def register_on_clear_callback(self, cb: Callable[[], None]) -> None:
+        """Register a callback invoked when clear_all() flushes caches."""
+        with self._lock:
+            if cb not in self._on_clear_callbacks:
+                self._on_clear_callbacks.append(cb)
 
     def register_partition(
         self,
@@ -422,6 +430,14 @@ class GlobalGpuCacheManager:
                 if dev_key[0] == "cuda":
                     with torch.cuda.device(dev_key[1]):
                         pool = torch.cuda.graph_pool_handle()  # type: ignore[no-untyped-call]
+                        anchor_stream = torch.cuda.Stream(device=dev_key[1])  # type: ignore[no-untyped-call]
+                        anchor_graph = torch.cuda.CUDAGraph()  # type: ignore[no-untyped-call]
+                        with torch.inference_mode(False), torch.no_grad():
+                            anchor_stream.wait_stream(torch.cuda.current_stream(dev_key[1]))
+                            with torch.cuda.graph(anchor_graph, pool=pool, stream=anchor_stream):
+                                anchor_t = torch.zeros((1,), dtype=torch.float32, device=f"cuda:{dev_key[1]}")
+                        anchor_stream.synchronize()
+                        self._pool_anchors[dev_key] = (anchor_graph, anchor_t)
                 else:
                     pool = None
                 self._graph_pools[dev_key] = pool
@@ -544,6 +560,9 @@ class GlobalGpuCacheManager:
                 self._pool_events[dev_key] = None
             if clear_canonical_models:
                 self._canonical_models.clear()
+            cbs = list(self._on_clear_callbacks)
+        for cb in cbs:
+            cb()
         gc.collect()
         if cuda_ok:
             torch.cuda.empty_cache()

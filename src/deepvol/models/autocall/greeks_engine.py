@@ -6655,6 +6655,7 @@ def _get_surrogate_cuda_graph_runner(
                                         allow_unused=True,
                                     )
                         stream.synchronize()
+                        torch.cuda.empty_cache()
 
                         g_fwd = torch.cuda.CUDAGraph()  # type: ignore[no-untyped-call]
                         with torch.cuda.graph(g_fwd, pool=pool, stream=stream):
@@ -19942,7 +19943,7 @@ def compute_batched_surrogate_greeks(
     if device.type == "cuda" and batch_size > 1:
         work_per_trade = max(m_act, 1) * max(d_act, 1) * (2 if compute_cash_gamma else 1)
         max_work_budget = 100_000 if batch_size >= 1024 else 400_000
-        eff_max_chunk = 256 if work_per_trade <= 128 else 128
+        eff_max_chunk = 1024 if work_per_trade <= 32 else (256 if work_per_trade <= 128 else 128)
         if batch_size > eff_max_chunk or batch_size * work_per_trade > max_work_budget:
             raw_chunk = min(eff_max_chunk, max(1, max_work_budget // max(work_per_trade, 1)))
             chunk_b = 1 << (raw_chunk.bit_length() - 1) if raw_chunk >= 16 else raw_chunk

@@ -812,6 +812,7 @@ def clear_qmc_aad_gpu_caches() -> None:
     _CRN_MF_CHEAP_CACHE.clear()
     _CRN_QMC_CG_CACHE.clear()
     _QMC_CG_SCRATCH_ARENA.clear()
+    _QMC_CG_ARENA_KEEPALIVE.clear()
     _QMC_CG_STREAMS.clear()
 
 
@@ -854,7 +855,9 @@ class _QmcCudagraphCache:
 
 _CRN_QMC_CG_CACHE = _QmcCudagraphCache(max_entries=_QMC_CG_MAX_ENTRIES)
 _QMC_CG_SCRATCH_ARENA: Dict[Tuple[int, str], torch.Tensor] = {}
+_QMC_CG_ARENA_KEEPALIVE: List[torch.Tensor] = []
 _QMC_CG_STREAMS: Dict[int, torch.cuda.Stream] = {}
+GLOBAL_GPU_CACHE_MANAGER.register_on_clear_callback(clear_qmc_aad_gpu_caches)
 
 
 def _get_qmc_cg_stream(device: torch.device) -> torch.cuda.Stream:
@@ -910,11 +913,12 @@ def _ensure_qmc_cg_scratch_arena(
     dev_idx = int(device.index or 0)
     # Unified canonical high-water budget (c_m_steps * c_d * c_n_chunk <= 160*6*4096) fits both (6,40,r=4) and (6,20,r=8)/(3,40,r=8)/(6,10,r=8).
     c_d = max(int(max_d), 6)
+    c_m = max(int(max_m), 60)
     c_dm_steps = max(int(max_d) * int(max_m) * int(n_sub) * int(max_r_chunk) * int(n_rep), 6 * 40 * 4 * 4 * 1024)
     c_dm_per = max(int(max_d) * int(max_m) * int(max_r_chunk) * int(n_rep), 6 * 40 * 4 * 1024)
     c_dm_th = max(int(max_d) * int(max_m_th) * int(max_r_chunk) * int(n_rep), c_dm_per)
     c_n_chunk = max(int(max_r_chunk) * int(n_rep), 8192)
-    c_shards = max(int(n_lv_shards), 32)
+    c_shards = max(int(n_lv_shards), 128)
     c_grid_s2 = max(1, int(max_r_chunk), 8) * max(1, (int(n_rep) + 127) // 128)
     c_grid_nv = (c_n_chunk + 31) // 32
     slots_bytes = {
@@ -928,21 +932,28 @@ def _ensure_qmc_cg_scratch_arena(
         "vib_j": c_d * c_n_chunk * 4,
         "vib_sig": c_d * c_n_chunk * 4,
         "bar_lx_post": c_dm_per * 4,
-        "out_cf_wf": 2 * c_grid_s2 * max(int(max_m), 40) * 8,
-        "bar_q": max(int(max_d) * int(max_m) * int(n_sub), 6 * 40 * 4) * 4,
+        "out_cf_wf": 2 * c_grid_s2 * c_m * 8,
+        "bar_q": max(c_d * c_m * int(n_sub), 6 * 60 * 4) * 4,
         "bar_lv": c_shards * c_d * max(int(lv_nt), 32) * max(int(lv_ny), 64) * 4,
         "d_ln_surv": (2 * c_d) * c_n_chunk * 4,
         "h_vib_out": c_grid_nv * c_d * c_d * 8,
         "frozen_term": 4 * c_n_chunk * 8,
-        "ema_shift": 2 * max(int(max_r_chunk), 8) * max(int(max_m), 40) * max(int(max_d_mf), c_d) * 4,
+        "ema_shift": 2 * max(int(max_r_chunk), 8) * c_m * max(int(max_d_mf), c_d) * 4,
         # z_mean_aux (get_z), ws_s2 (stage-2 AAD), perf_sp_pm, and perf_th have disjoint lifetimes within each chunk.
-        "perf_aux": max(2 * c_dm_per * 4, c_dm_th * 4, 7 * max(int(max_m), 40) * max(int(max_r_chunk) * int(n_rep), 4096) * 4),
+        "perf_aux": max(2 * c_dm_per * 4, c_dm_th * 4, 7 * c_m * max(int(max_r_chunk) * int(n_rep), 4096) * 4),
         "pv_tiles": max(int(max_nb), 64) * max(int(n_tiles_eval), 32) * 8,
     }
+    cleared_graphs = False
     for s_name, s_bytes in slots_bytes.items():
         k_ar = (dev_idx, s_name)
         cur = _QMC_CG_SCRATCH_ARENA.get(k_ar)
-        if cur is None or cur.device != device:
+        if cur is None or cur.device != device or int(cur.numel()) < int(s_bytes):
+            if cur is not None and cur.device == device:
+                if not cleared_graphs:
+                    _get_qmc_cg_stream(device).synchronize()
+                    _CRN_QMC_CG_CACHE.clear()
+                    cleared_graphs = True
+                _QMC_CG_ARENA_KEEPALIVE.append(cur)
             _QMC_CG_SCRATCH_ARENA[k_ar] = torch.empty((max(256, int(s_bytes)),), dtype=torch.uint8, device=device)
 
 
@@ -1107,7 +1118,7 @@ def _get_cpp_step_spot_bumps_fn() -> Any:
 
             backend = _require_cpp23_backend()
             _CPP_STEP_SPOT_BUMPS_CPU_FN = getattr(backend, "crn_step_spot_bumps_cpu", None)
-        except Exception:
+        except (OSError, ImportError, AttributeError, RuntimeError):
             _CPP_STEP_SPOT_BUMPS_CPU_FN = None
         _CPP_STEP_SPOT_BUMPS_CHECKED = True
         return _CPP_STEP_SPOT_BUMPS_CPU_FN
@@ -9239,7 +9250,7 @@ def _extract_fixing_value(
         if isinstance(val_dt, str):
             try:
                 return dt.date.fromisoformat(val_dt[:10])
-            except Exception:
+            except (ValueError, TypeError):
                 return val_dt
         return val_dt
 
@@ -15202,7 +15213,7 @@ def compute_qmc_aad_crn_greeks(
                         1,
                     ) * n_rep
                     _r_env_cap_b = int(os.environ.get("DEEPVOL_R_CAP", "4"))
-                    r_cap_b = _r_env_cap_b if (d_pad_b * m_pad_b * n_sub >= 512) else eff_r
+                    r_cap_b = 2 if (d_pad_b * m_pad_b > 240) else (_r_env_cap_b if (d_pad_b * m_pad_b * n_sub >= 512) else eff_r)
                     r_chunk_b = min(eff_r, r_cap_b, max(1, (72 * 1024 * 1024) // per_rep_b))
                     inv_perm_pad_b = torch.arange(d_pad_b, dtype=torch.int64, device=qmc_device)
                     inv_perm_pad_b[:d_assets].copy_(gpu_meta["inv_perm"])

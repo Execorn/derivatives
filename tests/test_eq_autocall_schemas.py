@@ -970,6 +970,19 @@ def test_canonical_tier3_config_and_to_decimal_merged_rho() -> None:
     cfg_cuda = resolve_canonical_tier3_config(6, 48, device_type="cuda")
     assert isinstance(cfg_cuda, CanonicalTier3Config)
     assert cfg_cuda == CanonicalTier3Config(
+        n_paths=4096,
+        n_replicates=4,
+        n_substeps=4,
+        lv_grid_nt=32,
+        lv_grid_ny=64,
+        cv_mode="multifidelity_gbm",
+        n_cheap_mf=262144,
+        seed=42,
+        adaptive_substeps=False,
+    )
+
+    cfg_cuda_mid = resolve_canonical_tier3_config(6, 20, device_type="cuda")
+    assert cfg_cuda_mid == CanonicalTier3Config(
         n_paths=8192,
         n_replicates=8,
         n_substeps=4,

@@ -191,7 +191,7 @@ def resolve_canonical_tier3_config(
         eff_paths = max(2, int(n_fallback_paths))
         n_sub = 8 if short_tenor else 4
     elif dev_tok == "cuda":
-        eff_paths = 8192
+        eff_paths = 4096 if m_val > 20 else 8192
         n_sub = 8 if short_tenor else 4
     elif cpu_very_short:
         eff_paths = 8192
@@ -205,12 +205,12 @@ def resolve_canonical_tier3_config(
     else:
         eff_paths = 4096
         n_sub = 4
-    eff_r = min(max(1, eff_paths // 2), 8 if (dev_tok == "cuda" or eff_paths >= 8192) else 4)
+    eff_r = min(max(1, eff_paths // 2), 8 if eff_paths >= 8192 else 4)
     nt, ny = 32, 64
     n_cheap = (
         max(262144, 8 * eff_paths)
         if (dev_tok == "cuda" or (n_fallback_paths is not None and short_tenor) or (dev_tok == "cpu" and cpu_very_short))
-        else max(32768, 8 * eff_paths)
+        else (max(16384, 8 * eff_paths) if (dev_tok == "cpu" and d_val * m_val >= 200) else max(32768, 8 * eff_paths))
     )
     return CanonicalTier3Config(
         n_paths=eff_paths,
