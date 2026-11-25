@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
 import hashlib
+import inspect
 import logging
 import math
 from pathlib import Path
@@ -41,6 +42,7 @@ from deepvol.models.autocall.analytical_baseline import (
 )
 from deepvol.models.autocall.dupire_qmc_solver import price_eq_autocall_dupire_qmc
 from deepvol.models.autocall.dupire_qmc_solver import DupireQMCResult
+from deepvol.models.autocall import feature_layout as _feature_layout_mod
 from deepvol.models.autocall.feature_layout import (
     D_MAX_DEFAULT,
     M_MAX_DEFAULT,
@@ -68,6 +70,54 @@ from deepvol.surrogates.eq_autocall_egno import (
 
 logger = logging.getLogger("deepvol.mrm.eq_autocall_guardian")
 
+
+@dataclass(frozen=True)
+class _CanonicalTier3ConfigFallback:
+    n_paths: int
+    n_replicates: int
+    n_substeps: int
+    lv_grid_nt: int
+    lv_grid_ny: int
+    cv_mode: Literal["multifidelity_gbm", "bs1d_exact", "none"]
+    n_cheap_mf: int
+    seed: int
+    adaptive_substeps: bool = False
+
+
+def _resolve_canonical_tier3_config_impl(
+    *,
+    device_type: str,
+    d_assets: int,
+    m_rem: int,
+    n_fallback_paths: int | None = None,
+    n_substeps_per_period: int | None = None,
+    seed: int = 42,
+) -> Any:
+    mod_fn = getattr(_feature_layout_mod, "resolve_canonical_tier3_config", None)
+    if callable(mod_fn):
+        return mod_fn(
+            device_type=device_type,
+            d_assets=d_assets,
+            m_rem=m_rem,
+            n_fallback_paths=n_fallback_paths,
+            n_substeps_per_period=n_substeps_per_period,
+            seed=seed,
+        )
+    eff_paths = int(n_fallback_paths) if n_fallback_paths is not None else (8192 if str(device_type) == "cuda" else 4096)
+    eff_r = 8 if (str(device_type) == "cuda" or eff_paths >= 8192) else 4
+    n_sub = int(n_substeps_per_period) if n_substeps_per_period is not None else 4
+    return _CanonicalTier3ConfigFallback(
+        n_paths=eff_paths,
+        n_replicates=eff_r,
+        n_substeps=n_sub,
+        lv_grid_nt=32,
+        lv_grid_ny=64,
+        cv_mode="multifidelity_gbm",
+        n_cheap_mf=max(65536 if str(device_type) == "cuda" else 32768, 4 * eff_paths),
+        seed=int(seed),
+        adaptive_substeps=False,
+    )
+
 DEFAULT_GUARDIAN_STATS_PATH: Path = (
     Path(__file__).resolve().parents[3]
     / "artifacts"
@@ -87,7 +137,7 @@ SUPPORTED_TIER2_INDICES: frozenset[str] = frozenset(
 )
 
 CHI2_16_0999: float = 39.25
-DEFAULT_TAU_DESK_BPS: float = 60.0
+DEFAULT_TAU_DESK_BPS: float = 15.0
 
 
 class AutocallFallbackReason(str, Enum):
@@ -905,6 +955,14 @@ class EQAutocallModelGuardian:
         self.scale_c1: float = 0.0
         self.scale_weights_5d: npt.NDArray[np.float64] = np.zeros(5, dtype=np.float64)
         self.mondrian_q_err_table: dict[str, float] = {}
+        self.conformal_mode: str = "abs_5d"
+        self.scale_weights_8d: npt.NDArray[np.float64] = np.zeros(8, dtype=np.float64)
+        self.b_global_conformal: float = 0.0
+        self.q_lo_conformal: float = 0.0
+        self.q_hi_conformal: float = 0.0
+        self.mondrian_bias_table: dict[str, float] = {}
+        self.mondrian_q_lo_table: dict[str, float] = {}
+        self.mondrian_q_hi_table: dict[str, float] = {}
         self._conformal_calibrated: bool = False
         self.stats_loaded: bool = False
         self.stats_path: Path | None = Path(stats_path) if stats_path is not None else None
@@ -948,18 +1006,52 @@ class EQAutocallModelGuardian:
         q_err = float(raw.get("q_err_conformal", 0.0))
         eps0 = float(raw.get("scale_eps0", 0.0))
         c1 = float(raw.get("scale_c1", 0.0))
-        if "scale_weights_5d" in raw:
-            w5 = _to_f64(raw["scale_weights_5d"]).reshape(5)
-            eps0 = float(w5[0])
-            c1 = float(w5[1])
+        raw_conf_mode = str(raw.get("conformal_mode", "abs_5d"))
+        has_8d = "scale_weights_8d" in raw or raw_conf_mode == "signed_eb_mondrian_8d"
+        if has_8d and "scale_weights_8d" in raw:
+            w8 = _to_f64(raw["scale_weights_8d"]).reshape(8)
+            w8[1] = max(float(w8[1]), 5e-4)
+            w5 = w8[:5].copy()
+            eps0 = float(w8[0])
+            c1 = float(w8[1])
+            conf_mode = "signed_eb_mondrian_8d"
         else:
-            w5 = np.array([eps0, c1, 0.0, 0.0, 0.0], dtype=np.float64)
+            if "scale_weights_5d" in raw:
+                w5 = _to_f64(raw["scale_weights_5d"]).reshape(5)
+                eps0 = float(w5[0])
+                c1 = float(w5[1])
+            else:
+                w5 = np.array([eps0, c1, 0.0, 0.0, 0.0], dtype=np.float64)
+            w8 = np.zeros(8, dtype=np.float64)
+            conf_mode = "abs_5d"
+
+        b_global = float(raw.get("b_global_conformal", 0.0))
+        q_lo_global = float(raw.get("q_lo_conformal", q_err))
+        q_hi_global = float(raw.get("q_hi_conformal", q_err))
         tau_file = float(raw.get("tau_desk_bps", self.tau_desk_bps))
         alpha_file = float(raw.get("conformal_alpha", self.conformal_alpha))
         raw_mondrian = raw.get("mondrian_q_err_table")
         mondrian_tbl: dict[str, float] = (
             {str(k): float(v) for k, v in raw_mondrian.items()}
             if isinstance(raw_mondrian, dict)
+            else {}
+        )
+        raw_bias_tbl = raw.get("mondrian_bias_table")
+        mondrian_bias_tbl: dict[str, float] = (
+            {str(k): float(v) for k, v in raw_bias_tbl.items()}
+            if isinstance(raw_bias_tbl, dict)
+            else {}
+        )
+        raw_q_lo_tbl = raw.get("mondrian_q_lo_table")
+        mondrian_q_lo_tbl: dict[str, float] = (
+            {str(k): float(v) for k, v in raw_q_lo_tbl.items()}
+            if isinstance(raw_q_lo_tbl, dict)
+            else {}
+        )
+        raw_q_hi_tbl = raw.get("mondrian_q_hi_table")
+        mondrian_q_hi_tbl: dict[str, float] = (
+            {str(k): float(v) for k, v in raw_q_hi_tbl.items()}
+            if isinstance(raw_q_hi_tbl, dict)
             else {}
         )
 
@@ -976,9 +1068,17 @@ class EQAutocallModelGuardian:
             self.scale_c1 = c1
             self.scale_weights_5d = w5.copy()
             self.mondrian_q_err_table = mondrian_tbl
+            self.conformal_mode = conf_mode
+            self.scale_weights_8d = w8.copy()
+            self.b_global_conformal = b_global
+            self.q_lo_conformal = q_lo_global
+            self.q_hi_conformal = q_hi_global
+            self.mondrian_bias_table = mondrian_bias_tbl
+            self.mondrian_q_lo_table = mondrian_q_lo_tbl
+            self.mondrian_q_hi_table = mondrian_q_hi_tbl
             self.conformal_alpha = alpha_file
             if self.tau_desk_bps == DEFAULT_TAU_DESK_BPS:
-                self.tau_desk_bps = tau_file
+                self.tau_desk_bps = min(tau_file, DEFAULT_TAU_DESK_BPS)
             self._conformal_calibrated = True
             self.stats_loaded = True
             self.stats_path = p
@@ -989,11 +1089,13 @@ class EQAutocallModelGuardian:
 
         return {
             "schema_version": str(raw.get("schema_version", "2.0")),
+            "conformal_mode": conf_mode,
             "q_ood_conformal": q_ood,
             "q_err_conformal": q_err,
             "scale_eps0": eps0,
             "scale_c1": c1,
             "scale_weights_5d": w5.tolist(),
+            "scale_weights_8d": w8.tolist(),
             "tau_desk_bps": self.tau_desk_bps,
             "n_cal": int(raw.get("n_cal", 0)),
         }
@@ -1155,6 +1257,15 @@ class EQAutocallModelGuardian:
         q_err: float,
         w5: npt.NDArray[np.float64],
         mondrian_tbl: dict[str, float],
+        conformal_mode: str = "abs_5d",
+        w8: npt.NDArray[np.float64] | None = None,
+        b_global: float = 0.0,
+        q_lo_global: float | None = None,
+        q_hi_global: float | None = None,
+        mondrian_bias_tbl: dict[str, float] | None = None,
+        mondrian_q_lo_tbl: dict[str, float] | None = None,
+        mondrian_q_hi_tbl: dict[str, float] | None = None,
+        pv_surr_proxy_gap: float = 0.0,
     ) -> float:
         m_rem = int(preproc_state.m_rem)
         if b_out is not None:
@@ -1173,10 +1284,12 @@ class EQAutocallModelGuardian:
             )
             v_bar = float(np.mean(vw_np[:m_rem])) if (m_rem > 0 and vw_np.size >= m_rem) else 0.0
             v_last = float(vw_np[m_rem - 1]) if (m_rem > 0 and vw_np.size >= m_rem) else 0.0
+            l_put_px = float(b_out.l_put_proxy.detach().cpu().item()) if b_out.l_put_proxy.numel() > 0 else 0.0
         else:
             h_disp = 0.0
             v_bar = 0.0
             v_last = 0.0
+            l_put_px = 0.0
 
         call_code = monitoring_index_to_code(preproc_state.callability_index)
         opt_code = monitoring_index_to_code(
@@ -1197,11 +1310,61 @@ class EQAutocallModelGuardian:
             if (preproc_state.ki_barrier is not None and float(preproc_state.i_ki_past) < 0.5)
             else 0.0
         )
+        g_put_val = max(float(preproc_state.option_gearing), 0.0)
+        ki_b = 1 if has_ki_untriggered > 0.5 else 0
+        m_b = 0 if m_rem <= 12 else (1 if m_rem <= 25 else 2)
+        d_b = 0 if int(preproc_state.d_assets) <= 2 else 1
+        mem_b = 1 if bool(preproc_state.is_memory) else 0
+        key_3d = f"ki{ki_b}_m{m_b}_d{d_b}"
+        key_4d = f"{key_3d}_mem{mem_b}"
+
+        if conformal_mode == "signed_eb_mondrian_8d" and w8 is not None:
+            d_act = int(preproc_state.d_assets)
+            if d_act > 0 and preproc_state.spots_t0.numel() >= d_act and preproc_state.ref_spots.numel() >= d_act:
+                m0_act = _as_f64_np(preproc_state.spots_t0[:d_act]) / np.maximum(
+                    _as_f64_np(preproc_state.ref_spots[:d_act]), 1e-12
+                )
+                min_m0 = float(np.min(m0_act))
+            else:
+                min_m0 = 1.0
+            phi_8 = np.array(
+                [
+                    1.0,
+                    math.sqrt(max(h_disp * max(v_bar, 0.0), 0.0)),
+                    (float(max(m_rem - 1, 0)) / 47.0) * max(v_bar, 0.0),
+                    is_wof * h_disp,
+                    has_ki_untriggered * g_put_val * max(v_last, 0.0),
+                    float(mem_b) * max(float(preproc_state.c_mem_0), 0.0),
+                    g_put_val * max(l_put_px, 0.0) * max(0.0, 1.0 - min_m0),
+                    max(float(pv_surr_proxy_gap), 0.0),
+                ],
+                dtype=np.float64,
+            )
+            w8_eff = np.asarray(w8, dtype=np.float64).reshape(8).copy()
+            w8_eff[1] = max(float(w8_eff[1]), 5e-4)
+            s_val = max(float(np.dot(phi_8, w8_eff)), 1.5e-4)
+            b_cell = (
+                float(mondrian_bias_tbl.get(key_4d, mondrian_bias_tbl.get(key_3d, b_global)))
+                if mondrian_bias_tbl
+                else float(b_global)
+            )
+            q_lo_g = float(q_lo_global) if q_lo_global is not None else float(q_err)
+            q_hi_g = float(q_hi_global) if q_hi_global is not None else float(q_err)
+            q_lo_cell = (
+                float(mondrian_q_lo_tbl.get(key_4d, mondrian_q_lo_tbl.get(key_3d, q_lo_g)))
+                if mondrian_q_lo_tbl
+                else q_lo_g
+            )
+            q_hi_cell = (
+                float(mondrian_q_hi_tbl.get(key_4d, mondrian_q_hi_tbl.get(key_3d, q_hi_g)))
+                if mondrian_q_hi_tbl
+                else q_hi_g
+            )
+            hw = max(abs(b_cell - q_lo_cell * s_val), abs(b_cell + q_hi_cell * s_val)) * 1e4
+            return float(max(hw, 0.0)) if math.isfinite(hw) else float("nan")
+
         if mondrian_tbl:
-            ki_b = 1 if has_ki_untriggered > 0.5 else 0
-            m_b = 0 if m_rem <= 12 else (1 if m_rem <= 25 else 2)
-            d_b = 0 if int(preproc_state.d_assets) <= 2 else 1
-            q_err = float(mondrian_tbl.get(f"ki{ki_b}_m{m_b}_d{d_b}", q_err))
+            q_err = float(mondrian_tbl.get(key_4d, mondrian_tbl.get(key_3d, q_err)))
 
         phi = np.array(
             [
@@ -1209,7 +1372,7 @@ class EQAutocallModelGuardian:
                 math.sqrt(max(h_disp * max(v_bar, 0.0), 0.0)),
                 (float(max(m_rem - 1, 0)) / 47.0) * max(v_bar, 0.0),
                 is_wof * h_disp,
-                has_ki_untriggered * max(float(preproc_state.option_gearing), 0.0) * max(v_last, 0.0),
+                has_ki_untriggered * g_put_val * max(v_last, 0.0),
             ],
             dtype=np.float64,
         )
@@ -1221,16 +1384,36 @@ class EQAutocallModelGuardian:
         preproc_state: AutocallPreprocState,
         baseline_out: AutocallBaselineOutput | None = None,
     ) -> float:
-        """Computes 5D locally-weighted split/Mondrian-conformal error half-width in bps."""
+        """Computes 8D signed EB-Mondrian (or legacy 5D) conformal error half-width in bps."""
         with self._lock:
             if not self._conformal_calibrated:
                 return 0.0
             q_err = self.q_err_conformal
             w5 = self.scale_weights_5d.copy()
             mondrian_tbl = dict(self.mondrian_q_err_table)
+            conf_mode = self.conformal_mode
+            w8 = self.scale_weights_8d.copy()
+            b_glob = self.b_global_conformal
+            q_lo_g = self.q_lo_conformal
+            q_hi_g = self.q_hi_conformal
+            m_bias_tbl = dict(self.mondrian_bias_table)
+            m_q_lo_tbl = dict(self.mondrian_q_lo_table)
+            m_q_hi_tbl = dict(self.mondrian_q_hi_table)
         b_out = _resolve_baseline_out(preproc_state, baseline_out)
         return self._compute_conformal_from_views(
-            preproc_state, b_out, q_err=q_err, w5=w5, mondrian_tbl=mondrian_tbl
+            preproc_state,
+            b_out,
+            q_err=q_err,
+            w5=w5,
+            mondrian_tbl=mondrian_tbl,
+            conformal_mode=conf_mode,
+            w8=w8,
+            b_global=b_glob,
+            q_lo_global=q_lo_g,
+            q_hi_global=q_hi_g,
+            mondrian_bias_tbl=m_bias_tbl,
+            mondrian_q_lo_tbl=m_q_lo_tbl,
+            mondrian_q_hi_tbl=m_q_hi_tbl,
         )
 
     @staticmethod
@@ -1472,6 +1655,10 @@ class EQAutocallModelGuardian:
             self._conformal_calibrated,
             self.q_ood_conformal,
             self.q_err_conformal,
+            self.conformal_mode,
+            self.b_global_conformal,
+            self.q_lo_conformal,
+            self.q_hi_conformal,
         )
 
     @staticmethod
@@ -1814,11 +2001,31 @@ class EQAutocallModelGuardian:
                 q_err = self.q_err_conformal
                 w5 = self.scale_weights_5d.copy()
                 mondrian_tbl = dict(self.mondrian_q_err_table)
+                conf_mode = self.conformal_mode
+                w8 = self.scale_weights_8d.copy()
+                b_glob = self.b_global_conformal
+                q_lo_g = self.q_lo_conformal
+                q_hi_g = self.q_hi_conformal
+                m_bias_tbl = dict(self.mondrian_bias_table)
+                m_q_lo_tbl = dict(self.mondrian_q_lo_table)
+                m_q_hi_tbl = dict(self.mondrian_q_hi_table)
                 tau_desk_bps = float(self.tau_desk_bps)
 
             conformal_hw_bps = (
                 self._compute_conformal_from_views(
-                    eval_state, eval_b_out, q_err=q_err, w5=w5, mondrian_tbl=mondrian_tbl
+                    eval_state,
+                    eval_b_out,
+                    q_err=q_err,
+                    w5=w5,
+                    mondrian_tbl=mondrian_tbl,
+                    conformal_mode=conf_mode,
+                    w8=w8,
+                    b_global=b_glob,
+                    q_lo_global=q_lo_g,
+                    q_hi_global=q_hi_g,
+                    mondrian_bias_tbl=m_bias_tbl,
+                    mondrian_q_lo_tbl=m_q_lo_tbl,
+                    mondrian_q_hi_tbl=m_q_hi_tbl,
                 )
                 if conformal_active
                 else 0.0
@@ -2214,22 +2421,62 @@ class EQAutocallModelGuardian:
                 else 0.0
             )
             raw_tau = (
-                0.0050
-                + 0.0350 * h_disp * math.sqrt(max(v_bar, 1e-4))
-                + 0.0450 * max((m_rem - 10) / 38.0, 0.0)
-                + 0.0150 * max(int(preproc_state.d_assets) - 2, 0)
+                0.0020
+                + 0.0100 * h_disp * math.sqrt(max(v_bar, 1e-4))
+                + 0.0150 * max((m_rem - 4) / 44.0, 0.0)
             )
             if not math.isfinite(raw_tau):
                 reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
                 return False, reasons
-            tau_res = min(raw_tau, 0.0750)
+            tau_res = min(raw_tau, 0.0250)
         else:
             tau_res = float(self.residual_threshold)
             if not math.isfinite(tau_res):
                 reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
                 return False, reasons
-        if abs(pv_surrogate - pv_proxy) > tau_res:
+        pv_gap = abs(pv_surrogate - pv_proxy)
+        if pv_gap > tau_res:
             reasons.append(AutocallFallbackReason.POST_INFERENCE_RESIDUAL_OUTLIER)
+
+        with self._lock:
+            post_conf_active = bool(self._conformal_calibrated) and self.conformal_mode == "signed_eb_mondrian_8d"
+            if post_conf_active:
+                q_err_p = self.q_err_conformal
+                w5_p = self.scale_weights_5d.copy()
+                m_tbl_p = dict(self.mondrian_q_err_table)
+                w8_p = self.scale_weights_8d.copy()
+                b_g_p = self.b_global_conformal
+                q_lo_p = self.q_lo_conformal
+                q_hi_p = self.q_hi_conformal
+                mb_p = dict(self.mondrian_bias_table)
+                mqlo_p = dict(self.mondrian_q_lo_table)
+                mqhi_p = dict(self.mondrian_q_hi_table)
+                tau_desk_p = float(self.tau_desk_bps)
+        if post_conf_active:
+            hw_post = self._compute_conformal_from_views(
+                preproc_state,
+                b_out,
+                q_err=q_err_p,
+                w5=w5_p,
+                mondrian_tbl=m_tbl_p,
+                conformal_mode="signed_eb_mondrian_8d",
+                w8=w8_p,
+                b_global=b_g_p,
+                q_lo_global=q_lo_p,
+                q_hi_global=q_hi_p,
+                mondrian_bias_tbl=mb_p,
+                mondrian_q_lo_tbl=mqlo_p,
+                mondrian_q_hi_tbl=mqhi_p,
+                pv_surr_proxy_gap=pv_gap,
+            )
+            if not math.isfinite(hw_post):
+                if AutocallFallbackReason.NON_FINITE_OUTPUT not in reasons:
+                    reasons.append(AutocallFallbackReason.NON_FINITE_OUTPUT)
+                if AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH not in reasons:
+                    reasons.append(AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH)
+            elif hw_post > tau_desk_p:
+                if AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH not in reasons:
+                    reasons.append(AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH)
 
         return len(reasons) == 0, reasons
 
@@ -2569,6 +2816,14 @@ class EQAutocallModelGuardian:
             q_err = float(self.q_err_conformal)
             w5 = self.scale_weights_5d.copy()
             mondrian_tbl = dict(self.mondrian_q_err_table)
+            conf_mode = self.conformal_mode
+            w8 = self.scale_weights_8d.copy()
+            b_glob = float(self.b_global_conformal)
+            q_lo_g = float(self.q_lo_conformal)
+            q_hi_g = float(self.q_hi_conformal)
+            m_bias_tbl = dict(self.mondrian_bias_table)
+            m_q_lo_tbl = dict(self.mondrian_q_lo_table)
+            m_q_hi_tbl = dict(self.mondrian_q_hi_table)
             tau_desk = float(self.tau_desk_bps)
 
         diff = summary_batch - ref_mean[None, :]
@@ -2606,36 +2861,96 @@ class EQAutocallModelGuardian:
             i_kip_b = glob_np[:, int(AutocallGlobalCol.I_KI_PAST)] < 0.5
             g_put_b = np.maximum(glob_np[:, int(AutocallGlobalCol.G_PUT)], 0.0)
             v_last_b = summary_batch[:, 13] * np.where(raw_m_cnt > 0, 1.0, 0.0)
-            phi_mat = np.stack(
-                [
-                    np.ones(b_sz, dtype=np.float64),
-                    np.sqrt(np.maximum(h_disp * np.maximum(v_bar, 0.0), 0.0)),
-                    (np.maximum(raw_m_cnt.astype(np.float64) - 1.0, 0.0) / 47.0)
-                    * np.maximum(v_bar, 0.0),
-                    is_wof * h_disp,
-                    np.where(has_ki_b & i_kip_b, 1.0, 0.0)
-                    * g_put_b
-                    * np.maximum(v_last_b, 0.0),
-                ],
-                axis=1,
-            )
-            if mondrian_tbl:
-                ki_untrig_vec = has_ki_b & i_kip_b
-                q_err_vec = np.array(
+            ki_untrig_vec = has_ki_b & i_kip_b
+            m_buck_vec = np.where(raw_m_cnt <= 12, 0, np.where(raw_m_cnt <= 25, 1, 2))
+            d_buck_vec = np.where(d_cnt_vec <= 2, 0, 1)
+
+            if conf_mode == "signed_eb_mondrian_8d":
+                is_mem_b = (
+                    (glob_np[:, int(AutocallGlobalCol.IS_MEMORY_FLAG)] > 0.5).astype(np.float64)
+                    if glob_np.shape[1] > int(AutocallGlobalCol.IS_MEMORY_FLAG)
+                    else np.zeros(b_sz, dtype=np.float64)
+                )
+                c_mem0_b = (
+                    np.maximum(glob_np[:, int(AutocallGlobalCol.C_MEM_0)], 0.0)
+                    if glob_np.shape[1] > int(AutocallGlobalCol.C_MEM_0)
+                    else np.zeros(b_sz, dtype=np.float64)
+                )
+                l_put_px_b = (
+                    np.maximum(glob_np[:, int(AutocallGlobalCol.L_PUT_PROXY)], 0.0)
+                    if glob_np.shape[1] > int(AutocallGlobalCol.L_PUT_PROXY)
+                    else np.zeros(b_sz, dtype=np.float64)
+                )
+                min_m0_b = np.exp(
+                    np.clip(summary_batch[:, int(AutocallSummaryCol.MIN_LOG_MONEYNESS)], -10.0, 10.0)
+                )
+                phi_mat_8 = np.stack(
                     [
-                        float(
-                            mondrian_tbl.get(
-                                f"ki{1 if bool(ki_u) else 0}_m{0 if int(m_c) <= 12 else (1 if int(m_c) <= 25 else 2)}_d{0 if int(d_c) <= 2 else 1}",
-                                q_err,
-                            )
-                        )
-                        for ki_u, m_c, d_c in zip(ki_untrig_vec, raw_m_cnt, d_cnt_vec)
+                        np.ones(b_sz, dtype=np.float64),
+                        np.sqrt(np.maximum(h_disp * np.maximum(v_bar, 0.0), 0.0)),
+                        (np.maximum(raw_m_cnt.astype(np.float64) - 1.0, 0.0) / 47.0)
+                        * np.maximum(v_bar, 0.0),
+                        is_wof * h_disp,
+                        np.where(ki_untrig_vec, 1.0, 0.0)
+                        * g_put_b
+                        * np.maximum(v_last_b, 0.0),
+                        is_mem_b * c_mem0_b,
+                        g_put_b * l_put_px_b * np.maximum(0.0, 1.0 - min_m0_b),
+                        np.zeros(b_sz, dtype=np.float64),
                     ],
+                    axis=1,
+                )
+                w8_eff = w8.copy()
+                w8_eff[1] = max(float(w8_eff[1]), 5e-4)
+                scale_vec = np.maximum(phi_mat_8 @ w8_eff, 1.5e-4)
+                keys_3 = [f"ki{1 if bool(ku) else 0}_m{int(mb)}_d{int(db)}" for ku, mb, db in zip(ki_untrig_vec, m_buck_vec, d_buck_vec)]
+                keys_4 = [f"{k3}_mem{1 if im > 0.5 else 0}" for k3, im in zip(keys_3, is_mem_b)]
+                b_vec = np.array(
+                    [float(m_bias_tbl.get(k4, m_bias_tbl.get(k3, b_glob))) if m_bias_tbl else b_glob for k4, k3 in zip(keys_4, keys_3)],
                     dtype=np.float64,
                 )
+                q_lo_vec = np.array(
+                    [float(m_q_lo_tbl.get(k4, m_q_lo_tbl.get(k3, q_lo_g))) if m_q_lo_tbl else q_lo_g for k4, k3 in zip(keys_4, keys_3)],
+                    dtype=np.float64,
+                )
+                q_hi_vec = np.array(
+                    [float(m_q_hi_tbl.get(k4, m_q_hi_tbl.get(k3, q_hi_g))) if m_q_hi_tbl else q_hi_g for k4, k3 in zip(keys_4, keys_3)],
+                    dtype=np.float64,
+                )
+                raw_conf_hw = np.maximum(
+                    np.abs(b_vec - q_lo_vec * scale_vec),
+                    np.abs(b_vec + q_hi_vec * scale_vec),
+                ) * 1e4
             else:
-                q_err_vec = np.full(b_sz, q_err, dtype=np.float64)
-            raw_conf_hw = np.maximum(q_err_vec * (phi_mat @ w5) * 1e4, 0.0)
+                phi_mat = np.stack(
+                    [
+                        np.ones(b_sz, dtype=np.float64),
+                        np.sqrt(np.maximum(h_disp * np.maximum(v_bar, 0.0), 0.0)),
+                        (np.maximum(raw_m_cnt.astype(np.float64) - 1.0, 0.0) / 47.0)
+                        * np.maximum(v_bar, 0.0),
+                        is_wof * h_disp,
+                        np.where(ki_untrig_vec, 1.0, 0.0)
+                        * g_put_b
+                        * np.maximum(v_last_b, 0.0),
+                    ],
+                    axis=1,
+                )
+                if mondrian_tbl:
+                    q_err_vec = np.array(
+                        [
+                            float(
+                                mondrian_tbl.get(
+                                    f"ki{1 if bool(ki_u) else 0}_m{int(m_b)}_d{int(d_b)}",
+                                    q_err,
+                                )
+                            )
+                            for ki_u, m_b, d_b in zip(ki_untrig_vec, m_buck_vec, d_buck_vec)
+                        ],
+                        dtype=np.float64,
+                    )
+                else:
+                    q_err_vec = np.full(b_sz, q_err, dtype=np.float64)
+                raw_conf_hw = np.maximum(q_err_vec * (phi_mat @ w5) * 1e4, 0.0)
             conf_valid = finite_mask & np.isfinite(raw_conf_hw)
             conf_hw_vec = np.where(conf_valid, raw_conf_hw, 1e6)
         else:
@@ -2776,16 +3091,14 @@ class EQAutocallModelGuardian:
                     m_cnt = sm_f.sum(dim=1)
                     v_raw = sched_feats[:, :, int(AutocallSchedCol.STULZ_VOL_W)].to(dtype=pv_proxy.dtype)
                     v_bar_t = torch.where(sm_f > 0.5, v_raw, zero_pv).sum(dim=1) / m_cnt.clamp(min=1.0)
-                    d_cnt = am_f.sum(dim=1)
                     tau_res_t = torch.clamp(
-                        0.0050
-                        + 0.0350 * h_disp_t * torch.sqrt(v_bar_t.clamp(min=1e-4))
-                        + 0.0450 * ((m_cnt - 10.0) / 38.0).clamp(min=0.0)
-                        + 0.0150 * (d_cnt - 2.0).clamp(min=0.0),
-                        max=0.0750,
+                        0.0020
+                        + 0.0100 * h_disp_t * torch.sqrt(v_bar_t.clamp(min=1e-4))
+                        + 0.0150 * ((m_cnt - 4.0) / 44.0).clamp(min=0.0),
+                        max=0.0250,
                     )
                 else:
-                    tau_res_t = torch.full_like(pv_proxy, 0.0750)
+                    tau_res_t = torch.full_like(pv_proxy, 0.0250)
                 tau_finite = torch.isfinite(tau_res_t)
                 finite_ok = finite_ok & tau_finite
                 tau_safe = torch.where(tau_finite, tau_res_t, zero_pv)
@@ -2891,9 +3204,9 @@ class EQAutocallModelGuardian:
         req_or_state: Any,
         surrogate: MaskedEQAutocallSurrogate | None = None,
         *,
-        n_fallback_paths: int = 32768,
+        n_fallback_paths: int | None = None,
         qmc_mode: Literal["dupire_lv", "terminal_iv", "auto"] = "auto",
-        n_substeps_per_period: int = 16,
+        n_substeps_per_period: int | None = None,
         force_qmc: bool = False,
         record_drift: bool | None = None,
         seed: int | None = None,
@@ -3139,21 +3452,84 @@ class EQAutocallModelGuardian:
         else:
             eff_use_gpu = (
                 torch.cuda.is_available()
-                and int(n_fallback_paths) >= 1024
+                and (n_fallback_paths is None or int(n_fallback_paths) >= 1024)
                 and ("TwinWin" not in idx_set)
             )
+        eff_dev_type = "cuda" if eff_use_gpu else "cpu"
+        eff_seed = 42 if seed is None else int(seed)
+        tier3_cfg = _resolve_canonical_tier3_config_impl(
+            device_type=eff_dev_type,
+            d_assets=int(state.d_assets),
+            m_rem=int(state.m_rem),
+            n_fallback_paths=n_fallback_paths,
+            n_substeps_per_period=n_substeps_per_period,
+            seed=eff_seed,
+        )
+        from deepvol.models.autocall.dupire_qmc_gpu import DupireQMCConfig
+
+        tier3_qmc_cfg = DupireQMCConfig(
+            n_paths=int(tier3_cfg.n_paths),
+            n_replicates=int(tier3_cfg.n_replicates),
+            n_substeps=int(tier3_cfg.n_substeps),
+            cv_mode=tier3_cfg.cv_mode,
+            seed=int(tier3_cfg.seed),
+            lv_grid_nt=int(tier3_cfg.lv_grid_nt),
+            lv_grid_ny=int(tier3_cfg.lv_grid_ny),
+            adaptive_substeps=bool(tier3_cfg.adaptive_substeps),
+        )
 
         qmc_g_out: Any = None
+        stage1_internal = False
+        eff_qmc_fn = qmc_greeks_fn
         if (
-            qmc_greeks_fn is not None
-            and callable(qmc_greeks_fn)
+            eff_qmc_fn is None
+            and qmc_mode in ("auto", "dupire_lv")
+            and n_substeps_per_period is None
+            and ("TwinWin" not in idx_set)
             and state.m_rem > 0
             and not state.already_autocalled
         ):
-            qmc_g_out = qmc_greeks_fn(state)
+            try:
+                from deepvol.models.autocall.qmc_aad_greeks import (
+                    compute_qmc_aad_crn_greeks as _stage1_qmc_fn,
+                )
 
-        if qmc_g_out is not None and getattr(qmc_g_out, "postproc_output", None) is not None:
-            post_qmc = qmc_g_out.postproc_output
+                eff_qmc_fn = _stage1_qmc_fn
+                stage1_internal = True
+            except ImportError:
+                eff_qmc_fn = None
+
+        if (
+            eff_qmc_fn is not None
+            and callable(eff_qmc_fn)
+            and state.m_rem > 0
+            and not state.already_autocalled
+        ):
+            try:
+                sig_q = inspect.signature(eff_qmc_fn)
+                params_q = sig_q.parameters
+                accepts_varkw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in params_q.values()
+                )
+                call_kw: dict[str, Any] = {}
+                if accepts_varkw or "config" in params_q:
+                    call_kw["config"] = tier3_qmc_cfg
+                if accepts_varkw or "device" in params_q:
+                    call_kw["device"] = eff_dev_type
+                if stage1_internal:
+                    if accepts_varkw or "queries" in params_q:
+                        call_kw["queries"] = ["ProductValue", "CashFlows"]
+                    if accepts_varkw or "return_cashflows" in params_q:
+                        call_kw["return_cashflows"] = True
+                qmc_g_out = eff_qmc_fn(state, **call_kw)
+            except NotImplementedError:
+                qmc_g_out = None
+
+        if qmc_g_out is not None and (
+            getattr(qmc_g_out, "postproc_output", None) is not None
+            or math.isfinite(float(getattr(qmc_g_out, "product_value", float("nan"))))
+        ):
+            post_qmc = getattr(qmc_g_out, "postproc_output", None)
             eff_greeks_qmc = greeks_engine_used or str(
                 getattr(qmc_g_out, "greeks_engine_used", "Tier4_DupireQMC_CRN")
             )
@@ -3178,23 +3554,53 @@ class EQAutocallModelGuardian:
             with self._lock:
                 self.audit_log.append(audit_fb)
 
+            if post_qmc is not None:
+                pv_res = float(post_qmc.product_value.detach().cpu().item())
+                not_res = float(post_qmc.notional_pv.detach().cpu().item())
+                cpn_res = float(post_qmc.coupon_pv.detach().cpu().item())
+                opt_res = float(post_qmc.option_pv.detach().cpu().item())
+                fnd_res = float(post_qmc.funding_pv.detach().cpu().item())
+                tr_res = float(post_qmc.pv_in_transit.detach().cpu().item())
+                p_stop_res = post_qmc.p_stop.detach().cpu().numpy().astype(np.float64)
+                q_cpn_res = post_qmc.q_cpn.detach().cpu().numpy().astype(np.float64)
+                l_put_res = float(post_qmc.l_put.detach().cpu().item())
+                l_call_res = float(post_qmc.l_call.detach().cpu().item())
+                cfs_res = list(post_qmc.cashflows)
+                ccy_res = str(post_qmc.reporting_currency)
+                ctoday_res = float(post_qmc.cash_to_settle_today)
+                se_res = float(getattr(post_qmc, "standard_error", getattr(qmc_g_out, "standard_error", 0.0)))
+            else:
+                pv_res = float(qmc_g_out.product_value)
+                cfs_raw = getattr(qmc_g_out, "cash_flows", None)
+                cfs_res = list(cfs_raw) if cfs_raw is not None else []
+                not_res = float(sum(float(getattr(cf, "PresentValue", 0.0)) for cf in cfs_res if getattr(cf, "Leg", "") == "Notional"))
+                cpn_res = float(sum(float(getattr(cf, "PresentValue", 0.0)) for cf in cfs_res if getattr(cf, "Leg", "") == "Coupon"))
+                opt_res = float(sum(float(getattr(cf, "PresentValue", 0.0)) for cf in cfs_res if getattr(cf, "Leg", "") == "Option"))
+                fnd_res = float(-sum(float(getattr(cf, "PresentValue", 0.0)) for cf in cfs_res if getattr(cf, "Leg", "") == "Funding"))
+                tr_res = float(state.pv_in_transit)
+                p_stop_res = np.zeros(state.m_rem, dtype=np.float64)
+                q_cpn_res = np.zeros(state.m_rem, dtype=np.float64)
+                l_put_res = 0.0
+                l_call_res = 0.0
+                ccy_res = str(getattr(qmc_g_out, "reporting_currency", state.payment_currency) or state.payment_currency)
+                ctoday_res = float(getattr(qmc_g_out, "cash_to_settle_today", cash_today) or 0.0)
+                se_res = float(getattr(qmc_g_out, "standard_error", 0.0) or 0.0)
+
             return GuardianPricingResult(
-                product_value=float(post_qmc.product_value.detach().cpu().item()),
-                standard_error=float(
-                    getattr(post_qmc, "standard_error", getattr(qmc_g_out, "standard_error", 0.0))
-                ),
-                notional_pv=float(post_qmc.notional_pv.detach().cpu().item()),
-                coupon_pv=float(post_qmc.coupon_pv.detach().cpu().item()),
-                option_pv=float(post_qmc.option_pv.detach().cpu().item()),
-                funding_pv=float(post_qmc.funding_pv.detach().cpu().item()),
-                pv_in_transit=float(post_qmc.pv_in_transit.detach().cpu().item()),
-                p_stop=post_qmc.p_stop.detach().cpu().numpy().astype(np.float64),
-                q_cpn=post_qmc.q_cpn.detach().cpu().numpy().astype(np.float64),
-                l_put=float(post_qmc.l_put.detach().cpu().item()),
-                l_call=float(post_qmc.l_call.detach().cpu().item()),
-                cashflows=post_qmc.cashflows,
-                reporting_currency=str(post_qmc.reporting_currency),
-                cash_to_settle_today=float(post_qmc.cash_to_settle_today),
+                product_value=pv_res,
+                standard_error=se_res,
+                notional_pv=not_res,
+                coupon_pv=cpn_res,
+                option_pv=opt_res,
+                funding_pv=fnd_res,
+                pv_in_transit=tr_res,
+                p_stop=p_stop_res,
+                q_cpn=q_cpn_res,
+                l_put=l_put_res,
+                l_call=l_call_res,
+                cashflows=cfs_res,
+                reporting_currency=ccy_res,
+                cash_to_settle_today=ctoday_res,
                 engine_selected="Tier3_DupireQMC",
                 fallback_triggered=True,
                 fallback_reasons=all_reasons,
@@ -3204,17 +3610,18 @@ class EQAutocallModelGuardian:
                 postproc_out=post_qmc,
                 qmc_result=None,
                 surrogate_out=surrogate_out,
-                greeks_out=qmc_g_out,
+                greeks_out=qmc_g_out if not stage1_internal else None,
             )
 
         qmc_res = price_eq_autocall_dupire_qmc(
             state,
-            n_paths=n_fallback_paths,
+            n_paths=int(tier3_cfg.n_paths),
+            n_replicates=int(tier3_cfg.n_replicates),
             mode=qmc_mode,
-            n_substeps_per_period=n_substeps_per_period,
-            seed=seed,
+            n_substeps_per_period=int(tier3_cfg.n_substeps),
+            seed=int(tier3_cfg.seed),
             use_gpu=eff_use_gpu,
-            cv_mode="multifidelity_gbm" if eff_use_gpu else "bs1d_exact",
+            cv_mode=tier3_cfg.cv_mode,
         )
 
         eff_greeks_qmc = greeks_engine_used or "None"

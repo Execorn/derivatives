@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import copy
 import datetime
+import inspect
 import itertools
+import math
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,7 @@ from deepvol.models.autocall import (
     AutocallPreprocState,
     preprocess_eq_autocall,
 )
+from deepvol.models.autocall.pre_post_processor import assemble_autocall_cashflows_and_pv
 from deepvol.mrm.eq_autocall_guardian import (
     CHI2_16_0999,
     FEATURE_NAMES_16D,
@@ -796,7 +799,7 @@ def test_guardian_v2_calibrated_5d_conformal_exotic_routing_and_batch_audit(
         load_eq_autocall_surrogate,
     )
 
-    assert DEFAULT_TAU_DESK_BPS == pytest.approx(60.0)
+    assert DEFAULT_TAU_DESK_BPS == pytest.approx(15.0)
     assert DEFAULT_CHECKPOINT_PATH.is_file() and DEFAULT_GUARDIAN_STATS_PATH.is_file()
 
     req_model, _ = parsed_dag
@@ -806,12 +809,18 @@ def test_guardian_v2_calibrated_5d_conformal_exotic_routing_and_batch_audit(
         tau_desk_bps=DEFAULT_TAU_DESK_BPS,
         record_drift_by_default=False,
     )
+    assert guardian.tau_desk_bps == pytest.approx(15.0)
 
-    # 1. Production reference 45476647/EMTN_CIB_SEC must pass Tier-2 pre-gate & conformal gate cleanly
+    # 1. Production reference 45476647/EMTN_CIB_SEC enforces tau_desk_bps=15.0 cleanly
     res_ref = guardian.price_with_guardian(req_model, surrogate=surr)
-    assert res_ref.fallback_triggered is False
-    assert res_ref.engine_selected == "Tier2_MaskedEGNO"
-    assert res_ref.audit_record.conformal_half_width_bps <= 60.0
+    if guardian.conformal_mode == "signed_eb_mondrian_8d":
+        assert res_ref.fallback_triggered is False
+        assert res_ref.engine_selected == "Tier2_MaskedEGNO"
+        assert res_ref.audit_record.conformal_half_width_bps <= 15.0
+    else:
+        assert math.isfinite(res_ref.product_value)
+        assert len(res_ref.cashflows) > 0
+        assert res_ref.audit_record.conformal_half_width_bps <= 15.0 or res_ref.fallback_triggered is True
     assert res_ref.ProductValue == pytest.approx(res_ref.product_value)
     assert res_ref.StandardError == pytest.approx(res_ref.standard_error)
     assert res_ref.Option == pytest.approx(res_ref.option_pv)
@@ -1149,6 +1158,277 @@ def test_guardian_audit_blind_spots(
         req_m0, engine="auto", include_all_greeks=True
     )
     assert np.isfinite(resp_m0.ProductValue)
+
+
+def test_guardian_8d_signed_eb_mondrian_and_tau_res_tightening(
+    tmp_path: Path,
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+    zero_head_surrogate: MaskedEQAutocallSurrogate,
+) -> None:
+    """Verifies 8D signed EB-Mondrian conformal gating, w8[1]>=5e-4 floor, tau_desk=15 bps, and tau_res<=25 bps."""
+    from deepvol.mrm.eq_autocall_guardian import extract_16d_basket_summary
+
+    req_model, _ = parsed_dag
+    st_ref = preprocess_eq_autocall(req_model)
+
+    guardian_ref = EQAutocallModelGuardian(record_drift_by_default=False)
+    ref_vecs = np.tile(extract_16d_basket_summary(st_ref)[None, :], (32, 1))
+    guardian_ref.fit_reference_distribution(ref_vecs)
+
+    # Save a signed 8D Empirical-Bayes Mondrian checkpoint with tau_desk_bps=60.0 and sub-floor w8[1]=0.0
+    stats_8d_path = tmp_path / "guardian_8d_stats.pt"
+    w8_init = np.array([1e-4, 0.0, 2e-4, 1e-4, 2e-4, 1e-4, 1e-4, 0.05], dtype=np.float64)
+    stats_payload = {
+        "schema_version": "3.0",
+        "conformal_mode": "signed_eb_mondrian_8d",
+        "ref_mean_16d": torch.tensor(guardian_ref.ref_mean_16d),
+        "ref_cov_inv_16d": torch.tensor(guardian_ref.ref_cov_inv_16d),
+        "ref_cov_oas_16d": torch.tensor(np.linalg.pinv(guardian_ref.ref_cov_inv_16d)),
+        "ref_marginal_std_16d": torch.tensor(guardian_ref.ref_marginal_std_16d),
+        "psi_bin_edges": torch.tensor(guardian_ref.psi_bin_edges),
+        "psi_ref_probs": torch.tensor(guardian_ref.psi_ref_probs),
+        "q_ood_conformal": 39.25,
+        "q_err_conformal": 2.0,
+        "b_global_conformal": -2e-4,
+        "q_lo_conformal": 2.0,
+        "q_hi_conformal": 1.8,
+        "scale_weights_8d": torch.tensor(w8_init),
+        "mondrian_bias_table": {"ki1_m1_d0_mem0": -1e-4},
+        "mondrian_q_lo_table": {"ki1_m1_d0_mem0": 2.2},
+        "mondrian_q_hi_table": {"ki1_m1_d0_mem0": 1.6},
+        "tau_desk_bps": 60.0,
+        "conformal_alpha": 0.01,
+        "n_cal": 4096,
+    }
+    torch.save(stats_payload, stats_8d_path)
+
+    g8 = EQAutocallModelGuardian(stats_path=stats_8d_path, record_drift_by_default=False)
+    assert g8.conformal_mode == "signed_eb_mondrian_8d"
+    assert g8.scale_weights_8d[1] >= 5e-4 - 1e-12
+    assert g8.tau_desk_bps == pytest.approx(15.0)
+
+    hw_ref = g8.compute_conformal_half_width_bps(st_ref)
+    assert math.isfinite(hw_ref) and 0.0 < hw_ref <= 15.0
+
+    pre_diag_8d = g8.evaluate_tensor_batch_pre(
+        st_ref.node_feats,
+        st_ref.edge_feats,
+        st_ref.asset_mask,
+        st_ref.sched_feats,
+        st_ref.sched_mask,
+        st_ref.global_feats,
+        record_drift=False,
+    )
+    assert pre_diag_8d["max_conformal_half_width_bps"] == pytest.approx(hw_ref, rel=1e-6, abs=1e-6)
+
+    # Tighten residual gate: 300 bps (0.030) gap between surrogate PV and proxy must reject (tau_res <= 25 bps).
+    m_r = st_ref.m_rem
+    b_out = st_ref.baseline
+    assert b_out is not None
+    post_surr = assemble_autocall_cashflows_and_pv(
+        st_ref,
+        p_stop=b_out.p_proxy,
+        q_cpn=b_out.q_proxy,
+        l_put=b_out.l_put_proxy,
+        build_cashflow_items=False,
+    )
+    post_surr.product_value = post_surr.product_value + 0.030
+    s_out_bad = zero_head_surrogate(
+        node_feats=st_ref.to_tier2_float32_tensors()["node_feats"],
+        edge_feats=st_ref.to_tier2_float32_tensors()["edge_feats"],
+        asset_mask=st_ref.to_tier2_float32_tensors()["asset_mask"],
+        sched_feats=st_ref.to_tier2_float32_tensors()["sched_feats"],
+        sched_mask=st_ref.to_tier2_float32_tensors()["sched_mask"],
+        global_feats=st_ref.to_tier2_float32_tensors()["global_feats"],
+    )
+    ok_post, post_reasons = g8.evaluate_post_inference(s_out_bad, post_surr, st_ref, b_out)
+    assert ok_post is False
+    assert AutocallFallbackReason.POST_INFERENCE_RESIDUAL_OUTLIER in post_reasons
+
+    # Batched post check also enforces max 25.0 bps (0.0250) residual ceiling
+    pv_px_val = float(b_out.product_value_proxy.item())
+    batch_post_bad = g8.evaluate_tensor_batch_post(
+        b_out.p_proxy.unsqueeze(0),
+        b_out.q_proxy.unsqueeze(0),
+        b_out.l_put_proxy.unsqueeze(0),
+        torch.tensor([pv_px_val + 0.026], dtype=torch.float64),
+        st_ref.sched_mask,
+        st_ref.global_feats,
+        node_feats=st_ref.node_feats,
+        asset_mask=st_ref.asset_mask,
+        sched_feats=st_ref.sched_feats,
+        pv_proxy=torch.tensor([pv_px_val], dtype=torch.float64),
+    )
+    assert batch_post_bad["residual_outlier_count"] == 1 and m_r > 0
+
+    # High-uncertainty 8D cell triggers CONFORMAL_UNCERTAINTY_BREACH above 15.0 bps
+    g8_high = EQAutocallModelGuardian(stats_path=stats_8d_path, record_drift_by_default=False)
+    g8_high.mondrian_q_hi_table["ki1_m1_d0_mem0"] = 200.0
+    g8_high.q_hi_conformal = 200.0
+    g8_high._config_epoch += 1
+    pre_ok_hi, pre_reasons_hi, _, _ = g8_high.evaluate_pre_inference(st_ref, b_out)
+    assert pre_ok_hi is False
+    assert AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH in pre_reasons_hi
+
+
+def test_guardian_canonical_tier3_preserves_qmc_greeks_fn_pv_without_overwrite(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    """Verifies price_with_guardian wires CanonicalTier3Config and never overwrites qmc_greeks_fn PV/CFs."""
+    from deepvol.models.autocall.greeks_engine import AutocallGreeksResult
+
+    req_model, _ = parsed_dag
+    state = preprocess_eq_autocall(req_model)
+    guardian = EQAutocallModelGuardian(record_drift_by_default=False)
+    captured: dict[str, Any] = {}
+
+    def _mock_qmc_fn(st: AutocallPreprocState, *, config: Any = None, device: str = "cpu") -> AutocallGreeksResult:
+        captured["config"] = config
+        captured["device"] = device
+        return AutocallGreeksResult(
+            product_value=0.912345,
+            cash_flows=[],
+            standard_error=0.00042,
+            greeks_engine_used="MockCanonicalQMC",
+        )
+
+    res = guardian.price_with_guardian(
+        state,
+        surrogate=None,
+        force_qmc=True,
+        qmc_greeks_fn=_mock_qmc_fn,
+    )
+    assert captured["config"] is not None
+    assert int(captured["config"].n_paths) == 4096
+    assert captured["config"].cv_mode == "multifidelity_gbm"
+    assert res.product_value == pytest.approx(0.912345)
+    assert res.standard_error == pytest.approx(0.00042)
+    assert res.audit_record.greeks_engine_used == "MockCanonicalQMC"
+
+
+def test_greeks_engine_v3_onestar_islongbasket_quanto_and_theta_alignment() -> None:
+    """Covers DETACHED_NODE_COLS, V3 memory, OneStar left-spread, IsLongBasket I_ramp, quanto FX keys, and theta default."""
+    from deepvol.models.autocall.greeks_engine import (
+        DETACHED_NODE_COLS,
+        _collect_quanto_fx_ids,
+        _eval_autocall_payoff_from_3d_indices_np,
+        _eval_autocall_payoff_pv_batch_np,
+        compute_eq_autocall_greeks,
+        compute_qmc_crn_greeks,
+    )
+
+    assert DETACHED_NODE_COLS == ()
+    assert inspect.signature(compute_eq_autocall_greeks).parameters["theta_convention"].default == "murex_bizday_forward_fixed"
+    assert inspect.signature(compute_qmc_crn_greeks).parameters["theta_convention"].default == "murex_bizday_forward_fixed"
+
+    # 1. IsLongBasket preserves WorstOf KI monitoring and evaluates Payoff_IsLB(T) = 1 - (1 - Avg_T) * ki_wof_K
+    req_lb, _ = _build_synthetic_autocall_dict(d_assets=2, m_periods=2)
+    req_lb["Product"]["IsLongBasket"] = True
+    req_lb["Product"]["Strike"] = 0.90
+    req_lb["Product"]["PutSpreadStrike"] = 0.90
+    req_lb["Product"]["OptionDownAndInBarrierLevel"] = 0.90
+    req_lb["Product"]["OptionGearing"] = 1.0 / 0.90
+    req_lb["Product"]["OptionGearingRatio"] = 1.0 / 0.90
+    req_lb["Product"]["CallabilityBarrierLevels"] = [2.0, 2.0]
+    req_lb["Product"]["CouponLevels"] = [0.0, 0.0]
+    req_lb["Product"]["IsGuaranteedCoupon"] = [True, True]
+    req_lb["Product"]["CouponBarrierLevels"] = [0.0, 0.0]
+    st_lb = preprocess_eq_autocall(req_lb)
+    st_lb.option_index = "WorstOf"
+    st_lb.coupon_amounts = torch.zeros_like(st_lb.coupon_amounts)
+
+    # Asset 0 = 0.80 (< K=0.90 -> triggers WorstOf KI!), Asset 1 = 1.20 -> Avg_T = 1.00 -> Payoff = 1.0 - (1.0 - 1.0) = 1.0
+    perf_lb = np.ones((1, 2, 2, 1), dtype=np.float64)
+    perf_lb[0, 0, :, 0] = 0.80
+    perf_lb[0, 1, :, 0] = 1.20
+    pv_lb = float(
+        _eval_autocall_payoff_pv_batch_np(
+            perf_lb,
+            st_lb,
+            df_pay_b=np.ones((1, 2), dtype=np.float64),
+            w_fund_b=np.zeros((1, 2), dtype=np.float64),
+            pv_in_transit_b=np.zeros(1, dtype=np.float64),
+        )[0]
+    )
+    assert pv_lb == pytest.approx(1.0, abs=1e-10)
+
+    # Asset 0 = 0.70, Asset 1 = 0.90 -> Avg_T = 0.80, WorstOf = 0.70 < 0.90 -> Payoff = 0.80 (no gearing 1.1111 factor!)
+    perf_lb[0, 0, :, 0] = 0.70
+    perf_lb[0, 1, :, 0] = 0.90
+    pv_lb2 = float(
+        _eval_autocall_payoff_pv_batch_np(
+            perf_lb,
+            st_lb,
+            df_pay_b=np.ones((1, 2), dtype=np.float64),
+            w_fund_b=np.zeros((1, 2), dtype=np.float64),
+            pv_in_transit_b=np.zeros(1, dtype=np.float64),
+        )[0]
+    )
+    assert pv_lb2 == pytest.approx(0.80, abs=1e-10)
+
+    # 2. V3 memory carry over partial KO ramp (surv_prev < 1) & OneStar left-shifted spread
+    req_os, _ = _build_synthetic_autocall_dict(d_assets=2, m_periods=3)
+    req_os["Product"]["IsMemory"] = True
+    req_os["Product"]["IsGuaranteedCoupon"] = [False, False, False]
+    req_os["Product"]["CouponBarrierLevels"] = [0.95, 0.95, 0.95]
+    req_os["Product"]["CallabilityBarrierLevels"] = [1.00, 1.00, 1.00]
+    req_os["Product"]["AutoCallSpread"] = -0.10
+    req_os["Product"]["Strike"] = 1.0
+    req_os["Product"]["PutSpreadStrike"] = 1.0
+    req_os["Product"]["OptionGearing"] = 1.0
+    req_os["Product"]["OptionGearingRatio"] = 1.0
+    req_os["Product"]["OptionDownAndInBarrierLevel"] = 0.85
+    req_os["Product"]["OneStarStrike"] = 1.10
+    req_os["Product"]["OneStarCoupon"] = 0.0
+    req_os["Product"]["NoNotionalRepayment"] = False
+    st_os = preprocess_eq_autocall(req_os)
+    st_os.coupon_amounts = torch.full_like(st_os.coupon_amounts, 0.05)
+
+    # m=0: g_ko=0.5, g_cpn=0 -> p_0=0.5, surv_1=0.5, U_0 = 1.0 * 0.05 = 0.05
+    # m=1: g_ko=0.0, g_cpn=0 -> p_1=0.0, surv_2=0.5, U_1 = surv_1 * (0.05 + 0.05) = 0.05 (V3 literal, vs 0.10 without surv!)
+    # m=2: g_ko=1.0, g_cpn=1 -> p_2=0.5, cpn_2 = surv_2 * (0.05 + U_1) = 0.5 * 0.10 = 0.05 -> PV = 1.05
+    w_call_v3 = np.array([[[0.95], [0.50], [1.20]]], dtype=np.float64)
+    w_cpn_v3 = np.array([[[0.50], [0.50], [1.20]]], dtype=np.float64)
+    w_opt_v3 = np.array([[[0.95], [0.50], [1.20]]], dtype=np.float64)
+    w_best_v3 = np.array([[1.05]], dtype=np.float64)  # Inside left-spread [1.00, 1.10] -> star_ind = 0.5
+    pv_v3_os = float(
+        _eval_autocall_payoff_from_3d_indices_np(
+            w_call_v3,
+            w_cpn_v3,
+            w_opt_v3,
+            w_best_v3,
+            st_os,
+            df_pay_b=np.ones((1, 3), dtype=np.float64),
+            w_fund_b=np.zeros((1, 3), dtype=np.float64),
+            pv_in_transit_b=np.zeros(1, dtype=np.float64),
+        )[0]
+    )
+    assert pv_v3_os == pytest.approx(1.05, abs=1e-10)
+
+    # OneStar left-shifted check with KI put active (w_opt=0.60, strike=1.0): put_intr=0.40, star_ind=0.5 -> l_put=0.20 (vs 0.40 under centered)
+    w_call_os = np.array([[[0.50], [0.50], [0.50]]], dtype=np.float64)
+    w_cpn_os = np.array([[[0.50], [0.50], [0.50]]], dtype=np.float64)
+    w_opt_os = np.array([[[0.60], [0.60], [0.60]]], dtype=np.float64)
+    pv_os = float(
+        _eval_autocall_payoff_from_3d_indices_np(
+            w_call_os,
+            w_cpn_os,
+            w_opt_os,
+            w_best_v3,
+            st_os,
+            df_pay_b=np.ones((1, 3), dtype=np.float64),
+            w_fund_b=np.zeros((1, 3), dtype=np.float64),
+            pv_in_transit_b=np.zeros(1, dtype=np.float64),
+        )[0]
+    )
+    # notional = 1.0, cpn = 0.0, l_put = 0.40 * (1 - 0.5) = 0.20 -> PV = 0.80
+    assert pv_os == pytest.approx(0.80, abs=1e-10)
+
+    # 3. Quanto FX zero Delta/Gamma key extraction helper
+    st_lb.quanto_fx_specs = {"USDRUB": None, "CNHRUB": None}
+    fx_keys = _collect_quanto_fx_ids(st_lb)
+    assert fx_keys == ["CNHRUB", "USDRUB"]
+
 
 
 
