@@ -634,7 +634,7 @@ def test_G4_7_traceability_matrix_completeness() -> None:
 
     raw_stats = torch.load(stats_path, map_location="cpu", weights_only=True)
     assert raw_stats["schema_version"] == "2.0"
-    assert float(raw_stats["tau_desk_bps"]) == pytest.approx(60.0)
+    assert float(raw_stats["tau_desk_bps"]) == pytest.approx(15.0)
     assert tuple(raw_stats["scale_weights_5d"].shape) == (5,)
 
     required_test_files = [
@@ -943,11 +943,36 @@ def test_eq_autocall_arrow_validation_and_runtime_batch_branches(
     assert mixed_res[0].Cega is not None
     assert mixed_res[0].FundingLeg is not None and abs(float(mixed_res[0].FundingLeg)) > 1e-6
 
-    # MRM-015: unified engine="surrogate" parity across price_trade & price_batch_json
+    # MRM-015: unified engine="surrogate" parity across price_trade & price_batch_json.
+    # Under production tau_desk_bps=15.0, t_exotic triggers CONFORMAL_UNCERTAINTY_BREACH post-gate fallback cleanly;
+    # with relaxed post-gate thresholds (tau_desk_bps=5000.0, residual_threshold=1.0), both stay on MaskedEGNO_Surrogate.
+    from deepvol.mrm.eq_autocall_guardian import EQAutocallModelGuardian
+
     single_surr = runtime.price_trade(t_exotic, engine="surrogate")
     batch_surr = runtime.price_batch_json([t_exotic], compute_greeks=False, engine="surrogate")
-    assert single_surr.fallback_triggered is False and batch_surr[0].fallback_triggered is False
+    assert single_surr.fallback_triggered is True and batch_surr[0].fallback_triggered is True
+    assert "CONFORMAL_UNCERTAINTY_BREACH" in single_surr.fallback_reasons
+    assert "CONFORMAL_UNCERTAINTY_BREACH" in batch_surr[0].fallback_reasons
     assert single_surr.ProductValue == pytest.approx(batch_surr[0].ProductValue, abs=1e-5)
+
+    rt_surr_relaxed = EQAutocallRuntime(
+        surrogate=copy.deepcopy(runtime.surrogate),
+        guardian=EQAutocallModelGuardian(
+            stats_path=runtime.stats_path,
+            tau_desk_bps=5000.0,
+            residual_threshold=1.0,
+            record_drift_by_default=False,
+        ),
+        stats_path=None,
+        device=runtime.device,
+        n_fallback_paths=runtime.n_fallback_paths,
+    )
+    single_surr_rel = rt_surr_relaxed.price_trade(t_exotic, engine="surrogate")
+    batch_surr_rel = rt_surr_relaxed.price_batch_json([t_exotic], compute_greeks=False, engine="surrogate")
+    assert single_surr_rel.fallback_triggered is False and batch_surr_rel[0].fallback_triggered is False
+    assert single_surr_rel.engine_used == "MaskedEGNO_Surrogate"
+    assert batch_surr_rel[0].engine_used == "MaskedEGNO_Surrogate"
+    assert single_surr_rel.ProductValue == pytest.approx(batch_surr_rel[0].ProductValue, abs=1e-5)
 
     mixed_no_grk = runtime.price_batch_json([t_fast, t_exotic], compute_greeks=False, engine="surrogate")
     assert len(mixed_no_grk) == 2 and mixed_no_grk[0].Delta is None
@@ -1079,7 +1104,10 @@ def test_eq_autocall_arrow_validation_and_runtime_batch_branches(
         k_use = f"{b_i}&{a_i}" if f"{b_i}&{a_i}" in corrs_s else f"{a_i}&{b_i}"
         corrs_s[k_use] = v_i
     r_psd_s = runtime.price_trade(t_non_psd_s, engine="surrogate", include_all_greeks=False)
-    assert r_psd_s.fallback_triggered is False
+    assert r_psd_s.fallback_triggered is True
+    assert "CONFORMAL_UNCERTAINTY_BREACH" in r_psd_s.fallback_reasons
+    r_psd_rel = rt_surr_relaxed.price_trade(t_non_psd_s, engine="surrogate", include_all_greeks=False)
+    assert r_psd_rel.fallback_triggered is False
 
     t_ood_a = copy.deepcopy(t_fast)
     t_ood_a["Model"]["MarketDataSet"]["Spots"][uids_s[0]] = 5000.0
@@ -1126,8 +1154,9 @@ def test_eq_autocall_arrow_validation_and_runtime_batch_branches(
     assert len(dag_b_out) == 2
 
     # Surrogate batch greeks + dedup cache hit + _compute_w_fund_per_period branches
-    surr_dup_grk = runtime.price_batch_json([t_fast, t_fast], compute_greeks=True, engine="surrogate")
+    surr_dup_grk = rt_surr_relaxed.price_batch_json([t_fast, t_fast], compute_greeks=True, engine="surrogate")
     assert len(surr_dup_grk) == 2
+    assert surr_dup_grk[0].engine_used == "MaskedEGNO_Surrogate"
     assert surr_dup_grk[0].Delta is not None and surr_dup_grk[0].MultivariateAggregatedCashGamma is not None
     assert surr_dup_grk[0].Cega is not None
 

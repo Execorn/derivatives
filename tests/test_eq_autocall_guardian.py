@@ -789,7 +789,7 @@ def test_guardian_v2_calibrated_5d_conformal_exotic_routing_and_batch_audit(
     parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
     zero_head_surrogate: MaskedEQAutocallSurrogate,
 ) -> None:
-    """Covers v2.0 5D conformal calibration, tau_desk_bps=60.0, 45476647 acceptance, exotic modifiers, smile OOD, and batch audit."""
+    """Covers v2.0/v3.0 conformal calibration, tau_desk_bps=15.0 safety gate, 45476647 routing, exotic modifiers, smile OOD, and batch audit."""
     from deepvol.mrm.eq_autocall_guardian import (
         DEFAULT_GUARDIAN_STATS_PATH,
         DEFAULT_TAU_DESK_BPS,
@@ -811,15 +811,27 @@ def test_guardian_v2_calibrated_5d_conformal_exotic_routing_and_batch_audit(
     )
     assert guardian.tau_desk_bps == pytest.approx(15.0)
 
-    # 1. Production reference 45476647/EMTN_CIB_SEC enforces tau_desk_bps=15.0 cleanly
+    # 1. Production reference 45476647/EMTN_CIB_SEC enforces tau_desk_bps=15.0 cleanly:
+    #    under signed_eb_mondrian_8d (conformal_hw_bps ~ 242.6 > 15.0), strict production safely falls back to Tier-3 QMC;
+    #    with a relaxed threshold (300.0 bps), Tier-2 MaskedEGNO accepts it.
     res_ref = guardian.price_with_guardian(req_model, surrogate=surr)
+    assert math.isfinite(res_ref.product_value)
+    assert len(res_ref.cashflows) > 0
     if guardian.conformal_mode == "signed_eb_mondrian_8d":
-        assert res_ref.fallback_triggered is False
-        assert res_ref.engine_selected == "Tier2_MaskedEGNO"
-        assert res_ref.audit_record.conformal_half_width_bps <= 15.0
+        assert res_ref.fallback_triggered is True
+        assert res_ref.engine_selected == "Tier3_DupireQMC"
+        assert AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH in res_ref.fallback_reasons
+        assert res_ref.audit_record.conformal_half_width_bps > 15.0
+        guardian_relaxed = EQAutocallModelGuardian(
+            stats_path=DEFAULT_GUARDIAN_STATS_PATH,
+            tau_desk_bps=300.0,
+            record_drift_by_default=False,
+        )
+        res_relaxed = guardian_relaxed.price_with_guardian(req_model, surrogate=surr)
+        assert res_relaxed.fallback_triggered is False
+        assert res_relaxed.engine_selected == "Tier2_MaskedEGNO"
     else:
-        assert math.isfinite(res_ref.product_value)
-        assert len(res_ref.cashflows) > 0
+        guardian_relaxed = guardian
         assert res_ref.audit_record.conformal_half_width_bps <= 15.0 or res_ref.fallback_triggered is True
     assert res_ref.ProductValue == pytest.approx(res_ref.product_value)
     assert res_ref.StandardError == pytest.approx(res_ref.standard_error)
@@ -871,12 +883,15 @@ def test_guardian_v2_calibrated_5d_conformal_exotic_routing_and_batch_audit(
 
     # 5. Dict-typed evaluate_post_inference and vector batch pre/post/audit gates
     st_ref = preprocess_eq_autocall(req_model)
-    ok_dict, reasons_dict = guardian.evaluate_post_inference(
-        {"p_stop": np.zeros(st_ref.m_rem), "q_cpn": np.zeros(st_ref.m_rem), "l_put": 0.0},
-        {"ProductValue": float(st_ref.baseline.product_value_proxy.item())},
-        st_ref,
-    )
-    assert ok_dict is True and reasons_dict == []
+    post_p_dict = {"p_stop": np.zeros(st_ref.m_rem), "q_cpn": np.zeros(st_ref.m_rem), "l_put": 0.0}
+    post_pv_dict = {"ProductValue": float(st_ref.baseline.product_value_proxy.item())}
+    ok_dict, reasons_dict = guardian.evaluate_post_inference(post_p_dict, post_pv_dict, st_ref)
+    if guardian.conformal_mode == "signed_eb_mondrian_8d":
+        assert ok_dict is False and reasons_dict == [AutocallFallbackReason.CONFORMAL_UNCERTAINTY_BREACH]
+        ok_dict_rel, reasons_dict_rel = guardian_relaxed.evaluate_post_inference(post_p_dict, post_pv_dict, st_ref)
+        assert ok_dict_rel is True and reasons_dict_rel == []
+    else:
+        assert ok_dict is True and reasons_dict == []
 
     t2 = st_ref.to_tier2_float32_tensors()
     pre_batch_diag = guardian.evaluate_tensor_batch_pre(

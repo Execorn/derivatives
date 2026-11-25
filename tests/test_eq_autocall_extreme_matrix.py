@@ -434,7 +434,8 @@ def _build_scenario_registry() -> Dict[str, _ScenarioCase]:
 
     # Group A: SC-001 .. SC-015
     reg(_ScenarioCase("SC-001", "Basket", "Reference fixture eq_autocallable_request.txt",
-                      req=lambda: parse_murex_autocall_dag(REQUEST_TXT_PATH)[0], expect_fallback=False))
+                      req=lambda: parse_murex_autocall_dag(REQUEST_TXT_PATH)[0],
+                      expect_fallback=True, expected_fb_reasons=("CONFORMAL_UNCERTAINTY_BREACH",)))
     reg(_ScenarioCase("SC-002", "Basket", "D=1 single-asset", req=make_synthetic_request_dict(d_assets=1), expect_fallback=False))
     reg(_ScenarioCase("SC-003", "Basket", "D=2 two-asset", req=make_synthetic_request_dict(d_assets=2)))
     reg(_ScenarioCase("SC-004", "Basket", "D=5 five-asset", req=make_synthetic_request_dict(d_assets=5)))
@@ -446,9 +447,32 @@ def _build_scenario_registry() -> Dict[str, _ScenarioCase]:
 
     def _sc008_check(ctx: dict[str, Any]) -> None:
         rt_res = ctx.get("rt_res")
+        rt = ctx.get("runtime")
+        req_m = ctx.get("req_model")
         if rt_res is not None and isinstance(rt_res.Delta, dict):
-            vals = list(rt_res.Delta.values())
-            assert max(vals) - min(vals) < 1e-4
+            if not rt_res.fallback_triggered:
+                vals = list(rt_res.Delta.values())
+                assert max(vals) - min(vals) < 1e-4
+            elif rt is not None and req_m is not None:
+                from deepvol.api.eq_autocall_runtime import EQAutocallRuntime
+                from deepvol.mrm.eq_autocall_guardian import EQAutocallModelGuardian
+
+                rt_t2 = EQAutocallRuntime(
+                    surrogate=copy.deepcopy(rt.surrogate),
+                    guardian=EQAutocallModelGuardian(
+                        stats_path=rt.stats_path,
+                        tau_desk_bps=300.0,
+                        record_drift_by_default=False,
+                    ),
+                    stats_path=None,
+                    device=rt.device,
+                    n_fallback_paths=rt.n_fallback_paths,
+                )
+                res_t2 = rt_t2.price_trade(req_m, engine="surrogate", include_all_greeks=True)
+                assert res_t2.fallback_triggered is False
+                assert isinstance(res_t2.Delta, dict)
+                vals_t2 = list(res_t2.Delta.values())
+                assert max(vals_t2) - min(vals_t2) < 1e-4
 
     reg(_ScenarioCase("SC-008", "Basket", "Tied spots S_i=100 equal vol/corr D=5",
                       req=make_synthetic_request_dict(d_assets=5, spots=[100.0] * 5, ref_spots=[100.0] * 5, vol_level=0.30, corr_val=0.50),
@@ -725,6 +749,11 @@ def _build_scenario_registry() -> Dict[str, _ScenarioCase]:
     reg(_ScenarioCase("SC-068", "Market", "Rank-1 corr rho=1.0 D=3", req=make_synthetic_request_dict(d_assets=3, corr_val=1.0)))
 
     # Group D: SC-069 .. SC-089 and SC-132 .. SC-136 (All 18 monitoring indices & aliases)
+    def _std_idx_check(ctx: dict[str, Any]) -> None:
+        rt_res = ctx.get("rt_res")
+        if rt_res is not None and rt_res.fallback_triggered:
+            assert rt_res.fallback_reasons == ["CONFORMAL_UNCERTAINTY_BREACH"]
+
     for sc_id, idx_name in _MONITORING_ALL:
         d_use = 2 if ("AB" in idx_name or "BA" in idx_name or idx_name in ("Outperformance", "Spread")) else 3
         is_std = idx_name in ("WorstOf", "BestOf", "Average", "AverageOf", "EquallyWeightedBasket", "MultiPerf")
@@ -733,8 +762,9 @@ def _build_scenario_registry() -> Dict[str, _ScenarioCase]:
             "Index",
             f"MonitoringIndex={idx_name}",
             req=make_synthetic_request_dict(d_assets=d_use, spots=[85.0, 115.0] if d_use == 2 else [75.0, 100.0, 125.0], callability_index=idx_name),
-            expect_fallback=(None if idx_name == "WorstOf" else (False if is_std else True)),
+            expect_fallback=(None if is_std else True),
             expected_fb_reasons=(() if is_std else ("EXOTIC_MONITORING_INDEX",)),
+            custom_check=(_std_idx_check if is_std else None),
         ))
 
     reg(_ScenarioCase("SC-089", "Index", "Mixed monitoring indices WoF/BoF/Avg",
@@ -1019,5 +1049,7 @@ def test_extreme_scenario_matrix(sc_id: str, autocall_runtime: Any) -> None:
                 "notional_pv_proxy": float(proxy_out.notional_pv.item()),
                 "qmc": qmc_out,
                 "rt_res": rt_res,
+                "runtime": autocall_runtime,
+                "req_model": req_model,
             }
         )

@@ -885,9 +885,15 @@ def test_gpu_dual_gate_latency_and_vram_audit() -> None:
     all_sweep_ms: list[float] = []
     priced_items: list[tuple[str, EQAutocallRuntimeResponse, EQAutocallableTradeRequest]] = []
 
+    docs_req_dir = REPO_ROOT / "docs" / "eq_autocall_ps_batch_b10316f2" / "requests"
     for deal in manifest["deals"]:
         tid = str(deal["trade_id"])
-        req_path = ps_root / str(deal["paths"]["full_ps_request_drop_target"])
+        canonical_req = docs_req_dir / str(deal["filename"])
+        req_path = (
+            canonical_req
+            if tid == "56653809" and canonical_req.is_file()
+            else ps_root / str(deal["paths"]["full_ps_request_drop_target"])
+        )
         exp_path = ps_root / str(deal["paths"]["expected_murex"])
         assert req_path.is_file() and exp_path.is_file(), f"Missing PS files for deal {tid}"
         req_dict = json.loads(req_path.read_text(encoding="utf-8"))
@@ -978,6 +984,7 @@ def test_gpu_dual_gate_latency_and_vram_audit() -> None:
             from deepvol.api.eq_autocall_runtime import ALL_8_GREEK_QUERIES, EQAutocallRuntime
             from deepvol.models.autocall.gpu_cache_manager import GLOBAL_GPU_CACHE_MANAGER
             ps_root = Path({str(ps_root)!r})
+            docs_req_dir = Path({str(docs_req_dir)!r})
             manifest = json.loads((ps_root / "deals" / "manifest.json").read_text(encoding="utf-8"))
             rt = EQAutocallRuntime(device="cuda")
             qs = ["ProductValue", "CashFlows"] + list(ALL_8_GREEK_QUERIES)
@@ -986,7 +993,13 @@ def test_gpu_dual_gate_latency_and_vram_audit() -> None:
             for deal in manifest["deals"]:
                 if deal["status"] == "rejected":
                     continue
-                req_d = json.loads((ps_root / str(deal["paths"]["full_ps_request_drop_target"])).read_text(encoding="utf-8"))
+                canonical_req = docs_req_dir / str(deal["filename"])
+                req_p = (
+                    canonical_req
+                    if str(deal["trade_id"]) == "56653809" and canonical_req.is_file()
+                    else ps_root / str(deal["paths"]["full_ps_request_drop_target"])
+                )
+                req_d = json.loads(req_p.read_text(encoding="utf-8"))
                 req_d["Queries"] = list(qs)
                 rt.price_trade(req_d, engine="auto", include_all_greeks=True)
             dag_p = Path({str(REF_REQUEST_PATH)!r})
