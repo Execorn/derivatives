@@ -668,6 +668,474 @@ def test_dupire_qmc_audit_blind_spots(
     assert abs(res_os_neg.product_value - res_os_zero.product_value) > 1e-5
 
 
+def test_v3_literal_memory_and_pure_sobol_bb_determinism(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    """Verify V3 literal survival-weighted unpaid_mem update and deterministic pure Sobol BB."""
+    from types import SimpleNamespace
+    from deepvol.models.autocall.dupire_qmc_solver import _digital_ramp_np, _evaluate_autocall_payoff_np
+
+    # Deterministic 2-period pathwise test comparing against exact V3 literal algebra:
+    # Period 0: W=[1.00, 1.00], ko_bar=1.00, ko_spread=-0.10 -> ko_ind=1.0? No, choose W=0.95 -> ko_ind=0.5, cpn_ind=0.5!
+    # Period 1: W=1.05 -> ko_ind=1.0, cpn_ind=1.0.
+    st_mock = SimpleNamespace(
+        seasoned_state=SimpleNamespace(c_mem_0=0.10, i_ki_past=0.0),
+        callability_index="WorstOf",
+        coupon_index="WorstOf",
+        option_index="WorstOf",
+        is_long_basket=False,
+        coupon_barrier_direction="Up",
+        coupon_barrier_type="In",
+        ki_barrier=None,
+        ki_spread=0.0,
+        ko_spread=-0.10,
+        cpn_spread=-0.10,
+        force_coupons_on_autocall=False,
+        is_memory=True,
+        autocall_coupon=0.0,
+        no_notional_repayment=False,
+        one_star_strike=None,
+        one_star_coupon=0.0,
+        strike=1.0,
+        option_gearing=0.0,
+        lower_strike=None,
+        participation_call_strike=None,
+        participation_call_rate=0.0,
+    )
+    perf_paths = np.array([[[0.95], [1.05]]], dtype=np.float64)
+    df_pay = np.array([0.95, 0.90], dtype=np.float64)
+    ko_bar = np.array([1.00, 1.00], dtype=np.float64)
+    cpn_bar = np.array([1.00, 1.00], dtype=np.float64)
+    is_call = np.array([1.0, 1.0], dtype=np.float64)
+    is_guar = np.array([0.0, 0.0], dtype=np.float64)
+    cpn_amt = np.array([0.05, 0.05], dtype=np.float64)
+    w_fund = np.array([0.0, 0.0], dtype=np.float64)
+
+    _, _, _, _, cpn_cf, *_ = _evaluate_autocall_payoff_np(
+        st_mock,
+        perf_paths,
+        df_pay=df_pay,
+        ko_barriers=ko_bar,
+        is_callable=is_call,
+        cpn_barriers=cpn_bar,
+        is_guaranteed_cpn=is_guar,
+        coupon_amounts=cpn_amt,
+        w_fund=w_fund,
+        inv_lex_perm=None,
+    )
+    # Period 0: alive=1.0, ko_ind=0.5, cpn_ind=0.5 -> cpn_0 = 1.0*0.5*(0.05+0.10)=0.075
+    # V3 literal: unpaid_mem = alive * (0.10 + 0.05) * (1 - 0.5) = 0.075 (NOT 0.075/1 without alive, wait alive=1 at m=0;
+    # at m=1: alive_1=0.5, cpn_1 = 0.5 * 1.0 * (0.05 + 0.075) = 0.0625)
+    # Test 3 periods so alive_1 = 0.5 enters unpaid_mem_1!
+    perf3 = np.array([[[0.95], [0.95], [1.05]]], dtype=np.float64)
+    df3 = np.array([0.95, 0.90, 0.85], dtype=np.float64)
+    ko3 = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+    ic3 = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+    ig3 = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    c3 = np.array([0.05, 0.05, 0.05], dtype=np.float64)
+    wf3 = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    _, _, _, _, cpn_cf3, *_ = _evaluate_autocall_payoff_np(
+        st_mock,
+        perf3,
+        df_pay=df3,
+        ko_barriers=ko3,
+        is_callable=ic3,
+        cpn_barriers=ko3,
+        is_guaranteed_cpn=ig3,
+        coupon_amounts=c3,
+        w_fund=wf3,
+        inv_lex_perm=None,
+    )
+    k0 = float(_digital_ramp_np(np.array([0.95]), 1.0, -0.10)[0])
+    assert k0 == pytest.approx(0.5, abs=1e-12)
+    # m=0: a0=1.0, cpn0=0.075, U0=1.0*(0.10+0.05)*0.5=0.075, a1=0.5
+    # m=1: a1=0.5, cpn1=0.5*0.5*(0.05+0.075)=0.03125, U1=0.5*(0.075+0.05)*0.5=0.03125, a2=0.25
+    # m=2: a2=0.25, cpn2=0.25*1.0*(0.05+0.03125)=0.0203125 (vs V1 unweighted: 0.25*(0.05+0.0625)=0.028125)
+    assert cpn_cf3[0] == pytest.approx(0.075, abs=1e-12)
+    assert cpn_cf3[1] == pytest.approx(0.03125, abs=1e-12)
+    assert cpn_cf3[2] == pytest.approx(0.0203125, abs=1e-12)
+
+    # Pure Sobol BB determinism check on parsed_dag
+    req_orig, _ = parsed_dag
+    st = preprocess_eq_autocall(req_orig)
+    r1 = price_eq_autocall_dupire_qmc(st, n_paths=512, n_replicates=4, n_substeps_per_period=4, use_gpu=False, seed=17)
+    r2 = price_eq_autocall_dupire_qmc(st, n_paths=512, n_replicates=4, n_substeps_per_period=4, use_gpu=False, seed=17)
+    assert r1.product_value == r2.product_value
+    assert r1.option_pv == r2.option_pv
+    assert r1.coupon_pv == r2.coupon_pv
+
+
+def test_buehler_eff_drift_1d_skewed_div_lv_reprices_smile(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    """Gate G9 proxy: 1D skewed discrete-dividend Dupire LV reprices 1.0F/1.2F within <= 10 bps IV."""
+    import datetime
+    import math
+    from scipy.special import ndtr
+    from deepvol.api.schemas_eq_autocall import CurveInterpolationMethodEnum
+
+    req_orig, _ = parsed_dag
+    as_of = datetime.datetime(2026, 10, 23, 0, 0, tzinfo=datetime.timezone.utc)
+    t_mat = as_of + datetime.timedelta(days=730)
+    s0 = 100.0
+    r_zero = 0.14
+    div_dates_days = [200, 560]
+    div_amts = [3.5, 3.5]
+    strikes = [50.0, 65.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 145.0, 165.0, 190.0]
+    exp_days = [90, 180, 365, 547, 730, 912]
+    # Smooth market smile centered on continuous-yield forward matching 2Y escrowed forward
+    q_eff_avg = 0.036
+    quotes = []
+    for d_exp in exp_days:
+        t_e = d_exp / 365.0
+        f_e = s0 * math.exp((r_zero - q_eff_avg) * t_e)
+        row_q = [max(0.28 - 0.10 * math.log(k_v / f_e) + 0.03 * (math.log(k_v / f_e) ** 2), 0.15) for k_v in strikes]
+        quotes.append(row_q)
+
+    req = copy.deepcopy(req_orig)
+    req.Product.StartDate = as_of
+    req.Product.ObservationDates = [
+        as_of + datetime.timedelta(days=91 * k) for k in range(1, 8)
+    ] + [t_mat]
+    req.Product.PaymentDates = list(req.Product.ObservationDates)
+    req.Product.AutoCallTriggerLevels = [999.0] * 8
+    req.Product.CouponBarrierLevels = [999.0] * 8
+    req.Product.FixedCouponAmount = 0.0
+    req.Product.FixedRate = None
+    req.Product.IsMemory = False
+    req.Product.OptionDownAndInBarrierLevel = None
+    req.Product.OneStarStrike = None
+    req.Product.OneStarCoupon = None
+    req.Product.NoNotionalRepayment = True
+    req.Product.OptionGearing = 1.0
+    req.Product.OptionMonitoringIndex = "WorstOf"
+    req.Product.UnderlyingIdentifiers = ["SKEW_RUB"]
+    req.Product.UnderlyingReferenceSpots = [s0]
+    req.Product.PredefinedDividends = {
+        "SKEW_RUB": {
+            "ExDates": [as_of + datetime.timedelta(days=d_ex) for d_ex in div_dates_days],
+            "Amounts": div_amts,
+        }
+    }
+    mds = req.Model.MarketDataSet
+    mds.AsOfDate = as_of
+    mds.Spots = {"SKEW_RUB": s0}
+    mds.Correlations = {}
+    mds.Dividends = {}
+    mds.Fixings = {}
+    mds.RepoSpreadCurves = {}
+    disc = mds.RatesCurvesBundles["RUB_RUONIA_OIS"]
+    disc.AsOfDate = as_of
+    disc.InterpolationMethod = CurveInterpolationMethodEnum.Linear
+    disc.RatesSchedule.Dates = [as_of + datetime.timedelta(days=180), as_of + datetime.timedelta(days=365), t_mat]
+    disc.RatesSchedule.Rates = [r_zero * 100.0] * 3
+    mds.VolatilitySurfaces = {
+        "SKEW_RUB": {
+            "Identifier": "SKEW_RUB",
+            "DayCountConvention": "Act365",
+            "ExpirationDates": [(as_of + datetime.timedelta(days=d_exp)).isoformat() for d_exp in exp_days],
+            "Strikes": strikes,
+            "VolatilityQuotes": quotes,
+        }
+    }
+
+    st_tmp = preprocess_eq_autocall(req)
+    f_rel = float(st_tmp.forward_perf[0, -1].item())
+    f_abs = float(st_tmp.dividend_schedule.forward_price[0, -1].item())
+    surf = st_tmp.vol_surfaces["SKEW_RUB"]
+    tau_l = float(st_tmp.tau_obs[-1].item())
+    df_l = float(st_tmp.df_pay[-1].item())
+
+    for mult in (1.0, 1.2):
+        r_k = copy.deepcopy(req)
+        r_k.Product.Strike = mult * f_rel
+        st_k = preprocess_eq_autocall(r_k)
+        res = price_eq_autocall_dupire_qmc(
+            st_k,
+            n_paths=4096,
+            n_replicates=8,
+            n_substeps_per_period=16,
+            precision="fp64_audit",
+            cv_mode="bs1d_exact",
+            use_gpu=False,
+            seed=42,
+        )
+        iv_mkt = float(surf.iv(tau_l, mult * f_abs))
+        w_mkt = iv_mkt * iv_mkt * tau_l
+        sw = math.sqrt(w_mkt)
+        d1 = (math.log(1.0 / mult) + 0.5 * w_mkt) / sw
+        d2 = d1 - sw
+        k_rel = mult * f_rel
+        b76_put = -df_l * (k_rel * float(ndtr(-d2)) - f_rel * float(ndtr(-d1)))
+        vega = df_l * f_rel * math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi) * math.sqrt(tau_l)
+        iv_err_bps = abs(res.product_value - b76_put) / max(vega, 1e-8) * 1e4
+        assert iv_err_bps <= 10.0, f"1D skewed LV {mult}F IV error {iv_err_bps:.2f} bps > 10.0 bps"
+
+
+def test_islongbasket_i_ramp_and_onestar_shifted_spread_rules() -> None:
+    """Verify IsLongBasket I_ramp payoff and OneStar ki_barrier/ko_spread rule."""
+    from types import SimpleNamespace
+    from deepvol.models.autocall.dupire_qmc_solver import _digital_ramp_np, _evaluate_autocall_payoff_np
+
+    # 1. IsLongBasket I_ramp: Payoff_IsLB(T) = Avg_T * ki_wof_K + 1.0 * (1 - ki_wof_K)
+    st_lb = SimpleNamespace(
+        seasoned_state=SimpleNamespace(c_mem_0=0.0, i_ki_past=0.0),
+        callability_index="WorstOf",
+        coupon_index="WorstOf",
+        option_index="WorstOf",
+        is_long_basket=True,
+        coupon_barrier_direction="Up",
+        coupon_barrier_type="In",
+        ki_barrier=1.0,
+        ki_spread=-0.10,
+        ko_spread=-0.05,
+        cpn_spread=0.0,
+        force_coupons_on_autocall=False,
+        is_memory=False,
+        autocall_coupon=0.0,
+        no_notional_repayment=False,
+        one_star_strike=None,
+        one_star_coupon=0.0,
+        strike=0.90,
+        option_gearing=1.111111,
+        lower_strike=None,
+        participation_call_strike=None,
+        participation_call_rate=0.0,
+    )
+    # Path 0: Wof=0.85, Avg=0.90 -> ki_wof_K=1 - ramp(0.85, 0.90, -0.10)=0.5 -> Payoff_IsLB = 0.90*0.5 + 1.0*0.5 = 0.95 -> opt_pay=-0.05
+    # Path 1: Wof=0.75, Avg=0.80 -> ki_wof_K=1.0 -> Payoff_IsLB = 0.80 -> opt_pay=-0.20
+    # Path 2: Wof=0.95, Avg=1.05 -> ki_wof_K=0.0 -> Payoff_IsLB = 1.00 -> opt_pay=0.00
+    perf_lb = np.array(
+        [
+            [[0.85, 0.95]],
+            [[0.75, 0.85]],
+            [[0.95, 1.15]],
+        ],
+        dtype=np.float64,
+    )
+    df_pay = np.array([0.80], dtype=np.float64)
+    total_pv, opt_pv, *_ = _evaluate_autocall_payoff_np(
+        st_lb,
+        perf_lb,
+        df_pay=df_pay,
+        ko_barriers=np.array([999.0]),
+        is_callable=np.array([0.0]),
+        cpn_barriers=np.array([999.0]),
+        is_guaranteed_cpn=np.array([0.0]),
+        coupon_amounts=np.array([0.0]),
+        w_fund=np.array([0.0]),
+        inv_lex_perm=None,
+    )
+    expected_opt = df_pay[0] * np.array([-0.05, -0.20, 0.0], dtype=np.float64)
+    expected_tot = df_pay[0] * np.array([0.95, 0.80, 1.00], dtype=np.float64)
+    np.testing.assert_allclose(opt_pv, expected_opt, atol=1e-12)
+    np.testing.assert_allclose(total_pv, expected_tot, atol=1e-12)
+
+    # 2. OneStar shifted left-spread rule when ki_barrier is not None and ko_spread < 0
+    st_os_ki = SimpleNamespace(
+        seasoned_state=SimpleNamespace(c_mem_0=0.0, i_ki_past=0.0),
+        callability_index="WorstOf",
+        coupon_index="WorstOf",
+        option_index="WorstOf",
+        is_long_basket=False,
+        coupon_barrier_direction="Up",
+        coupon_barrier_type="In",
+        ki_barrier=0.85,
+        ki_spread=-0.10,
+        ko_spread=-0.10,
+        cpn_spread=0.0,
+        force_coupons_on_autocall=False,
+        is_memory=False,
+        autocall_coupon=0.0,
+        no_notional_repayment=False,
+        one_star_strike=1.10,
+        one_star_coupon=0.10,
+        strike=1.00,
+        option_gearing=1.0,
+        lower_strike=None,
+        participation_call_strike=None,
+        participation_call_rate=0.0,
+    )
+    # BestOf = 1.05 sits at midpoint of [1.00, 1.10] -> star_ind = 0.5
+    perf_os = np.array([[[0.70, 1.05]]], dtype=np.float64)
+    _, _, _, _, _, _, _, l_os_ki, p_os_ki = _evaluate_autocall_payoff_np(
+        st_os_ki,
+        perf_os,
+        df_pay=np.array([1.0]),
+        ko_barriers=np.array([999.0]),
+        is_callable=np.array([0.0]),
+        cpn_barriers=np.array([999.0]),
+        is_guaranteed_cpn=np.array([0.0]),
+        coupon_amounts=np.array([0.0]),
+        w_fund=np.array([0.0]),
+        inv_lex_perm=None,
+    )
+    assert p_os_ki == pytest.approx(0.5, abs=1e-12)
+    assert l_os_ki == pytest.approx(0.05, abs=1e-12)
+
+    # With ki_barrier=None, falls back to narrow centered 0.02 ramp around 1.10 -> star_ind(1.05) = 0.0
+    st_os_noki = copy.copy(st_os_ki)
+    st_os_noki.ki_barrier = None
+    _, _, _, _, _, _, _, l_os_noki, p_os_noki = _evaluate_autocall_payoff_np(
+        st_os_noki,
+        perf_os,
+        df_pay=np.array([1.0]),
+        ko_barriers=np.array([999.0]),
+        is_callable=np.array([0.0]),
+        cpn_barriers=np.array([999.0]),
+        is_guaranteed_cpn=np.array([0.0]),
+        coupon_amounts=np.array([0.0]),
+        w_fund=np.array([0.0]),
+        inv_lex_perm=None,
+    )
+    assert p_os_noki == pytest.approx(0.0, abs=1e-12)
+    assert l_os_noki == pytest.approx(0.0, abs=1e-12)
+    assert _digital_ramp_np(np.array([1.05]), 1.10, -0.10)[0] == pytest.approx(0.5, abs=1e-12)
+
+
+def test_ki_obs_type_4_mode_dispatch_shevchenko_and_bgk(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    """Verify None->European default and 4-mode ki_obs_type dispatch with Shevchenko/BGK."""
+    import datetime
+
+    req_orig, _ = parsed_dag
+    req_ki = copy.deepcopy(req_orig)
+    as_of_ki = datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc)
+    req_ki.Product.StartDate = as_of_ki
+    req_ki.Product.ObservationDates = [as_of_ki + datetime.timedelta(days=90 * k) for k in range(1, 5)]
+    req_ki.Product.PaymentDates = list(req_ki.Product.ObservationDates)
+    req_ki.Product.AutoCallTriggerLevels = [1.05] * 4
+    req_ki.Product.CouponBarrierLevels = [0.85] * 4
+    req_ki.Model.MarketDataSet.AsOfDate = as_of_ki
+    req_ki.Model.MarketDataSet.Fixings = {}
+    for c in req_ki.Model.MarketDataSet.RatesCurvesBundles.values():
+        c.AsOfDate = as_of_ki
+    req_ki.Product.OptionDownAndInBarrierLevel = 0.85
+    req_ki.Product.OptionDownAndInBarrierObservationType = "European"
+    st_eu = preprocess_eq_autocall(req_ki)
+    assert float(st_eu.seasoned_state.i_ki_past) < 0.5
+
+    # None ki_obs_type must default to European even if ki_monitored_past=True
+    st_none = copy.copy(st_eu)
+    st_none.seasoned_state = copy.copy(st_eu.seasoned_state)
+    if hasattr(st_none, "ki_obs_type"):
+        st_none.ki_obs_type = None
+    if hasattr(st_none.seasoned_state, "ki_obs_type"):
+        st_none.seasoned_state.ki_obs_type = None
+    st_none.seasoned_state.ki_monitored_past = True
+
+    st_disc = copy.copy(st_eu)
+    st_disc.seasoned_state = copy.copy(st_eu.seasoned_state)
+    st_disc.ki_obs_type = "Discrete"
+    st_daily = copy.copy(st_eu)
+    st_daily.seasoned_state = copy.copy(st_eu.seasoned_state)
+    st_daily.ki_obs_type = "Daily"
+    st_cont = copy.copy(st_eu)
+    st_cont.seasoned_state = copy.copy(st_eu.seasoned_state)
+    st_cont.ki_obs_type = "Continuous"
+
+    r_eu = price_eq_autocall_dupire_qmc(st_eu, n_paths=1024, n_replicates=4, n_substeps_per_period=4, use_gpu=False, seed=19)
+    r_none = price_eq_autocall_dupire_qmc(st_none, n_paths=1024, n_replicates=4, n_substeps_per_period=4, use_gpu=False, seed=19)
+    r_disc = price_eq_autocall_dupire_qmc(st_disc, n_paths=1024, n_replicates=4, n_substeps_per_period=4, use_gpu=False, seed=19)
+    r_daily = price_eq_autocall_dupire_qmc(st_daily, n_paths=1024, n_replicates=4, n_substeps_per_period=4, use_gpu=False, seed=19)
+    r_cont = price_eq_autocall_dupire_qmc(st_cont, n_paths=1024, n_replicates=4, n_substeps_per_period=4, use_gpu=False, seed=19)
+
+    assert r_none.l_put == pytest.approx(r_eu.l_put, abs=1e-12)
+    assert r_eu.l_put <= r_disc.l_put + 1e-12
+    assert r_disc.l_put <= r_cont.l_put + 1e-12
+    assert r_daily.l_put <= r_cont.l_put + 1e-12
+    assert r_daily.l_put > r_eu.l_put
+
+
+def test_repair_arbitrage_quotes_and_canonical_tier3_config(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    """Verify repair_arbitrage_quotes (incl. j==0 guard) and CanonicalTier3Config consumer."""
+    from dataclasses import dataclass
+    from deepvol.models.autocall.dupire_qmc_solver import repair_arbitrage_quotes
+
+    # 1. Synthetic arbitrage surface with upward vol jump at high strikes + clean slice
+    t_exp = np.array([0.25, 1.0], dtype=np.float64)
+    strikes = np.array([3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0], dtype=np.float64)
+    quotes = np.array(
+        [
+            [0.32, 0.30, 0.28, 0.27, 0.36, 0.35, 0.34],
+            [0.31, 0.29, 0.275, 0.265, 0.35, 0.34, 0.33],
+        ],
+        dtype=np.float64,
+    )
+    repaired, info = repair_arbitrage_quotes(strikes, quotes, t_exp, k_ref=4.0)
+    assert info["repaired"] is True
+    assert info["repaired_slices"] == [0, 1]
+    assert repaired.shape == quotes.shape
+    surf = RegularizedVolSurface(
+        {"Identifier": "SYN_REP", "tenors": t_exp, "Strikes": strikes, "VolatilityQuotes": repaired}
+    )
+    assert np.all(np.isfinite(surf.quotes))
+
+    # 2. j==0 slope violation must not wrap d2c[-1]
+    strikes_j0 = np.array([3.9, 4.0, 4.1, 4.2, 4.3, 4.4, 4.5], dtype=np.float64)
+    q_j0 = np.array([[0.10, 0.45, 0.30, 0.28, 0.27, 0.26, 0.25]], dtype=np.float64)
+    rep_j0, info_j0 = repair_arbitrage_quotes(strikes_j0, q_j0, np.array([1.0]), k_ref=4.0)
+    assert info_j0["j_anom_by_slice"] == [0]
+    assert info_j0["repaired"] is True
+    assert np.all(np.isfinite(rep_j0))
+
+    # 3. CanonicalTier3Config duck-typed consumption
+    @dataclass(frozen=True)
+    class _CfgStub:
+        n_paths: int = 256
+        n_replicates: int = 4
+        n_substeps: int = 2
+        lv_grid_nt: int = 32
+        lv_grid_ny: int = 64
+        cv_mode: str = "multifidelity_gbm"
+        n_cheap_mf: int = 1024
+        seed: int = 42
+        adaptive_substeps: bool = False
+
+    req_orig, _ = parsed_dag
+    st = preprocess_eq_autocall(req_orig)
+    res_cfg = price_eq_autocall_dupire_qmc(st, use_gpu=False, config=_CfgStub())
+    assert res_cfg.n_paths == 256
+    assert np.isfinite(res_cfg.product_value)
+
+    # 4. Optional IRAO_RUB batch check if production-shadow corpus is available
+    batch_dir = REPO_ROOT / "docs" / "eq_autocall_ps_batch_b10316f2"
+    if batch_dir.exists():
+        import json
+        from deepvol.models.autocall.dupire_qmc_solver import _surface_year_fractions_batch
+
+        irao_req_path = batch_dir / "requests" / "trade_052_45040676.json"
+        if irao_req_path.exists():
+            d_irao = json.loads(irao_req_path.read_text())
+            req_irao = EQAutocallableTradeRequest.model_validate(d_irao)
+            s_irao = req_irao.Model.MarketDataSet.VolatilitySurfaces["IRAO_RUB"]
+            t_irao = _surface_year_fractions_batch(
+                req_irao.Model.MarketDataSet.AsOfDate,
+                s_irao.ExpirationDates,
+                s_irao.DayCountConvention.value,
+            )
+            rep_irao, info_irao = repair_arbitrage_quotes(
+                np.asarray(s_irao.Strikes, dtype=np.float64),
+                np.asarray(s_irao.VolatilityQuotes, dtype=np.float64),
+                t_irao,
+                float(req_irao.Model.MarketDataSet.Spots["IRAO_RUB"]),
+            )
+            assert info_irao["repaired"] is True
+            assert info_irao["repaired_slices"] == list(range(7))
+            surf_irao = RegularizedVolSurface(
+                {
+                    "Identifier": "IRAO_RUB",
+                    "tenors": t_irao,
+                    "Strikes": s_irao.Strikes,
+                    "VolatilityQuotes": rep_irao,
+                }
+            )
+            assert surf_irao.n_exp == 7
+
+
 
 
 

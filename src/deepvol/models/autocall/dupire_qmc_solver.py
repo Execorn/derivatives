@@ -27,7 +27,7 @@ import hashlib
 import inspect
 import math
 import threading
-from typing import Any, List, Literal, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -48,6 +48,16 @@ from deepvol.models.autocall.feature_layout import (
     MonitoringIndexCode,
     monitoring_index_to_code,
 )
+
+if TYPE_CHECKING:
+    from deepvol.models.autocall.feature_layout import (  # type: ignore[attr-defined]
+        CanonicalTier3Config,
+    )
+else:
+    try:
+        from deepvol.models.autocall.feature_layout import CanonicalTier3Config
+    except ImportError:
+        CanonicalTier3Config = Any  # type: ignore[misc, assignment]
 from deepvol.models.autocall.seasoned_collapser import (
     CashFlowItem,
     _to_utc_datetime,
@@ -265,6 +275,95 @@ def _project_wing_calls_convex(
         if out[j] > out[j - 1]:
             out[j] = out[j - 1]
     return out
+
+
+def repair_arbitrage_quotes(
+    strikes: npt.NDArray[np.float64],
+    quotes: npt.NDArray[np.float64],
+    t_exp: npt.NDArray[np.float64],
+    k_ref: float,
+    *,
+    tol_slope: float = 0.0,
+    tol_d2c: float = 1e-6,
+) -> tuple[npt.NDArray[np.float64], dict[str, Any]]:
+    """Repairs calendar/smile call-convexity arbitrage quotes via secant lower-hull projection.
+
+    For each expiry slice, computes normalized Black-76 call prices at ``k_ref``, finds the
+    earliest strike index ``j`` where ``slope[j] > tol_slope`` or ``(j >= 1 and d2c[j - 1] < -tol_d2c)``,
+    holds lower strikes ``0 .. j_anom - 1`` fixed, and projects ``[j_anom - 1 .. n_u - 1]``
+    onto the monotone non-increasing convex hull followed by Black-76 IV inversion.
+    """
+    strikes_arr = np.asarray(strikes, dtype=np.float64)
+    quotes_arr = np.asarray(quotes, dtype=np.float64)
+    t_arr = np.asarray(t_exp, dtype=np.float64)
+    if strikes_arr.ndim != 1 or t_arr.ndim != 1 or quotes_arr.ndim != 2:
+        raise ValueError("repair_arbitrage_quotes requires 1D strikes/t_exp and 2D quotes.")
+    n_exp, n_u = quotes_arr.shape
+    if n_exp != len(t_arr) or n_u != len(strikes_arr):
+        raise ValueError(
+            f"repair_arbitrage_quotes shape mismatch: quotes={quotes_arr.shape}, "
+            f"t_exp={t_arr.shape}, strikes={strikes_arr.shape}."
+        )
+
+    repaired = quotes_arr.copy()
+    k_scale = max(float(k_ref), 1e-12)
+    repaired_slices: list[int] = []
+    j_anom_by_slice: list[Optional[int]] = []
+    n_modified = 0
+
+    if n_exp == 0 or n_u < 2:
+        return repaired, {
+            "repaired": False,
+            "repaired_slices": repaired_slices,
+            "j_anom_by_slice": j_anom_by_slice,
+            "max_quote_delta": 0.0,
+            "n_quotes_modified": 0,
+            "k_ref": float(k_scale),
+        }
+
+    y_u = np.log(np.maximum(strikes_arr, 1e-12) / k_scale)
+    dk_step = np.maximum((strikes_arr[1:] - strikes_arr[:-1]) / k_scale, 1e-12)
+
+    for m in range(n_exp):
+        t_m = max(float(t_arr[m]), 1e-12)
+        w_m = (repaired[m] * repaired[m]) * t_m
+        calls_m = _b76_norm_call(y_u, w_m)
+        slope = (calls_m[1:] - calls_m[:-1]) / dk_step
+        d2c = slope[1:] - slope[:-1]
+
+        j_anom: Optional[int] = None
+        for j in range(n_u - 1):
+            if (float(slope[j]) > tol_slope) or (j >= 1 and float(d2c[j - 1]) < -tol_d2c):
+                j_anom = j
+                break
+        j_anom_by_slice.append(j_anom)
+        if j_anom is None:
+            continue
+
+        core_mask = np.zeros(n_u, dtype=np.bool_)
+        if j_anom > 0:
+            core_mask[:j_anom] = True
+        calls_proj = _project_wing_calls_convex(strikes_arr, calls_m, k_scale, core_mask)
+        slice_changed = False
+        for u in range(max(j_anom - 1, 0), n_u):
+            if abs(float(calls_proj[u]) - float(calls_m[u])) > 1e-12:
+                repaired[m, u] = _invert_b76_norm_call_to_vol(
+                    float(y_u[u]), float(calls_proj[u]), t_m, 0.01, 5.00
+                )
+                n_modified += 1
+                slice_changed = True
+        if slice_changed:
+            repaired_slices.append(m)
+
+    max_delta = float(np.max(np.abs(repaired - quotes_arr))) if repaired.size > 0 else 0.0
+    return repaired, {
+        "repaired": bool(repaired_slices),
+        "repaired_slices": repaired_slices,
+        "j_anom_by_slice": j_anom_by_slice,
+        "max_quote_delta": max_delta,
+        "n_quotes_modified": int(n_modified),
+        "k_ref": float(k_scale),
+    }
 
 
 def _surface_year_fractions_batch(
@@ -2039,6 +2138,35 @@ def _generate_sobol_normals(
     return np.concatenate([z_sobol, z_anti], axis=1)
 
 
+def _build_bb_orthogonal_np(tau_obs_np: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Constructs exact orthogonal (M, M) dyadic Brownian-bridge temporal basis."""
+    m_rem = int(len(tau_obs_np))
+    if m_rem <= 1:
+        return np.ones((max(m_rem, 1), max(m_rem, 1)), dtype=np.float64)
+    dt_arr = np.maximum(np.diff(np.concatenate([[0.0], tau_obs_np.astype(np.float64)])), 1e-12)
+    t_cum = np.concatenate([[0.0], np.cumsum(dt_arr)])
+    c_path = np.zeros((m_rem + 1, m_rem), dtype=np.float64)
+    c_path[m_rem, 0] = math.sqrt(float(t_cum[m_rem]))
+    queue: list[tuple[int, int]] = [(0, m_rem)]
+    col_idx = 1
+    head = 0
+    while head < len(queue):
+        l_idx, r_idx = queue[head]
+        head += 1
+        if r_idx - l_idx <= 1:
+            continue
+        mid = (l_idx + r_idx) // 2
+        tl, tm, tr = float(t_cum[l_idx]), float(t_cum[mid]), float(t_cum[r_idx])
+        denom = max(tr - tl, 1e-12)
+        c_path[mid, :] = ((tr - tm) / denom) * c_path[l_idx, :] + ((tm - tl) / denom) * c_path[r_idx, :]
+        c_path[mid, col_idx] = math.sqrt(max((tm - tl) * (tr - tm) / denom, 0.0))
+        col_idx += 1
+        queue.append((l_idx, mid))
+        queue.append((mid, r_idx))
+    inv_sqrt_dt = 1.0 / np.sqrt(dt_arr)[:, None]
+    return np.ascontiguousarray((c_path[1:, :] - c_path[:-1, :]) * inv_sqrt_dt, dtype=np.float64)
+
+
 def _lookup_funding_fixing_utc(
     fixings_pairs: Sequence[Tuple[datetime, float]],
     target_dt: datetime,
@@ -2523,35 +2651,70 @@ def _eval_continuous_ki_step_survival_np(
     opt_code: int,
     ki_barrier: float,
     inv_lex_perm: Optional[npt.NDArray[np.int64]],
+    *,
+    lv_step_end: Optional[npt.NDArray[np.float64]] = None,
+    lv_barrier: Optional[npt.NDArray[np.float64]] = None,
+    bgk_daily: bool = False,
 ) -> npt.NDArray[np.float64]:
-    """Brownian-bridge non-knock-in survival probability over one step [t0, t1]."""
+    """Shevchenko (2009) & BGK (1997) Brownian-bridge non-knock-in survival over [t0, t1]."""
+    if opt_code == int(MonitoringIndexCode.WORST_OF) and ki_barrier > 0.0:
+        lv0 = np.maximum(lv_step, 1e-6)
+        lv1 = np.maximum(lv_step_end, 1e-6) if lv_step_end is not None else lv0
+        lv_b = np.maximum(lv_barrier, 1e-6) if lv_barrier is not None else lv0
+        if bgk_daily:
+            b_eff = ki_barrier * np.exp(-0.5826 * lv_b * math.sqrt(1.0 / 252.0))
+        else:
+            b_eff = np.full_like(lv_b, ki_barrier, dtype=np.float64)
+        alive_i = (perf_prev > b_eff) & (perf_curr > b_eff)
+        if not np.any(np.all(alive_i, axis=-1)):
+            return np.zeros(perf_curr.shape[:-1], dtype=np.float64)
+        # Gobet-Menozzi (2010) Simpson-rule barrier-pinned local variance
+        var_simpson = (lv0 * lv0 + 4.0 * (lv_b * lv_b) + lv1 * lv1) / 6.0
+        p_prev_s = np.where(alive_i, np.maximum(perf_prev, b_eff + 1e-12), b_eff + 0.1)
+        p_curr_s = np.where(alive_i, np.maximum(perf_curr, b_eff + 1e-12), b_eff + 0.1)
+        eta_i = (
+            2.0
+            * np.log(p_prev_s / b_eff)
+            * np.log(p_curr_s / b_eff)
+            / np.maximum(var_simpson * max(dt_step, 1e-12), 1e-12)
+        )
+        surv_i = np.where(alive_i, 1.0 - np.exp(-np.maximum(eta_i, 0.0)), 0.0)
+        return np.asarray(np.prod(surv_i, axis=-1), dtype=np.float64)
+
     w_prev = _eval_index_by_code_np(perf_prev, opt_code, inv_lex_perm)
     w_curr = _eval_index_by_code_np(perf_curr, opt_code, inv_lex_perm)
-    alive_pair = (w_prev > ki_barrier) & (w_curr > ki_barrier)
-    if not np.any(alive_pair):
-        return np.zeros_like(w_curr, dtype=np.float64)
-
     perf_mid = 0.5 * (perf_prev + perf_curr)
     dw_dlog = _eval_index_log_weights_np(perf_mid, opt_code, inv_lex_perm)
     weighted = dw_dlog * lv_step
     var_abs = np.einsum("...i,ij,...j->...", weighted, corr_np, weighted)
 
     if opt_code in _DIFF_INDEX_CODES or ki_barrier <= 0.0:
+        b_eff_idx = np.full_like(w_curr, ki_barrier, dtype=np.float64)
+        alive_pair = (w_prev > b_eff_idx) & (w_curr > b_eff_idx)
+        if not np.any(alive_pair):
+            return np.zeros_like(w_curr, dtype=np.float64)
         eta = (
             2.0
-            * np.maximum(w_prev - ki_barrier, 0.0)
-            * np.maximum(w_curr - ki_barrier, 0.0)
+            * np.maximum(w_prev - b_eff_idx, 0.0)
+            * np.maximum(w_curr - b_eff_idx, 0.0)
             / np.maximum(var_abs * max(dt_step, 1e-12), 1e-12)
         )
     else:
         w_mid = np.maximum(_eval_index_by_code_np(perf_mid, opt_code, inv_lex_perm), 1e-12)
         var_log = var_abs / (w_mid * w_mid)
-        w_p_s = np.where(alive_pair, np.maximum(w_prev, ki_barrier + 1e-12), ki_barrier + 0.1)
-        w_c_s = np.where(alive_pair, np.maximum(w_curr, ki_barrier + 1e-12), ki_barrier + 0.1)
+        if bgk_daily:
+            b_eff_idx = ki_barrier * np.exp(-0.5826 * np.sqrt(np.maximum(var_log, 1e-12)) * math.sqrt(1.0 / 252.0))
+        else:
+            b_eff_idx = np.full_like(w_curr, ki_barrier, dtype=np.float64)
+        alive_pair = (w_prev > b_eff_idx) & (w_curr > b_eff_idx)
+        if not np.any(alive_pair):
+            return np.zeros_like(w_curr, dtype=np.float64)
+        w_p_s = np.where(alive_pair, np.maximum(w_prev, b_eff_idx + 1e-12), b_eff_idx + 0.1)
+        w_c_s = np.where(alive_pair, np.maximum(w_curr, b_eff_idx + 1e-12), b_eff_idx + 0.1)
         eta = (
             2.0
-            * np.log(w_p_s / ki_barrier)
-            * np.log(w_c_s / ki_barrier)
+            * np.log(w_p_s / b_eff_idx)
+            * np.log(w_c_s / b_eff_idx)
             / np.maximum(var_log * max(dt_step, 1e-12), 1e-12)
         )
     return np.where(alive_pair, 1.0 - np.exp(-np.maximum(eta, 0.0)), 0.0)
@@ -2603,6 +2766,12 @@ def _evaluate_autocall_payoff_np(
         else (raw_opt_idx if raw_opt_idx else state.callability_index)
     )
     opt_code = resolve_monitoring_index_code(eff_opt_idx)
+    ki_opt_idx = (
+        "WorstOf"
+        if is_long_flag
+        else (raw_opt_idx if raw_opt_idx else state.callability_index)
+    )
+    ki_opt_code = resolve_monitoring_index_code(ki_opt_idx)
     is_diff_opt = opt_code in _DIFF_INDEX_CODES
 
     cpn_dir = str(getattr(state, "coupon_barrier_direction", "Up") or "Up").strip().lower()
@@ -2613,7 +2782,7 @@ def _evaluate_autocall_payoff_np(
         and (float(state.ki_barrier) > 1e-6 or (is_diff_opt and float(state.ki_barrier) < -1e-6))
         and float(state.seasoned_state.i_ki_past) < 0.5
     )
-    discrete_ki_active = has_ki and ki_ind_override is None and ki_mode in ("Discrete", "Daily")
+    discrete_ki_active = has_ki and ki_ind_override is None and ki_mode == "Discrete"
     not_ki_disc = np.ones(n_total_paths, dtype=np.float64)
 
     for m in range(m_rem):
@@ -2623,7 +2792,7 @@ def _evaluate_autocall_payoff_np(
             w_call if cpn_code == call_code else _eval_index_by_code_np(perf_m, cpn_code, inv_lex_perm)
         )
         if discrete_ki_active and state.ki_barrier is not None:
-            w_opt_m = _eval_index_by_code_np(perf_m, opt_code, inv_lex_perm)
+            w_opt_m = _eval_index_by_code_np(perf_m, ki_opt_code, inv_lex_perm)
             not_ki_disc *= _digital_ramp_np(w_opt_m, float(state.ki_barrier), float(state.ki_spread))
 
         if is_callable[m] > 0.5:
@@ -2665,7 +2834,7 @@ def _evaluate_autocall_payoff_np(
         total_pv_paths += df_pay[m] * cpn_undisc_m
 
         if state.is_memory:
-            unpaid_mem = (unpaid_mem + float(coupon_amounts[m])) * (1.0 - cpn_ind)
+            unpaid_mem = alive * (unpaid_mem + float(coupon_amounts[m])) * (1.0 - cpn_ind)
 
         alive = alive * (1.0 - ko_ind)
         if not state.no_notional_repayment:
@@ -2680,13 +2849,36 @@ def _evaluate_autocall_payoff_np(
     if state.one_star_strike is not None and float(state.one_star_strike) > 0.0:
         w_best = _eval_index_by_code_np(perf_term, int(MonitoringIndexCode.BEST_OF), inv_lex_perm)
         k_os = float(state.one_star_strike)
-        eps_os = 0.02
-        star_ind = np.clip((w_best - (k_os - 0.5 * eps_os)) / eps_os, 0.0, 1.0)
+        ko_sp = float(getattr(state, "ko_spread", 0.0) or 0.0)
+        if state.ki_barrier is not None and ko_sp < 0.0:
+            k_os_eff = k_os + 0.5 * ko_sp
+            eps_os = abs(ko_sp)
+        else:
+            k_os_eff = k_os
+            eps_os = 0.02
+        star_ind = np.clip((w_best - (k_os_eff - 0.5 * eps_os)) / max(eps_os, 1e-12), 0.0, 1.0)
 
     k_put = float(state.strike)
     gearing = float(state.option_gearing)
     has_put = ((k_put > 1e-6) or (is_diff_opt and k_put < -1e-6)) and gearing != 0.0
-    if has_put:
+    if is_long_flag:
+        w_avg_term = _eval_index_by_code_np(
+            perf_term, int(MonitoringIndexCode.AVERAGE_OF), inv_lex_perm
+        )
+        w_wof_term = _eval_index_by_code_np(
+            perf_term, int(MonitoringIndexCode.WORST_OF), inv_lex_perm
+        )
+        if ki_ind_override is not None:
+            ki_wof_k = ki_ind_override
+        elif discrete_ki_active and state.ki_barrier is not None:
+            ki_wof_k = 1.0 - not_ki_disc
+        else:
+            ki_wof_k = 1.0 - _digital_ramp_np(w_wof_term, k_put, float(state.ki_spread))
+        if star_ind is not None:
+            ki_wof_k = ki_wof_k * (1.0 - star_ind)
+        eff_gearing = gearing if abs(gearing) > 1e-12 else 1.0
+        unit_put_paths = alive * ((1.0 - w_avg_term) * ki_wof_k) / eff_gearing
+    elif has_put:
         put_intrinsic = np.maximum(k_put - w_opt, 0.0)
         lk = state.lower_strike
         has_lower_strike = lk is not None and (
@@ -2791,7 +2983,7 @@ def _eval_cheap_gbm_expectation_np(
             coupon_amounts=coupon_amounts,
             w_fund=w_fund,
             inv_lex_perm=inv_lex_perm,
-            ki_mode="Discrete" if ki_mode == "Continuous" else ki_mode,
+            ki_mode="Discrete" if ki_mode in ("Continuous", "Daily") else ki_mode,
         )
         pv_sum += float(np.sum(pv_r))
         total_cnt += n_rep_mf
@@ -2812,6 +3004,7 @@ def price_eq_autocall_dupire_qmc(
     use_gpu: Optional[bool] = None,
     precision: Literal["mixed_fp32_fp64", "fp64_audit"] = "mixed_fp32_fp64",
     cv_mode: Literal["bs1d_exact", "multifidelity_gbm", "none"] = "bs1d_exact",
+    config: Optional[CanonicalTier3Config] = None,
 ) -> DupireQMCResult:
     """Vectorized Owen-scrambled RQMC solver for Multi-Asset Equity Autocallables.
 
@@ -2825,6 +3018,22 @@ def price_eq_autocall_dupire_qmc(
     )
 
     _ = compute_greeks
+
+    n_cheap_mf_override: Optional[int] = None
+    if config is not None:
+        n_paths = int(getattr(config, "n_paths", n_paths))
+        n_replicates = int(getattr(config, "n_replicates", n_replicates))
+        n_substeps_per_period = int(
+            getattr(config, "n_substeps", getattr(config, "n_substeps_per_period", n_substeps_per_period))
+        )
+        cv_mode = cast(
+            Literal["bs1d_exact", "multifidelity_gbm", "none"],
+            getattr(config, "cv_mode", cv_mode),
+        )
+        seed = int(getattr(config, "seed", 42 if seed is None else seed))
+        raw_n_cheap = getattr(config, "n_cheap_mf", None)
+        if raw_n_cheap is not None:
+            n_cheap_mf_override = int(raw_n_cheap)
 
     if isinstance(state_or_request, AutocallPreprocState):
         state = state_or_request
@@ -2861,15 +3070,20 @@ def price_eq_autocall_dupire_qmc(
         gpu_eff_mode: Literal["dupire_lv", "terminal_iv"] = (
             "terminal_iv" if mode == "terminal_iv" else "dupire_lv"
         )
-        cfg = DupireQMCConfig(
-            n_paths=int(n_paths),
-            n_replicates=int(n_replicates),
-            n_substeps=int(n_substeps_per_period),
-            mode=gpu_eff_mode,
-            precision=precision,
-            cv_mode=cv_mode,
-            seed=42 if seed is None else int(seed),
-        )
+        cfg_kwargs: dict[str, Any] = {
+            "n_paths": int(n_paths),
+            "n_replicates": int(n_replicates),
+            "n_substeps": int(n_substeps_per_period),
+            "mode": gpu_eff_mode,
+            "precision": precision,
+            "cv_mode": cv_mode,
+            "seed": 42 if seed is None else int(seed),
+        }
+        if config is not None:
+            for opt_k in ("lv_grid_nt", "lv_grid_ny", "adaptive_substeps"):
+                if hasattr(config, opt_k):
+                    cfg_kwargs[opt_k] = getattr(config, opt_k)
+        cfg = DupireQMCConfig(**cfg_kwargs)
         if want_gpu and torch.cuda.is_available():
             return DupireQMCGpuSolver(device=device or "cuda").simulate_and_price(state, config=cfg)
         return GpuTorchDupireQMC(device="cpu", use_triton=False).simulate_and_price(state, config=cfg)
@@ -2938,10 +3152,19 @@ def price_eq_autocall_dupire_qmc(
     ref_spots = ref_np_chk
     spots_t0 = spots_np_chk
 
+    if d_assets > 1:
+        idx_desc = np.argsort(eigvals)[::-1]
+        v_eig = np.ascontiguousarray(eigvecs[:, idx_desc], dtype=np.float64)
+    else:
+        v_eig = np.ones((1, 1), dtype=np.float64)
+    u_time = _build_bb_orthogonal_np(tau_obs)
+
     base_seed = (42 if seed is None else int(seed)) & 0x7FFFFFFF
-    total_dim = m_rem * d_assets
     eff_mode = "dupire_lv" if mode == "auto" else mode
     n_sub = max(int(n_substeps_per_period), 1)
+    dim_coarse = m_rem * d_assets
+    dim_fine = (m_rem * n_sub * d_assets) if (eff_mode == "dupire_lv" and n_sub > 1) else 0
+    total_dim = dim_coarse + dim_fine
 
     perf_paths = np.empty((n_total_paths, m_rem, d_assets), dtype=np.float64)
     surfs_ordered = [state.vol_surfaces[ticker] for ticker in state.sorted_identifiers]
@@ -2973,26 +3196,55 @@ def price_eq_autocall_dupire_qmc(
     opt_code = resolve_monitoring_index_code(eff_opt_idx)
     is_diff_opt = opt_code in _DIFF_INDEX_CODES
 
-    ki_obs_raw = getattr(state, "ki_obs_type", None) or getattr(state.seasoned_state, "ki_obs_type", None)
-    ki_mode = str(getattr(ki_obs_raw, "value", ki_obs_raw) or "European").strip()
-    if ki_mode not in ("European", "Discrete", "Daily", "Continuous"):
-        ki_mode = "Discrete" if bool(getattr(state.seasoned_state, "ki_monitored_past", False)) else "European"
+    ki_obs_raw = getattr(state, "ki_obs_type", None)
+    if ki_obs_raw is None and hasattr(state, "seasoned_state"):
+        ki_obs_raw = getattr(state.seasoned_state, "ki_obs_type", None)
+    ki_mode_raw = str(getattr(ki_obs_raw, "value", ki_obs_raw) or "European").strip()
+    ki_mode_low = ki_mode_raw.lower()
+    if ki_mode_low in ("european", "terminal", "atmaturity", "maturity"):
+        ki_mode = "European"
+    elif ki_mode_low in ("discrete", "periodic", "observation"):
+        ki_mode = "Discrete"
+    elif ki_mode_low == "daily":
+        ki_mode = "Daily"
+    elif ki_mode_low in ("continuous", "american"):
+        ki_mode = "Continuous"
+    else:
+        ki_mode = "European"
+
+    ki_opt_idx = (
+        "WorstOf"
+        if is_long_flag
+        else (raw_opt_idx if raw_opt_idx else state.callability_index)
+    )
+    ki_opt_code = resolve_monitoring_index_code(ki_opt_idx)
+
     has_ki = (
         state.ki_barrier is not None
         and (float(state.ki_barrier) > 1e-6 or (is_diff_opt and float(state.ki_barrier) < -1e-6))
         and float(state.seasoned_state.i_ki_past) < 0.5
     )
-    cont_ki_active = bool(has_ki and ki_mode == "Continuous" and state.ki_barrier is not None)
+    cont_ki_active = bool(has_ki and ki_mode in ("Continuous", "Daily") and state.ki_barrier is not None)
     p_noki_cont = np.ones((eff_r, n_rep), dtype=np.float64) if cont_ki_active else None
     ki_bar_val = float(state.ki_barrier) if state.ki_barrier is not None else 0.0
 
-    # Generate Owen-scrambled Sobol nets for all replicates and diffuse vectorized across (eff_r, n_rep)
+    # Generate Owen-scrambled Sobol nets for all replicates and apply dyadic BB + PCA rotation
     z_sobol_all = np.empty((eff_r, n_rep, total_dim), dtype=np.float64)
     for rep_idx in range(eff_r):
         rep_seed = (base_seed + rep_idx * 1009) & 0x7FFFFFFF
         z_sobol_all[rep_idx] = _generate_sobol_normals(
             n_rep, total_dim, scramble=scramble, seed=rep_seed
         )
+    z_coarse_raw = z_sobol_all[:, :, :dim_coarse].reshape(eff_r, n_rep, m_rem, d_assets)
+    z_coarse_indep = np.ascontiguousarray(
+        np.einsum("mt,rntd,jd->rmnj", u_time, z_coarse_raw, v_eig),
+        dtype=np.float64,
+    )
+    z_fine_raw = (
+        z_sobol_all[:, :, dim_coarse:].reshape(eff_r, n_rep, m_rem, n_sub, d_assets)
+        if dim_fine > 0
+        else None
+    )
 
     # Precompute cumulative and incremental terminal/GBM variances honoring surface DCC.
     var_cum_gbm = np.empty((d_assets, m_rem), dtype=np.float64)
@@ -3026,7 +3278,7 @@ def price_eq_autocall_dupire_qmc(
         for m in range(m_rem):
             t_curr_ti = float(tau_obs[m])
             dt_ti = max(t_curr_ti - t_prev_ti, 1e-8)
-            z_m = z_sobol_all[:, :, m * d_assets : (m + 1) * d_assets] @ chol_l.T
+            z_m = z_coarse_indep[:, m, :, :] @ chol_l.T
             z_flat_cum += sqrt_dvar_dom_np[m] * z_m[:, :, dom_idx]
             d_var = d_var_gbm[:, m]
             std_step = np.sqrt(d_var)
@@ -3041,18 +3293,18 @@ def price_eq_autocall_dupire_qmc(
                     corr_sym,
                     lv_ti,
                     dt_ti,
-                    opt_code,
+                    ki_opt_code,
                     ki_bar_val,
                     inv_lex_perm,
+                    lv_step_end=lv_ti,
+                    lv_barrier=lv_ti,
+                    bgk_daily=(ki_mode == "Daily"),
                 )
             perf_paths[:, m, :] = perf_step_curr.reshape(n_total_paths, d_assets)
             perf_step_prev = perf_step_curr
             log_x_prev = log_x_curr
             t_prev_ti = t_curr_ti
     else:
-        rng_bridges = [
-            np.random.default_rng((base_seed + rep_idx * 1009 + 777) & 0x7FFFFFFF) for rep_idx in range(eff_r)
-        ]
         log_x = np.zeros((eff_r, n_rep, d_assets), dtype=np.float64)
         perf_sub_prev = (
             np.broadcast_to((spots_t0 / ref_spots)[None, None, :], (eff_r, n_rep, d_assets)).copy()
@@ -3082,14 +3334,26 @@ def price_eq_autocall_dupire_qmc(
                 np.zeros(d_assets, dtype=np.float64) if m == 0 else r_native_obs_np[:, m - 1]
             )
             r_nat_curr = r_native_obs_np[:, m]
-            # Buhler pure-jump forward: between ex-dates the forward grows at continuous native drift.
+            f_curr = fwd_prices[:, m]
+            f_prev = spots_t0 if m == 0 else fwd_prices[:, m - 1]
+            if has_quanto_diff:
+                f_curr_nat = f_curr * np.exp(r_nat_curr - r_tot_curr)
+                f_prev_nat = spots_t0 if m == 0 else f_prev * np.exp(r_nat_prev - r_tot_prev)
+            else:
+                f_curr_nat = f_curr
+                f_prev_nat = f_prev
+            # Buehler effective native-currency drift: cancels div_yield * |dw_dy| double-subtraction.
             r_zero_m = (
                 -np.log(np.maximum(df_fin_curr / np.maximum(df_fin_prev, 1e-15), 1e-15))
                 / dt_period
             )
-            q_repo_m = r_zero_m - (r_nat_curr - r_nat_prev) / dt_period
+            q_repo_eff = (
+                r_zero_m
+                - np.log(np.maximum(f_curr_nat / np.maximum(f_prev_nat, 1e-12), 1e-12)) / dt_period
+            )
 
-            z_coarse = z_sobol_all[:, :, m * d_assets : (m + 1) * d_assets] @ chol_l.T
+            z_coarse_i = z_coarse_indep[:, m, :, :]
+            z_coarse = z_coarse_i @ chol_l.T
             z_flat_cum += sqrt_dvar_dom_np[m] * z_coarse[:, :, dom_idx]
             if log_x_gbm is not None and perf_gbm_fine is not None:
                 dv_m = d_var_gbm[:, m]
@@ -3102,24 +3366,31 @@ def price_eq_autocall_dupire_qmc(
                     (fwd_prices[:, m][None, None, :] * np.exp(log_x_gbm)) / ref_spots[None, None, :]
                 ).reshape(n_total_paths, d_assets)
 
-            if n_sub == 1:
+            if n_sub == 1 or z_fine_raw is None:
                 z_steps = z_coarse[None, :, :, :]
             else:
-                z_steps = np.empty((n_sub, eff_r, n_rep, d_assets), dtype=np.float64)
                 inv_sqrt_sub = 1.0 / math.sqrt(float(n_sub))
-                for rep_idx in range(eff_r):
-                    raw_sub = rng_bridges[rep_idx].standard_normal((n_sub, n_rep, d_assets)) @ chol_l.T
-                    mean_sub = np.mean(raw_sub, axis=0, keepdims=True)
-                    z_steps[:, rep_idx, :, :] = (
-                        raw_sub - mean_sub + z_coarse[rep_idx][None, :, :] * inv_sqrt_sub
-                    )
+                zf_m = np.ascontiguousarray(
+                    z_fine_raw[:, :, m, :, :].transpose(2, 0, 1, 3), dtype=np.float64
+                )
+                mean_sub = np.mean(zf_m, axis=0, keepdims=True)
+                z_steps_indep = zf_m - mean_sub + z_coarse_i[None, :, :, :] * inv_sqrt_sub
+                z_steps = z_steps_indep @ chol_l.T
 
-            f_curr = fwd_prices[:, m]
-            f_prev = spots_t0 if m == 0 else fwd_prices[:, m - 1]
             log_f_ratio = np.log(np.maximum(f_curr / np.maximum(f_prev, 1e-12), 1e-12))
 
             lv_step_ki = (
                 np.empty((eff_r, n_rep, d_assets), dtype=np.float64)
+                if p_noki_cont is not None
+                else None
+            )
+            lv_end_ki = (
+                np.empty((eff_r, n_rep, d_assets), dtype=np.float64)
+                if p_noki_cont is not None
+                else None
+            )
+            lv_bar_ki = (
+                np.empty((1, 1, d_assets), dtype=np.float64)
                 if p_noki_cont is not None
                 else None
             )
@@ -3164,10 +3435,10 @@ def price_eq_autocall_dupire_qmc(
                     lv0 = np.asarray(
                         surfs_ordered[i].local_vol(
                             t_surf_s0,
-                            (f_s0[i] * np.exp(lx_i)).reshape(-1),
+                            (f_s0_native[i] * np.exp(lx_i)).reshape(-1),
                             forward_at_t=float(f_s0_native[i]),
                             r_zero=float(r_zero_m[i]),
-                            q_repo=float(q_repo_m[i]),
+                            q_repo=float(q_repo_eff[i]),
                             cash_div_leverage=1.0,
                         ),
                         dtype=np.float64,
@@ -3182,10 +3453,10 @@ def price_eq_autocall_dupire_qmc(
                     lv_p = np.asarray(
                         surfs_ordered[i].local_vol(
                             t_surf_s1,
-                            (f_s1[i] * np.exp(y_h + sig_step)).reshape(-1),
+                            (f_s1_native[i] * np.exp(y_h + sig_step)).reshape(-1),
                             forward_at_t=float(f_s1_native[i]),
                             r_zero=float(r_zero_m[i]),
-                            q_repo=float(q_repo_m[i]),
+                            q_repo=float(q_repo_eff[i]),
                             cash_div_leverage=1.0,
                         ),
                         dtype=np.float64,
@@ -3193,10 +3464,10 @@ def price_eq_autocall_dupire_qmc(
                     lv_m = np.asarray(
                         surfs_ordered[i].local_vol(
                             t_surf_s1,
-                            (f_s1[i] * np.exp(y_h - sig_step)).reshape(-1),
+                            (f_s1_native[i] * np.exp(y_h - sig_step)).reshape(-1),
                             forward_at_t=float(f_s1_native[i]),
                             r_zero=float(r_zero_m[i]),
-                            q_repo=float(q_repo_m[i]),
+                            q_repo=float(q_repo_eff[i]),
                             cash_div_leverage=1.0,
                         ),
                         dtype=np.float64,
@@ -3210,8 +3481,43 @@ def price_eq_autocall_dupire_qmc(
                         + 0.25 * (lv_p + lv_m + 2.0 * lv0) * sqrt_dt_sub * z_i
                         + 0.25 * (lv_p - lv_m) * (z_i * z_i - 1.0) * sqrt_dt_sub
                     )
+                    if lv_end_ki is not None and lv_bar_ki is not None:
+                        lv_end_ki[:, :, i] = (
+                            np.asarray(
+                                surfs_ordered[i].local_vol(
+                                    t_surf_s1,
+                                    (f_s1_native[i] * np.exp(log_x[:, :, i])).reshape(-1),
+                                    forward_at_t=float(f_s1_native[i]),
+                                    r_zero=float(r_zero_m[i]),
+                                    q_repo=float(q_repo_eff[i]),
+                                    cash_div_leverage=1.0,
+                                ),
+                                dtype=np.float64,
+                            ).reshape(eff_r, n_rep)
+                            * scale_i
+                        )
+                        k_bar_i = max(ki_bar_val * ref_spots[i], 1e-4)
+                        lv_bar_ki[0, 0, i] = (
+                            float(
+                                surfs_ordered[i].local_vol(
+                                    0.5 * (t_surf_s0 + t_surf_s1),
+                                    k_bar_i,
+                                    forward_at_t=0.5 * float(f_s0_native[i] + f_s1_native[i]),
+                                    r_zero=float(r_zero_m[i]),
+                                    q_repo=float(q_repo_eff[i]),
+                                    cash_div_leverage=1.0,
+                                )
+                            )
+                            * scale_i
+                        )
 
-                if p_noki_cont is not None and perf_sub_prev is not None and lv_step_ki is not None:
+                if (
+                    p_noki_cont is not None
+                    and perf_sub_prev is not None
+                    and lv_step_ki is not None
+                    and lv_end_ki is not None
+                    and lv_bar_ki is not None
+                ):
                     perf_sub_curr = (f_s1[None, None, :] * np.exp(log_x)) / ref_spots[None, None, :]
                     p_noki_cont *= _eval_continuous_ki_step_survival_np(
                         perf_sub_prev,
@@ -3219,9 +3525,12 @@ def price_eq_autocall_dupire_qmc(
                         corr_sym,
                         lv_step_ki,
                         dt_sub,
-                        opt_code,
+                        ki_opt_code,
                         ki_bar_val,
                         inv_lex_perm,
+                        lv_step_end=lv_end_ki,
+                        lv_barrier=lv_bar_ki,
+                        bgk_daily=(ki_mode == "Daily"),
                     )
                     perf_sub_prev = perf_sub_curr
 
@@ -3230,7 +3539,10 @@ def price_eq_autocall_dupire_qmc(
             log_x = log_x - np.log(np.maximum(mean_x, 1e-12))
 
             s_m = f_curr[None, None, :] * np.exp(log_x)
-            perf_paths[:, m, :] = (s_m / ref_spots[None, None, :]).reshape(n_total_paths, d_assets)
+            perf_m_curr = s_m / ref_spots[None, None, :]
+            perf_paths[:, m, :] = perf_m_curr.reshape(n_total_paths, d_assets)
+            if perf_sub_prev is not None:
+                perf_sub_prev = perf_m_curr
             t_prev = t_curr
 
     w_fund = _compute_funding_weights_np(state)
@@ -3298,7 +3610,7 @@ def price_eq_autocall_dupire_qmc(
             coupon_amounts=coupon_amounts,
             w_fund=w_fund,
             inv_lex_perm=inv_lex_perm,
-            ki_mode="Discrete" if ki_mode == "Continuous" else ki_mode,
+            ki_mode="Discrete" if ki_mode in ("Continuous", "Daily") else ki_mode,
         )
         mu_mf = _eval_cheap_gbm_expectation_np(
             state,
@@ -3314,7 +3626,7 @@ def price_eq_autocall_dupire_qmc(
             w_fund=w_fund,
             inv_lex_perm=inv_lex_perm,
             ki_mode=ki_mode,
-            n_cheap=4 * n_total_paths,
+            n_cheap=(n_cheap_mf_override if n_cheap_mf_override is not None else 4 * n_total_paths),
             seed=base_seed + 88888,
         )
         cv_pv_est, total_se = _apply_loo_control_variate_np(
@@ -3418,6 +3730,7 @@ __all__ = [
     "DupireQMCOutput",
     "enforce_no_arbitrage_projection",
     "enforce_no_arbitrage_projection_with_jacobian",
+    "repair_arbitrage_quotes",
     "price_eq_autocall_dupire_qmc",
     "price_autocall_dupire_qmc",
     "price_eq_autocall_qmc_fallback",
