@@ -958,6 +958,83 @@ def test_schema_audit_blind_spots() -> None:
     assert isinstance(cega_map, dict) and float(cega_map["A"]["B"]) == pytest.approx(0.03)
 
 
+def test_canonical_tier3_config_and_to_decimal_merged_rho() -> None:
+    """Verifies `CanonicalTier3Config` resolver invariants and `to_decimal_merged_rho` scaling/merging."""
+    from types import SimpleNamespace
+    from deepvol.api.schemas_eq_autocall import to_decimal_merged_rho
+    from deepvol.models.autocall.feature_layout import (
+        CanonicalTier3Config,
+        resolve_canonical_tier3_config,
+    )
+
+    cfg_cuda = resolve_canonical_tier3_config(6, 48, device_type="cuda")
+    assert isinstance(cfg_cuda, CanonicalTier3Config)
+    assert cfg_cuda == CanonicalTier3Config(
+        n_paths=8192,
+        n_replicates=8,
+        n_substeps=4,
+        lv_grid_nt=32,
+        lv_grid_ny=64,
+        cv_mode="multifidelity_gbm",
+        n_cheap_mf=262144,
+        seed=42,
+        adaptive_substeps=False,
+    )
+
+    cfg_cpu = resolve_canonical_tier3_config(5, 12, device_type="cpu")
+    assert cfg_cpu == CanonicalTier3Config(
+        n_paths=4096,
+        n_replicates=4,
+        n_substeps=4,
+        lv_grid_nt=32,
+        lv_grid_ny=64,
+        cv_mode="multifidelity_gbm",
+        n_cheap_mf=32768,
+        seed=42,
+        adaptive_substeps=False,
+    )
+
+    cfg_override = resolve_canonical_tier3_config(3, 24, device_type="cpu", n_fallback_paths=16384, seed=7)
+    assert cfg_override.n_paths == 16384
+    assert cfg_override.n_replicates == 8
+    assert cfg_override.n_cheap_mf == 131072
+    assert cfg_override.seed == 7
+    assert cfg_override.adaptive_substeps is False
+
+    # Quote -> decimal conversion with mixed Percentage / Decimal bundles + RepoRho merging
+    fake_req = SimpleNamespace(
+        Model=SimpleNamespace(
+            MarketDataSet=SimpleNamespace(
+                RatesCurvesBundles={
+                    "RUB_RUONIA_OIS": SimpleNamespace(RateQuoteExpression="Percentage"),
+                    "USD_SOFR": SimpleNamespace(RateQuoteExpression="Decimal"),
+                },
+                RepoSpreadCurves={
+                    "SBER_RUB": SimpleNamespace(RateQuoteExpression="Percentage"),
+                },
+            )
+        )
+    )
+    resp_quote = {
+        "Rho": {"RUB_RUONIA_OIS": [-0.02, -0.01], "USD_SOFR": [-0.5]},
+        "RepoRho": {"SBER_RUB": [0.004, 0.006]},
+        "rho_unit_convention": "quote",
+    }
+    merged_q = to_decimal_merged_rho(resp_quote, request=fake_req)
+    assert merged_q["RUB_RUONIA_OIS"] == pytest.approx([-2.0, -1.0])
+    assert merged_q["USD_SOFR"] == pytest.approx([-0.5])
+    assert merged_q["SBER_RUB"] == pytest.approx([0.4, 0.6])
+
+    resp_dec = {
+        "Rho": {"RUB_RUONIA_OIS": [-2.0, -1.0]},
+        "RepoRho": {"SBER_RUB": [0.4, 0.6]},
+        "rho_unit_convention": "decimal",
+    }
+    merged_d = to_decimal_merged_rho(resp_dec, request=fake_req)
+    assert merged_d["RUB_RUONIA_OIS"] == pytest.approx([-2.0, -1.0])
+    assert merged_d["SBER_RUB"] == pytest.approx([0.4, 0.6])
+
+
 
 
 

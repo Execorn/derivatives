@@ -1437,6 +1437,204 @@ def test_api_audit_blind_spots(client: TestClient) -> None:
     assert callable(getattr(runtime, "price_trade"))
 
 
+def test_runtime_canonical_invariance_cpp23_startup_quanto_and_irao_arb(
+    monkeypatch: pytest.MonkeyPatch,
+    parsed_production_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    """Verifies cpp23 startup check, CanonicalTier3Config pv_only==all_greeks invariance, quanto 0.0 keys, and IRAO_RUB pre-gate/repair."""
+    import time
+    from types import SimpleNamespace
+    import deepvol.api.eq_autocall_runtime as rt_mod
+
+    req_model, _ = parsed_production_dag
+
+    # 1. Runtime defaults & cpp23 startup assertion
+    rt_default = EQAutocallRuntime(device="cpu")
+    assert rt_default.n_fallback_paths is None
+    assert rt_default.theta_convention == "murex_bizday_forward_fixed"
+    assert rt_default.repair_arbitrage is False
+
+    monkeypatch.setattr(rt_mod, "get_tier1_backend", lambda: SimpleNamespace(name="numpy"))
+    monkeypatch.delenv("DEEPVOL_TIER1_CPP_LIB", raising=False)
+    with pytest.raises(RuntimeError, match="cpp23"):
+        EQAutocallRuntime(device="cpu")
+    monkeypatch.setenv("DEEPVOL_TIER1_CPP_LIB", "numpy")
+    rt_np_allowed = EQAutocallRuntime(device="cpu")
+    assert rt_np_allowed.theta_convention == "murex_bizday_forward_fixed"
+    monkeypatch.undo()
+
+    # 2. CanonicalTier3Config invariance across pv_only vs all_greeks & quanto FX 0.0 Delta/Gamma keys
+    captured_calls: list[dict[str, Any]] = []
+    orig_crn = getattr(rt_mod._greeks_mod, "compute_qmc_crn_greeks")
+
+    def _spy_crn(state: Any, **kwargs: Any) -> Any:
+        captured_calls.append(
+            {
+                "queries": list(kwargs.get("queries") or ()),
+                "config": kwargs.get("config"),
+                "device": kwargs.get("device"),
+                "theta_convention": kwargs.get("theta_convention"),
+            }
+        )
+        return orig_crn(state, **kwargs)
+
+    monkeypatch.setattr(rt_mod._greeks_mod, "compute_qmc_crn_greeks", _spy_crn)
+
+    # Use a compact 2-asset 2-period QMC-routed request with CNHRUB FX surface
+    import datetime as _dt_mod
+
+    req_q = copy.deepcopy(req_model)
+    uids = req_q.Product.UnderlyingIdentifiers[:2]
+    as_of_dt = req_q.Model.MarketDataSet.AsOfDate
+    req_q.Product.StartDate = as_of_dt
+    req_q.Product.UnderlyingIdentifiers = uids
+    req_q.Product.UnderlyingReferenceSpots = req_q.Product.UnderlyingReferenceSpots[:2]
+    req_q.Product.ObservationDates = [
+        as_of_dt + _dt_mod.timedelta(days=30),
+        as_of_dt + _dt_mod.timedelta(days=60),
+    ]
+    req_q.Product.PaymentDates = [
+        as_of_dt + _dt_mod.timedelta(days=33),
+        as_of_dt + _dt_mod.timedelta(days=63),
+    ]
+    req_q.Product.AutoCallTriggerLevels = req_q.Product.AutoCallTriggerLevels[-2:]
+    if req_q.Product.CouponBarrierLevels is not None:
+        req_q.Product.CouponBarrierLevels = req_q.Product.CouponBarrierLevels[-2:]
+    if isinstance(req_q.Product.FixedRate, list):
+        req_q.Product.FixedRate = req_q.Product.FixedRate[-2:]
+    if isinstance(req_q.Product.FixedCouponAmount, list):
+        req_q.Product.FixedCouponAmount = req_q.Product.FixedCouponAmount[-2:]
+    if req_q.Product.FundingLegPaymentDates is not None:
+        req_q.Product.FundingLegPaymentDates = [
+            as_of_dt + _dt_mod.timedelta(days=33),
+            as_of_dt + _dt_mod.timedelta(days=63),
+        ]
+    req_q.Product.PaymentCurrency = "CNH"
+    req_q.Model.MarketDataSet.Spots = {k: req_q.Model.MarketDataSet.Spots[k] for k in uids}
+    req_q.Model.MarketDataSet.VolatilitySurfaces = {
+        k: req_q.Model.MarketDataSet.VolatilitySurfaces[k] for k in uids
+    }
+    first_bundle_k = next(iter(req_q.Model.MarketDataSet.RatesCurvesBundles))
+    cnh_curve = req_q.Model.MarketDataSet.RatesCurvesBundles[first_bundle_k].model_copy(
+        update={"Identifier": "CNH_FX", "Currency": "CNH"},
+        deep=True,
+    )
+    req_q.Model.MarketDataSet.RatesCurvesBundles["CNH_FX"] = cnh_curve
+    from deepvol.api.schemas_eq_autocall import FXVolatilitySmileCollectionSpec
+
+    req_q.Model.MarketDataSet.VolatilitySurfaces["CNHRUB"] = FXVolatilitySmileCollectionSpec(
+        Identifier="CNHRUB",
+        AsOfDate=as_of_dt,
+        Deltas=["-25D", "ATM", "25D"],
+        Tenors=["3M", "1Y"],
+        VolatilityQuotes=[[0.18, 0.16, 0.19], [0.20, 0.18, 0.21]],
+    )
+    req_q.Model.MarketDataSet.Dividends = {
+        k: req_q.Model.MarketDataSet.Dividends[k]
+        for k in uids
+        if k in req_q.Model.MarketDataSet.Dividends
+    }
+    req_q.Model.MarketDataSet.Fixings = {}
+    req_q.Model.MarketDataSet.Correlations = {
+        f"{uids[0]}&{uids[1]}": 0.45,
+        f"{uids[0]}&CNHRUB": 0.20,
+        f"{uids[1]}&CNHRUB": 0.20,
+    }
+    req_pv = req_q.model_copy(update={"Queries": ["ProductValue", "CashFlows"]})
+
+    rt_cpu = EQAutocallRuntime(device="cpu")
+    res_pv = rt_cpu.price_trade(req_pv, engine="qmc", include_all_greeks=False)
+    res_grk = rt_cpu.price_trade(req_q, engine="qmc", include_all_greeks=True)
+    assert len(captured_calls) == 2
+    assert captured_calls[0]["theta_convention"] == "murex_bizday_forward_fixed"
+    assert captured_calls[1]["theta_convention"] == "murex_bizday_forward_fixed"
+    assert str(captured_calls[0]["device"]) == "cpu"
+    assert str(captured_calls[1]["device"]) == "cpu"
+    cfg0, cfg1 = captured_calls[0]["config"], captured_calls[1]["config"]
+    assert (cfg0.n_paths, cfg0.n_replicates, cfg0.n_substeps, cfg0.lv_grid_nt, cfg0.lv_grid_ny) == (
+        4096,
+        4,
+        4,
+        32,
+        64,
+    )
+    assert (cfg1.n_paths, cfg1.n_replicates, cfg1.n_substeps, cfg1.lv_grid_nt, cfg1.lv_grid_ny) == (
+        4096,
+        4,
+        4,
+        32,
+        64,
+    )
+    assert abs(float(res_pv.ProductValue) - float(res_grk.ProductValue)) * 1e4 == pytest.approx(0.0, abs=1e-9)
+    assert res_pv.Delta is None and res_grk.Delta is not None
+    assert res_grk.Delta.get("CNHRUB") == 0.0
+    assert isinstance(res_grk.Gamma, dict) and isinstance(res_grk.Gamma.get("CNHRUB"), dict)
+    assert res_grk.Gamma["CNHRUB"]["CNHRUB"] == 0.0
+
+    # 3. IRAO_RUB multi-slice pre-gate (slices=[0..6]) + convexity right-leg stencil + repair_arbitrage=True
+    rt_mod._SURFACE_ARB_CACHE.clear()
+    rt_mod._SURFACE_ARB_FAST_CACHE.clear()
+    strikes_arb = [4.6725, 4.8725, 5.0725, 5.2725, 5.4725]
+    q_bad_irao = [[0.28, 0.275, 0.2728, 0.32577, 0.32339] for _ in range(7)]
+    exp_7 = [_dt_mod.datetime.fromisoformat(as_of_dt.isoformat()) + _dt_mod.timedelta(days=60 * (m + 1)) for m in range(7)]
+    req_irao = copy.deepcopy(req_q)
+    req_irao.Product.UnderlyingIdentifiers = ["IRAO_RUB", uids[1]]
+    req_irao.Product.UnderlyingReferenceSpots = [3.984, req_q.Product.UnderlyingReferenceSpots[1]]
+    req_irao.Model.MarketDataSet.Spots = {"IRAO_RUB": 2.684, uids[1]: req_q.Model.MarketDataSet.Spots[uids[1]]}
+    req_irao.Model.MarketDataSet.VolatilitySurfaces = {
+        "IRAO_RUB": EquityVolSmileCollectionSpec(
+            Identifier="IRAO_RUB",
+            ExpirationDates=exp_7,
+            Strikes=strikes_arb,
+            VolatilityQuotes=q_bad_irao,
+        ),
+        uids[1]: req_q.Model.MarketDataSet.VolatilitySurfaces[uids[1]],
+    }
+    req_irao.Model.MarketDataSet.Dividends = {}
+    req_irao.Model.MarketDataSet.Correlations = {f"IRAO_RUB&{uids[1]}": 0.4}
+
+    t_cold = time.perf_counter_ns()
+    with pytest.raises(ValueError, match="SMILE_ARBITRAGE") as exc_irao:
+        rt_cpu.price_trade(req_irao, engine="proxy", include_all_greeks=False)
+    cold_ms = (time.perf_counter_ns() - t_cold) / 1e6
+    msg_irao = str(exc_irao.value)
+    assert "surface=IRAO_RUB" in msg_irao
+    assert "slices=[0, 1, 2, 3, 4, 5, 6]" in msg_irao
+    assert "K=5.2725" in msg_irao and "prev_K=5.0725" in msg_irao
+    assert "vol_jump=" in msg_irao and "slope=" in msg_irao and "min_d2c=" in msg_irao
+    assert cold_ms < 25.0  # Well under 2 ms in steady process; generous bound for first import/ndtr
+
+    # Right-leg convexity jump (j_d2+1 -> j_d2+2) where slopes remain negative so convexity branch triggers
+    strikes_conv = [90.0, 95.0, 100.0, 105.0, 110.0]
+    q_conv_right = [[0.25, 0.25, 0.25, 0.25, 0.05] for _ in range(2)]
+    req_conv = copy.deepcopy(req_irao)
+    req_conv.Model.MarketDataSet.Spots["IRAO_RUB"] = 100.0
+    req_conv.Model.MarketDataSet.VolatilitySurfaces["IRAO_RUB"] = EquityVolSmileCollectionSpec(
+        Identifier="IRAO_RUB",
+        ExpirationDates=exp_7[:2],
+        Strikes=strikes_conv,
+        VolatilityQuotes=q_conv_right,
+    )
+    with pytest.raises(ValueError, match="Discrete call convexity violation") as exc_conv:
+        rt_mod._validate_surfaces_for_arbitrage(req_conv)
+    assert "K=110.0000" in str(exc_conv.value) and "prev_K=105.0000" in str(exc_conv.value)
+
+    # repair_arbitrage=True clones request and repairs quotes before validation without mutating caller input
+    import deepvol.models.autocall.dupire_qmc_solver as qmc_solver_mod
+
+    def _mock_repair(strikes: Any, quotes: Any, t_exp: Any, k_ref: float, **kw: Any) -> tuple[Any, dict[str, Any]]:
+        _ = (t_exp, k_ref, kw)
+        return np.full_like(quotes, 0.28, dtype=np.float64), {"repaired": True}
+
+    monkeypatch.setattr(qmc_solver_mod, "repair_arbitrage_quotes", _mock_repair, raising=False)
+    res_rep = rt_cpu.price_trade(req_irao, engine="proxy", include_all_greeks=False, repair_arbitrage=True)
+    assert np.isfinite(res_rep.ProductValue)
+    # Caller's original quotes remain untouched (still strictly rejected when repair_arbitrage=False)
+    assert req_irao.Model.MarketDataSet.VolatilitySurfaces["IRAO_RUB"].VolatilityQuotes[0][3] == pytest.approx(0.32577)
+    with pytest.raises(ValueError, match="SMILE_ARBITRAGE"):
+        rt_cpu.price_trade(req_irao, engine="proxy", include_all_greeks=False, repair_arbitrage=False)
+
+
 
 
 

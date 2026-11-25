@@ -325,6 +325,44 @@ def test_greeks_engine_16_thread_market_diversity_and_cache_eviction(
     assert pv_0_after == pytest.approx(pv_0_before, abs=1e-12)
 
 
+def test_arbitrage_cache_isolation_strict_vs_repaired(
+    base_request: EQAutocallableTradeRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies `_SURFACE_ARB_FAST_CACHE` isolates strict rejections from `repair_arbitrage=True` clones under concurrency."""
+    from deepvol.api.eq_autocall_runtime import EQAutocallRuntime
+    import deepvol.models.autocall.dupire_qmc_solver as qmc_solver_mod
+
+    req_bad = copy.deepcopy(base_request)
+    tkr0 = req_bad.Product.UnderlyingIdentifiers[0]
+    surf0 = req_bad.Model.MarketDataSet.VolatilitySurfaces[tkr0]
+    q_bad = copy.deepcopy(surf0.VolatilityQuotes)
+    mid_j = len(surf0.Strikes) // 2
+    for row in q_bad:
+        row[mid_j] = min(float(row[mid_j]) + 0.35, 4.50)
+    surf0.VolatilityQuotes = q_bad
+
+    def _mock_repair(strikes: Any, quotes: Any, t_exp: Any, k_ref: float, **kw: Any) -> tuple[Any, dict[str, Any]]:
+        _ = (strikes, t_exp, k_ref, kw)
+        return np.full_like(quotes, 0.25, dtype=np.float64), {"repaired": True}
+
+    monkeypatch.setattr(qmc_solver_mod, "repair_arbitrage_quotes", _mock_repair, raising=False)
+    rt = EQAutocallRuntime(device="cpu")
+
+    def _check_worker(idx: int) -> float:
+        if idx % 2 == 0:
+            with pytest.raises(ValueError, match="SMILE_ARBITRAGE"):
+                rt.price_trade(req_bad, engine="proxy", include_all_greeks=False, repair_arbitrage=False)
+            return -1.0
+        res = rt.price_trade(req_bad, engine="proxy", include_all_greeks=False, repair_arbitrage=True)
+        return float(res.ProductValue)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        vals = list(pool.map(_check_worker, range(16)))
+    assert all(vals[i] == -1.0 for i in range(0, 16, 2))
+    assert all(np.isfinite(vals[i]) and vals[i] > 0.0 for i in range(1, 16, 2))
+
+
 @pytest.mark.gpu
 def test_cuda_packed_surrogate_overlapping_forwards_and_tf32_restoration(
     base_request: EQAutocallableTradeRequest,

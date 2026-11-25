@@ -1364,12 +1364,35 @@ def to_decimal_merged_rho(
     *,
     repo_quote_scales: Optional[Mapping[str, float]] = None,
     merge_repo: bool = True,
+    request: Any = None,
 ) -> Dict[str, List[float]]:
     """Converts quote-unit Rho and optional RepoRho sensitivities to decimal dPV/dr_dec."""
     out: Dict[str, List[float]] = {}
     is_map = isinstance(response, Mapping)
     conv = response.get("rho_unit_convention", "quote") if is_map else getattr(response, "rho_unit_convention", "quote")
     rho_map = response.get("Rho") if is_map else getattr(response, "Rho", None)
+    if request is not None:
+        mds_obj = getattr(getattr(request, "Model", None), "MarketDataSet", None)
+        if quote_scales is None and mds_obj is not None:
+            bundles = getattr(mds_obj, "RatesCurvesBundles", None) or {}
+            quote_scales = {
+                str(cid): (
+                    0.01
+                    if "Percentage" in str(getattr(c_spec, "RateQuoteExpression", "Percentage"))
+                    else 1.0
+                )
+                for cid, c_spec in bundles.items()
+            }
+        if repo_quote_scales is None and mds_obj is not None:
+            repos = getattr(mds_obj, "RepoSpreadCurves", None) or {}
+            repo_quote_scales = {
+                str(tk): (
+                    0.01
+                    if "Percentage" in str(getattr(r_spec, "RateQuoteExpression", "Percentage"))
+                    else 1.0
+                )
+                for tk, r_spec in repos.items()
+            }
     scales = quote_scales or {}
     if rho_map:
         for cid, vec in rho_map.items():
@@ -1390,7 +1413,7 @@ def to_decimal_merged_rho(
     if merge_repo and repo_map:
         r_scales = repo_quote_scales or {}
         for asset_id, vec in repo_map.items():
-            if asset_id not in out:
+            if asset_id not in out or not out[asset_id]:
                 raw_r_scale = r_scales.get(asset_id)
                 r_scale_val = 0.01 if raw_r_scale is None else float(raw_r_scale)
                 if not math.isfinite(r_scale_val):

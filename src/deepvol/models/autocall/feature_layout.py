@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 
 FEATURE_SCHEMA_VERSION: str = "2.0"
 D_MAX_DEFAULT: int = 8
@@ -157,6 +158,54 @@ class AutocallGlobalCol(IntEnum):
     ABS_KI_SPREAD = 15
 
 
+@dataclass(frozen=True)
+class CanonicalTier3Config:
+    """Query-invariant Tier-3/4 base configuration guaranteeing 0.00 bps pv_only==all_greeks drift."""
+
+    n_paths: int
+    n_replicates: int
+    n_substeps: int
+    lv_grid_nt: int
+    lv_grid_ny: int
+    cv_mode: Literal["multifidelity_gbm", "bs1d_exact", "none"]
+    n_cheap_mf: int
+    seed: int
+    adaptive_substeps: bool = False
+
+
+def resolve_canonical_tier3_config(
+    d_assets: int,
+    m_rem: int,
+    *,
+    device_type: Literal["cuda", "cpu"] | str,
+    n_fallback_paths: Optional[int] = None,
+    seed: int = 42,
+) -> CanonicalTier3Config:
+    """Deterministic resolver depending strictly on (d_assets, m_rem, device_type, n_fallback_paths), NEVER on Queries."""
+    _ = (int(d_assets), int(m_rem))
+    dev_tok = "cuda" if str(device_type).strip().lower().startswith("cuda") else "cpu"
+    eff_paths = (
+        max(2, int(n_fallback_paths))
+        if n_fallback_paths is not None
+        else (8192 if dev_tok == "cuda" else 4096)
+    )
+    eff_r = min(max(1, eff_paths // 2), 8 if (dev_tok == "cuda" or eff_paths >= 8192) else 4)
+    n_sub = 4
+    nt, ny = 32, 64
+    n_cheap = max(262144, 8 * eff_paths) if dev_tok == "cuda" else max(32768, 8 * eff_paths)
+    return CanonicalTier3Config(
+        n_paths=eff_paths,
+        n_replicates=eff_r,
+        n_substeps=n_sub,
+        lv_grid_nt=nt,
+        lv_grid_ny=ny,
+        cv_mode="multifidelity_gbm",
+        n_cheap_mf=n_cheap,
+        seed=int(seed),
+        adaptive_substeps=False,
+    )
+
+
 __all__ = [
     "FEATURE_SCHEMA_VERSION",
     "D_MAX_DEFAULT",
@@ -168,4 +217,6 @@ __all__ = [
     "AutocallEdgeCol",
     "AutocallSchedCol",
     "AutocallGlobalCol",
+    "CanonicalTier3Config",
+    "resolve_canonical_tier3_config",
 ]

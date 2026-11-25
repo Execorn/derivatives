@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import importlib
+import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -19,11 +22,14 @@ from deepvol.api.eq_autocall_arrow import (
 from deepvol.api.eq_autocall_runtime import (
     DEFAULT_CHECKPOINT_PATH,
     EQAutocallRuntime,
+    _SURFACE_ARB_CACHE,
+    _SURFACE_ARB_FAST_CACHE,
     _load_surrogate_from_ckpt,
 )
 from deepvol.api.schemas_eq_autocall import (
     EQAutocallableTradeRequest,
     parse_murex_autocall_dag,
+    to_decimal_merged_rho,
 )
 from deepvol.models.autocall.analytical_baseline import compute_analytical_autocall_baseline
 from deepvol.models.autocall.dupire_qmc_solver import price_eq_autocall_dupire_qmc
@@ -67,6 +73,11 @@ GATE_GR5_PEAK_VRAM_MB = 1500.0
 GATE_QMC_GPU_M1_MS = 10.0
 GATE_QMC_GPU_M12_MS = 30.0
 GATE_QMC_GPU_PEAK_VRAM_MB = 250.0
+GATE_106_GPU_WARM_MS = 15.0
+GATE_106_CPU_WARM_MS = 100.0
+GATE_106_ARB_COLD_MS = 2.0
+GATE_106_ARB_WARM_MS = 0.1
+BATCH_106_DEFAULT_DIR = REPO_ROOT / "docs" / "eq_autocall_ps_batch_b10316f2"
 
 
 @dataclass(frozen=True)
@@ -85,6 +96,7 @@ class BenchmarkMetric:
     speedup_vs_mc: float
     passed: bool
     peak_vram_mb: float = 0.0
+    peak_reserved_vram_mb: float = 0.0
 
 
 def _clear_runtime_caches(states: Sequence[AutocallPreprocState] = ()) -> None:
@@ -319,12 +331,12 @@ def _measure_real_qmc_suites(
                 ("QMC-GPU-M1", state_m1, GATE_QMC_GPU_M1_MS, "M_rem=1"),
                 ("QMC-GPU", state_m12, GATE_QMC_GPU_M12_MS, "M_rem=12"),
             ):
+                cfg_gpu = DupireQMCConfig(n_paths=n_paths)
                 torch.cuda.reset_peak_memory_stats()
-                gpu_solver.simulate_and_price(st_q, config=DupireQMCConfig(n_paths=4096))
+                gpu_solver.simulate_and_price(st_q, config=cfg_gpu)
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
                 gpu_samples_ms: List[float] = []
-                cfg_gpu = DupireQMCConfig(n_paths=n_paths)
                 for _ in range(n_iter):
                     _clear_runtime_caches([st_q])
                     t0 = time.perf_counter_ns()
@@ -332,12 +344,16 @@ def _measure_real_qmc_suites(
                     torch.cuda.synchronize()
                     gpu_samples_ms.append((time.perf_counter_ns() - t0) / 1e6)
                 peak_gpu_mb = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+                peak_res_mb = torch.cuda.max_memory_reserved() / (1024.0 * 1024.0)
                 p50_g, p95_g, p99_g = (float(x) for x in np.percentile(gpu_samples_ms, [50, 95, 99]))
                 metrics.append(
                     BenchmarkMetric(
                         gate_id=gid,
                         suite_name="qmc",
-                        description=f"Dupire RQMC GPU Forward ({label}, N={n_paths}, VRAM={peak_gpu_mb:.1f} MB)",
+                        description=(
+                            f"Dupire RQMC GPU Forward ({label}, N={n_paths}, "
+                            f"alloc={peak_gpu_mb:.1f} MB, reserved={peak_res_mb:.1f} MB)"
+                        ),
                         unit="ms",
                         p50=p50_g,
                         p95=p95_g,
@@ -345,8 +361,9 @@ def _measure_real_qmc_suites(
                         threshold=thresh_ms,
                         mc_baseline_same_unit=p50_cpu,
                         speedup_vs_mc=p50_cpu / max(p50_g, 1e-9),
-                        passed=(p50_g <= thresh_ms and peak_gpu_mb <= GATE_QMC_GPU_PEAK_VRAM_MB),
+                        passed=(p50_g <= thresh_ms and peak_res_mb <= GATE_QMC_GPU_PEAK_VRAM_MB),
                         peak_vram_mb=peak_gpu_mb,
+                        peak_reserved_vram_mb=peak_res_mb,
                     )
                 )
         except Exception:
@@ -789,15 +806,20 @@ def run_batch_suite(
             if dev.type == "cuda"
             else 0.0
         )
+        peak_res_mb = (
+            torch.cuda.max_memory_reserved() / (1024.0 * 1024.0)
+            if dev.type == "cuda"
+            else 0.0
+        )
         p50, p95, p99 = (float(x) for x in np.percentile(samples_ms_per_trade, [50, 95, 99]))
-        vram_ok = (peak_mb <= GATE_GR5_PEAK_VRAM_MB) if dev.type == "cuda" else True
+        vram_ok = (peak_res_mb <= GATE_GR5_PEAK_VRAM_MB) if dev.type == "cuda" else True
         results.append(
             BenchmarkMetric(
                 gate_id=label,
                 suite_name="batch",
                 description=(
                     f"Arrow E2E Round-Trip + Greeks (B={batch_size}, D={st.d_assets}, "
-                    f"M={st.m_rem}, VRAM={peak_mb:.1f} MB)"
+                    f"M={st.m_rem}, alloc={peak_mb:.1f} MB, reserved={peak_res_mb:.1f} MB)"
                 ),
                 unit="ms/trade",
                 p50=p50,
@@ -808,6 +830,7 @@ def run_batch_suite(
                 speedup_vs_mc=mc_aad_ms / max(p50, 1e-9),
                 passed=(p50 <= thresh and vram_ok),
                 peak_vram_mb=peak_mb,
+                peak_reserved_vram_mb=peak_res_mb,
             )
         )
 
@@ -840,6 +863,336 @@ def run_batch_suite(
         )
     )
     return results
+
+
+@dataclass(frozen=True)
+class Batch106DealItem:
+    """Single trade entry from the 106-deal Production Shadow certification corpus."""
+
+    index: int
+    trade_id: str
+    status: str
+    raw_str: str
+    dict_payload: Dict[str, Any]
+    murex_pv: float
+    murex_se: float
+    expected_murex: Dict[str, Any]
+
+
+def _load_batch_106_corpus(batch_dir: Path) -> List[Batch106DealItem]:
+    """Loads all 106 requests (`RAW_STR` & `DICT_PAYLOAD`) and Murex references from `batch_dir`."""
+    index_path = batch_dir / "index.csv"
+    req_dir = batch_dir / "requests"
+    mx_dir = batch_dir / "expected_murex"
+    if not index_path.is_file():
+        raise FileNotFoundError(f"Missing 106-deal index.csv at {index_path}")
+
+    items: List[Batch106DealItem] = []
+    with index_path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            idx = int(row["index"])
+            tid = str(row["trade"]).strip()
+            status = str(row.get("status", "priced")).strip().lower()
+            stem = f"trade_{idx:03d}_{tid}.json"
+            req_path = req_dir / stem
+            mx_path = mx_dir / stem
+            raw_str = req_path.read_text(encoding="utf-8")
+            dict_payload: Dict[str, Any] = json.loads(raw_str)
+            mx_obj: Dict[str, Any] = json.loads(mx_path.read_text(encoding="utf-8")) if mx_path.is_file() else {}
+            mx_pv = float(mx_obj.get("ProductValue", row.get("murex_pv", 0.0)))
+            mx_se = float(mx_obj.get("StandardError", row.get("murex_se", 0.0)))
+            items.append(
+                Batch106DealItem(
+                    index=idx,
+                    trade_id=tid,
+                    status=status,
+                    raw_str=raw_str,
+                    dict_payload=dict_payload,
+                    murex_pv=mx_pv,
+                    murex_se=mx_se,
+                    expected_murex=mx_obj,
+                )
+            )
+    return items
+
+
+def _run_batch_106_suite(
+    *,
+    batch_dir: Path,
+    checkpoint_path: Path,
+    strict_ckpt: bool,
+    device_arg: str,
+    n_sweeps: int,
+    payload_mode: str,
+    oracle_cache: Optional[Path],
+    compute_oracle: bool,
+) -> Tuple[List[BenchmarkMetric], str]:
+    """Executes 3-sweep 106-deal certification (`RAW_STR`/`DICT_PAYLOAD`, `IRAO_RUB` strict/repaired, VRAM, accuracy)."""
+    eff_dev = (
+        ("cuda" if torch.cuda.is_available() else "cpu")
+        if device_arg == "auto"
+        else device_arg
+    )
+    rt = EQAutocallRuntime(
+        checkpoint_path=checkpoint_path,
+        strict_checkpoint=strict_ckpt,
+        device=eff_dev,
+        n_fallback_paths=None,
+    )
+    dev_type = rt.device.type
+    warm_thresh_ms = GATE_106_GPU_WARM_MS if dev_type == "cuda" else GATE_106_CPU_WARM_MS
+    corpus = _load_batch_106_corpus(batch_dir)
+    rejected_deals = [d for d in corpus if d.status == "rejected"]
+
+    # 1. Strict IRAO_RUB Pre-Gate (< 2.0 ms cold / < 0.1 ms warm, all slices [0..6])
+    _SURFACE_ARB_CACHE.clear()
+    _SURFACE_ARB_FAST_CACHE.clear()
+    arb_cold_ms: List[float] = []
+    arb_warm_ms: List[float] = []
+    arb_diag_ok = True
+    arb_sample_msg = ""
+    for d_item in rejected_deals:
+        _SURFACE_ARB_CACHE.clear()
+        _SURFACE_ARB_FAST_CACHE.clear()
+        t0 = time.perf_counter_ns()
+        try:
+            rt.price_trade(d_item.raw_str, include_all_greeks=True, repair_arbitrage=False)
+            arb_diag_ok = False
+        except ValueError as exc:
+            arb_cold_ms.append((time.perf_counter_ns() - t0) / 1e6)
+            msg = str(exc)
+            if not arb_sample_msg:
+                arb_sample_msg = msg
+            if "SMILE_ARBITRAGE" not in msg or "IRAO_RUB" not in msg or "slices=[0, 1, 2, 3, 4, 5, 6]" not in msg:
+                arb_diag_ok = False
+
+        t1 = time.perf_counter_ns()
+        try:
+            rt.price_trade(d_item.raw_str, include_all_greeks=True, repair_arbitrage=False)
+            arb_diag_ok = False
+        except ValueError:
+            arb_warm_ms.append((time.perf_counter_ns() - t1) / 1e6)
+
+    # 2. Optional 65k FP64 Oracle lookup / computation
+    oracle_pvs: Dict[str, float] = {}
+    if oracle_cache is not None and oracle_cache.is_file():
+        loaded_orc = json.loads(oracle_cache.read_text(encoding="utf-8"))
+        for k, v in loaded_orc.items():
+            oracle_pvs[str(k)] = float(v["pv"] if isinstance(v, dict) else v)
+    elif compute_oracle:
+        for d_item in corpus:
+            req_orc, _ = rt._parse_request(d_item.dict_payload)
+            if d_item.status == "rejected":
+                from deepvol.api.eq_autocall_runtime import _repair_request_surfaces
+
+                req_orc = _repair_request_surfaces(req_orc)
+            st_orc = preprocess_eq_autocall(req_orc, d_max=8, m_max=48)
+            q_orc = price_eq_autocall_dupire_qmc(
+                st_orc,
+                n_paths=65536,
+                n_replicates=8,
+                n_substeps_per_period=32,
+                use_gpu=False,
+                precision="fp64_audit",
+                cv_mode="multifidelity_gbm",
+            )
+            oracle_pvs[d_item.trade_id] = float(q_orc.product_value)
+        if oracle_cache is not None:
+            oracle_cache.parent.mkdir(parents=True, exist_ok=True)
+            oracle_cache.write_text(json.dumps(oracle_pvs, indent=2), encoding="utf-8")
+
+    modes: List[str] = (
+        ["raw_str", "dict"] if payload_mode == "both" else [payload_mode]
+    )
+    metrics: List[BenchmarkMetric] = []
+    if rejected_deals:
+        p50_ac, p95_ac, p99_ac = (float(x) for x in np.percentile(arb_cold_ms, [50, 95, 99]))
+        p50_aw, p95_aw, p99_aw = (float(x) for x in np.percentile(arb_warm_ms, [50, 95, 99]))
+        metrics.append(
+            BenchmarkMetric(
+                gate_id="G6-IRAO-Strict-Cold",
+                suite_name="batch106",
+                description=f"IRAO_RUB Strict Pre-Gate Cold (n={len(rejected_deals)}, slices=[0..6]={arb_diag_ok})",
+                unit="ms",
+                p50=p50_ac,
+                p95=p95_ac,
+                p99=p99_ac,
+                threshold=GATE_106_ARB_COLD_MS,
+                mc_baseline_same_unit=GATE_106_ARB_COLD_MS,
+                speedup_vs_mc=1.0,
+                passed=(arb_diag_ok and max(arb_cold_ms) <= GATE_106_ARB_COLD_MS),
+            )
+        )
+        metrics.append(
+            BenchmarkMetric(
+                gate_id="G6-IRAO-Strict-Warm",
+                suite_name="batch106",
+                description=f"IRAO_RUB Strict Pre-Gate Warm (n={len(rejected_deals)})",
+                unit="ms",
+                p50=p50_aw,
+                p95=p95_aw,
+                p99=p99_aw,
+                threshold=GATE_106_ARB_WARM_MS,
+                mc_baseline_same_unit=GATE_106_ARB_WARM_MS,
+                speedup_vs_mc=1.0,
+                passed=(arb_diag_ok and max(arb_warm_ms) <= GATE_106_ARB_WARM_MS),
+            )
+        )
+
+    accuracy_rows: List[str] = []
+    max_drift_bps = 0.0
+    max_dcf = 0.0
+    t2_count = 0
+    t2_breaches = 0
+    nan_count = 0
+    rho_curves_total = 0
+
+    ref_dag_text = REF_REQUEST_PATH.read_text(encoding="utf-8") if REF_REQUEST_PATH.is_file() else ""
+
+    for mode_tok in modes:
+        cold_lat_ms: List[float] = []
+        warm_lat_ms: List[float] = []
+        peak_alloc_mb = 0.0
+        peak_res_mb = 0.0
+
+        for sweep_idx in range(max(1, n_sweeps)):
+            if dev_type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+            sweep_lat: List[float] = []
+            for d_item in corpus:
+                payload: Any = d_item.raw_str if mode_tok == "raw_str" else d_item.dict_payload
+                repair_flag = d_item.status == "rejected"
+                t0 = time.perf_counter_ns()
+                resp = rt.price_trade(
+                    payload,
+                    engine="auto",
+                    include_all_greeks=True,
+                    repair_arbitrage=repair_flag,
+                )
+                if dev_type == "cuda":
+                    torch.cuda.synchronize()
+                dt_ms = (time.perf_counter_ns() - t0) / 1e6
+                sweep_lat.append(dt_ms)
+
+                if not math.isfinite(float(resp.ProductValue)):
+                    nan_count += 1
+
+                if sweep_idx == 1 and mode_tok == modes[0]:
+                    resp_pv = rt.price_trade(
+                        payload,
+                        engine="auto",
+                        include_all_greeks=False,
+                        repair_arbitrage=repair_flag,
+                    )
+                    drift_bps = abs(float(resp.ProductValue) - float(resp_pv.ProductValue)) * 1e4
+                    max_drift_bps = max(max_drift_bps, drift_bps)
+                    cf_a = [float(c.Amount) for c in (resp.CashFlows or [])]
+                    cf_b = [float(c.Amount) for c in (resp_pv.CashFlows or [])]
+                    if len(cf_a) == len(cf_b) and cf_a:
+                        max_dcf = max(max_dcf, float(np.max(np.abs(np.asarray(cf_a) - np.asarray(cf_b)))))
+                    elif len(cf_a) != len(cf_b):
+                        max_dcf = float("inf")
+
+                    req_parsed, _ = rt._parse_request(d_item.dict_payload)
+                    merged_rho = to_decimal_merged_rho(resp, request=req_parsed)
+                    rho_curves_total += len(merged_rho)
+
+                    mx_diff_abs_bps = (float(resp.ProductValue) - d_item.murex_pv) * 1e4
+                    mx_se_bps = max(d_item.murex_se * 1e4, 1e-9)
+                    z_mx = mx_diff_abs_bps / mx_se_bps
+                    if resp.engine_used == "MaskedEGNO_Surrogate":
+                        t2_count += 1
+                        if abs(mx_diff_abs_bps) >= 15.0:
+                            t2_breaches += 1
+                    orc_pv = oracle_pvs.get(d_item.trade_id)
+                    orc_diff_str = (
+                        f"{(float(resp.ProductValue) - orc_pv) * 1e4:+.2f}"
+                        if orc_pv is not None
+                        else "n/a"
+                    )
+                    accuracy_rows.append(
+                        f"| `{d_item.trade_id}` | `{resp.engine_used}` | `{resp.ProductValue:.6f}` | "
+                        f"`{d_item.murex_pv:.6f}` | `{mx_diff_abs_bps:+.2f}` | `{z_mx:+.2f}` | "
+                        f"`{orc_diff_str}` | `{dt_ms:.2f}` |"
+                    )
+
+            if mode_tok == "raw_str" and ref_dag_text:
+                t_dag = time.perf_counter_ns()
+                rt.price_murex_dag(ref_dag_text, engine="auto", include_all_greeks=True)
+                if dev_type == "cuda":
+                    torch.cuda.synchronize()
+                sweep_lat.append((time.perf_counter_ns() - t_dag) / 1e6)
+
+            if dev_type == "cuda":
+                peak_alloc_mb = max(peak_alloc_mb, torch.cuda.max_memory_allocated() / (1024.0 * 1024.0))
+                peak_res_mb = max(peak_res_mb, torch.cuda.max_memory_reserved() / (1024.0 * 1024.0))
+
+            if sweep_idx == 0:
+                cold_lat_ms.extend(sweep_lat)
+            else:
+                warm_lat_ms.extend(sweep_lat)
+
+        if warm_lat_ms:
+            p50_w, p95_w, p99_w = (float(x) for x in np.percentile(warm_lat_ms, [50, 95, 99]))
+            max_w = float(max(warm_lat_ms))
+        else:
+            p50_w, p95_w, p99_w = (float(x) for x in np.percentile(cold_lat_ms, [50, 95, 99]))
+            max_w = float(max(cold_lat_ms))
+
+        vram_ok = (peak_res_mb <= GATE_QMC_GPU_PEAK_VRAM_MB) if dev_type == "cuda" else True
+        metrics.append(
+            BenchmarkMetric(
+                gate_id=f"G4/G5-106-{mode_tok.upper()}",
+                suite_name="batch106",
+                description=(
+                    f"106-Deal Warm {mode_tok.upper()} ({dev_type.upper()}, sweeps={n_sweeps}, "
+                    f"max={max_w:.2f} ms, alloc={peak_alloc_mb:.1f} MB, reserved={peak_res_mb:.1f} MB)"
+                ),
+                unit="ms",
+                p50=p50_w,
+                p95=p95_w,
+                p99=p99_w,
+                threshold=warm_thresh_ms,
+                mc_baseline_same_unit=warm_thresh_ms,
+                speedup_vs_mc=warm_thresh_ms / max(p50_w, 1e-9),
+                passed=(max_w <= warm_thresh_ms and vram_ok and nan_count == 0),
+                peak_vram_mb=peak_alloc_mb,
+                peak_reserved_vram_mb=peak_res_mb,
+            )
+        )
+
+    summary_lines = [
+        f"# 106-Deal Certification Report (`{dev_type.upper()}`)",
+        "",
+        f"- **Deals Tested**: `{len(corpus)}` (`98` priced + `{len(rejected_deals)}` repaired `IRAO_RUB`)"
+        + (" + `eq_autocallable_request.txt`" if ref_dag_text else ""),
+        f"- **Canonical Drift (`pv_only == all_greeks`)**: `max|dPV| = {max_drift_bps:.6f} bps`, `max|dCF| = {max_dcf:.6f}`",
+        f"- **Tier-2 EGNO Accepted**: `{t2_count}` deals, `>= 15.0 bps` breaches = `{t2_breaches}`",
+        f"- **Non-Finite Outputs**: `{nan_count}`, **Merged Decimal Rho+RepoRho Curves**: `{rho_curves_total}`",
+        f"- **Sample `IRAO_RUB` Strict Error**: `{arb_sample_msg}`",
+        "",
+        "| Gate ID | Suite | Operation | Unit | p50 | p95 | p99 | Gate Threshold | Status |",
+        "| :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | :--- |",
+    ]
+    for m in metrics:
+        summary_lines.append(
+            f"| `{m.gate_id}` | `{m.suite_name}` | {m.description} | `{m.unit}` | "
+            f"`{m.p50:.4f}` | `{m.p95:.4f}` | `{m.p99:.4f}` | `<= {m.threshold:.4f}` | "
+            f"**{'PASS' if m.passed else 'FAIL'}** |"
+        )
+    if accuracy_rows:
+        summary_lines.extend(
+            [
+                "",
+                "## Per-Deal Accuracy & Latency Table (Sweep 1)",
+                "",
+                "| Trade ID | Engine | DeepVol PV | Murex PV | Diff vs Murex (bps) | z_SE | Diff vs 65k Oracle (bps) | Warm Latency (ms) |",
+                "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+                *accuracy_rows,
+            ]
+        )
+    return metrics, "\n".join(summary_lines)
 
 
 def _format_markdown_report(
@@ -903,7 +1256,70 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Fail immediately if checkpoint cannot be loaded strictly with weights_only=True.",
     )
+    parser.add_argument(
+        "--batch-106",
+        action="store_true",
+        help="Run the 106-deal Production Shadow certification sweep (RAW_STR/DICT_PAYLOAD + IRAO_RUB).",
+    )
+    parser.add_argument(
+        "--batch-dir",
+        type=Path,
+        default=BATCH_106_DEFAULT_DIR,
+        help="Directory containing the 106-deal corpus (index.csv, requests/, expected_murex/).",
+    )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Device to use for --batch-106 certification.",
+    )
+    parser.add_argument(
+        "--sweeps",
+        type=int,
+        default=3,
+        help="Number of sweeps for --batch-106 (sweep 0 = cold, sweeps 1..N-1 = warm).",
+    )
+    parser.add_argument(
+        "--payload-mode",
+        choices=("both", "raw_str", "dict"),
+        default="both",
+        help="Payload mode(s) to benchmark in --batch-106.",
+    )
+    parser.add_argument(
+        "--oracle-cache",
+        type=Path,
+        default=None,
+        help="Optional JSON cache path for 65,536-path FP64 oracle PVs in --batch-106.",
+    )
+    parser.add_argument(
+        "--compute-oracle",
+        action="store_true",
+        help="Compute 65,536-path FP64 oracle PVs on the fly if --oracle-cache is absent.",
+    )
     args = parser.parse_args(argv)
+
+    if args.batch_106:
+        b_metrics, b_report = _run_batch_106_suite(
+            batch_dir=args.batch_dir,
+            checkpoint_path=args.checkpoint,
+            strict_ckpt=bool(args.strict_ckpt),
+            device_arg=str(args.device),
+            n_sweeps=int(args.sweeps),
+            payload_mode=str(args.payload_mode),
+            oracle_cache=args.oracle_cache,
+            compute_oracle=bool(args.compute_oracle),
+        )
+        print(b_report)
+        failed_106 = [m for m in b_metrics if not m.passed]
+        if failed_106:
+            for m in failed_106:
+                print(
+                    f"ERROR: Gate {m.gate_id} failed: p50={m.p50:.4f} {m.unit}, "
+                    f"alloc={m.peak_vram_mb:.1f} MB, reserved={m.peak_reserved_vram_mb:.1f} MB",
+                    file=sys.stderr,
+                )
+            return 1
+        return 0
 
     _surr_check, ckpt_loaded = _load_surrogate(
         "cpu",

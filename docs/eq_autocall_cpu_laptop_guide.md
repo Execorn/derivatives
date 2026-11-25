@@ -135,11 +135,12 @@ Checkpoint     : True | Guardian Stats: True
 
 ## 5. Launch and Run `EQAutocallable`
 
-### A. Direct Python Valuation (`PV`, `37` CashFlows, All `8` Greeks & `RepoRho`)
+### A. Direct Python Valuation (`PV`, CashFlows, All `8` Greeks & `RepoRho`)
 
-Instantiate `EQAutocallRuntime(device="cpu", n_fallback_paths=8192)` (or `n_fallback_paths=4096` for faster screening; default `32768`). In-domain trades run directly on the Masked EGNO surrogate in tens of milliseconds on CPU. When an out-of-distribution (`Tier3_DupireQMC`) fallback triggers:
-- **PV + CashFlows only**: runs IEEE-754 `float64` Owen-scrambled Dupire QMC (`n_replicates=8`, `n_substeps_per_period=16`) at `n_fallback_paths`, while keeping surface quote Jacobians lazy (`_LazySurfaceJacobianDict`) and reusing spot-invariant schedule/market templates with SHA-256 slice hashing across spot-shocked requests.
-- **All-8 Greeks requested on CPU**: routes single-pass CRN QMC Greeks through an adaptive CPU budget scaled by `n_fallback_paths` (`<= 1024` keeps tiny unit-test runs fast at `n_replicates=1, n_substeps=2, lv_grid=16x32`; `4096 <= n_fallback_paths < 8192` uses `n_paths=4096, n_replicates=1, lv_grid=32x64`; `n_fallback_paths >= 8192` uses `n_paths=8192, n_replicates=2, lv_grid=32x64`, with `n_substeps=4` when `m_rem * d_assets <= 48` and `2` on longer schedules) so long-maturity OOD deals achieve `< 5 bps` median PV/Greek accuracy in `< 2.5 s/deal`.
+Instantiate `EQAutocallRuntime(device="cpu")` (default `n_fallback_paths=None` resolves `CanonicalTier3Config`, `theta_convention="murex_bizday_forward_fixed"`, `repair_arbitrage=False` strict pre-gate). In-domain trades run directly on the Masked EGNO surrogate; when an out-of-distribution (`Tier3_DupireQMC`) fallback triggers:
+- **Canonical Tier-3 Invariance (`pv_only == all_greeks`)**: Both `Queries=["ProductValue", "CashFlows"]` (`include_all_greeks=False`) and `All-8 Greeks` (`include_all_greeks=True`) resolve the identical query-invariant `CanonicalTier3Config` via `resolve_canonical_tier3_config` (`4096` paths, `n_replicates=4`, `n_substeps=4`, `32x64` LV grid, `cv_mode="multifidelity_gbm"`, `n_cheap_mf=32768` on CPU; `8192` paths, `n_replicates=8`, `n_substeps=4`, `32x64`, `n_cheap_mf=262144` on CUDA), guaranteeing `0.00 bps` PV & CashFlow drift.
+- **Strict Smile Arbitrage Pre-Gate & Opt-In Repair**: `repair_arbitrage=False` (default) rejects arbitrageable smiles (`IRAO_RUB`) with full per-slice diagnostics (`surface`, `slices=[0..6]`, `worst_slice`, `K`, `prev_K`, `vol_jump`, `slope`, `min_d2c`) in `< 2.0 ms` cold / `< 0.1 ms` warm; pass `repair_arbitrage=True` to clone and secant-project violating quotes before preprocessing.
+- **Native `cpp23` Assertion**: `EQAutocallRuntime` verifies `get_tier1_backend().name == "cpp23"` at startup unless `DEEPVOL_TIER1_CPP_LIB=numpy` is explicitly set.
 
 ```bash
 .venv/bin/python - <<'PY'

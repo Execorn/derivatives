@@ -9,11 +9,12 @@ import importlib
 import inspect
 import logging
 import math
+import os
 from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -39,6 +40,7 @@ from deepvol.api.schemas_eq_autocall import (
     parse_murex_autocall_dag,
     to_decimal_merged_rho,
 )
+from deepvol.models.autocall._tier1_backend import get_tier1_backend
 from deepvol.models.autocall.analytical_baseline import (
     compute_analytical_autocall_baseline,
 )
@@ -48,6 +50,8 @@ from deepvol.models.autocall.feature_layout import (
     AutocallGlobalCol,
     AutocallNodeCol,
     AutocallSchedCol,
+    CanonicalTier3Config,
+    resolve_canonical_tier3_config,
 )
 import deepvol.models.autocall.greeks_engine as _greeks_mod
 from deepvol.models.autocall.greeks_engine import (
@@ -139,11 +143,18 @@ _GREEKS_SINGLE_PARAMS = frozenset(inspect.signature(compute_eq_autocall_greeks).
 _SUPPORTS_STABILIZE_F32_SURROGATE: bool = "stabilize_f32_surrogate" in _GREEKS_SINGLE_PARAMS
 _SUPPORTS_GREEKS_REQUEST_PARAM: bool = "request" in _GREEKS_SINGLE_PARAMS
 _SUPPORTS_GREEKS_THETA_PARAM: bool = "theta_roll_days" in _GREEKS_SINGLE_PARAMS
+_SUPPORTS_GREEKS_THETA_CONV_PARAM: bool = "theta_convention" in _GREEKS_SINGLE_PARAMS
 _QMC_CRN_FN = getattr(_greeks_mod, "compute_qmc_crn_greeks", None)
+_QMC_CRN_SIG = inspect.signature(_QMC_CRN_FN) if callable(_QMC_CRN_FN) else None
 _QMC_CRN_PARAMS = (
-    frozenset(inspect.signature(_QMC_CRN_FN).parameters.keys())
-    if callable(_QMC_CRN_FN)
+    frozenset(_QMC_CRN_SIG.parameters.keys())
+    if _QMC_CRN_SIG is not None
     else frozenset()
+)
+_QMC_CRN_ACCEPTS_VARKW: bool = (
+    any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _QMC_CRN_SIG.parameters.values())
+    if _QMC_CRN_SIG is not None
+    else False
 )
 _ASSEMBLE_SURR_PARAMS = frozenset(inspect.signature(assemble_surrogate_product_value).parameters.keys())
 _SURR_INIT_PARAMS = tuple(inspect.signature(MaskedEQAutocallSurrogate.__init__).parameters.keys())
@@ -627,6 +638,15 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                 slopes = (calls[:, 1:] - calls[:, :-1]) / dk[None, :]
                 max_slope = float(slopes.max())
                 min_slope = float(slopes.min())
+                d2c = slopes[:, 1:] - slopes[:, :-1] if len(u_s) >= 3 else None
+                min_d2c = float(d2c.min()) if d2c is not None else 0.0
+                slice_slope_bad = (slopes.max(axis=1) > 1e-3) | (slopes.min(axis=1) < -1.0 - 1e-3)
+                slice_d2c_bad = (
+                    d2c.min(axis=1) < -1e-3
+                    if d2c is not None
+                    else np.zeros(n_exp, dtype=bool)
+                )
+                violating_slices = [int(m) for m in np.flatnonzero(slice_slope_bad | slice_d2c_bad)]
                 if max_slope > 1e-3 or min_slope < -1.0 - 1e-3:
                     if max_slope > 1e-3 and (min_slope >= -1.0 - 1e-3 or max_slope >= -1.0 - min_slope):
                         m_off, j_seg = map(int, np.unravel_index(int(np.argmax(slopes)), slopes.shape))
@@ -636,29 +656,38 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                         off_slope = min_slope
                     j_prev = j_seg
                     j_curr = min(j_seg + 1, len(u_s) - 1)
-                    d2c_val = float((slopes[:, 1:] - slopes[:, :-1]).min()) if len(u_s) >= 3 else 0.0
                     raise ValueError(
                         f"SMILE_ARBITRAGE: Call-spread slope violation on surface={ticker}, "
-                        f"slice={m_off} (T={t_vals[m_off]:.4f}Y), "
-                        f"K={float(u_s[j_curr]):.4f} (prev_K={float(u_s[j_prev]):.4f} -> K={float(u_s[j_curr]):.4f}, "
-                        f"vol_jump={float(q_u[m_off, j_prev]):.5f}->{float(q_u[m_off, j_curr]):.5f}), "
+                        f"slices={violating_slices}, worst_slice={m_off} (T={t_vals[m_off]:.4f}Y), "
+                        f"K={float(u_s[j_curr]):.4f}, prev_K={float(u_s[j_prev]):.4f}, "
+                        f"vol_jump={float(q_u[m_off, j_prev]):.5f}->{float(q_u[m_off, j_curr]):.5f}, "
                         f"slope={off_slope:.6f} (range [{min_slope:.4f}, {max_slope:.4f}]), "
-                        f"min_d2c={d2c_val:.6f}."
+                        f"min_d2c={min_d2c:.6f}."
                     )
-                if len(u_s) >= 3:
-                    d2c = slopes[:, 1:] - slopes[:, :-1]
-                    min_d2c = float(d2c.min())
-                    if min_d2c < -1e-3:
-                        m_off, j_d2 = map(int, np.unravel_index(int(np.argmin(d2c)), d2c.shape))
+                if d2c is not None and min_d2c < -1e-3:
+                    m_off, j_d2 = map(int, np.unravel_index(int(np.argmin(d2c)), d2c.shape))
+                    left_jump = abs(float(q_u[m_off, j_d2 + 1] - q_u[m_off, j_d2]))
+                    right_jump = (
+                        abs(float(q_u[m_off, j_d2 + 2] - q_u[m_off, j_d2 + 1]))
+                        if j_d2 + 2 < len(u_s)
+                        else -1.0
+                    )
+                    if j_d2 + 2 < len(u_s) and right_jump > left_jump:
+                        j_prev = j_d2 + 1
+                        j_curr = j_d2 + 2
+                        off_slope = float(slopes[m_off, j_d2 + 1])
+                    else:
                         j_prev = j_d2
                         j_curr = min(j_d2 + 1, len(u_s) - 1)
-                        raise ValueError(
-                            f"SMILE_ARBITRAGE: Discrete call convexity violation on surface={ticker}, "
-                            f"slice={m_off} (T={t_vals[m_off]:.4f}Y), "
-                            f"K={float(u_s[j_curr]):.4f} (prev_K={float(u_s[j_prev]):.4f} -> K={float(u_s[j_curr]):.4f}, "
-                            f"vol_jump={float(q_u[m_off, j_prev]):.5f}->{float(q_u[m_off, j_curr]):.5f}), "
-                            f"min_d2c={min_d2c:.6f}, slope_range=[{min_slope:.4f}, {max_slope:.4f}]."
-                        )
+                        off_slope = float(slopes[m_off, j_d2])
+                    raise ValueError(
+                        f"SMILE_ARBITRAGE: Discrete call convexity violation on surface={ticker}, "
+                        f"slices={violating_slices}, worst_slice={m_off} (T={t_vals[m_off]:.4f}Y), "
+                        f"K={float(u_s[j_curr]):.4f}, prev_K={float(u_s[j_prev]):.4f}, "
+                        f"vol_jump={float(q_u[m_off, j_prev]):.5f}->{float(q_u[m_off, j_curr]):.5f}, "
+                        f"slope={off_slope:.6f}, min_d2c={min_d2c:.6f}, "
+                        f"slope_range=[{min_slope:.4f}, {max_slope:.4f}]."
+                    )
         except ValueError as exc:
             err_msg = str(exc)
             if "SMILE_ARBITRAGE" in err_msg:
@@ -708,6 +737,93 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
             if arb_key is not None:
                 _put_surface_arb_cache(_SURFACE_ARB_CACHE, arb_key, (True, None))
             _put_surface_arb_cache(_SURFACE_ARB_FAST_CACHE, fast_arb_key, (True, None))
+
+
+def _repair_request_surfaces(req: EQAutocallableTradeRequest) -> EQAutocallableTradeRequest:
+    """Clones `req` and projects arbitrageable equity smiles via `repair_arbitrage_quotes` before pre-gating."""
+    try:
+        solver_mod = importlib.import_module("deepvol.models.autocall.dupire_qmc_solver")
+        repair_fn = getattr(solver_mod, "repair_arbitrage_quotes", None)
+    except ImportError:
+        repair_fn = None
+    if not callable(repair_fn):
+        raise RuntimeError(
+            "repair_arbitrage=True requires dupire_qmc_solver.repair_arbitrage_quotes, which is unavailable."
+        )
+
+    mds = req.Model.MarketDataSet
+    as_of_dt = mds.AsOfDate
+    as_of_utc = (
+        as_of_dt
+        if (isinstance(as_of_dt, datetime) and as_of_dt.tzinfo is timezone.utc)
+        else _to_utc_datetime(as_of_dt)
+    )
+    spots_map = getattr(mds, "Spots", None) or {}
+    vol_surfs = getattr(mds, "VolatilitySurfaces", None) or {}
+    repaired_surfs: dict[str, Any] = dict(vol_surfs)
+    any_changed = False
+    inv_sec_yr = 1.0 / 31536000.0
+
+    for ticker, surf in vol_surfs.items():
+        type_name = str(getattr(surf, "TypeName", "") or "")
+        strikes_attr = getattr(surf, "Strikes", None)
+        exp_dates_attr = getattr(surf, "ExpirationDates", None)
+        if (
+            type_name == "FXVolatilitySmileCollection"
+            or getattr(surf, "Deltas", None) is not None
+            or getattr(surf, "Tenors", None) is not None
+            or strikes_attr is None
+            or exp_dates_attr is None
+        ):
+            continue
+        strikes = np.asarray(strikes_attr, dtype=np.float64)
+        quotes = np.asarray(surf.VolatilityQuotes, dtype=np.float64)
+        if (
+            strikes.ndim != 1
+            or strikes.size < 2
+            or quotes.ndim != 2
+            or quotes.shape != (len(exp_dates_attr), strikes.size)
+            or not bool(np.all(np.isfinite(strikes)))
+            or not bool(np.all(np.isfinite(quotes)))
+            or float(strikes.min()) <= 0.0
+        ):
+            continue
+        t_exp = np.array(
+            [max((_to_utc_datetime(exp_d) - as_of_utc).total_seconds() * inv_sec_yr, 1e-8) for exp_d in exp_dates_attr],
+            dtype=np.float64,
+        )
+        raw_spot = spots_map.get(ticker)
+        k_ref = (
+            float(raw_spot)
+            if (raw_spot is not None and math.isfinite(float(raw_spot)) and float(raw_spot) > 0.0)
+            else float(np.median(strikes))
+        )
+        repaired_q_raw, repair_info = repair_fn(strikes, quotes, t_exp, k_ref)
+        repaired_q = np.asarray(repaired_q_raw, dtype=np.float64)
+        was_repaired = (
+            bool(repair_info.get("repaired", False))
+            if isinstance(repair_info, Mapping)
+            else not np.array_equal(repaired_q, quotes)
+        )
+        if was_repaired or not np.array_equal(repaired_q, quotes):
+            any_changed = True
+            if hasattr(surf, "model_copy"):
+                repaired_surfs[ticker] = surf.model_copy(
+                    update={"VolatilityQuotes": repaired_q.tolist()},
+                    deep=False,
+                )
+            else:
+                repaired_surfs[ticker] = surf
+
+    if not any_changed:
+        return req
+
+    new_mds = mds.model_copy(update={"VolatilitySurfaces": repaired_surfs}, deep=False)
+    for attr in ("_cached_mds_digest_hex", "_batch_arbitrage_checked"):
+        new_mds.__dict__.pop(attr, None)
+    new_model = req.Model.model_copy(update={"MarketDataSet": new_mds}, deep=False)
+    repaired_req = req.model_copy(update={"Model": new_model}, deep=False)
+    return _strip_untrusted_digests(repaired_req)
 
 
 def _validate_engine(engine: str) -> str:
@@ -1130,6 +1246,82 @@ def _collect_state_and_surface_warnings(state: AutocallPreprocState) -> list[str
     return out
 
 
+def _collect_quanto_fx_ids(state: AutocallPreprocState) -> list[str]:
+    """Returns ordered quanto FX surface identifiers (e.g. `CNHRUB`, `USDRUB`) present on state."""
+    fx_ids: list[str] = []
+    seen: set[str] = set()
+    fx_specs = getattr(state, "quanto_fx_specs", None)
+    if isinstance(fx_specs, Mapping):
+        for fx_id in fx_specs.keys():
+            fx_s = str(fx_id).strip()
+            if fx_s and fx_s not in seen:
+                seen.add(fx_s)
+                fx_ids.append(fx_s)
+    quanto_meta = getattr(state, "quanto_meta", None) or {}
+    if isinstance(quanto_meta, Mapping):
+        for qm in quanto_meta.values():
+            if isinstance(qm, Mapping):
+                fx_s = str(qm.get("fx_id", "")).strip()
+                if fx_s and fx_s not in seen:
+                    seen.add(fx_s)
+                    fx_ids.append(fx_s)
+    return fx_ids
+
+
+def _merge_fx_delta_and_gamma(
+    greeks_out: AutocallGreeksResult | None,
+    state: AutocallPreprocState,
+) -> tuple[
+    Optional[Dict[str, float]],
+    Optional[Union[Dict[str, Dict[str, float]], Dict[str, float], List[List[float]]]],
+]:
+    """Emits `0.0` quanto FX Delta/Gamma keys (`CNHRUB`, `USDRUB`, etc.) when absent."""
+    if greeks_out is None:
+        return None, None
+    fx_ids = _collect_quanto_fx_ids(state)
+    delta_out: Optional[Dict[str, float]] = (
+        dict(greeks_out.delta) if greeks_out.delta is not None else None
+    )
+    if delta_out is not None and fx_ids:
+        for fx_id in fx_ids:
+            delta_out.setdefault(fx_id, 0.0)
+
+    gamma_raw = greeks_out.gamma
+    gamma_out: Optional[Union[Dict[str, Dict[str, float]], Dict[str, float], List[List[float]]]]
+    if gamma_raw is None:
+        gamma_out = None
+    elif isinstance(gamma_raw, Mapping):
+        is_nested = any(isinstance(v, Mapping) for v in gamma_raw.values())
+        if is_nested:
+            nested_gamma: dict[str, dict[str, float]] = {
+                str(k): (
+                    {str(ik): float(iv) for ik, iv in v.items()}
+                    if isinstance(v, Mapping)
+                    else {}
+                )
+                for k, v in gamma_raw.items()
+            }
+            for fx_id in fx_ids:
+                if fx_id not in nested_gamma:
+                    for row in nested_gamma.values():
+                        row.setdefault(fx_id, 0.0)
+                    nested_gamma[fx_id] = {k: 0.0 for k in nested_gamma}
+                    nested_gamma[fx_id][fx_id] = 0.0
+            gamma_out = nested_gamma
+        else:
+            flat_gamma: dict[str, float] = {
+                str(k): float(cast(Any, v))
+                for k, v in gamma_raw.items()
+                if not isinstance(v, Mapping)
+            }
+            for fx_id in fx_ids:
+                flat_gamma.setdefault(fx_id, 0.0)
+            gamma_out = flat_gamma
+    else:
+        gamma_out = gamma_raw
+    return delta_out, gamma_out
+
+
 def _merge_fx_vega_and_cega(
     greeks_out: AutocallGreeksResult | None,
     state: AutocallPreprocState,
@@ -1242,29 +1434,56 @@ def _compute_qmc_crn_if_available(
     state: AutocallPreprocState,
     *,
     queries: Sequence[str],
-    n_paths: int,
+    n_paths: int | None = None,
     request: Any = None,
     device: torch.device | None = None,
     theta_roll_days: int = 1,
+    theta_convention: str = "murex_bizday_forward_fixed",
 ) -> AutocallGreeksResult | None:
-    """Computes Dupire QMC CRN Greeks with device-appropriate path budgets; returns None on failure."""
+    """Computes Dupire QMC CRN Greeks under `CanonicalTier3Config` (0.00 bps drift); returns None on failure."""
     crn_fn = getattr(_greeks_mod, "compute_qmc_crn_greeks", None)
     if callable(crn_fn):
         try:
-            params = (
-                _QMC_CRN_PARAMS
-                if crn_fn is _QMC_CRN_FN
-                else frozenset(inspect.signature(crn_fn).parameters.keys())
+            if crn_fn is _QMC_CRN_FN:
+                params = _QMC_CRN_PARAMS
+                accepts_varkw = _QMC_CRN_ACCEPTS_VARKW
+            else:
+                crn_sig = inspect.signature(crn_fn)
+                params = frozenset(crn_sig.parameters.keys())
+                accepts_varkw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in crn_sig.parameters.values()
+                )
+            eff_device = (
+                device
+                if device is not None
+                else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+            )
+            canon_cfg: CanonicalTier3Config = resolve_canonical_tier3_config(
+                int(getattr(state, "d_assets", 1)),
+                int(getattr(state, "m_rem", 1)),
+                device_type=("cuda" if eff_device.type == "cuda" else "cpu"),
+                n_fallback_paths=n_paths,
             )
             crn_kwargs: dict[str, Any] = {"queries": queries}
-            eff_is_cuda = (
-                device.type == "cuda"
-                if device is not None
-                else torch.cuda.is_available()
-            )
-            req_paths = int(n_paths)
-            if not (eff_is_cuda and req_paths >= 1024):
-                cfg_cls = None
+            cfg_obj: Any = None
+            try:
+                aad_mod = importlib.import_module("deepvol.models.autocall.qmc_aad_greeks")
+                aad_cfg_cls = getattr(aad_mod, "QmcAadGreeksConfig", None)
+                if aad_cfg_cls is not None:
+                    cfg_obj = aad_cfg_cls(
+                        n_paths=canon_cfg.n_paths,
+                        n_replicates=canon_cfg.n_replicates,
+                        n_substeps=canon_cfg.n_substeps,
+                        lv_grid_nt=canon_cfg.lv_grid_nt,
+                        lv_grid_ny=canon_cfg.lv_grid_ny,
+                        cv_mode="multifidelity_gbm",
+                        n_cheap_mf=canon_cfg.n_cheap_mf,
+                        seed=canon_cfg.seed,
+                    )
+            except ImportError:
+                cfg_obj = None
+            if cfg_obj is None:
                 for mod_name in (
                     "deepvol.models.autocall.dupire_qmc_gpu",
                     "deepvol.models.autocall.dupire_qmc_solver",
@@ -1273,54 +1492,28 @@ def _compute_qmc_crn_if_available(
                         qmc_mod = importlib.import_module(mod_name)
                         cfg_cls = getattr(qmc_mod, "DupireQMCConfig", None)
                         if cfg_cls is not None:
+                            cfg_obj = cfg_cls(
+                                n_paths=canon_cfg.n_paths,
+                                n_replicates=canon_cfg.n_replicates,
+                                n_substeps=canon_cfg.n_substeps,
+                                cv_mode=canon_cfg.cv_mode,
+                                seed=canon_cfg.seed,
+                                lv_grid_nt=canon_cfg.lv_grid_nt,
+                                lv_grid_ny=canon_cfg.lv_grid_ny,
+                                adaptive_substeps=canon_cfg.adaptive_substeps,
+                            )
                             break
                     except ImportError:
                         continue
-                if cfg_cls is not None:
-                    if req_paths <= 1024 or eff_is_cuda:
-                        # Keep tiny unit-test budgets and small CUDA probes fast.
-                        crn_kwargs["config"] = cfg_cls(
-                            n_paths=min(max(req_paths, 1), 1024),
-                            n_replicates=1,
-                            n_substeps=2,
-                            lv_grid_nt=16,
-                            lv_grid_ny=32,
-                        )
-                    else:
-                        step_load = max(int(getattr(state, "m_rem", 1)), 1) * max(
-                            int(getattr(state, "d_assets", 1)), 1
-                        )
-                        cpu_substeps = 4 if step_load <= 48 else 2
-                        if req_paths >= 8192:
-                            crn_kwargs["config"] = cfg_cls(
-                                n_paths=8192,
-                                n_replicates=2,
-                                n_substeps=cpu_substeps,
-                                lv_grid_nt=32,
-                                lv_grid_ny=64,
-                            )
-                        elif req_paths >= 4096:
-                            crn_kwargs["config"] = cfg_cls(
-                                n_paths=4096,
-                                n_replicates=1,
-                                n_substeps=cpu_substeps,
-                                lv_grid_nt=32,
-                                lv_grid_ny=64,
-                            )
-                        else:
-                            crn_kwargs["config"] = cfg_cls(
-                                n_paths=min(max(req_paths, 1), 4096),
-                                n_replicates=1,
-                                n_substeps=2,
-                                lv_grid_nt=32,
-                                lv_grid_ny=64,
-                            )
-            if request is not None and "request" in params:
+            crn_kwargs["config"] = cfg_obj if cfg_obj is not None else canon_cfg
+            if request is not None and (accepts_varkw or "request" in params):
                 crn_kwargs["request"] = request
-            if device is not None and "device" in params:
-                crn_kwargs["device"] = device
-            if "theta_roll_days" in params:
+            if accepts_varkw or "device" in params:
+                crn_kwargs["device"] = eff_device
+            if accepts_varkw or "theta_roll_days" in params:
                 crn_kwargs["theta_roll_days"] = int(theta_roll_days)
+            if accepts_varkw or "theta_convention" in params:
+                crn_kwargs["theta_convention"] = str(theta_convention)
             return crn_fn(state, **crn_kwargs)  # type: ignore[no-any-return]
         except Exception as exc:
             logger.warning(
@@ -1464,6 +1657,7 @@ def _assemble_runtime_response(
     vega: Optional[Dict[str, List[List[float]]]],
     rho: Optional[Dict[str, List[float]]],
     repo_rho: Optional[Dict[str, List[float]]],
+    rho_unit_convention: Literal["quote", "decimal"] = "quote",
     dividends_sensitivities: Optional[Dict[str, List[float]]],
     theta: Optional[float],
     cega: Optional[Union[Dict[str, Dict[str, float]], Dict[str, float], List[List[float]]]],
@@ -1526,7 +1720,7 @@ def _assemble_runtime_response(
         Vega=vega,
         Rho=rho,
         RepoRho=repo_rho,
-        rho_unit_convention="quote",
+        rho_unit_convention=rho_unit_convention,
         DividendsSensitivities=dividends_sensitivities,
         Theta=theta,
         Cega=cega_val,
@@ -1642,14 +1836,27 @@ class EQAutocallRuntime:
         m_max: int = M_MAX_DEFAULT,
         guardian: EQAutocallModelGuardian | None = None,
         surrogate: MaskedEQAutocallSurrogate | None = None,
-        n_fallback_paths: int = 32768,
+        n_fallback_paths: int | None = None,
+        theta_convention: str = "murex_bizday_forward_fixed",
+        repair_arbitrage: bool = False,
         strict_checkpoint: bool = False,
         enable_compiled_runner: bool = True,
     ) -> None:
+        if os.environ.get("DEEPVOL_TIER1_CPP_LIB", "").strip().lower() != "numpy":
+            backend = get_tier1_backend()
+            if getattr(backend, "name", None) != "cpp23":
+                raise RuntimeError(
+                    f"Expected Tier-1 native backend 'cpp23' at runtime startup, got {getattr(backend, 'name', None)!r}. "
+                    "Set DEEPVOL_TIER1_CPP_LIB=numpy only when explicitly running without C++23."
+                )
         self._lock = threading.RLock()
         self.d_max = int(d_max)
         self.m_max = int(m_max)
-        self.n_fallback_paths = int(n_fallback_paths)
+        self.n_fallback_paths: int | None = (
+            int(n_fallback_paths) if n_fallback_paths is not None else None
+        )
+        self.theta_convention: str = str(theta_convention)
+        self.repair_arbitrage: bool = bool(repair_arbitrage)
         self.device = (
             torch.device(device)
             if device is not None
@@ -2035,12 +2242,21 @@ class EQAutocallRuntime:
         *,
         include_all_greeks: bool | None = None,
         theta_roll_days: int = 1,
+        theta_convention: str | None = None,
+        repair_arbitrage: bool | None = None,
     ) -> EQAutocallRuntimeResponse:
         """Prices a single Multi-Asset Equity Autocallable trade and computes requested Greeks in `float64`."""
         t0 = time.perf_counter()
         eng_norm = _validate_engine(engine)
         req_model, is_dag = self._parse_request(req)
+        eff_repair = self.repair_arbitrage if repair_arbitrage is None else bool(repair_arbitrage)
+        eff_theta_conv = (
+            self.theta_convention if theta_convention is None else str(theta_convention)
+        )
         allow_cached_mds_digest = isinstance(getattr(req_model, "_raw_payload_digest_hex", None), str)
+        if eff_repair:
+            req_model = _repair_request_surfaces(req_model)
+            allow_cached_mds_digest = False
         return self._price_parsed_trade(
             req_model,
             is_dag=is_dag,
@@ -2048,6 +2264,7 @@ class EQAutocallRuntime:
             t0=t0,
             include_all_greeks=include_all_greeks,
             theta_roll_days=theta_roll_days,
+            theta_convention=eff_theta_conv,
             allow_cached_mds_digest=allow_cached_mds_digest,
         )
 
@@ -2060,6 +2277,7 @@ class EQAutocallRuntime:
         t0: float,
         include_all_greeks: bool | None,
         theta_roll_days: int,
+        theta_convention: str,
         allow_cached_mds_digest: bool,
     ) -> EQAutocallRuntimeResponse:
         src_req = (
@@ -2116,6 +2334,8 @@ class EQAutocallRuntime:
             greeks_extra["request"] = req_model
         if _SUPPORTS_GREEKS_THETA_PARAM:
             greeks_extra["theta_roll_days"] = int(theta_roll_days)
+        if _SUPPORTS_GREEKS_THETA_CONV_PARAM:
+            greeks_extra["theta_convention"] = str(theta_convention)
         greeks_out: AutocallGreeksResult | None = None
         greeks_engine_used = "None"
         persisted_audit_rec: SR262AuditRecord | None = None
@@ -2228,6 +2448,7 @@ class EQAutocallRuntime:
                     post_reasons=post_reasons,
                     pre_diag=diag,
                     theta_roll_days=theta_roll_days,
+                    theta_convention=theta_convention,
                     mds_digest_hex=mds_digest_hex,
                 )
             fb_reasons_str = [r.value for r in (*pre_reasons, *post_reasons)]
@@ -2276,8 +2497,7 @@ class EQAutocallRuntime:
             ] | None = None
             qmc_crn_attempted = False
             if (
-                len(greek_queries_present) > 0
-                and state.m_rem > 0
+                state.m_rem > 0
                 and not state.seasoned_state.already_autocalled
             ):
                 pre_passed_sp, pre_reasons_sp, r_psd_sp, diag_sp = self.guardian.evaluate_pre_inference(
@@ -2296,19 +2516,20 @@ class EQAutocallRuntime:
                     if force_qmc and AutocallFallbackReason.ENGINE_REQUESTED_QMC not in sp_reasons:
                         sp_reasons.append(AutocallFallbackReason.ENGINE_REQUESTED_QMC)
                     qmc_crn_attempted = True
-                    greeks_out = _compute_qmc_crn_if_available(
+                    qmc_stage1_out = _compute_qmc_crn_if_available(
                         state,
                         queries=requested_queries,
                         n_paths=self.n_fallback_paths,
                         request=req_model,
                         device=self.device,
                         theta_roll_days=theta_roll_days,
+                        theta_convention=theta_convention,
                     )
-                    if greeks_out is not None and greeks_out.postproc_output is not None:
-                        post_qmc = greeks_out.postproc_output
+                    if qmc_stage1_out is not None and qmc_stage1_out.postproc_output is not None:
+                        post_qmc = qmc_stage1_out.postproc_output
                         pv_val = float(post_qmc.product_value.detach().cpu().item())
                         se_val = float(
-                            getattr(post_qmc, "standard_error", greeks_out.standard_error)
+                            getattr(post_qmc, "standard_error", qmc_stage1_out.standard_error)
                         )
                         notional_val = float(post_qmc.notional_pv.detach().cpu().item())
                         coupon_val = float(post_qmc.coupon_pv.detach().cpu().item())
@@ -2322,9 +2543,14 @@ class EQAutocallRuntime:
                         fb_reasons_str = [r.value for r in sp_reasons]
                         active_state = state
                         surrogate_for_greeks = None
-                        greeks_engine_used = _map_greeks_engine_label(
-                            getattr(greeks_out, "greeks_engine_used", "qmc_crn")
-                        )
+                        if len(greek_queries_present) > 0:
+                            greeks_out = qmc_stage1_out
+                            greeks_engine_used = _map_greeks_engine_label(
+                                getattr(qmc_stage1_out, "greeks_engine_used", "qmc_crn")
+                            )
+                        else:
+                            greeks_out = None
+                            greeks_engine_used = "None"
                         sp_warns = list(diag_sp.get("warnings", []))
                         audit_rec = SR262AuditRecord(
                             trade_id=req_model.TradeInfo if req_model.TradeInfo is not None else (state.trade_info if state.trade_info is not None else "UNSPECIFIED_TRADE"),
@@ -2383,8 +2609,6 @@ class EQAutocallRuntime:
                 guardian_kwargs: dict[str, Any] = {}
                 if pv_surr_fn is not None:
                     guardian_kwargs["surrogate_forward_fn"] = pv_surr_fn
-                if self.device.type == "cuda":
-                    guardian_kwargs["n_substeps_per_period"] = 4
                 pg_fn = self.guardian.price_with_guardian
                 guardian_params = (
                     _GUARDIAN_PRICE_PARAMS
@@ -2394,8 +2618,7 @@ class EQAutocallRuntime:
                 if pre_gate_sp_res is not None and "pre_gate_result" in guardian_params:
                     guardian_kwargs["pre_gate_result"] = pre_gate_sp_res
                 if (
-                    len(greek_queries_present) > 0
-                    and state.m_rem > 0
+                    state.m_rem > 0
                     and not state.seasoned_state.already_autocalled
                     and not qmc_crn_attempted
                     and "qmc_greeks_fn" in guardian_params
@@ -2413,13 +2636,19 @@ class EQAutocallRuntime:
                             request=req_model,
                             device=self.device,
                             theta_roll_days=theta_roll_days,
+                            theta_convention=theta_convention,
                         )
 
                     guardian_kwargs["qmc_greeks_fn"] = _qmc_greeks_fn_runtime
+                eff_fb_paths = (
+                    self.n_fallback_paths
+                    if self.n_fallback_paths is not None
+                    else (8192 if self.device.type == "cuda" else 4096)
+                )
                 guardian_res: GuardianPricingResult = self.guardian.price_with_guardian(
                     state,
                     surrogate=surr_for_greeks,
-                    n_fallback_paths=self.n_fallback_paths,
+                    n_fallback_paths=eff_fb_paths,
                     force_qmc=force_qmc,
                     record_drift=False,
                     greeks_fn=greeks_fn,
@@ -2477,6 +2706,7 @@ class EQAutocallRuntime:
                     request=req_model,
                     device=self.device,
                     theta_roll_days=theta_roll_days,
+                    theta_convention=theta_convention,
                 )
                 if greeks_out is None:
                     greeks_engine_used = "Tier1_AnalyticalProxy_AD"
@@ -2526,7 +2756,13 @@ class EQAutocallRuntime:
                 with self.guardian._lock:
                     persisted_audit_rec.warnings = list(cur_warns)
 
+        delta_out, gamma_out = _merge_fx_delta_and_gamma(greeks_out, active_state)
         vega_out, cega_out = _merge_fx_vega_and_cega(greeks_out, active_state, req_model)
+        rho_conv: Literal["quote", "decimal"] = (
+            "decimal"
+            if (greeks_out is not None and getattr(greeks_out, "rho_unit_convention", "quote") == "decimal")
+            else "quote"
+        )
         latency_ms = (time.perf_counter() - t0) * 1e3
         primary_fb_reason = fb_reasons_str[0] if len(fb_reasons_str) > 0 else None
 
@@ -2536,8 +2772,8 @@ class EQAutocallRuntime:
             standard_error=se_val,
             cash_to_settle_today=cash_today_val,
             cash_flows=cf_rows,
-            delta=greeks_out.delta if greeks_out is not None else None,
-            gamma=greeks_out.gamma if greeks_out is not None else None,
+            delta=delta_out,
+            gamma=gamma_out,
             cash_gamma=(
                 greeks_out.multivariate_aggregated_cash_gamma
                 if greeks_out is not None
@@ -2546,6 +2782,7 @@ class EQAutocallRuntime:
             vega=vega_out,
             rho=greeks_out.rho if greeks_out is not None else None,
             repo_rho=getattr(greeks_out, "repo_rho", None) if greeks_out is not None else None,
+            rho_unit_convention=rho_conv,
             dividends_sensitivities=(
                 greeks_out.dividends_sensitivities if greeks_out is not None else None
             ),
@@ -2572,12 +2809,21 @@ class EQAutocallRuntime:
         *,
         include_all_greeks: bool = True,
         theta_roll_days: int = 1,
+        theta_convention: str | None = None,
+        repair_arbitrage: bool | None = None,
     ) -> EQAutocallRuntimeResponse:
         """Parses and prices a raw Murex `ConstantMessageMap` DAG payload (such as `eq_autocallable_request.txt`)."""
         t0 = time.perf_counter()
         eng_norm = _validate_engine(engine)
         req_model, parsed_is_dag = self._parse_request(raw_dag_text)
+        eff_repair = self.repair_arbitrage if repair_arbitrage is None else bool(repair_arbitrage)
+        eff_theta_conv = (
+            self.theta_convention if theta_convention is None else str(theta_convention)
+        )
         allow_cached_mds_digest = isinstance(getattr(req_model, "_raw_payload_digest_hex", None), str)
+        if eff_repair:
+            req_model = _repair_request_surfaces(req_model)
+            allow_cached_mds_digest = False
         return self._price_parsed_trade(
             req_model,
             is_dag=parsed_is_dag,
@@ -2585,6 +2831,7 @@ class EQAutocallRuntime:
             t0=t0,
             include_all_greeks=include_all_greeks,
             theta_roll_days=theta_roll_days,
+            theta_convention=eff_theta_conv,
             allow_cached_mds_digest=allow_cached_mds_digest,
         )
 
@@ -3122,6 +3369,7 @@ class EQAutocallRuntime:
         post_reasons: Sequence[AutocallFallbackReason] = (),
         pre_diag: Mapping[str, Any] | None = None,
         theta_roll_days: int = 1,
+        theta_convention: str = "murex_bizday_forward_fixed",
         mds_digest_hex: str | None = None,
     ) -> EQAutocallRuntimeResponse:
         """Executes single-pass post-gate Tier-3/4 Dupire QMC fallback directly on an already preprocessed state."""
@@ -3153,25 +3401,22 @@ class EQAutocallRuntime:
         engine_used_str = "Tier3_DupireQMC"
         fb_triggered = True
         active_state = state_k
+        want_greeks_resp = bool(compute_greeks and len(greek_queries_present) > 0)
 
-        if (
-            compute_greeks
-            and len(greek_queries_present) > 0
-            and state_k.m_rem > 0
-            and not state_k.seasoned_state.already_autocalled
-        ):
-            greeks_out = _compute_qmc_crn_if_available(
+        if state_k.m_rem > 0 and not state_k.seasoned_state.already_autocalled:
+            qmc_stage1_out = _compute_qmc_crn_if_available(
                 state_k,
                 queries=requested_queries,
                 n_paths=self.n_fallback_paths,
                 request=req_m,
                 device=self.device,
                 theta_roll_days=theta_roll_days,
+                theta_convention=theta_convention,
             )
-            if greeks_out is not None and greeks_out.postproc_output is not None:
-                post_qmc = greeks_out.postproc_output
+            if qmc_stage1_out is not None and qmc_stage1_out.postproc_output is not None:
+                post_qmc = qmc_stage1_out.postproc_output
                 pv_val = float(post_qmc.product_value.detach().cpu().item())
-                se_val = float(getattr(post_qmc, "standard_error", greeks_out.standard_error))
+                se_val = float(getattr(post_qmc, "standard_error", qmc_stage1_out.standard_error))
                 notional_val = float(post_qmc.notional_pv.detach().cpu().item())
                 coupon_val = float(post_qmc.coupon_pv.detach().cpu().item())
                 option_val = float(post_qmc.option_pv.detach().cpu().item())
@@ -3179,9 +3424,14 @@ class EQAutocallRuntime:
                 ccy_val = post_qmc.reporting_currency
                 cash_today_val = float(post_qmc.cash_to_settle_today)
                 cf_items = post_qmc.cashflows
-                greeks_engine_used = _map_greeks_engine_label(
-                    getattr(greeks_out, "greeks_engine_used", "qmc_crn")
-                )
+                if want_greeks_resp:
+                    greeks_out = qmc_stage1_out
+                    greeks_engine_used = _map_greeks_engine_label(
+                        getattr(qmc_stage1_out, "greeks_engine_used", "qmc_crn")
+                    )
+                else:
+                    greeks_out = None
+                    greeks_engine_used = "None"
                 diag_m = dict(pre_diag or {})
                 fb_reasons_str = [r.value for r in combined_reasons]
                 audit_rec = SR262AuditRecord(
@@ -3208,17 +3458,18 @@ class EQAutocallRuntime:
                 handled_single_pass = True
 
         if not handled_single_pass:
-            fb_guardian_kw: dict[str, Any] = {}
-            if self.device.type == "cuda":
-                fb_guardian_kw["n_substeps_per_period"] = 4
+            eff_fb_paths = (
+                self.n_fallback_paths
+                if self.n_fallback_paths is not None
+                else (8192 if self.device.type == "cuda" else 4096)
+            )
             guardian_res = self.guardian.price_with_guardian(
                 state_k,
                 surrogate=None,
-                n_fallback_paths=self.n_fallback_paths,
+                n_fallback_paths=eff_fb_paths,
                 force_qmc=True,
                 record_drift=False,
                 greeks_fn=None,
-                **fb_guardian_kw,
             )
             _attach_runtime_market_metadata(
                 guardian_res.preproc_state,
@@ -3226,7 +3477,7 @@ class EQAutocallRuntime:
                 mds_digest_hex=eff_mds_hex,
             )
             active_state = guardian_res.preproc_state
-            if compute_greeks and len(greek_queries_present) > 0:
+            if want_greeks_resp:
                 greeks_extra: dict[str, Any] = {}
                 if _SUPPORTS_STABILIZE_F32_SURROGATE:
                     greeks_extra["stabilize_f32_surrogate"] = True
@@ -3234,6 +3485,8 @@ class EQAutocallRuntime:
                     greeks_extra["request"] = req_m
                 if _SUPPORTS_GREEKS_THETA_PARAM:
                     greeks_extra["theta_roll_days"] = int(theta_roll_days)
+                if _SUPPORTS_GREEKS_THETA_CONV_PARAM:
+                    greeks_extra["theta_convention"] = str(theta_convention)
                 greeks_out = _compute_qmc_crn_if_available(
                     active_state,
                     queries=requested_queries,
@@ -3241,6 +3494,7 @@ class EQAutocallRuntime:
                     request=req_m,
                     device=self.device,
                     theta_roll_days=theta_roll_days,
+                    theta_convention=theta_convention,
                 )
                 if greeks_out is None:
                     greeks_engine_used = "Tier1_AnalyticalProxy_AD"
@@ -3292,7 +3546,13 @@ class EQAutocallRuntime:
         audit_dict["warnings"] = cur_warns
         with self.guardian._lock:
             audit_rec.warnings = list(cur_warns)
+        delta_out, gamma_out = _merge_fx_delta_and_gamma(greeks_out, active_state)
         vega_out, cega_out = _merge_fx_vega_and_cega(greeks_out, active_state, req_m)
+        rho_conv: Literal["quote", "decimal"] = (
+            "decimal"
+            if (greeks_out is not None and getattr(greeks_out, "rho_unit_convention", "quote") == "decimal")
+            else "quote"
+        )
         cf_rows = _build_cashflows_fast(cf_items)
         return _assemble_runtime_response(
             product_value=pv_val,
@@ -3300,8 +3560,8 @@ class EQAutocallRuntime:
             standard_error=se_val,
             cash_to_settle_today=cash_today_val,
             cash_flows=cf_rows,
-            delta=greeks_out.delta if greeks_out is not None else None,
-            gamma=greeks_out.gamma if greeks_out is not None else None,
+            delta=delta_out,
+            gamma=gamma_out,
             cash_gamma=(
                 greeks_out.multivariate_aggregated_cash_gamma
                 if greeks_out is not None
@@ -3310,6 +3570,7 @@ class EQAutocallRuntime:
             vega=vega_out,
             rho=greeks_out.rho if greeks_out is not None else None,
             repo_rho=getattr(greeks_out, "repo_rho", None) if greeks_out is not None else None,
+            rho_unit_convention=rho_conv,
             dividends_sensitivities=(
                 greeks_out.dividends_sensitivities if greeks_out is not None else None
             ),
@@ -3334,6 +3595,9 @@ class EQAutocallRuntime:
         requests: Sequence[EQAutocallableTradeRequest | dict[str, Any] | str],
         compute_greeks: bool = True,
         engine: str = "auto",
+        *,
+        theta_convention: str | None = None,
+        repair_arbitrage: bool | None = None,
     ) -> list[EQAutocallRuntimeResponse]:
         """Prices a sequence of JSON/Pydantic requests via collated batching with market dedup & SR 26-2 audit."""
         if len(requests) == 0 or len(requests) > MAX_BATCH_TRADES:
@@ -3342,6 +3606,10 @@ class EQAutocallRuntime:
             )
 
         engine_norm = _validate_engine(engine)
+        eff_repair = self.repair_arbitrage if repair_arbitrage is None else bool(repair_arbitrage)
+        eff_theta_conv = (
+            self.theta_convention if theta_convention is None else str(theta_convention)
+        )
         full_jacobian_queries = {"Gamma", "Vega", "Rho", "DividendsSensitivities", "Theta"}
 
         model_cache: dict[str, DupireModelSpec] = {}
@@ -3367,7 +3635,13 @@ class EQAutocallRuntime:
         for item in requests:
             req_m: EQAutocallableTradeRequest
             mkt_key: str
-            if isinstance(item, Mapping) and "Product" in item and "Model" in item and set(item.keys()) <= _standard_keys:
+            if (
+                not eff_repair
+                and isinstance(item, Mapping)
+                and "Product" in item
+                and "Model" in item
+                and set(item.keys()) <= _standard_keys
+            ):
                 raw_model_obj = item["Model"]
                 if isinstance(raw_model_obj, Mapping):
                     raw_mds = raw_model_obj.get("MarketDataSet")
@@ -3569,9 +3843,12 @@ class EQAutocallRuntime:
                         req_m = req_m.model_copy(update={"Model": model_cache[mkt_key]})
             else:
                 req_m, _is_dag = self._parse_request(item)
+                if eff_repair:
+                    req_m = _repair_request_surfaces(req_m)
                 mds_hex = _resolve_request_mds_digest_hex(
                     req_m,
-                    allow_cached=isinstance(getattr(req_m, "_raw_payload_digest_hex", None), str),
+                    allow_cached=(not eff_repair)
+                    and isinstance(getattr(req_m, "_raw_payload_digest_hex", None), str),
                 )
                 if mds_hex not in mds_only_cache:
                     _validate_surfaces_for_arbitrage(req_m)
@@ -3849,6 +4126,7 @@ class EQAutocallRuntime:
                         pre_reasons=pre_reasons_k,
                         post_reasons=post_reasons_k,
                         pre_diag=pre_diag_k,
+                        theta_convention=eff_theta_conv,
                     )
                     continue
 
@@ -3886,6 +4164,8 @@ class EQAutocallRuntime:
                     delta_out_k = {
                         orig_ids[i]: float(delta_orig[i]) for i in range(d_act)
                     }
+                    for fx_id in _collect_quanto_fx_ids(state_k):
+                        delta_out_k.setdefault(fx_id, 0.0)
                 cg_out_k = float(cg_np[k]) if "MultivariateAggregatedCashGamma" in q_set else None
                 cega_out_k: _CegaDict | None = None
                 if "Cega" in q_set or "ConvexCega" in q_set:
@@ -3943,6 +4223,8 @@ class EQAutocallRuntime:
                     req_call,
                     engine=engine_norm,
                     include_all_greeks=False,
+                    theta_convention=eff_theta_conv,
+                    repair_arbitrage=False,
                 )
                 if stripped_f and not res_i.stripped_legacy_fields:
                     res_i = res_i.model_copy(update={"stripped_legacy_fields": stripped_f})
