@@ -902,8 +902,6 @@ def _clark_symmetrized(
     elif d == 4:
         trees_d4 = ((0, 1, 2, 3), (2, 3, 0, 1), (0, 2, 1, 3), (1, 3, 0, 2), (0, 3, 1, 2), (1, 2, 0, 3))
         for a, b, c, dd in trees_d4:
-            f_ab, v_ab, w_ab_v, rho_ab = _clark_one_order(2, (f_in[a], f_in[b]), (v_in[a], v_in[b]), ((1.0, corr[a][b]), (corr[b][a], 1.0)), (0, 1), is_best_of, False)
-            del w_ab_v, rho_ab
             # Balanced 2+2 tree via sequential 1-step merges matching C++ clark_d4_tied.
             va = v_in[a] if v_in[a] > 1e-12 else 1e-12
             vb = v_in[b] if v_in[b] > 1e-12 else 1e-12
@@ -1854,12 +1852,14 @@ def _eval_1factor_onestar_np(
     log_ks = math.log(max(one_star_strike, 1e-16))
 
     if d == 1:
-        eps_os = 0.02
+        use_left_os = (ki_barrier > 0.0) and (ko_spread < -1e-9)
+        k_os_eff = (one_star_strike + 0.5 * ko_spread) if use_left_os else one_star_strike
+        eps_os = abs(ko_spread) if use_left_os else 0.02
         f0 = max(f_c[0], 1e-16)
         v0 = max(v_c[0], 1e-12)
-        os_lo = max(one_star_strike - 0.5 * eps_os, 0.0)
-        os_hi = one_star_strike + 0.5 * eps_os
-        inv_os_eps = 1.0 / (os_hi - os_lo)
+        os_lo = max(k_os_eff - 0.5 * eps_os, 0.0)
+        os_hi = k_os_eff + 0.5 * eps_os
+        inv_os_eps = 1.0 / max(os_hi - os_lo, 1e-12)
         surv_mult = surv_prev_term if use_direct_ko else surv_cur
 
         if one_star_strike > 0.0:

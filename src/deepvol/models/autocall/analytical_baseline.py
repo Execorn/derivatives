@@ -2179,12 +2179,14 @@ def _eval_1factor_onestar_torch(
     ko_t = torch.as_tensor(ko_b_term, dtype=torch.float64, device=device)
 
     if d_assets == 1:
-        eps_os = 0.02
+        use_left_os = (ki_barrier > 0.0) and (ko_spread < -1e-9)
+        k_os_eff = (one_star_strike + 0.5 * ko_spread) if use_left_os else one_star_strike
+        eps_os = abs(ko_spread) if use_left_os else 0.02
         f0 = f_c[:, 0].clamp(min=1e-16)
         v0 = v_c[:, 0].clamp(min=1e-12)
-        os_lo = max(one_star_strike - 0.5 * eps_os, 0.0)
-        os_hi = one_star_strike + 0.5 * eps_os
-        inv_os_eps = 1.0 / (os_hi - os_lo)
+        os_lo = max(k_os_eff - 0.5 * eps_os, 0.0)
+        os_hi = k_os_eff + 0.5 * eps_os
+        inv_os_eps = 1.0 / max(os_hi - os_lo, 1e-12)
         surv_mult = surv_prev_term if use_direct_ko else surv_cur
 
         p_onestar_out = torch.zeros(b_sz, dtype=torch.float64, device=device)

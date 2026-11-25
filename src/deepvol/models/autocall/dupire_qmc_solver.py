@@ -1,6 +1,6 @@
-"""dupire_qmc_solver.py — Durrleman Surface Regularizer & Multi-Asset Dupire QMC Solver.
+"""dupire_qmc_solver.py: Durrleman surface regularizer and multi-asset Dupire QMC solver.
 
-Implements SPEC-DEEPVOL-EQ-AUTOCALL-002 §5.5.1 in strict IEEE-754 float64 precision:
+Implements the multi-asset Dupire QMC solver in strict IEEE-754 float64 precision:
   - `RegularizedVolSurface`:
       * Rejects negative implied volatility quotes (`SMILE_ARBITRAGE`) and screens
         spot-independent Durrleman butterfly density g(y) with monotone convex-hull
@@ -1336,7 +1336,7 @@ class RegularizedVolSurface:
         self.content_digest: str = h_surf.hexdigest()
 
     def _freeze_arrays(self) -> None:
-        """Marks all internal NumPy arrays read-only (`CHR-010`)."""
+        """Mark all internal NumPy arrays read-only."""
         arrays: List[Optional[npt.NDArray[Any]]] = [
             self.raw_strikes,
             self.raw_quotes,
@@ -1864,7 +1864,6 @@ class RegularizedVolSurface:
                     d_sig_dv1 = alpha * t1 * v1 / max(t_val * sig, 1e-12)
                     jac_u[idx + 1, :] = d_sig_dv1 * self._eval_basis_u_vec(k_val, slice_idx=idx + 1)
 
-        # Contract through calendar-projection + min-vol floor Jacobian (T1M-013)
         jac_dedup = np.einsum("mu,mnu->nu", jac_u, self.calendar_proj_jacobian)
         jac = np.asarray(jac_dedup @ self.dedup_matrix, dtype=np.float64)
         return sig, jac
@@ -3167,7 +3166,7 @@ def price_eq_autocall_dupire_qmc(
             l_onestar=0.0,
         )
 
-    # Power-of-2 RQMC replicate layout (T1M-009, T1M-024)
+    # Sobol net generation requires power-of-2 point counts per scrambled replicate.
     eff_r = max(1, int(n_replicates)) if scramble else 1
     if eff_r > 1:
         n_rep = _next_power_of_two(max(2, int(n_paths) // eff_r))

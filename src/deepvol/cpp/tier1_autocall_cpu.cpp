@@ -360,6 +360,10 @@ inline double centered_onestar_ramp(double w_best, double k_os, double eps_os) n
     return std::clamp((w_best - (k_os - half)) * inv_eps, 0.0, 1.0);
 }
 
+inline double clamp_grid_u(double u, double hi) noexcept {
+    return (u > 0.0) ? ((u < hi) ? u : hi) : 0.0;
+}
+
 constexpr double kInvSqrt2 = 0.70710678118654752440084436210485;
 constexpr double kInvSqrt2Pi = 0.39894228040143267793994605993438;
 constexpr double kSqrtHalfPi = 1.2533141373155002512078826424055;
@@ -3195,12 +3199,14 @@ void eval_1factor_onestar(
     const double log_ks = std::log(std::max(one_star_strike, 1e-16));
 
     if (d == 1) {
-        constexpr double kOneStarEpsD1 = 0.02;
+        const bool use_left_os = (ki_barrier > 0.0) && (ko_spread < -1e-9);
+        const double k_os_eff = use_left_os ? (one_star_strike + 0.5 * ko_spread) : one_star_strike;
+        const double eps_os = use_left_os ? std::abs(ko_spread) : 0.02;
         const double f0 = std::max(f_c[0], 1e-16);
         const double v0 = std::max(v_c[0], 1e-12);
-        const double os_lo = std::max(one_star_strike - 0.5 * kOneStarEpsD1, 0.0);
-        const double os_hi = one_star_strike + 0.5 * kOneStarEpsD1;
-        const double inv_os_eps = 1.0 / (os_hi - os_lo);
+        const double os_lo = std::max(k_os_eff - 0.5 * eps_os, 0.0);
+        const double os_hi = k_os_eff + 0.5 * eps_os;
+        const double inv_os_eps = 1.0 / std::max(os_hi - os_lo, 1e-12);
 
         if (one_star_strike > 0.0) {
             const double blo_ko = std::min(ko_b_term, ko_b_term + ko_spread);
@@ -4421,7 +4427,7 @@ void crn_step_1d_trajectories_cpp(
         double* lv_slice_end = lv_slice_end_vec.data();
 
         auto fill_lv_slice = [&](const double* lv_b, double t_val, double* dst_slice) noexcept {
-            const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+            const double u_t = (lv_nt > 1) ? clamp_grid_u(t_val * inv_dt_grid, max_u_t) : 0.0;
             const int it0 = static_cast<int>(u_t);
             const int it1 = std::min(it0 + 1, lv_nt - 1);
             const double wt = (lv_nt > 1) ? (u_t - static_cast<double>(it0)) : 0.0;
@@ -4533,7 +4539,7 @@ void crn_step_1d_trajectories_cpp(
                             const double zd = z_ptr[n];
                             auto lookup_scalar = [&](const double* slice_ptr, double y_val) noexcept -> double {
                                 const double u_raw = (lv_ny > 1) ? ((y_val - lv_y_min) * inv_dy_grid) : 0.0;
-                                const double u_y = (u_raw > 0.0) ? ((u_raw < max_u_y) ? u_raw : max_u_y) : 0.0;
+                                const double u_y = clamp_grid_u(u_raw, max_u_y);
                                 const int iy0 = static_cast<int>(u_y);
                                 const int iy1 = std::min(iy0 + 1, lv_ny - 1);
                                 const double wy = u_y - static_cast<double>(iy0);
@@ -4660,7 +4666,7 @@ std::int32_t crn_step_spot_bumps_cpp(
         std::vector<double> sl1_m(lv_ny_sz + 4, 0.0);
 
         auto fill_lv_slice = [&](const double* lv_b, double t_val, double* dst_slice) noexcept {
-            const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+            const double u_t = (lv_nt > 1) ? clamp_grid_u(t_val * inv_dt_grid, max_u_t) : 0.0;
             const int it0 = static_cast<int>(u_t);
             const int it1 = std::min(it0 + 1, lv_nt - 1);
             const double wt = (lv_nt > 1) ? (u_t - static_cast<double>(it0)) : 0.0;
@@ -4798,7 +4804,7 @@ std::int32_t crn_step_spot_bumps_cpp(
                         auto lookup_scalar = [&](const double* slice_ptr, double y_val) noexcept -> double {
                             if (lv_ny <= 1) return slice_ptr[0];
                             const double u_raw = (y_val - y_min_d) * inv_dy_grid;
-                            const double u_y = std::clamp(u_raw, 0.0, max_u_y);
+                            const double u_y = clamp_grid_u(u_raw, max_u_y);
                             const int iy0 = static_cast<int>(u_y);
                             const int iy1 = std::min(iy0 + 1, lv_ny - 1);
                             const double wy = u_y - static_cast<double>(iy0);
@@ -5360,14 +5366,14 @@ inline BilinearLvEval eval_lv_bilinear_with_deriv(
     double max_u_t,
     double max_u_y
 ) noexcept {
-    const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+    const double u_t = (lv_nt > 1) ? clamp_grid_u(t_val * inv_dt_grid, max_u_t) : 0.0;
     const int it0 = static_cast<int>(u_t);
     const int it1 = std::min(it0 + 1, lv_nt - 1);
     const double wt = u_t - static_cast<double>(it0);
 
     const double u_y_raw = (lv_ny > 1) ? ((y_val - y_min) * inv_dy_grid) : 0.0;
     const bool in_y = (lv_ny > 1) && (u_y_raw > 0.0) && (u_y_raw < max_u_y);
-    const double u_y = (lv_ny > 1) ? std::clamp(u_y_raw, 0.0, max_u_y) : 0.0;
+    const double u_y = (lv_ny > 1) ? clamp_grid_u(u_y_raw, max_u_y) : 0.0;
     const int iy0 = static_cast<int>(u_y);
     const int iy1 = std::min(iy0 + 1, lv_ny - 1);
     const double wy = u_y - static_cast<double>(iy0);
@@ -5398,12 +5404,12 @@ inline double eval_lv_bilinear_val(
     double max_u_t,
     double max_u_y
 ) noexcept {
-    const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+    const double u_t = (lv_nt > 1) ? clamp_grid_u(t_val * inv_dt_grid, max_u_t) : 0.0;
     const int it0 = static_cast<int>(u_t);
     const int it1 = std::min(it0 + 1, lv_nt - 1);
     const double wt = u_t - static_cast<double>(it0);
 
-    const double u_y = (lv_ny > 1) ? std::clamp((y_val - y_min) * inv_dy_grid, 0.0, max_u_y) : 0.0;
+    const double u_y = (lv_ny > 1) ? clamp_grid_u((y_val - y_min) * inv_dy_grid, max_u_y) : 0.0;
     const int iy0 = static_cast<int>(u_y);
     const int iy1 = std::min(iy0 + 1, lv_ny - 1);
     const double wy = u_y - static_cast<double>(iy0);
@@ -6320,7 +6326,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                     const double inv_dy_d = inv_dy_vec[du];
 
                     auto fill_lv_slice = [&](double t_val, double* dst) noexcept {
-                        const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+                        const double u_t = (lv_nt > 1) ? clamp_grid_u(t_val * inv_dt_grid, max_u_t) : 0.0;
                         const int it0 = static_cast<int>(u_t);
                         const int it1 = std::min(it0 + 1, lv_nt - 1);
                         const double wt = (lv_nt > 1) ? (u_t - static_cast<double>(it0)) : 0.0;
@@ -6339,7 +6345,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
 
                     auto lookup_scalar = [&](const double* sl, double y_v) noexcept -> double {
                         if (lv_ny <= 1) return sl[0];
-                        const double u_y = std::clamp((y_v - y_min_d) * inv_dy_d, 0.0, max_u_y);
+                        const double u_y = clamp_grid_u((y_v - y_min_d) * inv_dy_d, max_u_y);
                         const int iy0 = static_cast<int>(u_y);
                         const int iy1 = std::min(iy0 + 1, lv_ny - 1);
                         const double wy = u_y - static_cast<double>(iy0);
@@ -6353,7 +6359,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                         }
                         const double u_raw = (y_v - y_min_d) * inv_dy_d;
                         const bool in_y = (u_raw > 0.0) && (u_raw < max_u_y);
-                        const double u_y = std::clamp(u_raw, 0.0, max_u_y);
+                        const double u_y = clamp_grid_u(u_raw, max_u_y);
                         const int iy0 = static_cast<int>(u_y);
                         const int iy1 = std::min(iy0 + 1, lv_ny - 1);
                         const double wy = u_y - static_cast<double>(iy0);
@@ -6724,7 +6730,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                     const double inv_dy_d = inv_dy_vec[du];
 
                     auto fill_lv_slice_meta = [&](double t_val, double* dst, int& it0_out, int& it1_out, double& wt_out) noexcept {
-                        const double u_t = (lv_nt > 1) ? std::clamp(t_val * inv_dt_grid, 0.0, max_u_t) : 0.0;
+                        const double u_t = (lv_nt > 1) ? clamp_grid_u(t_val * inv_dt_grid, max_u_t) : 0.0;
                         const int it0 = static_cast<int>(u_t);
                         const int it1 = std::min(it0 + 1, lv_nt - 1);
                         const double wt = (lv_nt > 1) ? (u_t - static_cast<double>(it0)) : 0.0;
@@ -6865,7 +6871,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
 #endif
                             auto lookup_scalar_bwd = [&](const double* sl, double y_v) noexcept -> double {
                                 if (lv_ny <= 1) return sl[0];
-                                const double u_y = std::clamp((y_v - y_min_d) * inv_dy_d, 0.0, max_u_y);
+                                const double u_y = clamp_grid_u((y_v - y_min_d) * inv_dy_d, max_u_y);
                                 const int iy0 = static_cast<int>(u_y);
                                 const int iy1 = std::min(iy0 + 1, lv_ny - 1);
                                 const double wy = u_y - static_cast<double>(iy0);
@@ -7088,7 +7094,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                 }
                                 const double u_raw = (y_v - y_min_d) * inv_dy_d;
                                 const bool in_y = (u_raw > 0.0) && (u_raw < max_u_y);
-                                const double u_y = std::clamp(u_raw, 0.0, max_u_y);
+                                const double u_y = clamp_grid_u(u_raw, max_u_y);
                                 iy0_out = static_cast<int>(u_y);
                                 iy1_out = std::min(iy0_out + 1, lv_ny - 1);
                                 wy_out = u_y - static_cast<double>(iy0_out);
@@ -7309,7 +7315,6 @@ std::int32_t crn_generate_sobol_normals_cpp(const SobolGenArgs* args) noexcept {
     const int n_threads = omp_guard.active ? omp_guard.n_threads : 1;
     const std::size_t n_gen_u = static_cast<std::size_t>(n_gen);
 
-    // Step 1: Generate Sobol + Brownian-bridge substeps into z_indep [M, n_sub, eff_r, n_rep, D].
     #pragma omp parallel if(omp_guard.active) num_threads(n_threads)
     {
         std::vector<double> zc_buf(n_gen_u);
@@ -7367,7 +7372,6 @@ std::int32_t crn_generate_sobol_normals_cpp(const SobolGenArgs* args) noexcept {
         }
     }
 
-    // Step 2: Optional temporal rotation across M periods via bb_ortho_mat [M, M].
     if (apply_bb && M > 1) {
         const double* bb = args->bb_ortho_mat;
         const std::size_t rep_d = Nrep_u * Du;
@@ -7430,7 +7434,6 @@ std::int32_t crn_generate_sobol_normals_cpp(const SobolGenArgs* args) noexcept {
         }
     }
 
-    // Step 3: Optional cross-asset Cholesky correlation z_corr_out = z_indep @ chol_mat.T.
     if (args->z_corr_out != nullptr) {
         if (apply_corr) {
             const double* chol = args->chol_mat;
@@ -7594,14 +7597,14 @@ std::int32_t crn_eval_vibrato_gamma_cpp(const VibratoGammaArgs* args) noexcept {
     auto eval_terminal_opt = [&](const IdxBaseStats& st, double wo, double wb, double os_ind) noexcept -> double {
         double ki_g = 1.0;
         if (is_long_basket) {
-            if (has_ki && !ki_active) {
-                ki_g = i_ki_past;
-            } else {
+            if (!has_ki || i_ki_past < 0.5) {
                 const double w_wof = st.min1;
                 ki_g = hard_ki_sp
                     ? std::clamp((bhi_ki_islb - w_wof) * inv_sp_ki_islb, 0.0, 1.0)
                     : ((w_wof < strike) ? 1.0 : 0.0);
                 if (has_ki) ki_g = std::max(i_ki_past, ki_g);
+            } else {
+                ki_g = i_ki_past;
             }
         } else if (ki_active) {
             ki_g = hard_ki_sp

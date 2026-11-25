@@ -1,4 +1,4 @@
-"""dupire_qmc_gpu.py — GPU-Vectorized Owen-Scrambled RQMC Dupire Local-Vol Solver & PEMC.
+"""dupire_qmc_gpu.py: GPU-vectorized Owen-scrambled RQMC Dupire local-vol solver and PEMC.
 
 Implements SPEC-DEEPVOL-EQ-AUTOCALL-002 §5.5.2 for NVIDIA Ampere (`sm_86`) and CPU fallback:
   - `DupireQMCConfig` & `DupireQMCBackend` protocol unifying:
@@ -410,13 +410,19 @@ def resolve_dupire_qmc_config(
                 seed=seed,
             )
             return DupireQMCConfig.from_canonical(canonical, mode=mode, precision=precision)
-    except Exception:
+    except ImportError:
         pass
 
-    eff_paths = int(n_fallback_paths) if n_fallback_paths is not None else (8192 if device_type == "cuda" else 4096)
-    eff_r = 8 if (device_type == "cuda" or eff_paths >= 8192) else 4
-    n_sub = 4 if device_type == "cuda" else (8 if (int(d_assets) * int(m_rem)) <= 96 else 4)
-    n_cheap = max(65536, 4 * eff_paths)
+    _ = (int(d_assets), int(m_rem))
+    dev_tok = "cuda" if str(device_type).strip().lower().startswith("cuda") else "cpu"
+    eff_paths = (
+        max(2, int(n_fallback_paths))
+        if n_fallback_paths is not None
+        else (8192 if dev_tok == "cuda" else 4096)
+    )
+    eff_r = min(max(1, eff_paths // 2), 8 if (dev_tok == "cuda" or eff_paths >= 8192) else 4)
+    n_sub = 4
+    n_cheap = max(262144, 8 * eff_paths) if dev_tok == "cuda" else max(32768, 8 * eff_paths)
     return DupireQMCConfig(
         n_paths=eff_paths,
         n_replicates=eff_r,
@@ -444,13 +450,13 @@ def _resolve_ki_obs_mode(state: Any) -> str:
     if not ki_str:
         return "European"
     ki_norm = ki_str.lower()
-    if ki_norm == "european":
+    if ki_norm in ("european", "terminal", "atmaturity", "maturity"):
         return "European"
-    if ki_norm == "discrete":
+    if ki_norm in ("discrete", "periodic", "observation"):
         return "Discrete"
     if ki_norm == "daily":
         return "Daily"
-    if ki_norm == "continuous":
+    if ki_norm in ("continuous", "american"):
         return "Continuous"
     return "European"
 
@@ -465,6 +471,20 @@ def _resolve_onestar_effective_params(
         sp = float(ko_spread)
         return float(one_star_strike) + 0.5 * sp, abs(sp)
     return float(one_star_strike), 0.02
+
+
+def _resolve_eff_and_ki_opt_indices(state: Any) -> Tuple[str, str, bool]:
+    """Return `(eff_opt_idx, ki_opt_idx, is_long)` aligned with `dupire_qmc_solver`."""
+    is_long = bool(getattr(state, "is_long_basket", False))
+    raw_opt_idx = getattr(state, "option_index", None)
+    fallback = str(raw_opt_idx if raw_opt_idx else state.callability_index)
+    eff_opt_idx = (
+        "AverageOf"
+        if (is_long and (raw_opt_idx is None or str(raw_opt_idx).strip() in ("", "WorstOf")))
+        else fallback
+    )
+    ki_opt_idx = "WorstOf" if is_long else fallback
+    return eff_opt_idx, ki_opt_idx, is_long
 
 
 class DupireQMCBackend(Protocol):
@@ -2419,8 +2439,10 @@ if _HAS_TRITON:
         else:
             star_ind = w_max * 0.0
 
-        if HAS_PUT:
-            if IS_LONG_BASKET:
+        if IS_LONG_BASKET:
+            if HAS_KI and IS_DISCRETE_KI:
+                ki_wof_k = 1.0 - not_ki
+            else:
                 if HAS_KI_SPREAD:
                     blo_lb = tl.minimum(strike, strike + ki_spread)
                     bhi_lb = tl.maximum(strike, strike + ki_spread)
@@ -2430,25 +2452,29 @@ if _HAS_TRITON:
                 else:
                     ki_up_lb = tl.where(w_min >= strike, 1.0, 0.0)
                 ki_wof_k = 1.0 - ki_up_lb
-                put_int = ((1.0 - w_avg) * ki_wof_k) / option_gearing
-            else:
-                put_int = tl.maximum(strike - w_opt, 0.0)
-                if HAS_LOW_K:
-                    put_int = tl.minimum(put_int, max_spread_put)
-                if HAS_KI:
-                    if IS_DISCRETE_KI:
-                        ki_ind = 1.0 - not_ki
+            eff_gearing = tl.where(tl.abs(option_gearing) > 1e-12, option_gearing, 1.0)
+            put_int = ((1.0 - w_avg) * ki_wof_k) / eff_gearing
+            if HAS_ONESTAR:
+                put_int = put_int * (1.0 - star_ind)
+            unit_put = al_next * put_int
+        elif HAS_PUT:
+            put_int = tl.maximum(strike - w_opt, 0.0)
+            if HAS_LOW_K:
+                put_int = tl.minimum(put_int, max_spread_put)
+            if HAS_KI:
+                if IS_DISCRETE_KI:
+                    ki_ind = 1.0 - not_ki
+                else:
+                    if HAS_KI_SPREAD:
+                        blo_ki = tl.minimum(ki_barrier, ki_barrier + ki_spread)
+                        bhi_ki = tl.maximum(ki_barrier, ki_barrier + ki_spread)
+                        ki_up = tl.minimum(
+                            tl.maximum((w_opt - blo_ki) / tl.maximum(bhi_ki - blo_ki, 1e-9), 0.0), 1.0
+                        )
                     else:
-                        if HAS_KI_SPREAD:
-                            blo_ki = tl.minimum(ki_barrier, ki_barrier + ki_spread)
-                            bhi_ki = tl.maximum(ki_barrier, ki_barrier + ki_spread)
-                            ki_up = tl.minimum(
-                                tl.maximum((w_opt - blo_ki) / tl.maximum(bhi_ki - blo_ki, 1e-9), 0.0), 1.0
-                            )
-                        else:
-                            ki_up = tl.where(w_opt >= ki_barrier, 1.0, 0.0)
-                        ki_ind = 1.0 - ki_up
-                    put_int = put_int * ki_ind
+                        ki_up = tl.where(w_opt >= ki_barrier, 1.0, 0.0)
+                    ki_ind = 1.0 - ki_up
+                put_int = put_int * ki_ind
             if HAS_ONESTAR:
                 put_int = put_int * (1.0 - star_ind)
             unit_put = al_next * put_int
@@ -2704,10 +2730,11 @@ if _HAS_TRITON:
                 else tl.full((BLOCK_N,), 1.0, dtype=tl.float64)
             )
 
+        w_ki = w_min if IS_LONG_BASKET else w_opt
         al_next, unp_next, tpv, not_ki, stop_m, cpn_al_m, cpn_undisc_m = _mf_period_step_triton(
             w_call,
             w_cpn,
-            w_opt,
+            w_ki,
             al,
             unp,
             tpv,
@@ -2774,10 +2801,11 @@ if _HAS_TRITON:
                     if IS_DISCRETE_KI
                     else tl.full((BLOCK_N,), 1.0, dtype=tl.float64)
                 )
+            wg_ki = wg_min if IS_LONG_BASKET else wg_opt
             al_g_next, unp_g_next, tpv_g, not_ki_g, _, _, _ = _mf_period_step_triton(
                 wg_call,
                 wg_cpn,
-                wg_opt,
+                wg_ki,
                 al_g,
                 unp_g,
                 tpv_g,
@@ -3354,14 +3382,15 @@ if _HAS_TRITON:
                 cpn_ind = tl.maximum(cpn_ind, ko_ind)
 
             if HAS_KI and IS_DISCRETE_KI:
+                w_ki_m = w_min if IS_LONG_BASKET else w_opt
                 if HAS_KI_SPREAD:
                     blo_ki = tl.minimum(ki_barrier, ki_barrier + ki_spread)
                     bhi_ki = tl.maximum(ki_barrier, ki_barrier + ki_spread)
                     ki_up_m = tl.minimum(
-                        tl.maximum((w_opt - blo_ki) / tl.maximum(bhi_ki - blo_ki, 1e-9), 0.0), 1.0
+                        tl.maximum((w_ki_m - blo_ki) / tl.maximum(bhi_ki - blo_ki, 1e-9), 0.0), 1.0
                     )
                 else:
-                    ki_up_m = tl.where(w_opt >= ki_barrier, 1.0, 0.0)
+                    ki_up_m = tl.where(w_ki_m >= ki_barrier, 1.0, 0.0)
                 not_ki = not_ki * ki_up_m
 
             df_m = tl.load(df_pay_ptr + m)
@@ -3430,12 +3459,13 @@ if _HAS_TRITON:
                 if FORCE_CPN_AC:
                     cpn_g = tl.maximum(cpn_g, ko_g)
                 if HAS_KI and IS_DISCRETE_KI:
+                    wg_ki_m = wg_min if IS_LONG_BASKET else wg_opt_m
                     if HAS_KI_SPREAD:
                         ki_ug = tl.minimum(
-                            tl.maximum((wg_opt_m - blo_ki) / tl.maximum(bhi_ki - blo_ki, 1e-9), 0.0), 1.0
+                            tl.maximum((wg_ki_m - blo_ki) / tl.maximum(bhi_ki - blo_ki, 1e-9), 0.0), 1.0
                         )
                     else:
-                        ki_ug = tl.where(wg_opt_m >= ki_barrier, 1.0, 0.0)
+                        ki_ug = tl.where(wg_ki_m >= ki_barrier, 1.0, 0.0)
                     not_ki_g = not_ki_g * ki_ug
                 tpv_g = tpv_g - al_g * wf_m
                 st_g = al_g * ko_g
@@ -3459,9 +3489,11 @@ if _HAS_TRITON:
         else:
             star_ind = tl.zeros((BLOCK_N,), dtype=tl.float64)
 
-        if HAS_PUT:
-            if IS_LONG_BASKET:
-                w_avg_term = w_sum * (1.0 / float(D_ASSETS))
+        if IS_LONG_BASKET:
+            w_avg_term = w_sum * (1.0 / float(D_ASSETS))
+            if HAS_KI and IS_DISCRETE_KI:
+                ki_wof_k = 1.0 - not_ki
+            else:
                 if HAS_KI_SPREAD:
                     blo_lb = tl.minimum(strike, strike + ki_spread)
                     bhi_lb = tl.maximum(strike, strike + ki_spread)
@@ -3471,25 +3503,29 @@ if _HAS_TRITON:
                 else:
                     ki_up_lb = tl.where(w_min >= strike, 1.0, 0.0)
                 ki_wof_k = 1.0 - ki_up_lb
-                put_int = ((1.0 - w_avg_term) * ki_wof_k) / option_gearing
-            else:
-                put_int = tl.maximum(strike - w_opt_term, 0.0)
-                if HAS_LOW_K:
-                    put_int = tl.minimum(put_int, max_spread_put)
-                if HAS_KI:
-                    if IS_DISCRETE_KI:
-                        ki_ind = 1.0 - not_ki
+            eff_gearing = tl.where(tl.abs(option_gearing) > 1e-12, option_gearing, 1.0)
+            put_int = ((1.0 - w_avg_term) * ki_wof_k) / eff_gearing
+            if HAS_ONESTAR:
+                put_int = put_int * (1.0 - star_ind)
+            unit_put = al * put_int
+        elif HAS_PUT:
+            put_int = tl.maximum(strike - w_opt_term, 0.0)
+            if HAS_LOW_K:
+                put_int = tl.minimum(put_int, max_spread_put)
+            if HAS_KI:
+                if IS_DISCRETE_KI:
+                    ki_ind = 1.0 - not_ki
+                else:
+                    if HAS_KI_SPREAD:
+                        blo_ki = tl.minimum(ki_barrier, ki_barrier + ki_spread)
+                        bhi_ki = tl.maximum(ki_barrier, ki_barrier + ki_spread)
+                        ki_up = tl.minimum(
+                            tl.maximum((w_opt_term - blo_ki) / tl.maximum(bhi_ki - blo_ki, 1e-9), 0.0), 1.0
+                        )
                     else:
-                        if HAS_KI_SPREAD:
-                            blo_ki = tl.minimum(ki_barrier, ki_barrier + ki_spread)
-                            bhi_ki = tl.maximum(ki_barrier, ki_barrier + ki_spread)
-                            ki_up = tl.minimum(
-                                tl.maximum((w_opt_term - blo_ki) / tl.maximum(bhi_ki - blo_ki, 1e-9), 0.0), 1.0
-                            )
-                        else:
-                            ki_up = tl.where(w_opt_term >= ki_barrier, 1.0, 0.0)
-                        ki_ind = 1.0 - ki_up
-                    put_int = put_int * ki_ind
+                        ki_up = tl.where(w_opt_term >= ki_barrier, 1.0, 0.0)
+                    ki_ind = 1.0 - ki_up
+                put_int = put_int * ki_ind
             if HAS_ONESTAR:
                 put_int = put_int * (1.0 - star_ind)
             unit_put = al * put_int
@@ -3520,9 +3556,11 @@ if _HAS_TRITON:
                 )
             else:
                 star_g = tl.zeros((BLOCK_N,), dtype=tl.float64)
-            if HAS_PUT:
-                if IS_LONG_BASKET:
-                    wg_avg_term = wg_sum * (1.0 / float(D_ASSETS))
+            if IS_LONG_BASKET:
+                wg_avg_term = wg_sum * (1.0 / float(D_ASSETS))
+                if HAS_KI and IS_DISCRETE_KI:
+                    ki_wof_kg = 1.0 - not_ki_g
+                else:
                     if HAS_KI_SPREAD:
                         blo_lb_g = tl.minimum(strike, strike + ki_spread)
                         bhi_lb_g = tl.maximum(strike, strike + ki_spread)
@@ -3532,25 +3570,29 @@ if _HAS_TRITON:
                     else:
                         ki_up_lb_g = tl.where(wg_min >= strike, 1.0, 0.0)
                     ki_wof_kg = 1.0 - ki_up_lb_g
-                    put_g = ((1.0 - wg_avg_term) * ki_wof_kg) / option_gearing
-                else:
-                    put_g = tl.maximum(strike - wg_opt_term, 0.0)
-                    if HAS_LOW_K:
-                        put_g = tl.minimum(put_g, max_spread_put)
-                    if HAS_KI:
-                        if IS_DISCRETE_KI:
-                            ki_g = 1.0 - not_ki_g
+                eff_gearing_g = tl.where(tl.abs(option_gearing) > 1e-12, option_gearing, 1.0)
+                put_g = ((1.0 - wg_avg_term) * ki_wof_kg) / eff_gearing_g
+                if HAS_ONESTAR:
+                    put_g = put_g * (1.0 - star_g)
+                uput_g = al_g * put_g
+            elif HAS_PUT:
+                put_g = tl.maximum(strike - wg_opt_term, 0.0)
+                if HAS_LOW_K:
+                    put_g = tl.minimum(put_g, max_spread_put)
+                if HAS_KI:
+                    if IS_DISCRETE_KI:
+                        ki_g = 1.0 - not_ki_g
+                    else:
+                        if HAS_KI_SPREAD:
+                            blo_ki = tl.minimum(ki_barrier, ki_barrier + ki_spread)
+                            bhi_ki = tl.maximum(ki_barrier, ki_barrier + ki_spread)
+                            ki_upg = tl.minimum(
+                                tl.maximum((wg_opt_term - blo_ki) / tl.maximum(bhi_ki - blo_ki, 1e-9), 0.0), 1.0
+                            )
                         else:
-                            if HAS_KI_SPREAD:
-                                blo_ki = tl.minimum(ki_barrier, ki_barrier + ki_spread)
-                                bhi_ki = tl.maximum(ki_barrier, ki_barrier + ki_spread)
-                                ki_upg = tl.minimum(
-                                    tl.maximum((wg_opt_term - blo_ki) / tl.maximum(bhi_ki - blo_ki, 1e-9), 0.0), 1.0
-                                )
-                            else:
-                                ki_upg = tl.where(wg_opt_term >= ki_barrier, 1.0, 0.0)
-                            ki_g = 1.0 - ki_upg
-                        put_g = put_g * ki_g
+                            ki_upg = tl.where(wg_opt_term >= ki_barrier, 1.0, 0.0)
+                        ki_g = 1.0 - ki_upg
+                    put_g = put_g * ki_g
                 if HAS_ONESTAR:
                     put_g = put_g * (1.0 - star_g)
                 uput_g = al_g * put_g
@@ -3837,10 +3879,11 @@ if _HAS_TRITON:
             c_m = tl.load(cpn_amt_ptr + m)
             wf_m = tl.load(w_fund_ptr + m)
 
+            w_ki_p = w_min_p if IS_LONG_BASKET else w_opt_p
             al_p, unp_p, tpv_p, not_ki_p, _, _, _ = _mf_period_step_triton(
                 w_call_p,
                 w_cpn_p,
-                w_opt_p,
+                w_ki_p,
                 al_p,
                 unp_p,
                 tpv_p,
@@ -3870,10 +3913,11 @@ if _HAS_TRITON:
                 HAS_KI_SPREAD,
                 IS_DISCRETE_KI,
             )
+            w_ki_m = w_min_m if IS_LONG_BASKET else w_opt_m
             al_m, unp_m, tpv_m, not_ki_m, _, _, _ = _mf_period_step_triton(
                 w_call_m,
                 w_cpn_m,
-                w_opt_m,
+                w_ki_m,
                 al_m,
                 unp_m,
                 tpv_m,
@@ -4440,7 +4484,7 @@ def _eval_gpu_surface_local_vol_table(
     n_y: int,
     device: torch.device,
 ) -> Tuple[torch.Tensor, float, float]:
-    """Builds adaptive (N_t, N_y) float32 Dupire LV table on GPU in < 0.2 ms."""
+    """Build adaptive (N_t, N_y) float32 Dupire local-volatility table on GPU."""
     g = _get_surface_gpu_tensors(surf, device)
     strikes = g["strikes"]
     tenors = g["tenors"]
@@ -4605,7 +4649,6 @@ def _eval_gpu_surface_local_vol_table(
         d2w1_dk2 = 2.0 * t1 * (dv1 * dv1 + v1 * d2v1)
         d2w_dk2 = (1.0 - alpha) * d2w0_dk2 + alpha * d2w1_dk2
 
-        # Handle t_surf <= tenors[0] and t_surf >= tenors[-1] cleanly
         low_t = (t_surf <= tenors[0])[:, None]
         high_t = (t_surf >= tenors[-1])[:, None]
         sig_0, dsig_0, d2sig_0 = v_all[:, :, 0], dv_all[:, :, 0], d2v_all[:, :, 0]
@@ -5132,15 +5175,14 @@ class GpuTorchDupireQMC:
             )
 
         eff_cpn_idx = state.coupon_index if state.coupon_index else state.callability_index
-        raw_opt_idx = state.option_index
-        is_long = bool(getattr(state, "is_long_basket", False))
-        eff_opt_idx = raw_opt_idx if raw_opt_idx else state.callability_index
+        eff_opt_idx, ki_opt_idx, is_long = _resolve_eff_and_ki_opt_indices(state)
         cpn_dir = str(getattr(state, "coupon_barrier_direction", "Up") or "Up").strip().lower()
         cpn_type = str(getattr(state, "coupon_barrier_type", "In") or "In").strip().lower()
 
         call_code = _qmc_index_code(state.callability_index)
         cpn_code = _qmc_index_code(eff_cpn_idx)
         opt_code = _qmc_index_code(eff_opt_idx)
+        ki_opt_code = _qmc_index_code(ki_opt_idx)
         is_diff_opt = opt_code in _DIFF_INDEX_CODES
 
         ki_mode = _resolve_ki_obs_mode(state)
@@ -6066,7 +6108,7 @@ class GpuTorchDupireQMC:
                         perf_curr_ti = perf_curr_ti.permute(0, 2, 1)
                         lv_ti = torch.sqrt(dv_t / dt_m_ti).permute(0, 2, 1).expand(rc_fb, n_rep, d_assets)
                         p_noki_cont = p_noki_cont * _eval_continuous_ki_step_survival_torch(
-                            perf_sub_prev, perf_curr_ti, corr_64, lv_ti, dt_m_ti, eff_opt_idx, opt_code, ki_bar_val, inv_perm_gpu
+                            perf_sub_prev, perf_curr_ti, corr_64, lv_ti, dt_m_ti, ki_opt_idx, ki_opt_code, ki_bar_val, inv_perm_gpu
                         )
                         perf_sub_prev = perf_curr_ti
                 else:
@@ -6251,8 +6293,8 @@ class GpuTorchDupireQMC:
                                     corr_64,
                                     lv0.to(torch.float64).permute(0, 2, 1),
                                     dt_sub,
-                                    eff_opt_idx,
-                                    opt_code,
+                                    ki_opt_idx,
+                                    ki_opt_code,
                                     ki_bar_val,
                                     inv_perm_gpu,
                                 )
@@ -6271,7 +6313,7 @@ class GpuTorchDupireQMC:
                 w_call = _evaluate_monitoring_index_gpu(perf_m, state.callability_index, inv_perm_gpu)
                 w_cpn = w_call if same_cpn_call else _evaluate_monitoring_index_gpu(perf_m, eff_cpn_idx, inv_perm_gpu)
                 if is_discrete_ki and state.ki_barrier is not None:
-                    w_opt_m = _evaluate_monitoring_index_gpu(perf_m, eff_opt_idx, inv_perm_gpu)
+                    w_opt_m = _evaluate_monitoring_index_gpu(perf_m, ki_opt_idx, inv_perm_gpu)
                     not_ki_disc = not_ki_disc * _digital_ramp_torch(w_opt_m, float(state.ki_barrier), float(state.ki_spread))
 
                 if is_callable_np[m] > 0.5:
@@ -6331,7 +6373,7 @@ class GpuTorchDupireQMC:
                     wc_g = _evaluate_monitoring_index_gpu(perf_mg, state.callability_index, inv_perm_gpu)
                     wq_g = wc_g if same_cpn_call else _evaluate_monitoring_index_gpu(perf_mg, eff_cpn_idx, inv_perm_gpu)
                     if is_discrete_ki and state.ki_barrier is not None:
-                        w_og_m = _evaluate_monitoring_index_gpu(perf_mg, eff_opt_idx, inv_perm_gpu)
+                        w_og_m = _evaluate_monitoring_index_gpu(perf_mg, ki_opt_idx, inv_perm_gpu)
                         not_ki_gbm = not_ki_gbm * _digital_ramp_torch(w_og_m, float(state.ki_barrier), float(state.ki_spread))
                     ko_g = _digital_ramp_torch(wc_g, float(ko_barriers_np[m]), float(state.ko_spread)) if is_callable_np[m] > 0.5 else torch.zeros_like(alive_gbm)
                     if is_guar_np[m] > 0.5:
@@ -6370,24 +6412,35 @@ class GpuTorchDupireQMC:
                 w_best = _evaluate_monitoring_index_gpu(perf_term, "BestOf", inv_perm_gpu)
                 star_ind = _onestar_ramp_torch(w_best, one_star_strike, one_star_eps)
 
-            if has_put:
-                if is_long:
-                    avg_t = _evaluate_monitoring_index_gpu(perf_term, "AverageOf", inv_perm_gpu)
-                    wof_t = _evaluate_monitoring_index_gpu(perf_term, "WorstOf", inv_perm_gpu)
-                    ki_wof_k = 1.0 - _digital_ramp_torch(wof_t, float(state.strike), float(state.ki_spread))
-                    put_int = ((1.0 - avg_t) * ki_wof_k) / float(state.option_gearing)
+            if is_long:
+                avg_t = _evaluate_monitoring_index_gpu(perf_term, "AverageOf", inv_perm_gpu)
+                wof_t = _evaluate_monitoring_index_gpu(perf_term, "WorstOf", inv_perm_gpu)
+                if has_ki and state.ki_barrier is not None:
+                    if p_noki_cont is not None:
+                        ki_wof_k = 1.0 - p_noki_cont
+                    elif is_discrete_ki:
+                        ki_wof_k = 1.0 - not_ki_disc
+                    else:
+                        ki_wof_k = 1.0 - _digital_ramp_torch(wof_t, float(state.strike), float(state.ki_spread))
                 else:
-                    put_int = torch.clamp(float(state.strike) - w_opt, min=0.0)
-                    if has_low_k:
-                        put_int = torch.clamp(put_int, max=max_spread_put)
-                    if has_ki and state.ki_barrier is not None:
-                        if p_noki_cont is not None:
-                            ki_ind = 1.0 - p_noki_cont
-                        elif is_discrete_ki:
-                            ki_ind = 1.0 - not_ki_disc
-                        else:
-                            ki_ind = 1.0 - _digital_ramp_torch(w_opt, float(state.ki_barrier), float(state.ki_spread))
-                        put_int = put_int * ki_ind
+                    ki_wof_k = 1.0 - _digital_ramp_torch(wof_t, float(state.strike), float(state.ki_spread))
+                eff_gearing = float(state.option_gearing) if abs(float(state.option_gearing)) > 1e-12 else 1.0
+                put_int = ((1.0 - avg_t) * ki_wof_k) / eff_gearing
+                if star_ind is not None:
+                    put_int = put_int * (1.0 - star_ind)
+                unit_put_blk = alive * put_int
+            elif has_put:
+                put_int = torch.clamp(float(state.strike) - w_opt, min=0.0)
+                if has_low_k:
+                    put_int = torch.clamp(put_int, max=max_spread_put)
+                if has_ki and state.ki_barrier is not None:
+                    if p_noki_cont is not None:
+                        ki_ind = 1.0 - p_noki_cont
+                    elif is_discrete_ki:
+                        ki_ind = 1.0 - not_ki_disc
+                    else:
+                        ki_ind = 1.0 - _digital_ramp_torch(w_opt, float(state.ki_barrier), float(state.ki_spread))
+                    put_int = put_int * ki_ind
                 if star_ind is not None:
                     put_int = put_int * (1.0 - star_ind)
                 unit_put_blk = alive * put_int
@@ -6432,23 +6485,29 @@ class GpuTorchDupireQMC:
                         one_star_strike,
                         one_star_eps,
                     )
-                if has_put:
-                    if is_long:
-                        avg_tg = _evaluate_monitoring_index_gpu(perf_tg, "AverageOf", inv_perm_gpu)
-                        wof_tg = _evaluate_monitoring_index_gpu(perf_tg, "WorstOf", inv_perm_gpu)
-                        ki_wof_kg = 1.0 - _digital_ramp_torch(wof_tg, float(state.strike), float(state.ki_spread))
-                        pi_g = ((1.0 - avg_tg) * ki_wof_kg) / float(state.option_gearing)
+                if is_long:
+                    avg_tg = _evaluate_monitoring_index_gpu(perf_tg, "AverageOf", inv_perm_gpu)
+                    wof_tg = _evaluate_monitoring_index_gpu(perf_tg, "WorstOf", inv_perm_gpu)
+                    if has_ki and state.ki_barrier is not None and is_discrete_ki:
+                        ki_wof_kg = 1.0 - not_ki_gbm
                     else:
-                        pi_g = torch.clamp(float(state.strike) - w_og, min=0.0)
-                        if has_low_k:
-                            pi_g = torch.clamp(pi_g, max=max_spread_put)
-                        if has_ki and state.ki_barrier is not None:
-                            ki_g_ind = (
-                                1.0 - not_ki_gbm
-                                if is_discrete_ki
-                                else (1.0 - _digital_ramp_torch(w_og, float(state.ki_barrier), float(state.ki_spread)))
-                            )
-                            pi_g = pi_g * ki_g_ind
+                        ki_wof_kg = 1.0 - _digital_ramp_torch(wof_tg, float(state.strike), float(state.ki_spread))
+                    eff_gearing_g = float(state.option_gearing) if abs(float(state.option_gearing)) > 1e-12 else 1.0
+                    pi_g = ((1.0 - avg_tg) * ki_wof_kg) / eff_gearing_g
+                    if st_g_term is not None:
+                        pi_g = pi_g * (1.0 - st_g_term)
+                    up_g = alive_gbm * pi_g
+                elif has_put:
+                    pi_g = torch.clamp(float(state.strike) - w_og, min=0.0)
+                    if has_low_k:
+                        pi_g = torch.clamp(pi_g, max=max_spread_put)
+                    if has_ki and state.ki_barrier is not None:
+                        ki_g_ind = (
+                            1.0 - not_ki_gbm
+                            if is_discrete_ki
+                            else (1.0 - _digital_ramp_torch(w_og, float(state.ki_barrier), float(state.ki_spread)))
+                        )
+                        pi_g = pi_g * ki_g_ind
                     if st_g_term is not None:
                         pi_g = pi_g * (1.0 - st_g_term)
                     up_g = alive_gbm * pi_g
@@ -6604,6 +6663,7 @@ class GpuTorchDupireQMC:
         opt_code = _qmc_index_code(eff_opt_idx)
         is_diff_opt = opt_code in _DIFF_INDEX_CODES
         is_long = bool(getattr(state, "is_long_basket", False))
+        ki_opt_idx = "WorstOf" if is_long else eff_opt_idx
         ki_mode = _resolve_ki_obs_mode(state)
         has_ki = (
             state.ki_barrier is not None
@@ -6984,7 +7044,7 @@ class GpuTorchDupireQMC:
                 w_call_m = _evaluate_monitoring_index_gpu(perf_m, state.callability_index, inv_perm_gpu)
                 w_cpn_m = w_call_m if same_cpn_call else _evaluate_monitoring_index_gpu(perf_m, eff_cpn_idx, inv_perm_gpu)
                 if is_discrete_ki and state.ki_barrier is not None:
-                    w_opt_m = _evaluate_monitoring_index_gpu(perf_m, eff_opt_idx, inv_perm_gpu)
+                    w_opt_m = _evaluate_monitoring_index_gpu(perf_m, ki_opt_idx, inv_perm_gpu)
                     not_ki_c = not_ki_c * _digital_ramp_torch(w_opt_m, float(state.ki_barrier), float(state.ki_spread))
                 ko_i = (
                     _digital_ramp_torch(w_call_m, float(ko_barriers_np[m]), float(state.ko_spread))
@@ -7029,23 +7089,29 @@ class GpuTorchDupireQMC:
                     one_star_strike,
                     one_star_eps,
                 )
-            if has_put:
-                if is_long:
-                    avg_t = _evaluate_monitoring_index_gpu(perf_last, "AverageOf", inv_perm_gpu)
-                    wof_t = _evaluate_monitoring_index_gpu(perf_last, "WorstOf", inv_perm_gpu)
-                    ki_wof_k = 1.0 - _digital_ramp_torch(wof_t, float(state.strike), float(state.ki_spread))
-                    pi = ((1.0 - avg_t) * ki_wof_k) / float(state.option_gearing)
+            if is_long:
+                avg_t = _evaluate_monitoring_index_gpu(perf_last, "AverageOf", inv_perm_gpu)
+                wof_t = _evaluate_monitoring_index_gpu(perf_last, "WorstOf", inv_perm_gpu)
+                if has_ki and state.ki_barrier is not None and is_discrete_ki:
+                    ki_wof_k = 1.0 - not_ki_c
                 else:
-                    pi = torch.clamp(float(state.strike) - w_opt, min=0.0)
-                    if has_low_k:
-                        pi = torch.clamp(pi, max=max_spread_put)
-                    if has_ki and state.ki_barrier is not None:
-                        ki_c = (
-                            1.0 - not_ki_c
-                            if is_discrete_ki
-                            else (1.0 - _digital_ramp_torch(w_opt, float(state.ki_barrier), float(state.ki_spread)))
-                        )
-                        pi = pi * ki_c
+                    ki_wof_k = 1.0 - _digital_ramp_torch(wof_t, float(state.strike), float(state.ki_spread))
+                eff_gearing = float(state.option_gearing) if abs(float(state.option_gearing)) > 1e-12 else 1.0
+                pi = ((1.0 - avg_t) * ki_wof_k) / eff_gearing
+                if st_term is not None:
+                    pi = pi * (1.0 - st_term)
+                up = alive * pi
+            elif has_put:
+                pi = torch.clamp(float(state.strike) - w_opt, min=0.0)
+                if has_low_k:
+                    pi = torch.clamp(pi, max=max_spread_put)
+                if has_ki and state.ki_barrier is not None:
+                    ki_c = (
+                        1.0 - not_ki_c
+                        if is_discrete_ki
+                        else (1.0 - _digital_ramp_torch(w_opt, float(state.ki_barrier), float(state.ki_spread)))
+                    )
+                    pi = pi * ki_c
                 if st_term is not None:
                     pi = pi * (1.0 - st_term)
                 up = alive * pi
@@ -7305,9 +7371,7 @@ class GpuTorchDupireQMC:
         surfs_flat: List[Any] = []
         div_events_flat: List[Sequence[Any]] = []
         for bi, st in enumerate(st_chunk):
-            raw_o = st.option_index
-            is_long_i = bool(getattr(st, "is_long_basket", False))
-            e_opt_i = str(raw_o if raw_o else st.callability_index)
+            e_opt_i, _, is_long_i = _resolve_eff_and_ki_opt_indices(st)
             opt_c_i = _qmc_index_code(e_opt_i)
             is_diff_i = opt_c_i in _DIFF_INDEX_CODES
             scal_np[0, bi] = float(st.seasoned_state.c_mem_0)
@@ -7419,6 +7483,7 @@ class GpuTorchDupireQMC:
         call_groups: Dict[Tuple[str, Optional[Tuple[int, ...]]], List[int]] = {}
         cpn_groups: Dict[Tuple[str, Optional[Tuple[int, ...]]], List[int]] = {}
         opt_groups: Dict[Tuple[str, Optional[Tuple[int, ...]]], List[int]] = {}
+        ki_opt_groups: Dict[Tuple[str, Optional[Tuple[int, ...]]], List[int]] = {}
         cpn_diff_list: List[int] = []
         cpn_down_flags: List[bool] = []
         cpn_out_flags: List[bool] = []
@@ -7433,9 +7498,9 @@ class GpuTorchDupireQMC:
             if e_cpn != c_idx:
                 cpn_diff_list.append(bi)
                 cpn_groups.setdefault((e_cpn, p_key), []).append(bi)
-            raw_o = st.option_index
-            e_opt = str(raw_o if raw_o else st.callability_index)
+            e_opt, ki_opt_i, _ = _resolve_eff_and_ki_opt_indices(st)
             opt_groups.setdefault((e_opt, p_key), []).append(bi)
+            ki_opt_groups.setdefault((ki_opt_i, p_key), []).append(bi)
             cpn_down_flags.append(str(getattr(st, "coupon_barrier_direction", "Up") or "Up").strip().lower() == "down")
             cpn_out_flags.append(str(getattr(st, "coupon_barrier_type", "In") or "In").strip().lower() == "out")
         call_groups_t = [
@@ -7447,6 +7512,11 @@ class GpuTorchDupireQMC:
         opt_groups_t = [
             (k, torch.tensor(v, dtype=torch.long, device=dev)) for k, v in opt_groups.items()
         ]
+        ki_opt_groups_t = (
+            opt_groups_t
+            if ki_opt_groups == opt_groups
+            else [(k, torch.tensor(v, dtype=torch.long, device=dev)) for k, v in ki_opt_groups.items()]
+        )
         cpn_down_mask_t = torch.tensor(cpn_down_flags, dtype=torch.bool, device=dev).view(b_c, 1)
         cpn_out_mask_t = torch.tensor(cpn_out_flags, dtype=torch.bool, device=dev).view(b_c, 1)
 
@@ -7689,8 +7759,8 @@ class GpuTorchDupireQMC:
                         dw_cpn[idx_t] = gwq_g * dperf_diag[idx_t]
 
             if has_any_disc_ki and not_ki_disc_b is not None:
-                if len(opt_groups_t) == 1:
-                    (o_idx_only, p_key_only), _ = opt_groups_t[0]
+                if len(ki_opt_groups_t) == 1:
+                    (o_idx_only, p_key_only), _ = ki_opt_groups_t[0]
                     inv_p_only = perm_cache.get(p_key_only) if p_key_only is not None else None
                     w_opt_m, gwo_m = _eval_index_and_grad_gpu(
                         perf_m, o_idx_only, inv_p_only, compute_grad=compute_pathwise_delta, asset_dim=1
@@ -7707,7 +7777,7 @@ class GpuTorchDupireQMC:
                         if compute_pathwise_delta
                         else None
                     )
-                    for (o_idx_g, p_key_g), idx_t in opt_groups_t:
+                    for (o_idx_g, p_key_g), idx_t in ki_opt_groups_t:
                         inv_p_g = perm_cache.get(p_key_g) if p_key_g is not None else None
                         wo_g, gwo_g = _eval_index_and_grad_gpu(
                             perf_m[idx_t], o_idx_g, inv_p_g, compute_grad=compute_pathwise_delta, asset_dim=1
@@ -7974,13 +8044,14 @@ class GpuTorchDupireQMC:
             ki_wof_up, dki_wof_up = _digital_ramp_and_deriv_batch(
                 w_wof_b, strike_b, ki_spr_b, compute_deriv=compute_pathwise_delta
             )
-            ki_wof_k = 1.0 - ki_wof_up
-            gearing_safe = torch.where(gearing_b.abs() > 1e-12, gearing_b, torch.ones_like(gearing_b))
-            raw_put_lb = torch.where(
-                has_put_b,
-                ((1.0 - w_avg_b) * ki_wof_k) / gearing_safe,
-                torch.zeros_like(w_opt_b),
+            ki_wof_eu = 1.0 - ki_wof_up
+            ki_wof_k = (
+                torch.where(is_disc_ki_b, 1.0 - not_ki_disc_b, ki_wof_eu)
+                if (has_any_disc_ki and not_ki_disc_b is not None)
+                else ki_wof_eu
             )
+            gearing_safe = torch.where(gearing_b.abs() > 1e-12, gearing_b, torch.ones_like(gearing_b))
+            raw_put_lb = ((1.0 - w_avg_b) * ki_wof_k) / gearing_safe
             raw_put_b = torch.where(is_long_b, raw_put_lb, raw_put_b)
             if (
                 compute_pathwise_delta
@@ -7991,17 +8062,19 @@ class GpuTorchDupireQMC:
             ):
                 dw_avg_b = gw_avg_b * dperf_term_diag
                 dw_wof_b = gw_wof_b * dperf_term_diag
-                d_ki_wof_k = (
+                d_ki_wof_eu = (
                     (-dki_wof_up).unsqueeze(1) * dw_wof_b
                     if dki_wof_up is not None
                     else torch.zeros_like(d_raw_put_b)
                 )
-                d_raw_put_lb = torch.where(
-                    has_put_b.unsqueeze(1),
-                    (-dw_avg_b * ki_wof_k.unsqueeze(1) + (1.0 - w_avg_b).unsqueeze(1) * d_ki_wof_k)
-                    / gearing_safe.unsqueeze(1),
-                    torch.zeros_like(d_raw_put_b),
+                d_ki_wof_k = (
+                    torch.where(is_disc_ki_b.unsqueeze(1), -d_not_ki_disc_b, d_ki_wof_eu)
+                    if (has_any_disc_ki and d_not_ki_disc_b is not None)
+                    else d_ki_wof_eu
                 )
+                d_raw_put_lb = (
+                    -dw_avg_b * ki_wof_k.unsqueeze(1) + (1.0 - w_avg_b).unsqueeze(1) * d_ki_wof_k
+                ) / gearing_safe.unsqueeze(1)
                 d_raw_put_b = torch.where(is_long_b.unsqueeze(1), d_raw_put_lb, d_raw_put_b)
 
         star_ind_b = torch.zeros_like(w_opt_b)
