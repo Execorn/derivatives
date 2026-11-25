@@ -266,6 +266,7 @@ class AutocallPreprocState:
     coupon_barrier_type: str = "In"
     coupon_barrier_direction: str = "Up"
     cash_to_settle_today: float = 0.0
+    ki_obs_type: str | None = None
     quanto_meta: dict[str, Any] = field(default_factory=dict)
     asset_financing_curves: dict[str, Any] = field(default_factory=dict)
     discount_curve_id: str | None = None
@@ -1732,6 +1733,7 @@ def _state_digest_sections(
         state.option_index,
         state.coupon_barrier_type,
         state.coupon_barrier_direction,
+        state.ki_obs_type,
         {
             str(k): [(ev.ex_date, ev.payment_date, float(ev.amount)) for ev in evs]
             for k, evs in state.dividend_schedule.dividend_events.items()
@@ -3118,9 +3120,10 @@ def preprocess_eq_autocall(
     ki_barrier = float(ki_barrier_raw) if ki_barrier_raw is not None else None
 
     ki_obs_type_raw = _extract_attr(
-        product, "OptionDownAndInBarrierObservationType", "ki_observation_type"
+        product, "OptionDownAndInBarrierObservationType", "ki_observation_type", "ki_obs_type"
     )
-    ki_obs_type = str(getattr(ki_obs_type_raw, "value", ki_obs_type_raw)) if ki_obs_type_raw else None
+    ki_obs_type_s = str(getattr(ki_obs_type_raw, "value", ki_obs_type_raw)).strip() if ki_obs_type_raw else ""
+    ki_obs_type: str | None = ki_obs_type_s or None
     ki_monitored_past_override = _extract_attr(product, "ki_monitored_past")
     if ki_monitored_past_override is not None:
         ki_monitored_past = bool(ki_monitored_past_override)
@@ -3184,10 +3187,6 @@ def preprocess_eq_autocall(
         if modifiers is not None
         else _extract_attr(product, "IsLongBasket", "is_long_basket", default=False)
     )
-    if is_long_basket and (
-        option_index is None or option_index.strip() == "" or option_index.strip() == "WorstOf"
-    ):
-        option_index = "AverageOf"
     part_strike_raw = (
         _extract_attr(modifiers, "participation_call_strike")
         if modifiers is not None
@@ -3426,6 +3425,7 @@ def preprocess_eq_autocall(
         fixings=fixings_map,
         ki_barrier=ki_barrier,
         ki_monitored_past=ki_monitored_past,
+        ki_obs_type=ki_obs_type,
         allow_autocall_on_expiry=allow_autocall_on_expiry,
         force_coupons_on_autocall=force_coupons_on_autocall,
         autocall_coupon=autocall_coupon,
@@ -3869,6 +3869,7 @@ def preprocess_eq_autocall(
         coupon_barrier_type=cpn_barrier_type,
         coupon_barrier_direction=cpn_barrier_direction,
         cash_to_settle_today=seasoned.cash_to_settle_today,
+        ki_obs_type=seasoned.ki_obs_type,
         quanto_meta=div_out.quanto_meta,
         asset_financing_curves=asset_fin_curves,
         discount_curve_id=disc_curve_id,
@@ -4403,6 +4404,11 @@ def _append_future_cashflow_items(
         add_cf(_fast_cf("Option", pay_dt, opt_only_amt, se_opt))
         add_cf(_fast_cf("Notional", pay_dt, notional_rem_amt, 0.0))
         return
+    if preproc_state.allow_autocall_on_expiry and not no_notional:
+        add_cf(_fast_cf("Notional", pay_dt, df_last * p_last, 0.0))
+        add_cf(_fast_cf("Option", pay_dt, opt_amt, se_opt))
+        add_cf(_fast_cf("Notional", pay_dt, df_last * surv_last, 0.0))
+        return
     add_cf(_fast_cf("Option", pay_dt, opt_amt, se_opt))
     add_cf(_fast_cf("Notional", pay_dt, notional_amt, 0.0))
 
@@ -4659,7 +4665,7 @@ def assemble_autocall_cashflows_and_pv(
         coupon_pv_s = float(coupon_cf_np.sum())
         funding_pv_s = float(fund_np.sum())
         pv_it_s = float(preproc_state.pv_in_transit)
-        pv_total_s = pv_it_s + notional_pv_s + coupon_pv_s + opt_amt - funding_pv_s
+        pv_total_s = pv_it_s + cash_today + notional_pv_s + coupon_pv_s + opt_amt - funding_pv_s
 
         cashflows_fast: list[CashFlowItem] = list(ss.past_cashflows) if build_cashflow_items else []
         if build_cashflow_items:
@@ -4789,7 +4795,8 @@ def assemble_autocall_cashflows_and_pv(
         )
         need_grad_empty = bool(zero_link.requires_grad or pv_in_transit_t.requires_grad)
         z_s = zero_link if need_grad_empty else torch.tensor(0.0, dtype=torch.float64, device=device)
-        pv_out_empty = pv_in_transit_t + zero_link if need_grad_empty else pv_in_transit_t
+        pv_base_empty = pv_in_transit_t + cash_today
+        pv_out_empty = pv_base_empty + zero_link if need_grad_empty else pv_base_empty
         p_zero = 0.0 * p_t if need_grad_empty else torch.zeros(m_rem, dtype=torch.float64, device=device)
         q_zero = 0.0 * q_t if need_grad_empty else torch.zeros(m_rem, dtype=torch.float64, device=device)
         l_put_zero = 0.0 * l_put_t if need_grad_empty else torch.tensor(0.0, dtype=torch.float64, device=device)
@@ -5009,7 +5016,7 @@ def assemble_autocall_cashflows_and_pv(
         coupon_pv = coupon_cf_t.sum()
         funding_pv = funding_cf_t.sum()
         option_pv = cf_option_term
-        product_value = pv_in_transit_t + notional_pv + coupon_pv + option_pv - funding_pv
+        product_value = pv_in_transit_t + cash_today + notional_pv + coupon_pv + option_pv - funding_pv
 
         if build_cashflow_items:
             scalars_ad = torch.stack(

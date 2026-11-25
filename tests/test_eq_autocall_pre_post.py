@@ -421,6 +421,11 @@ def test_m1_in_transit_expiry_and_cash_to_settle_today(
         curve.AsOfDate = final_pay
     st_settle = preprocess_eq_autocall(req_settle)
     assert st_settle.seasoned_state.cash_to_settle_today == pytest.approx(1.0 + expected_opt, abs=1e-11)
+    assert any(cf.StatusText == "SettlesToday" for cf in st_settle.seasoned_state.past_cashflows)
+    assert all(
+        cf.StatusText == ("SettlesToday" if cf.Date.date() == final_pay.date() else "Settled")
+        for cf in st_settle.seasoned_state.past_cashflows
+    )
     asm_settle = assemble_autocall_cashflows_and_pv(
         st_settle,
         p_stop=torch.zeros(0, dtype=torch.float64),
@@ -428,6 +433,7 @@ def test_m1_in_transit_expiry_and_cash_to_settle_today(
         l_put=torch.tensor(0.0, dtype=torch.float64),
     )
     assert asm_settle.cash_to_settle_today == pytest.approx(1.0 + expected_opt, abs=1e-11)
+    assert float(asm_settle.product_value.item()) == pytest.approx(1.0 + expected_opt, abs=1e-11)
 
 
 def test_m1_quanto_dividends_and_fx_tenors(
@@ -1169,6 +1175,128 @@ def test_pre_post_audit_blind_spots(
         payment_currency="RUB",
     )
     assert ed_2m.forward_perf.shape == (1, 2) and torch.isfinite(ed_2m.forward_perf).all()
+
+
+def test_settles_today_ki_obs_is_long_basket_dual_expiry_and_coupon_undisc(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    """Verify SettlesToday PV inclusion, ki_obs_type persistence, IsLongBasket option_index,
+    AllowAutocallOnExpiry dual maturity Notional rows, and Class B2 coupon_cf_undisc override."""
+    req_orig, _ = parsed_dag
+
+    # 1. SettlesToday with remaining future periods: past < AsOfDate is Settled, == AsOfDate is SettlesToday,
+    #    and cash_to_settle_today is included in ProductValue on both fast and AD paths.
+    req_st = copy.deepcopy(req_orig)
+    as_of_st = req_st.Product.PaymentDates[9]
+    req_st.Product.IsMemory = False
+    req_st.Model.MarketDataSet.AsOfDate = as_of_st
+    for curve in req_st.Model.MarketDataSet.RatesCurvesBundles.values():
+        curve.AsOfDate = as_of_st
+    for tkr, ref_s in zip(req_st.Product.UnderlyingIdentifiers, req_st.Product.UnderlyingReferenceSpots):
+        fix = req_st.Model.MarketDataSet.Fixings[tkr]
+        # Force period 9 (index 9) coupon hit (above 0.90 cpn barrier, below 0.925 KO barrier)
+        fix.Values[9] = float(ref_s) * 0.91
+    st_today = preprocess_eq_autocall(req_st)
+    assert st_today.already_autocalled is False and st_today.m_rem >= 1
+    assert isinstance(req_st.Product.FixedCouponAmount, float)
+    assert st_today.cash_to_settle_today == pytest.approx(float(req_st.Product.FixedCouponAmount), abs=1e-12)
+    settles_today_rows = [cf for cf in st_today.seasoned_state.past_cashflows if cf.StatusText == "SettlesToday"]
+    assert len(settles_today_rows) == 3
+    assert all(cf.Date.date() == as_of_st.date() for cf in settles_today_rows)
+
+    p0 = torch.zeros(st_today.m_rem, dtype=torch.float64)
+    q0 = torch.zeros(st_today.m_rem, dtype=torch.float64)
+    asm_fast = assemble_autocall_cashflows_and_pv(st_today, p_stop=p0, q_cpn=q0, l_put=torch.tensor(0.0, dtype=torch.float64))
+    asm_ad = assemble_autocall_cashflows_and_pv(
+        st_today,
+        p_stop=p0.clone().requires_grad_(True),
+        q_cpn=q0.clone().requires_grad_(True),
+        l_put=torch.tensor(0.0, dtype=torch.float64, requires_grad=True),
+    )
+    expected_pv_today = float(asm_fast.notional_pv.item()) + float(asm_fast.coupon_pv.item()) + st_today.cash_to_settle_today
+    assert float(asm_fast.product_value.item()) == pytest.approx(expected_pv_today, abs=1e-12)
+    assert float(asm_ad.product_value.item()) == pytest.approx(expected_pv_today, abs=1e-12)
+
+    # 2. ki_obs_type persistence across SeasonedScheduleState, AutocallPreprocState, digest, and spot template
+    digests: dict[str | None, str] = {}
+    for mode in (None, "European", "Discrete", "Daily", "Continuous"):
+        req_ki = copy.deepcopy(req_orig)
+        req_ki.Product.OptionDownAndInBarrierLevel = 0.70
+        req_ki.Product.OptionDownAndInBarrierObservationType = mode
+        st_ki = preprocess_eq_autocall(req_ki)
+        assert st_ki.ki_obs_type == mode
+        assert st_ki.seasoned_state.ki_obs_type == mode
+        digests[mode] = st_ki.state_digest
+        # Spot-shock template reuse preserves ki_obs_type
+        req_ki_bump = copy.deepcopy(req_ki)
+        t0_k = req_ki_bump.Product.UnderlyingIdentifiers[0]
+        req_ki_bump.Model.MarketDataSet.Spots[t0_k] *= 1.01
+        st_ki_bump = preprocess_eq_autocall(req_ki_bump)
+        assert st_ki_bump.ki_obs_type == mode
+        assert st_ki_bump.seasoned_state.ki_obs_type == mode
+    assert len(set(digests.values())) == 5
+
+    # 3. IsLongBasket preserves true option_index (WorstOf) instead of forcing AverageOf
+    req_lb = copy.deepcopy(req_orig)
+    req_lb.Product.IsLongBasket = True
+    req_lb.Product.OptionMonitoringIndex = "WorstOf"
+    req_lb.Product.OptionDownAndInBarrierLevel = 0.80
+    req_lb.Product.OptionDownAndInBarrierObservationType = "Discrete"
+    # Breach WorstOf in historical period 0 while AverageOf stays above 0.80
+    u0 = req_lb.Product.UnderlyingIdentifiers[0]
+    req_lb.Model.MarketDataSet.Fixings[u0].Values[0] = float(req_lb.Product.UnderlyingReferenceSpots[0]) * 0.50
+    for u_other, ref_other in zip(
+        req_lb.Product.UnderlyingIdentifiers[1:], req_lb.Product.UnderlyingReferenceSpots[1:]
+    ):
+        req_lb.Model.MarketDataSet.Fixings[u_other].Values[0] = float(ref_other) * 1.10
+    st_lb = preprocess_eq_autocall(req_lb)
+    assert st_lb.is_long_basket is True
+    assert st_lb.option_index == "WorstOf"
+    assert st_lb.seasoned_state.i_ki_past == pytest.approx(1.0, abs=1e-12)
+
+    # 4. AllowAutocallOnExpiry=True emits dual maturity Notional rows (expiry-autocall + survival)
+    req_exp = copy.deepcopy(req_orig)
+    req_exp.Product.AllowAutocallOnExpiry = True
+    req_exp.Product.AutoCallTriggerLevels[-1] = 1.00
+    st_exp = preprocess_eq_autocall(req_exp)
+    asm_exp = assemble_autocall_cashflows_and_pv(
+        st_exp,
+        p_stop=torch.tensor([0.25], dtype=torch.float64),
+        q_cpn=torch.tensor([0.25], dtype=torch.float64),
+        l_put=torch.tensor(0.10, dtype=torch.float64),
+    )
+    assert len(asm_exp.cashflows) == 38
+    df_last = float(st_exp.df_pay[-1].item())
+    tail_rows = asm_exp.cashflows[-5:]
+    assert [r.Description for r in tail_rows] == ["FundingLeg", "Coupon", "Notional", "Option", "Notional"]
+    assert tail_rows[2].Amount == pytest.approx(df_last * 0.25, abs=1e-12)
+    assert tail_rows[4].Amount == pytest.approx(df_last * 0.75, abs=1e-12)
+    assert tail_rows[2].Amount + tail_rows[4].Amount == pytest.approx(float(asm_exp.notional_pv.item()), abs=1e-12)
+
+    # 5. Class B2 coupon_cf_undisc is always honored for IsMemory=Y (fast + AD paths)
+    req_mem = copy.deepcopy(req_orig)
+    req_mem.Model.MarketDataSet.AsOfDate = req_mem.Product.StartDate
+    for curve in req_mem.Model.MarketDataSet.RatesCurvesBundles.values():
+        curve.AsOfDate = req_mem.Product.StartDate
+    st_mem = preprocess_eq_autocall(req_mem)
+    assert st_mem.is_memory is True and st_mem.m_rem > 1
+    undisc_override = np.linspace(0.01, 0.05, st_mem.m_rem, dtype=np.float64)
+    p_mem = torch.full((st_mem.m_rem,), 0.02, dtype=torch.float64)
+    q_mem = torch.full((st_mem.m_rem,), 0.50, dtype=torch.float64)
+    asm_b2_fast = assemble_autocall_cashflows_and_pv(
+        st_mem, p_stop=p_mem, q_cpn=q_mem, coupon_cf_undisc=undisc_override
+    )
+    undisc_t = torch.tensor(undisc_override, dtype=torch.float64, requires_grad=True)
+    asm_b2_ad = assemble_autocall_cashflows_and_pv(
+        st_mem, p_stop=p_mem, q_cpn=q_mem, coupon_cf_undisc=undisc_t
+    )
+    expected_cpn_pv = float((st_mem.df_pay * torch.tensor(undisc_override, dtype=torch.float64)).sum().item())
+    assert float(asm_b2_fast.coupon_pv.item()) == pytest.approx(expected_cpn_pv, abs=1e-12)
+    assert float(asm_b2_ad.coupon_pv.item()) == pytest.approx(expected_cpn_pv, abs=1e-12)
+    asm_b2_ad.coupon_pv.backward()
+    assert undisc_t.grad is not None
+    torch.testing.assert_close(undisc_t.grad, st_mem.df_pay, atol=1e-12, rtol=1e-12)
+
 
 
 

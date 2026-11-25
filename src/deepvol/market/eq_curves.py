@@ -1075,6 +1075,8 @@ class ClampedYieldCurve:
         elif method in ("QuadraticSpline", "Quadratic"):
             deg = min(2, k_len - 1)
             self._cs_val = make_interp_spline(self._tenors, self._y_pillars, k=deg)
+        elif method == "MonotoneCubic" and self.space_coords == "Rates":
+            pass
         elif method in ("MonotoneCubic", "PCHIP", "Kruger", "Harmonic", "Smooth"):
             self._nonlin_interp = PchipInterpolator(self._tenors, self._y_pillars)
         elif method == "Akima":
@@ -1205,7 +1207,7 @@ class ClampedYieldCurve:
             return w
 
         method = self.interpolation_method
-        if method == "Linear":
+        if method == "Linear" or (method == "MonotoneCubic" and self.space_coords == "Rates"):
             return _linear_basis(self._tenors, tau_arr, extrapolation=self.extrapolation_method)
         if method == "FwdFwdLinear":
             if self.space_coords in ("Rates", "LogarithmOfDiscountFactors"):

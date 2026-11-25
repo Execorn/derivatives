@@ -67,7 +67,7 @@ class CashFlowItem:
     StandardError: float = 0.0
     Currency: str = "RUB"
     Leg: int = 0
-    StatusText: Literal["Settled", "Estimate"] = "Estimate"
+    StatusText: Literal["Settled", "SettlesToday", "Estimate"] = "Estimate"
 
     @property
     def PaymentValue(self) -> float:
@@ -171,6 +171,7 @@ class SeasonedScheduleState:
     warnings: list[str] = field(default_factory=list)
     time_day_count_convention: str = "Act365"
     ki_monitored_past: bool = False
+    ki_obs_type: str | None = None
 
 
 _DIFF_MONITORING_INDICES = frozenset(
@@ -589,6 +590,7 @@ def collapse_seasoned_schedule(
     fixings: Mapping[str, Any] | None = None,
     ki_barrier: float | None = None,
     ki_monitored_past: bool = False,
+    ki_obs_type: str | None = None,
     allow_autocall_on_expiry: bool = False,
     force_coupons_on_autocall: bool = False,
     autocall_coupon: float = 0.0,
@@ -719,12 +721,7 @@ def collapse_seasoned_schedule(
         else eff_call_index
     )
     opt_stripped = option_index.strip() if option_index is not None else ""
-    if is_long_basket and (option_index is None or opt_stripped == "" or opt_stripped == "WorstOf"):
-        eff_opt_index = "AverageOf"
-    elif opt_stripped:
-        eff_opt_index = opt_stripped
-    else:
-        eff_opt_index = eff_call_index
+    eff_opt_index = opt_stripped if opt_stripped else eff_call_index
     is_diff_cpn = eff_cpn_index in _DIFF_MONITORING_INDICES
     is_diff_opt = eff_opt_index in _DIFF_MONITORING_INDICES
     type_out = coupon_barrier_type.strip().lower() == "out"
@@ -849,7 +846,9 @@ def collapse_seasoned_schedule(
         if T_m <= t0_dt:
             settled_indices.append(m)
             period_status: Literal["Settled", "In-Transit"] = "Settled"
-            cf_status: Literal["Settled", "Estimate"] = "Settled"
+            cf_status: Literal["Settled", "SettlesToday", "Estimate"] = (
+                "SettlesToday" if T_m.date() == t0_dt.date() else "Settled"
+            )
         elif t_m <= t0_dt < T_m:
             in_transit_indices.append(m)
             period_status = "In-Transit"
@@ -993,7 +992,7 @@ def collapse_seasoned_schedule(
                         StandardError=0.0,
                         Currency=payment_currency,
                         Leg=0,
-                        StatusText="Settled",
+                        StatusText="SettlesToday" if sf_dt.date() == t0_dt.date() else "Settled",
                     )
                 )
 
@@ -1139,7 +1138,7 @@ def collapse_seasoned_schedule(
         sum(
             cf.Amount
             for cf in past_cashflows
-            if cf.Date.date() == t0_dt.date() and cf.StatusText == "Settled"
+            if cf.Date.date() == t0_dt.date() and cf.StatusText == "SettlesToday"
         )
     )
 
@@ -1177,6 +1176,12 @@ def collapse_seasoned_schedule(
         is_diff_index=is_diff_cpn,
     )
 
+    eff_ki_obs_type = (
+        str(ki_obs_type).strip()
+        if ki_obs_type is not None and str(ki_obs_type).strip()
+        else None
+    )
+
     return SeasonedScheduleState(
         as_of_date=t0_dt,
         start_date=start_dt,
@@ -1209,6 +1214,7 @@ def collapse_seasoned_schedule(
         cash_to_settle_today=cash_to_settle_today,
         time_day_count_convention=time_day_count_convention,
         ki_monitored_past=bool(ki_monitored_past),
+        ki_obs_type=eff_ki_obs_type,
     )
 
 

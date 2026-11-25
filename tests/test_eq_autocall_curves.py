@@ -670,4 +670,51 @@ def test_curves_audit_blind_spots() -> None:
     assert year_fraction(as_of, as_of + datetime.timedelta(days=365), "Act.365") == pytest.approx(1.0, rel=1e-12)
 
 
+def test_monotone_cubic_rates_linear_parity_and_zero_spillover() -> None:
+    """43350563 parity: MonotoneCubic in Rates space uses piecewise-linear zero-rate interpolation."""
+    as_of = datetime.datetime(2026, 10, 23, 0, 0, tzinfo=datetime.timezone.utc)
+    tenors = np.array([0.0027397260273972603, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0], dtype=np.float64)
+    rates_pct = np.array([15.5, 14.9, 14.4, 14.1, 14.15, 14.3, 14.6], dtype=np.float64)
+
+    c_mc = ClampedYieldCurve(
+        as_of_date=as_of,
+        pillar_tenors=tenors,
+        rates=rates_pct,
+        interpolation_method="MonotoneCubic",
+        space_coords="Rates",
+    )
+    c_lin = ClampedYieldCurve(
+        as_of_date=as_of,
+        pillar_tenors=tenors,
+        rates=rates_pct,
+        interpolation_method="Linear",
+        space_coords="Rates",
+    )
+
+    eval_t = np.array([0.001, 0.10, 0.37, 0.80, 1.50, 2.25, 4.0, 6.5], dtype=np.float64)
+    np.testing.assert_allclose(c_mc.zero_rate(eval_t), c_lin.zero_rate(eval_t), atol=1e-15, rtol=0.0)
+    np.testing.assert_allclose(c_mc.df(eval_t), c_lin.df(eval_t), atol=1e-15, rtol=0.0)
+
+    # Zero Rho spillover onto non-adjacent pillars for an interior evaluation point in (2.0, 3.0)
+    w_mid = c_mc.spline_weights(np.array([2.25], dtype=np.float64))[0]
+    np.testing.assert_allclose(w_mid[:4], 0.0, atol=1e-15)
+    np.testing.assert_allclose(w_mid[6:], 0.0, atol=1e-15)
+    assert w_mid[4] == pytest.approx(0.75, abs=1e-15)
+    assert w_mid[5] == pytest.approx(0.25, abs=1e-15)
+
+    # DiscountFactors space preserves non-linear PCHIP behavior cleanly
+    dfs_pil = np.exp(-(rates_pct / 100.0) * tenors)
+    c_mc_df = ClampedYieldCurve(
+        as_of_date=as_of,
+        pillar_tenors=tenors,
+        rates=dfs_pil,
+        interpolation_method="MonotoneCubic",
+        space_coords="DiscountFactors",
+        quote_expression="Standard",
+    )
+    df_vals, d_df_mat = c_mc_df.df_and_d_df_d_pillar(eval_t)
+    assert np.all(np.isfinite(df_vals)) and np.all(np.isfinite(d_df_mat))
+
+
+
 
