@@ -599,3 +599,206 @@ def test_gpu_qmc_vram_m60_d12_qshift_onestar_and_nonpow2_replicates(
     fd_log_delta = (float(pv_up[0]) - float(pv_dn[0])) / (2.0 * h_rel)
     assert abs(float(delta_base[0, idx_sorted]) - fd_log_delta) < 0.05
 
+
+def test_global_gpu_cache_manager_112mb_6_partitions_and_eviction() -> None:
+    """Enforces 112 MB total budget, 6 named partitions, oversized guard, and <=8-entry cudagraph LRU."""
+    from deepvol.models.autocall.gpu_cache_manager import (
+        GLOBAL_GPU_CACHE_MANAGER,
+        GlobalGpuCacheManager,
+    )
+
+    mgr = GlobalGpuCacheManager()
+    assert mgr.TOTAL_BUDGET_BYTES == 112 * 1024 * 1024
+    expected_budgets = {
+        "static_constants": 8 * 1024 * 1024,
+        "cudagraph_pool": 24 * 1024 * 1024,
+        "triton_kernels": 12 * 1024 * 1024,
+        "sobol_normals": 20 * 1024 * 1024,
+        "deal_prep_lv_vega": 32 * 1024 * 1024,
+        "lv_table_cache": 16 * 1024 * 1024,
+    }
+    assert sum(expected_budgets.values()) == 112 * 1024 * 1024
+    for name, b in expected_budgets.items():
+        part = mgr.register_partition(name, max_entries=64, max_bytes=b * 2)
+        assert part.max_bytes == b
+    assert GLOBAL_GPU_CACHE_MANAGER.TOTAL_BUDGET_BYTES == 112 * 1024 * 1024
+
+    cg_pool = mgr.register_cudagraph_pool(max_entries=8)
+    assert cg_pool.max_entries == 8
+    assert cg_pool.max_bytes == 24 * 1024 * 1024
+    evicted_cg: list[str] = []
+    cg_pool_test = mgr.register_partition(
+        "cudagraph_pool_test", max_entries=8, max_bytes=1024, on_evict=lambda k, _v: evicted_cg.append(str(k))
+    )
+    for i in range(10):
+        cg_pool_test.put(f"shape_{i}", torch.zeros(16, dtype=torch.float32))
+    assert len(cg_pool_test) <= 8
+    assert evicted_cg == ["shape_0", "shape_1"]
+
+    # Oversized tensor must be rejected safely without corrupting LRU accounting.
+    cg_pool_test.put("ok_small", torch.zeros(8, dtype=torch.float32))
+    before_bytes = cg_pool_test.resident_bytes
+    before_len = len(cg_pool_test)
+    cg_pool_test.put("oversized", torch.zeros(1024, dtype=torch.float32))
+    assert cg_pool_test.resident_bytes == before_bytes
+    assert len(cg_pool_test) == before_len
+    assert cg_pool_test.get("oversized") is None
+
+    mf_lru = mgr.register_mf_cheap_cache(max_entries=4, max_bytes=256)
+    mf_lru.put("k1", torch.zeros(8, dtype=torch.float64))
+    assert mf_lru.resident_bytes == 64
+    mgr.evict_partition("deal_prep_lv_vega", clear=True)
+    assert mf_lru.resident_bytes == 0
+
+
+def test_bf37d79_helpers_haar_bb_and_canonical_config(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    """Verifies ported bf37d79 helpers (_arr_bytes_equal, _fast_triton_launch, Haar BB, CanonicalTier3Config)."""
+    from types import SimpleNamespace
+
+    from deepvol.models.autocall.dupire_qmc_gpu import (
+        _HAS_TRITON,
+        GpuTorchDupireQMC,
+        _arr_bytes_equal,
+        _fast_triton_launch,
+        _haar_global_dims_for_period,
+        _haar_reconstruct_residuals_torch,
+        _sobol_vec_flat,
+        _splitmix64_30bit_shifts,
+        resolve_dupire_qmc_config,
+    )
+
+    assert callable(_fast_triton_launch)
+    if _HAS_TRITON:
+        assert _sobol_vec_flat is not None
+    a = np.asarray([1.0, 2.0, 3.0], dtype=np.float64)
+    b = np.asarray([1.0, 2.0, 3.0], dtype=np.float64)
+    c = np.asarray([1.0, 2.0, 4.0], dtype=np.float64)
+    assert _arr_bytes_equal(a, b)
+    assert not _arr_bytes_equal(a, c)
+    assert not _arr_bytes_equal(a, np.asarray([1.0, 2.0], dtype=np.float64))
+
+    keys = np.asarray([10, 20, 30], dtype=np.uint64)
+    sh1 = _splitmix64_30bit_shifts(keys, 4)
+    sh2 = _splitmix64_30bit_shifts(keys, 4)
+    assert sh1.shape == (3, 4) and sh1.dtype == np.int32
+    assert np.array_equal(sh1, sh2)
+    assert np.all((sh1 >= 0) & (sh1 < (1 << 30)))
+
+    # Nested Haar global dims at n_sub=4 must be strict prefix of n_sub=8.
+    d4 = _haar_global_dims_for_period(m_rem=4, d_assets=2, n_sub=4, m=1).reshape(2, 3)
+    d8 = _haar_global_dims_for_period(m_rem=4, d_assets=2, n_sub=8, m=1).reshape(2, 7)
+    assert np.array_equal(d4, d8[:, :3])
+
+    gen = torch.Generator().manual_seed(7)
+    modes = torch.randn((32, 3, 256), generator=gen, dtype=torch.float64)
+    res = _haar_reconstruct_residuals_torch(modes, n_sub=4)
+    assert res.shape == (32, 4, 256)
+    assert torch.allclose(res.sum(dim=1), torch.zeros((32, 256), dtype=torch.float64), atol=1e-12)
+
+    default_cfg = DupireQMCConfig()
+    assert default_cfg.adaptive_substeps is False
+    assert default_cfg.lv_grid_nt == 32 and default_cfg.lv_grid_ny == 64
+
+    canon_duck = SimpleNamespace(
+        n_paths=1024,
+        n_replicates=4,
+        n_substeps=2,
+        cv_mode="none",
+        seed=123,
+        lv_grid_nt=16,
+        lv_grid_ny=32,
+        adaptive_substeps=False,
+        n_cheap_mf=2048,
+    )
+    conv = DupireQMCConfig.from_canonical(canon_duck)
+    assert conv.n_paths == 1024 and conv.n_replicates == 4 and conv.n_substeps == 2
+    assert conv.lv_grid_nt == 16 and conv.lv_grid_ny == 32 and conv.n_cheap_mf == 2048
+
+    auto_cfg = resolve_dupire_qmc_config(2, 6, device_type="cpu", n_fallback_paths=512)
+    assert auto_cfg.n_paths == 512 and auto_cfg.adaptive_substeps is False
+
+    st = preprocess_eq_autocall(copy.deepcopy(parsed_dag[0]))
+    res_auto = GpuTorchDupireQMC(device="cpu", use_triton=False).simulate_and_price(st, canon_duck)  # type: ignore[arg-type]
+    assert np.isfinite(res_auto.product_value)
+
+
+def test_math_parity_v3_buehler_islongbasket_onestar_and_ki_obs(
+    parsed_dag: tuple[EQAutocallableTradeRequest, dict[str, Any]],
+) -> None:
+    """CPU unit checks for V3 memory, Buehler drift LV, IsLongBasket I_ramp, OneStar left-spread, and ki_obs_type."""
+    from types import SimpleNamespace
+
+    from deepvol.models.autocall.dupire_qmc_gpu import (
+        GpuTorchDupireQMC,
+        _eval_gpu_surface_local_vol_table,
+        _onestar_ramp_torch,
+        _resolve_ki_obs_mode,
+        _resolve_onestar_effective_params,
+        _resolve_r_native_obs_tensor,
+    )
+
+    # 1) ki_obs_type None/empty must strictly default to European (never Discrete even if ki_monitored_past=True).
+    assert _resolve_ki_obs_mode(SimpleNamespace(ki_obs_type=None, seasoned_state=SimpleNamespace(ki_obs_type=None, ki_monitored_past=True))) == "European"
+    assert _resolve_ki_obs_mode(SimpleNamespace(ki_obs_type="Discrete", seasoned_state=None)) == "Discrete"
+    assert _resolve_ki_obs_mode(SimpleNamespace(ki_obs_type="Daily", seasoned_state=None)) == "Daily"
+    assert _resolve_ki_obs_mode(SimpleNamespace(ki_obs_type="Continuous", seasoned_state=None)) == "Continuous"
+
+    # 2) OneStar shifted left-spread vs narrow centered 0.02 when ki_barrier is None.
+    k_eff, eps_eff = _resolve_onestar_effective_params(1.0, 0.7, -0.05)
+    assert abs(k_eff - 0.975) < 1e-12 and abs(eps_eff - 0.05) < 1e-12
+    assert float(_onestar_ramp_torch(torch.tensor(0.95, dtype=torch.float64), k_eff, eps_eff)) == pytest.approx(0.0, abs=1e-12)
+    assert float(_onestar_ramp_torch(torch.tensor(0.975, dtype=torch.float64), k_eff, eps_eff)) == pytest.approx(0.5, abs=1e-12)
+    assert float(_onestar_ramp_torch(torch.tensor(1.00, dtype=torch.float64), k_eff, eps_eff)) == pytest.approx(1.0, abs=1e-12)
+
+    k_none, eps_none = _resolve_onestar_effective_params(1.0, None, -0.05)
+    assert abs(k_none - 1.0) < 1e-12 and abs(eps_none - 0.02) < 1e-12
+
+    # 3) Buehler effective drift must alter LV table when discrete cash dividends are present on skewed surface.
+    req_div = copy.deepcopy(parsed_dag[0])
+    st_ref = preprocess_eq_autocall(req_div)
+    tkr0 = st_ref.sorted_identifiers[0]
+    surf0 = st_ref.vol_surfaces[tkr0]
+    tau_arr = st_ref.tau_obs.detach().cpu().numpy()
+    r_nat = _resolve_r_native_obs_tensor(st_ref)[0].detach().cpu().numpy()
+    df_fin = st_ref.dividend_schedule.df_fin_obs[0].detach().cpu().numpy()
+    spot0 = float(st_ref.spots_t0[0].item())
+    vt0 = float(st_ref.v_perf[0, -1].item())
+    lv_nodiv, _, _ = _eval_gpu_surface_local_vol_table(
+        surf0, spot0, r_nat, df_fin, tau_arr, [], vt0, 16, 32, torch.device("cpu")
+    )
+    synth_divs = [SimpleNamespace(tau_ex_act365=float(tau_arr[0]) * 0.5, amount=spot0 * 0.08, pv_discount_weight=0.98)]
+    lv_withdiv, _, _ = _eval_gpu_surface_local_vol_table(
+        surf0, spot0, r_nat, df_fin, tau_arr, synth_divs, vt0, 16, 32, torch.device("cpu")
+    )
+    assert float((lv_withdiv - lv_nodiv).abs().max().item()) > 1e-4
+
+    # 4) V3 literal memory + IsLongBasket parity between GpuTorchDupireQMC(cpu) and CpuNumpyDupireQMC.
+    req_mem = copy.deepcopy(parsed_dag[0])
+    req_mem.Product.IsMemory = True
+    st_mem = preprocess_eq_autocall(req_mem)
+    cfg_cpu = DupireQMCConfig(n_paths=1024, n_replicates=4, n_substeps=2, mode="dupire_lv", cv_mode="none", lv_grid_nt=16, lv_grid_ny=32, seed=42)
+    gpu_cpu = GpuTorchDupireQMC(device="cpu", use_triton=False)
+    cpu_ref = CpuNumpyDupireQMC()
+    res_gpu_mem = gpu_cpu.simulate_and_price(st_mem, cfg_cpu)
+    res_cpu_mem = cpu_ref.simulate_and_price(st_mem, cfg_cpu)
+    assert abs(res_gpu_mem.product_value - res_cpu_mem.product_value) < max(0.015, 4.0 * res_cpu_mem.standard_error)
+
+    req_lb = copy.deepcopy(parsed_dag[0])
+    req_lb.Product.IsLongBasket = True
+    req_lb.Product.Strike = 1.0
+    req_lb.Product.OptionDownAndInBarrierLevel = None
+    req_lb.Product.OptionGearing = 1.0
+    st_lb = preprocess_eq_autocall(req_lb)
+    res_lb = gpu_cpu.simulate_and_price(st_lb, cfg_cpu)
+    res_lb_ref = cpu_ref.simulate_and_price(st_lb, cfg_cpu)
+    pv_lb_tr, _, _, _, delta_lb_tr = gpu_cpu.simulate_batch_for_training(
+        [st_lb], config=cfg_cpu, compute_pathwise_delta=True
+    )
+    assert np.isfinite(res_lb.product_value) and torch.isfinite(pv_lb_tr).all()
+    assert abs(res_lb.product_value - res_lb_ref.product_value) < max(0.015, 4.0 * res_lb_ref.standard_error)
+    assert delta_lb_tr is not None and torch.isfinite(delta_lb_tr).all()
+    assert abs(float(pv_lb_tr[0]) - res_lb.product_value) < max(0.02, 4.0 * res_lb.standard_error)
+
+

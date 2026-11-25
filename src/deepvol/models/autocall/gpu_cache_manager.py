@@ -170,24 +170,25 @@ class PartitionedGpuLRU(Generic[_V]):
             return val
 
     def put(self, key: Any, val: _V, *, explicit_bytes: Optional[int] = None) -> _V:
-        nb = int(explicit_bytes) if explicit_bytes is not None else measure_tensor_nbytes(val)
+        raw_nb = int(explicit_bytes) if explicit_bytes is not None else measure_tensor_nbytes(val)
+        nb = max(0, raw_nb)
         cuda_tensors = _extract_cuda_tensors(val)
         with self._lock:
             if key in self._store:
                 old_val, old_nb, old_cuda = self._store.pop(key)
-                self._resident_bytes -= old_nb
+                self._resident_bytes = max(0, self._resident_bytes - old_nb)
                 if old_cuda:
                     _record_cuda_tensors_stream(old_cuda)
                 if self._on_evict is not None and old_val is not val:
                     self._on_evict(key, old_val)
-            if nb > self.max_bytes:
+            if self.max_bytes <= 0 or nb > self.max_bytes:
                 # Reject oversized entries so a single tensor never exceeds the partition budget.
                 return val
             while self._store and (
                 len(self._store) >= self.max_entries or (self._resident_bytes + nb) > self.max_bytes
             ):
                 ev_k, (ev_v, ev_nb, ev_cuda) = self._store.popitem(last=False)
-                self._resident_bytes -= ev_nb
+                self._resident_bytes = max(0, self._resident_bytes - ev_nb)
                 if ev_cuda:
                     _record_cuda_tensors_stream(ev_cuda)
                 if self._on_evict is not None:
@@ -198,13 +199,55 @@ class PartitionedGpuLRU(Generic[_V]):
                 _record_cuda_tensors_stream(cuda_tensors)
             return val
 
+    def evict_oldest(self, max_evict: int = 1) -> int:
+        """Evict up to `max_evict` least-recently-used entries cleanly and return the eviction count."""
+        target = max(0, int(max_evict))
+        if target == 0:
+            return 0
+        evicted = 0
+        with self._lock:
+            while self._store and evicted < target:
+                ev_k, (ev_v, ev_nb, ev_cuda) = self._store.popitem(last=False)
+                self._resident_bytes = max(0, self._resident_bytes - ev_nb)
+                if ev_cuda:
+                    _record_cuda_tensors_stream(ev_cuda)
+                if self._on_evict is not None:
+                    self._on_evict(ev_k, ev_v)
+                evicted += 1
+        return evicted
+
+    def resize(
+        self,
+        *,
+        max_entries: Optional[int] = None,
+        max_bytes: Optional[int] = None,
+    ) -> int:
+        """Tighten or update partition entry/byte caps and evict LRU items until satisfied."""
+        evicted = 0
+        with self._lock:
+            if max_entries is not None:
+                self.max_entries = max(1, int(max_entries))
+            if max_bytes is not None:
+                self.max_bytes = max(0, int(max_bytes))
+            while self._store and (
+                len(self._store) > self.max_entries or self._resident_bytes > self.max_bytes
+            ):
+                ev_k, (ev_v, ev_nb, ev_cuda) = self._store.popitem(last=False)
+                self._resident_bytes = max(0, self._resident_bytes - ev_nb)
+                if ev_cuda:
+                    _record_cuda_tensors_stream(ev_cuda)
+                if self._on_evict is not None:
+                    self._on_evict(ev_k, ev_v)
+                evicted += 1
+        return evicted
+
     def remove(self, key: Any) -> bool:
         with self._lock:
             entry = self._store.pop(key, None)
             if entry is None:
                 return False
             ev_v, ev_nb, ev_cuda = entry
-            self._resident_bytes -= ev_nb
+            self._resident_bytes = max(0, self._resident_bytes - ev_nb)
             if ev_cuda:
                 _record_cuda_tensors_stream(ev_cuda)
             if self._on_evict is not None:
@@ -232,15 +275,16 @@ class PartitionedGpuLRU(Generic[_V]):
 
 
 class GlobalGpuCacheManager:
-    """Global <= 192 MB GPU cache registry, shared CUDAGraph pool, and canonical eval model store."""
+    """Global <= 112 MB GPU cache registry, shared CUDAGraph pool, and canonical eval model store."""
 
-    TOTAL_BUDGET_BYTES: int = 192 * 1024 * 1024
+    TOTAL_BUDGET_BYTES: int = 112 * 1024 * 1024
     PARTITION_BUDGETS: Mapping[str, int] = {
-        "static_constants": 16 * 1024 * 1024,
-        "cudagraph_pool": 40 * 1024 * 1024,
-        "triton_kernels": 24 * 1024 * 1024,
-        "sobol_normals": 24 * 1024 * 1024,
-        "deal_prep_lv_vega": 88 * 1024 * 1024,
+        "static_constants": 8 * 1024 * 1024,
+        "cudagraph_pool": 24 * 1024 * 1024,
+        "triton_kernels": 12 * 1024 * 1024,
+        "sobol_normals": 20 * 1024 * 1024,
+        "deal_prep_lv_vega": 32 * 1024 * 1024,
+        "lv_table_cache": 16 * 1024 * 1024,
     }
 
     def __init__(self) -> None:
@@ -258,21 +302,118 @@ class GlobalGpuCacheManager:
         name: str,
         *,
         max_entries: int,
-        max_bytes: int,
+        max_bytes: Optional[int] = None,
         on_evict: Optional[Callable[[Any, Any], None]] = None,
     ) -> PartitionedGpuLRU[Any]:
+        budget_cap = self.PARTITION_BUDGETS.get(name)
+        if budget_cap is not None:
+            eff_bytes = int(budget_cap) if max_bytes is None else min(max(0, int(max_bytes)), int(budget_cap))
+        else:
+            eff_bytes = max(0, int(max_bytes)) if max_bytes is not None else 0
         with self._lock:
             existing = self._partitions.get(name)
             if existing is not None:
+                if existing.max_bytes > eff_bytes:
+                    existing.resize(max_bytes=eff_bytes)
+                if on_evict is not None and existing._on_evict is None:
+                    existing._on_evict = on_evict
                 return existing
             part: PartitionedGpuLRU[Any] = PartitionedGpuLRU(
                 name,
                 max_entries=max_entries,
-                max_bytes=max_bytes,
+                max_bytes=eff_bytes,
                 on_evict=on_evict,
             )
             self._partitions[name] = part
             return part
+
+    def get_partition(self, name: str) -> Optional[PartitionedGpuLRU[Any]]:
+        """Return a registered cache partition by name, or None if unregistered."""
+        with self._lock:
+            return self._partitions.get(name)
+
+    def register_cudagraph_pool(
+        self,
+        *,
+        max_entries: int = 8,
+        max_bytes: Optional[int] = None,
+        on_evict: Optional[Callable[[Any, Any], None]] = None,
+    ) -> PartitionedGpuLRU[Any]:
+        """Register or retrieve the <= 24 MB, <= 8-shape LRU CUDAGraph pool partition."""
+        eff_on_evict = on_evict if on_evict is not None else (lambda _k, v: record_obj_cuda_stream(v))
+        part = self.register_partition(
+            "cudagraph_pool",
+            max_entries=max(1, int(max_entries)),
+            max_bytes=max_bytes,
+            on_evict=eff_on_evict,
+        )
+        if part.max_entries > max(1, int(max_entries)):
+            part.resize(max_entries=max(1, int(max_entries)))
+        return part
+
+    def register_mf_cheap_cache(
+        self,
+        *,
+        max_entries: int = 128,
+        max_bytes: Optional[int] = None,
+        on_evict: Optional[Callable[[Any, Any], None]] = None,
+    ) -> PartitionedGpuLRU[Any]:
+        """Register or retrieve the budgeted partition for `_CRN_MF_CHEAP_CACHE` CUDA tensors."""
+        eff_on_evict = on_evict if on_evict is not None else (lambda _k, v: record_obj_cuda_stream(v))
+        return self.register_partition(
+            "deal_prep_lv_vega",
+            max_entries=max(1, int(max_entries)),
+            max_bytes=max_bytes,
+            on_evict=eff_on_evict,
+        )
+
+    def evict_partition(
+        self,
+        name: str,
+        *,
+        max_entries: Optional[int] = None,
+        max_bytes: Optional[int] = None,
+        clear: bool = False,
+    ) -> int:
+        """Evict entries from a named partition by clear, entry cap, or byte cap."""
+        with self._lock:
+            part = self._partitions.get(name)
+        if part is None:
+            return 0
+        if clear:
+            n_prev = len(part)
+            part.clear()
+            return n_prev
+        return part.resize(max_entries=max_entries, max_bytes=max_bytes)
+
+    def evict_cudagraph_pool(
+        self,
+        *,
+        max_entries: Optional[int] = None,
+        max_bytes: Optional[int] = None,
+        clear: bool = False,
+    ) -> int:
+        """Evict cached CUDAGraph entries from `"cudagraph_pool"` with stream-safe cleanup."""
+        cuda_ok = bool(torch.cuda.is_available() and torch.cuda.is_initialized())  # type: ignore[no-untyped-call]
+        if clear and cuda_ok:
+            torch.cuda.synchronize()
+        evicted = self.evict_partition(
+            "cudagraph_pool",
+            max_entries=max_entries,
+            max_bytes=max_bytes,
+            clear=clear,
+        )
+        if clear:
+            with self._lock:
+                for dev_key in list(self._pool_events.keys()):
+                    self._pool_events[dev_key] = None
+                for dev_key in list(self._pool_page_bytes.keys()):
+                    if dev_key[0] == "cuda" and cuda_ok:
+                        stats = torch.cuda.memory_stats(dev_key[1])
+                        self._pool_page_bytes[dev_key] = int(stats.get("allocated_bytes.pool.current", 0))
+                    else:
+                        self._pool_page_bytes[dev_key] = 0
+        return evicted
 
     def get_shared_graph_pool(self, device: torch.device | str) -> Any:
         dev_key = normalize_cuda_device(device)
