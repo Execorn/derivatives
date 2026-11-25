@@ -12850,11 +12850,16 @@ def compute_qmc_aad_crn_greeks(
             else:
                 var_s1 = max(float(s1_mean[c0_s1 + 5]) - float(s1_mean[c0_s1 + 4]) ** 2, 0.0)
                 tot_se_s1 = math.sqrt(var_s1 / float(max(n_total, 1)))
+        l_put_s1_val = float(s1_mean[c0_s1 + 0])
+        if is_long_flag:
+            eff_gearing_s1 = float(state.option_gearing)
+            if abs(eff_gearing_s1) > 1e-12:
+                l_put_s1_val /= eff_gearing_s1
         base_postproc = assemble_autocall_cashflows_and_pv(
             state,
             p_stop=torch.as_tensor(s1_mean[:m_rem], dtype=torch.float64, device=out_device),
             q_cpn=torch.as_tensor(s1_mean[m_rem : 2 * m_rem], dtype=torch.float64, device=out_device),
-            l_put=torch.tensor(float(s1_mean[c0_s1 + 0]), dtype=torch.float64, device=out_device),
+            l_put=torch.tensor(l_put_s1_val, dtype=torch.float64, device=out_device),
             l_call=torch.tensor(float(s1_mean[c0_s1 + 1]), dtype=torch.float64, device=out_device),
             l_onestar=float(s1_mean[c0_s1 + 2]),
             p_onestar=float(s1_mean[c0_s1 + 3]),

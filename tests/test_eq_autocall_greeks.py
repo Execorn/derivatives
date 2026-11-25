@@ -1363,5 +1363,77 @@ def test_qmc_aad_buehler_lv_rho_divs_and_3d_spotcarry_theta(
     assert res_cross.theta is not None and np.isfinite(float(res_cross.theta))
 
 
+def test_qmc_aad_is_long_basket_gearing_parity(
+    multi_period_request: EQAutocallableTradeRequest,
+) -> None:
+    """Verifies IsLongBasket with OptionGearing != 1.0 does not double-count gearing in PV or Greeks."""
+    import json
+    from deepvol.models.autocall.dupire_qmc_gpu import DupireQMCConfig
+    from deepvol.models.autocall.dupire_qmc_solver import price_autocall_dupire_qmc
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        QmcAadGreeksConfig,
+        compute_qmc_aad_crn_greeks,
+    )
+
+    req_ilb = copy.deepcopy(multi_period_request)
+    req_ilb.Product.IsLongBasket = True
+    req_ilb.Product.Strike = 0.90
+    req_ilb.Product.OptionGearing = 1.0 / 0.90
+    req_ilb.Product.OptionDownAndInBarrierLevel = 1.0
+    req_ilb.Product.OptionDownAndInBarrierAbsoluteDigitalSpread = -0.10
+    req_ilb.Product.AutoCallTriggerAbsoluteDigitalSpread = -0.10
+    if req_ilb.Product.CouponBarrierLevels is not None:
+        req_ilb.Product.CouponBarrierAbsoluteDigitalSpread = -0.10
+    st_ilb = preprocess_eq_autocall(req_ilb)
+
+    cfg_q = QmcAadGreeksConfig(n_paths=2048, n_replicates=4, n_substeps=4)
+    res_pv = compute_qmc_aad_crn_greeks(st_ilb, req_ilb, queries=["ProductValue"], config=cfg_q, device="cpu")
+    res_all = compute_qmc_aad_crn_greeks(
+        st_ilb,
+        req_ilb,
+        queries=["ProductValue", "Delta", "Gamma", "Vega", "Rho", "Theta", "Cega"],
+        config=cfg_q,
+        device="cpu",
+    )
+    assert abs(float(res_pv.product_value) - float(res_all.product_value)) < 1e-12
+
+    res_ref = price_autocall_dupire_qmc(
+        st_ilb,
+        config=DupireQMCConfig(n_paths=2048, n_replicates=4, n_substeps=4),
+    )
+    assert abs(float(res_all.product_value) - float(res_ref.product_value)) * 1e4 < 15.0
+
+    # Central FD Delta check on the first underlying confirms consistent scaling with PV.
+    uid0 = st_ilb.original_identifiers[0]
+    s0 = float(req_ilb.Model.MarketDataSet.Spots[uid0])
+    h_s = 0.01 * s0
+    ru, rd = copy.deepcopy(req_ilb), copy.deepcopy(req_ilb)
+    ru.Model.MarketDataSet.Spots[uid0] = s0 + h_s
+    rd.Model.MarketDataSet.Spots[uid0] = s0 - h_s
+    pvu = float(compute_qmc_aad_crn_greeks(preprocess_eq_autocall(ru), ru, queries=["ProductValue"], config=cfg_q, device="cpu").product_value)
+    pvd = float(compute_qmc_aad_crn_greeks(preprocess_eq_autocall(rd), rd, queries=["ProductValue"], config=cfg_q, device="cpu").product_value)
+    fd_delta0 = (pvu - pvd) / (2.0 * h_s)
+    assert res_all.delta is not None
+    assert abs(float(res_all.delta[uid0]) - fd_delta0) * (0.01 * s0) * 1e4 < 5.0
+
+    # Also verify deal 59553619 directly if the PS batch request fixture is present.
+    deal_59553619 = REPO_ROOT / "docs" / "eq_autocall_ps_batch_b10316f2" / "requests" / "trade_095_59553619.json"
+    if deal_59553619.is_file():
+        req_59 = EQAutocallableTradeRequest.model_validate(json.loads(deal_59553619.read_text()))
+        st_59 = preprocess_eq_autocall(req_59)
+        cfg_59 = QmcAadGreeksConfig(n_paths=8192, n_replicates=4, n_substeps=8)
+        r59_pv = compute_qmc_aad_crn_greeks(st_59, req_59, queries=["ProductValue"], config=cfg_59, device="cpu")
+        r59_all = compute_qmc_aad_crn_greeks(
+            st_59, req_59, queries=["ProductValue", "CashFlows", "Delta", "Vega"], config=cfg_59, device="cpu"
+        )
+        r59_ref = price_autocall_dupire_qmc(
+            st_59, config=DupireQMCConfig(n_paths=8192, n_replicates=4, n_substeps=8)
+        )
+        assert abs(float(r59_pv.product_value) - float(r59_all.product_value)) < 1e-12
+        assert abs(float(r59_all.product_value) - float(r59_ref.product_value)) * 1e4 < 15.0
+        assert abs(float(r59_all.product_value) - 0.8875) * 1e4 < 15.0
+
+
+
 
 
