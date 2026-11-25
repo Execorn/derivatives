@@ -6596,10 +6596,11 @@ def _get_surrogate_cuda_graph_runner(
             tot_out = 2 * nh + b_tot
 
             stream = torch.cuda.Stream(device=surr_dev)  # type: ignore[no-untyped-call]
-            with pool_lock:
+            stream.wait_stream(torch.cuda.current_stream(surr_dev))
+            with torch.inference_mode(False), pool_lock:
                 before_stats = torch.cuda.memory_stats(norm_dev[1]) if norm_dev[0] == "cuda" else {}
                 GLOBAL_GPU_CACHE_MANAGER.wait_pool_event(surr_dev, stream)
-                s_packed_g = torch.randn(tot_in, device=surr_dev, dtype=surr_dtype) * 0.05
+                s_packed_g = torch.linspace(-0.05, 0.05, tot_in, device=surr_dev, dtype=surr_dtype)
                 s_am_g = torch.ones((b_tot, int(nf_shape[1])), device=surr_dev, dtype=surr_dtype)
                 s_sm_g = torch.ones((b_tot, int(sf_shape[1])), device=surr_dev, dtype=surr_dtype)
                 s_out_g = torch.empty(tot_out, device=surr_dev, dtype=surr_dtype)
@@ -6610,62 +6611,84 @@ def _get_surrogate_cuda_graph_runner(
                 s_sf = s_packed_g[n1 + n2 : n1 + n2 + n3].view(sf_shape).detach().requires_grad_(True)
                 s_gf = s_packed_g[n1 + n2 + n3 :].view(gf_shape).detach().requires_grad_(True)
 
-                with warnings.catch_warnings(), GLOBAL_GPU_CACHE_MANAGER.tf32_precision_guard(False):
-                    warnings.simplefilter("ignore", UserWarning)
-                    with torch.cuda.stream(stream):
-                        with torch.enable_grad():  # type: ignore[no-untyped-call]
-                            for _ in range(3):
-                                wdh, wdc, wdp = m_copy.forward_residuals(
+                g_fwd: Any = None
+                g_bwd: Any = None
+                captured_ok = False
+                try:
+                    with warnings.catch_warnings(), GLOBAL_GPU_CACHE_MANAGER.tf32_precision_guard(False):
+                        warnings.simplefilter("ignore", UserWarning)
+                        with torch.cuda.stream(stream):
+                            with torch.enable_grad():  # type: ignore[no-untyped-call]
+                                for _ in range(3):
+                                    wdh, wdc, wdp = m_copy.forward_residuals(
+                                        s_nf, s_ef, s_am_g, s_sf, s_sm_g, s_gf, require_second_order_sdpa=False
+                                    )
+                                    w_hs, w_cs, w_ps = wdh[:b_tot, :m_rem], wdc[:b_tot, :m_rem], wdp[:b_tot]
+                                    torch.autograd.grad(
+                                        (w_hs, w_cs, w_ps),
+                                        (s_nf, s_ef, s_sf, s_gf),
+                                        grad_outputs=(
+                                            s_gin_g[:nh].view(b_tot, m_rem),
+                                            s_gin_g[nh : 2 * nh].view(b_tot, m_rem),
+                                            s_gin_g[2 * nh :].view(b_tot),
+                                        ),
+                                        allow_unused=True,
+                                    )
+                        stream.synchronize()
+
+                        g_fwd = torch.cuda.CUDAGraph()  # type: ignore[no-untyped-call]
+                        with torch.cuda.graph(g_fwd, pool=pool, stream=stream):
+                            with torch.enable_grad():  # type: ignore[no-untyped-call]
+                                fdh, fdc, fdp = m_copy.forward_residuals(
                                     s_nf, s_ef, s_am_g, s_sf, s_sm_g, s_gf, require_second_order_sdpa=False
                                 )
-                                w_hs, w_cs, w_ps = wdh[:b_tot, :m_rem], wdc[:b_tot, :m_rem], wdp[:b_tot]
-                                torch.autograd.grad(
-                                    (w_hs, w_cs, w_ps),
+                                f_hs = fdh[:b_tot, :m_rem]
+                                f_cs = fdc[:b_tot, :m_rem]
+                                f_ps = fdp[:b_tot]
+                                s_out_g[:nh].copy_(f_hs.detach().reshape(-1))
+                                s_out_g[nh : 2 * nh].copy_(f_cs.detach().reshape(-1))
+                                s_out_g[2 * nh :].copy_(f_ps.detach().reshape(-1))
+
+                        g_bwd = torch.cuda.CUDAGraph()  # type: ignore[no-untyped-call]
+                        with torch.cuda.graph(g_bwd, pool=pool, stream=stream):
+                            with torch.enable_grad():  # type: ignore[no-untyped-call]
+                                b_gs = torch.autograd.grad(
+                                    (f_hs, f_cs, f_ps),
                                     (s_nf, s_ef, s_sf, s_gf),
                                     grad_outputs=(
                                         s_gin_g[:nh].view(b_tot, m_rem),
                                         s_gin_g[nh : 2 * nh].view(b_tot, m_rem),
                                         s_gin_g[2 * nh :].view(b_tot),
                                     ),
+                                    retain_graph=True,
                                     allow_unused=True,
                                 )
-                    stream.synchronize()
-
-                    g_fwd = torch.cuda.CUDAGraph()  # type: ignore[no-untyped-call]
-                    with torch.cuda.graph(g_fwd, pool=pool, stream=stream):
-                        with torch.enable_grad():  # type: ignore[no-untyped-call]
-                            fdh, fdc, fdp = m_copy.forward_residuals(
-                                s_nf, s_ef, s_am_g, s_sf, s_sm_g, s_gf, require_second_order_sdpa=False
-                            )
-                            f_hs = fdh[:b_tot, :m_rem]
-                            f_cs = fdc[:b_tot, :m_rem]
-                            f_ps = fdp[:b_tot]
-                            s_out_g[:nh].copy_(f_hs.detach().reshape(-1))
-                            s_out_g[nh : 2 * nh].copy_(f_cs.detach().reshape(-1))
-                            s_out_g[2 * nh :].copy_(f_ps.detach().reshape(-1))
-
-                    g_bwd = torch.cuda.CUDAGraph()  # type: ignore[no-untyped-call]
-                    with torch.cuda.graph(g_bwd, pool=pool, stream=stream):
-                        with torch.enable_grad():  # type: ignore[no-untyped-call]
-                            b_gs = torch.autograd.grad(
-                                (f_hs, f_cs, f_ps),
-                                (s_nf, s_ef, s_sf, s_gf),
-                                grad_outputs=(
-                                    s_gin_g[:nh].view(b_tot, m_rem),
-                                    s_gin_g[nh : 2 * nh].view(b_tot, m_rem),
-                                    s_gin_g[2 * nh :].view(b_tot),
-                                ),
-                                retain_graph=True,
-                                allow_unused=True,
-                            )
-                            g_parts = [
-                                (g.reshape(-1) if g is not None else torch.zeros_like(inp).reshape(-1))
-                                for g, inp in zip(b_gs, (s_nf, s_ef, s_sf, s_gf))
-                            ]
-                            s_gout_g.copy_(torch.cat(g_parts, dim=0))
-                    stream.synchronize()
-                GLOBAL_GPU_CACHE_MANAGER.record_pool_event(surr_dev, stream)
-                GLOBAL_GPU_CACHE_MANAGER.account_pool_capture_bytes(surr_dev, before_stats)
+                                g_parts = [
+                                    (g.reshape(-1) if g is not None else torch.zeros_like(inp).reshape(-1))
+                                    for g, inp in zip(b_gs, (s_nf, s_ef, s_sf, s_gf))
+                                ]
+                                s_gout_g.copy_(torch.cat(g_parts, dim=0))
+                        stream.synchronize()
+                    captured_ok = True
+                    GLOBAL_GPU_CACHE_MANAGER.account_pool_capture_bytes(surr_dev, before_stats)
+                finally:
+                    if not captured_ok:
+                        for g_partial in (g_bwd, g_fwd):
+                            if g_partial is not None:
+                                try:
+                                    g_partial.reset()
+                                except Exception:
+                                    pass
+                        try:
+                            with torch.cuda.stream(stream):
+                                if torch.cuda.is_current_stream_capturing():  # type: ignore[no-untyped-call]
+                                    if g_bwd is not None:
+                                        g_bwd.capture_end()
+                                    elif g_fwd is not None:
+                                        g_fwd.capture_end()
+                        except Exception:
+                            pass
+                    GLOBAL_GPU_CACHE_MANAGER.record_pool_event(surr_dev, stream)
             keep_alive = (s_am_g, s_sm_g, s_nf, s_ef, s_sf, s_gf, f_hs, f_cs, f_ps)
             runner = (stream, g_fwd, g_bwd, s_packed_g, s_out_g, s_gin_g, s_gout_g, nh, b_tot, m_rem, keep_alive)
             runner_bytes = measure_tensor_nbytes((s_packed_g, s_out_g, s_gin_g, s_gout_g, s_am_g, s_sm_g))
@@ -6736,31 +6759,32 @@ class _PackedCudaSurrogateFn(torch.autograd.Function):
         n2 = int(ef_shape[0] * ef_shape[1] * ef_shape[2] * ef_shape[3])
         n3 = int(sf_shape[0] * sf_shape[1] * sf_shape[2])
         packed_g = packed_cpu_f64.detach().to(dtype=surr_dtype).to(device=surr_dev)
-        if need_g:
-            with torch.enable_grad():  # type: ignore[no-untyped-call]
-                nf_g = packed_g[:n1].view(nf_shape).detach().requires_grad_(True)
-                ef_g = packed_g[n1 : n1 + n2].view(ef_shape).detach().requires_grad_(True)
-                sf_g = packed_g[n1 + n2 : n1 + n2 + n3].view(sf_shape).detach().requires_grad_(True)
-                gf_g = packed_g[n1 + n2 + n3 :].view(gf_shape).detach().requires_grad_(True)
+        with GLOBAL_GPU_CACHE_MANAGER.tf32_precision_guard(False):
+            if need_g:
+                with torch.enable_grad():  # type: ignore[no-untyped-call]
+                    nf_g = packed_g[:n1].view(nf_shape).detach().requires_grad_(True)
+                    ef_g = packed_g[n1 : n1 + n2].view(ef_shape).detach().requires_grad_(True)
+                    sf_g = packed_g[n1 + n2 : n1 + n2 + n3].view(sf_shape).detach().requires_grad_(True)
+                    gf_g = packed_g[n1 + n2 + n3 :].view(gf_shape).detach().requires_grad_(True)
+                    d_haz_g, d_cpn_g, d_put_g = _call_surrogate_residuals_fast(
+                        surrogate, nf_g, ef_g, am_g, sf_g, sm_g, gf_g, require_second_order_sdpa=False
+                    )
+                    haz_s = d_haz_g[:b_tot, :m_rem]
+                    cpn_s = d_cpn_g[:b_tot, :m_rem]
+                    put_s = d_put_g[:b_tot]
+                ctx.gpu_state = ("eager", nf_g, ef_g, sf_g, gf_g, haz_s, cpn_s, put_s)
+            else:
+                nf_g = packed_g[:n1].view(nf_shape)
+                ef_g = packed_g[n1 : n1 + n2].view(ef_shape)
+                sf_g = packed_g[n1 + n2 : n1 + n2 + n3].view(sf_shape)
+                gf_g = packed_g[n1 + n2 + n3 :].view(gf_shape)
                 d_haz_g, d_cpn_g, d_put_g = _call_surrogate_residuals_fast(
                     surrogate, nf_g, ef_g, am_g, sf_g, sm_g, gf_g, require_second_order_sdpa=False
                 )
                 haz_s = d_haz_g[:b_tot, :m_rem]
                 cpn_s = d_cpn_g[:b_tot, :m_rem]
                 put_s = d_put_g[:b_tot]
-            ctx.gpu_state = ("eager", nf_g, ef_g, sf_g, gf_g, haz_s, cpn_s, put_s)
-        else:
-            nf_g = packed_g[:n1].view(nf_shape)
-            ef_g = packed_g[n1 : n1 + n2].view(ef_shape)
-            sf_g = packed_g[n1 + n2 : n1 + n2 + n3].view(sf_shape)
-            gf_g = packed_g[n1 + n2 + n3 :].view(gf_shape)
-            d_haz_g, d_cpn_g, d_put_g = _call_surrogate_residuals_fast(
-                surrogate, nf_g, ef_g, am_g, sf_g, sm_g, gf_g, require_second_order_sdpa=False
-            )
-            haz_s = d_haz_g[:b_tot, :m_rem]
-            cpn_s = d_cpn_g[:b_tot, :m_rem]
-            put_s = d_put_g[:b_tot]
-            ctx.gpu_state = None
+                ctx.gpu_state = None
         out_g = torch.cat(
             [haz_s.detach().reshape(-1), cpn_s.detach().reshape(-1), put_s.detach().reshape(-1)], dim=0
         )
@@ -6812,7 +6836,7 @@ class _PackedCudaSurrogateFn(torch.autograd.Function):
         gh_g = g_cat_g[:nh].view(haz_s.shape)
         gc_g = g_cat_g[nh : 2 * nh].view(cpn_s.shape)
         gp_g = g_cat_g[2 * nh :].view(put_s.shape)
-        with torch.enable_grad():  # type: ignore[no-untyped-call]
+        with GLOBAL_GPU_CACHE_MANAGER.tf32_precision_guard(False), torch.enable_grad():  # type: ignore[no-untyped-call]
             grads_g = torch.autograd.grad(
                 (haz_s, cpn_s, put_s),
                 (nf_g, ef_g, sf_g, gf_g),
@@ -15529,14 +15553,16 @@ if _HAS_TRITON_TIER1:
         out_gsep: torch.Tensor = fac.prod(dim=1)
         return out_gsep
 
-    def _canon_sym_perms(d_act: int, device: torch.device) -> torch.Tensor:
+    def _canon_sym_perms(d_act: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         if d_act == 2:
-            return torch.tensor([[0, 1]], dtype=torch.long, device=device)
-        if d_act == 3:
-            return torch.tensor([[0, 1, 2], [0, 2, 1], [1, 2, 0]], dtype=torch.long, device=device)
-        base = torch.arange(d_act, dtype=torch.long, device=device)
-        rolls = [torch.roll(base, shifts=-s, dims=0) for s in range(d_act)]
-        return torch.stack(rolls + [torch.flip(p, dims=[0]) for p in rolls], dim=0)
+            perms = torch.tensor([[0, 1]], dtype=torch.long, device=device)
+        elif d_act == 3:
+            perms = torch.tensor([[0, 1, 2], [0, 2, 1], [1, 2, 0]], dtype=torch.long, device=device)
+        else:
+            base = torch.arange(d_act, dtype=torch.long, device=device)
+            rolls = [torch.roll(base, shifts=-s, dims=0) for s in range(d_act)]
+            perms = torch.stack(rolls + [torch.flip(p, dims=[0]) for p in rolls], dim=0)
+        return perms, perms.to(dtype=torch.int32)
 
     def _eval_sym_dyn32_fwd(
         f_t: torch.Tensor,

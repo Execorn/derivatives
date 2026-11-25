@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Literal, Optional, Union, cast
@@ -166,6 +167,16 @@ _SURFACE_ARB_CACHE_LOCK = threading.RLock()
 _SURFACE_ARB_CACHE: OrderedDict[tuple[str, str, int], tuple[bool, str | None]] = OrderedDict()
 _SURFACE_ARB_FAST_CACHE: OrderedDict[tuple[Any, ...], tuple[bool, str | None]] = OrderedDict()
 _SURFACE_ARB_CACHE_MAXSIZE: int = 512
+
+_REPAIRED_CACHE_LOCK = threading.RLock()
+_REPAIRED_SURFACE_CACHE: OrderedDict[
+    tuple[Any, ...], tuple[Callable[..., Any], list[list[float]], bool]
+] = OrderedDict()
+_REPAIRED_SURFACE_CACHE_MAXSIZE: int = 512
+_REPAIRED_REQ_CACHE: OrderedDict[
+    tuple[str, str], tuple[Callable[..., Any], EQAutocallableTradeRequest | None]
+] = OrderedDict()
+_REPAIRED_REQ_CACHE_MAXSIZE: int = 256
 
 _FX_TENOR_CACHE_LOCK = threading.Lock()
 _FX_TENOR_YEARS_CACHE: OrderedDict[Any, float] = OrderedDict()
@@ -476,6 +487,9 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
 
         raw_q = surf.VolatilityQuotes
         fast_arb_key: tuple[Any, ...] | None = None
+        s_arr_buf: array[float] | None = None
+        q_arr_buf: array[float] | None = None
+        n_s = 0
         if (
             _SURFACE_ARB_FAST_CACHE
             and isinstance(strikes_attr, (list, tuple))
@@ -485,14 +499,14 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
         ):
             n_s = len(strikes_attr)
             try:
-                s_bytes = array("d", strikes_attr).tobytes()
-                q_arr_raw = array("d")
+                s_arr_buf = array("d", strikes_attr)
+                q_arr_buf = array("d")
                 all_rows_match = True
                 for q_row in raw_q:
                     if not isinstance(q_row, (list, tuple)) or len(q_row) != n_s:
                         all_rows_match = False
                         break
-                    q_arr_raw.fromlist(q_row) if type(q_row) is list else q_arr_raw.extend(q_row)
+                    q_arr_buf.fromlist(q_row) if type(q_row) is list else q_arr_buf.extend(q_row)
                 if all_rows_match:
                     fast_arb_key = (
                         str(ticker),
@@ -502,8 +516,8 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                         interp_str,
                         extrap_str,
                         tuple(exp_utc_list),
-                        s_bytes,
-                        q_arr_raw.tobytes(),
+                        s_arr_buf.tobytes(),
+                        q_arr_buf.tobytes(),
                     )
                     with _SURFACE_ARB_CACHE_LOCK:
                         fast_verdict = _SURFACE_ARB_FAST_CACHE.get(fast_arb_key)
@@ -517,11 +531,20 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
                                 or f"SMILE_ARBITRAGE: Invalid volatility surface on surface={ticker}."
                             )
                         continue
+                else:
+                    s_arr_buf = None
+                    q_arr_buf = None
             except (TypeError, ValueError, OverflowError):
                 fast_arb_key = None
+                s_arr_buf = None
+                q_arr_buf = None
 
-        quotes = np.asarray(raw_q, dtype=np.float64)
-        strikes = np.asarray(strikes_attr, dtype=np.float64)
+        if s_arr_buf is not None and q_arr_buf is not None:
+            strikes = np.frombuffer(s_arr_buf, dtype=np.float64)
+            quotes = np.frombuffer(q_arr_buf, dtype=np.float64).reshape(n_exp, n_s)
+        else:
+            quotes = np.asarray(raw_q, dtype=np.float64)
+            strikes = np.asarray(strikes_attr, dtype=np.float64)
         if quotes.size == 0 or quotes.ndim != 2:
             raise ValueError(
                 f"SMILE_ARBITRAGE: VolatilityQuotes on surface={ticker} must be non-empty 2D."
@@ -741,15 +764,31 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
 
 def _repair_request_surfaces(req: EQAutocallableTradeRequest) -> EQAutocallableTradeRequest:
     """Clones `req` and projects arbitrageable equity smiles via `repair_arbitrage_quotes` before pre-gating."""
-    try:
-        solver_mod = importlib.import_module("deepvol.models.autocall.dupire_qmc_solver")
-        repair_fn = getattr(solver_mod, "repair_arbitrage_quotes", None)
-    except ImportError:
-        repair_fn = None
+    solver_mod = sys.modules.get("deepvol.models.autocall.dupire_qmc_solver")
+    if solver_mod is None:
+        try:
+            solver_mod = importlib.import_module("deepvol.models.autocall.dupire_qmc_solver")
+        except ImportError:
+            solver_mod = None
+    repair_fn = getattr(solver_mod, "repair_arbitrage_quotes", None) if solver_mod is not None else None
     if not callable(repair_fn):
         raise RuntimeError(
             "repair_arbitrage=True requires dupire_qmc_solver.repair_arbitrage_quotes, which is unavailable."
         )
+
+    raw_digest = getattr(req, "_raw_payload_digest_hex", None)
+    src_req = getattr(req, "_immutable_cache_source", None)
+    trusted_raw_digest = raw_digest if (isinstance(raw_digest, str) and src_req is not None) else None
+    req_cache_key = ("repaired_req", trusted_raw_digest) if trusted_raw_digest is not None else None
+    if req_cache_key is not None:
+        with _REPAIRED_CACHE_LOCK:
+            hit_req = _REPAIRED_REQ_CACHE.get(req_cache_key)
+            if hit_req is not None and hit_req[0] is repair_fn:
+                _REPAIRED_REQ_CACHE.move_to_end(req_cache_key)
+                rep_template = hit_req[1]
+                if rep_template is None:
+                    return req
+                return _clone_cached_request(rep_template)
 
     mds = req.Model.MarketDataSet
     as_of_dt = mds.AsOfDate
@@ -798,24 +837,55 @@ def _repair_request_surfaces(req: EQAutocallableTradeRequest) -> EQAutocallableT
             if (raw_spot is not None and math.isfinite(float(raw_spot)) and float(raw_spot) > 0.0)
             else float(np.median(strikes))
         )
-        repaired_q_raw, repair_info = repair_fn(strikes, quotes, t_exp, k_ref)
-        repaired_q = np.asarray(repaired_q_raw, dtype=np.float64)
-        was_repaired = (
-            bool(repair_info.get("repaired", False))
-            if isinstance(repair_info, Mapping)
-            else not np.array_equal(repaired_q, quotes)
+        surf_cache_key = (
+            str(ticker),
+            strikes.tobytes(),
+            quotes.tobytes(),
+            t_exp.tobytes(),
+            float(k_ref),
         )
-        if was_repaired or not np.array_equal(repaired_q, quotes):
+        cached_surf_hit = None
+        with _REPAIRED_CACHE_LOCK:
+            hit_s = _REPAIRED_SURFACE_CACHE.get(surf_cache_key)
+            if hit_s is not None and hit_s[0] is repair_fn:
+                _REPAIRED_SURFACE_CACHE.move_to_end(surf_cache_key)
+                cached_surf_hit = hit_s
+
+        if cached_surf_hit is not None:
+            _, repaired_q_lists, changed_surf = cached_surf_hit
+        else:
+            repaired_q_raw, repair_info = repair_fn(strikes, quotes, t_exp, k_ref)
+            repaired_q = np.asarray(repaired_q_raw, dtype=np.float64)
+            was_repaired = (
+                bool(repair_info.get("repaired", False))
+                if isinstance(repair_info, Mapping)
+                else not np.array_equal(repaired_q, quotes)
+            )
+            changed_surf = bool(was_repaired or not np.array_equal(repaired_q, quotes))
+            repaired_q_lists = repaired_q.tolist() if changed_surf else []
+            with _REPAIRED_CACHE_LOCK:
+                _REPAIRED_SURFACE_CACHE[surf_cache_key] = (repair_fn, repaired_q_lists, changed_surf)
+                _REPAIRED_SURFACE_CACHE.move_to_end(surf_cache_key)
+                while len(_REPAIRED_SURFACE_CACHE) > _REPAIRED_SURFACE_CACHE_MAXSIZE:
+                    _REPAIRED_SURFACE_CACHE.popitem(last=False)
+
+        if changed_surf:
             any_changed = True
             if hasattr(surf, "model_copy"):
                 repaired_surfs[ticker] = surf.model_copy(
-                    update={"VolatilityQuotes": repaired_q.tolist()},
+                    update={"VolatilityQuotes": [list(row) for row in repaired_q_lists]},
                     deep=False,
                 )
             else:
                 repaired_surfs[ticker] = surf
 
     if not any_changed:
+        if req_cache_key is not None:
+            with _REPAIRED_CACHE_LOCK:
+                _REPAIRED_REQ_CACHE[req_cache_key] = (repair_fn, None)
+                _REPAIRED_REQ_CACHE.move_to_end(req_cache_key)
+                while len(_REPAIRED_REQ_CACHE) > _REPAIRED_REQ_CACHE_MAXSIZE:
+                    _REPAIRED_REQ_CACHE.popitem(last=False)
         return req
 
     new_mds = mds.model_copy(update={"VolatilitySurfaces": repaired_surfs}, deep=False)
@@ -823,7 +893,18 @@ def _repair_request_surfaces(req: EQAutocallableTradeRequest) -> EQAutocallableT
         new_mds.__dict__.pop(attr, None)
     new_model = req.Model.model_copy(update={"MarketDataSet": new_mds}, deep=False)
     repaired_req = req.model_copy(update={"Model": new_model}, deep=False)
-    return _strip_untrusted_digests(repaired_req)
+    repaired_req = _strip_untrusted_digests(repaired_req)
+    if req_cache_key is not None and trusted_raw_digest is not None:
+        rep_digest_hex = f"repaired:{trusted_raw_digest}"
+        object.__setattr__(repaired_req, "_raw_payload_digest_hex", rep_digest_hex)
+        object.__setattr__(repaired_req, "_immutable_cache_source", repaired_req)
+        with _REPAIRED_CACHE_LOCK:
+            _REPAIRED_REQ_CACHE[req_cache_key] = (repair_fn, repaired_req)
+            _REPAIRED_REQ_CACHE.move_to_end(req_cache_key)
+            while len(_REPAIRED_REQ_CACHE) > _REPAIRED_REQ_CACHE_MAXSIZE:
+                _REPAIRED_REQ_CACHE.popitem(last=False)
+        return _clone_cached_request(repaired_req)
+    return repaired_req
 
 
 def _validate_engine(engine: str) -> str:
@@ -2253,10 +2334,9 @@ class EQAutocallRuntime:
         eff_theta_conv = (
             self.theta_convention if theta_convention is None else str(theta_convention)
         )
-        allow_cached_mds_digest = isinstance(getattr(req_model, "_raw_payload_digest_hex", None), str)
         if eff_repair:
             req_model = _repair_request_surfaces(req_model)
-            allow_cached_mds_digest = False
+        allow_cached_mds_digest = isinstance(getattr(req_model, "_raw_payload_digest_hex", None), str)
         return self._price_parsed_trade(
             req_model,
             is_dag=is_dag,
@@ -2820,10 +2900,9 @@ class EQAutocallRuntime:
         eff_theta_conv = (
             self.theta_convention if theta_convention is None else str(theta_convention)
         )
-        allow_cached_mds_digest = isinstance(getattr(req_model, "_raw_payload_digest_hex", None), str)
         if eff_repair:
             req_model = _repair_request_surfaces(req_model)
-            allow_cached_mds_digest = False
+        allow_cached_mds_digest = isinstance(getattr(req_model, "_raw_payload_digest_hex", None), str)
         return self._price_parsed_trade(
             req_model,
             is_dag=parsed_is_dag,
@@ -3847,8 +3926,7 @@ class EQAutocallRuntime:
                     req_m = _repair_request_surfaces(req_m)
                 mds_hex = _resolve_request_mds_digest_hex(
                     req_m,
-                    allow_cached=(not eff_repair)
-                    and isinstance(getattr(req_m, "_raw_payload_digest_hex", None), str),
+                    allow_cached=isinstance(getattr(req_m, "_raw_payload_digest_hex", None), str),
                 )
                 if mds_hex not in mds_only_cache:
                     _validate_surfaces_for_arbitrage(req_m)

@@ -1088,8 +1088,17 @@ class MaskedEQAutocallSurrogate(nn.Module):
             hazard_act_c = c_call_c * torch.sigmoid(
                 logit_h_proxy_c + delta_hazard.to(dtype=calc_dtype)
             )
-            survival_act_c = torch.cumprod(1.0 - hazard_act_c, dim=1) * has_sched_any_c.unsqueeze(1)
-            surv_term_pred_c = survival_act_c[:, -1]
+            # Binary tree product avoids torch.cumprod CUDAGraph capture failure and preserves exact gradients near (1 - h) == 0.
+            p_cur = 1.0 - hazard_act_c
+            while p_cur.shape[1] > 1:
+                half = p_cur.shape[1] // 2
+                prod_pairs = p_cur[:, : 2 * half : 2] * p_cur[:, 1 : 2 * half : 2]
+                p_cur = (
+                    torch.cat([prod_pairs, p_cur[:, 2 * half :]], dim=1)
+                    if (p_cur.shape[1] & 1)
+                    else prod_pairs
+                )
+            surv_term_pred_c = p_cur.squeeze(1) * has_sched_any_c
             surv_proxy_term_c = (1.0 - p_proxy_c.sum(dim=1)).clamp(min=0.0) * has_sched_any_c
             stulz_fwd_last_c = (
                 torch.gather(stulz_fwd_c, dim=1, index=last_pos).squeeze(1) * has_sched_any_c
@@ -1403,7 +1412,16 @@ class MaskedEQAutocallSurrogate(nn.Module):
         hazard_act = (
             c_call * m_sched * torch.sigmoid(logit_h_proxy + delta_hazard_act.to(dtype=calc_dtype))
         )
-        survival_act = torch.cumprod(1.0 - hazard_act, dim=1) * has_sched_any_f.unsqueeze(1)
+        # Parallel prefix product avoids torch.cumprod CUDAGraph capture failure and preserves exact gradients near (1 - h) == 0.
+        s_cur = 1.0 - hazard_act
+        step = 1
+        while step < m_act:
+            s_cur = torch.cat(
+                [s_cur[:, :step], s_cur[:, step:] * s_cur[:, :-step]],
+                dim=1,
+            )
+            step <<= 1
+        survival_act = s_cur * has_sched_any_f.unsqueeze(1)
         surv_prev = torch.cat(
             [torch.ones_like(survival_act[:, :1]), survival_act[:, :-1]], dim=1
         )
