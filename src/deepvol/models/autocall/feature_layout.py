@@ -195,6 +195,8 @@ def resolve_canonical_tier3_config(
         eff_paths = 2048
     elif d_val >= 6 and m_val <= 12:
         eff_paths = 8192
+    elif dev_tok == "cpu" and ((d_val <= 5 and m_val <= 10) or (d_val <= 4 and m_val <= 12)):
+        eff_paths = 8192
     else:
         eff_paths = 4096
     n_sub = 4
@@ -205,7 +207,7 @@ def resolve_canonical_tier3_config(
     nt, ny = 32, 64
     n_cheap = (
         max(262144, 8 * eff_paths)
-        if dev_tok == "cuda"
+        if (dev_tok == "cuda" or (dev_tok == "cpu" and d_val <= 4 and 9 <= m_val <= 12 and eff_paths >= 8192))
         else (max(16384, 8 * eff_paths) if (dev_tok == "cpu" and d_val * m_val >= 200) else max(32768, 8 * eff_paths))
     )
     return CanonicalTier3Config(

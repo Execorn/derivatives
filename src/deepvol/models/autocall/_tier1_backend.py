@@ -2802,6 +2802,15 @@ def _ensure_i64_c(arr: npt.ArrayLike) -> npt.NDArray[np.int64]:
     return np.ascontiguousarray(arr, dtype=np.int64)
 
 
+_I32_DTYPE = np.dtype(np.int32)
+
+
+def _ensure_i32_c(arr: npt.ArrayLike) -> npt.NDArray[np.int32]:
+    if type(arr) is np.ndarray and arr.dtype == _I32_DTYPE and arr.flags.c_contiguous:
+        return arr
+    return np.ascontiguousarray(arr, dtype=np.int32)
+
+
 def _ensure_u32_c(arr: npt.ArrayLike) -> npt.NDArray[np.uint32]:
     if type(arr) is np.ndarray and arr.dtype == _U32_DTYPE and arr.flags.c_contiguous:
         return arr
@@ -3229,6 +3238,62 @@ class Cpp23Tier1Backend:
         ]
         lib.crn_step_spot_bumps_cpp.restype = ctypes.c_int32
 
+        lib.crn_corr_normals_cpp.argtypes = [
+            ctypes.c_int32,
+            ctypes.c_int64,
+            c_vp,
+            c_vp,
+            c_vp,
+        ]
+        lib.crn_corr_normals_cpp.restype = ctypes.c_int32
+
+        lib.crn_eval_c2_preterm_cpp.argtypes = [
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int64,
+            ctypes.c_int32,
+            ctypes.c_int64,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            c_vp,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_double,
+            ctypes.c_double,
+            c_vp,
+        ]
+        lib.crn_eval_c2_preterm_cpp.restype = ctypes.c_int32
+
+        lib.crn_pullback_matvec_cpp.argtypes = [ctypes.c_int64, ctypes.c_int64, c_vp, c_vp, c_vp]
+        lib.crn_pullback_matvec_cpp.restype = ctypes.c_int32
+
+        lib.crn_pack_sp_bumps_nocross_cpp.argtypes = [
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_int64, c_vp, c_vp, c_vp, c_vp, c_vp
+        ]
+        lib.crn_pack_sp_bumps_nocross_cpp.restype = ctypes.c_int32
+
         self._fn_coeffs = lib.tier1_clamped_cubic_coeffs_1d
         self._fn_eval_cubic = lib.tier1_eval_cubic_with_derivs
         self._fn_bridge = lib.tier1_eval_autocall_bridge_cpu
@@ -3236,6 +3301,10 @@ class Cpp23Tier1Backend:
         self._fn_index_moments = lib.tier1_eval_index_moments_cpu
         self._fn_crn_step_1d = lib.crn_step_1d_trajectories_cpp
         self._fn_crn_step_spot_bumps = lib.crn_step_spot_bumps_cpp
+        self._fn_crn_corr_normals = lib.crn_corr_normals_cpp
+        self._fn_crn_eval_c2_preterm = lib.crn_eval_c2_preterm_cpp
+        self._fn_crn_pullback_matvec = lib.crn_pullback_matvec_cpp
+        self._fn_crn_pack_sp_bumps_nocross = lib.crn_pack_sp_bumps_nocross_cpp
         self._fn_crn_loo_l2o = lib.crn_eval_payoff_loo_l2o_cpp
         self._fn_platen_sde_aad = lib.crn_platen_sde_aad_cpp
         self._fn_sobol_gen = lib.crn_generate_sobol_normals_cpp
@@ -3447,6 +3516,177 @@ class Cpp23Tier1Backend:
         if rc != 0:
             raise RuntimeError(f"crn_step_spot_bumps_cpp failed with status code {rc}.")
         return out_arr
+
+    def crn_corr_normals_cpu(
+        self,
+        *,
+        z_indep: npt.NDArray[np.float64],
+        chol_mat: npt.NDArray[np.float64],
+        z_corr_out: npt.NDArray[np.float64],
+    ) -> None:
+        z_c = _ensure_f64_c(z_indep)
+        ch_c = _ensure_f64_c(chol_mat)
+        if not (
+            isinstance(z_corr_out, np.ndarray)
+            and z_corr_out.dtype == _F64_DTYPE
+            and z_corr_out.flags.c_contiguous
+            and z_corr_out.shape == z_c.shape
+        ):
+            raise ValueError(f"z_corr_out must be C-contiguous float64 of shape {z_c.shape}")
+        d_assets = int(z_c.shape[-1])
+        n_rows = int(z_c.size // max(d_assets, 1))
+        rc = int(self._fn_crn_corr_normals(d_assets, n_rows, z_c.ctypes.data, ch_c.ctypes.data, z_corr_out.ctypes.data))
+        if rc != 0:
+            raise RuntimeError(f"crn_corr_normals_cpp failed with status code {rc}.")
+
+    def crn_eval_c2_preterm_cpu(
+        self,
+        *,
+        perf_base: npt.NDArray[np.float64],
+        perf_sp_p: npt.NDArray[np.float64],
+        perf_sp_m: npt.NDArray[np.float64],
+        frozen_term: npt.NDArray[np.float64],
+        aa_pre: npt.NDArray[np.int32],
+        ab_pre: npt.NDArray[np.int32],
+        asl_pre: npt.NDArray[np.int32],
+        bsl_pre: npt.NDArray[np.int32],
+        ko_barriers: npt.NDArray[np.float64],
+        is_callable: npt.NDArray[np.float64],
+        cpn_barriers: npt.NDArray[np.float64],
+        is_guar: npt.NDArray[np.float64],
+        cpn_rates: npt.NDArray[np.float64],
+        df_pay: npt.NDArray[np.float64],
+        w_fund: Optional[npt.NDArray[np.float64]],
+        eps_vec: npt.NDArray[np.float64],
+        call_code: int,
+        cpn_code: int,
+        hard_ko: bool,
+        hard_cpn: bool,
+        ko_spread: float,
+        eff_csp: float,
+        cpn_dir_down: bool,
+        cpn_type_out: bool,
+        is_memory: bool,
+        force_cpn_ac: bool,
+        no_notional: bool,
+        ac_cpn: float,
+        c_mem_0: float,
+    ) -> npt.NDArray[np.float64]:
+        pb_c = _ensure_f64_c(perf_base)
+        m_rem, d_assets, n_tot = int(pb_c.shape[0]), int(pb_c.shape[1]), int(pb_c.shape[2])
+        if (
+            isinstance(perf_sp_p, np.ndarray)
+            and isinstance(perf_sp_m, np.ndarray)
+            and perf_sp_p.dtype == _F64_DTYPE
+            and perf_sp_m.dtype == _F64_DTYPE
+            and perf_sp_p.shape == (d_assets, m_rem, n_tot)
+            and perf_sp_m.shape == (d_assets, m_rem, n_tot)
+            and perf_sp_p.strides[1] == n_tot * 8
+            and perf_sp_p.strides[2] == 8
+            and perf_sp_m.strides == perf_sp_p.strides
+            and (perf_sp_p.strides[0] % 8) == 0
+        ):
+            spp_c = perf_sp_p
+            spm_c = perf_sp_m
+            sp_row_stride = int(perf_sp_p.strides[0] // 8)
+        else:
+            spp_c = _ensure_f64_c(perf_sp_p)
+            spm_c = _ensure_f64_c(perf_sp_m)
+            sp_row_stride = m_rem * n_tot
+        ft_c = _ensure_f64_c(frozen_term)
+        aa_c = _ensure_i32_c(aa_pre)
+        ab_c = _ensure_i32_c(ab_pre)
+        asl_c = _ensure_i32_c(asl_pre)
+        bsl_c = _ensure_i32_c(bsl_pre)
+        ko_c = _ensure_f64_c(ko_barriers)
+        ic_c = _ensure_f64_c(is_callable)
+        cp_c = _ensure_f64_c(cpn_barriers)
+        ig_c = _ensure_f64_c(is_guar)
+        cr_c = _ensure_f64_c(cpn_rates)
+        df_c = _ensure_f64_c(df_pay)
+        wf_c = _ensure_f64_c(w_fund) if w_fund is not None else None
+        eps_c = _ensure_f64_c(eps_vec)
+        n_rows = int(aa_c.shape[0])
+        pv_out = np.empty(n_rows, dtype=_F64_DTYPE)
+        rc = int(
+            self._fn_crn_eval_c2_preterm(
+                d_assets,
+                m_rem,
+                n_tot,
+                n_rows,
+                sp_row_stride,
+                pb_c.ctypes.data,
+                spp_c.ctypes.data,
+                spm_c.ctypes.data,
+                ft_c.ctypes.data,
+                aa_c.ctypes.data,
+                ab_c.ctypes.data,
+                asl_c.ctypes.data,
+                bsl_c.ctypes.data,
+                ko_c.ctypes.data,
+                ic_c.ctypes.data,
+                cp_c.ctypes.data,
+                ig_c.ctypes.data,
+                cr_c.ctypes.data,
+                df_c.ctypes.data,
+                wf_c.ctypes.data if wf_c is not None else 0,
+                eps_c.ctypes.data,
+                int(call_code),
+                int(cpn_code),
+                1 if hard_ko else 0,
+                1 if hard_cpn else 0,
+                float(ko_spread),
+                float(eff_csp),
+                1 if cpn_dir_down else 0,
+                1 if cpn_type_out else 0,
+                1 if is_memory else 0,
+                1 if force_cpn_ac else 0,
+                1 if no_notional else 0,
+                float(ac_cpn),
+                float(c_mem_0),
+                pv_out.ctypes.data,
+            )
+        )
+        if rc != 0:
+            raise RuntimeError(f"crn_eval_c2_preterm_cpp failed with status code {rc}.")
+        return pv_out
+
+    def crn_pullback_matvec_cpu(
+        self,
+        *,
+        vec_in: npt.NDArray[np.float64],
+        mat_w: npt.NDArray[np.float64],
+        out_vec: npt.NDArray[np.float64],
+    ) -> None:
+        v_c = _ensure_f64_c(vec_in)
+        m_c = _ensure_f64_c(mat_w)
+        k_len, n_len = int(m_c.shape[0]), int(m_c.shape[1])
+        rc = int(self._fn_crn_pullback_matvec(k_len, n_len, v_c.ctypes.data, m_c.ctypes.data, out_vec.ctypes.data))
+        if rc != 0:
+            raise RuntimeError(f"crn_pullback_matvec_cpp failed with status code {rc}.")
+
+    def crn_pack_sp_bumps_nocross_cpu(
+        self,
+        *,
+        nx_p: npt.NDArray[np.float64],
+        nx_m: npt.NDArray[np.float64],
+        fwd_p: npt.NDArray[np.float64],
+        fwd_m: npt.NDArray[np.float64],
+        bump_a: npt.NDArray[np.float64],
+    ) -> None:
+        nxp_c = _ensure_f64_c(nx_p)
+        nxm_c = _ensure_f64_c(nx_m)
+        fp_c = _ensure_f64_c(fwd_p)
+        fm_c = _ensure_f64_c(fwd_m)
+        d_assets, m_rem, n_tot = int(nxp_c.shape[0]), int(nxp_c.shape[1]), int(nxp_c.shape[2])
+        rc = int(
+            self._fn_crn_pack_sp_bumps_nocross(
+                d_assets, m_rem, n_tot,
+                nxp_c.ctypes.data, nxm_c.ctypes.data, fp_c.ctypes.data, fm_c.ctypes.data, bump_a.ctypes.data,
+            )
+        )
+        if rc != 0:
+            raise RuntimeError(f"crn_pack_sp_bumps_nocross_cpp failed with status code {rc}.")
 
     def crn_generate_sobol_normals_cpu(
         self,
@@ -4155,6 +4395,110 @@ def crn_step_spot_bumps_cpu(
     )
 
 
+def crn_corr_normals_cpu(
+    *,
+    z_indep: npt.NDArray[np.float64],
+    chol_mat: npt.NDArray[np.float64],
+    z_corr_out: npt.NDArray[np.float64],
+) -> None:
+    """Computes correlated standard normals in C++23 OpenMP."""
+    _require_cpp23_backend().crn_corr_normals_cpu(
+        z_indep=z_indep,
+        chol_mat=chol_mat,
+        z_corr_out=z_corr_out,
+    )
+
+
+def crn_eval_c2_preterm_cpu(
+    *,
+    perf_base: npt.NDArray[np.float64],
+    perf_sp_p: npt.NDArray[np.float64],
+    perf_sp_m: npt.NDArray[np.float64],
+    frozen_term: npt.NDArray[np.float64],
+    aa_pre: npt.NDArray[np.int32],
+    ab_pre: npt.NDArray[np.int32],
+    asl_pre: npt.NDArray[np.int32],
+    bsl_pre: npt.NDArray[np.int32],
+    ko_barriers: npt.NDArray[np.float64],
+    is_callable: npt.NDArray[np.float64],
+    cpn_barriers: npt.NDArray[np.float64],
+    is_guar: npt.NDArray[np.float64],
+    cpn_rates: npt.NDArray[np.float64],
+    df_pay: npt.NDArray[np.float64],
+    w_fund: Optional[npt.NDArray[np.float64]],
+    eps_vec: npt.NDArray[np.float64],
+    call_code: int,
+    cpn_code: int,
+    hard_ko: bool,
+    hard_cpn: bool,
+    ko_spread: float,
+    eff_csp: float,
+    cpn_dir_down: bool,
+    cpn_type_out: bool,
+    is_memory: bool,
+    force_cpn_ac: bool,
+    no_notional: bool,
+    ac_cpn: float,
+    c_mem_0: float,
+) -> npt.NDArray[np.float64]:
+    """Dispatches L1-cached C^2 preterm LOO/L2O evaluator to C++23 AVX2/OpenMP."""
+    return _require_cpp23_backend().crn_eval_c2_preterm_cpu(
+        perf_base=perf_base,
+        perf_sp_p=perf_sp_p,
+        perf_sp_m=perf_sp_m,
+        frozen_term=frozen_term,
+        aa_pre=aa_pre,
+        ab_pre=ab_pre,
+        asl_pre=asl_pre,
+        bsl_pre=bsl_pre,
+        ko_barriers=ko_barriers,
+        is_callable=is_callable,
+        cpn_barriers=cpn_barriers,
+        is_guar=is_guar,
+        cpn_rates=cpn_rates,
+        df_pay=df_pay,
+        w_fund=w_fund,
+        eps_vec=eps_vec,
+        call_code=call_code,
+        cpn_code=cpn_code,
+        hard_ko=hard_ko,
+        hard_cpn=hard_cpn,
+        ko_spread=ko_spread,
+        eff_csp=eff_csp,
+        cpn_dir_down=cpn_dir_down,
+        cpn_type_out=cpn_type_out,
+        is_memory=is_memory,
+        force_cpn_ac=force_cpn_ac,
+        no_notional=no_notional,
+        ac_cpn=ac_cpn,
+        c_mem_0=c_mem_0,
+    )
+
+
+def crn_pullback_matvec_cpu(
+    *,
+    vec_in: npt.NDArray[np.float64],
+    mat_w: npt.NDArray[np.float64],
+    out_vec: npt.NDArray[np.float64],
+) -> None:
+    """Evaluates row-vector times matrix pullback in C++23 SIMD without waking BLAS pools."""
+    _require_cpp23_backend().crn_pullback_matvec_cpu(vec_in=vec_in, mat_w=mat_w, out_vec=out_vec)
+
+
+def crn_pack_sp_bumps_nocross_cpu(
+    *,
+    nx_p: npt.NDArray[np.float64],
+    nx_m: npt.NDArray[np.float64],
+    fwd_p: npt.NDArray[np.float64],
+    fwd_m: npt.NDArray[np.float64],
+    bump_a: npt.NDArray[np.float64],
+) -> None:
+    """Packs +/- spot-bump performance tensors in C++23 OpenMP/SIMD."""
+    _require_cpp23_backend().crn_pack_sp_bumps_nocross_cpu(
+        nx_p=nx_p, nx_m=nx_m, fwd_p=fwd_p, fwd_m=fwd_m, bump_a=bump_a
+    )
+
+
 def crn_generate_sobol_normals_cpu(
     *,
     d_assets: int,
@@ -4316,9 +4660,13 @@ __all__ = [
     "Tier1AbiInfoV2C",
     "Tier1MathBackend",
     "VibratoGammaArgsC",
+    "crn_corr_normals_cpu",
+    "crn_eval_c2_preterm_cpu",
     "crn_eval_vibrato_gamma_cpu",
     "crn_generate_sobol_normals_cpu",
+    "crn_pack_sp_bumps_nocross_cpu",
     "crn_platen_sde_aad_cpu",
+    "crn_pullback_matvec_cpu",
     "crn_step_spot_bumps_cpu",
     "get_tier1_backend",
     "is_exact_analytical_index",

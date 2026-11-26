@@ -49,6 +49,13 @@ from deepvol.models.autocall.gpu_cache_manager import (
 )
 from deepvol.models.autocall.pre_post_processor import assemble_autocall_cashflows_and_pv
 
+if _HAS_NUMBA:
+    os.environ.setdefault("NUMBA_THREADING_LAYER", "omp")
+    try:
+        numba.config.THREADING_LAYER = "omp"
+    except Exception:
+        pass
+
 _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
 
@@ -138,8 +145,24 @@ _CRN_VEGA_JAC_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=4096
 _CRN_CURVE_JAC_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=2048)
 _CRN_CPU_PREP_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=512)
 _CRN_MF_CHEAP_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=512)
+_CPU_SCRATCH_TL = threading.local()
+
+
+def _get_cpu_tl_f64_buf(slot: str, shape: Tuple[int, ...], *, max_bytes: int = 160 * 1024 * 1024) -> npt.NDArray[np.float64]:
+    need = 1
+    for s in shape:
+        need *= int(s)
+    buf: Optional[npt.NDArray[np.float64]] = getattr(_CPU_SCRATCH_TL, slot, None)
+    if buf is None or buf.size < need:
+        alloc_elems = need
+        if (alloc_elems * 8) <= max_bytes:
+            buf = np.empty(alloc_elems, dtype=np.float64)
+            setattr(_CPU_SCRATCH_TL, slot, buf)
+        else:
+            return np.empty(shape, dtype=np.float64)
+    return buf[:need].reshape(shape)
 _CRN_DEAL_PREP_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "deal_prep_lv_vega", max_entries=512, max_bytes=24 * 1024 * 1024
+    "deal_prep_lv_vega", max_entries=512, max_bytes=16 * 1024 * 1024
 )
 _CRN_STATIC_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
     "static_constants", max_entries=256, max_bytes=8 * 1024 * 1024
@@ -7161,6 +7184,840 @@ if _HAS_NUMBA:
                 idx_out[m, n] = 0
         return w_out, idx_out
 
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_corr_normals(
+        z_indep: npt.NDArray[np.float64],
+        chol_base: npt.NDArray[np.float64],
+        out_arr: npt.NDArray[np.float64],
+    ) -> None:
+        d_assets = chol_base.shape[0]
+        n_rows = z_indep.size // d_assets
+        z2 = z_indep.reshape((n_rows, d_assets))
+        o2 = out_arr.reshape((n_rows, d_assets))
+        for i in numba.prange(n_rows):
+            for d in range(d_assets):
+                acc = 0.0
+                for k in range(d_assets):
+                    acc += z2[i, k] * chol_base[d, k]
+                o2[i, d] = acc
+
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_mul_fwd_m_d_n(
+        nx_m_d_n: npt.NDArray[np.float64],
+        fwd_d_m: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        m_rem, d_assets, n_tot = nx_m_d_n.shape
+        out = np.empty((m_rem, d_assets, n_tot), dtype=np.float64)
+        for md in numba.prange(m_rem * d_assets):
+            m = md // d_assets
+            d = md - m * d_assets
+            f_val = fwd_d_m[d, m]
+            for n in range(n_tot):
+                out[m, d, n] = nx_m_d_n[m, d, n] * f_val
+        return out
+
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_pack_sp_bumps(
+        nx_sp_p: npt.NDArray[np.float64],
+        nx_sp_m: npt.NDArray[np.float64],
+        fwd_sp_p: npt.NDArray[np.float64],
+        fwd_sp_m: npt.NDArray[np.float64],
+        cross_i: npt.NDArray[np.int32],
+        cross_j: npt.NDArray[np.int32],
+        perf_p: npt.NDArray[np.float64],
+        perf_m: npt.NDArray[np.float64],
+        bump_a: npt.NDArray[np.float64],
+        bump_b: npt.NDArray[np.float64],
+    ) -> None:
+        d_assets, m_rem, n_tot = nx_sp_p.shape
+        n_cross_pairs = len(cross_i)
+        for dm in numba.prange(d_assets * m_rem):
+            d = dm // m_rem
+            m = dm - d * m_rem
+            fp = fwd_sp_p[d, m]
+            fm = fwd_sp_m[d, m]
+            r_p = 2 * d
+            r_m = 2 * d + 1
+            for n in range(n_tot):
+                vp = nx_sp_p[d, m, n] * fp
+                vm = nx_sp_m[d, m, n] * fm
+                perf_p[d, m, n] = vp
+                perf_m[d, m, n] = vm
+                bump_a[r_p, m, n] = vp
+                bump_a[r_m, m, n] = vm
+        if n_cross_pairs > 0:
+            for cm in numba.prange(n_cross_pairs * m_rem):
+                c_idx = cm // m_rem
+                m = cm - c_idx * m_rem
+                i = int(cross_i[c_idx])
+                j = int(cross_j[c_idx])
+                b0 = 2 * d_assets + 2 * c_idx
+                for n in range(n_tot):
+                    bump_a[b0, m, n] = perf_p[i, m, n]
+                    bump_b[b0, m, n] = perf_p[j, m, n]
+                    bump_a[b0 + 1, m, n] = perf_m[i, m, n]
+                    bump_b[b0 + 1, m, n] = perf_m[j, m, n]
+
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_eval_theta_hard_pv(
+        perf_m_d_n: npt.NDArray[np.float64],
+        ko_arr: npt.NDArray[np.float64],
+        is_call: npt.NDArray[np.float64],
+        cpn_arr: npt.NDArray[np.float64],
+        is_guar: npt.NDArray[np.float64],
+        cpn_rates: npt.NDArray[np.float64],
+        df_pay: npt.NDArray[np.float64],
+        w_fund: npt.NDArray[np.float64],
+        has_w_fund: bool,
+        eps_ki: npt.NDArray[np.float64],
+        ext_ki: npt.NDArray[np.float64],
+        use_ext_ki: bool,
+        k_cross: int,
+        call_code: int,
+        cpn_code: int,
+        opt_code: int,
+        ko_spread: float,
+        eff_csp: float,
+        ki_spread: float,
+        dir_down: bool,
+        type_out: bool,
+        is_memory: bool,
+        force_cpn_ac: bool,
+        no_notional: bool,
+        is_long_flag: bool,
+        has_ki: bool,
+        ki_is_discrete: bool,
+        b_ki: float,
+        eff_iki_th: float,
+        eff_cmem_th: float,
+        ac_cpn: float,
+        k_put: float,
+        has_low_k: bool,
+        k_low: float,
+        option_gearing: float,
+        has_part_call: bool,
+        k_call: float,
+        part_call_rate: float,
+        k_os: float,
+        os_cpn: float,
+        one_star_eps: float,
+    ) -> float:
+        m_rem_th, d_assets, n_tot = perf_m_d_n.shape
+        m_last = m_rem_th - 1
+        inv_d = 1.0 / float(d_assets)
+        hard_ko = abs(ko_spread) <= 1e-6
+        hard_cpn = abs(eff_csp) <= 1e-6
+        has_os = k_os > 0.0
+        b_ki_th = k_put if is_long_flag else b_ki
+        ki_active = has_ki and b_ki > 0.0 and eff_iki_th < 0.5
+        flip_cpn = dir_down != type_out
+        put_active = is_long_flag or (((not has_low_k) or (k_put > k_low)) and option_gearing > 0.0)
+
+        tile_n = 256
+        n_tiles = max(1, (n_tot + tile_n - 1) // tile_n)
+        tile_sums = np.zeros(n_tiles, dtype=np.float64)
+
+        for t_i in numba.prange(n_tiles):
+            n_start = t_i * tile_n
+            n_end = min(n_start + tile_n, n_tot)
+            s_pv = 0.0
+            for n in range(n_start, n_end):
+                surv = 1.0
+                cmem = eff_cmem_th
+                pv = 0.0
+                p_noki_d = 1.0
+                for m_loc in range(m_rem_th):
+                    m_orig = k_cross + m_loc
+                    w_min = perf_m_d_n[m_loc, 0, n]
+                    w_max = w_min
+                    w_sum = w_min
+                    for d in range(1, d_assets):
+                        v = perf_m_d_n[m_loc, d, n]
+                        if v < w_min:
+                            w_min = v
+                        if v > w_max:
+                            w_max = v
+                        w_sum += v
+                    w_avg = w_sum * inv_d
+
+                    wc = w_min if call_code == 0 else (w_max if call_code == 1 else w_avg)
+                    wcp = w_min if cpn_code == 0 else (w_max if cpn_code == 1 else w_avg)
+                    wo = w_min if (is_long_flag or opt_code == 0) else (w_max if opt_code == 1 else w_avg)
+
+                    if ki_active and ki_is_discrete and (not use_ext_ki):
+                        if abs(ki_spread) > 1e-6:
+                            blk = min(b_ki_th, b_ki_th + ki_spread)
+                            bhk = max(b_ki_th, b_ki_th + ki_spread)
+                            u_km = (bhk - wo) / max(bhk - blk, 1e-12)
+                        else:
+                            em = eps_ki[m_loc]
+                            bhk = b_ki_th + 0.5 * em
+                            u_km = (bhk - wo) / max(em, 1e-12)
+                        if u_km < 0.0:
+                            g_km = 0.0
+                        elif u_km > 1.0:
+                            g_km = 1.0
+                        else:
+                            g_km = u_km
+                        p_noki_d *= 1.0 - g_km
+
+                    if is_call[m_orig] > 0.5:
+                        bk = ko_arr[m_orig]
+                        if hard_ko:
+                            gk = 1.0 if wc >= bk else 0.0
+                        else:
+                            bl = min(bk, bk + ko_spread)
+                            bh = max(bk, bk + ko_spread)
+                            uk = (wc - bl) / max(bh - bl, 1e-12)
+                            gk = 0.0 if uk < 0.0 else (1.0 if uk > 1.0 else uk)
+                    else:
+                        gk = 0.0
+
+                    if is_guar[m_orig] > 0.5:
+                        gc = 1.0
+                    else:
+                        bc = cpn_arr[m_orig]
+                        if hard_cpn:
+                            hd = (wcp <= bc) if dir_down else (wcp >= bc)
+                            gc = (0.0 if hd else 1.0) if type_out else (1.0 if hd else 0.0)
+                        else:
+                            blc = min(bc, bc + eff_csp)
+                            bhc = max(bc, bc + eff_csp)
+                            uc = (wcp - blc) / max(bhc - blc, 1e-12)
+                            ru = 0.0 if uc < 0.0 else (1.0 if uc > 1.0 else uc)
+                            gc = (1.0 - ru) if flip_cpn else ru
+
+                    egc = (gk if gk > gc else gc) if force_cpn_ac else gc
+                    pm = surv * gk
+                    cr = cpn_rates[m_orig]
+                    if is_memory:
+                        ec = cr + cmem
+                        ccf = surv * egc * ec + pm * ac_cpn
+                        cmem = surv * ec * (1.0 - egc)
+                    else:
+                        ccf = surv * egc * cr + pm * ac_cpn
+                    df_m = df_pay[m_loc]
+                    pv += df_m * (ccf if no_notional else (ccf + pm))
+                    if has_w_fund:
+                        pv -= w_fund[m_loc] * surv
+                    rem_s = surv - pm
+                    surv = rem_s if rem_s > 0.0 else 0.0
+
+                    if m_loc == m_last:
+                        if not no_notional:
+                            pv += df_m * surv
+                        if not has_ki:
+                            kig = 1.0
+                        elif use_ext_ki:
+                            kig = ext_ki[n]
+                        elif not ki_active:
+                            kig = eff_iki_th
+                        elif ki_is_discrete:
+                            kig = 1.0 - p_noki_d
+                        else:
+                            if abs(ki_spread) <= 1e-6:
+                                gki = 1.0 if wo < b_ki_th else 0.0
+                            else:
+                                blk = min(b_ki_th, b_ki_th + ki_spread)
+                                bhk = max(b_ki_th, b_ki_th + ki_spread)
+                                uki = (bhk - wo) / max(bhk - blk, 1e-12)
+                                gki = 0.0 if uki < 0.0 else (1.0 if uki > 1.0 else uki)
+                            kig = gki if gki > eff_iki_th else eff_iki_th
+
+                        if has_os:
+                            if one_star_eps <= 1e-6:
+                                sind = 1.0 if w_max >= k_os else 0.0
+                            else:
+                                uos = (w_max - (k_os - 0.5 * one_star_eps)) / one_star_eps
+                                sind = 0.0 if uos < 0.0 else (1.0 if uos > 1.0 else uos)
+                        else:
+                            sind = 0.0
+
+                        opay = 0.0
+                        if is_long_flag:
+                            opay -= kig * (1.0 - sind) * (1.0 - w_avg)
+                        elif put_active:
+                            p_lo = max(k_low - wo, 0.0) if has_low_k else 0.0
+                            p_in = max(k_put - wo, 0.0) - p_lo
+                            opay -= option_gearing * kig * (1.0 - sind) * p_in
+                        if has_part_call:
+                            opay += part_call_rate * max(wo - k_call, 0.0)
+                        if has_os and os_cpn != 0.0:
+                            opay += sind * os_cpn
+                        pv += df_m * surv * opay
+                s_pv += pv
+            tile_sums[t_i] = s_pv
+
+        tot = 0.0
+        for t_i in range(n_tiles):
+            tot += tile_sums[t_i]
+        return tot / float(n_tot)
+
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_payoff_aad_fused_full(
+        perf_m_d_n: npt.NDArray[np.float64],
+        ko_barriers: npt.NDArray[np.float64],
+        is_callable: npt.NDArray[np.float64],
+        cpn_barriers: npt.NDArray[np.float64],
+        is_guar: npt.NDArray[np.float64],
+        cpn_rates: npt.NDArray[np.float64],
+        df_pay: npt.NDArray[np.float64],
+        w_fund_arr: npt.NDArray[np.float64],
+        has_w_fund: bool,
+        eps_vec: npt.NDArray[np.float64],
+        call_code: int,
+        cpn_code: int,
+        eff_opt_code: int,
+        hard_ko: bool,
+        hard_cpn: bool,
+        ko_spread: float,
+        eff_csp: float,
+        ki_spread: float,
+        cpn_dir_down: bool,
+        cpn_type_out: bool,
+        is_memory: bool,
+        force_cpn_ac: bool,
+        no_notional: bool,
+        is_long_basket: bool,
+        has_ki: bool,
+        ki_is_discrete: bool,
+        ki_barrier: float,
+        i_ki_past: float,
+        strike: float,
+        has_lower_strike: bool,
+        lower_strike: float,
+        option_gearing: float,
+        ac_cpn: float,
+        c_mem_0: float,
+        has_pc: bool,
+        part_call_strike: float,
+        part_call_rate: float,
+        has_os: bool,
+        one_star_strike: float,
+        one_star_coupon: float,
+        one_star_eps: float,
+        n_rep: int,
+        want_cf_wf: bool,
+        bar_lx_post_np: npt.NDArray[np.float64],
+        bar_ln_fwd_np: npt.NDArray[np.float64],
+        s1_mat: npt.NDArray[np.float64],
+        cf_wf_out: npt.NDArray[np.float64],
+    ) -> None:
+        m_rem, d_assets, n_tot = perf_m_d_n.shape
+        m_last = m_rem - 1
+        n_r_blk = n_tot // n_rep
+        chunks_per_rep = 8 if n_rep >= 1024 else (4 if n_rep >= 256 else 1)
+        while n_rep % chunks_per_rep != 0 and chunks_per_rep > 1:
+            chunks_per_rep //= 2
+        tile_len = n_rep // chunks_per_rep
+        n_tasks = n_r_blk * chunks_per_rep
+        inv_d = 1.0 / float(d_assets)
+        inv_n_tot = 1.0 / float(n_tot)
+        inv_rep = 1.0 / float(n_rep)
+        scale = inv_n_tot
+        df_last = float(df_pay[m_last])
+        same_cpn_call = cpn_code == call_code
+        ki_active = has_ki and ki_barrier > 0.0 and i_ki_past < 0.5
+        b_ki_base = strike if is_long_basket else ki_barrier
+        put_active = (strike > lower_strike and option_gearing > 0.0) if has_lower_strike else (option_gearing > 0.0)
+
+        lo_ko_arr = np.empty(m_rem, dtype=np.float64)
+        inv_w_ko_arr = np.empty(m_rem, dtype=np.float64)
+        lo_cp_arr = np.empty(m_rem, dtype=np.float64)
+        inv_w_cp_arr = np.empty(m_rem, dtype=np.float64)
+        bhi_ki_arr = np.empty(m_rem, dtype=np.float64)
+        inv_w_ki_arr = np.empty(m_rem, dtype=np.float64)
+        sign_cpn = (-1.0 if cpn_dir_down else 1.0) * (-1.0 if cpn_type_out else 1.0)
+        for m in range(m_rem):
+            em = eps_vec[m]
+            bk = ko_barriers[m]
+            lok = (bk - 0.5 * em) if hard_ko else min(bk, bk + ko_spread)
+            hik = (bk + 0.5 * em) if hard_ko else max(bk, bk + ko_spread)
+            lo_ko_arr[m] = lok
+            inv_w_ko_arr[m] = 1.0 / max(hik - lok, 1e-12)
+
+            bc = cpn_barriers[m]
+            loc = (bc - 0.5 * em) if hard_cpn else min(bc, bc + eff_csp)
+            hic = (bc + 0.5 * em) if hard_cpn else max(bc, bc + eff_csp)
+            lo_cp_arr[m] = loc
+            inv_w_cp_arr[m] = 1.0 / max(hic - loc, 1e-12)
+
+            if abs(ki_spread) > 1e-6:
+                blki = min(b_ki_base, b_ki_base + ki_spread)
+                bhki = max(b_ki_base, b_ki_base + ki_spread)
+                bhi_ki_arr[m] = bhki
+                inv_w_ki_arr[m] = 1.0 / max(bhki - blki, 1e-12)
+            else:
+                bhi_ki_arr[m] = b_ki_base + 0.5 * em
+                inv_w_ki_arr[m] = 1.0 / max(em, 1e-12)
+
+        s1_cols = 3 * m_rem + 6
+        task_s1 = np.zeros((n_tasks, s1_cols), dtype=np.float64)
+        task_cf_wf = np.zeros((n_tasks if want_cf_wf else 1, 2, m_rem), dtype=np.float64)
+        bar_ln_tasks = np.zeros((n_tasks, d_assets, m_rem), dtype=np.float64)
+        use_disc_ki = ki_active and ki_is_discrete
+
+        for task_i in numba.prange(n_tasks):
+            n_start = task_i * tile_len
+            n_len = tile_len
+            c0 = 3 * m_rem
+
+            idx_c_t = np.empty((m_rem, n_len), dtype=np.int32)
+            idx_cp_t = np.empty((m_rem, n_len), dtype=np.int32)
+            idx_o_t = np.empty((m_rem, n_len), dtype=np.int32)
+            g_ko_t = np.empty((m_rem, n_len), dtype=np.float64)
+            dg_ko_t = np.empty((m_rem, n_len), dtype=np.float64)
+            egc_t = np.empty((m_rem, n_len), dtype=np.float64)
+            dgc_cpn_t = np.empty((m_rem, n_len), dtype=np.float64)
+            dgc_ko_t = np.empty((m_rem, n_len), dtype=np.float64)
+            surv_pre_t = np.empty((m_rem, n_len), dtype=np.float64)
+            eff_c_t = np.empty((m_rem, n_len), dtype=np.float64)
+
+            disc_m = m_rem if use_disc_ki else 1
+            disc_n = n_len if use_disc_ki else 1
+            pref_t = np.empty((disc_m, disc_n), dtype=np.float64)
+            omg_t = np.empty((disc_m, disc_n), dtype=np.float64)
+            dg_ki_t = np.empty((disc_m, disc_n), dtype=np.float64)
+
+            surv_a = np.ones(n_len, dtype=np.float64)
+            cmem_a = np.full(n_len, c_mem_0, dtype=np.float64)
+            surv_s1 = np.ones(n_len, dtype=np.float64)
+            cmem_s1 = np.full(n_len, c_mem_0, dtype=np.float64)
+            pv_s1 = np.zeros(n_len, dtype=np.float64)
+            p_noki_d = np.ones(n_len, dtype=np.float64)
+
+            wo_last_a = np.empty(n_len, dtype=np.float64)
+            wavg_last_a = np.empty(n_len, dtype=np.float64)
+            wbest_last_a = np.empty(n_len, dtype=np.float64)
+            idx_best_a = np.empty(n_len, dtype=np.int32)
+
+            for m in range(m_rem):
+                callable_m = is_callable[m] > 0.5
+                guar_m = is_guar[m] > 0.5
+                c_r = float(cpn_rates[m])
+                df_m = float(df_pay[m])
+                wf_m = float(w_fund_arr[m]) if has_w_fund else 0.0
+                lok = lo_ko_arr[m]
+                iwk = inv_w_ko_arr[m]
+                bk = ko_barriers[m]
+                loc = lo_cp_arr[m]
+                iwc = inv_w_cp_arr[m]
+                bc = cpn_barriers[m]
+                bhk = bhi_ki_arr[m]
+                iwki = inv_w_ki_arr[m]
+                pm_sum = 0.0
+                qc_sum = 0.0
+                ccf_sum = 0.0
+                cf_sum = 0.0
+                sv_sum = 0.0
+                is_last = m == m_last
+
+                for k in range(n_len):
+                    n = n_start + k
+                    v0 = perf_m_d_n[m, 0, n]
+                    w_min = v0
+                    i_min = 0
+                    w_max = v0
+                    i_max = 0
+                    w_sum = v0
+                    for d in range(1, d_assets):
+                        vd = perf_m_d_n[m, d, n]
+                        if vd < w_min:
+                            w_min = vd
+                            i_min = d
+                        if vd > w_max:
+                            w_max = vd
+                            i_max = d
+                        w_sum += vd
+                    w_avg = w_sum * inv_d
+
+                    if call_code == 0:
+                        wc, ic = w_min, i_min
+                    elif call_code == 1:
+                        wc, ic = w_max, i_max
+                    else:
+                        wc, ic = w_avg, 0
+                    idx_c_t[m, k] = ic
+
+                    if cpn_code == 0:
+                        wcp, icp = w_min, i_min
+                    elif cpn_code == 1:
+                        wcp, icp = w_max, i_max
+                    else:
+                        wcp, icp = w_avg, 0
+                    idx_cp_t[m, k] = icp
+
+                    eff_oc = 0 if is_long_basket else eff_opt_code
+                    if eff_oc == 0:
+                        wo, io = w_min, i_min
+                    elif eff_oc == 1:
+                        wo, io = w_max, i_max
+                    else:
+                        wo, io = w_avg, 0
+                    idx_o_t[m, k] = io
+
+                    if is_last:
+                        wo_last_a[k] = wo
+                        wavg_last_a[k] = w_avg
+                        wbest_last_a[k] = w_max
+                        idx_best_a[k] = i_max
+
+                    # AAD smooth barriers + hard Stage-1 indicators
+                    if callable_m:
+                        uk = (wc - lok) * iwk
+                        if uk <= 0.0:
+                            gk = 0.0
+                            dgk = 0.0
+                        elif uk >= 1.0:
+                            gk = 1.0
+                            dgk = 0.0
+                        else:
+                            gk = uk
+                            dgk = iwk
+                        gk_s1 = (1.0 if wc >= bk else 0.0) if hard_ko else gk
+                    else:
+                        gk = 0.0
+                        dgk = 0.0
+                        gk_s1 = 0.0
+                    g_ko_t[m, k] = gk
+                    dg_ko_t[m, k] = dgk
+
+                    if guar_m:
+                        gc = 1.0
+                        dgc_raw = 0.0
+                        gc_s1 = 1.0
+                    else:
+                        uc = (wcp - loc) * iwc
+                        if uc <= 0.0:
+                            rmp = 0.0
+                            dgc_raw = 0.0
+                        elif uc >= 1.0:
+                            rmp = 1.0
+                            dgc_raw = 0.0
+                        else:
+                            rmp = uc
+                            dgc_raw = iwc * sign_cpn
+                        hit_c = (1.0 - rmp) if cpn_dir_down else rmp
+                        gc = (1.0 - hit_c) if cpn_type_out else hit_c
+                        if hard_cpn:
+                            hd = (wcp <= bc) if cpn_dir_down else (wcp >= bc)
+                            gc_s1 = (0.0 if hd else 1.0) if cpn_type_out else (1.0 if hd else 0.0)
+                        else:
+                            gc_s1 = gc
+
+                    if force_cpn_ac:
+                        if gc > gk:
+                            egc = gc
+                            dgc_c = dgc_raw
+                            dgc_k = 0.0
+                        elif gc < gk:
+                            egc = gk
+                            dgc_c = 0.0
+                            dgc_k = dgk
+                        else:
+                            egc = gc
+                            dgc_c = 0.5 * dgc_raw
+                            dgc_k = 0.5 * dgk
+                        egc_s1 = gc_s1 if gc_s1 >= gk_s1 else gk_s1
+                    else:
+                        egc = gc
+                        dgc_c = dgc_raw
+                        dgc_k = 0.0
+                        egc_s1 = gc_s1
+
+                    egc_t[m, k] = egc
+                    dgc_cpn_t[m, k] = dgc_c
+                    dgc_ko_t[m, k] = dgc_k
+
+                    # AAD survival/memory
+                    sv_a = surv_a[k]
+                    surv_pre_t[m, k] = sv_a
+                    if is_memory:
+                        ec_a = c_r + cmem_a[k]
+                        eff_c_t[m, k] = ec_a
+                        cmem_a[k] = sv_a * ec_a * (1.0 - egc)
+                    else:
+                        eff_c_t[m, k] = c_r
+                    rem_a = sv_a - sv_a * gk
+                    surv_a[k] = rem_a if rem_a > 0.0 else 0.0
+
+                    if use_disc_ki:
+                        pref_t[m, k] = p_noki_d[k]
+                        uki = (bhk - wo) * iwki
+                        if uki <= 0.0:
+                            gki_m = 0.0
+                            dgki_m = 0.0
+                        elif uki >= 1.0:
+                            gki_m = 1.0
+                            dgki_m = 0.0
+                        else:
+                            gki_m = uki
+                            dgki_m = -iwki
+                        omg = 1.0 - gki_m
+                        omg_t[m, k] = omg
+                        dg_ki_t[m, k] = dgki_m
+                        p_noki_d[k] = p_noki_d[k] * omg
+
+                    # Stage-1 forward accumulation
+                    sv_1 = surv_s1[k]
+                    pm_1 = sv_1 * gk_s1
+                    qc_1 = sv_1 * egc_s1
+                    if is_memory:
+                        ec_1 = c_r + cmem_s1[k]
+                        ccf_1 = qc_1 * ec_1 + pm_1 * ac_cpn
+                        cmem_s1[k] = sv_1 * ec_1 * (1.0 - egc_s1)
+                    else:
+                        ccf_1 = qc_1 * c_r + pm_1 * ac_cpn
+                    cf_1 = ccf_1 if no_notional else (pm_1 + ccf_1)
+                    pv_s1[k] += df_m * cf_1 - wf_m * sv_1
+                    rem_1 = sv_1 - pm_1
+                    surv_s1[k] = rem_1 if rem_1 > 0.0 else 0.0
+                    pm_sum += pm_1
+                    qc_sum += qc_1
+                    ccf_sum += ccf_1
+                    cf_sum += cf_1
+                    sv_sum += sv_1
+
+                task_s1[task_i, m] = pm_sum * inv_rep
+                task_s1[task_i, m_rem + m] = qc_sum * inv_rep
+                task_s1[task_i, 2 * m_rem + m] = ccf_sum * inv_rep
+                if want_cf_wf:
+                    task_cf_wf[task_i, 0, m] = cf_sum * inv_n_tot
+                    task_cf_wf[task_i, 1, m] = sv_sum * inv_n_tot
+
+            # Terminal option, KI, Stage-1 summary & backward AAD init
+            bar_surv = np.empty(n_len, dtype=np.float64)
+            bar_c_mem = np.zeros(n_len, dtype=np.float64)
+            bar_last_wo = np.empty(n_len, dtype=np.float64)
+            bar_last_avg = np.empty(n_len, dtype=np.float64)
+            bar_last_wb = np.empty(n_len, dtype=np.float64)
+            bar_iki_disc = np.empty(n_len, dtype=np.float64)
+
+            s_uput = 0.0
+            s_ucall = 0.0
+            s_los = 0.0
+            s_pos = 0.0
+            s_pv = 0.0
+            s_pv2 = 0.0
+            term_cf_sum = 0.0
+            bhk_last = bhi_ki_arr[m_last]
+            iwki_last = inv_w_ki_arr[m_last]
+
+            for k in range(n_len):
+                wo_l = wo_last_a[k]
+                if ki_active:
+                    if ki_is_discrete:
+                        iki = 1.0 - p_noki_d[k]
+                        d_iki_wo_l = 0.0
+                        ki_s1 = iki
+                    else:
+                        uki_l = (bhk_last - wo_l) * iwki_last
+                        if uki_l <= 0.0:
+                            iki = 0.0
+                            d_iki_wo_l = 0.0
+                        elif uki_l >= 1.0:
+                            iki = 1.0
+                            d_iki_wo_l = 0.0
+                        else:
+                            iki = uki_l
+                            d_iki_wo_l = -iwki_last
+                        if abs(ki_spread) > 1e-6:
+                            ki_s1 = iki
+                        else:
+                            ki_s1 = 1.0 if wo_l < b_ki_base else 0.0
+                else:
+                    iki = i_ki_past
+                    d_iki_wo_l = 0.0
+                    ki_s1 = i_ki_past if has_ki else 1.0
+
+                if has_os:
+                    wb_l = wbest_last_a[k]
+                    if one_star_eps <= 1e-6:
+                        star_i = 1.0 if wb_l >= one_star_strike else 0.0
+                        d_st = 0.0
+                    else:
+                        uos = (wb_l - (one_star_strike - 0.5 * one_star_eps)) / one_star_eps
+                        if uos <= 0.0:
+                            star_i = 0.0
+                            d_st = 0.0
+                        elif uos >= 1.0:
+                            star_i = 1.0
+                            d_st = 0.0
+                        else:
+                            star_i = uos
+                            d_st = 1.0 / one_star_eps
+                else:
+                    star_i = 0.0
+                    d_st = 0.0
+
+                ki_g = iki if has_ki else 1.0
+                op = 0.0
+                d_op_wo = 0.0
+                d_op_avg = 0.0
+                d_op_wb = 0.0
+                d_op_iki = 0.0
+                put_intr = 0.0
+                if is_long_basket:
+                    wa_l = wavg_last_a[k]
+                    op -= (1.0 - wa_l) * ki_g * (1.0 - star_i)
+                    d_op_avg = ki_g * (1.0 - star_i)
+                    if has_ki:
+                        d_op_iki = -(1.0 - wa_l) * (1.0 - star_i)
+                    d_op_wb = (1.0 - wa_l) * ki_g * d_st
+                else:
+                    if has_lower_strike:
+                        put_intr = max(strike - wo_l, 0.0) - max(lower_strike - wo_l, 0.0)
+                        d_put = (-1.0 if wo_l < strike else 0.0) - (-1.0 if wo_l < lower_strike else 0.0)
+                    else:
+                        put_intr = max(strike - wo_l, 0.0)
+                        d_put = -1.0 if wo_l < strike else 0.0
+                    if put_active:
+                        op -= option_gearing * ki_g * (1.0 - star_i) * put_intr
+                        if has_ki:
+                            d_op_iki = -option_gearing * (1.0 - star_i) * put_intr
+                        d_op_wo -= option_gearing * ki_g * (1.0 - star_i) * d_put
+                        d_op_wb = option_gearing * ki_g * put_intr * d_st
+
+                call_intr = max(wo_l - part_call_strike, 0.0) if has_pc else 0.0
+                if has_pc:
+                    op += part_call_rate * call_intr
+                    if wo_l > part_call_strike:
+                        d_op_wo += part_call_rate
+                if has_os and one_star_coupon != 0.0:
+                    op += star_i * one_star_coupon
+                    d_op_wb += d_st * one_star_coupon
+
+                se = surv_a[k]
+                term_mult = op if no_notional else (1.0 + op)
+                bar_surv[k] = scale * df_last * term_mult
+                s_df_se = scale * df_last * se
+                d_iki_term = 0.0 if use_disc_ki else (d_op_iki * d_iki_wo_l)
+                bar_last_wo[k] = s_df_se * (d_op_wo + d_iki_term)
+                bar_last_avg[k] = s_df_se * d_op_avg
+                bar_last_wb[k] = s_df_se * d_op_wb
+                bar_iki_disc[k] = s_df_se * d_op_iki
+
+                # Stage-1 terminal accumulators
+                sv1 = surv_s1[k]
+                if is_long_basket:
+                    u_put = sv1 * ki_s1 * (1.0 - star_i) * (1.0 - wavg_last_a[k])
+                    put_t = -u_put
+                else:
+                    u_put = (sv1 * ki_s1 * (1.0 - star_i) * put_intr) if put_active else 0.0
+                    put_t = -option_gearing * u_put
+                u_call = (sv1 * call_intr) if has_pc else 0.0
+                p_os = (sv1 * star_i) if has_os else 0.0
+                l_os = (p_os * one_star_coupon) if (has_os and one_star_coupon != 0.0) else 0.0
+                opt_t = put_t + (part_call_rate * u_call if has_pc else 0.0) + l_os
+                term_t = opt_t if no_notional else (sv1 + opt_t)
+                pv_n = pv_s1[k] + df_last * term_t
+                s_uput += u_put
+                s_ucall += u_call
+                s_los += l_os
+                s_pos += p_os
+                s_pv += pv_n
+                s_pv2 += pv_n * pv_n
+                term_cf_sum += term_t
+
+            task_s1[task_i, c0 + 0] = s_uput * inv_rep
+            task_s1[task_i, c0 + 1] = s_ucall * inv_rep
+            task_s1[task_i, c0 + 2] = s_los * inv_rep
+            task_s1[task_i, c0 + 3] = s_pos * inv_rep
+            task_s1[task_i, c0 + 4] = s_pv * inv_rep
+            task_s1[task_i, c0 + 5] = s_pv2 * inv_rep
+            if want_cf_wf:
+                task_cf_wf[task_i, 0, m_last] += term_cf_sum * inv_n_tot
+
+            # Backward pass with streaming discrete KI suffix product
+            suff_ki = np.ones(n_len, dtype=np.float64)
+            has_idx_call = call_code in (0, 1)
+            has_idx_cpn = cpn_code in (0, 1)
+            has_idx_opt = True if is_long_basket else (eff_opt_code in (0, 1))
+
+            for m in range(m_rem - 1, -1, -1):
+                df_m = float(df_pay[m])
+                wf_m = float(w_fund_arr[m]) if has_w_fund else 0.0
+                s_df_m = scale * df_m
+                s_wf_m = scale * wf_m
+                pm_off = (0.0 if no_notional else s_df_m) + s_df_m * ac_cpn
+                is_last = m == m_last
+                for k in range(n_len):
+                    n = n_start + k
+                    surv_pre = surv_pre_t[m, k]
+                    g_k = g_ko_t[m, k]
+                    eff_g_c = egc_t[m, k]
+                    eff_c = eff_c_t[m, k]
+                    bs = bar_surv[k]
+                    bcm = bar_c_mem[k]
+
+                    bar_pm = pm_off - bs
+                    bar_eff_g_c = s_df_m * surv_pre * eff_c
+                    if is_memory:
+                        bar_eff_g_c -= bcm * surv_pre * eff_c
+                    bs_next = bs + bar_pm * g_k + s_df_m * eff_g_c * eff_c - s_wf_m
+                    if is_memory:
+                        bs_next += bcm * eff_c * (1.0 - eff_g_c)
+                        bar_c_mem[k] = s_df_m * surv_pre * eff_g_c + bcm * surv_pre * (1.0 - eff_g_c)
+                    bar_surv[k] = bs_next
+
+                    bw_call = (bar_pm * surv_pre) * dg_ko_t[m, k] + bar_eff_g_c * dgc_ko_t[m, k]
+                    bw_cpn = bar_eff_g_c * dgc_cpn_t[m, k]
+                    if use_disc_ki:
+                        sk_v = suff_ki[k]
+                        bw_opt = bar_iki_disc[k] * (-pref_t[m, k] * sk_v * dg_ki_t[m, k])
+                        suff_ki[k] = sk_v * omg_t[m, k]
+                    else:
+                        bw_opt = 0.0
+                    bw_avg = 0.0
+                    bw_wb = 0.0
+                    if is_last:
+                        bw_opt += bar_last_wo[k]
+                        if is_long_basket:
+                            bw_avg = bar_last_avg[k]
+                        if has_os:
+                            bw_wb = bar_last_wb[k]
+
+                    eff_wc_tot = bw_call + (bw_cpn if same_cpn_call else 0.0)
+                    uni_w = 0.0
+                    if call_code == 2:
+                        uni_w += eff_wc_tot * inv_d
+                    if (not same_cpn_call) and cpn_code == 2:
+                        uni_w += bw_cpn * inv_d
+                    if is_long_basket:
+                        uni_w += bw_avg * inv_d
+                    elif eff_opt_code == 2:
+                        uni_w += bw_opt * inv_d
+
+                    ic_k = idx_c_t[m, k]
+                    icp_k = idx_cp_t[m, k]
+                    io_k = idx_o_t[m, k]
+                    ib_k = idx_best_a[k]
+                    for d in range(d_assets):
+                        bp = uni_w
+                        if has_idx_call and ic_k == d:
+                            bp += eff_wc_tot
+                        if (not same_cpn_call) and has_idx_cpn and icp_k == d:
+                            bp += bw_cpn
+                        if has_idx_opt and io_k == d:
+                            bp += bw_opt
+                        if is_last and has_os and ib_k == d:
+                            bp += bw_wb
+                        lx_v = bp * perf_m_d_n[m, d, n]
+                        bar_lx_post_np[m, d, n] = lx_v
+                        bar_ln_tasks[task_i, d, m] += lx_v
+
+        for task_i in range(n_tasks):
+            r_i = task_i // chunks_per_rep
+            for col in range(s1_cols):
+                s1_mat[r_i, col] += task_s1[task_i, col]
+            if want_cf_wf:
+                for m in range(m_rem):
+                    cf_wf_out[0, m] += task_cf_wf[task_i, 0, m]
+                    cf_wf_out[1, m] += task_cf_wf[task_i, 1, m]
+            for d in range(d_assets):
+                for m in range(m_rem):
+                    bar_ln_fwd_np[d, m] += bar_ln_tasks[task_i, d, m]
+
 
 def _eval_index_and_weights_np(
     perf_m_d_n: npt.NDArray[np.float64],
@@ -7493,6 +8350,89 @@ def _compute_payoff_aad_state_adjoints_cpu_np(
     """Closed-form float64 analytical payoff AAD & Stage-1 evaluation in pure NumPy for codes {0,1,2}."""
     m_rem, d_assets, n_tot = perf_m_d_n.shape
     eff_opt_code = int(opt_code)
+    use_nb_pa = bool(_HAS_NUMBA and call_code in (0, 1, 2) and cpn_code in (0, 1, 2) and eff_opt_code in (0, 1, 2))
+    ki_mode_norm = str(ki_monitoring_type or "Discrete").strip().lower()
+    if (
+        use_nb_pa
+        and compute_grads
+        and emit_stage1
+        and n_rep > 0
+        and (n_tot % n_rep == 0)
+    ):
+        tau_prev = np.concatenate([[0.0], tau_obs[:-1]])
+        dt_period = np.maximum(tau_obs - tau_prev, 1e-8)
+        sig_est = np.maximum(np.mean(vol_atm_obs, axis=0), 0.05) if vol_atm_obs is not None else np.full(m_rem, 0.25, dtype=np.float64)
+        eps_vec_1d = np.ascontiguousarray(
+            np.clip(
+                0.65 * sig_est * np.sqrt(dt_period),
+                max(float(barrier_eps_min), 0.015),
+                max(float(barrier_eps_max), 0.08),
+            ),
+            dtype=np.float64,
+        )
+        hard_ko_f = abs(ko_spread) <= 1e-6
+        eff_csp_f = -cpn_spread if cpn_dir_down else cpn_spread
+        hard_cpn_f = abs(eff_csp_f) <= 1e-6
+        has_pc_f = part_call_strike is not None and float(part_call_strike) >= 0.0 and float(part_call_rate) != 0.0
+        has_os_f = one_star_strike is not None and float(one_star_strike) > 0.0
+        n_r_blk = max(n_tot // n_rep, 1)
+        bar_lx_post_np = np.empty((m_rem, d_assets, n_tot), dtype=np.float64)
+        bar_ln_fwd_np = np.zeros((d_assets, m_rem), dtype=np.float64)
+        s1_mat = np.zeros((n_r_blk, 3 * m_rem + 6), dtype=np.float64)
+        cf_wf_out = np.zeros((2, m_rem), dtype=np.float64) if want_cf_wf else None
+        cf_nb_pa = cf_wf_out if cf_wf_out is not None else np.zeros((2, m_rem), dtype=np.float64)
+        wf_nb_pa = np.ascontiguousarray(w_fund, dtype=np.float64) if w_fund is not None else np.zeros(m_rem, dtype=np.float64)
+        _nb_payoff_aad_fused_full(
+            np.ascontiguousarray(perf_m_d_n, dtype=np.float64),
+            np.ascontiguousarray(ko_barriers, dtype=np.float64),
+            np.ascontiguousarray(is_callable, dtype=np.float64),
+            np.ascontiguousarray(cpn_barriers, dtype=np.float64),
+            np.ascontiguousarray(is_guar, dtype=np.float64),
+            np.ascontiguousarray(cpn_rates, dtype=np.float64),
+            np.ascontiguousarray(df_pay, dtype=np.float64),
+            wf_nb_pa,
+            w_fund is not None,
+            eps_vec_1d,
+            int(call_code),
+            int(cpn_code),
+            int(eff_opt_code),
+            bool(hard_ko_f),
+            bool(hard_cpn_f),
+            float(ko_spread),
+            float(eff_csp_f),
+            float(ki_spread),
+            bool(cpn_dir_down),
+            bool(cpn_type_out),
+            bool(is_memory),
+            bool(force_cpn_ac),
+            bool(no_notional),
+            bool(is_long_basket),
+            bool(has_ki),
+            bool(ki_mode_norm == "discrete"),
+            float(ki_barrier),
+            float(i_ki_past),
+            float(strike),
+            lower_strike is not None,
+            float(lower_strike) if lower_strike is not None else 0.0,
+            float(option_gearing),
+            float(ac_cpn),
+            float(c_mem_0),
+            bool(has_pc_f and part_call_strike is not None),
+            float(part_call_strike) if part_call_strike is not None else 0.0,
+            float(part_call_rate),
+            bool(has_os_f and one_star_strike is not None),
+            float(one_star_strike) if one_star_strike is not None else 0.0,
+            float(one_star_coupon),
+            float(one_star_eps),
+            int(n_rep),
+            bool(want_cf_wf),
+            bar_lx_post_np,
+            bar_ln_fwd_np,
+            s1_mat,
+            cf_nb_pa,
+        )
+        return bar_lx_post_np, bar_ln_fwd_np, s1_mat, cf_wf_out
+
     w_call, idx_call = _eval_index_and_weights_np(perf_m_d_n, call_code)
     if cpn_code == call_code:
         w_cpn, idx_cpn = w_call, idx_call
@@ -7821,7 +8761,7 @@ def _compute_payoff_aad_state_adjoints_cpu_np(
             bar_ln_fwd_np[:, m] = lx_m.sum(axis=1)
 
     stage1_rep_out: Optional[npt.NDArray[np.float64]] = None
-    cf_wf_out: Optional[npt.NDArray[np.float64]] = None
+    cf_wf_out = None
     if emit_stage1 and n_rep > 0:
         n_r_blk = max(n_tot // n_rep, 1)
         s1_mat = np.zeros((n_r_blk, 3 * m_rem + 6), dtype=np.float64)
@@ -8363,6 +9303,663 @@ if _HAS_NUMBA:
 
         return out_pv
 
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_c2_preterm_l1o_fused(
+        perf_base: npt.NDArray[np.float64],
+        perf_sp_p: npt.NDArray[np.float64],
+        perf_sp_m: npt.NDArray[np.float64],
+        frozen_term: npt.NDArray[np.float64],
+        aa_pre: npt.NDArray[np.int32],
+        ab_pre: npt.NDArray[np.int32],
+        asl_pre: npt.NDArray[np.int32],
+        bsl_pre: npt.NDArray[np.int32],
+        ko_barriers: npt.NDArray[np.float64],
+        is_callable: npt.NDArray[np.float64],
+        cpn_barriers: npt.NDArray[np.float64],
+        is_guar: npt.NDArray[np.float64],
+        cpn_rates: npt.NDArray[np.float64],
+        df_pay: npt.NDArray[np.float64],
+        w_fund_arr: npt.NDArray[np.float64],
+        has_w_fund: bool,
+        eps_vec: npt.NDArray[np.float64],
+        call_code: int,
+        cpn_code: int,
+        hard_ko: bool,
+        hard_cpn: bool,
+        ko_spread: float,
+        eff_csp: float,
+        cpn_dir_down: bool,
+        cpn_type_out: bool,
+        is_memory: bool,
+        force_cpn_ac: bool,
+        no_notional: bool,
+        ac_cpn: float,
+        c_mem_0: float,
+    ) -> npt.NDArray[np.float64]:
+        m_rem, d_assets, n_tot = perf_base.shape
+        m_pre = m_rem - 1
+        m_last = m_pre
+        n_rows = len(aa_pre)
+        inv_d = 1.0 / float(d_assets)
+        c_last = float(cpn_rates[m_last])
+        df_last = float(df_pay[m_last])
+        wf_last = float(w_fund_arr[m_last]) if has_w_fund else 0.0
+        gk_f = frozen_term[0]
+        egc_f = frozen_term[1]
+        opt_f = frozen_term[2]
+        flip_cpn = cpn_dir_down != cpn_type_out
+        need_min = (call_code == 0) or (cpn_code == 0)
+        need_max = (call_code == 1) or (cpn_code == 1)
+        need_sum = (call_code == 2) or (cpn_code == 2)
+        has_neg2 = False
+        has_l2o = False
+        for r_i in range(n_rows):
+            if aa_pre[r_i] == -2:
+                has_neg2 = True
+            if ab_pre[r_i] >= 0:
+                has_l2o = True
+
+        lo_ko_a = np.empty(m_pre, dtype=np.float64)
+        inv_wk_a = np.empty(m_pre, dtype=np.float64)
+        lo_cp_a = np.empty(m_pre, dtype=np.float64)
+        inv_wc_a = np.empty(m_pre, dtype=np.float64)
+        for m in range(m_pre):
+            em = float(eps_vec[m])
+            bk = float(ko_barriers[m])
+            lok = (bk - 0.5 * em) if hard_ko else min(bk, bk + ko_spread)
+            hik = (bk + 0.5 * em) if hard_ko else max(bk, bk + ko_spread)
+            lo_ko_a[m] = lok
+            inv_wk_a[m] = 1.0 / max(hik - lok, 1e-12)
+            bc = float(cpn_barriers[m])
+            loc = (bc - 0.5 * em) if hard_cpn else min(bc, bc + eff_csp)
+            hic = (bc + 0.5 * em) if hard_cpn else max(bc, bc + eff_csp)
+            lo_cp_a[m] = loc
+            inv_wc_a[m] = 1.0 / max(hic - loc, 1e-12)
+
+        tile_n = 256
+        n_tiles = max(1, (n_tot + tile_n - 1) // tile_n)
+        tile_pv = np.zeros((n_tiles, n_rows), dtype=np.float64)
+
+        for tile_i in numba.prange(n_tiles):
+            n_start = tile_i * tile_n
+            n_end = min(n_start + tile_n, n_tot)
+            n_len = n_end - n_start
+            surv_r = np.ones((n_rows, n_len), dtype=np.float64)
+            cmem_r = np.full((n_rows, n_len), c_mem_0, dtype=np.float64)
+            pv_r = np.zeros((n_rows, n_len), dtype=np.float64)
+
+            i1_mn_a = np.empty(n_len, dtype=np.int32)
+            i2_mn_a = np.empty(n_len if has_l2o else 1, dtype=np.int32)
+            v1_mn_a = np.empty(n_len, dtype=np.float64)
+            v2_mn_a = np.empty(n_len, dtype=np.float64)
+            v3_mn_a = np.empty(n_len if has_l2o else 1, dtype=np.float64)
+            i1_mx_a = np.empty(n_len, dtype=np.int32)
+            i2_mx_a = np.empty(n_len if has_l2o else 1, dtype=np.int32)
+            v1_mx_a = np.empty(n_len, dtype=np.float64)
+            v2_mx_a = np.empty(n_len, dtype=np.float64)
+            v3_mx_a = np.empty(n_len if has_l2o else 1, dtype=np.float64)
+            s_b_a = np.empty(n_len, dtype=np.float64)
+            mp_mn_a = np.empty(n_len if has_neg2 else 1, dtype=np.float64)
+            mm_mn_a = np.empty(n_len if has_neg2 else 1, dtype=np.float64)
+            mp_mx_a = np.empty(n_len if has_neg2 else 1, dtype=np.float64)
+            mm_mx_a = np.empty(n_len if has_neg2 else 1, dtype=np.float64)
+            spp_a = np.empty(n_len if has_neg2 else 1, dtype=np.float64)
+            spm_a = np.empty(n_len if has_neg2 else 1, dtype=np.float64)
+            wc_buf = np.empty(n_len, dtype=np.float64)
+            wcp_buf = np.empty(n_len, dtype=np.float64)
+
+            for m in range(m_pre):
+                callable_m = is_callable[m] > 0.5
+                guar_m = is_guar[m] > 0.5
+                lok = lo_ko_a[m]
+                iwk = inv_wk_a[m]
+                loc = lo_cp_a[m]
+                iwc = inv_wc_a[m]
+                c_rate = float(cpn_rates[m])
+                df_m = float(df_pay[m])
+                wf_m = float(w_fund_arr[m]) if has_w_fund else 0.0
+
+                if callable_m or (not guar_m):
+                    for k in range(n_len):
+                        n = n_start + k
+                        i1_mn, i2_mn, v1_mn, v2_mn, v3_mn = 0, 0, 1e300, 1e300, 1e300
+                        i1_mx, i2_mx, v1_mx, v2_mx, v3_mx = 0, 0, -1e300, -1e300, -1e300
+                        s_b = 0.0
+                        mp_mn, mm_mn = 1e300, 1e300
+                        mp_mx, mm_mx = -1e300, -1e300
+                        spp, spm = 0.0, 0.0
+                        for d in range(d_assets):
+                            v = perf_base[m, d, n]
+                            if need_min:
+                                if v < v1_mn:
+                                    v3_mn = v2_mn
+                                    i2_mn, v2_mn = i1_mn, v1_mn
+                                    i1_mn, v1_mn = d, v
+                                elif v < v2_mn:
+                                    v3_mn = v2_mn
+                                    i2_mn, v2_mn = d, v
+                                elif v < v3_mn:
+                                    v3_mn = v
+                            if need_max:
+                                if v > v1_mx:
+                                    v3_mx = v2_mx
+                                    i2_mx, v2_mx = i1_mx, v1_mx
+                                    i1_mx, v1_mx = d, v
+                                elif v > v2_mx:
+                                    v3_mx = v2_mx
+                                    i2_mx, v2_mx = d, v
+                                elif v > v3_mx:
+                                    v3_mx = v
+                            if need_sum:
+                                s_b += v
+                            if has_neg2:
+                                vp = perf_sp_p[d, m, n]
+                                vm = perf_sp_m[d, m, n]
+                                if need_min:
+                                    if vp < mp_mn:
+                                        mp_mn = vp
+                                    if vm < mm_mn:
+                                        mm_mn = vm
+                                if need_max:
+                                    if vp > mp_mx:
+                                        mp_mx = vp
+                                    if vm > mm_mx:
+                                        mm_mx = vm
+                                if need_sum:
+                                    spp += vp
+                                    spm += vm
+                        if need_min:
+                            i1_mn_a[k] = i1_mn
+                            v1_mn_a[k] = v1_mn
+                            v2_mn_a[k] = v2_mn
+                            if has_l2o:
+                                i2_mn_a[k] = i2_mn
+                                v3_mn_a[k] = v3_mn
+                        if need_max:
+                            i1_mx_a[k] = i1_mx
+                            v1_mx_a[k] = v1_mx
+                            v2_mx_a[k] = v2_mx
+                            if has_l2o:
+                                i2_mx_a[k] = i2_mx
+                                v3_mx_a[k] = v3_mx
+                        if need_sum:
+                            s_b_a[k] = s_b
+                        if has_neg2:
+                            mp_mn_a[k] = mp_mn
+                            mm_mn_a[k] = mm_mn
+                            mp_mx_a[k] = mp_mx
+                            mm_mx_a[k] = mm_mx
+                            spp_a[k] = spp
+                            spm_a[k] = spm
+
+                for row_i in range(n_rows):
+                    aa_i = int(aa_pre[row_i])
+                    ab_i = int(ab_pre[row_i])
+                    asl_i = int(asl_pre[row_i])
+                    bsl_i = int(bsl_pre[row_i])
+                    use_pos_sp = (asl_i == 0) if (aa_i == -2) else (asl_i < d_assets)
+                    sp_idx = asl_i if (asl_i < d_assets) else (asl_i - d_assets)
+                    use_pos_b = bsl_i < d_assets
+                    sp_idx_b = bsl_i if use_pos_b else (bsl_i - d_assets)
+                    sp_a_src = perf_sp_p if use_pos_sp else perf_sp_m
+                    sp_b_src = perf_sp_p if use_pos_b else perf_sp_m
+
+                    if callable_m:
+                        if aa_i == -2:
+                            if call_code == 0:
+                                src_w = mp_mn_a if use_pos_sp else mm_mn_a
+                                for k in range(n_len):
+                                    wc_buf[k] = src_w[k]
+                            elif call_code == 1:
+                                src_w = mp_mx_a if use_pos_sp else mm_mx_a
+                                for k in range(n_len):
+                                    wc_buf[k] = src_w[k]
+                            else:
+                                src_w = spp_a if use_pos_sp else spm_a
+                                for k in range(n_len):
+                                    wc_buf[k] = src_w[k] * inv_d
+                        elif aa_i == -1:
+                            if call_code == 0:
+                                for k in range(n_len):
+                                    wc_buf[k] = v1_mn_a[k]
+                            elif call_code == 1:
+                                for k in range(n_len):
+                                    wc_buf[k] = v1_mx_a[k]
+                            else:
+                                for k in range(n_len):
+                                    wc_buf[k] = s_b_a[k] * inv_d
+                        elif ab_i < 0:
+                            sp_a = sp_a_src[sp_idx, m, n_start:n_end]
+                            if call_code == 0:
+                                for k in range(n_len):
+                                    bex = v2_mn_a[k] if i1_mn_a[k] == aa_i else v1_mn_a[k]
+                                    spv = sp_a[k]
+                                    wc_buf[k] = bex if bex < spv else spv
+                            elif call_code == 1:
+                                for k in range(n_len):
+                                    bex = v2_mx_a[k] if i1_mx_a[k] == aa_i else v1_mx_a[k]
+                                    spv = sp_a[k]
+                                    wc_buf[k] = bex if bex > spv else spv
+                            else:
+                                pb_a = perf_base[m, aa_i, n_start:n_end]
+                                for k in range(n_len):
+                                    wc_buf[k] = (s_b_a[k] - pb_a[k] + sp_a[k]) * inv_d
+                        else:
+                            sp_a = sp_a_src[sp_idx, m, n_start:n_end]
+                            sp_b = sp_b_src[sp_idx_b, m, n_start:n_end]
+                            if call_code == 0:
+                                for k in range(n_len):
+                                    k1n = i1_mn_a[k]
+                                    k2n = i2_mn_a[k]
+                                    m1 = (k1n == aa_i) or (k1n == ab_i)
+                                    m2 = (k2n == aa_i) or (k2n == ab_i)
+                                    bex = v3_mn_a[k] if (m1 and m2) else (v2_mn_a[k] if m1 else v1_mn_a[k])
+                                    spa = sp_a[k]
+                                    spb = sp_b[k]
+                                    sv_p = spa if spa < spb else spb
+                                    wc_buf[k] = bex if bex < sv_p else sv_p
+                            elif call_code == 1:
+                                for k in range(n_len):
+                                    k1n = i1_mx_a[k]
+                                    k2n = i2_mx_a[k]
+                                    m1 = (k1n == aa_i) or (k1n == ab_i)
+                                    m2 = (k2n == aa_i) or (k2n == ab_i)
+                                    bex = v3_mx_a[k] if (m1 and m2) else (v2_mx_a[k] if m1 else v1_mx_a[k])
+                                    spa = sp_a[k]
+                                    spb = sp_b[k]
+                                    sv_p = spa if spa > spb else spb
+                                    wc_buf[k] = bex if bex > sv_p else sv_p
+                            else:
+                                pb_a = perf_base[m, aa_i, n_start:n_end]
+                                pb_b = perf_base[m, ab_i, n_start:n_end]
+                                for k in range(n_len):
+                                    wc_buf[k] = (s_b_a[k] - pb_a[k] - pb_b[k] + sp_a[k] + sp_b[k]) * inv_d
+
+                    if (not guar_m) and not (callable_m and cpn_code == call_code):
+                        if aa_i == -2:
+                            if cpn_code == 0:
+                                src_w = mp_mn_a if use_pos_sp else mm_mn_a
+                                for k in range(n_len):
+                                    wcp_buf[k] = src_w[k]
+                            elif cpn_code == 1:
+                                src_w = mp_mx_a if use_pos_sp else mm_mx_a
+                                for k in range(n_len):
+                                    wcp_buf[k] = src_w[k]
+                            else:
+                                src_w = spp_a if use_pos_sp else spm_a
+                                for k in range(n_len):
+                                    wcp_buf[k] = src_w[k] * inv_d
+                        elif aa_i == -1:
+                            if cpn_code == 0:
+                                for k in range(n_len):
+                                    wcp_buf[k] = v1_mn_a[k]
+                            elif cpn_code == 1:
+                                for k in range(n_len):
+                                    wcp_buf[k] = v1_mx_a[k]
+                            else:
+                                for k in range(n_len):
+                                    wcp_buf[k] = s_b_a[k] * inv_d
+                        elif ab_i < 0:
+                            sp_a = sp_a_src[sp_idx, m, n_start:n_end]
+                            if cpn_code == 0:
+                                for k in range(n_len):
+                                    bex = v2_mn_a[k] if i1_mn_a[k] == aa_i else v1_mn_a[k]
+                                    spv = sp_a[k]
+                                    wcp_buf[k] = bex if bex < spv else spv
+                            elif cpn_code == 1:
+                                for k in range(n_len):
+                                    bex = v2_mx_a[k] if i1_mx_a[k] == aa_i else v1_mx_a[k]
+                                    spv = sp_a[k]
+                                    wcp_buf[k] = bex if bex > spv else spv
+                            else:
+                                pb_a = perf_base[m, aa_i, n_start:n_end]
+                                for k in range(n_len):
+                                    wcp_buf[k] = (s_b_a[k] - pb_a[k] + sp_a[k]) * inv_d
+                        else:
+                            sp_a = sp_a_src[sp_idx, m, n_start:n_end]
+                            sp_b = sp_b_src[sp_idx_b, m, n_start:n_end]
+                            if cpn_code == 0:
+                                for k in range(n_len):
+                                    k1n = i1_mn_a[k]
+                                    k2n = i2_mn_a[k]
+                                    m1 = (k1n == aa_i) or (k1n == ab_i)
+                                    m2 = (k2n == aa_i) or (k2n == ab_i)
+                                    bex = v3_mn_a[k] if (m1 and m2) else (v2_mn_a[k] if m1 else v1_mn_a[k])
+                                    spa = sp_a[k]
+                                    spb = sp_b[k]
+                                    sv_p = spa if spa < spb else spb
+                                    wcp_buf[k] = bex if bex < sv_p else sv_p
+                            elif cpn_code == 1:
+                                for k in range(n_len):
+                                    k1n = i1_mx_a[k]
+                                    k2n = i2_mx_a[k]
+                                    m1 = (k1n == aa_i) or (k1n == ab_i)
+                                    m2 = (k2n == aa_i) or (k2n == ab_i)
+                                    bex = v3_mx_a[k] if (m1 and m2) else (v2_mx_a[k] if m1 else v1_mx_a[k])
+                                    spa = sp_a[k]
+                                    spb = sp_b[k]
+                                    sv_p = spa if spa > spb else spb
+                                    wcp_buf[k] = bex if bex > sv_p else sv_p
+                            else:
+                                pb_a = perf_base[m, aa_i, n_start:n_end]
+                                pb_b = perf_base[m, ab_i, n_start:n_end]
+                                for k in range(n_len):
+                                    wcp_buf[k] = (s_b_a[k] - pb_a[k] - pb_b[k] + sp_a[k] + sp_b[k]) * inv_d
+                        wcp_view = wcp_buf
+                    else:
+                        wcp_view = wc_buf
+
+                    for k in range(n_len):
+                        gk = _nb_c2_s5(wc_buf[k], lok, iwk) if callable_m else 0.0
+                        if guar_m:
+                            gc = 1.0
+                        else:
+                            gc = _nb_c2_s5(wcp_view[k], loc, iwc)
+                            if flip_cpn:
+                                gc = 1.0 - gc
+                            if callable_m and force_cpn_ac and gk > gc:
+                                gc = gk
+                        surv = surv_r[row_i, k]
+                        pm = surv * gk if callable_m else 0.0
+                        if is_memory:
+                            u_m = cmem_r[row_i, k] + c_rate
+                            tmp = surv * gc * u_m + (pm * ac_cpn if callable_m else 0.0)
+                            cmem_r[row_i, k] = (1.0 - gc) * surv * u_m
+                        else:
+                            tmp = surv * gc * c_rate + (pm * ac_cpn if callable_m else 0.0)
+                        if callable_m and (not no_notional):
+                            tmp += pm
+                        pv_cur = pv_r[row_i, k] + df_m * tmp
+                        if has_w_fund:
+                            pv_cur -= wf_m * surv
+                        pv_r[row_i, k] = pv_cur
+                        if callable_m:
+                            rem_s = surv - pm
+                            surv_r[row_i, k] = rem_s if rem_s > 0.0 else 0.0
+
+            for row_i in range(n_rows):
+                s_row = 0.0
+                for k in range(n_len):
+                    n = n_start + k
+                    surv = surv_r[row_i, k]
+                    eff_c_last = (c_last + cmem_r[row_i, k]) if is_memory else c_last
+                    pm = surv * gk_f[n]
+                    cpn_last = surv * egc_f[n] * eff_c_last + pm * ac_cpn
+                    rem_s = surv - pm
+                    if rem_s < 0.0:
+                        rem_s = 0.0
+                    pv_cur = pv_r[row_i, k] - (wf_last * surv if has_w_fund else 0.0)
+                    term_pay = (
+                        (cpn_last + rem_s * opt_f[n])
+                        if no_notional
+                        else (pm + cpn_last + rem_s * (1.0 + opt_f[n]))
+                    )
+                    s_row += pv_cur + df_last * term_pay
+                tile_pv[tile_i, row_i] = s_row
+
+        out_pv = np.zeros(n_rows, dtype=np.float64)
+        inv_n = 1.0 / float(n_tot)
+        for row_i in range(n_rows):
+            s_r = 0.0
+            for tile_i in range(n_tiles):
+                s_r += tile_pv[tile_i, row_i]
+            out_pv[row_i] = s_r * inv_n
+        return out_pv
+
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_loo_l2o_batch_eval(
+        perf_base: npt.NDArray[np.float64],
+        has_base: bool,
+        bump_a_3d: npt.NDArray[np.float64],
+        bump_b_3d: npt.NDArray[np.float64],
+        bump_alt_4d: npt.NDArray[np.float64],
+        is_full_alt: bool,
+        aa_c: npt.NDArray[np.int32],
+        ab_c: npt.NDArray[np.int32],
+        a_slot: npt.NDArray[np.int32],
+        b_slot: npt.NDArray[np.int32],
+        df_mat: npt.NDArray[np.float64],
+        wf_mat: npt.NDArray[np.float64],
+        has_w_fund: bool,
+        in_tr_arr: npt.NDArray[np.float64],
+        ko_arr: npt.NDArray[np.float64],
+        is_call: npt.NDArray[np.float64],
+        cpn_arr: npt.NDArray[np.float64],
+        is_guar: npt.NDArray[np.float64],
+        cpn_rates: npt.NDArray[np.float64],
+        eps_ki: npt.NDArray[np.float64],
+        call_code: int,
+        cpn_code: int,
+        opt_code: int,
+        ko_spread: float,
+        eff_csp: float,
+        ki_spread: float,
+        dir_down: bool,
+        type_out: bool,
+        is_memory: bool,
+        force_cpn_ac: bool,
+        no_notional: bool,
+        is_long_flag: bool,
+        has_ki: bool,
+        ki_is_discrete: bool,
+        b_ki: float,
+        i_ki_past: float,
+        ac_cpn: float,
+        c_mem_0: float,
+        k_put: float,
+        has_low_k: bool,
+        k_low: float,
+        option_gearing: float,
+        has_part_call: bool,
+        k_call: float,
+        part_call_rate: float,
+        k_os: float,
+        os_cpn: float,
+        one_star_eps: float,
+    ) -> npt.NDArray[np.float64]:
+        n_b = len(aa_c)
+        if is_full_alt:
+            _, m_rem, d_assets, n_tot = bump_alt_4d.shape
+        else:
+            m_rem, d_assets, n_tot = perf_base.shape
+        m_last = m_rem - 1
+        inv_d = 1.0 / float(d_assets)
+        hard_ko = abs(ko_spread) <= 1e-6
+        hard_cpn = abs(eff_csp) <= 1e-6
+        has_os = k_os > 0.0
+        b_ki_fb = k_put if is_long_flag else b_ki
+        ki_disc_active = has_ki and (i_ki_past < 0.5) and ki_is_discrete
+        flip_cpn = dir_down != type_out
+        put_active = is_long_flag or ((k_put > k_low and option_gearing > 0.0) if has_low_k else (option_gearing > 0.0))
+
+        tile_n = 256
+        n_tiles = max(1, (n_tot + tile_n - 1) // tile_n)
+        tile_pv = np.zeros((n_tiles, n_b), dtype=np.float64)
+
+        for tile_i in numba.prange(n_tiles):
+            n_start = tile_i * tile_n
+            n_end = min(n_start + tile_n, n_tot)
+            surv_b = np.empty(n_b, dtype=np.float64)
+            cmem_b = np.empty(n_b, dtype=np.float64)
+            pv_b = np.empty(n_b, dtype=np.float64)
+            pnoki_b = np.empty(n_b, dtype=np.float64)
+            b_arr = np.empty(d_assets, dtype=np.float64)
+
+            for n in range(n_start, n_end):
+                for b_i in range(n_b):
+                    surv_b[b_i] = 1.0
+                    cmem_b[b_i] = c_mem_0
+                    pv_b[b_i] = 0.0
+                    pnoki_b[b_i] = 1.0
+
+                for m in range(m_rem):
+                    callable_m = is_call[m] > 0.5
+                    guar_m = is_guar[m] > 0.5
+                    bk = ko_arr[m]
+                    bc = cpn_arr[m]
+                    cr = cpn_rates[m]
+                    em = eps_ki[m]
+                    is_last = m == m_last
+
+                    if has_base:
+                        for d in range(d_assets):
+                            b_arr[d] = perf_base[m, d, n]
+
+                    for b_i in range(n_b):
+                        w_min = 1e300
+                        w_max = -1e300
+                        w_sum = 0.0
+                        if is_full_alt:
+                            a_r = int(a_slot[b_i])
+                            for d in range(d_assets):
+                                v = bump_alt_4d[a_r, m, d, n]
+                                if v < w_min:
+                                    w_min = v
+                                if v > w_max:
+                                    w_max = v
+                                w_sum += v
+                        else:
+                            aa_v = int(aa_c[b_i])
+                            ab_v = int(ab_c[b_i])
+                            va = bump_a_3d[int(a_slot[b_i]), m, n] if aa_v >= 0 else 0.0
+                            vb = bump_b_3d[int(b_slot[b_i]), m, n] if ab_v >= 0 else 0.0
+                            for d in range(d_assets):
+                                v = va if d == aa_v else (vb if d == ab_v else b_arr[d])
+                                if v < w_min:
+                                    w_min = v
+                                if v > w_max:
+                                    w_max = v
+                                w_sum += v
+                        w_avg = w_sum * inv_d
+
+                        wc = w_min if call_code == 0 else (w_max if call_code == 1 else w_avg)
+                        wcp = w_min if cpn_code == 0 else (w_max if cpn_code == 1 else w_avg)
+                        wo = w_min if opt_code == 0 else (w_max if opt_code == 1 else w_avg)
+
+                        if ki_disc_active:
+                            w_ki = w_min if is_long_flag else wo
+                            if abs(ki_spread) > 1e-6:
+                                blk_d = min(b_ki_fb, b_ki_fb + ki_spread)
+                                bhk_d = max(b_ki_fb, b_ki_fb + ki_spread)
+                                u_km = (bhk_d - w_ki) / max(bhk_d - blk_d, 1e-12)
+                            else:
+                                bhk_d = b_ki_fb + 0.5 * em
+                                u_km = (bhk_d - w_ki) / max(em, 1e-12)
+                            g_km = 0.0 if u_km <= 0.0 else (1.0 if u_km >= 1.0 else u_km)
+                            pnoki_b[b_i] *= 1.0 - g_km
+
+                        if callable_m:
+                            if hard_ko:
+                                gk = 1.0 if wc >= bk else 0.0
+                            else:
+                                bl = min(bk, bk + ko_spread)
+                                bh = max(bk, bk + ko_spread)
+                                uk = (wc - bl) / max(bh - bl, 1e-12)
+                                gk = 0.0 if uk <= 0.0 else (1.0 if uk >= 1.0 else uk)
+                        else:
+                            gk = 0.0
+
+                        if guar_m:
+                            gc = 1.0
+                        else:
+                            if hard_cpn:
+                                hd = (wcp <= bc) if dir_down else (wcp >= bc)
+                                gc = (0.0 if hd else 1.0) if type_out else (1.0 if hd else 0.0)
+                            else:
+                                blc = min(bc, bc + eff_csp)
+                                bhc = max(bc, bc + eff_csp)
+                                uc = (wcp - blc) / max(bhc - blc, 1e-12)
+                                ru = 0.0 if uc <= 0.0 else (1.0 if uc >= 1.0 else uc)
+                                gc = (1.0 - ru) if flip_cpn else ru
+
+                        egc = (gk if gk > gc else gc) if force_cpn_ac else gc
+                        sv = surv_b[b_i]
+                        pm = sv * gk
+                        if is_memory:
+                            ec = cr + cmem_b[b_i]
+                            ccf = sv * egc * ec + pm * ac_cpn
+                            cmem_b[b_i] = sv * ec * (1.0 - egc)
+                        else:
+                            ccf = sv * egc * cr + pm * ac_cpn
+                        df_m = df_mat[b_i, m]
+                        pv_cur = pv_b[b_i] + df_m * (ccf if no_notional else (ccf + pm))
+                        if has_w_fund:
+                            pv_cur -= wf_mat[b_i, m] * sv
+                        rem_s = sv - pm
+                        sv_next = rem_s if rem_s > 0.0 else 0.0
+                        surv_b[b_i] = sv_next
+
+                        if is_last:
+                            if not no_notional:
+                                pv_cur += df_m * sv_next
+                            if ki_disc_active:
+                                kig = 1.0 - pnoki_b[b_i]
+                            elif has_ki:
+                                if abs(ki_spread) <= 1e-6:
+                                    gki = 1.0 if wo < b_ki_fb else 0.0
+                                else:
+                                    blk_e = min(b_ki_fb, b_ki_fb + ki_spread)
+                                    bhk_e = max(b_ki_fb, b_ki_fb + ki_spread)
+                                    uki_e = (bhk_e - wo) / max(bhk_e - blk_e, 1e-12)
+                                    gki = 0.0 if uki_e <= 0.0 else (1.0 if uki_e >= 1.0 else uki_e)
+                                kig = gki if gki > i_ki_past else i_ki_past
+                            else:
+                                kig = 1.0
+
+                            if has_os:
+                                if one_star_eps <= 1e-6:
+                                    sind = 1.0 if w_max >= k_os else 0.0
+                                else:
+                                    uos = (w_max - (k_os - 0.5 * one_star_eps)) / one_star_eps
+                                    sind = 0.0 if uos <= 0.0 else (1.0 if uos >= 1.0 else uos)
+                            else:
+                                sind = 0.0
+
+                            opay = 0.0
+                            if is_long_flag:
+                                opay -= kig * (1.0 - sind) * (1.0 - w_avg)
+                            elif put_active:
+                                p_lo = max(k_low - wo, 0.0) if has_low_k else 0.0
+                                p_in = max(k_put - wo, 0.0) - p_lo
+                                opay -= option_gearing * kig * (1.0 - sind) * p_in
+                            if has_part_call:
+                                opay += part_call_rate * max(wo - k_call, 0.0)
+                            if has_os and os_cpn != 0.0:
+                                opay += sind * os_cpn
+                            pv_cur += df_m * sv_next * opay
+                            tile_pv[tile_i, b_i] += pv_cur
+                        else:
+                            pv_b[b_i] = pv_cur
+
+        out_pv = np.empty(n_b, dtype=np.float64)
+        inv_n = 1.0 / float(n_tot)
+        for b_i in range(n_b):
+            s_r = 0.0
+            for tile_i in range(n_tiles):
+                s_r += tile_pv[tile_i, b_i]
+            out_pv[b_i] = s_r * inv_n + in_tr_arr[b_i]
+        return out_pv
+
+    @numba.njit(parallel=True, cache=True)  # type: ignore[untyped-decorator]
+    def _nb_pack_sp_bumps_nocross(
+        nx_p: npt.NDArray[np.float64],
+        nx_m: npt.NDArray[np.float64],
+        fwd_p: npt.NDArray[np.float64],
+        fwd_m: npt.NDArray[np.float64],
+        bump_a: npt.NDArray[np.float64],
+    ) -> None:
+        d_assets, m_rem, n_tot = nx_p.shape
+        for idx in numba.prange(d_assets * m_rem):
+            d = idx // m_rem
+            m = idx - d * m_rem
+            fp = fwd_p[d, m]
+            fm = fwd_m[d, m]
+            row_p = 2 * d
+            row_m = 2 * d + 1
+            for n in range(n_tot):
+                bump_a[row_p, m, n] = nx_p[d, m, n] * fp
+                bump_a[row_m, m, n] = nx_m[d, m, n] * fm
+
 
 def _eval_c2_preterm_cpu_np(
     perf_base_m_d_n: npt.NDArray[np.float64],
@@ -8399,23 +9996,49 @@ def _eval_c2_preterm_cpu_np(
     m_rem, d_assets, n_tot = perf_base_m_d_n.shape
     m_pre = m_rem - 1
     n_rows = int(len(aa_pre))
-    p_pre = np.ascontiguousarray(perf_base_m_d_n[:m_pre], dtype=np.float64)
-    pm_sp = np.ascontiguousarray(
-        np.concatenate([perf_sp_p[:, :m_pre, :], perf_sp_m[:, :m_pre, :]], axis=0),
-        dtype=np.float64,
-    )
-
-    need_min = (call_code == 0) or (cpn_code == 0)
-    need_max = (call_code == 1) or (cpn_code == 1)
-    need_sum = (call_code == 2) or (cpn_code == 2)
     hard_ko = abs(ko_spread) <= 1e-6
     eff_csp = -cpn_spread if cpn_dir_down else cpn_spread
     hard_cpn = abs(eff_csp) <= 1e-6
+    if call_code in (0, 1, 2) and cpn_code in (0, 1, 2):
+        _ = want_gamma
+        try:
+            from deepvol.models.autocall._tier1_backend import crn_eval_c2_preterm_cpu
+
+            return crn_eval_c2_preterm_cpu(
+                perf_base=perf_base_m_d_n,
+                perf_sp_p=perf_sp_p,
+                perf_sp_m=perf_sp_m,
+                frozen_term=frozen_term,
+                aa_pre=aa_pre,
+                ab_pre=ab_pre,
+                asl_pre=asl_pre,
+                bsl_pre=bsl_pre,
+                ko_barriers=ko_barriers,
+                is_callable=is_callable,
+                cpn_barriers=cpn_barriers,
+                is_guar=is_guar,
+                cpn_rates=cpn_rates,
+                df_pay=df_pay,
+                w_fund=w_fund,
+                eps_vec=eps_vec,
+                call_code=int(call_code),
+                cpn_code=int(cpn_code),
+                hard_ko=bool(hard_ko),
+                hard_cpn=bool(hard_cpn),
+                ko_spread=float(ko_spread),
+                eff_csp=float(eff_csp),
+                cpn_dir_down=bool(cpn_dir_down),
+                cpn_type_out=bool(cpn_type_out),
+                is_memory=bool(is_memory),
+                force_cpn_ac=bool(force_cpn_ac),
+                no_notional=bool(no_notional),
+                ac_cpn=float(ac_cpn),
+                c_mem_0=float(c_mem_0),
+            )
+        except (ImportError, OSError, RuntimeError):
+            pass
     if _HAS_NUMBA and call_code in (0, 1, 2) and cpn_code in (0, 1, 2):
         _ = want_gamma
-        mk1, mv1, mk2, mv2, mk3, mv3, min_p, min_m, xk1, xv1, xk2, xv2, xk3, xv3, max_p, max_m, sum_b, sum_sp_p, sum_sp_m = (
-            _nb_c2_precompute_stats(p_pre, pm_sp, need_min, need_max, need_sum)
-        )
         wf_arr = (
             np.ascontiguousarray(w_fund, dtype=np.float64)
             if w_fund is not None
@@ -8423,9 +10046,10 @@ def _eval_c2_preterm_cpu_np(
         )
         return cast(
             npt.NDArray[np.float64],
-            _nb_c2_preterm_eval(
-                p_pre,
-                pm_sp,
+            _nb_c2_preterm_l1o_fused(
+                np.ascontiguousarray(perf_base_m_d_n, dtype=np.float64),
+                np.asarray(perf_sp_p, dtype=np.float64),
+                np.asarray(perf_sp_m, dtype=np.float64),
                 np.ascontiguousarray(frozen_term, dtype=np.float64),
                 np.ascontiguousarray(aa_pre, dtype=np.int32),
                 np.ascontiguousarray(ab_pre, dtype=np.int32),
@@ -8440,9 +10064,6 @@ def _eval_c2_preterm_cpu_np(
                 wf_arr,
                 w_fund is not None,
                 np.ascontiguousarray(eps_vec, dtype=np.float64),
-                mk1, mv1, mk2, mv2, mk3, mv3, min_p, min_m,
-                xk1, xv1, xk2, xv2, xk3, xv3, max_p, max_m,
-                sum_b, sum_sp_p, sum_sp_m,
                 int(call_code),
                 int(cpn_code),
                 bool(hard_ko),
@@ -8458,9 +10079,17 @@ def _eval_c2_preterm_cpu_np(
                 float(c_mem_0),
             ),
         )
+    p_pre = np.ascontiguousarray(perf_base_m_d_n[:m_pre], dtype=np.float64)
+    pm_sp = np.ascontiguousarray(
+        np.concatenate([perf_sp_p[:, :m_pre, :], perf_sp_m[:, :m_pre, :]], axis=0),
+        dtype=np.float64,
+    )
+    need_min = (call_code == 0) or (cpn_code == 0)
+    need_max = (call_code == 1) or (cpn_code == 1)
+    need_sum = (call_code == 2) or (cpn_code == 2)
     need_sort = need_min or need_max
     order = np.argsort(p_pre, axis=1) if need_sort else np.empty(0, dtype=np.intp)
-    sum_base = p_pre.sum(axis=1) if (call_code == 2 or cpn_code == 2) else np.empty(0, dtype=np.float64)
+    sum_base = p_pre.sum(axis=1) if need_sum else np.empty(0, dtype=np.float64)
     inv_d = 1.0 / float(d_assets)
     ar_m = np.arange(m_pre)[:, None]
     ar_n = np.arange(n_tot)[None, :]
@@ -9382,7 +11011,15 @@ def _pullback_lv_to_raw_quotes(
         lv_cache["_dense_pullback"] = pb_cache
 
     pullback_mat, n_exp_s, n_raw_s = pb_cache
-    return np.asarray((np.ascontiguousarray(bar_lv, dtype=np.float64).reshape(-1) @ pullback_mat).reshape(n_exp_s, n_raw_s), dtype=np.float64)
+    bar_flat = np.ascontiguousarray(bar_lv, dtype=np.float64).reshape(-1)
+    try:
+        from deepvol.models.autocall._tier1_backend import crn_pullback_matvec_cpu
+
+        out_mat = np.empty((n_exp_s, n_raw_s), dtype=np.float64)
+        crn_pullback_matvec_cpu(vec_in=bar_flat, mat_w=pullback_mat, out_vec=out_mat.reshape(-1))
+        return out_mat
+    except (ImportError, OSError, RuntimeError):
+        return np.asarray((bar_flat @ pullback_mat).reshape(n_exp_s, n_raw_s), dtype=np.float64)
 
 
 def _cpu_lv_bilinear_np(
@@ -12275,6 +13912,83 @@ def compute_qmc_aad_crn_greeks(
             cpp_loo_fn(ctypes.byref(desc))
             return pv_out_np
 
+        if (
+            _HAS_NUMBA
+            and call_code in (0, 1, 2)
+            and cpn_code in (0, 1, 2)
+            and opt_code in (0, 1, 2)
+            and ki_monitoring_type in ("European", "Discrete")
+        ):
+            is_full_alt_nb = bool(n_b > 0 and int(aa_c[0]) == -2 and ba_c is not None and ba_c.ndim == 4)
+            pb_nb = pb_c if pb_c is not None else np.empty((1, 1, 1), dtype=np.float64)
+            ba_3d_nb = ba_c if (ba_c is not None and not is_full_alt_nb) else np.empty((1, 1, 1), dtype=np.float64)
+            bb_3d_nb = bb_c if bb_c is not None else np.empty((1, 1, 1), dtype=np.float64)
+            balt_4d_nb = ba_c if (ba_c is not None and is_full_alt_nb) else np.empty((1, 1, 1, 1), dtype=np.float64)
+            a_sl_nb = np.ascontiguousarray(a_slot_np, dtype=np.int32) if a_slot_np is not None else np.arange(n_b, dtype=np.int32)
+            b_sl_nb = np.ascontiguousarray(b_slot_np, dtype=np.int32) if b_slot_np is not None else np.arange(n_b, dtype=np.int32)
+            wf_nb = wf_c if wf_c is not None else np.zeros((n_b, m_rem), dtype=np.float64)
+            tau_prev_l = np.concatenate([[0.0], tau_obs_np[:-1]])
+            dt_per_l = np.maximum(tau_obs_np - tau_prev_l, 1e-8)
+            sig_est_l = np.maximum(np.mean(vol_atm_obs, axis=0), 0.05) if vol_atm_obs is not None else np.full(m_rem, 0.25, dtype=np.float64)
+            eps_ki_l = np.ascontiguousarray(
+                np.clip(0.65 * sig_est_l * np.sqrt(dt_per_l), max(float(barrier_eps_min), 0.015), max(float(barrier_eps_max), 0.08)),
+                dtype=np.float64,
+            )
+            eff_csp_l = -cpn_spread if dir_down else cpn_spread
+            return cast(
+                npt.NDArray[np.float64],
+                _nb_loo_l2o_batch_eval(
+                    pb_nb,
+                    pb_c is not None,
+                    ba_3d_nb,
+                    bb_3d_nb,
+                    balt_4d_nb,
+                    is_full_alt_nb,
+                    aa_c,
+                    ab_c,
+                    a_sl_nb,
+                    b_sl_nb,
+                    df_c,
+                    wf_nb,
+                    wf_c is not None,
+                    in_tr_arr,
+                    np.ascontiguousarray(ko_arr_np, dtype=np.float64),
+                    np.ascontiguousarray(is_call_np, dtype=np.float64),
+                    np.ascontiguousarray(cpn_arr_np, dtype=np.float64),
+                    np.ascontiguousarray(is_guar_np, dtype=np.float64),
+                    np.ascontiguousarray(cpn_rates_np, dtype=np.float64),
+                    eps_ki_l,
+                    int(call_code),
+                    int(cpn_code),
+                    int(opt_code),
+                    float(ko_spread),
+                    float(eff_csp_l),
+                    float(ki_spread),
+                    bool(dir_down),
+                    bool(type_out),
+                    bool(is_memory),
+                    bool(force_cpn_ac),
+                    bool(no_notional),
+                    bool(is_long_flag),
+                    bool(has_ki),
+                    bool(ki_monitoring_type == "Discrete"),
+                    float(b_ki),
+                    float(state.i_ki_past),
+                    float(state.autocall_coupon),
+                    float(state.c_mem_0),
+                    float(k_put),
+                    bool(has_lower_strike_flag),
+                    float(k_low),
+                    float(state.option_gearing),
+                    bool(has_part_call_flag),
+                    float(k_call),
+                    float(part_call_rate),
+                    float(k_os),
+                    float(os_cpn),
+                    float(one_star_eps),
+                ),
+            )
+
         i_ki_base_cpu_cache: Optional[torch.Tensor] = None
         for b_i in range(n_b):
             is_unbumped_row = bool(aa_c[b_i] == -1 and ab_c[b_i] == -1)
@@ -12970,11 +14684,19 @@ def compute_qmc_aad_crn_greeks(
         }
     elif not use_gpu_triton:
         assert z_indep_np is not None
-        z_corr_base_np = (
-            np.ascontiguousarray(np.matmul(z_indep_np, chol_base.T), dtype=np.float64)
-            if (need_spot_bumps or cpp_sde_v2_fn is None)
-            else None
-        )
+        if need_spot_bumps or cpp_sde_v2_fn is None:
+            z_corr_base_np = _get_cpu_tl_f64_buf("z_corr", z_indep_np.shape, max_bytes=128 * 1024 * 1024)
+            try:
+                from deepvol.models.autocall._tier1_backend import crn_corr_normals_cpu
+
+                crn_corr_normals_cpu(z_indep=z_indep_np, chol_mat=chol_base, z_corr_out=z_corr_base_np)
+            except (ImportError, OSError, RuntimeError):
+                if _HAS_NUMBA:
+                    _nb_corr_normals(z_indep_np, chol_base, z_corr_base_np)
+                else:
+                    z_corr_base_np = np.ascontiguousarray(np.matmul(z_indep_np, chol_base.T), dtype=np.float64)
+        else:
+            z_corr_base_np = None
         norm_x_base_np = np.empty((d_assets, m_rem, n_total), dtype=np.float64)
         lx_period_cpu: Optional[npt.NDArray[np.float64]] = None
         lx_norm_cpu: Optional[npt.NDArray[np.float64]] = None
@@ -13022,6 +14744,7 @@ def compute_qmc_aad_crn_greeks(
                 )
                 assert norm_x_m_v2 is not None
                 lx_norm_cpu = lx_period_cpu
+                nx_m_d_n_cpu: Optional[npt.NDArray[np.float64]] = norm_x_m_v2
                 norm_x_base_np = np.transpose(norm_x_m_v2, (1, 0, 2))
             else:
                 lx_p_arr = np.empty((m_rem, d_assets, n_total), dtype=np.float64)
@@ -13079,6 +14802,7 @@ def compute_qmc_aad_crn_greeks(
                 cpp_sde_v2_fn(ctypes.byref(sde_args_fwd))
                 lx_period_cpu = lx_p_arr
                 lx_norm_cpu = lx_p_arr
+                nx_m_d_n_cpu = nx_p_arr
                 norm_x_base_np = np.transpose(nx_p_arr, (1, 0, 2))
         else:
             lx_period_cpu, lx_norm_cpu, norm_x_m = _cpu_step_and_ckpt_sde(
@@ -13095,10 +14819,14 @@ def compute_qmc_aad_crn_greeks(
                 eff_r,
                 n_rep,
             )
+            nx_m_d_n_cpu = norm_x_m
             norm_x_base_np = np.transpose(norm_x_m, (1, 0, 2))
-        perf_base_m_d_n_np = np.ascontiguousarray(
-            np.transpose(norm_x_base_np * fwd_perf_np[:, :, None], (1, 0, 2)), dtype=np.float64
-        )
+        if _HAS_NUMBA and nx_m_d_n_cpu is not None and nx_m_d_n_cpu.flags.c_contiguous:
+            perf_base_m_d_n_np = _nb_mul_fwd_m_d_n(nx_m_d_n_cpu, fwd_perf_np)
+        else:
+            perf_base_m_d_n_np = np.ascontiguousarray(
+                np.transpose(norm_x_base_np * fwd_perf_np[:, :, None], (1, 0, 2)), dtype=np.float64
+            )
         norm_x_base_dev = norm_x_base_np
         perf_base_dev = perf_base_m_d_n_np
 
@@ -13529,7 +15257,7 @@ def compute_qmc_aad_crn_greeks(
                 int(raw_n_cheap_cpu) if raw_n_cheap_cpu is not None else 32768,
                 4 * n_total if n_total >= 32768 else 32768,
             )
-            n_rep_mf_cpu = _next_power_of_two_int(min(max(n_rep, 1024), 4096))
+            n_rep_mf_cpu = _next_power_of_two_int(min(max(n_rep, min(max(n_cheap_cpu_cfg // 16, 1024), 16384)), 16384))
             eff_r_mf_cpu = max(8, (n_cheap_cpu_cfg + (2 * n_rep_mf_cpu) - 1) // (2 * n_rep_mf_cpu))
             wf_mf_c_src: Any = w_fund_base_np
             mf_cpu_dig = _content_digest(
@@ -13941,6 +15669,7 @@ def compute_qmc_aad_crn_greeks(
                     np.stack([np.stack([sp_p_lv_list[i], sp_m_lv_list[i]], axis=0) for i in range(d_assets)], axis=0),
                     dtype=np.float64,
                 )
+                nx_pm_tl = _get_cpu_tl_f64_buf("nx_pm_sp", (2, d_assets, m_rem, n_total), max_bytes=128 * 1024 * 1024)
                 out_nx_pm_cpu = cpp_step_sp_v2_fn(
                     lv_tables_pm=lv_pm_batch_np,
                     z_corr=z_corr_base_np,
@@ -13953,6 +15682,7 @@ def compute_qmc_aad_crn_greeks(
                     n_sub=n_sub,
                     eff_r=eff_r,
                     n_rep=n_rep,
+                    out_norm_x_pm=nx_pm_tl,
                 )
                 nx_sp_p_np = out_nx_pm_cpu[0]
                 nx_sp_m_np = out_nx_pm_cpu[1]
@@ -13989,8 +15719,9 @@ def compute_qmc_aad_crn_greeks(
                             lv_t_grid, lv_y_min_vec[i : i + 1], lv_y_max_vec[i : i + 1], n_sub, eff_r, n_rep,
                         )
                         nx_sp_p_np[i], nx_sp_m_np[i] = out_p[:, 0, :], out_m[:, 0, :]
-            perf_sp_p_dev = nx_sp_p_np * fwd_sp_p_np[:, :, None]
-            perf_sp_m_dev = nx_sp_m_np * fwd_sp_m_np[:, :, None]
+            if not _HAS_NUMBA:
+                perf_sp_p_dev = nx_sp_p_np * fwd_sp_p_np[:, :, None]
+                perf_sp_m_dev = nx_sp_m_np * fwd_sp_m_np[:, :, None]
 
         want_fd_dg = bool(want_delta or ((not use_vibrato_gamma) and want_gamma))
         want_fd_gamma_only = bool((not use_vibrato_gamma) and want_gamma)
@@ -14029,9 +15760,53 @@ def compute_qmc_aad_crn_greeks(
                     spot_a_slots=a_sl_sp,
                     spot_b_slots=b_sl_sp if n_cross > 0 else None,
                 )
+            elif _HAS_NUMBA:
+                bump_a_sp = _get_cpu_tl_f64_buf("bump_a_sp", (n_sp_total, m_rem, n_total), max_bytes=200 * 1024 * 1024)
+                if n_cross == 0:
+                    try:
+                        from deepvol.models.autocall._tier1_backend import crn_pack_sp_bumps_nocross_cpu
+
+                        crn_pack_sp_bumps_nocross_cpu(
+                            nx_p=nx_sp_p_np,
+                            nx_m=nx_sp_m_np,
+                            fwd_p=fwd_sp_p_np,
+                            fwd_m=fwd_sp_m_np,
+                            bump_a=bump_a_sp,
+                        )
+                    except (ImportError, OSError, RuntimeError):
+                        _nb_pack_sp_bumps_nocross(
+                            np.ascontiguousarray(nx_sp_p_np, dtype=np.float64),
+                            np.ascontiguousarray(nx_sp_m_np, dtype=np.float64),
+                            np.ascontiguousarray(fwd_sp_p_np, dtype=np.float64),
+                            np.ascontiguousarray(fwd_sp_m_np, dtype=np.float64),
+                            bump_a_sp,
+                        )
+                    perf_sp_p_dev = bump_a_sp[0::2]
+                    perf_sp_m_dev = bump_a_sp[1::2]
+                    bump_b_sp_arr = np.empty((1, 1, 1), dtype=np.float64)
+                else:
+                    ci_arr = np.array([p[0] for p in cross_pairs], dtype=np.int32)
+                    cj_arr = np.array([p[1] for p in cross_pairs], dtype=np.int32)
+                    perf_sp_p_dev = _get_cpu_tl_f64_buf("perf_sp_p", (d_assets, m_rem, n_total), max_bytes=128 * 1024 * 1024)
+                    perf_sp_m_dev = _get_cpu_tl_f64_buf("perf_sp_m", (d_assets, m_rem, n_total), max_bytes=128 * 1024 * 1024)
+                    bump_b_sp_arr = np.empty((n_sp_total, m_rem, n_total), dtype=np.float64)
+                    _nb_pack_sp_bumps(
+                        np.ascontiguousarray(nx_sp_p_np, dtype=np.float64),
+                        np.ascontiguousarray(nx_sp_m_np, dtype=np.float64),
+                        np.ascontiguousarray(fwd_sp_p_np, dtype=np.float64),
+                        np.ascontiguousarray(fwd_sp_m_np, dtype=np.float64),
+                        ci_arr,
+                        cj_arr,
+                        perf_sp_p_dev,
+                        perf_sp_m_dev,
+                        bump_a_sp,
+                        bump_b_sp_arr,
+                    )
+                bump_b_sp: Optional[npt.NDArray[np.float64]] = bump_b_sp_arr if n_cross > 0 else None
+                tok_sp = _submit_payoff(aa_sp, ab_sp, bump_a=bump_a_sp, bump_b=bump_b_sp)
             else:
                 bump_a_sp = np.empty((n_sp_total, m_rem, n_total), dtype=np.float64)
-                bump_b_sp: Optional[npt.NDArray[np.float64]] = (
+                bump_b_sp = (
                     np.zeros((n_sp_total, m_rem, n_total), dtype=np.float64) if n_cross > 0 else None
                 )
                 for i in range(d_assets):
@@ -14054,6 +15829,9 @@ def compute_qmc_aad_crn_greeks(
                     spot_a_slots=np.array([-100, -101], dtype=np.int32),
                 )
             else:
+                if _HAS_NUMBA:
+                    perf_sp_p_dev = nx_sp_p_np * fwd_sp_p_np[:, :, None]
+                    perf_sp_m_dev = nx_sp_m_np * fwd_sp_m_np[:, :, None]
                 perf_epm = np.ascontiguousarray(
                     np.stack([np.transpose(perf_sp_p_dev, (1, 0, 2)), np.transpose(perf_sp_m_dev, (1, 0, 2))], axis=0),
                     dtype=np.float64,
@@ -14064,6 +15842,9 @@ def compute_qmc_aad_crn_greeks(
                     alt_perf=perf_epm,
                 )
             sp_task_meta = {"mode": "cg", "tok": tok_epm}
+        elif (not use_gpu_triton) and _HAS_NUMBA and need_spot_bumps:
+            perf_sp_p_dev = nx_sp_p_np * fwd_sp_p_np[:, :, None]
+            perf_sp_m_dev = nx_sp_m_np * fwd_sp_m_np[:, :, None]
 
     if (
         not use_gpu_triton
@@ -15996,15 +17777,7 @@ def compute_qmc_aad_crn_greeks(
                         1,
                     ) * n_rep
                     _r_env_cap_b = int(os.environ.get("DEEPVOL_R_CAP", "4"))
-                    r_cap_b = (
-                        2
-                        if (d_pad_b * m_pad_b >= 240)
-                        else (
-                            5
-                            if (d_pad_b * m_pad_b <= 120 and eff_r == 10)
-                            else (min(_r_env_cap_b, 4) if _r_env_cap_b != 4 else 4)
-                        )
-                    )
+                    r_cap_b = 2 if (d_pad_b * m_pad_b >= 240) else min(_r_env_cap_b, 4) if _r_env_cap_b != 4 else 4
                     r_chunk_b = min(eff_r, r_cap_b, max(1, (72 * 1024 * 1024) // per_rep_b))
                     inv_perm_pad_b = torch.arange(d_pad_b, dtype=torch.int64, device=qmc_device)
                     inv_perm_pad_b[:d_assets].copy_(gpu_meta["inv_perm"])
@@ -18686,6 +20459,7 @@ def compute_qmc_aad_crn_greeks(
                         has_q_shift_sub=0,
                     )
                     cpp_sde_v2_fn(ctypes.byref(sde_th_args))
+                    nx_th_m_d_n = nx_p_th
                     norm_x_th_np = np.transpose(nx_p_th, (1, 0, 2))
             else:
                 _, _, out_m_th = _cpu_step_and_ckpt_sde(
@@ -18702,11 +20476,15 @@ def compute_qmc_aad_crn_greeks(
                     eff_r,
                     n_rep,
                 )
+                nx_th_m_d_n = out_m_th
                 norm_x_th_np = np.transpose(out_m_th, (1, 0, 2))
-            perf_th_dev = np.ascontiguousarray(
-                np.transpose(norm_x_th_np * fwd_perf_th_np[:, :, None], (1, 0, 2)),
-                dtype=np.float64,
-            )
+            if _HAS_NUMBA and nx_th_m_d_n is not None and nx_th_m_d_n.flags.c_contiguous:
+                perf_th_dev = _nb_mul_fwd_m_d_n(nx_th_m_d_n, fwd_perf_th_np)
+            else:
+                perf_th_dev = np.ascontiguousarray(
+                    np.transpose(norm_x_th_np * fwd_perf_th_np[:, :, None], (1, 0, 2)),
+                    dtype=np.float64,
+                )
 
             if k_cross == 0 and ki_monitoring_type == "European":
                 pv_th_qmc = float(
@@ -18721,6 +20499,131 @@ def compute_qmc_aad_crn_greeks(
                         np.array([in_tr_th + crossed_pv], dtype=np.float64),
                     )[0]
                 )
+            elif (
+                _HAS_NUMBA
+                and call_code in (0, 1, 2)
+                and cpn_code in (0, 1, 2)
+                and opt_code in (0, 1, 2)
+            ):
+                eff_csp_th = -cpn_spread if dir_down else cpn_spread
+                ki_th_mode_norm = str(ki_monitoring_type or "Discrete").strip().lower()
+                use_ext_ki_nb = bool(
+                    has_ki and float(eff_iki_th) < 0.5 and ki_th_mode_norm in ("continuous", "daily")
+                )
+                if use_ext_ki_nb:
+                    p_th_t = torch.from_numpy(perf_th_dev)
+                    iki_th_cpu_box: List[torch.Tensor] = []
+                    _compute_payoff_aad_state_adjoints_torch(
+                        p_th_t,
+                        ko_barriers=torch.from_numpy(ko_arr_np[k_cross:]),
+                        is_callable=torch.from_numpy(is_call_np[k_cross:]),
+                        cpn_barriers=torch.from_numpy(cpn_arr_np[k_cross:]),
+                        is_guar=torch.from_numpy(is_guar_np[k_cross:]),
+                        cpn_rates=torch.from_numpy(cpn_rates_np[k_cross:]),
+                        df_pay=torch.from_numpy(df_pay_th_np),
+                        w_fund=torch.from_numpy(w_fund_th_np) if w_fund_th_np is not None else None,
+                        inv_perm=inv_perm,
+                        call_code=call_code,
+                        cpn_code=cpn_code,
+                        opt_code=opt_code,
+                        ko_spread=ko_spread,
+                        cpn_spread=cpn_spread,
+                        ki_spread=ki_spread,
+                        cpn_dir_down=dir_down,
+                        cpn_type_out=type_out,
+                        is_memory=is_memory,
+                        force_cpn_ac=force_cpn_ac,
+                        no_notional=no_notional,
+                        is_long_basket=is_long_flag,
+                        has_ki=has_ki,
+                        ki_barrier=b_ki,
+                        i_ki_past=float(eff_iki_th),
+                        ki_monitoring_type=ki_monitoring_type,
+                        tau_obs=tau_obs_th_np,
+                        vol_atm_obs=vol_atm_obs[:, k_cross:] if vol_atm_obs is not None else None,
+                        strike=k_put,
+                        lower_strike=state.lower_strike,
+                        option_gearing=float(state.option_gearing),
+                        ac_cpn=float(state.autocall_coupon),
+                        c_mem_0=float(eff_cmem_th),
+                        part_call_strike=state.participation_call_strike,
+                        part_call_rate=part_call_rate,
+                        one_star_strike=(k_os if k_os > 0.0 else state.one_star_strike),
+                        one_star_coupon=os_cpn,
+                        one_star_eps=one_star_eps,
+                        barrier_eps_min=barrier_eps_min,
+                        barrier_eps_max=barrier_eps_max,
+                        lv_tables_t=torch.from_numpy(lv_th_tables),
+                        corr_t=torch.from_numpy(corr_np),
+                        fwd_perf_t=torch.from_numpy(fwd_perf_th_np),
+                        y_min=lv_y_min_vec,
+                        y_max=lv_y_max_vec,
+                        n_sub=n_sub,
+                        n_rep=n_rep,
+                        emit_stage1=False,
+                        compute_grads=False,
+                        out_i_ki_ext=iki_th_cpu_box,
+                    )
+                    ext_ki_arr_th = (
+                        np.ascontiguousarray(iki_th_cpu_box[0].detach().cpu().numpy(), dtype=np.float64)
+                        if iki_th_cpu_box
+                        else np.ones(n_total, dtype=np.float64)
+                    )
+                else:
+                    ext_ki_arr_th = np.empty(1, dtype=np.float64)
+                tau_prev_th = np.concatenate([[0.0], tau_obs_th_np[:-1]])
+                dt_th_arr = np.maximum(tau_obs_th_np - tau_prev_th, 1e-8)
+                v_atm_th = vol_atm_obs[:, k_cross:] if vol_atm_obs is not None else None
+                sig_est_th = np.maximum(np.mean(v_atm_th, axis=0), 0.05) if v_atm_th is not None else np.full(m_rem_th, 0.25, dtype=np.float64)
+                eps_ki_th = np.ascontiguousarray(
+                    np.clip(0.65 * sig_est_th * np.sqrt(dt_th_arr), max(float(barrier_eps_min), 0.015), max(float(barrier_eps_max), 0.08)),
+                    dtype=np.float64,
+                )
+                wf_th_nb = np.ascontiguousarray(w_fund_th_np, dtype=np.float64) if w_fund_th_np is not None else np.zeros(m_rem_th, dtype=np.float64)
+                pv_mc_th = _nb_eval_theta_hard_pv(
+                    perf_th_dev,
+                    np.ascontiguousarray(ko_arr_np, dtype=np.float64),
+                    np.ascontiguousarray(is_call_np, dtype=np.float64),
+                    np.ascontiguousarray(cpn_arr_np, dtype=np.float64),
+                    np.ascontiguousarray(is_guar_np, dtype=np.float64),
+                    np.ascontiguousarray(cpn_rates_np, dtype=np.float64),
+                    np.ascontiguousarray(df_pay_th_np, dtype=np.float64),
+                    wf_th_nb,
+                    w_fund_th_np is not None,
+                    eps_ki_th,
+                    ext_ki_arr_th,
+                    use_ext_ki_nb,
+                    int(k_cross),
+                    int(call_code),
+                    int(cpn_code),
+                    int(opt_code),
+                    float(ko_spread),
+                    float(eff_csp_th),
+                    float(ki_spread),
+                    bool(dir_down),
+                    bool(type_out),
+                    bool(is_memory),
+                    bool(force_cpn_ac),
+                    bool(no_notional),
+                    bool(is_long_flag),
+                    bool(has_ki),
+                    bool(ki_th_mode_norm == "discrete"),
+                    float(b_ki),
+                    float(eff_iki_th),
+                    float(eff_cmem_th),
+                    float(state.autocall_coupon),
+                    float(k_put),
+                    state.lower_strike is not None,
+                    float(k_low),
+                    float(state.option_gearing),
+                    bool(has_part_call_flag),
+                    float(k_call),
+                    float(part_call_rate),
+                    float(k_os),
+                    float(os_cpn),
+                    float(one_star_eps),
+                )
+                pv_th_qmc = float(pv_mc_th) + in_tr_th + crossed_pv
             else:
                 p_th_t = torch.from_numpy(perf_th_dev)
                 wc_t = _eval_index_batch_torch(p_th_t, call_code, inv_perm)
