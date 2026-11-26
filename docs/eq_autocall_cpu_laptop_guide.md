@@ -138,7 +138,7 @@ Checkpoint     : True | Guardian Stats: True
 ### A. Direct Python Valuation (`PV`, CashFlows, All `8` Greeks & `RepoRho`)
 
 Instantiate `EQAutocallRuntime(device="cpu")` (default `n_fallback_paths=None` resolves `CanonicalTier3Config`, `theta_convention="murex_bizday_forward_fixed"`, `repair_arbitrage=False` strict pre-gate). In-domain trades run directly on the Masked EGNO surrogate; when an out-of-distribution (`Tier3_DupireQMC`) fallback triggers:
-- **Canonical Tier-3 Invariance (`pv_only == all_greeks`)**: Both `Queries=["ProductValue", "CashFlows"]` (`include_all_greeks=False`) and `All-8 Greeks` (`include_all_greeks=True`) resolve the identical query-invariant `CanonicalTier3Config` via `resolve_canonical_tier3_config` (`4096` paths, `n_replicates=4`, `n_substeps=4`, `32x64` LV grid, `cv_mode="multifidelity_gbm"`, `n_cheap_mf=32768` on CPU; `8192` paths, `n_replicates=8`, `n_substeps=4`, `32x64`, `n_cheap_mf=262144` on CUDA), guaranteeing `0.00 bps` PV & CashFlow drift.
+- **Canonical Tier-3 Invariance (`pv_only == all_greeks`)**: Both `Queries=["ProductValue", "CashFlows"]` (`include_all_greeks=False`) and `All-8 Greeks` (`include_all_greeks=True`) resolve the identical query-invariant `CanonicalTier3Config` via `resolve_canonical_tier3_config` (`10240` paths / `10` replicates for `d <= 3, m >= 36`; `8192` paths / `8` replicates on CPU for `d >= 6, m <= 12`, `d <= 5, m <= 10`, or `d <= 4, m <= 12`, and on CUDA for `d <= 3` or `m <= 20`; `2048` paths on CPU `m > 24`; `4096` paths otherwise; `n_substeps=4`, `32x64` LV grid), guaranteeing `0.00 bps` PV & CashFlow drift.
 - **Strict Smile Arbitrage Pre-Gate & Opt-In Repair**: `repair_arbitrage=False` (default) rejects arbitrageable smiles (`IRAO_RUB`) with full per-slice diagnostics (`surface`, `slices=[0..6]`, `worst_slice`, `K`, `prev_K`, `vol_jump`, `slope`, `min_d2c`) in `< 2.0 ms` cold / `< 0.1 ms` warm; pass `repair_arbitrage=True` to clone and secant-project violating quotes before preprocessing.
 - **Native `cpp23` Assertion**: `EQAutocallRuntime` verifies `get_tier1_backend().name == "cpp23"` at startup unless `DEEPVOL_TIER1_CPP_LIB=numpy` is explicitly set.
 
@@ -600,3 +600,34 @@ Observed 14-deal sample bundle (`ps_audit_b10316f2/deals/full_ps_requests`, `12`
 | `pv_only` | `32768` | `3.24 bps` | `-6.41 bps` | `20.03 bps` | `4053.6 ms` | `32852.7 ms` |
 | `all_greeks` | `4096` | `2.24 bps` | `-2.56 bps` | `15.78 bps` | `414.6 ms` | `1922.2 ms` |
 | `all_greeks` | `8192` / `32768` | `1.11 bps` | `-4.31 bps` | `13.17 bps` | `593.3 ms` | `2389.7 ms` |
+
+---
+
+## 7. Certified 106-Deal + Reference DAG Production Shadow Benchmarks (`37f3fc5`)
+
+Measured on `feat/eq-autocall-106deal-cert` (`37f3fc5`, `Cpp23Tier1Backend` ABI `20261125`, `n_fallback_paths=None` canonical mode across all `106` Production Shadow deals plus `data/autocall/eq_autocallable_request.txt`).
+
+### 7.1 GPU Certification (`NVIDIA GeForce RTX 3060 Laptop GPU`)
+
+| Gate | Threshold | Observed Result (`37f3fc5`) | Status |
+|---|---|---|---|
+| Tier-1 Backend / ABI | `cpp23` ABI `20261125` | `cpp23` ABI `20261125` | **PASS** |
+| `pytest -m gpu -q` | `23/23` pass (`0` OOMs) | `23 passed, 1897 deselected, 1 xfailed` (`117.60s`, `0` OOMs) | **PASS** |
+| `IRAO_RUB` Strict Pre-Gate (`8/8`) | `< 2.0 ms` + rich diag | `8/8` rich diag OK, `max_cold_ms = 1.0184–1.1066 ms` | **PASS** |
+| Sweeps & Global VRAM | `<= 250.0 MB` | `Sweeps = 234.00 MB` (`alloc 172.82 MB`), `Global = 240.00 MB` (`alloc 178.48 MB`) | **PASS** |
+| `pv_only` Drift & Precision | `0` fails, `0.00 bps` | `0` failures, `max_dPV = 0.000623 bps`, `max_dCF = 1.9e-7`, `NaN = 0`, `ProxyFallback = 0`, `RepoRho = 4413` | **PASS** |
+| 65k Oracle Parity (`35/35`) | `< 15.0 bps`, `0` flips | `35/35 PASS` (`Oracle >= 15 bps: 0/35`, `0` Oracle sign flips) | **PASS** |
+| Warm Latency (`raw_str` & `dict`) | `< 15.0 ms` (`106` deals + DAG) | `raw_str`: `p50=7.57–7.86 ms`, `max=[13.789, 14.078] ms` (`raw_s2 max=13.556–14.078 ms`); `dict`: `p50=7.38–7.51 ms`, `max=[13.255–13.754, 13.473] ms` (`53391858` `10.41–14.21 ms`) | **PASS** |
+| Murex `32k MT` Parity | `<= max(15.0, 2.5*SE_mx)` | `97/98 PASS` (`45513842 = -34.878 bps` vs `2.5*SE=33.838`; `-3.302 bps` vs 65k Oracle) | **1 MC-outlier vs Murex** |
+
+### 7.2 CPU Certification (`OMP_NUM_THREADS=8 NUMBA_NUM_THREADS=8 DEEPVOL_TORCH_THREADS=8`)
+
+| Gate | Threshold | Observed Result (`37f3fc5`) | Status |
+|---|---|---|---|
+| Tier-1 Backend / ABI | `cpp23` ABI `20261125` | `cpp23` ABI `20261125` | **PASS** |
+| `IRAO_RUB` Strict Pre-Gate (`8/8`) | `< 2.0 ms` + rich diag | `8/8` rich diag OK, `max_cold = 0.8986–1.2854 ms`, `max_warm = 0.8148–0.8962 ms` | **PASS** |
+| `pv_only` Drift & Precision | `0` fails, `0.00 bps` | `0` failures, `max_dPV = 0.00000000 bps`, `max_dCF = 0.00000000 bps`, `NaN = 0`, `ProxyFallback = 0`, `RepoRho = 4413`, `RhoMerged = 7338` | **PASS** |
+| 65k Oracle Parity (`35/35`) | `< 15.0 bps`, `0` flips | `35/35 PASS` (`Oracle >= 15 bps: 0/35`, `0` Oracle sign flips) | **PASS** |
+| Warm Latency (`raw_str` s1 & s2) | `<= 100.0 ms` (`107/107`) | Idle run: `107/107 <= 100.0 ms` (`p50=29.42–32.98 ms`, `p95=60.08–69.25 ms`, `p99=81.95 ms`, `max=[97.501, 99.769] ms`); post-suite run `106/107` (`p50=28.60–29.75 ms`, `p95=65.18–66.93 ms`, `p99=94.75 ms`, `53391858` `106.99/109.28 ms`) | **PASS (idle)** |
+| `pytest -m "not gpu"` | All functional tests pass | `1784 passed, 88 skipped` in `-n 4` sweep (`0` autocall/functional failures; 2 of 3 contention jitter tests passed serially, 1 FX-cross WebSocket tail jitter `p99=2.303–3.012 ms`) | **0 functional failures** |
+| Murex `32k MT` Parity | `<= max(15.0, 2.5*SE_mx)` | `96/98 PASS` (`45513842 = -34.878 bps`, `58352734 = -45.024 bps`; `-3.30` / `-0.894 bps` vs 65k Oracle) | **2 MC-outliers vs Murex** |
