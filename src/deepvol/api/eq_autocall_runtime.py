@@ -1575,7 +1575,7 @@ def _compute_qmc_crn_if_available(
                         n_substeps=canon_cfg.n_substeps,
                         lv_grid_nt=canon_cfg.lv_grid_nt,
                         lv_grid_ny=canon_cfg.lv_grid_ny,
-                        cv_mode="multifidelity_gbm",
+                        cv_mode=canon_cfg.cv_mode,
                         n_cheap_mf=canon_cfg.n_cheap_mf,
                         seed=canon_cfg.seed,
                     )

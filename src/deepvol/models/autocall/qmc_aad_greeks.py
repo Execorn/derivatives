@@ -139,7 +139,7 @@ _CRN_CURVE_JAC_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=204
 _CRN_CPU_PREP_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=512)
 _CRN_MF_CHEAP_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=512)
 _CRN_DEAL_PREP_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "deal_prep_lv_vega", max_entries=512, max_bytes=16 * 1024 * 1024
+    "deal_prep_lv_vega", max_entries=512, max_bytes=24 * 1024 * 1024
 )
 _CRN_STATIC_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
     "static_constants", max_entries=256, max_bytes=8 * 1024 * 1024
@@ -10499,6 +10499,7 @@ def _eval_mf_gbm_batch_cpu(
     r_b, m_rem, n_rep, d_assets = z_corr_rmnd.shape
     s1_out = np.zeros((r_b, 3 * m_rem + 5), dtype=np.float64)
     cf_surv_out = np.zeros((r_b, 2, m_rem), dtype=np.float64) if compute_cf_surv else None
+    blf_out: Optional[npt.NDArray[np.float64]] = None
     sqrt_dv = np.ascontiguousarray(np.sqrt(np.maximum(d_var_gbm, 1e-18)), dtype=np.float64)
     eff_csp = -cpn_spread if dir_down else cpn_spread
     has_os = bool(k_os > 0.0)
@@ -15995,7 +15996,15 @@ def compute_qmc_aad_crn_greeks(
                         1,
                     ) * n_rep
                     _r_env_cap_b = int(os.environ.get("DEEPVOL_R_CAP", "4"))
-                    r_cap_b = 2 if (d_pad_b * m_pad_b >= 240) else min(_r_env_cap_b, 4) if _r_env_cap_b != 4 else 4
+                    r_cap_b = (
+                        2
+                        if (d_pad_b * m_pad_b >= 240)
+                        else (
+                            5
+                            if (d_pad_b * m_pad_b <= 120 and eff_r == 10)
+                            else (min(_r_env_cap_b, 4) if _r_env_cap_b != 4 else 4)
+                        )
+                    )
                     r_chunk_b = min(eff_r, r_cap_b, max(1, (72 * 1024 * 1024) // per_rep_b))
                     inv_perm_pad_b = torch.arange(d_pad_b, dtype=torch.int64, device=qmc_device)
                     inv_perm_pad_b[:d_assets].copy_(gpu_meta["inv_perm"])
@@ -18163,12 +18172,7 @@ def compute_qmc_aad_crn_greeks(
                     # on smaller eff_r=4 runs (noisy df=3 covariance), only zero when strictly anti-correlated.
                     if cov_xy_cv < 0.0 or (eff_r >= 8 and cov_xy_cv < 0.5 * var_x_cv):
                         beta_cv = 0.0
-            if m_rem >= 32:
-                s1_mean[c0_s1:n_cv_cols] = s1_mean[c0_s1:n_cv_cols] + beta_cv * (
-                    s1_cheap_mean[c0_s1:n_cv_cols] - s1_crn_mean[c0_s1:n_cv_cols]
-                )
-            else:
-                s1_mean[:n_cv_cols] = s1_mean[:n_cv_cols] + beta_cv * (s1_cheap_mean - s1_crn_mean)
+            s1_mean[:n_cv_cols] = s1_mean[:n_cv_cols] + beta_cv * (s1_cheap_mean - s1_crn_mean)
             if se_mu_mf_cached is not None and math.isfinite(se_mu_mf_cached):
                 var_cheap = (beta_cv * beta_cv) * (se_mu_mf_cached * se_mu_mf_cached)
             else:

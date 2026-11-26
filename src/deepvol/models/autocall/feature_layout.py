@@ -187,6 +187,8 @@ def resolve_canonical_tier3_config(
     dev_tok = "cuda" if str(device_type).strip().lower().startswith("cuda") else "cpu"
     if n_fallback_paths is not None:
         eff_paths = max(2, int(n_fallback_paths))
+    elif d_val <= 3 and m_val >= 36:
+        eff_paths = 10240
     elif dev_tok == "cuda":
         eff_paths = 4096 if (m_val > 20 and d_val > 3) else 8192
     elif m_val > 24:
@@ -196,7 +198,10 @@ def resolve_canonical_tier3_config(
     else:
         eff_paths = 4096
     n_sub = 4
-    eff_r = min(max(1, eff_paths // 2), 8 if eff_paths >= 8192 else 4)
+    eff_r = 10 if eff_paths == 10240 else min(max(1, eff_paths // 2), 8 if eff_paths >= 8192 else 4)
+    eff_cv: Literal["multifidelity_gbm", "bs1d_exact", "none"] = (
+        "none" if (n_fallback_paths is None and d_val <= 3 and m_val >= 36) else "multifidelity_gbm"
+    )
     nt, ny = 32, 64
     n_cheap = (
         max(262144, 8 * eff_paths)
@@ -209,7 +214,7 @@ def resolve_canonical_tier3_config(
         n_substeps=n_sub,
         lv_grid_nt=nt,
         lv_grid_ny=ny,
-        cv_mode="multifidelity_gbm",
+        cv_mode=eff_cv,
         n_cheap_mf=n_cheap,
         seed=int(seed),
         adaptive_substeps=False,
