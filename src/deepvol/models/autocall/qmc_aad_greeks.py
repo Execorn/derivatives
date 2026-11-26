@@ -16601,7 +16601,7 @@ def compute_qmc_aad_crn_greeks(
                 and th_prep is not None
                 and not th_prep["eff_autocalled"]
                 and int(th_prep["k_cross"]) == 0
-                and float(tau_obs_np[0]) > 2.0 * float(th_prep.get("dt_shift", 1.0 / 365.0))
+                and float(tau_obs_np[0]) > 4.0 * float(th_prep.get("dt_shift", 1.0 / 365.0))
                 and not bool(th_prep.get("has_ex_div_in_roll", False))
                 and not is_cont_ki_active
                 and want_rate_aad_smooth
@@ -18005,7 +18005,7 @@ def compute_qmc_aad_crn_greeks(
                     out_layout.append(("th_fused", (1,)))
                     if use_vibrato_gamma:
                         out_layout.append(("h_vib", (d_out_b, d_out_b)))
-                    if want_cega or need_stage2_aad:
+                    if want_chol_aad_sde:
                         out_layout.append(("bar_chol", (d_out_b, d_out_b)))
                     if want_lv_aad_sde:
                         out_layout.append(("bar_lv", (d_out_b, lv_nt, lv_ny)))
@@ -18101,7 +18101,7 @@ def compute_qmc_aad_crn_greeks(
                             bool(need_stage2_aad),
                             bool(want_cf_wf_aad),
                             bool(want_lv_aad_sde),
-                            bool(want_cega or need_stage2_aad),
+                            bool(want_chol_aad_sde),
                             bool(want_q_aad_sde or need_stage2_aad),
                             bool(use_vibrato_gamma),
                             bool(need_spot_bumps),
@@ -18879,7 +18879,7 @@ def compute_qmc_aad_crn_greeks(
                     # Backpropagate bar_lx_post_c through rematerialized Platen substeps using parallel period shards.
                     if need_stage2_aad and bar_lx_post_c is not None and lx_period_c is not None:
                         want_q_launch = bool(want_q_aad_sde or (use_cg_bucket and bar_q_tot_g is not None))
-                        want_chol_launch = bool(want_chol_aad_sde or (use_cg_bucket and bar_chol_tot_g is not None))
+                        want_chol_launch = bool(want_chol_aad_sde)
                         if defer_bwd_shard_sum:
                             if bar_q_acc_c is None and want_q_launch:
                                 bar_q_acc_c = _alloc_cg_buf(
@@ -20289,7 +20289,7 @@ def compute_qmc_aad_crn_greeks(
         can_analytical_theta = bool(
             not th_prep["eff_autocalled"]
             and int(th_prep["k_cross"]) == 0
-            and float(tau_obs_np[0]) > 2.0 * dt_shift_th
+            and float(tau_obs_np[0]) > 4.0 * dt_shift_th
             and not bool(th_prep.get("has_ex_div_in_roll", False))
             and not is_cont_ki_active
             and want_rate_aad_smooth

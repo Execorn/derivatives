@@ -4247,6 +4247,76 @@ def _generate_gpu_sobol_tile(
     return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
 
 
+def _compute_escrowed_fwd_and_drift_batch(
+    spots_t0: torch.Tensor,
+    r_tot_obs: torch.Tensor,
+    df_fin_obs: torch.Tensor,
+    tau_2d: torch.Tensor,
+    t_eff: torch.Tensor,
+    div_events_list: Sequence[Sequence[Any]],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Computes batched (A, N_t) escrowed forward, r_zero, and q_repo grids matching QAG."""
+    a_cnt = int(spots_t0.shape[0])
+    m_len = int(tau_2d.shape[1])
+    device = spots_t0.device
+
+    zeros_a = torch.zeros((a_cnt, 1), dtype=torch.float64, device=device)
+    ones_a = torch.ones((a_cnt, 1), dtype=torch.float64, device=device)
+    tau_knots = torch.cat([zeros_a, tau_2d], dim=1).contiguous()
+    r_tot_knots = torch.cat([zeros_a, r_tot_obs], dim=1)
+    log_df_knots = torch.log(torch.clamp(torch.cat([ones_a, df_fin_obs], dim=1), min=1e-15))
+
+    max_div = max((len(evs) for evs in div_events_list), default=0)
+    if max_div > 0:
+        ex_taus_np = np.zeros((a_cnt, max_div), dtype=np.float64)
+        ex_pvs_np = np.zeros((a_cnt, max_div), dtype=np.float64)
+        for a_i, evs in enumerate(div_events_list):
+            for j, ev in enumerate(evs):
+                ex_taus_np[a_i, j] = float(getattr(ev, "tau_ex_act365", 0.0))
+                ex_pvs_np[a_i, j] = float(getattr(ev, "amount", 0.0)) * float(
+                    getattr(ev, "pv_discount_weight", 0.0)
+                )
+        ex_taus = torch.tensor(ex_taus_np, dtype=torch.float64, device=device)
+        ex_pvs = torch.tensor(ex_pvs_np, dtype=torch.float64, device=device)
+        mask_ex_k = (ex_taus[:, None, :] > 0.0) & (ex_taus[:, None, :] <= tau_knots[:, :, None] + 1e-12)
+        d_pv_knots = (mask_ex_k.to(torch.float64) * ex_pvs[:, None, :]).sum(dim=2)
+    else:
+        d_pv_knots = torch.zeros((a_cnt, m_len + 1), dtype=torch.float64, device=device)
+
+    floor_sp = 0.01 * spots_t0[:, None]
+    scale_sp = torch.clamp(floor_sp, min=1e-12)
+    escrowed_knots = floor_sp + scale_sp * F.softplus(
+        (spots_t0[:, None] - d_pv_knots - floor_sp) / scale_sp, beta=1.0, threshold=40.0
+    )
+
+    k_idx = torch.clamp(torch.searchsorted(tau_knots, t_eff, right=True) - 1, 0, m_len - 1)
+    tau0 = torch.gather(tau_knots, 1, k_idx)
+    tau1 = torch.gather(tau_knots, 1, k_idx + 1)
+    r0 = torch.gather(r_tot_knots, 1, k_idx)
+    r1 = torch.gather(r_tot_knots, 1, k_idx + 1)
+    ldf0 = torch.gather(log_df_knots, 1, k_idx)
+    ldf1 = torch.gather(log_df_knots, 1, k_idx + 1)
+
+    dt_k = torch.clamp(tau1 - tau0, min=1e-8)
+    alpha_k = torch.clamp((t_eff - tau0) / dt_k, 0.0, 1.0)
+    r_tot_grid = r0 + alpha_k * (r1 - r0)
+    r_zero_grid = -(ldf1 - ldf0) / dt_k
+
+    # Smooth exponential interpolation of escrowed spot across tau_knots matching qmc_aad_greeks.
+    esc0 = torch.gather(escrowed_knots, 1, k_idx)
+    esc1 = torch.gather(escrowed_knots, 1, k_idx + 1)
+    q_div_grid = -torch.log(torch.clamp(esc1 / torch.clamp(esc0, min=1e-12), min=1e-12)) / dt_k
+    escrowed_grid = esc0 * torch.exp(-q_div_grid * torch.clamp(t_eff - tau0, min=0.0))
+    f_grid = torch.clamp(escrowed_grid * torch.exp(r_tot_grid), min=1e-4)
+
+    f_nat_knots = torch.clamp(escrowed_knots * torch.exp(r_tot_knots), min=1e-12)
+    fn0 = torch.gather(f_nat_knots, 1, k_idx)
+    fn1 = torch.gather(f_nat_knots, 1, k_idx + 1)
+    buehler_eff_drift = torch.log(fn1 / fn0) / dt_k
+    q_repo_grid = r_zero_grid - buehler_eff_drift
+    return f_grid, r_zero_grid, q_repo_grid
+
+
 def _build_lv_tables_batch(
     surfs: Sequence[Any],
     spots_t0: torch.Tensor,
@@ -4285,7 +4355,7 @@ def _build_lv_tables_batch(
             device,
             use_triton,
         )
-    lv_cache_key = ("lv_table", lv_digest)
+    lv_cache_key = ("lv_table_v2", lv_digest)
     cached_lv = _LV_TABLE_LRU.get(lv_cache_key)
     if cached_lv is not None:
         return cached_lv  # type: ignore[no-any-return]
@@ -4331,65 +4401,13 @@ def _build_lv_tables_batch(
         return _LV_TABLE_LRU.put(lv_cache_key, out_fb)  # type: ignore[no-any-return]
 
     tau_2d = tau_obs.unsqueeze(0).expand(a_cnt, -1) if tau_obs.ndim == 1 else tau_obs
-    m_len = int(tau_2d.shape[1])
     tau_max = torch.clamp(tau_2d[:, -1], min=1e-4)
     steps = torch.linspace(0.0, 1.0, n_t, dtype=torch.float64, device=device)
     t_eff = torch.clamp(tau_max[:, None] * steps[None, :], min=1e-4)
 
-    zeros_a = torch.zeros((a_cnt, 1), dtype=torch.float64, device=device)
-    ones_a = torch.ones((a_cnt, 1), dtype=torch.float64, device=device)
-    tau_knots = torch.cat([zeros_a, tau_2d], dim=1).contiguous()
-    r_tot_knots = torch.cat([zeros_a, r_tot_obs], dim=1)
-    log_df_knots = torch.log(torch.clamp(torch.cat([ones_a, df_fin_obs], dim=1), min=1e-15))
-
-    max_div = max((len(evs) for evs in div_events_list), default=0)
-    if max_div > 0:
-        ex_taus_np = np.zeros((a_cnt, max_div), dtype=np.float64)
-        ex_pvs_np = np.zeros((a_cnt, max_div), dtype=np.float64)
-        for a_i, evs in enumerate(div_events_list):
-            for j, ev in enumerate(evs):
-                ex_taus_np[a_i, j] = float(getattr(ev, "tau_ex_act365", 0.0))
-                ex_pvs_np[a_i, j] = float(getattr(ev, "amount", 0.0)) * float(
-                    getattr(ev, "pv_discount_weight", 0.0)
-                )
-        ex_taus = torch.tensor(ex_taus_np, dtype=torch.float64, device=device)
-        ex_pvs = torch.tensor(ex_pvs_np, dtype=torch.float64, device=device)
-        mask_ex = (ex_taus[:, None, :] > 0.0) & (ex_taus[:, None, :] <= t_eff[:, :, None] + 1e-12)
-        d_pv_grid = (mask_ex.to(torch.float64) * ex_pvs[:, None, :]).sum(dim=2)
-        mask_ex_k = (ex_taus[:, None, :] > 0.0) & (ex_taus[:, None, :] <= tau_knots[:, :, None] + 1e-12)
-        d_pv_knots = (mask_ex_k.to(torch.float64) * ex_pvs[:, None, :]).sum(dim=2)
-    else:
-        d_pv_grid = torch.zeros((a_cnt, n_t), dtype=torch.float64, device=device)
-        d_pv_knots = torch.zeros((a_cnt, m_len + 1), dtype=torch.float64, device=device)
-
-    floor_sp = 0.01 * spots_t0[:, None]
-    scale_sp = torch.clamp(floor_sp, min=1e-12)
-    escrowed_grid = floor_sp + scale_sp * F.softplus(
-        (spots_t0[:, None] - d_pv_grid - floor_sp) / scale_sp, beta=1.0, threshold=40.0
+    f_grid, r_zero_grid, q_repo_grid = _compute_escrowed_fwd_and_drift_batch(
+        spots_t0, r_tot_obs, df_fin_obs, tau_2d, t_eff, div_events_list
     )
-
-    k_idx = torch.clamp(torch.searchsorted(tau_knots, t_eff, right=True) - 1, 0, m_len - 1)
-    tau0 = torch.gather(tau_knots, 1, k_idx)
-    tau1 = torch.gather(tau_knots, 1, k_idx + 1)
-    r0 = torch.gather(r_tot_knots, 1, k_idx)
-    r1 = torch.gather(r_tot_knots, 1, k_idx + 1)
-    ldf0 = torch.gather(log_df_knots, 1, k_idx)
-    ldf1 = torch.gather(log_df_knots, 1, k_idx + 1)
-
-    dt_k = torch.clamp(tau1 - tau0, min=1e-8)
-    alpha_k = (t_eff - tau0) / dt_k
-    r_tot_grid = r0 + alpha_k * (r1 - r0)
-    r_zero_grid = -(ldf1 - ldf0) / dt_k
-    f_grid = torch.clamp(escrowed_grid * torch.exp(r_tot_grid), min=1e-4)
-    # Buehler effective drift in native currency captures continuous carry minus discrete dividend drops.
-    escrowed_knots = floor_sp + scale_sp * F.softplus(
-        (spots_t0[:, None] - d_pv_knots - floor_sp) / scale_sp, beta=1.0, threshold=40.0
-    )
-    f_nat_knots = torch.clamp(escrowed_knots * torch.exp(r_tot_knots), min=1e-12)
-    fn0 = torch.gather(f_nat_knots, 1, k_idx)
-    fn1 = torch.gather(f_nat_knots, 1, k_idx + 1)
-    buehler_eff_drift = torch.log(fn1 / fn0) / dt_k
-    q_repo_grid = r_zero_grid - buehler_eff_drift
 
     half_w = torch.clamp(5.0 * v_term, min=0.50, max=6.0)
     y_min_64 = -half_w
@@ -4500,55 +4518,17 @@ def _eval_gpu_surface_local_vol_table(
     t_grid_365 = torch.linspace(0.0, tau_max, n_t, dtype=torch.float64, device=device)
     t_eff_365 = torch.clamp(t_grid_365, min=1e-4)
 
-    # Compute exact escrowed forward F(0, t_k) and r_zero(t_k), q_repo(t_k) across t_grid_365
-    tau_knots = torch.cat(
-        [torch.zeros(1, dtype=torch.float64, device=device), torch.as_tensor(tau_obs, dtype=torch.float64, device=device)]
+    f_grid_2d, r_zero_2d, q_repo_2d = _compute_escrowed_fwd_and_drift_batch(
+        torch.tensor([spots_t0_i], dtype=torch.float64, device=device),
+        torch.as_tensor(r_tot_obs_i, dtype=torch.float64, device=device).unsqueeze(0),
+        torch.as_tensor(df_fin_obs_i, dtype=torch.float64, device=device).unsqueeze(0),
+        torch.as_tensor(tau_obs, dtype=torch.float64, device=device).unsqueeze(0),
+        t_eff_365.unsqueeze(0),
+        [div_events_i],
     )
-    r_tot_knots = torch.cat(
-        [torch.zeros(1, dtype=torch.float64, device=device), torch.as_tensor(r_tot_obs_i, dtype=torch.float64, device=device)]
-    )
-    df_fin_knots = torch.cat(
-        [torch.ones(1, dtype=torch.float64, device=device), torch.as_tensor(df_fin_obs_i, dtype=torch.float64, device=device)]
-    )
-    log_df_knots = torch.log(torch.clamp(df_fin_knots, min=1e-15))
-
-    k_idx = torch.clamp(torch.searchsorted(tau_knots, t_eff_365, right=True) - 1, 0, len(tau_obs) - 1)
-    dt_k = torch.clamp(tau_knots[k_idx + 1] - tau_knots[k_idx], min=1e-8)
-    alpha_k = (t_eff_365 - tau_knots[k_idx]) / dt_k
-    r_tot_grid = r_tot_knots[k_idx] + alpha_k * (r_tot_knots[k_idx + 1] - r_tot_knots[k_idx])
-    r_zero_grid = -(log_df_knots[k_idx + 1] - log_df_knots[k_idx]) / dt_k
-
-    if len(div_events_i) > 0:
-        ex_taus = torch.tensor(
-            [float(getattr(ev, "tau_ex_act365", 0.0)) for ev in div_events_i],
-            dtype=torch.float64,
-            device=device,
-        )
-        ex_pvs = torch.tensor(
-            [float(getattr(ev, "amount", 0.0)) * float(getattr(ev, "pv_discount_weight", 0.0)) for ev in div_events_i],
-            dtype=torch.float64,
-            device=device,
-        )
-        mask_ex = (ex_taus[None, :] > 0.0) & (ex_taus[None, :] <= t_eff_365[:, None] + 1e-12)
-        d_pv_grid = (mask_ex.to(torch.float64) * ex_pvs[None, :]).sum(dim=1)
-        mask_ex_k = (ex_taus[None, :] > 0.0) & (ex_taus[None, :] <= tau_knots[:, None] + 1e-12)
-        d_pv_knots = (mask_ex_k.to(torch.float64) * ex_pvs[None, :]).sum(dim=1)
-    else:
-        d_pv_grid = torch.zeros(n_t, dtype=torch.float64, device=device)
-        d_pv_knots = torch.zeros(len(tau_obs) + 1, dtype=torch.float64, device=device)
-
-    floor_sp = 0.01 * spots_t0_i
-    scale_sp = max(floor_sp, 1e-12)
-    escrowed_grid = floor_sp + scale_sp * F.softplus(
-        (spots_t0_i - d_pv_grid - floor_sp) / scale_sp, beta=1.0, threshold=40.0
-    )
-    f_grid = torch.clamp(escrowed_grid * torch.exp(r_tot_grid), min=1e-4)  # (N_t,)
-    escrowed_knots = floor_sp + scale_sp * F.softplus(
-        (spots_t0_i - d_pv_knots - floor_sp) / scale_sp, beta=1.0, threshold=40.0
-    )
-    f_nat_knots = torch.clamp(escrowed_knots * torch.exp(r_tot_knots), min=1e-12)
-    buehler_eff_drift = torch.log(f_nat_knots[k_idx + 1] / f_nat_knots[k_idx]) / dt_k
-    q_repo_grid = r_zero_grid - buehler_eff_drift
+    f_grid = f_grid_2d[0]
+    r_zero_grid = r_zero_2d[0]
+    q_repo_grid = q_repo_2d[0]
 
     half_w = min(max(5.0 * float(v_term_i), 0.50), 6.0)
     y_min_val = -half_w

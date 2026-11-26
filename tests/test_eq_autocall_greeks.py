@@ -1502,6 +1502,278 @@ def test_gpu_warm_cache_cudagraph_all_greeks_regression(
         assert delta_mb <= 250.0, f"Delta reserved VRAM {delta_mb:.1f} MB > 250.0 MB"
 
 
+def test_rolled_in_transit_pv_includes_settling_on_roll_date(
+    multi_period_request: EQAutocallableTradeRequest,
+) -> None:
+    """Theta roll must keep In-Transit coupons settling ON eff_as_of (pay_dt == eff_as_of)."""
+    import json
+    from types import SimpleNamespace
+
+    from deepvol.models.autocall.greeks_engine import _rolled_in_transit_pv
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        QmcAadGreeksConfig,
+        compute_qmc_aad_crn_greeks,
+    )
+
+    as_of_0 = datetime.datetime(2026, 10, 23, tzinfo=datetime.timezone.utc)
+    eff_as_of = datetime.datetime(2026, 10, 26, tzinfo=datetime.timezone.utc)
+    dt_before = datetime.datetime(2026, 10, 25, tzinfo=datetime.timezone.utc)
+    dt_after = datetime.datetime(2026, 10, 28, tzinfo=datetime.timezone.utc)
+
+    class _FlatDiscCurve:
+        def df(self, d: Any) -> float:
+            if d == eff_as_of:
+                return 0.998
+            return 1.0
+
+    # 1. Estimate past_cashflows branch
+    st_cf = SimpleNamespace(
+        pv_in_transit=0.030,
+        seasoned_state=SimpleNamespace(
+            as_of_date=as_of_0,
+            past_cashflows=[
+                SimpleNamespace(StatusText="Estimate", Date=dt_before, Amount=0.005),
+                SimpleNamespace(StatusText="Estimate", Date=eff_as_of, Amount=0.017),
+                SimpleNamespace(StatusText="Estimate", Date=dt_after, Amount=0.008),
+            ],
+            historical_records=[],
+        ),
+    )
+    rolled_cf = float(
+        _rolled_in_transit_pv(
+            st_cf,  # type: ignore[arg-type]
+            _FlatDiscCurve(),
+            eff_as_of,
+            None,
+            torch.device("cpu"),
+        ).item()
+    )
+    assert rolled_cf == pytest.approx((0.017 + 0.008) / 0.998, rel=0.0, abs=1e-12)
+
+    # 2. HistoricalPeriodRecord fallback branch when past_cashflows is empty
+    st_rec = SimpleNamespace(
+        pv_in_transit=0.030,
+        seasoned_state=SimpleNamespace(
+            as_of_date=as_of_0,
+            past_cashflows=[],
+            historical_records=[
+                SimpleNamespace(
+                    status="In-Transit",
+                    payment_date=dt_before,
+                    discount_factor=1.0,
+                    coupon_paid=0.005,
+                    notional_paid=0.0,
+                ),
+                SimpleNamespace(
+                    status="In-Transit",
+                    payment_date=eff_as_of,
+                    discount_factor=0.998,
+                    coupon_paid=0.017 / 0.998,
+                    notional_paid=0.0,
+                ),
+                SimpleNamespace(
+                    status="In-Transit",
+                    payment_date=dt_after,
+                    discount_factor=0.996,
+                    coupon_paid=0.008 / 0.996,
+                    notional_paid=0.0,
+                ),
+            ],
+        ),
+    )
+    rolled_rec = float(
+        _rolled_in_transit_pv(
+            st_rec,  # type: ignore[arg-type]
+            _FlatDiscCurve(),
+            eff_as_of,
+            None,
+            torch.device("cpu"),
+        ).item()
+    )
+    assert rolled_rec == pytest.approx((0.017 + 0.008) / 0.998, rel=0.0, abs=1e-12)
+
+    # 3. Deal 56152892 pays an In-Transit coupon ON 2026-10-26 (~160.5 bps); Theta must stay near +19 bps, not -141 bps.
+    deal_56 = REPO_ROOT / "docs" / "eq_autocall_ps_batch_b10316f2" / "requests" / "trade_013_56152892.json"
+    if deal_56.is_file():
+        req_56 = EQAutocallableTradeRequest.model_validate(json.loads(deal_56.read_text(encoding="utf-8")))
+        st_56 = preprocess_eq_autocall(req_56)
+        cfg_56 = QmcAadGreeksConfig(n_paths=2048, n_replicates=4, n_substeps=4)
+        res_56 = compute_qmc_aad_crn_greeks(
+            st_56, req_56, queries=["ProductValue", "Theta"], config=cfg_56, device="cpu"
+        )
+        assert res_56.theta is not None
+        assert float(res_56.theta) > 0.0, f"Deal 56152892 dropped In-Transit coupon on roll date: theta={res_56.theta}"
+
+
+def test_theta_short_first_period_avoids_analytical_bias_cpu(
+    multi_period_request: EQAutocallableTradeRequest,
+) -> None:
+    """Short first period (<= 4*dt_shift) must bypass analytical Theta and match exact rolled QMC."""
+    import json
+
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        QmcAadGreeksConfig,
+        compute_qmc_aad_crn_greeks,
+    )
+
+    deal_65 = REPO_ROOT / "docs" / "eq_autocall_ps_batch_b10316f2" / "requests" / "trade_105_65028910.json"
+    if deal_65.is_file():
+        req_65 = EQAutocallableTradeRequest.model_validate(json.loads(deal_65.read_text(encoding="utf-8")))
+        st_65 = preprocess_eq_autocall(req_65)
+        cfg_65 = QmcAadGreeksConfig(n_paths=4096, n_replicates=4, n_substeps=4)
+        res_th = compute_qmc_aad_crn_greeks(
+            st_65, req_65, queries=["ProductValue", "Theta"], config=cfg_65, device="cpu"
+        )
+        assert res_th.theta is not None and np.isfinite(float(res_th.theta))
+        # Exact nonlinear rolled Theta on 65028910 is ~+28..+32 bps (vs ~+40 bps biased linear tangent).
+        assert float(res_th.theta) * 1e4 < 36.0, f"Short-period analytical Theta leak: {float(res_th.theta) * 1e4:.2f} bps"
+    else:
+        req_s = copy.deepcopy(multi_period_request)
+        as_of_s = req_s.Model.MarketDataSet.AsOfDate
+        fut_idx = next(i for i, d in enumerate(req_s.Product.ObservationDates) if d > as_of_s)
+        req_s.Product.ObservationDates[fut_idx] = as_of_s + datetime.timedelta(days=7)
+        req_s.Product.PaymentDates[fut_idx] = as_of_s + datetime.timedelta(days=9)
+        st_s = preprocess_eq_autocall(req_s)
+        cfg_s = QmcAadGreeksConfig(n_paths=2048, n_replicates=4, n_substeps=4)
+        res_s = compute_qmc_aad_crn_greeks(
+            st_s, req_s, queries=["ProductValue", "Theta"], config=cfg_s, device="cpu"
+        )
+        assert res_s.theta is not None and np.isfinite(float(res_s.theta))
+
+
+@pytest.mark.gpu
+def test_gpu_pv_theta_cudagraph_guard_and_lv_table_parity() -> None:
+    """Verifies ProductValue+Theta CUDAGraph safety (no bar_chol/z_indep crash) and GPU_TBL==QAG parity."""
+    import json
+
+    from deepvol.api.eq_autocall_runtime import EQAutocallRuntime
+    from deepvol.models.autocall.dupire_qmc_gpu import (
+        DupireQMCConfig,
+        GpuTritonDupireQMC,
+        _build_lv_tables_batch,
+        _eval_gpu_surface_local_vol_table,
+    )
+    from deepvol.models.autocall.dupire_qmc_solver import _resolve_r_native_obs_tensor
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        QmcAadGreeksConfig,
+        _build_lv_table_and_forward_cache,
+        compute_qmc_aad_crn_greeks,
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU required for CUDAGraph Theta guard and GPU_TBL parity test")
+
+    docs_req = REPO_ROOT / "docs" / "eq_autocall_ps_batch_b10316f2" / "requests"
+    deal_65 = docs_req / "trade_105_65028910.json"
+    deal_53 = docs_req / "trade_081_53391858.json"
+    if not (deal_65.is_file() and deal_53.is_file()):
+        pytest.skip("106-deal canonical requests not present")
+
+    dev = torch.device("cuda")
+    runtime = EQAutocallRuntime(device="cuda")
+    for path in (deal_65, deal_53):
+        raw_d = json.loads(path.read_text(encoding="utf-8"))
+        req_th = copy.deepcopy(raw_d)
+        req_th["Queries"] = ["ProductValue", "Theta"]
+        # 3 calls exercise eager + CUDAGraph capture + CUDAGraph replay without bar_chol/z_indep crash.
+        r1 = runtime.price_trade(req_th, engine="auto", include_all_greeks=False)
+        r2 = runtime.price_trade(req_th, engine="auto", include_all_greeks=False)
+        r3 = runtime.price_trade(req_th, engine="auto", include_all_greeks=False)
+        assert r1.Theta is not None and np.isfinite(float(r1.Theta))
+        assert abs(float(r2.Theta) - float(r1.Theta)) <= 1e-8  # type: ignore[arg-type]
+        assert abs(float(r3.Theta) - float(r1.Theta)) <= 1e-8  # type: ignore[arg-type]
+
+        # Subsequent Cega query on the same bucket must NOT collide with ProductValue+Theta CUDAGraph.
+        req_cega = copy.deepcopy(raw_d)
+        req_cega["Queries"] = ["ProductValue", "Cega"]
+        rc = runtime.price_trade(req_cega, engine="auto", include_all_greeks=False)
+        assert isinstance(rc.Cega, dict)
+        cega_vals = [
+            abs(float(v))
+            for row in rc.Cega.values()
+            if isinstance(row, dict)
+            for v in row.values()
+        ]
+        assert max(cega_vals) > 0.0, "Cega collided with ProductValue+Theta CUDAGraph"
+
+    # High-dividend deal 53391858: GPU_TBL (_build_lv_tables_batch & fallback) must match QAG LV tables & PV.
+    req_53 = EQAutocallableTradeRequest.model_validate(json.loads(deal_53.read_text(encoding="utf-8")))
+    st_53 = preprocess_eq_autocall(req_53)
+    tau_np = st_53.tau_obs.detach().cpu().numpy()
+    r_nat_t = _resolve_r_native_obs_tensor(st_53)
+    r_nat_np = r_nat_t.detach().cpu().numpy()
+    df_fin_t = st_53.dividend_schedule.df_fin_obs.to(device=dev, dtype=torch.float64)
+    df_fin_np = df_fin_t.detach().cpu().numpy()
+    spots_np = st_53.spots_t0.detach().cpu().numpy()
+    div_pv_np = st_53.dividend_schedule.div_pv.detach().cpu().numpy()
+    surfs = [st_53.vol_surfaces[tk] for tk in st_53.sorted_identifiers]
+    div_lists = [st_53.dividend_schedule.dividend_events.get(tk, []) for tk in st_53.sorted_identifiers]
+
+    nt, ny = 32, 64
+    t_max = max(float(tau_np[-1]), 1e-4)
+    lv_t_grid = np.linspace(1e-5, t_max, nt, dtype=np.float64)
+    lv_batched, _, _ = _build_lv_tables_batch(
+        surfs,
+        st_53.spots_t0.to(device=dev, dtype=torch.float64),
+        r_nat_t.to(device=dev, dtype=torch.float64),
+        df_fin_t,
+        st_53.tau_obs.to(device=dev, dtype=torch.float64),
+        div_lists,
+        st_53.v_perf[:, -1].to(device=dev, dtype=torch.float64),
+        nt,
+        ny,
+        dev,
+        use_triton=True,
+    )
+    lv_batched_np = lv_batched.detach().cpu().numpy()
+    for i, surf in enumerate(surfs):
+        half_w = min(max(5.0 * float(st_53.v_perf[i, -1].item()), 0.50), 6.0)
+        y_grid = np.linspace(-half_w, half_w, ny, dtype=np.float64)
+        qag_lv = _build_lv_table_and_forward_cache(
+            surf,
+            float(spots_np[i]),
+            tau_np,
+            r_nat_np[i],
+            lv_t_grid,
+            y_grid,
+            div_pv_np[i],
+            need_vega_jac=False,
+        )["lv_out"].astype(np.float32)
+        lv_fb_i, _, _ = _eval_gpu_surface_local_vol_table(
+            surf,
+            float(spots_np[i]),
+            r_nat_np[i],
+            df_fin_np[i],
+            tau_np,
+            div_lists[i],
+            float(st_53.v_perf[i, -1].item()),
+            nt,
+            ny,
+            dev,
+        )
+        max_diff_tr = float(np.max(np.abs(lv_batched_np[i] - qag_lv)))
+        max_diff_fb = float(np.max(np.abs(lv_fb_i.detach().cpu().numpy() - qag_lv)))
+        assert max_diff_tr < 2e-4, f"Asset {i} GPU_TBL Triton vs QAG LV diff {max_diff_tr:.6f}"
+        assert max_diff_fb < 2e-4, f"Asset {i} GPU_TBL PyTorch vs QAG LV diff {max_diff_fb:.6f}"
+
+    # Full PV parity between GpuTritonDupireQMC, CPU reference DupireQMC, and QAG on 53391858 at 65k paths.
+    from deepvol.models.autocall.dupire_qmc_solver import price_eq_autocall_dupire_qmc
+
+    cfg_pv_gpu = DupireQMCConfig(n_paths=65536, n_replicates=16, n_substeps=4, mode="dupire_lv", cv_mode="none")
+    cfg_pv_qag = QmcAadGreeksConfig(n_paths=65536, n_replicates=16, n_substeps=4, cv_mode="none")
+    res_gpu_tbl = GpuTritonDupireQMC(device="cuda").simulate_and_price(st_53, cfg_pv_gpu)
+    res_cpu_ref = price_eq_autocall_dupire_qmc(st_53, config=cfg_pv_gpu)
+    res_qag = compute_qmc_aad_crn_greeks(st_53, req_53, queries=["ProductValue"], config=cfg_pv_qag, device="cuda")
+    assert abs(float(res_gpu_tbl.product_value) - float(res_cpu_ref.product_value)) * 1e4 < 5.0, (
+        f"53391858 GPU_TBL vs CPU_REF PV drift {(float(res_gpu_tbl.product_value) - float(res_cpu_ref.product_value)) * 1e4:.2f} bps"
+    )
+    se_comb = float(np.hypot(res_gpu_tbl.standard_error, res_qag.standard_error))
+    assert abs(float(res_gpu_tbl.product_value) - float(res_qag.product_value)) <= max(0.0010, 2.5 * se_comb), (
+        f"53391858 GPU_TBL vs QAG PV drift {(float(res_gpu_tbl.product_value) - float(res_qag.product_value)) * 1e4:.2f} bps"
+    )
+
+
+
 
 
 

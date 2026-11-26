@@ -2078,7 +2078,7 @@ def _rolled_in_transit_pv(
     if estimate_cfs:
         for cf in estimate_cfs:
             pay_dt = cf.Date
-            if eff_as_of != as_of_orig and pay_dt <= eff_as_of:
+            if eff_as_of != as_of_orig and pay_dt < eff_as_of:
                 continue
             amt = float(cf.Amount) / disc_anchor
             if curve_pillar_deltas is not None and abs(amt) > 0.0:
@@ -2098,7 +2098,7 @@ def _rolled_in_transit_pv(
     # Fallback when past_cashflows was omitted: use HistoricalPeriodRecord rows.
     for rec in base_state.seasoned_state.historical_records:
         if rec.status == "In-Transit" and (rec.coupon_paid != 0.0 or rec.notional_paid != 0.0):
-            if eff_as_of != as_of_orig and rec.payment_date <= eff_as_of:
+            if eff_as_of != as_of_orig and rec.payment_date < eff_as_of:
                 continue
             amt = float(rec.discount_factor * (rec.coupon_paid + rec.notional_paid)) / disc_anchor
             if curve_pillar_deltas is not None:
