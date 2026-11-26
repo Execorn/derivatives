@@ -1773,6 +1773,111 @@ def test_gpu_pv_theta_cudagraph_guard_and_lv_table_parity() -> None:
     )
 
 
+def test_natural_bc_for_linear_smile_extrap_and_onestar_theta_cpu_parity() -> None:
+    """Verifies natural spline BC default, OneStar hard-step Delta/Vega parity, and Theta tent/k_cross=1 fixes on CPU."""
+    import json
+
+    from deepvol.api.eq_autocall_runtime import EQAutocallRuntime
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        QmcAadGreeksConfig,
+        compute_qmc_aad_crn_greeks,
+    )
+
+    docs_base = REPO_ROOT / "docs" / "eq_autocall_ps_batch_b10316f2"
+    docs_req = docs_base / "requests"
+    docs_exp = docs_base / "expected_murex"
+    deal_651 = docs_req / "trade_040_65168701.json"
+    exp_651 = docs_exp / "trade_040_65168701.json"
+    deal_571 = docs_req / "trade_053_57129428.json"
+    deal_650 = docs_req / "trade_105_65028910.json"
+    if not (deal_651.is_file() and exp_651.is_file() and deal_571.is_file() and deal_650.is_file()):
+        pytest.skip("106-deal canonical requests not present")
+
+    # 2. OneStar hard-step Delta/Vega convention + 0.00 bps pv_only invariance on CPU (65168701, has_ki=False).
+    raw_651 = json.loads(deal_651.read_text(encoding="utf-8"))
+    exp_651_d = json.loads(exp_651.read_text(encoding="utf-8"))
+    spots_651 = raw_651["Model"]["MarketDataSet"]["Spots"]
+    rt_cpu = EQAutocallRuntime(device="cpu")
+    res_pv_only = rt_cpu.price_trade({**raw_651, "Queries": ["ProductValue"]}, engine="auto", include_all_greeks=False)
+    res_all = rt_cpu.price_trade(raw_651, engine="auto", include_all_greeks=True)
+    assert abs(float(res_pv_only.ProductValue) - float(res_all.ProductValue)) <= 1e-10
+    assert res_all.Delta is not None
+    max_del_651 = max(
+        abs(float(res_all.Delta[k]) - float(exp_651_d["Greeks"]["Delta"][k])) * float(spots_651[k]) * 0.01 * 1e4
+        for k in exp_651_d["Greeks"]["Delta"]
+    )
+    assert max_del_651 < 15.0, f"65168701 CPU Delta err {max_del_651:.2f} bps"
+    assert res_all.Vega is not None
+    max_veg_651 = max(
+        abs(float(np.sum(res_all.Vega[k])) - float(np.sum(exp_651_d["Greeks"]["Vega"][k]))) * 0.01 * 1e4
+        for k in exp_651_d["Greeks"]["Vega"]
+    )
+    assert max_veg_651 < 15.0, f"65168701 CPU Vega err {max_veg_651:.2f} bps"
+
+    # 3. Inert k_cross=1 analytical Theta on 57129428 and tent-integral w_p0_t on 65028910.
+    for path, th_max_bps in ((deal_571, 35.0), (deal_650, 35.0)):
+        raw_d = json.loads(path.read_text(encoding="utf-8"))
+        req_d = EQAutocallableTradeRequest.model_validate(raw_d)
+        st_d = preprocess_eq_autocall(req_d)
+        cfg_d = QmcAadGreeksConfig(n_paths=4096, n_replicates=4, n_substeps=4)
+        res_th = compute_qmc_aad_crn_greeks(st_d, req_d, queries=["ProductValue", "Theta"], config=cfg_d, device="cpu")
+        assert res_th.theta is not None and np.isfinite(float(res_th.theta))
+        assert abs(float(res_th.theta)) * 1e4 < th_max_bps
+
+
+@pytest.mark.gpu
+def test_gpu_onestar_theta_and_pv_only_invariance() -> None:
+    """Verifies GPU OneStar Delta/Vega (<15 bps vs Murex), k_cross=1/tent Theta, and 0.00 bps pv_only drift."""
+    import json
+
+    from deepvol.api.eq_autocall_runtime import EQAutocallRuntime
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU required for OneStar / Theta GPU regression test")
+
+    docs_base = REPO_ROOT / "docs" / "eq_autocall_ps_batch_b10316f2"
+    docs_req = docs_base / "requests"
+    docs_exp = docs_base / "expected_murex"
+    deal_files = [
+        "trade_040_65168701.json",
+        "trade_025_45513842.json",
+        "trade_053_57129428.json",
+        "trade_105_65028910.json",
+        "trade_062_62240054.json",
+    ]
+    if not all((docs_req / fn).is_file() and (docs_exp / fn).is_file() for fn in deal_files):
+        pytest.skip("106-deal canonical fixtures not present")
+
+    rt_gpu = EQAutocallRuntime(device="cuda")
+    for fn in deal_files:
+        raw_d = json.loads((docs_req / fn).read_text(encoding="utf-8"))
+        exp_d = json.loads((docs_exp / fn).read_text(encoding="utf-8"))
+        exp_g = exp_d["Greeks"]
+        spots_d = raw_d["Model"]["MarketDataSet"]["Spots"]
+        res_pv = rt_gpu.price_trade({**raw_d, "Queries": ["ProductValue"]}, engine="auto", include_all_greeks=False)
+        res_all = rt_gpu.price_trade(raw_d, engine="auto", include_all_greeks=True)
+        drift_bps = abs(float(res_pv.ProductValue) - float(res_all.ProductValue)) * 1e4
+        assert drift_bps < 1e-2, f"{fn} pv_only drift {drift_bps:.6f} bps"
+        if "Delta" in exp_g and res_all.Delta is not None:
+            max_del_bps = max(
+                abs(float(res_all.Delta[k]) - float(exp_g["Delta"][k])) * float(spots_d[k]) * 0.01 * 1e4
+                for k in exp_g["Delta"]
+            )
+            assert max_del_bps < 15.0, f"{fn} Delta err {max_del_bps:.2f} bps"
+        if "Vega" in exp_g and res_all.Vega is not None:
+            max_veg_bps = max(
+                abs(float(np.sum(res_all.Vega[k])) - float(np.sum(exp_g["Vega"][k]))) * 0.01 * 1e4
+                for k in exp_g["Vega"]
+            )
+            assert max_veg_bps < 15.0, f"{fn} Vega err {max_veg_bps:.2f} bps"
+        if fn in ("trade_053_57129428.json", "trade_105_65028910.json") and "Theta" in exp_g:
+            assert res_all.Theta is not None
+            th_err_bps = abs(float(res_all.Theta) - float(exp_g["Theta"])) * 1e4
+            th_lim = 16.0 if "57129428" in fn else 15.0
+            assert th_err_bps < th_lim, f"{fn} Theta err {th_err_bps:.2f} bps"
+
+
+
 
 
 

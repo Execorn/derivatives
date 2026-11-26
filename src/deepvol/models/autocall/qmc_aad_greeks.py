@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import ctypes
 import datetime as dt
 import hashlib
@@ -3999,7 +4000,36 @@ if _HAS_TRITON:
                 if USE_RT_FLAGS:
                     last_avg = last_wa_rt
                     last_wo = tl.where(f_is_long, last_m1_rt, tl.where(eff_opt_rt == 0, last_m1_rt, tl.where(eff_opt_rt == 1, last_x1_rt, last_wa_rt)))
-                    last_wb = tl.where(f_has_os, last_x1_rt, zero_vec)
+                    os_freeze_rt = (has_a | has_b) & (~(f_has_ki & (ko_spread < -1e-6)))
+                    if f_has_os:
+                        m_off_last_rt = (m_act - 1) * d_assets
+                        last_wb_base = tl.where(
+                            os_freeze_rt,
+                            _eval_index_tile_helper(
+                                perf_base_ptr,
+                                m_off_last_rt,
+                                zero_vec,
+                                zero_vec,
+                                -1,
+                                -1,
+                                tl.full((), False, tl.int1),
+                                tl.full((), False, tl.int1),
+                                scale_row_ptr,
+                                has_sc,
+                                ia,
+                                ib,
+                                offs_n,
+                                mask_n,
+                                d_act,
+                                n_total,
+                                1,
+                                EVAL_DTYPE,
+                            ),
+                            last_x1_rt,
+                        )
+                    else:
+                        last_wb_base = zero_vec
+                    last_wb = tl.where(f_has_os, last_wb_base, zero_vec)
                 else:
                     if need_tail_opt or need_tail_best:
                         m_off_last = m_last * d_assets
@@ -4047,14 +4077,37 @@ if _HAS_TRITON:
                             )
                     if not HAS_ONE_STAR:
                         last_wb = zero_vec
-                    elif (not IS_LONG) and (OPT_CODE == 1):
-                        last_wb = last_wo
-                    elif CALL_CODE == 1:
-                        last_wb = last_wc
                     else:
-                        last_wb = _eval_index_tile_helper(
-                            p_src_ptr, m_off_last, pa_last, pb_last, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, 1, EVAL_DTYPE
-                        )
+                        os_freeze_st = (has_a | has_b) & (~(HAS_KI & (ko_spread < -1e-6)))
+                        if os_freeze_st:
+                            last_wb = _eval_index_tile_helper(
+                                perf_base_ptr,
+                                m_last * d_assets,
+                                zero_vec,
+                                zero_vec,
+                                -1,
+                                -1,
+                                tl.full((), False, tl.int1),
+                                tl.full((), False, tl.int1),
+                                scale_row_ptr,
+                                has_sc,
+                                ia,
+                                ib,
+                                offs_n,
+                                mask_n,
+                                d_assets,
+                                n_total,
+                                1,
+                                EVAL_DTYPE,
+                            )
+                        elif (not IS_LONG) and (OPT_CODE == 1):
+                            last_wb = last_wo
+                        elif CALL_CODE == 1:
+                            last_wb = last_wc
+                        else:
+                            last_wb = _eval_index_tile_helper(
+                                p_src_ptr, m_off_last, pa_last, pb_last, aa, bb, has_a, has_b, scale_row_ptr, has_sc, ia, ib, offs_n, mask_n, d_assets, n_total, 1, EVAL_DTYPE
+                            )
 
                 if HAS_EXT_KI and (i_ki_ext_ptr is not None):
                     ki_gate = tl.load(i_ki_ext_ptr + offs_n, mask=mask_n, other=i_ki_past).to(EVAL_DTYPE)
@@ -4706,13 +4759,15 @@ if _HAS_TRITON:
             inv_wos = 1.0 / tl.maximum(one_star_eps, tiny_i)
             u_os = (last_wb - (one_star_strike - 0.5 * one_star_eps)) * inv_wos
             star_ind = tl.where(f_has_os, tl.where(os_soft, tl.minimum(tl.maximum(u_os, zero_vec), one_vec), tl.where(last_wb >= one_star_strike, one_vec, zero_vec)), zero_vec)
-            d_star = tl.where(f_has_os & os_soft & (u_os > 0.0) & (u_os < 1.0), inv_wos, zero_vec)
+            os_smooth_grad = f_has_ki & (ko_spread < -1e-6)
+            d_star = tl.where(f_has_os & os_smooth_grad & os_soft & (u_os > 0.0) & (u_os < 1.0), inv_wos, zero_vec)
         elif HAS_ONE_STAR:
             os_soft = one_star_eps > 1e-6
             inv_wos = 1.0 / tl.maximum(one_star_eps, tiny_i)
             u_os = (last_wb - (one_star_strike - 0.5 * one_star_eps)) * inv_wos
             star_ind = tl.where(os_soft, tl.minimum(tl.maximum(u_os, zero_vec), one_vec), tl.where(last_wb >= one_star_strike, one_vec, zero_vec))
-            d_star = tl.where(os_soft & (u_os > 0.0) & (u_os < 1.0), inv_wos, zero_vec)
+            os_smooth_grad = HAS_KI & (ko_spread < -1e-6)
+            d_star = tl.where(os_smooth_grad & os_soft & (u_os > 0.0) & (u_os < 1.0), inv_wos, zero_vec)
         else:
             star_ind = zero_vec
             d_star = zero_vec
@@ -5579,6 +5634,7 @@ if _HAS_TRITON:
         tiny_i = tl.zeros((), dtype=tl.float32) + 1e-12
         inv_d_f = 1.0 / tl.maximum(tl.zeros((), dtype=tl.float32) + d_act, 1.0)
 
+        ko_spread = tl.load(scalar_f32_ptr + 0)
         ki_spread = tl.load(scalar_f32_ptr + 2)
         one_star_strike = tl.load(scalar_f32_ptr + 3)
         one_star_eps = tl.load(scalar_f32_ptr + 4)
@@ -5685,13 +5741,15 @@ if _HAS_TRITON:
             inv_wos = 1.0 / tl.maximum(one_star_eps, tiny_i)
             u_os = (last_wb - (one_star_strike - 0.5 * one_star_eps)) * inv_wos
             star_ind = tl.where(f_has_os, tl.where(os_soft, tl.minimum(tl.maximum(u_os, zero_vec), one_vec), tl.where(last_wb >= one_star_strike, one_vec, zero_vec)), zero_vec)
-            d_star = tl.where(f_has_os & os_soft & (u_os > 0.0) & (u_os < 1.0), inv_wos, zero_vec)
+            os_smooth_grad = f_has_ki & (ko_spread < -1e-6)
+            d_star = tl.where(f_has_os & os_smooth_grad & os_soft & (u_os > 0.0) & (u_os < 1.0), inv_wos, zero_vec)
         elif HAS_ONE_STAR:
             os_soft = one_star_eps > 1e-6
             inv_wos = 1.0 / tl.maximum(one_star_eps, tiny_i)
             u_os = (last_wb - (one_star_strike - 0.5 * one_star_eps)) * inv_wos
             star_ind = tl.where(os_soft, tl.minimum(tl.maximum(u_os, zero_vec), one_vec), tl.where(last_wb >= one_star_strike, one_vec, zero_vec))
-            d_star = tl.where(os_soft & (u_os > 0.0) & (u_os < 1.0), inv_wos, zero_vec)
+            os_smooth_grad = HAS_KI & (ko_spread < -1e-6)
+            d_star = tl.where(os_smooth_grad & os_soft & (u_os > 0.0) & (u_os < 1.0), inv_wos, zero_vec)
         else:
             star_ind = zero_vec
             d_star = zero_vec
@@ -6990,6 +7048,8 @@ def _compute_payoff_aad_state_adjoints_torch(
         else:
             half_os = 0.5 * one_star_eps
             star_ind = ((w_best[m_rem - 1] - (k_os - half_os)) / one_star_eps).clamp(0.0, 1.0)
+            if not (has_ki and ko_spread < -1e-6):
+                star_ind = star_ind.detach()
     else:
         star_ind = torch.zeros(n_tot, dtype=torch.float64, device=dev)
 
@@ -7845,7 +7905,7 @@ if _HAS_NUMBA:
                             d_st = 0.0
                         else:
                             star_i = uos
-                            d_st = 1.0 / one_star_eps
+                            d_st = (1.0 / one_star_eps) if (has_ki and ko_spread < -1e-6) else 0.0
                 else:
                     star_i = 0.0
                     d_st = 0.0
@@ -8575,7 +8635,7 @@ def _compute_payoff_aad_state_adjoints_cpu_np(
             half_os = 0.5 * one_star_eps
             u_os = (w_best_last - (k_os - half_os)) / one_star_eps
             star_ind = np.clip(u_os, 0.0, 1.0)
-            d_star = np.where((u_os > 0.0) & (u_os < 1.0), 1.0 / one_star_eps, 0.0)
+            d_star = np.where((has_ki and ko_spread < -1e-6) & (u_os > 0.0) & (u_os < 1.0), 1.0 / one_star_eps, 0.0)
     else:
         idx_best_last = None
         star_ind = np.zeros(n_tot, dtype=np.float64)
@@ -9907,10 +9967,17 @@ if _HAS_NUMBA:
                                 kig = 1.0
 
                             if has_os:
+                                _wb_os = w_max
+                                if has_base and (not is_full_alt) and (int(aa_c[b_i]) >= 0 or int(ab_c[b_i]) >= 0) and (not (has_ki and ko_spread < -1e-6)):
+                                    _wmx_b = -1e300
+                                    for _d_os in range(d_assets):
+                                        if b_arr[_d_os] > _wmx_b:
+                                            _wmx_b = b_arr[_d_os]
+                                    _wb_os = _wmx_b
                                 if one_star_eps <= 1e-6:
-                                    sind = 1.0 if w_max >= k_os else 0.0
+                                    sind = 1.0 if _wb_os >= k_os else 0.0
                                 else:
-                                    uos = (w_max - (k_os - 0.5 * one_star_eps)) / one_star_eps
+                                    uos = (_wb_os - (k_os - 0.5 * one_star_eps)) / one_star_eps
                                     sind = 0.0 if uos <= 0.0 else (1.0 if uos >= 1.0 else uos)
                             else:
                                 sind = 0.0
@@ -10452,6 +10519,22 @@ def _map_t_eff_to_surf_np(
     t_surf = np.maximum(np.where(past_last, t_tail, t_in), 1e-6)
     dt_ratio = np.maximum(np.where(past_last, slope_tail, slope_seg), 1e-12)
     return t_surf, dt_ratio
+
+
+def _shift_surf_tenors_for_theta(surf_obj: Any, dt_shift_val: float) -> Any:
+    """Returns a shallow-copied surface with tenors shifted forward by `-dt_shift_val` for sticky-date Theta."""
+    if dt_shift_val > 0.0 and hasattr(surf_obj, "tenors"):
+        t_orig = np.asarray(surf_obj.tenors, dtype=np.float64)
+        if t_orig.size > 0 and float(t_orig[0]) > dt_shift_val + 1e-6:
+            surf_c = copy.copy(surf_obj)
+            surf_c.tenors = np.maximum(t_orig - dt_shift_val, 1e-6)
+            if hasattr(surf_obj, "tenors_act365"):
+                surf_c.tenors_act365 = np.maximum(
+                    np.asarray(surf_obj.tenors_act365, dtype=np.float64) - dt_shift_val,
+                    1e-6,
+                )
+            return surf_c
+    return surf_obj
 
 
 def _eval_basis_matrices_for_slice(
@@ -11959,7 +12042,7 @@ if _HAS_NUMBA:
                             else:
                                 uos_s = (mx_p - (k_os - 0.5 * one_star_eps)) / one_star_eps
                                 st_s = 0.0 if uos_s < 0.0 else (1.0 if uos_s > 1.0 else uos_s)
-                                d_st_s = (1.0 / one_star_eps) if (0.0 < uos_s < 1.0) else 0.0
+                                d_st_s = (1.0 / one_star_eps) if ((has_ki and ko_spread < -1e-6) and 0.0 < uos_s < 1.0) else 0.0
                         else:
                             st_s = 0.0
                             d_st_s = 0.0
@@ -13860,6 +13943,7 @@ def compute_qmc_aad_crn_greeks(
             and (not is_long_flag or cpp_sde_v2_fn is not None)
             and (not has_lower_strike_flag or k_low >= 0.0)
             and (not has_part_call_flag or k_call > 0.0)
+            and not (k_os > 0.0 and not (has_ki and ko_spread < -1e-6) and (np.any(aa_c >= 0) or np.any(ab_c >= 0)))
         ):
             desc = _CrnLooL2oBatchArgsC()
             desc.n_bumps = n_b
@@ -14124,10 +14208,13 @@ def compute_qmc_aad_crn_greeks(
                 kig = 1.0
             sind: torch.Tensor | float
             if wb is not None:
+                _wb_eff = wb
+                if pb_c is not None and (int(aa_c[b_i]) >= 0 or int(ab_c[b_i]) >= 0) and (not (has_ki and ko_spread < -1e-6)):
+                    _wb_eff = _eval_index_batch_torch(torch.from_numpy(pb_c[m_rem - 1 : m_rem]), 1, inv_perm)[0]
                 if one_star_eps <= 1e-6:
-                    sind = (wb >= k_os).to(torch.float64)
+                    sind = (_wb_eff >= k_os).to(torch.float64)
                 else:
-                    sind = ((wb - (k_os - 0.5 * one_star_eps)) / one_star_eps).clamp(0.0, 1.0)
+                    sind = ((_wb_eff - (k_os - 0.5 * one_star_eps)) / one_star_eps).clamp(0.0, 1.0)
             else:
                 sind = 0.0
             opay = torch.zeros(n_total, dtype=torch.float64)
@@ -14358,8 +14445,9 @@ def compute_qmc_aad_crn_greeks(
                     if iv_th_c is not None:
                         sig_eq_q_i = cast(npt.NDArray[np.float64], iv_th_c)
                     else:
+                        _surf_q_th = _shift_surf_tenors_for_theta(state.vol_surfaces[ticker], dt_shift) if as_of_rolled is not None else state.vol_surfaces[ticker]
                         sig_eq_q_i = np.asarray(
-                            state.vol_surfaces[ticker].iv_batch(tau_obs_th_np, np.full(m_rem_th, spot_roll_i)),
+                            _surf_q_th.iv_batch(tau_obs_th_np, np.full(m_rem_th, spot_roll_i)),
                             dtype=np.float64,
                         )
                         _CRN_VEGA_JAC_CACHE.put(iv_th_key, sig_eq_q_i)
@@ -14393,9 +14481,10 @@ def compute_qmc_aad_crn_greeks(
                 r_nat_th_np[i] = np.log(np.maximum(df_repo_th_i / np.maximum(df_fin_th_i, 1e-15), 1e-15))
                 r_tot_th_np[i] = r_nat_th_np[i] + q_carry_th_i
 
+                surf_th_i = _shift_surf_tenors_for_theta(state.vol_surfaces[ticker], dt_shift) if as_of_rolled is not None else state.vol_surfaces[ticker]
                 grid_dig_th_i = _content_digest(grid_th_t_dig, lv_y_grids[i])
                 lv_th_tables[i] = _build_lv_table_and_forward_cache(
-                    state.vol_surfaces[ticker],
+                    surf_th_i,
                     spot_roll_i,
                     tau_obs_th_np,
                     r_nat_th_np[i],
@@ -14403,7 +14492,7 @@ def compute_qmc_aad_crn_greeks(
                     lv_y_grids[i],
                     dpv_th_i,
                     grid_dig=grid_dig_th_i,
-                    surf_dig=surf_dig_map.get(ticker),
+                    surf_dig=surf_dig_map.get(ticker) if surf_th_i is state.vol_surfaces[ticker] else None,
                     rn_div_dig=_content_digest(r_nat_th_np[i], dpv_th_i),
                     need_vega_jac=False,
                 )["lv_out"]
@@ -16596,14 +16685,25 @@ def compute_qmc_aad_crn_greeks(
                 n_tiles_sde = (n_rep + block_n_sde - 1) // block_n_sde
                 nw_sde = 8
 
+            _dt_sh_p = float(th_prep.get("dt_shift", 1.0 / 365.0)) if th_prep is not None else 1.0 / 365.0
+            _kx_p = int(th_prep["k_cross"]) if th_prep is not None else 0
+            _k1_inert_p = bool(
+                th_prep is not None
+                and _kx_p == 1
+                and m_rem >= 2
+                and not th_prep["eff_autocalled"]
+                and abs(float(th_prep["crossed_pv"])) < 1e-12
+                and float(tau_obs_np[1]) > 2.0 * _dt_sh_p
+                and float(np.min(fwd_perf_np[:, 0])) < float(ko_arr_np[0] + min(ko_spread, 0.0)) - 0.03
+            )
             use_analytical_theta_plan = bool(
                 want_theta
                 and th_prep is not None
                 and not th_prep["eff_autocalled"]
-                and int(th_prep["k_cross"]) == 0
-                and float(tau_obs_np[0]) > 4.0 * float(th_prep.get("dt_shift", 1.0 / 365.0))
+                and ((_kx_p == 0 and float(tau_obs_np[0]) > 2.0 * _dt_sh_p) or _k1_inert_p)
                 and not bool(th_prep.get("has_ex_div_in_roll", False))
                 and not is_cont_ki_active
+                and not (k_os > 0.0 and not (has_ki and ko_spread < -1e-6))
                 and want_rate_aad_smooth
                 and use_triton_aad_s2
             )
@@ -19949,10 +20049,11 @@ def compute_qmc_aad_crn_greeks(
                     xc = x_cv - float(np.mean(x_cv))
                     yc = y_cv - float(np.mean(y_cv))
                     cov_xy_cv = float(np.sum(xc * yc) / float(eff_r - 1))
-                    # On eff_r >= 8 (e.g. 53391858 GPU), disable unit CV when variance actually increases (cov < 0.5 * var_x);
-                    # on smaller eff_r=4 runs (noisy df=3 covariance), only zero when strictly anti-correlated.
-                    if cov_xy_cv < 0.0 or (eff_r >= 8 and cov_xy_cv < 0.5 * var_x_cv):
+                    # Continuous CV shrinkage for eff_r >= 8 (only zero when strictly anti-correlated).
+                    if cov_xy_cv < 0.0:
                         beta_cv = 0.0
+                    elif eff_r >= 8:
+                        beta_cv = min(1.0, cov_xy_cv / var_x_cv)
             s1_mean[:n_cv_cols] = s1_mean[:n_cv_cols] + beta_cv * (s1_cheap_mean - s1_crn_mean)
             if se_mu_mf_cached is not None and math.isfinite(se_mu_mf_cached):
                 var_cheap = (beta_cv * beta_cv) * (se_mu_mf_cached * se_mu_mf_cached)
@@ -20283,15 +20384,24 @@ def compute_qmc_aad_crn_greeks(
                 pv_fxc_pm = _get_pv(tok_fxc)
                 fx_cega_dict[ticker] = {fx_id: float((pv_fxc_pm[0] - pv_fxc_pm[1]) / (2.0 * h_fxc))}
 
-    # Step 7: Same-engine rolled Dupire QMC CRN Theta (analytical single-pass when k_cross == 0 & smooth).
+    # Step 7: Same-engine rolled Dupire QMC CRN Theta (analytical single-pass when k_cross in {0, 1 inert} & smooth).
     if want_theta and th_prep is not None:
         dt_shift_th = float(th_prep.get("dt_shift", float(max(1, theta_roll_days)) / 365.0))
+        _kx_c = int(th_prep["k_cross"])
+        _k1_inert_c = bool(
+            _kx_c == 1
+            and m_rem >= 2
+            and not th_prep["eff_autocalled"]
+            and abs(float(th_prep["crossed_pv"])) < 1e-12
+            and float(tau_obs_np[1]) > 2.0 * dt_shift_th
+            and (stage1_rep_np is None or (float(np.mean(stage1_rep_np[:, 0])) < 1e-6 and float(np.mean(stage1_rep_np[:, m_rem])) < 1e-6))
+        )
         can_analytical_theta = bool(
             not th_prep["eff_autocalled"]
-            and int(th_prep["k_cross"]) == 0
-            and float(tau_obs_np[0]) > 4.0 * dt_shift_th
+            and ((_kx_c == 0 and float(tau_obs_np[0]) > 2.0 * dt_shift_th) or _k1_inert_c)
             and not bool(th_prep.get("has_ex_div_in_roll", False))
             and not is_cont_ki_active
+            and not (k_os > 0.0 and not (has_ki and ko_spread < -1e-6))
             and want_rate_aad_smooth
             and bar_cf_np is not None
             and (use_triton_aad_s2 or (not use_gpu_triton and cpp_sde_v2_fn is not None))
@@ -20316,19 +20426,37 @@ def compute_qmc_aad_crn_greeks(
                 lv_t_grid_th = th_prep["lv_t_grid"]
                 lv_th_tables = th_prep["lv_tables"]
 
-                d_df_th = np.ascontiguousarray(df_pay_th_np - df_pay_np, dtype=np.float64)
-                d_wf_th = (
-                    np.ascontiguousarray(w_fund_th_np - w_fund_base_np, dtype=np.float64)
-                    if (w_fund_th_np is not None and w_fund_base_np is not None)
-                    else None
-                )
-                d_log_fwd_th = np.ascontiguousarray(
-                    np.log(np.maximum(fwd_perf_th_np / np.maximum(fwd_perf_np, 1e-12), 1e-30)),
-                    dtype=np.float64,
-                )
+                _kc_a = int(th_prep["k_cross"])
+                if _kc_a == 0:
+                    d_df_th = np.ascontiguousarray(df_pay_th_np - df_pay_np, dtype=np.float64)
+                    d_wf_th = (
+                        np.ascontiguousarray(w_fund_th_np - w_fund_base_np, dtype=np.float64)
+                        if (w_fund_th_np is not None and w_fund_base_np is not None)
+                        else None
+                    )
+                    d_log_fwd_th = np.ascontiguousarray(
+                        np.log(np.maximum(fwd_perf_th_np / np.maximum(fwd_perf_np, 1e-12), 1e-30)),
+                        dtype=np.float64,
+                    )
+                else:
+                    d_df_th = np.zeros(m_rem, dtype=np.float64)
+                    d_df_th[_kc_a:] = df_pay_th_np - df_pay_np[_kc_a:]
+                    if w_fund_th_np is not None and w_fund_base_np is not None:
+                        d_wf_th = np.zeros(m_rem, dtype=np.float64)
+                        d_wf_th[:_kc_a] = -w_fund_base_np[:_kc_a]
+                        d_wf_th[_kc_a:] = w_fund_th_np - w_fund_base_np[_kc_a:]
+                    else:
+                        d_wf_th = None
+                    d_log_fwd_th = np.zeros((d_assets, m_rem), dtype=np.float64)
+                    d_log_fwd_th[:, _kc_a:] = np.log(
+                        np.maximum(fwd_perf_th_np / np.maximum(fwd_perf_np[:, _kc_a:], 1e-12), 1e-30)
+                    )
                 if quanto_meta:
                     q_diff_base = r_tot_obs_np - r_native_obs_np
-                    q_diff_th = r_tot_th_np - r_nat_th_np
+                    q_diff_th = np.zeros_like(q_diff_base)
+                    q_diff_th[:, _kc_a:] = r_tot_th_np - r_nat_th_np
+                    if _kc_a > 0:
+                        q_diff_th[:, :_kc_a] = q_diff_base[:, :_kc_a]
                     a_s_th = (np.arange(n_sub, dtype=np.float64) + 0.5) / float(n_sub)
                     q_prev_b = np.concatenate([np.zeros((d_assets, 1), dtype=np.float64), q_diff_base[:, :-1]], axis=1)
                     q_prev_t = np.concatenate([np.zeros((d_assets, 1), dtype=np.float64), q_diff_th[:, :-1]], axis=1)
@@ -20342,7 +20470,7 @@ def compute_qmc_aad_crn_greeks(
                 else:
                     dq_shift_th = None
 
-                tau0_b = max(float(tau_obs_np[0]), 1e-6)
+                tau0_b = max(float(tau_obs_np[_kc_a]), 1e-6)
                 t_query_lv = np.where(
                     lv_t_grid <= tau0_b,
                     lv_t_grid * max((tau0_b - dt_shift_th) / tau0_b, 0.0),
@@ -20355,8 +20483,24 @@ def compute_qmc_aad_crn_greeks(
                 wt_q = (u_tq - it0_q)[None, :, None]
                 sig_scale_tau0 = math.sqrt(max(1.0 - dt_shift_th / tau0_b, 0.0)) - 1.0
                 if lv_nt > 1:
-                    dt_g_half = 0.5 * (t_max / float(lv_nt - 1))
-                    w_p0_t = np.clip((tau0_b + dt_g_half - lv_t_grid) / max(2.0 * dt_g_half, 1e-12), 0.0, 1.0)[None, :, None]
+                    dt_g = t_max / float(lv_nt - 1)
+                    w_vec = np.zeros(lv_nt, dtype=np.float64)
+                    for _k in range(lv_nt):
+                        _a = max(0.0, (_k - 1) * dt_g)
+                        _b = min(t_max, (_k + 1) * dt_g)
+                        _tk = _k * dt_g
+                        _tot = (0.5 * dt_g) if (_k == 0 or _k == lv_nt - 1) else dt_g
+                        _num = 0.0
+                        if tau0_b > _a:
+                            _u1 = min(tau0_b, _tk)
+                            if _u1 > _a:
+                                _num += 0.5 * (((_u1 - _a) / dt_g) ** 2) * dt_g
+                            if tau0_b > _tk:
+                                _u2 = min(tau0_b, _b)
+                                _dt2 = _u2 - _tk
+                                _num += _dt2 * (1.0 - 0.5 * _dt2 / dt_g)
+                        w_vec[_k] = min(max(_num / max(_tot, 1e-12), 0.0), 1.0)
+                    w_p0_t = w_vec[None, :, None]
                 else:
                     w_p0_t = np.ones((1, 1, 1), dtype=np.float64)
                 lv_th_interp_all = (1.0 - wt_q) * lv_th_tables[:, it0_q, :] + wt_q * lv_th_tables[:, it1_q, :]
