@@ -139,7 +139,7 @@ _CRN_CURVE_JAC_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=204
 _CRN_CPU_PREP_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=512)
 _CRN_MF_CHEAP_CACHE: _ThreadSafeLRUCache[Any] = _ThreadSafeLRUCache(maxsize=512)
 _CRN_DEAL_PREP_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "deal_prep_lv_vega", max_entries=512, max_bytes=32 * 1024 * 1024
+    "deal_prep_lv_vega", max_entries=512, max_bytes=16 * 1024 * 1024
 )
 _CRN_STATIC_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
     "static_constants", max_entries=256, max_bytes=8 * 1024 * 1024
@@ -909,11 +909,11 @@ def _ensure_qmc_cg_scratch_arena(
 ) -> None:
     """Pre-allocates fixed pointer-stable scratch buffers outside CUDAGraph capture so all graphs share one workspace."""
     dev_idx = int(device.index or 0)
-    # Unified canonical high-water budget (c_m_steps * c_d * c_n_chunk <= 6*40*4*2*1024) fits (6,60,r=1) and (6,40,r=2)/(6,20,r=4).
+    # Unified canonical high-water budget (c_m_steps * c_d * c_n_chunk <= 6*60*4*2*1024) fits (6,60,r=2) and (6,40,r=4).
     c_d = max(int(max_d), 6)
     c_m = max(int(max_m), 60)
-    c_dm_steps = max(int(max_d) * int(max_m) * int(n_sub) * int(max_r_chunk) * int(n_rep), 6 * 40 * 4 * 2 * 1024)
-    c_dm_per = max(int(max_d) * int(max_m) * int(max_r_chunk) * int(n_rep), 6 * 40 * 2 * 1024)
+    c_dm_steps = max(int(max_d) * int(max_m) * int(n_sub) * int(max_r_chunk) * int(n_rep), 6 * 60 * 4 * 2 * 1024)
+    c_dm_per = max(int(max_d) * int(max_m) * int(max_r_chunk) * int(n_rep), 6 * 60 * 2 * 1024)
     c_dm_th = max(int(max_d) * int(max_m_th) * int(max_r_chunk) * int(n_rep), c_dm_per)
     c_n_chunk = max(int(max_r_chunk) * int(n_rep), 8192)
     c_shards = max(int(n_lv_shards), 128)
@@ -11754,7 +11754,6 @@ def compute_qmc_aad_crn_greeks(
             os.environ.get("DEEPVOL_QMC_CG", "1") != "0"
             and can_triton_sobol
             and (not is_cont_ki_active)
-            and (need_stage2_aad or use_vibrato_gamma or need_spot_bumps)
         )
         if z_indep_full_f32 is None and z_full_bytes <= 18 * 1024 * 1024 and (not will_cg_eager_skip):
             z_indep_full_f32 = _get_z_indep_chunk_gpu(0, eff_r)
@@ -15996,7 +15995,7 @@ def compute_qmc_aad_crn_greeks(
                         1,
                     ) * n_rep
                     _r_env_cap_b = int(os.environ.get("DEEPVOL_R_CAP", "4"))
-                    r_cap_b = 1 if (d_pad_b * m_pad_b > 240) else (2 if (d_pad_b * m_pad_b >= 120) else _r_env_cap_b)
+                    r_cap_b = 2 if (d_pad_b * m_pad_b >= 240) else min(_r_env_cap_b, 4) if _r_env_cap_b != 4 else 4
                     r_chunk_b = min(eff_r, r_cap_b, max(1, (72 * 1024 * 1024) // per_rep_b))
                     inv_perm_pad_b = torch.arange(d_pad_b, dtype=torch.int64, device=qmc_device)
                     inv_perm_pad_b[:d_assets].copy_(gpu_meta["inv_perm"])
@@ -16701,6 +16700,30 @@ def compute_qmc_aad_crn_greeks(
                             )
                             _CRN_ZCORR_CACHE.put(z_corr_key, (z_corr_full_f32, z_corr_coarse_f32))
 
+                use_arena_step1 = bool(
+                    cg_capturing_now
+                    or (
+                        (not use_cg_bucket)
+                        and ((int(qmc_device.index or 0), "z_raw_or_bzc") in _QMC_CG_SCRATCH_ARENA)
+                    )
+                )
+                if (not use_cg_bucket) and use_arena_step1 and (not cg_capturing_now):
+                    _ar_dev_i = int(qmc_device.index or 0)
+                    _ar_z = _QMC_CG_SCRATCH_ARENA.get((_ar_dev_i, "z_raw_or_bzc"))
+                    _ar_p = _QMC_CG_SCRATCH_ARENA.get((_ar_dev_i, "lx_period"))
+                    _ar_cap_r = r_chunk_eff
+                    if _ar_z is not None:
+                        _ar_cap_r = min(
+                            _ar_cap_r,
+                            max(1, (int(_ar_z.numel()) // 4) // max(d_eff_k * m_eff_k * n_sub * n_rep, 1)),
+                        )
+                    if _ar_p is not None:
+                        _ar_cap_r = min(
+                            _ar_cap_r,
+                            max(1, (int(_ar_p.numel()) // 4) // max(d_eff_k * m_eff_k * n_rep, 1)),
+                        )
+                    r_chunk_eff = max(1, _ar_cap_r)
+
                 single_chunk = bool(eff_r <= r_chunk_eff)
                 defer_bwd_shard_sum = bool(
                     fuse_m_sde
@@ -16733,8 +16756,8 @@ def compute_qmc_aad_crn_greeks(
                         z_indep_f32_c = _get_z_indep_chunk_gpu(
                             r_start,
                             r_end,
-                            allow_full_cache=(not cg_capturing_now),
-                            use_cg_arena=cg_capturing_now,
+                            allow_full_cache=(not cg_capturing_now and not use_arena_step1),
+                            use_cg_arena=use_arena_step1,
                         )
 
                     lx_period_c: Optional[torch.Tensor] = None
@@ -16752,7 +16775,7 @@ def compute_qmc_aad_crn_greeks(
                             )
                         else:
                             z_corr_f32_mdn_c = _alloc_cg_buf(
-                                cg_capturing_now,
+                                use_arena_step1,
                                 qmc_device,
                                 "z_corr",
                                 (m_eff_k * n_sub, d_eff_k, n_chunk),
@@ -16767,7 +16790,7 @@ def compute_qmc_aad_crn_greeks(
                     norm_x_c: Optional[torch.Tensor] = None
                     if need_fwd_ckpt:
                         lx_period_c = _alloc_cg_buf(
-                            cg_capturing_now,
+                            use_arena_step1,
                             qmc_device,
                             "lx_period",
                             (m_eff_k, d_eff_k, n_chunk),
@@ -16790,7 +16813,7 @@ def compute_qmc_aad_crn_greeks(
                         if fuse_m_sde:
                             if use_f32_perf_direct:
                                 perf_base_c = _alloc_cg_buf(
-                                    cg_capturing_now,
+                                    use_arena_step1,
                                     qmc_device,
                                     "perf_base",
                                     (m_eff_k, d_eff_k, n_chunk),
@@ -17045,7 +17068,7 @@ def compute_qmc_aad_crn_greeks(
                             cg_flags_g=cg_flags_eff,
                             use_rt_flags=use_cg_bucket,
                             d_pad_k=d_eff_k,
-                            use_cg_arena=cg_capturing_now,
+                            use_cg_arena=use_arena_step1,
                         )
                         if bar_ln_fwd_tot_g is not None:
                             if single_chunk:
@@ -18140,7 +18163,12 @@ def compute_qmc_aad_crn_greeks(
                     # on smaller eff_r=4 runs (noisy df=3 covariance), only zero when strictly anti-correlated.
                     if cov_xy_cv < 0.0 or (eff_r >= 8 and cov_xy_cv < 0.5 * var_x_cv):
                         beta_cv = 0.0
-            s1_mean[:n_cv_cols] = s1_mean[:n_cv_cols] + beta_cv * (s1_cheap_mean - s1_crn_mean)
+            if m_rem >= 32:
+                s1_mean[c0_s1:n_cv_cols] = s1_mean[c0_s1:n_cv_cols] + beta_cv * (
+                    s1_cheap_mean[c0_s1:n_cv_cols] - s1_crn_mean[c0_s1:n_cv_cols]
+                )
+            else:
+                s1_mean[:n_cv_cols] = s1_mean[:n_cv_cols] + beta_cv * (s1_cheap_mean - s1_crn_mean)
             if se_mu_mf_cached is not None and math.isfinite(se_mu_mf_cached):
                 var_cheap = (beta_cv * beta_cv) * (se_mu_mf_cached * se_mu_mf_cached)
             else:
