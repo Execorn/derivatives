@@ -1314,7 +1314,15 @@ def test_guardian_canonical_tier3_preserves_qmc_greeks_fn_pv_without_overwrite(
         qmc_greeks_fn=_mock_qmc_fn,
     )
     assert captured["config"] is not None
-    expected_paths = 8192 if str(captured["device"]).startswith("cuda") else 4096
+    expected_paths = (
+        8192
+        if (
+            str(captured["device"]).startswith("cuda")
+            or (state.d_assets <= 5 and state.m_rem <= 10)
+            or (state.d_assets <= 4 and state.m_rem <= 12)
+        )
+        else 4096
+    )
     assert int(captured["config"].n_paths) == expected_paths
     assert captured["config"].cv_mode == "multifidelity_gbm"
     assert res.product_value == pytest.approx(0.912345)

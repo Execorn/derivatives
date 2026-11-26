@@ -93,6 +93,7 @@ DEFAULT_CHECKPOINT_PATH: Path = (
     Path(__file__).resolve().parents[3] / "artifacts" / "checkpoints" / "eq_autocall_egno.pt"
 )
 _ = ndtr(0.0)
+_ = _to_utc_datetime("2026-01-01T00:00:00Z")
 
 
 def _load_surrogate_from_ckpt(
@@ -443,6 +444,345 @@ def _validate_fx_surface_quotes(ticker: str, surf: Any, quotes: npt.NDArray[np.f
         )
 
 
+def _check_eq_surface_discrete_arbitrage(
+    *,
+    ticker: str,
+    surf_id: str,
+    as_of_utc: datetime,
+    exp_utc_list: list[datetime],
+    dcc_str: str,
+    interp_str: str,
+    extrap_str: str,
+    strikes_raw: Any,
+    raw_q: Any,
+) -> tuple[bool, tuple[Any, ...]]:
+    """Checks fast arbitrage cache and Black-76 discrete call monotonicity/convexity for an EQ surface."""
+    n_exp = len(exp_utc_list)
+    if n_exp == 0:
+        raise ValueError(f"SMILE_ARBITRAGE: Missing ExpirationDates on surface={ticker}.")
+
+    fast_arb_key: tuple[Any, ...] | None = None
+    s_arr_buf: array[float] | None = None
+    q_arr_buf: array[float] | None = None
+    n_s = 0
+    if (
+        _SURFACE_ARB_FAST_CACHE
+        and isinstance(strikes_raw, (list, tuple))
+        and isinstance(raw_q, (list, tuple))
+        and len(strikes_raw) > 0
+        and len(raw_q) == n_exp
+    ):
+        n_s = len(strikes_raw)
+        try:
+            s_arr_buf = array("d", strikes_raw)
+            q_arr_buf = array("d")
+            all_rows_match = True
+            for q_row in raw_q:
+                if not isinstance(q_row, (list, tuple)) or len(q_row) != n_s:
+                    all_rows_match = False
+                    break
+                q_arr_buf.fromlist(q_row) if type(q_row) is list else q_arr_buf.extend(q_row)
+            if all_rows_match:
+                fast_arb_key = (
+                    ticker,
+                    surf_id,
+                    as_of_utc,
+                    dcc_str,
+                    interp_str,
+                    extrap_str,
+                    tuple(exp_utc_list),
+                    s_arr_buf.tobytes(),
+                    q_arr_buf.tobytes(),
+                )
+                with _SURFACE_ARB_CACHE_LOCK:
+                    fast_verdict = _SURFACE_ARB_FAST_CACHE.get(fast_arb_key)
+                    if fast_verdict is not None:
+                        _SURFACE_ARB_FAST_CACHE.move_to_end(fast_arb_key)
+                if fast_verdict is not None:
+                    is_valid_f, cached_err_f = fast_verdict
+                    if not is_valid_f:
+                        raise ValueError(
+                            cached_err_f
+                            or f"SMILE_ARBITRAGE: Invalid volatility surface on surface={ticker}."
+                        )
+                    return True, fast_arb_key
+            else:
+                s_arr_buf = None
+                q_arr_buf = None
+        except (TypeError, ValueError, OverflowError) as exc:
+            if "SMILE_ARBITRAGE" in str(exc):
+                raise
+            fast_arb_key = None
+            s_arr_buf = None
+            q_arr_buf = None
+
+    if s_arr_buf is not None and q_arr_buf is not None:
+        strikes = np.frombuffer(s_arr_buf, dtype=np.float64)
+        quotes = np.frombuffer(q_arr_buf, dtype=np.float64).reshape(n_exp, n_s)
+    else:
+        quotes = np.asarray(raw_q, dtype=np.float64)
+        strikes = np.asarray(strikes_raw, dtype=np.float64)
+    if quotes.size == 0 or quotes.ndim != 2:
+        raise ValueError(
+            f"SMILE_ARBITRAGE: VolatilityQuotes on surface={ticker} must be non-empty 2D."
+        )
+    q_min = float(quotes.min())
+    q_max = float(quotes.max())
+    if not (math.isfinite(q_min) and math.isfinite(q_max)):
+        bad_q = np.argwhere(~np.isfinite(quotes))
+        m_b, j_b = int(bad_q[0, 0]), int(bad_q[0, 1])
+        k_b = float(strikes[j_b]) if (strikes.ndim == 1 and j_b < strikes.size) else float("nan")
+        raise ValueError(
+            f"SMILE_ARBITRAGE: Non-finite volatility surface quote on surface={ticker}, "
+            f"slice={m_b}, K={k_b:.4f}, quote={float(quotes[m_b, j_b])!r}."
+        )
+    if strikes.size == 0:
+        raise ValueError(f"SMILE_ARBITRAGE: Non-finite volatility surface strikes on surface={ticker}.")
+    s_min = float(strikes.min())
+    s_max = float(strikes.max())
+    if not (math.isfinite(s_min) and math.isfinite(s_max)):
+        bad_s = np.flatnonzero(~np.isfinite(strikes))
+        j_b = int(bad_s[0]) if bad_s.size > 0 else 0
+        raise ValueError(
+            f"SMILE_ARBITRAGE: Non-finite volatility surface strike on surface={ticker}, "
+            f"strike_idx={j_b}, K={float(strikes.flat[j_b])!r}."
+        )
+
+    if fast_arb_key is None:
+        fast_arb_key = (
+            ticker,
+            surf_id,
+            as_of_utc,
+            dcc_str,
+            interp_str,
+            extrap_str,
+            tuple(exp_utc_list),
+            strikes.tobytes(),
+            quotes.tobytes(),
+        )
+    fast_verdict = None
+    if _SURFACE_ARB_FAST_CACHE:
+        with _SURFACE_ARB_CACHE_LOCK:
+            fast_verdict = _SURFACE_ARB_FAST_CACHE.get(fast_arb_key)
+            if fast_verdict is not None:
+                _SURFACE_ARB_FAST_CACHE.move_to_end(fast_arb_key)
+    if fast_verdict is not None:
+        is_valid_f, cached_err_f = fast_verdict
+        if not is_valid_f:
+            raise ValueError(
+                cached_err_f or f"SMILE_ARBITRAGE: Invalid volatility surface on surface={ticker}."
+            )
+        return True, fast_arb_key
+
+    try:
+        if q_min < 1e-4 or q_max > 5.00:
+            bad_q = np.argwhere((quotes < 1e-4) | (quotes > 5.00))
+            m_b, j_b = int(bad_q[0, 0]), int(bad_q[0, 1])
+            k_b = float(strikes[j_b]) if (strikes.ndim == 1 and j_b < strikes.size) else float("nan")
+            raise ValueError(
+                f"SMILE_ARBITRAGE: Volatility quote out of certifiable bounds [1e-4, 5.00] on surface={ticker}, "
+                f"slice={m_b}, K={k_b:.4f}, quote={float(quotes[m_b, j_b]):.5f}."
+            )
+        if s_min <= 0.0:
+            bad_k = np.flatnonzero(strikes <= 0.0)
+            j_b = int(bad_k[0]) if bad_k.size > 0 else 0
+            raise ValueError(
+                f"SMILE_ARBITRAGE: Non-positive strike on surface={ticker}, K={float(strikes.flat[j_b]):.4f}."
+            )
+        if strikes.size >= 2 and bool(np.all((strikes[1:] - strikes[:-1]) > 1e-9)):
+            u_s = strikes
+            already_sorted = True
+        else:
+            order = np.argsort(strikes)
+            s_sorted = strikes[order]
+            s_round = np.round(s_sorted, 9)
+            keep = np.concatenate(([True], (s_round[1:] - s_round[:-1]) > 0.0))
+            u_s = s_sorted[keep]
+            already_sorted = False
+        if len(u_s) < 2:
+            raise ValueError(
+                f"SMILE_ARBITRAGE: Fewer than 2 distinct strikes on surface={ticker}."
+            )
+        prev_exp = as_of_utc
+        t_vals: list[float] = []
+        inv_sec_yr = 1.0 / 31536000.0
+        for idx, exp_utc in enumerate(exp_utc_list):
+            if idx == 0 and exp_utc <= as_of_utc:
+                raise ValueError(
+                    f"SMILE_ARBITRAGE: ExpirationDate {exp_utc.isoformat()} <= AsOfDate on surface={ticker}, slice=0."
+                )
+            if idx > 0 and exp_utc <= prev_exp:
+                raise ValueError(
+                    f"SMILE_ARBITRAGE: Non-increasing ExpirationDates on surface={ticker}, slice={idx}."
+                )
+            t_vals.append(max((exp_utc - as_of_utc).total_seconds() * inv_sec_yr, 1e-8))
+            prev_exp = exp_utc
+
+        if quotes.shape != (n_exp, strikes.size):
+            raise ValueError(
+                f"SMILE_ARBITRAGE: Quotes shape {quotes.shape} != ({n_exp}, {strikes.size}) on surface={ticker}."
+            )
+
+        # Constant-volatility Black-76 smiles are strictly decreasing and convex across positive strikes.
+        if q_max > q_min:
+            q_u = quotes if already_sorted else quotes[:, order][:, keep]
+            t_vec = np.asarray(t_vals, dtype=np.float64)[:, None]
+            k_ref = float(u_s[len(u_s) >> 1]) if already_sorted else float(np.median(u_s))
+            k_norm = u_s / k_ref
+            y = np.log(k_norm)[None, :]
+            sqrt_w = np.sqrt(np.maximum((q_u * q_u) * t_vec, 1e-12))
+            d1 = -y / sqrt_w + 0.5 * sqrt_w
+            d2 = d1 - sqrt_w
+            calls = ndtr(d1) - k_norm[None, :] * ndtr(d2)
+            dk = k_norm[1:] - k_norm[:-1]
+            slopes = (calls[:, 1:] - calls[:, :-1]) / dk[None, :]
+            max_slope = float(slopes.max())
+            min_slope = float(slopes.min())
+            d2c = slopes[:, 1:] - slopes[:, :-1] if len(u_s) >= 3 else None
+            min_d2c = float(d2c.min()) if d2c is not None else 0.0
+            slice_slope_bad = (slopes.max(axis=1) > 1e-3) | (slopes.min(axis=1) < -1.0 - 1e-3)
+            slice_d2c_bad = (
+                d2c.min(axis=1) < -1e-3
+                if d2c is not None
+                else np.zeros(n_exp, dtype=bool)
+            )
+            violating_slices = [int(m) for m in np.flatnonzero(slice_slope_bad | slice_d2c_bad)]
+            if max_slope > 1e-3 or min_slope < -1.0 - 1e-3:
+                if max_slope > 1e-3 and (min_slope >= -1.0 - 1e-3 or max_slope >= -1.0 - min_slope):
+                    m_off, j_seg = map(int, np.unravel_index(int(np.argmax(slopes)), slopes.shape))
+                    off_slope = max_slope
+                else:
+                    m_off, j_seg = map(int, np.unravel_index(int(np.argmin(slopes)), slopes.shape))
+                    off_slope = min_slope
+                j_prev = j_seg
+                j_curr = min(j_seg + 1, len(u_s) - 1)
+                raise ValueError(
+                    f"SMILE_ARBITRAGE: Call-spread slope violation on surface={ticker}, "
+                    f"slices={violating_slices}, worst_slice={m_off} (T={t_vals[m_off]:.4f}Y), "
+                    f"K={float(u_s[j_curr]):.4f}, prev_K={float(u_s[j_prev]):.4f}, "
+                    f"vol_jump={float(q_u[m_off, j_prev]):.5f}->{float(q_u[m_off, j_curr]):.5f}, "
+                    f"slope={off_slope:.6f} (range [{min_slope:.4f}, {max_slope:.4f}]), "
+                    f"min_d2c={min_d2c:.6f}."
+                )
+            if d2c is not None and min_d2c < -1e-3:
+                m_off, j_d2 = map(int, np.unravel_index(int(np.argmin(d2c)), d2c.shape))
+                left_jump = abs(float(q_u[m_off, j_d2 + 1] - q_u[m_off, j_d2]))
+                right_jump = (
+                    abs(float(q_u[m_off, j_d2 + 2] - q_u[m_off, j_d2 + 1]))
+                    if j_d2 + 2 < len(u_s)
+                    else -1.0
+                )
+                if j_d2 + 2 < len(u_s) and right_jump > left_jump:
+                    j_prev = j_d2 + 1
+                    j_curr = j_d2 + 2
+                    off_slope = float(slopes[m_off, j_d2 + 1])
+                else:
+                    j_prev = j_d2
+                    j_curr = min(j_d2 + 1, len(u_s) - 1)
+                    off_slope = float(slopes[m_off, j_d2])
+                raise ValueError(
+                    f"SMILE_ARBITRAGE: Discrete call convexity violation on surface={ticker}, "
+                    f"slices={violating_slices}, worst_slice={m_off} (T={t_vals[m_off]:.4f}Y), "
+                    f"K={float(u_s[j_curr]):.4f}, prev_K={float(u_s[j_prev]):.4f}, "
+                    f"vol_jump={float(q_u[m_off, j_prev]):.5f}->{float(q_u[m_off, j_curr]):.5f}, "
+                    f"slope={off_slope:.6f}, min_d2c={min_d2c:.6f}, "
+                    f"slope_range=[{min_slope:.4f}, {max_slope:.4f}]."
+                )
+    except ValueError as exc:
+        err_msg = str(exc)
+        if "SMILE_ARBITRAGE" in err_msg:
+            with _SURFACE_ARB_CACHE_LOCK:
+                _put_surface_arb_cache(_SURFACE_ARB_FAST_CACHE, fast_arb_key, (False, err_msg))
+        raise
+
+    return False, fast_arb_key
+
+
+def _precheck_raw_json_surfaces(payload: Mapping[str, Any]) -> None:
+    """Fast raw-dict SMILE_ARBITRAGE screen before Pydantic validation when repair_arbitrage=False."""
+    model_obj = payload.get("Model")
+    if not isinstance(model_obj, Mapping):
+        return
+    mds = model_obj.get("MarketDataSet")
+    if not isinstance(mds, Mapping):
+        return
+    as_of_raw = mds.get("AsOfDate")
+    vol_surfs = mds.get("VolatilitySurfaces")
+    if as_of_raw is None or not isinstance(vol_surfs, Mapping) or not vol_surfs:
+        return
+    try:
+        as_of_utc = (
+            as_of_raw
+            if (isinstance(as_of_raw, datetime) and as_of_raw.tzinfo is timezone.utc)
+            else _to_utc_datetime(as_of_raw)
+        )
+    except (TypeError, ValueError):
+        return
+
+    prod_obj = payload.get("Product")
+    prod_uids = prod_obj.get("UnderlyingIdentifiers") if isinstance(prod_obj, Mapping) else None
+    seen_tickers: set[str] = set()
+    ordered_surfs: list[tuple[str, Any]] = []
+    if isinstance(prod_uids, Sequence) and not isinstance(prod_uids, (str, bytes)):
+        for uid_raw in prod_uids:
+            uid = str(uid_raw)
+            if uid in vol_surfs and uid not in seen_tickers:
+                seen_tickers.add(uid)
+                ordered_surfs.append((uid, vol_surfs[uid]))
+    for ticker_raw, surf in vol_surfs.items():
+        ticker = str(ticker_raw)
+        if ticker not in seen_tickers:
+            seen_tickers.add(ticker)
+            ordered_surfs.append((ticker, surf))
+
+    for ticker, surf in ordered_surfs:
+        if not isinstance(surf, Mapping):
+            continue
+        type_name = str(surf.get("TypeName") or "")
+        strikes_raw = surf.get("Strikes")
+        exp_dates_raw = surf.get("ExpirationDates")
+        raw_q = surf.get("VolatilityQuotes")
+        if (
+            type_name == "FXVolatilitySmileCollection"
+            or surf.get("Deltas") is not None
+            or surf.get("Tenors") is not None
+            or not isinstance(strikes_raw, Sequence)
+            or isinstance(strikes_raw, (str, bytes))
+            or not isinstance(exp_dates_raw, Sequence)
+            or isinstance(exp_dates_raw, (str, bytes))
+            or not isinstance(raw_q, Sequence)
+            or isinstance(raw_q, (str, bytes))
+        ):
+            continue
+        try:
+            exp_utc_list = [
+                d if (isinstance(d, datetime) and d.tzinfo is timezone.utc) else _to_utc_datetime(d)
+                for d in exp_dates_raw
+            ]
+        except (TypeError, ValueError):
+            continue
+        dcc_str = str(surf.get("DayCountConvention") or "Act365")
+        interp_str = str(surf.get("SmileInterpolationMethod") or "CubicSpline")
+        extrap_str = str(surf.get("SmileExtrapolationMethod") or "Linear")
+        surf_id = str(surf.get("Identifier") or ticker)
+        try:
+            _check_eq_surface_discrete_arbitrage(
+                ticker=ticker,
+                surf_id=surf_id,
+                as_of_utc=as_of_utc,
+                exp_utc_list=exp_utc_list,
+                dcc_str=dcc_str,
+                interp_str=interp_str,
+                extrap_str=extrap_str,
+                strikes_raw=strikes_raw,
+                raw_q=raw_q,
+            )
+        except (TypeError, ValueError) as exc:
+            if "SMILE_ARBITRAGE" in str(exc):
+                raise
+            continue
+
+
 def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
     """Screens input `VolatilitySurfaces` for corrupt or arbitrageable quotes before spline caching."""
     as_of_dt = req.Model.MarketDataSet.AsOfDate
@@ -484,10 +824,6 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
             _validate_fx_surface_quotes(str(ticker), surf, quotes_fx)
             continue
 
-        n_exp = len(exp_dates_attr)
-        if n_exp == 0:
-            raise ValueError(f"SMILE_ARBITRAGE: Missing ExpirationDates on surface={ticker}.")
-
         dt_cls = datetime
         exp_utc_list = [
             d if (type(d) is dt_cls and d.tzinfo is utc_tz) else _to_utc_datetime(d)
@@ -501,238 +837,19 @@ def _validate_surfaces_for_arbitrage(req: EQAutocallableTradeRequest) -> None:
         extrap_str = str(getattr(extrap_attr, "value", extrap_attr) or "Linear")
         surf_id = str(getattr(surf, "Identifier", ticker))
 
-        raw_q = surf.VolatilityQuotes
-        fast_arb_key: tuple[Any, ...] | None = None
-        s_arr_buf: array[float] | None = None
-        q_arr_buf: array[float] | None = None
-        n_s = 0
-        if (
-            _SURFACE_ARB_FAST_CACHE
-            and isinstance(strikes_attr, (list, tuple))
-            and isinstance(raw_q, (list, tuple))
-            and len(strikes_attr) > 0
-            and len(raw_q) == n_exp
-        ):
-            n_s = len(strikes_attr)
-            try:
-                s_arr_buf = array("d", strikes_attr)
-                q_arr_buf = array("d")
-                all_rows_match = True
-                for q_row in raw_q:
-                    if not isinstance(q_row, (list, tuple)) or len(q_row) != n_s:
-                        all_rows_match = False
-                        break
-                    q_arr_buf.fromlist(q_row) if type(q_row) is list else q_arr_buf.extend(q_row)
-                if all_rows_match:
-                    fast_arb_key = (
-                        str(ticker),
-                        surf_id,
-                        as_of_utc,
-                        dcc_str,
-                        interp_str,
-                        extrap_str,
-                        tuple(exp_utc_list),
-                        s_arr_buf.tobytes(),
-                        q_arr_buf.tobytes(),
-                    )
-                    with _SURFACE_ARB_CACHE_LOCK:
-                        fast_verdict = _SURFACE_ARB_FAST_CACHE.get(fast_arb_key)
-                        if fast_verdict is not None:
-                            _SURFACE_ARB_FAST_CACHE.move_to_end(fast_arb_key)
-                    if fast_verdict is not None:
-                        is_valid_f, cached_err_f = fast_verdict
-                        if not is_valid_f:
-                            raise ValueError(
-                                cached_err_f
-                                or f"SMILE_ARBITRAGE: Invalid volatility surface on surface={ticker}."
-                            )
-                        continue
-                else:
-                    s_arr_buf = None
-                    q_arr_buf = None
-            except (TypeError, ValueError, OverflowError):
-                fast_arb_key = None
-                s_arr_buf = None
-                q_arr_buf = None
-
-        if s_arr_buf is not None and q_arr_buf is not None:
-            strikes = np.frombuffer(s_arr_buf, dtype=np.float64)
-            quotes = np.frombuffer(q_arr_buf, dtype=np.float64).reshape(n_exp, n_s)
-        else:
-            quotes = np.asarray(raw_q, dtype=np.float64)
-            strikes = np.asarray(strikes_attr, dtype=np.float64)
-        if quotes.size == 0 or quotes.ndim != 2:
-            raise ValueError(
-                f"SMILE_ARBITRAGE: VolatilityQuotes on surface={ticker} must be non-empty 2D."
-            )
-        q_min = float(quotes.min())
-        q_max = float(quotes.max())
-        if not (math.isfinite(q_min) and math.isfinite(q_max)):
-            bad_q = np.argwhere(~np.isfinite(quotes))
-            m_b, j_b = int(bad_q[0, 0]), int(bad_q[0, 1])
-            k_b = float(strikes[j_b]) if (strikes.ndim == 1 and j_b < strikes.size) else float("nan")
-            raise ValueError(
-                f"SMILE_ARBITRAGE: Non-finite volatility surface quote on surface={ticker}, "
-                f"slice={m_b}, K={k_b:.4f}, quote={float(quotes[m_b, j_b])!r}."
-            )
-        if strikes.size == 0:
-            raise ValueError(f"SMILE_ARBITRAGE: Non-finite volatility surface strikes on surface={ticker}.")
-        s_min = float(strikes.min())
-        s_max = float(strikes.max())
-        if not (math.isfinite(s_min) and math.isfinite(s_max)):
-            bad_s = np.flatnonzero(~np.isfinite(strikes))
-            j_b = int(bad_s[0]) if bad_s.size > 0 else 0
-            raise ValueError(
-                f"SMILE_ARBITRAGE: Non-finite volatility surface strike on surface={ticker}, "
-                f"strike_idx={j_b}, K={float(strikes.flat[j_b])!r}."
-            )
-
-        if fast_arb_key is None:
-            fast_arb_key = (
-                str(ticker),
-                surf_id,
-                as_of_utc,
-                dcc_str,
-                interp_str,
-                extrap_str,
-                tuple(exp_utc_list),
-                strikes.tobytes(),
-                quotes.tobytes(),
-            )
-        fast_verdict = None
-        if _SURFACE_ARB_FAST_CACHE:
-            with _SURFACE_ARB_CACHE_LOCK:
-                fast_verdict = _SURFACE_ARB_FAST_CACHE.get(fast_arb_key)
-                if fast_verdict is not None:
-                    _SURFACE_ARB_FAST_CACHE.move_to_end(fast_arb_key)
-        if fast_verdict is not None:
-            is_valid_f, cached_err_f = fast_verdict
-            if not is_valid_f:
-                raise ValueError(
-                    cached_err_f or f"SMILE_ARBITRAGE: Invalid volatility surface on surface={ticker}."
-                )
+        is_fast_cached, fast_arb_key = _check_eq_surface_discrete_arbitrage(
+            ticker=str(ticker),
+            surf_id=surf_id,
+            as_of_utc=as_of_utc,
+            exp_utc_list=exp_utc_list,
+            dcc_str=dcc_str,
+            interp_str=interp_str,
+            extrap_str=extrap_str,
+            strikes_raw=strikes_attr,
+            raw_q=surf.VolatilityQuotes,
+        )
+        if is_fast_cached:
             continue
-
-        try:
-            if q_min < 1e-4 or q_max > 5.00:
-                bad_q = np.argwhere((quotes < 1e-4) | (quotes > 5.00))
-                m_b, j_b = int(bad_q[0, 0]), int(bad_q[0, 1])
-                k_b = float(strikes[j_b]) if (strikes.ndim == 1 and j_b < strikes.size) else float("nan")
-                raise ValueError(
-                    f"SMILE_ARBITRAGE: Volatility quote out of certifiable bounds [1e-4, 5.00] on surface={ticker}, "
-                    f"slice={m_b}, K={k_b:.4f}, quote={float(quotes[m_b, j_b]):.5f}."
-                )
-            if s_min <= 0.0:
-                bad_k = np.flatnonzero(strikes <= 0.0)
-                j_b = int(bad_k[0]) if bad_k.size > 0 else 0
-                raise ValueError(
-                    f"SMILE_ARBITRAGE: Non-positive strike on surface={ticker}, K={float(strikes.flat[j_b]):.4f}."
-                )
-            if strikes.size >= 2 and bool(np.all((strikes[1:] - strikes[:-1]) > 1e-9)):
-                u_s = strikes
-                already_sorted = True
-            else:
-                order = np.argsort(strikes)
-                s_sorted = strikes[order]
-                s_round = np.round(s_sorted, 9)
-                keep = np.concatenate(([True], (s_round[1:] - s_round[:-1]) > 0.0))
-                u_s = s_sorted[keep]
-                already_sorted = False
-            if len(u_s) < 2:
-                raise ValueError(
-                    f"SMILE_ARBITRAGE: Fewer than 2 distinct strikes on surface={ticker}."
-                )
-            prev_exp = as_of_utc
-            t_vals: list[float] = []
-            inv_sec_yr = 1.0 / 31536000.0
-            for idx, exp_utc in enumerate(exp_utc_list):
-                if idx == 0 and exp_utc <= as_of_utc:
-                    raise ValueError(
-                        f"SMILE_ARBITRAGE: ExpirationDate {exp_utc.isoformat()} <= AsOfDate on surface={ticker}, slice=0."
-                    )
-                if idx > 0 and exp_utc <= prev_exp:
-                    raise ValueError(
-                        f"SMILE_ARBITRAGE: Non-increasing ExpirationDates on surface={ticker}, slice={idx}."
-                    )
-                t_vals.append(max((exp_utc - as_of_utc).total_seconds() * inv_sec_yr, 1e-8))
-                prev_exp = exp_utc
-
-            if quotes.shape != (n_exp, strikes.size):
-                raise ValueError(
-                    f"SMILE_ARBITRAGE: Quotes shape {quotes.shape} != ({n_exp}, {strikes.size}) on surface={ticker}."
-                )
-
-            # Constant-volatility Black-76 smiles are strictly decreasing and convex across positive strikes.
-            if q_max > q_min:
-                q_u = quotes if already_sorted else quotes[:, order][:, keep]
-                t_vec = np.asarray(t_vals, dtype=np.float64)[:, None]
-                k_ref = float(u_s[len(u_s) >> 1]) if already_sorted else float(np.median(u_s))
-                k_norm = u_s / k_ref
-                y = np.log(k_norm)[None, :]
-                sqrt_w = np.sqrt(np.maximum((q_u * q_u) * t_vec, 1e-12))
-                d1 = -y / sqrt_w + 0.5 * sqrt_w
-                d2 = d1 - sqrt_w
-                calls = ndtr(d1) - k_norm[None, :] * ndtr(d2)
-                dk = k_norm[1:] - k_norm[:-1]
-                slopes = (calls[:, 1:] - calls[:, :-1]) / dk[None, :]
-                max_slope = float(slopes.max())
-                min_slope = float(slopes.min())
-                d2c = slopes[:, 1:] - slopes[:, :-1] if len(u_s) >= 3 else None
-                min_d2c = float(d2c.min()) if d2c is not None else 0.0
-                slice_slope_bad = (slopes.max(axis=1) > 1e-3) | (slopes.min(axis=1) < -1.0 - 1e-3)
-                slice_d2c_bad = (
-                    d2c.min(axis=1) < -1e-3
-                    if d2c is not None
-                    else np.zeros(n_exp, dtype=bool)
-                )
-                violating_slices = [int(m) for m in np.flatnonzero(slice_slope_bad | slice_d2c_bad)]
-                if max_slope > 1e-3 or min_slope < -1.0 - 1e-3:
-                    if max_slope > 1e-3 and (min_slope >= -1.0 - 1e-3 or max_slope >= -1.0 - min_slope):
-                        m_off, j_seg = map(int, np.unravel_index(int(np.argmax(slopes)), slopes.shape))
-                        off_slope = max_slope
-                    else:
-                        m_off, j_seg = map(int, np.unravel_index(int(np.argmin(slopes)), slopes.shape))
-                        off_slope = min_slope
-                    j_prev = j_seg
-                    j_curr = min(j_seg + 1, len(u_s) - 1)
-                    raise ValueError(
-                        f"SMILE_ARBITRAGE: Call-spread slope violation on surface={ticker}, "
-                        f"slices={violating_slices}, worst_slice={m_off} (T={t_vals[m_off]:.4f}Y), "
-                        f"K={float(u_s[j_curr]):.4f}, prev_K={float(u_s[j_prev]):.4f}, "
-                        f"vol_jump={float(q_u[m_off, j_prev]):.5f}->{float(q_u[m_off, j_curr]):.5f}, "
-                        f"slope={off_slope:.6f} (range [{min_slope:.4f}, {max_slope:.4f}]), "
-                        f"min_d2c={min_d2c:.6f}."
-                    )
-                if d2c is not None and min_d2c < -1e-3:
-                    m_off, j_d2 = map(int, np.unravel_index(int(np.argmin(d2c)), d2c.shape))
-                    left_jump = abs(float(q_u[m_off, j_d2 + 1] - q_u[m_off, j_d2]))
-                    right_jump = (
-                        abs(float(q_u[m_off, j_d2 + 2] - q_u[m_off, j_d2 + 1]))
-                        if j_d2 + 2 < len(u_s)
-                        else -1.0
-                    )
-                    if j_d2 + 2 < len(u_s) and right_jump > left_jump:
-                        j_prev = j_d2 + 1
-                        j_curr = j_d2 + 2
-                        off_slope = float(slopes[m_off, j_d2 + 1])
-                    else:
-                        j_prev = j_d2
-                        j_curr = min(j_d2 + 1, len(u_s) - 1)
-                        off_slope = float(slopes[m_off, j_d2])
-                    raise ValueError(
-                        f"SMILE_ARBITRAGE: Discrete call convexity violation on surface={ticker}, "
-                        f"slices={violating_slices}, worst_slice={m_off} (T={t_vals[m_off]:.4f}Y), "
-                        f"K={float(u_s[j_curr]):.4f}, prev_K={float(u_s[j_prev]):.4f}, "
-                        f"vol_jump={float(q_u[m_off, j_prev]):.5f}->{float(q_u[m_off, j_curr]):.5f}, "
-                        f"slope={off_slope:.6f}, min_d2c={min_d2c:.6f}, "
-                        f"slope_range=[{min_slope:.4f}, {max_slope:.4f}]."
-                    )
-        except ValueError as exc:
-            err_msg = str(exc)
-            if "SMILE_ARBITRAGE" in err_msg:
-                with _SURFACE_ARB_CACHE_LOCK:
-                    _put_surface_arb_cache(_SURFACE_ARB_FAST_CACHE, fast_arb_key, (False, err_msg))
-            raise
 
         deferred_spline_checks.append((str(ticker), surf, fast_arb_key))
 
@@ -2070,6 +2187,8 @@ class EQAutocallRuntime:
     def _parse_request(
         self,
         req: EQAutocallableTradeRequest | str | bytes | Path | Mapping[str, Any],
+        *,
+        precheck_raw_surfaces: bool = False,
     ) -> tuple[EQAutocallableTradeRequest, bool]:
         """Normalizes `req` into a validated `EQAutocallableTradeRequest` and returns `(req_model, is_murex_dag)`."""
         if isinstance(req, EQAutocallableTradeRequest):
@@ -2110,6 +2229,8 @@ class EQAutocallRuntime:
                     parsed_json_ok = False
                 if parsed_json_ok and isinstance(json_obj, dict) and "Product" in json_obj and "Model" in json_obj:
                     json_obj.pop("Result", None)
+                    if precheck_raw_surfaces:
+                        _precheck_raw_json_surfaces(json_obj)
                     validated = EQAutocallableTradeRequest.model_validate(json_obj)
                     object.__setattr__(validated, "_raw_payload_digest_hex", raw_digest_hex)
                     object.__setattr__(validated, "_immutable_cache_source", validated)
@@ -2175,6 +2296,8 @@ class EQAutocallRuntime:
                             return _clone_cached_request(cached_req), cached_is_dag
 
             if is_direct_json:
+                if precheck_raw_surfaces:
+                    _precheck_raw_json_surfaces(payload_obj)
                 validated = EQAutocallableTradeRequest.model_validate(payload_obj)
                 is_dag_res = False
             else:
@@ -2346,11 +2469,11 @@ class EQAutocallRuntime:
         """Prices a single Multi-Asset Equity Autocallable trade and computes requested Greeks in `float64`."""
         t0 = time.perf_counter()
         eng_norm = _validate_engine(engine)
-        req_model, is_dag = self._parse_request(req)
         eff_repair = self.repair_arbitrage if repair_arbitrage is None else bool(repair_arbitrage)
         eff_theta_conv = (
             self.theta_convention if theta_convention is None else str(theta_convention)
         )
+        req_model, is_dag = self._parse_request(req, precheck_raw_surfaces=not eff_repair)
         if eff_repair:
             req_model = _repair_request_surfaces(req_model)
         allow_cached_mds_digest = isinstance(getattr(req_model, "_raw_payload_digest_hex", None), str)

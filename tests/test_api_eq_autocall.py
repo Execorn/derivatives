@@ -1581,15 +1581,15 @@ def test_runtime_canonical_invariance_cpp23_startup_quanto_and_irao_arb(
     assert str(captured_calls[1]["device"]) == "cpu"
     cfg0, cfg1 = captured_calls[0]["config"], captured_calls[1]["config"]
     assert (cfg0.n_paths, cfg0.n_replicates, cfg0.n_substeps, cfg0.lv_grid_nt, cfg0.lv_grid_ny) == (
-        4096,
-        4,
+        8192,
+        8,
         4,
         32,
         64,
     )
     assert (cfg1.n_paths, cfg1.n_replicates, cfg1.n_substeps, cfg1.lv_grid_nt, cfg1.lv_grid_ny) == (
-        4096,
-        4,
+        8192,
+        8,
         4,
         32,
         64,

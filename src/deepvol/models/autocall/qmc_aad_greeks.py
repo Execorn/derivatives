@@ -133,10 +133,10 @@ class _ThreadSafeLRUCache(Generic[_T]):
 
 
 _CRN_SOBOL_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "sobol_normals", max_entries=256, max_bytes=8 * 1024 * 1024
+    "sobol_normals", max_entries=256, max_bytes=4 * 1024 * 1024
 )
 _CRN_ZCORR_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "sobol_normals", max_entries=16, max_bytes=8 * 1024 * 1024
+    "sobol_normals", max_entries=16, max_bytes=4 * 1024 * 1024
 )
 _CRN_LV_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
     "lv_table_cache", max_entries=512, max_bytes=16 * 1024 * 1024
@@ -165,7 +165,7 @@ _CRN_DEAL_PREP_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register
     "deal_prep_lv_vega", max_entries=512, max_bytes=16 * 1024 * 1024
 )
 _CRN_STATIC_CACHE: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
-    "static_constants", max_entries=256, max_bytes=8 * 1024 * 1024
+    "static_constants", max_entries=256, max_bytes=4 * 1024 * 1024
 )
 _CRN_CUDAGRAPH_POOL_PARTITION: PartitionedGpuLRU[Any] = GLOBAL_GPU_CACHE_MANAGER.register_partition(
     "cudagraph_pool", max_entries=8, max_bytes=24 * 1024 * 1024
@@ -932,11 +932,11 @@ def _ensure_qmc_cg_scratch_arena(
 ) -> None:
     """Pre-allocates fixed pointer-stable scratch buffers outside CUDAGraph capture so all graphs share one workspace."""
     dev_idx = int(device.index or 0)
-    # Unified canonical high-water budget (c_m_steps * c_d * c_n_chunk <= 6*60*4*2*1024) fits (6,60,r=2) and (6,40,r=4).
+    # Unified canonical high-water budget covering (6,40,r=2), (6,20,r=4), and (3,40,r=5).
     c_d = max(int(max_d), 6)
-    c_m = max(int(max_m), 60)
-    c_dm_steps = max(int(max_d) * int(max_m) * int(n_sub) * int(max_r_chunk) * int(n_rep), 6 * 60 * 4 * 2 * 1024)
-    c_dm_per = max(int(max_d) * int(max_m) * int(max_r_chunk) * int(n_rep), 6 * 60 * 2 * 1024)
+    c_m = max(int(max_m), 40)
+    c_dm_steps = max(int(max_d) * int(max_m) * int(n_sub) * int(max_r_chunk) * int(n_rep), 3 * 40 * 4 * 5 * 1024)
+    c_dm_per = max(int(max_d) * int(max_m) * int(max_r_chunk) * int(n_rep), 3 * 40 * 5 * 1024)
     c_dm_th = max(int(max_d) * int(max_m_th) * int(max_r_chunk) * int(n_rep), c_dm_per)
     c_n_chunk = max(int(max_r_chunk) * int(n_rep), 8192)
     c_shards = max(int(n_lv_shards), 128)
@@ -954,14 +954,14 @@ def _ensure_qmc_cg_scratch_arena(
         "vib_sig": c_d * c_n_chunk * 4,
         "bar_lx_post": c_dm_per * 4,
         "out_cf_wf": 2 * c_grid_s2 * c_m * 8,
-        "bar_q": max(c_d * c_m * int(n_sub), 6 * 60 * 4) * 4,
+        "bar_q": max(c_d * c_m * int(n_sub), 6 * 40 * 4) * 4,
         "bar_lv": c_shards * c_d * max(int(lv_nt), 32) * max(int(lv_ny), 64) * 4,
         "d_ln_surv": (2 * c_d) * c_n_chunk * 4,
         "h_vib_out": c_grid_nv * c_d * c_d * 8,
         "frozen_term": 4 * c_n_chunk * 8,
         "ema_shift": 2 * max(int(max_r_chunk), 8) * c_m * max(int(max_d_mf), c_d) * 4,
         # z_mean_aux (get_z), ws_s2 (stage-2 AAD), perf_sp_pm, and perf_th have disjoint lifetimes within each chunk.
-        "perf_aux": max(2 * c_dm_per * 4, c_dm_th * 4, 7 * c_m * max(int(max_r_chunk) * int(n_rep), 4096) * 4),
+        "perf_aux": max(2 * c_dm_per * 4, c_dm_th * 4, 7 * c_m * max(int(max_r_chunk) * int(n_rep), 5120) * 4),
         "pv_tiles": max(int(max_nb), 64) * max(int(n_tiles_eval), 32) * 8,
     }
     cleared_graphs = False
@@ -17777,7 +17777,15 @@ def compute_qmc_aad_crn_greeks(
                         1,
                     ) * n_rep
                     _r_env_cap_b = int(os.environ.get("DEEPVOL_R_CAP", "4"))
-                    r_cap_b = 2 if (d_pad_b * m_pad_b >= 240) else min(_r_env_cap_b, 4) if _r_env_cap_b != 4 else 4
+                    r_cap_b = (
+                        2
+                        if (d_pad_b * m_pad_b >= 240)
+                        else (
+                            5
+                            if (d_pad_b * m_pad_b <= 120 and eff_r == 10)
+                            else (min(_r_env_cap_b, 4) if _r_env_cap_b != 4 else 4)
+                        )
+                    )
                     r_chunk_b = min(eff_r, r_cap_b, max(1, (72 * 1024 * 1024) // per_rep_b))
                     inv_perm_pad_b = torch.arange(d_pad_b, dtype=torch.int64, device=qmc_device)
                     inv_perm_pad_b[:d_assets].copy_(gpu_meta["inv_perm"])
