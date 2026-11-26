@@ -215,3 +215,6 @@ run_demo.sh
 overnight_pipeline.py
 data/*.npz
 .hypothesis/
+ps_audit_b10316f2/
+build_cpp/
+SESSION_CHECKPOINT.md

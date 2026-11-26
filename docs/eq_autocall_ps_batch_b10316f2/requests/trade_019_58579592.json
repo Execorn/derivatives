@@ -1,0 +1,467 @@
+{
+  "Product": {
+    "PaymentCurrency": "RUB",
+    "StartDate": "2026-03-05T00:00:00Z",
+    "PaymentDates": [
+      "2026-04-13T00:00:00Z",
+      "2026-05-13T00:00:00Z",
+      "2026-06-15T00:00:00Z",
+      "2026-07-13T00:00:00Z",
+      "2026-08-12T00:00:00Z",
+      "2026-09-14T00:00:00Z",
+      "2026-10-12T00:00:00Z",
+      "2026-11-12T00:00:00Z",
+      "2026-12-14T00:00:00Z"
+    ],
+    "ObservationDates": [
+      "2026-04-06T00:00:00Z",
+      "2026-05-05T00:00:00Z",
+      "2026-06-05T00:00:00Z",
+      "2026-07-06T00:00:00Z",
+      "2026-08-05T00:00:00Z",
+      "2026-09-07T00:00:00Z",
+      "2026-10-05T00:00:00Z",
+      "2026-11-05T00:00:00Z",
+      "2026-12-07T00:00:00Z"
+    ],
+    "AutoCallTriggerAbsoluteDigitalSpread": -0.1,
+    "Strike": 1.0,
+    "OptionGearing": 1.0,
+    "CallabilityMonitoringIndex": "WorstOf",
+    "AutoCallTriggerLevels": [
+      55555.55,
+      55555.55,
+      55555.55,
+      55555.55,
+      55555.55,
+      55555.55,
+      55555.55,
+      55555.55,
+      55555.55
+    ],
+    "UnderlyingIdentifiers": [
+      "SBER_RUB"
+    ],
+    "UnderlyingReferenceSpots": [
+      315.42
+    ],
+    "AllowAutocallOnExpiry": false,
+    "IsLongBasket": false,
+    "FixedCouponAmount": 0.0175,
+    "OptionDownAndInBarrierLevel": 0.9,
+    "OptionDownAndInBarrierAbsoluteDigitalSpread": -0.1,
+    "CouponBarrierMonitoringIndex": "WorstOf",
+    "OptionMonitoringIndex": "WorstOf",
+    "IsMemory": false,
+    "ParticipationCallStrike": null,
+    "ParticipationCallRate": null,
+    "FixedRate": null,
+    "RateIdentifier": null,
+    "FundingSpread": null,
+    "FundingLegPaymentDates": null,
+    "AutoCallCoupon": null,
+    "PredefinedDividends": null,
+    "OptionDownAndInBarrierObservationType": null,
+    "TypeName": "AutoCallableProduct",
+    "DayCountConvention": "Act360",
+    "CouponBarrierType": "In",
+    "CouponBarrierDirection": "Up",
+    "NoNotionalRepayment": false,
+    "ForceCouponsOnAutocall": false
+  },
+  "Queries": [
+    "ProductValue",
+    "CashFlows"
+  ],
+  "TradeInfo": "58579592/EMTN_CIB_SEC",
+  "Model": {
+    "FinancingCurveIdentifiers": [
+      "RUB_RUONIA_OIS"
+    ],
+    "MarketDataSet": {
+      "TypeName": "MarketDataSet",
+      "AsOfDate": "2026-10-23T00:00:00Z",
+      "RatesCurvesBundles": {
+        "RUB_RUONIA_OIS": {
+          "TypeName": "DiscountFactorCurve",
+          "Identifier": "RUB_RUONIA_OIS",
+          "Currency": "RUB",
+          "AsOfDate": "2026-10-23T00:00:00Z",
+          "InterpolationDayCountConvention": "Act365",
+          "InterpolationMethod": "CubicSpline",
+          "InterpolationSpaceCoordinates": "Rates",
+          "ExtrapolationMethod": "Flat",
+          "RateQuoteExpression": "Percentage",
+          "RatesSchedule": {
+            "Dates": [
+              "2026-10-26T00:00:00Z",
+              "2026-11-02T00:00:00Z",
+              "2026-11-09T00:00:00Z",
+              "2026-11-26T00:00:00Z",
+              "2026-12-28T00:00:00Z",
+              "2027-01-26T00:00:00Z",
+              "2027-02-26T00:00:00Z",
+              "2027-03-26T00:00:00Z",
+              "2027-04-26T00:00:00Z",
+              "2027-05-26T00:00:00Z",
+              "2027-06-28T00:00:00Z",
+              "2027-07-26T00:00:00Z",
+              "2027-08-26T00:00:00Z",
+              "2027-09-27T00:00:00Z",
+              "2027-10-26T00:00:00Z",
+              "2028-10-26T00:00:00Z",
+              "2029-10-26T00:00:00Z",
+              "2030-10-28T00:00:00Z",
+              "2031-10-27T00:00:00Z",
+              "2032-10-26T00:00:00Z",
+              "2033-10-26T00:00:00Z",
+              "2034-10-26T00:00:00Z",
+              "2035-10-26T00:00:00Z",
+              "2036-10-27T00:00:00Z",
+              "2038-10-26T00:00:00Z",
+              "2041-10-28T00:00:00Z"
+            ],
+            "Rates": [
+              14.001939881447692,
+              13.98703042629353,
+              13.96957893830438,
+              13.925148933760209,
+              13.887687024817739,
+              13.85181785412243,
+              13.851013278374136,
+              13.854560274974029,
+              13.839385237272698,
+              13.78003102518039,
+              13.703941248404734,
+              13.653980924289353,
+              13.598296151647725,
+              13.548894457970503,
+              13.520661135766977,
+              13.37036744218053,
+              13.76993755058664,
+              14.124315104126858,
+              14.376959242003442,
+              14.632614444816273,
+              14.805551905126555,
+              14.882025899085841,
+              14.93673506070382,
+              14.979286061354363,
+              15.034574327330633,
+              15.046578312066828
+            ],
+            "Spreads": null
+          },
+          "stripped_legacy_fields": []
+        }
+      },
+      "VolatilitySurfaces": {
+        "SBER_RUB": {
+          "Identifier": "SBER_RUB",
+          "TypeName": "EquityVolatilitySmileCollection",
+          "DayCountConvention": "Act365",
+          "SmileInterpolationMethod": "CubicSpline",
+          "SmileExtrapolationMethod": "Linear",
+          "ExpirationDates": [
+            "2026-12-18T00:00:00Z",
+            "2027-03-19T00:00:00Z",
+            "2027-06-18T00:00:00Z",
+            "2027-09-17T00:00:00Z",
+            "2027-12-17T00:00:00Z",
+            "2028-12-15T00:00:00Z",
+            "2030-12-18T00:00:00Z"
+          ],
+          "Strikes": [
+            3.1000000000000227,
+            7.75,
+            31.0,
+            62.0,
+            108.5,
+            155.0,
+            201.5,
+            248.0,
+            279.0,
+            294.5,
+            310.0,
+            325.5,
+            341.0,
+            372.0,
+            465.0,
+            620.0,
+            930.0,
+            1550.0,
+            3100.0,
+            7750.0,
+            31000.0
+          ],
+          "VolatilityQuotes": [
+            [
+              0.899,
+              0.8111,
+              0.6564,
+              0.5636,
+              0.47619999999999996,
+              0.4118,
+              0.35850000000000004,
+              0.3126,
+              0.2862,
+              0.2747,
+              0.2647,
+              0.2565,
+              0.2503,
+              0.2441,
+              0.2556,
+              0.2905,
+              0.3411,
+              0.3982,
+              0.4657,
+              0.5427000000000001,
+              0.6422
+            ],
+            [
+              0.8349500000000001,
+              0.754825,
+              0.614425,
+              0.5307999999999999,
+              0.452825,
+              0.3961,
+              0.349825,
+              0.310625,
+              0.28835,
+              0.278675,
+              0.270225,
+              0.263275,
+              0.2579,
+              0.25215,
+              0.2594,
+              0.286725,
+              0.32945,
+              0.37985,
+              0.440825,
+              0.511225,
+              0.602875
+            ],
+            [
+              0.7709,
+              0.69855,
+              0.57245,
+              0.498,
+              0.42945,
+              0.3804,
+              0.34115,
+              0.30865,
+              0.2905,
+              0.28265,
+              0.27575,
+              0.27005,
+              0.2655,
+              0.2602,
+              0.2632,
+              0.28295000000000003,
+              0.3178,
+              0.3615,
+              0.41595,
+              0.47975,
+              0.56355
+            ],
+            [
+              0.70685,
+              0.642275,
+              0.530475,
+              0.46520000000000006,
+              0.406075,
+              0.36469999999999997,
+              0.332475,
+              0.30667500000000003,
+              0.29265,
+              0.286625,
+              0.281275,
+              0.276825,
+              0.2731,
+              0.26825,
+              0.267,
+              0.279175,
+              0.30615,
+              0.34314999999999996,
+              0.391075,
+              0.448275,
+              0.5242249999999999
+            ],
+            [
+              0.6428,
+              0.586,
+              0.4885,
+              0.4324,
+              0.38270000000000004,
+              0.349,
+              0.32380000000000003,
+              0.30469999999999997,
+              0.2948,
+              0.29059999999999997,
+              0.2868,
+              0.2836,
+              0.2807,
+              0.2763,
+              0.2708,
+              0.2754,
+              0.2945,
+              0.3248,
+              0.36619999999999997,
+              0.4168,
+              0.4849
+            ],
+            [
+              0.5384,
+              0.49579999999999996,
+              0.42460000000000003,
+              0.38539999999999996,
+              0.35240000000000005,
+              0.33140000000000003,
+              0.3165,
+              0.3057,
+              0.3,
+              0.29760000000000003,
+              0.2955,
+              0.29350000000000004,
+              0.2917,
+              0.2888,
+              0.2833,
+              0.2811,
+              0.2862,
+              0.3011,
+              0.32689999999999997,
+              0.3625,
+              0.41359999999999997
+            ],
+            [
+              0.44789999999999996,
+              0.41979999999999995,
+              0.375,
+              0.3521,
+              0.33399999999999996,
+              0.32299999999999995,
+              0.3155,
+              0.31,
+              0.3071,
+              0.30579999999999996,
+              0.3046,
+              0.3036,
+              0.30260000000000004,
+              0.30079999999999996,
+              0.2969,
+              0.2932,
+              0.2909,
+              0.2926,
+              0.3012,
+              0.3186,
+              0.3494
+            ]
+          ]
+        }
+      },
+      "Spots": {
+        "SBER_RUB": 290.28499999999997
+      },
+      "Correlations": {},
+      "RepoSpreadCurves": {
+        "SBER_RUB": {
+          "TypeName": "RepoSpreadCurve",
+          "Identifier": "SBER_RUB",
+          "InterpolationDayCountConvention": "Act360",
+          "InterpolationMethod": "CubicSpline",
+          "ExtrapolationMethod": "Flat",
+          "InterpolationSpaceCoordinates": "Rates",
+          "RateQuoteExpression": "Percentage",
+          "RatesSchedule": {
+            "Periods": [
+              "31D",
+              "90D",
+              "182D",
+              "270D",
+              "367D",
+              "460D",
+              "507D",
+              "550D",
+              "913D",
+              "1095D",
+              "1277D"
+            ],
+            "Rates": [
+              -0.5,
+              -0.5,
+              -0.5,
+              -0.5,
+              -0.5,
+              -0.5,
+              -0.5,
+              -0.5,
+              -0.5,
+              -0.5,
+              -0.5
+            ]
+          }
+        }
+      },
+      "Dividends": {
+        "SBER_RUB": {
+          "TypeName": "Dividends",
+          "Identifier": "SBER_RUB",
+          "CashDividendList": [
+            {
+              "ExDate": "2027-07-20T00:00:00Z",
+              "PaymentDate": "2027-07-20T00:00:00Z",
+              "Amount": 27.84
+            },
+            {
+              "ExDate": "2028-07-20T00:00:00Z",
+              "PaymentDate": "2028-07-20T00:00:00Z",
+              "Amount": 23.49
+            },
+            {
+              "ExDate": "2029-07-20T00:00:00Z",
+              "PaymentDate": "2029-07-20T00:00:00Z",
+              "Amount": 21.75
+            },
+            {
+              "ExDate": "2030-07-20T00:00:00Z",
+              "PaymentDate": "2030-07-20T00:00:00Z",
+              "Amount": 20.01
+            },
+            {
+              "ExDate": "2031-07-20T00:00:00Z",
+              "PaymentDate": "2031-07-20T00:00:00Z",
+              "Amount": 18.27
+            }
+          ]
+        }
+      },
+      "Fixings": {
+        "SBER_RUB": {
+          "TypeName": "Fixings",
+          "Identifier": "SBER_RUB",
+          "Dates": [
+            "2026-04-06T00:00:00Z",
+            "2026-05-05T00:00:00Z",
+            "2026-06-05T00:00:00Z",
+            "2026-07-06T00:00:00Z",
+            "2026-08-05T00:00:00Z",
+            "2026-09-07T00:00:00Z",
+            "2026-10-05T00:00:00Z"
+          ],
+          "Values": [
+            319.47,
+            322.0,
+            322.18,
+            298.68,
+            287.45,
+            279.61,
+            282.05
+          ]
+        }
+      }
+    },
+    "TypeName": "DupireLocalVolatilityModel",
+    "stripped_legacy_fields": [
+      "UseNumeraireCurrencyParameterForCrossCurrency"
+    ]
+  }
+}

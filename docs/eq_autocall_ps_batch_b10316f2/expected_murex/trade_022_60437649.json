@@ -1,0 +1,571 @@
+{
+  "BatchId": "b10316f28c2fdfa9058be6611306735e98fc4fb3",
+  "Source": "Murex MonteCarloWithAAD (ps batch result)",
+  "MurexEngine": {
+    "BatchSizeForMCPath": 16384,
+    "CalculationMethod": "MonteCarloWithAAD",
+    "GreekMetricsSettings": {
+      "DifferentiationMethod": "LibTorch"
+    },
+    "HostName": null,
+    "NumberOfPaths": 32768
+  },
+  "TradeInfo": "60437649/EMTN_CIB_SEC",
+  "ProductValue": 0.9685233891618084,
+  "ReportingCurrency": "RUB",
+  "StandardError": 0.0006227852207995556,
+  "CashToSettleToday": 0.0,
+  "CashFlows": [
+    {
+      "Description": "FundingLeg",
+      "Date": "2026-06-16 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2026-06-16 00:00:00+00:00",
+      "Amount": 0.015419999999999991,
+      "StandardError": 2.87589925185429e-12,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2026-06-16 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2026-07-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2026-07-15 00:00:00+00:00",
+      "Amount": 0.015419999999999991,
+      "StandardError": 2.87589925185429e-12,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2026-07-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2026-08-17 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2026-08-17 00:00:00+00:00",
+      "Amount": 0.015419999999999991,
+      "StandardError": 2.87589925185429e-12,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2026-08-17 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2026-09-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2026-09-15 00:00:00+00:00",
+      "Amount": 0.015419999999999991,
+      "StandardError": 2.87589925185429e-12,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2026-09-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2026-10-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2026-10-15 00:00:00+00:00",
+      "Amount": 0.015419999999999991,
+      "StandardError": 2.87589925185429e-12,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2026-10-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Settled",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2026-11-16 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2026-11-16 00:00:00+00:00",
+      "Amount": 0.015279196144302095,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2026-11-16 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2026-12-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2026-12-15 00:00:00+00:00",
+      "Amount": 0.015111902599340145,
+      "StandardError": 3.150389786705651e-12,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2026-12-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2027-01-18 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2027-01-18 00:00:00+00:00",
+      "Amount": 0.014918907045559175,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2027-01-18 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2027-02-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2027-02-15 00:00:00+00:00",
+      "Amount": 0.014761675672453513,
+      "StandardError": 2.87589925185429e-12,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2027-02-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2027-03-16 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2027-03-16 00:00:00+00:00",
+      "Amount": 0.014599796700929509,
+      "StandardError": 3.749713863961797e-12,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2027-03-16 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2027-04-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2027-04-15 00:00:00+00:00",
+      "Amount": 0.014434819050594102,
+      "StandardError": 3.637756782813511e-12,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2027-04-15 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "FundingLeg",
+      "Date": "2027-05-17 00:00:00+00:00",
+      "Amount": 0.0,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Coupon",
+      "Date": "2027-05-17 00:00:00+00:00",
+      "Amount": 0.01426451010220206,
+      "StandardError": 0.0,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Option",
+      "Date": "2027-05-17 00:00:00+00:00",
+      "Amount": -0.05991292413295342,
+      "StandardError": 0.0006227852207977601,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    },
+    {
+      "Description": "Notional",
+      "Date": "2027-05-17 00:00:00+00:00",
+      "Amount": 0.9250655059793812,
+      "StandardError": 1.1640821705003236e-10,
+      "Currency": "RUB",
+      "StatusText": "Estimate",
+      "Leg": 0
+    }
+  ],
+  "Greeks": {
+    "Delta": {
+      "SBER_RUB": 0.0013538444355581777
+    },
+    "Gamma": {
+      "SBER_RUB": -2.2569661295854912e-05
+    },
+    "Vega": {
+      "SBER_RUB": [
+        [
+          5.169261692831985e-09,
+          -1.798673047278249e-08,
+          1.1682327893117332e-07,
+          -5.903659720574934e-07,
+          3.5126617826110567e-06,
+          -4.729474695077342e-05,
+          0.00021833833669225345,
+          -0.0017566334524773994,
+          0.004683949414077113,
+          -0.007470055018486852,
+          0.008022884740927851,
+          -0.0015538450032022972,
+          -0.0009227863715454924,
+          -0.0003501738256505942,
+          2.327271329706632e-05,
+          -4.302101951282397e-06,
+          8.258901666979872e-07,
+          -1.766126071040735e-07,
+          3.462878715832444e-08,
+          -6.4593985873265316e-09,
+          7.555426745546095e-10
+        ],
+        [
+          6.208151664560251e-07,
+          -2.1644976728471234e-06,
+          1.414043335986785e-05,
+          -7.189757941063361e-05,
+          0.00043192700949398093,
+          -0.002569208152190589,
+          0.013944341277182639,
+          0.004191706617084755,
+          -0.10506758759094066,
+          -0.00948719411279551,
+          -0.007306200642466062,
+          -0.0030424826835226677,
+          -0.0027415475292078394,
+          -0.0018117369533465612,
+          -2.1348005387041304e-05,
+          6.356549131597984e-06,
+          -1.1941293508619347e-06,
+          2.5220509851158187e-07,
+          -4.9070280964256476e-08,
+          9.108893650512203e-09,
+          -1.0617866442408186e-09
+        ],
+        [
+          2.1999153340635972e-07,
+          -7.688018445447715e-07,
+          5.056354016261413e-06,
+          -2.5889208303246406e-05,
+          0.0001572166890299465,
+          -0.0009068276808283428,
+          0.0057759103706283114,
+          0.04297177593823427,
+          -0.11763276820773218,
+          -0.0671414057461432,
+          -0.048357287835639896,
+          -0.00819027171792576,
+          -0.0015418619784964736,
+          -0.0003657630738692039,
+          -6.947149445469287e-06,
+          1.2675076395999562e-06,
+          -2.3275595159246233e-07,
+          4.849925567019807e-08,
+          -9.355747618598139e-09,
+          1.7272435198517364e-09,
+          -2.0055222199384712e-10
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      ]
+    },
+    "Rho": {
+      "RUB_RUONIA_OIS": [
+        -1.8580683299639857e-05,
+        7.43227331985594e-05,
+        -0.0003263895901925601,
+        -0.001520225582345198,
+        -0.002399672044187822,
+        -0.003638836193375563,
+        -0.007465400458887668,
+        0.01653774835735258,
+        -0.03230563876734323,
+        -0.3229586577554369,
+        0.05813443273609581,
+        -0.01597464057778039,
+        0.003776330415353009,
+        -0.0009543596800184477,
+        0.00018595986010378596,
+        -9.500501820789751e-07,
+        2.5484597457140693e-07,
+        -6.80947027222192e-08,
+        1.838817686867835e-08,
+        -4.912500853712683e-09,
+        1.3161302778284996e-09,
+        -3.5202025760131525e-10,
+        9.200476626311704e-11,
+        -1.9730250777269143e-11,
+        2.0464784234324038e-12,
+        -3.2582554626756326e-13
+      ],
+      "SBER_RUB": [
+        -0.007591987787291416,
+        0.020094077343474584,
+        -0.1903592430148751,
+        -0.040402051746142316,
+        0.008803789743124533,
+        -0.003399856543321365,
+        0.0016586548280024813,
+        -0.00032776232130085604,
+        5.103278932739486e-06,
+        -2.7162586244617325e-06,
+        6.790646561154331e-07
+      ]
+    },
+    "Theta": 0.001278851685682425,
+    "Cega": {}
+  }
+}

@@ -1,0 +1,469 @@
+{
+  "Product": {
+    "PaymentCurrency": "RUB",
+    "StartDate": "2025-12-08T00:00:00Z",
+    "PaymentDates": [
+      "2026-03-17T00:00:00Z",
+      "2026-06-17T00:00:00Z",
+      "2026-09-15T00:00:00Z",
+      "2026-12-15T00:00:00Z"
+    ],
+    "ObservationDates": [
+      "2026-03-10T00:00:00Z",
+      "2026-06-08T00:00:00Z",
+      "2026-09-08T00:00:00Z",
+      "2026-12-08T00:00:00Z"
+    ],
+    "AutoCallTriggerAbsoluteDigitalSpread": -0.15,
+    "Strike": 1.0,
+    "OptionGearing": 1.0,
+    "CallabilityMonitoringIndex": "WorstOf",
+    "AutoCallTriggerLevels": [
+      666666.66,
+      666666.66,
+      666666.66,
+      666666.66
+    ],
+    "UnderlyingIdentifiers": [
+      "YDEX_RUB"
+    ],
+    "UnderlyingReferenceSpots": [
+      4336.5
+    ],
+    "AllowAutocallOnExpiry": false,
+    "IsLongBasket": false,
+    "FixedCouponAmount": 0.05375,
+    "OptionDownAndInBarrierLevel": 1.0,
+    "OptionDownAndInBarrierAbsoluteDigitalSpread": -0.1,
+    "CouponBarrierMonitoringIndex": "WorstOf",
+    "OptionMonitoringIndex": "WorstOf",
+    "IsMemory": false,
+    "ParticipationCallStrike": null,
+    "ParticipationCallRate": null,
+    "FixedRate": null,
+    "RateIdentifier": null,
+    "FundingSpread": null,
+    "FundingLegPaymentDates": null,
+    "AutoCallCoupon": null,
+    "PredefinedDividends": null,
+    "OptionDownAndInBarrierObservationType": null,
+    "TypeName": "AutoCallableProduct",
+    "DayCountConvention": "Act360",
+    "CouponBarrierType": "In",
+    "CouponBarrierDirection": "Up",
+    "NoNotionalRepayment": false,
+    "ForceCouponsOnAutocall": false
+  },
+  "Queries": [
+    "ProductValue",
+    "CashFlows"
+  ],
+  "TradeInfo": "56615092/EMTN_CIB_SEC",
+  "Model": {
+    "FinancingCurveIdentifiers": [
+      "RUB_RUONIA_OIS"
+    ],
+    "MarketDataSet": {
+      "TypeName": "MarketDataSet",
+      "AsOfDate": "2026-10-23T00:00:00Z",
+      "RatesCurvesBundles": {
+        "RUB_RUONIA_OIS": {
+          "TypeName": "DiscountFactorCurve",
+          "Identifier": "RUB_RUONIA_OIS",
+          "Currency": "RUB",
+          "AsOfDate": "2026-10-23T00:00:00Z",
+          "InterpolationDayCountConvention": "Act365",
+          "InterpolationMethod": "CubicSpline",
+          "InterpolationSpaceCoordinates": "Rates",
+          "ExtrapolationMethod": "Flat",
+          "RateQuoteExpression": "Percentage",
+          "RatesSchedule": {
+            "Dates": [
+              "2026-10-26T00:00:00Z",
+              "2026-11-02T00:00:00Z",
+              "2026-11-09T00:00:00Z",
+              "2026-11-26T00:00:00Z",
+              "2026-12-28T00:00:00Z",
+              "2027-01-26T00:00:00Z",
+              "2027-02-26T00:00:00Z",
+              "2027-03-26T00:00:00Z",
+              "2027-04-26T00:00:00Z",
+              "2027-05-26T00:00:00Z",
+              "2027-06-28T00:00:00Z",
+              "2027-07-26T00:00:00Z",
+              "2027-08-26T00:00:00Z",
+              "2027-09-27T00:00:00Z",
+              "2027-10-26T00:00:00Z",
+              "2028-10-26T00:00:00Z",
+              "2029-10-26T00:00:00Z",
+              "2030-10-28T00:00:00Z",
+              "2031-10-27T00:00:00Z",
+              "2032-10-26T00:00:00Z",
+              "2033-10-26T00:00:00Z",
+              "2034-10-26T00:00:00Z",
+              "2035-10-26T00:00:00Z",
+              "2036-10-27T00:00:00Z",
+              "2038-10-26T00:00:00Z",
+              "2041-10-28T00:00:00Z"
+            ],
+            "Rates": [
+              14.001939881447692,
+              13.98703042629353,
+              13.96957893830438,
+              13.925148933760209,
+              13.887687024817739,
+              13.85181785412243,
+              13.851013278374136,
+              13.854560274974029,
+              13.839385237272698,
+              13.78003102518039,
+              13.703941248404734,
+              13.653980924289353,
+              13.598296151647725,
+              13.548894457970503,
+              13.520661135766977,
+              13.37036744218053,
+              13.76993755058664,
+              14.124315104126858,
+              14.376959242003442,
+              14.632614444816273,
+              14.805551905126555,
+              14.882025899085841,
+              14.93673506070382,
+              14.979286061354363,
+              15.034574327330633,
+              15.046578312066828
+            ],
+            "Spreads": null
+          },
+          "stripped_legacy_fields": []
+        }
+      },
+      "VolatilitySurfaces": {
+        "YDEX_RUB": {
+          "Identifier": "YDEX_RUB",
+          "TypeName": "EquityVolatilitySmileCollection",
+          "DayCountConvention": "Act365",
+          "SmileInterpolationMethod": "CubicSpline",
+          "SmileExtrapolationMethod": "Linear",
+          "ExpirationDates": [
+            "2026-12-18T00:00:00Z",
+            "2027-03-19T00:00:00Z",
+            "2027-06-18T00:00:00Z",
+            "2027-09-17T00:00:00Z",
+            "2027-12-17T00:00:00Z",
+            "2028-12-15T00:00:00Z",
+            "2030-12-18T00:00:00Z"
+          ],
+          "Strikes": [
+            37.0,
+            92.5,
+            370.0,
+            740.0,
+            1295.0,
+            1850.0,
+            2405.0,
+            2960.0,
+            3330.0,
+            3515.0,
+            3700.0,
+            3885.0,
+            4070.0,
+            4440.0,
+            5550.0,
+            7400.0,
+            11100.0,
+            18500.0,
+            37000.0,
+            92500.0,
+            370000.0
+          ],
+          "VolatilityQuotes": [
+            [
+              1.4044999999999999,
+              1.2642,
+              1.0156999999999998,
+              0.8654999999999999,
+              0.7222,
+              0.6144,
+              0.5227,
+              0.44,
+              0.3897,
+              0.3669,
+              0.3467,
+              0.33020000000000005,
+              0.31829999999999997,
+              0.3085,
+              0.3312,
+              0.3832,
+              0.4534,
+              0.5311,
+              0.6221,
+              0.7256,
+              0.8591
+            ],
+            [
+              1.0925,
+              0.9875,
+              0.8033,
+              0.6936,
+              0.5912,
+              0.5167,
+              0.4562,
+              0.4052,
+              0.3763,
+              0.3636,
+              0.3522,
+              0.3423,
+              0.33399999999999996,
+              0.3224,
+              0.3184,
+              0.3439,
+              0.39159999999999995,
+              0.4498,
+              0.5206000000000001,
+              0.6028,
+              0.7098
+            ],
+            [
+              0.9242,
+              0.8384,
+              0.6890999999999999,
+              0.6015,
+              0.5214,
+              0.46490000000000004,
+              0.4207,
+              0.38520000000000004,
+              0.36590000000000006,
+              0.3576,
+              0.35009999999999997,
+              0.3435,
+              0.3378,
+              0.32909999999999995,
+              0.3196,
+              0.3301,
+              0.3618,
+              0.40619999999999995,
+              0.4635,
+              0.5316,
+              0.6217
+            ],
+            [
+              0.8207,
+              0.7475,
+              0.6214,
+              0.5485,
+              0.4832,
+              0.43829999999999997,
+              0.4042,
+              0.3776,
+              0.36329999999999996,
+              0.35700000000000004,
+              0.3514,
+              0.3464,
+              0.3419,
+              0.3346,
+              0.3232,
+              0.3245,
+              0.34409999999999996,
+              0.37810000000000005,
+              0.4254,
+              0.48369999999999996,
+              0.5621
+            ],
+            [
+              0.748,
+              0.6836,
+              0.5736,
+              0.511,
+              0.456,
+              0.419,
+              0.39159999999999995,
+              0.37060000000000004,
+              0.35950000000000004,
+              0.3546,
+              0.3503,
+              0.34630000000000005,
+              0.3428,
+              0.3368,
+              0.32630000000000003,
+              0.3237,
+              0.33549999999999996,
+              0.3614,
+              0.4007,
+              0.4512,
+              0.5206000000000001
+            ],
+            [
+              0.5962,
+              0.5521,
+              0.4793,
+              0.4401,
+              0.40740000000000004,
+              0.3868,
+              0.3722,
+              0.36119999999999997,
+              0.3554,
+              0.3528,
+              0.3505,
+              0.3483,
+              0.34630000000000005,
+              0.3428,
+              0.33509999999999995,
+              0.3287,
+              0.3264,
+              0.33299999999999996,
+              0.3513,
+              0.38130000000000003,
+              0.4278
+            ],
+            [
+              0.4857,
+              0.45880000000000004,
+              0.4168,
+              0.3956,
+              0.3789,
+              0.36869999999999997,
+              0.3616,
+              0.3563,
+              0.35340000000000005,
+              0.3521,
+              0.35090000000000005,
+              0.3497,
+              0.34869999999999995,
+              0.3468,
+              0.3422,
+              0.3372,
+              0.332,
+              0.32880000000000004,
+              0.33,
+              0.33899999999999997,
+              0.36090000000000005
+            ]
+          ]
+        }
+      },
+      "Spots": {
+        "YDEX_RUB": 3400.25
+      },
+      "Correlations": {},
+      "RepoSpreadCurves": {
+        "YDEX_RUB": {
+          "TypeName": "RepoSpreadCurve",
+          "Identifier": "YDEX_RUB",
+          "InterpolationDayCountConvention": "Act360",
+          "InterpolationMethod": "CubicSpline",
+          "ExtrapolationMethod": "Flat",
+          "InterpolationSpaceCoordinates": "Rates",
+          "RateQuoteExpression": "Percentage",
+          "RatesSchedule": {
+            "Periods": [
+              "31D",
+              "90D",
+              "182D",
+              "270D",
+              "367D",
+              "460D",
+              "507D",
+              "550D",
+              "913D",
+              "1095D",
+              "1277D"
+            ],
+            "Rates": [
+              -0.25,
+              -0.25,
+              -0.25,
+              -0.25,
+              -0.25,
+              -0.25,
+              -0.25,
+              -0.25,
+              -0.25,
+              -0.25,
+              -0.25
+            ]
+          }
+        }
+      },
+      "Dividends": {
+        "YDEX_RUB": {
+          "TypeName": "Dividends",
+          "Identifier": "YDEX_RUB",
+          "CashDividendList": [
+            {
+              "ExDate": "2027-05-06T00:00:00Z",
+              "PaymentDate": "2027-05-06T00:00:00Z",
+              "Amount": 95.7
+            },
+            {
+              "ExDate": "2027-10-06T00:00:00Z",
+              "PaymentDate": "2027-10-06T00:00:00Z",
+              "Amount": 87.0
+            },
+            {
+              "ExDate": "2028-05-05T00:00:00Z",
+              "PaymentDate": "2028-05-05T00:00:00Z",
+              "Amount": 87.0
+            },
+            {
+              "ExDate": "2028-10-05T00:00:00Z",
+              "PaymentDate": "2028-10-05T00:00:00Z",
+              "Amount": 87.0
+            },
+            {
+              "ExDate": "2029-05-05T00:00:00Z",
+              "PaymentDate": "2029-05-05T00:00:00Z",
+              "Amount": 87.0
+            },
+            {
+              "ExDate": "2029-10-05T00:00:00Z",
+              "PaymentDate": "2029-10-05T00:00:00Z",
+              "Amount": 78.3
+            },
+            {
+              "ExDate": "2030-05-05T00:00:00Z",
+              "PaymentDate": "2030-05-05T00:00:00Z",
+              "Amount": 78.3
+            },
+            {
+              "ExDate": "2030-10-06T00:00:00Z",
+              "PaymentDate": "2030-10-06T00:00:00Z",
+              "Amount": 78.3
+            },
+            {
+              "ExDate": "2031-05-05T00:00:00Z",
+              "PaymentDate": "2031-05-05T00:00:00Z",
+              "Amount": 69.6
+            },
+            {
+              "ExDate": "2031-10-06T00:00:00Z",
+              "PaymentDate": "2031-10-06T00:00:00Z",
+              "Amount": 69.6
+            }
+          ]
+        }
+      },
+      "Fixings": {
+        "YDEX_RUB": {
+          "TypeName": "Fixings",
+          "Identifier": "YDEX_RUB",
+          "Dates": [
+            "2026-03-10T00:00:00Z",
+            "2026-06-08T00:00:00Z",
+            "2026-09-08T00:00:00Z"
+          ],
+          "Values": [
+            4548.5,
+            3871.0,
+            3825.0
+          ]
+        }
+      }
+    },
+    "TypeName": "DupireLocalVolatilityModel",
+    "stripped_legacy_fields": [
+      "UseNumeraireCurrencyParameterForCrossCurrency"
+    ]
+  }
+}
