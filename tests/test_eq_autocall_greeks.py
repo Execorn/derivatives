@@ -1877,6 +1877,244 @@ def test_gpu_onestar_theta_and_pv_only_invariance() -> None:
             assert th_err_bps < th_lim, f"{fn} Theta err {th_err_bps:.2f} bps"
 
 
+def test_anchored_lv_t_grid_m1_length_and_cg_buckets() -> None:
+    """Verifies anchored LV time grid preserves exact lv_nt even when tau0 == t_max (m_rem=1)."""
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        _build_anchored_lv_t_grid,
+        _resolve_qmc_cg_bucket,
+    )
+
+    grid_m1 = _build_anchored_lv_t_grid(np.array([0.24931507], dtype=np.float64), {}, lv_nt=32)
+    assert grid_m1.shape == (32,)
+    assert np.all(np.diff(grid_m1) > 0.0)
+    assert grid_m1[0] >= 1e-5 and grid_m1[-1] == pytest.approx(0.24931507, rel=1e-6)
+
+    grid_short = _build_anchored_lv_t_grid(
+        np.array([0.05, 0.15, 0.30, 0.50], dtype=np.float64),
+        {},
+        lv_nt=32,
+    )
+    assert grid_short.shape == (32,)
+    assert np.all(np.diff(grid_short) > 0.0)
+    assert np.min(np.abs(grid_short - 0.05)) < 1e-6
+
+    assert _resolve_qmc_cg_bucket(3, 28, 4) == (3, 28)
+    assert _resolve_qmc_cg_bucket(3, 40, 4) == (3, 40)
+    assert _resolve_qmc_cg_bucket(4, 40, 4) == (6, 40)
+
+
+def test_long_tau0_anchor_cell_avg_and_three_law_cv(
+    multi_period_request: EQAutocallableTradeRequest,
+) -> None:
+    """Verifies gated single-knot tau0 LV32, Voronoi K=4 cell-avg AAD pullback FD parity, and 3-Law CV."""
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        _build_anchored_lv_t_grid,
+        _build_lv_table_and_forward_cache,
+        _compute_three_law_conserved_s1,
+        _is_long_single_tau0_anchor_deal,
+        _pullback_lv_to_r_nat_and_div,
+        _pullback_lv_to_raw_quotes,
+    )
+
+    tau_long = np.linspace(0.04, 2.0, 18, dtype=np.float64)
+    assert _is_long_single_tau0_anchor_deal(tau_long, lv_nt=32, d_assets=3) is True
+    assert _is_long_single_tau0_anchor_deal(tau_long, lv_nt=32, d_assets=5) is False
+    assert _is_long_single_tau0_anchor_deal(np.linspace(0.04, 3.0, 40, dtype=np.float64), lv_nt=32, d_assets=3) is False
+
+    g_d3 = _build_anchored_lv_t_grid(tau_long, {}, lv_nt=32, d_assets=3)
+    assert g_d3.shape == (32,)
+    assert np.all(np.diff(g_d3) > 0.0)
+    assert g_d3[0] == pytest.approx(1e-5, abs=1e-12)
+    assert g_d3[1] == pytest.approx(0.04, abs=1e-9)
+    assert g_d3[-1] == pytest.approx(2.0, abs=1e-9)
+
+    g_d5 = _build_anchored_lv_t_grid(tau_long, {}, lv_nt=32, d_assets=5)
+    assert np.allclose(g_d5, np.linspace(1e-5, 2.0, 32, dtype=np.float64))
+
+    st_base = preprocess_eq_autocall(multi_period_request)
+    tk0 = st_base.sorted_identifiers[0]
+    surf0 = st_base.vol_surfaces[tk0]
+    tau_obs = st_base.tau_obs.detach().cpu().numpy().astype(np.float64)
+    r_nat0 = st_base.dividend_schedule.r_native_obs[0].detach().cpu().numpy().astype(np.float64)
+    dpv0 = st_base.dividend_schedule.div_pv[0].detach().cpu().numpy().astype(np.float64)
+    spot0 = float(st_base.spots_t0[0].item())
+    t_grid = np.linspace(1e-5, float(tau_obs[-1]), 32, dtype=np.float64)
+    y_grid = np.linspace(-1.5, 1.5, 64, dtype=np.float64)
+
+    cavg0 = _build_lv_table_and_forward_cache(
+        surf0, spot0, tau_obs, r_nat0, t_grid, y_grid, dpv0, need_vega_jac=True, use_cavg=True
+    )
+    assert "_cavg_fe" in cavg0
+    rng = np.random.default_rng(19)
+    bar_lv = rng.standard_normal(cavg0["lv_out"].shape)
+    g_rn, g_dpv = _pullback_lv_to_r_nat_and_div(cavg0, bar_lv)
+    g_q = _pullback_lv_to_raw_quotes(surf0, cavg0, bar_lv)
+    assert g_q.shape == (surf0.n_exp, surf0.n_raw_strikes)
+    assert np.all(np.isfinite(g_q))
+
+    h = 1e-7
+    for m_idx in range(len(tau_obs)):
+        rn_p, rn_m = r_nat0.copy(), r_nat0.copy()
+        rn_p[m_idx] += h
+        rn_m[m_idx] -= h
+        lv_p = _build_lv_table_and_forward_cache(
+            surf0, spot0, tau_obs, rn_p, t_grid, y_grid, dpv0, need_vega_jac=False, use_cavg=True
+        )["lv_out"]
+        lv_m = _build_lv_table_and_forward_cache(
+            surf0, spot0, tau_obs, rn_m, t_grid, y_grid, dpv0, need_vega_jac=False, use_cavg=True
+        )["lv_out"]
+        fd_rn = float(np.sum(bar_lv * (lv_p - lv_m))) / (2.0 * h)
+        assert abs(float(g_rn[m_idx]) - fd_rn) <= max(1e-5, 1e-3 * abs(fd_rn))
+
+        dp_p, dp_m = dpv0.copy(), dpv0.copy()
+        dp_p[m_idx] += h
+        dp_m[m_idx] -= h
+        lv_dp = _build_lv_table_and_forward_cache(
+            surf0, spot0, tau_obs, r_nat0, t_grid, y_grid, dp_p, need_vega_jac=False, use_cavg=True
+        )["lv_out"]
+        lv_dm = _build_lv_table_and_forward_cache(
+            surf0, spot0, tau_obs, r_nat0, t_grid, y_grid, dp_m, need_vega_jac=False, use_cavg=True
+        )["lv_out"]
+        fd_dp = float(np.sum(bar_lv * (lv_dp - lv_dm))) / (2.0 * h)
+        assert abs(float(g_dpv[m_idx]) - fd_dp) <= max(1e-5, 1e-3 * abs(fd_dp))
+
+    # Three-Law conserved Stage-1 CV conservation invariants
+    m_rem_cv, eff_r_cv = 6, 12
+    n_cols = 3 * m_rem_cv + 5
+    is_call = np.array([0.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64)
+    df_pay = np.linspace(0.98, 0.85, m_rem_cv, dtype=np.float64)
+    crn = np.abs(rng.normal(0.05, 0.01, size=(eff_r_cv, n_cols)))
+    crn[:, 0] = 0.0
+    s1 = crn * 0.96 + rng.normal(0.0, 0.002, size=(eff_r_cv, n_cols))
+    s1[:, 0] = 0.0
+    chp = np.abs(rng.normal(0.052, 0.002, size=(32, n_cols)))
+    chp[:, 0] = 0.0
+    out_cv, beta_pv = _compute_three_law_conserved_s1(s1, crn, chp, is_call, df_pay, m_rem_cv, eff_r_cv, n_rep=1024)
+    assert 0.0 <= beta_pv <= 1.0
+    assert out_cv[0] == 0.0
+    assert np.all(out_cv[:m_rem_cv] >= 0.0)
+    assert float(np.sum(out_cv[:m_rem_cv])) <= 1.0 + 1e-12
+    assert np.all(out_cv[m_rem_cv : 3 * m_rem_cv + 4] >= 0.0)
+
+
+def test_cg_eff_r_cap_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies split-budget CUDAGraph replicate capping across canonical bucket shapes."""
+    from deepvol.models.autocall.qmc_aad_greeks import _resolve_qmc_cg_eff_r_cap
+
+    monkeypatch.delenv("DEEPVOL_QMC_CG_S1_TAIL", raising=False)
+    assert _resolve_qmc_cg_eff_r_cap(6, 40, 12) == 4
+    assert _resolve_qmc_cg_eff_r_cap(6, 40, 8) == 4
+    assert _resolve_qmc_cg_eff_r_cap(6, 20, 16) == 8
+    assert _resolve_qmc_cg_eff_r_cap(6, 20, 12) == 12
+    assert _resolve_qmc_cg_eff_r_cap(3, 28, 24) == 12
+    assert _resolve_qmc_cg_eff_r_cap(3, 28, 16) == 12
+    assert _resolve_qmc_cg_eff_r_cap(3, 28, 12) == 12
+    assert _resolve_qmc_cg_eff_r_cap(3, 20, 32) == 12
+    assert _resolve_qmc_cg_eff_r_cap(3, 40, 8) == 8
+
+    monkeypatch.setenv("DEEPVOL_QMC_CG_S1_TAIL", "0")
+    assert _resolve_qmc_cg_eff_r_cap(6, 40, 12) == 12
+    assert _resolve_qmc_cg_eff_r_cap(3, 20, 32) == 32
+
+
+@pytest.mark.gpu
+def test_gpu_split_budget_s1_tail_parity_and_pv_only_invariance(
+    multi_period_request: EQAutocallableTradeRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies split-budget Stage-1 tail matches full-budget PV/CF, preserves eff_r_cg Greeks, and keeps pv_only <= 1e-6."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device not available")
+
+    from deepvol.models.autocall.qmc_aad_greeks import (
+        QmcAadGreeksConfig,
+        _resolve_qmc_cg_bucket,
+        _resolve_qmc_cg_eff_r_cap,
+        clear_qmc_aad_gpu_caches,
+        compute_qmc_aad_crn_greeks,
+    )
+
+    state = preprocess_eq_autocall(multi_period_request)
+    bkt = _resolve_qmc_cg_bucket(len(state.sorted_identifiers), len(state.tau_obs), 4)
+    assert bkt is not None
+    monkeypatch.setenv("DEEPVOL_QMC_CG_S1_TAIL", "1")
+    eff_r_cg_expected = _resolve_qmc_cg_eff_r_cap(bkt[0], bkt[1], 16)
+    assert eff_r_cg_expected < 16
+
+    all_q = ["ProductValue", "CashFlows", "Delta", "Gamma", "Vega", "Rho", "Theta", "Cega", "DividendsSensitivities"]
+    cfg_16k = QmcAadGreeksConfig(
+        n_paths=16384,
+        n_replicates=16,
+        n_substeps=4,
+        lv_grid_nt=32,
+        lv_grid_ny=64,
+        cv_mode="multifidelity_gbm",
+        n_cheap_mf=262144,
+        seed=42,
+    )
+    cfg_cg_base = QmcAadGreeksConfig(
+        n_paths=eff_r_cg_expected * 1024,
+        n_replicates=eff_r_cg_expected,
+        n_substeps=4,
+        lv_grid_nt=32,
+        lv_grid_ny=64,
+        cv_mode="multifidelity_gbm",
+        n_cheap_mf=262144,
+        seed=42,
+    )
+
+    try:
+        clear_qmc_aad_gpu_caches()
+        monkeypatch.setenv("DEEPVOL_QMC_CG_S1_TAIL", "1")
+        # Cold capture + warm replay with split-budget Stage-1 tail.
+        res_tail_cold = compute_qmc_aad_crn_greeks(
+            state, request=multi_period_request, queries=all_q, config=cfg_16k, device=torch.device("cuda")
+        )
+        res_tail_warm = compute_qmc_aad_crn_greeks(
+            state, request=multi_period_request, queries=all_q, config=cfg_16k, device=torch.device("cuda")
+        )
+        res_pv_only = compute_qmc_aad_crn_greeks(
+            state,
+            request=multi_period_request,
+            queries=["ProductValue", "CashFlows"],
+            config=cfg_16k,
+            device=torch.device("cuda"),
+        )
+
+        # Reference full-Greeks run at eff_r_cg_expected (exact Greeks & Theta baseline).
+        res_cg_base = compute_qmc_aad_crn_greeks(
+            state, request=multi_period_request, queries=all_q, config=cfg_cg_base, device=torch.device("cuda")
+        )
+
+        # Reference 16k native full-budget CUDAGraph (S1 tail disabled).
+        clear_qmc_aad_gpu_caches()
+        monkeypatch.setenv("DEEPVOL_QMC_CG_S1_TAIL", "0")
+        res_full_16k = compute_qmc_aad_crn_greeks(
+            state, request=multi_period_request, queries=all_q, config=cfg_16k, device=torch.device("cuda")
+        )
+
+        # Cold vs warm replay determinism
+        assert abs(float(res_tail_cold.product_value) - float(res_tail_warm.product_value)) <= 1e-6
+        # Stage-1 PV & CashFlows parity against full-budget 16k CUDAGraph and pv_only
+        assert abs(float(res_tail_warm.product_value) - float(res_full_16k.product_value)) <= 1e-5
+        assert abs(float(res_tail_warm.product_value) - float(res_pv_only.product_value)) <= 1e-6
+        cf_tail = {(cf.Date, cf.Description): float(cf.Amount) for cf in (res_tail_warm.cash_flows or [])}
+        cf_full = {(cf.Date, cf.Description): float(cf.Amount) for cf in (res_full_16k.cash_flows or [])}
+        cf_pv = {(cf.Date, cf.Description): float(cf.Amount) for cf in (res_pv_only.cash_flows or [])}
+        for k in set(cf_tail) | set(cf_full):
+            assert abs(cf_tail.get(k, 0.0) - cf_full.get(k, 0.0)) <= 1e-5
+            assert abs(cf_tail.get(k, 0.0) - cf_pv.get(k, 0.0)) <= 1e-6
+
+        # Greeks & Theta match eff_r_cg_expected CUDAGraph identically
+        assert abs(float(res_tail_warm.theta or 0.0) - float(res_cg_base.theta or 0.0)) <= 1e-6
+        for tk, d_v in (res_cg_base.delta or {}).items():
+            assert abs(float((res_tail_warm.delta or {})[tk]) - float(d_v)) <= 1e-6
+    finally:
+        clear_qmc_aad_gpu_caches()
+
+
+
+
 
 
 

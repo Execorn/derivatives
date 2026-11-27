@@ -1125,6 +1125,8 @@ def test_repair_arbitrage_quotes_and_canonical_tier3_config(
             )
             assert info_irao["repaired"] is True
             assert info_irao["repaired_slices"] == list(range(7))
+            orig_irao_q = np.asarray(s_irao.VolatilityQuotes, dtype=np.float64)
+            assert np.array_equal(rep_irao[:, :21], orig_irao_q[:, :21])
             surf_irao = RegularizedVolSurface(
                 {
                     "Identifier": "IRAO_RUB",
@@ -1134,6 +1136,12 @@ def test_repair_arbitrage_quotes_and_canonical_tier3_config(
                 }
             )
             assert surf_irao.n_exp == 7
+
+    # 5. Clean surface pass-through must be bitwise untouched
+    clean_q = np.full((1, len(strikes)), 0.25, dtype=np.float64)
+    rep_clean, info_clean = repair_arbitrage_quotes(strikes, clean_q, np.array([1.0]), k_ref=4.0)
+    assert info_clean["repaired"] is False
+    assert np.array_equal(rep_clean, clean_q)
 
 
 

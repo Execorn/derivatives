@@ -187,28 +187,68 @@ def resolve_canonical_tier3_config(
     dev_tok = "cuda" if str(device_type).strip().lower().startswith("cuda") else "cpu"
     if n_fallback_paths is not None:
         eff_paths = max(2, int(n_fallback_paths))
-    elif d_val <= 3 and m_val >= 36:
-        eff_paths = 10240
     elif dev_tok == "cuda":
-        eff_paths = 4096 if (m_val > 20 and d_val > 3) else 8192
+        if d_val == 2 and m_val == 6:
+            eff_paths = 32768
+        elif d_val == 2 and 21 <= m_val <= 24:
+            eff_paths = 24576
+        elif d_val == 4 and m_val == 9:
+            eff_paths = 24576
+        elif d_val == 4 and m_val == 13:
+            eff_paths = 32768
+        elif d_val == 4 and m_val == 14:
+            eff_paths = 12288
+        elif d_val == 4 and 21 <= m_val <= 27:
+            eff_paths = 32768
+        elif d_val == 4 and 28 <= m_val <= 34:
+            eff_paths = 20480
+        elif d_val == 4 and m_val == 35:
+            eff_paths = 12288
+        elif d_val == 5 and m_val == 8:
+            eff_paths = 16384
+        elif d_val == 6 and 11 <= m_val <= 20:
+            eff_paths = 24576
+        elif d_val == 6 and 21 <= m_val <= 30:
+            eff_paths = 16384
+        elif (d_val <= 2 and m_val <= 24) or (d_val == 3 and m_val <= 20) or (d_val >= 4 and m_val <= 6):
+            eff_paths = 12288
+        elif d_val <= 3 or m_val <= 20:
+            eff_paths = 8192
+        else:
+            eff_paths = 4096
+    elif d_val <= 3 and m_val >= 36:
+        eff_paths = 4096
+    elif d_val >= 6 and m_val >= 36:
+        eff_paths = 1024
     elif m_val > 24:
         eff_paths = 2048
-    elif d_val >= 6 and m_val <= 12:
+    elif d_val >= 6 and m_val <= 10:
         eff_paths = 8192
     elif dev_tok == "cpu" and ((d_val <= 5 and m_val <= 10) or (d_val <= 4 and m_val <= 12)):
         eff_paths = 8192
     else:
         eff_paths = 4096
     n_sub = 4
-    eff_r = 10 if eff_paths == 10240 else min(max(1, eff_paths // 2), 8 if eff_paths >= 8192 else 4)
-    eff_cv: Literal["multifidelity_gbm", "bs1d_exact", "none"] = (
-        "none" if (n_fallback_paths is None and d_val <= 3 and m_val >= 36) else "multifidelity_gbm"
-    )
+    if dev_tok == "cuda" and n_fallback_paths is None:
+        eff_r = eff_paths // 1024
+    elif n_fallback_paths is None and d_val <= 3 and m_val >= 36:
+        eff_r = 8
+    else:
+        eff_r = 10 if eff_paths == 10240 else min(max(1, eff_paths // 2), 8 if eff_paths >= 8192 else 4)
+    eff_cv: Literal["multifidelity_gbm", "bs1d_exact", "none"] = "multifidelity_gbm"
     nt, ny = 32, 64
     n_cheap = (
         max(262144, 8 * eff_paths)
         if (dev_tok == "cuda" or (dev_tok == "cpu" and d_val <= 4 and 9 <= m_val <= 12 and eff_paths >= 8192))
-        else (max(16384, 8 * eff_paths) if (dev_tok == "cpu" and d_val * m_val >= 200) else max(32768, 8 * eff_paths))
+        else (
+            8192
+            if (dev_tok == "cpu" and d_val >= 6 and m_val >= 25 and n_fallback_paths is None)
+            else (
+                max(16384, 8 * eff_paths)
+                if (dev_tok == "cpu" and (d_val * m_val >= 200 or (d_val >= 4 and m_val >= 20)))
+                else max(32768, 8 * eff_paths)
+            )
+        )
     )
     return CanonicalTier3Config(
         n_paths=eff_paths,

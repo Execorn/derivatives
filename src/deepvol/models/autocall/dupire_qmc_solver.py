@@ -346,39 +346,76 @@ def repair_arbitrage_quotes(
 
         q_final = q_hull
         if j_anom >= 2 and slice_changed and n_u >= 3:
-            # Piecewise-linear convex-hull chords have zero density (C'' = 0), causing negative/near-zero
-            # Durrleman denominators and local-vol cliffs; prefer a C1-smooth damped-slope wing continuation
-            # when it stays arbitrage-free with strictly positive Durrleman butterfly density.
-            _, g_hull = _eval_durrleman_slice(y_u, (q_hull * q_hull) * t_m)
+            # Piecewise-linear convex-hull chords have zero density (C'' = 0), causing negative or
+            # near-zero Durrleman denominators and local-vol cliffs; prefer a C2 Lee-hyperbolic
+            # upward-wing continuation bounded by w_hull (falling back to C1 damped-slope) when
+            # the hull drops below the Durrleman safety floor.
+            w_hull = (q_hull * q_hull) * t_m
+            _, g_hull = _eval_durrleman_slice(y_u, w_hull)
             min_g_hull = float(np.min(g_hull))
             is_slope_jump = float(slope[j_anom]) > tol_slope and float(d2c[j_anom - 1]) >= -tol_d2c
             u_a = j_anom if is_slope_jump else (j_anom - 1)
-            if 1 <= u_a < n_u - 1:
+            if min_g_hull < 0.05 and 1 <= u_a < n_u - 1:
                 dy_prev = max(float(y_u[u_a] - y_u[u_a - 1]), 1e-6)
-                s_a = float(np.clip((repaired[m, u_a] - repaired[m, u_a - 1]) / dy_prev, -0.5, 0.5))
-                l_decay = 0.30
-                q_c1 = repaired[m].copy()
-                for u in range(u_a + 1, n_u):
-                    dy_u = max(float(y_u[u] - y_u[u_a]), 0.0)
-                    q_c1[u] = float(
-                        np.clip(
-                            repaired[m, u_a] + s_a * l_decay * (1.0 - math.exp(-dy_u / l_decay)),
-                            0.01,
-                            5.00,
+                lee_used = False
+                if n_u >= 4 and float(w_hull[-1]) > float(w_m[u_a]):
+                    sw_a = float((w_m[u_a] - w_m[u_a - 1]) / dy_prev)
+                    l_scale = 0.20
+                    dy_vec = np.maximum(y_u[u_a + 1 :] - y_u[u_a], 0.0)
+                    hyp_vec = l_scale * (np.sqrt(l_scale * l_scale + dy_vec * dy_vec) - l_scale)
+
+                    def _eval_lee_gam(gam: float) -> Tuple[npt.NDArray[np.float64], bool]:
+                        w_c = w_m.copy()
+                        w_wing = np.maximum(w_m[u_a] + sw_a * dy_vec + gam * hyp_vec, 1e-6)
+                        w_c[u_a + 1 :] = np.minimum(w_wing, w_hull[u_a + 1 :])
+                        q_c = np.clip(np.sqrt(w_c / t_m), 0.01, 5.00)
+                        q_c[: u_a + 1] = quotes_arr[m, : u_a + 1]
+                        w_chk = (q_c * q_c) * t_m
+                        c_c = _b76_norm_call(y_u, w_chk)
+                        sl_c = (c_c[1:] - c_c[:-1]) / dk_step
+                        d2_c = sl_c[1:] - sl_c[:-1]
+                        if float(np.max(sl_c)) > tol_slope + 1e-9 or float(np.min(d2_c)) < -(tol_d2c + 1e-9):
+                            return q_c, False
+                        _, g_c = _eval_durrleman_slice(y_u, w_chk)
+                        return q_c, bool(float(np.min(g_c)) >= 0.05)
+
+                    _, ok0 = _eval_lee_gam(0.0)
+                    if ok0:
+                        lo_g, hi_g = 0.0, 4.0
+                        for _ in range(20):
+                            mid_g = 0.5 * (lo_g + hi_g)
+                            _, ok_m = _eval_lee_gam(mid_g)
+                            if ok_m:
+                                lo_g = mid_g
+                            else:
+                                hi_g = mid_g
+                        q_final, _ = _eval_lee_gam(lo_g)
+                        lee_used = True
+
+                if not lee_used:
+                    s_a = float(np.clip((repaired[m, u_a] - repaired[m, u_a - 1]) / dy_prev, -0.5, 0.5))
+                    l_decay = 0.30
+                    q_c1 = repaired[m].copy()
+                    for u in range(u_a + 1, n_u):
+                        dy_u = max(float(y_u[u] - y_u[u_a]), 0.0)
+                        q_c1[u] = float(
+                            np.clip(
+                                repaired[m, u_a] + s_a * l_decay * (1.0 - math.exp(-dy_u / l_decay)),
+                                0.01,
+                                5.00,
+                            )
                         )
-                    )
-                w_c1 = (q_c1 * q_c1) * t_m
-                calls_c1 = _b76_norm_call(y_u, w_c1)
-                sl_c1 = (calls_c1[1:] - calls_c1[:-1]) / dk_step
-                d2_c1 = sl_c1[1:] - sl_c1[:-1]
-                _, g_c1 = _eval_durrleman_slice(y_u, w_c1)
-                if (
-                    float(np.max(sl_c1)) <= tol_slope
-                    and float(np.min(d2_c1)) >= -tol_d2c
-                    and float(np.min(g_c1)) >= 0.05
-                    and min_g_hull < 0.05
-                ):
-                    q_final = q_c1
+                    w_c1 = (q_c1 * q_c1) * t_m
+                    calls_c1 = _b76_norm_call(y_u, w_c1)
+                    sl_c1 = (calls_c1[1:] - calls_c1[:-1]) / dk_step
+                    d2_c1 = sl_c1[1:] - sl_c1[:-1]
+                    _, g_c1 = _eval_durrleman_slice(y_u, w_c1)
+                    if (
+                        float(np.max(sl_c1)) <= tol_slope
+                        and float(np.min(d2_c1)) >= -tol_d2c
+                        and float(np.min(g_c1)) >= 0.05
+                    ):
+                        q_final = q_c1
 
         slice_changed = False
         for u in range(max(j_anom - 1, 0), n_u):

@@ -983,8 +983,8 @@ def test_canonical_tier3_config_and_to_decimal_merged_rho() -> None:
 
     cfg_cuda_mid = resolve_canonical_tier3_config(6, 20, device_type="cuda")
     assert cfg_cuda_mid == CanonicalTier3Config(
-        n_paths=8192,
-        n_replicates=8,
+        n_paths=24576,
+        n_replicates=24,
         n_substeps=4,
         lv_grid_nt=32,
         lv_grid_ny=64,
@@ -1013,6 +1013,27 @@ def test_canonical_tier3_config_and_to_decimal_merged_rho() -> None:
     assert cfg_override.n_cheap_mf == 131072
     assert cfg_override.seed == 7
     assert cfg_override.adaptive_substeps is False
+
+    assert (resolve_canonical_tier3_config(2, 24, device_type="cuda").n_paths, resolve_canonical_tier3_config(2, 24, device_type="cuda").n_replicates) == (24576, 24)
+    assert (resolve_canonical_tier3_config(2, 28, device_type="cuda").n_paths, resolve_canonical_tier3_config(2, 28, device_type="cuda").n_replicates) == (8192, 8)
+    assert (resolve_canonical_tier3_config(3, 20, device_type="cuda").n_paths, resolve_canonical_tier3_config(3, 20, device_type="cuda").n_replicates) == (12288, 12)
+    assert (resolve_canonical_tier3_config(3, 22, device_type="cuda").n_paths, resolve_canonical_tier3_config(3, 22, device_type="cuda").n_replicates) == (8192, 8)
+    assert (resolve_canonical_tier3_config(3, 38, device_type="cuda").n_paths, resolve_canonical_tier3_config(3, 38, device_type="cuda").n_replicates) == (8192, 8)
+    assert (resolve_canonical_tier3_config(5, 6, device_type="cuda").n_paths, resolve_canonical_tier3_config(5, 6, device_type="cuda").n_replicates) == (12288, 12)
+    assert (resolve_canonical_tier3_config(5, 13, device_type="cuda").n_paths, resolve_canonical_tier3_config(5, 13, device_type="cuda").n_replicates) == (8192, 8)
+    assert (resolve_canonical_tier3_config(4, 23, device_type="cuda").n_paths, resolve_canonical_tier3_config(4, 23, device_type="cuda").n_replicates) == (32768, 32)
+    assert (resolve_canonical_tier3_config(4, 35, device_type="cuda").n_paths, resolve_canonical_tier3_config(4, 35, device_type="cuda").n_replicates) == (12288, 12)
+    assert (resolve_canonical_tier3_config(6, 29, device_type="cuda").n_paths, resolve_canonical_tier3_config(6, 29, device_type="cuda").n_replicates) == (16384, 16)
+    assert (resolve_canonical_tier3_config(5, 8, device_type="cuda").n_paths, resolve_canonical_tier3_config(5, 8, device_type="cuda").n_replicates) == (16384, 16)
+    assert (resolve_canonical_tier3_config(2, 6, device_type="cuda").n_paths, resolve_canonical_tier3_config(2, 6, device_type="cuda").n_replicates) == (32768, 32)
+    assert (resolve_canonical_tier3_config(2, 23, device_type="cuda").n_paths, resolve_canonical_tier3_config(2, 23, device_type="cuda").n_replicates) == (24576, 24)
+    assert (resolve_canonical_tier3_config(6, 36, device_type="cuda").n_paths, resolve_canonical_tier3_config(6, 36, device_type="cuda").n_replicates) == (4096, 4)
+    assert (resolve_canonical_tier3_config(6, 37, device_type="cuda").n_paths, resolve_canonical_tier3_config(6, 37, device_type="cuda").n_replicates) == (4096, 4)
+    assert (resolve_canonical_tier3_config(6, 11, device_type="cpu").n_paths, resolve_canonical_tier3_config(6, 11, device_type="cpu").n_replicates) == (4096, 4)
+    cfg_cpu_long = resolve_canonical_tier3_config(3, 40, device_type="cpu")
+    assert (cfg_cpu_long.n_paths, cfg_cpu_long.n_replicates, cfg_cpu_long.cv_mode) == (4096, 8, "multifidelity_gbm")
+    cfg_cpu_d6_long = resolve_canonical_tier3_config(6, 39, device_type="cpu")
+    assert (cfg_cpu_d6_long.n_paths, cfg_cpu_d6_long.n_replicates, cfg_cpu_d6_long.cv_mode) == (1024, 4, "multifidelity_gbm")
 
     # Quote -> decimal conversion with mixed Percentage / Decimal bundles + RepoRho merging
     fake_req = SimpleNamespace(

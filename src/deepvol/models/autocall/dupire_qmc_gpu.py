@@ -1386,11 +1386,14 @@ if _HAS_TRITON:
             mu_p = -0.5 * lv_p * lv_p
             mu_m = -0.5 * lv_m * lv_m
             z = tl.load(z_corr_ptr + z_base + s * n_rep + offs_n, mask=mask_n, other=0.0)
+            lam_dt = 1.0 + tl.minimum(1.0, tl.maximum(0.0, (0.0330 - dt_sub) * 250.0)) * (
+                tl.minimum(1.0, tl.maximum(-1.0, 1.0 - 1.0 / tl.maximum(0.375, 73.0 * dt_sub))) - 1.0
+            )
             lx = lx + (
                 0.5 * (mu0 + 0.5 * (mu_p + mu_m)) * dt_sub
                 + 0.25 * (mu_p - mu_m) * dt_sub * z
                 + 0.25 * (lv_p + lv_m + 2.0 * lv0) * sqrt_dt_sub * z
-                + 0.25 * (lv_p - lv_m) * (z * z - 1.0) * sqrt_dt_sub
+                + 0.25 * lam_dt * (lv_p - lv_m) * (z * z - 1.0) * sqrt_dt_sub
             )
 
         tl.store(log_x_ptr + lx_off, lx, mask=mask_n)
@@ -1646,11 +1649,14 @@ if _HAS_TRITON:
                 z_k = tl.load(z_indep_ptr + z_k_off, mask=mask_n, other=0.0)
                 z_c = z_c + l_dk * z_k
 
+            lam_dt = 1.0 + tl.minimum(1.0, tl.maximum(0.0, (0.0330 - dt_sub) * 250.0)) * (
+                tl.minimum(1.0, tl.maximum(-1.0, 1.0 - 1.0 / tl.maximum(0.375, 73.0 * dt_sub))) - 1.0
+            )
             lx = lx + (
                 0.5 * (mu0 + 0.5 * (mu_p + mu_m)) * dt_sub
                 + 0.25 * (mu_p - mu_m) * dt_sub * z_c
                 + 0.25 * (lv_p + lv_m + 2.0 * lv0) * sqrt_dt * z_c
-                + 0.25 * (lv_p - lv_m) * (z_c * z_c - 1.0) * sqrt_dt
+                + 0.25 * lam_dt * (lv_p - lv_m) * (z_c * z_c - 1.0) * sqrt_dt
             )
             if COMPUTE_DELTA:
                 dlv_dy = (lv_p - lv_m) / tl.maximum(2.0 * sig_step, 1e-6)
@@ -2240,11 +2246,14 @@ if _HAS_TRITON:
                         other=0.0,
                     )
                     z_corr = z_corr + l_dj * zj
+            lam_dt = 1.0 + tl.minimum(1.0, tl.maximum(0.0, (0.0330 - dt_sub) * 250.0)) * (
+                tl.minimum(1.0, tl.maximum(-1.0, 1.0 - 1.0 / tl.maximum(0.375, 73.0 * dt_sub))) - 1.0
+            )
             lx = lx + (
                 0.5 * (mu0 + 0.5 * (mu_p + mu_m)) * dt_sub
                 + 0.25 * (mu_p - mu_m) * dt_sub * z_corr
                 + 0.25 * (lv_p + lv_m + 2.0 * lv0) * sqrt_dt_sub * z_corr
-                + 0.25 * (lv_p - lv_m) * (z_corr * z_corr - 1.0) * sqrt_dt_sub
+                + 0.25 * lam_dt * (lv_p - lv_m) * (z_corr * z_corr - 1.0) * sqrt_dt_sub
             )
 
         tl.store(lx_buf_ptr + rd_off, lx, mask=mask_n)
@@ -3258,11 +3267,14 @@ if _HAS_TRITON:
                     else:
                         z_corr = zc_d
 
+                    lam_dt = 1.0 + tl.minimum(1.0, tl.maximum(0.0, (0.0330 - dt_sub) * 250.0)) * (
+                        tl.minimum(1.0, tl.maximum(-1.0, 1.0 - 1.0 / tl.maximum(0.375, 73.0 * dt_sub))) - 1.0
+                    )
                     lx = lx + (
                         0.5 * (mu0 + 0.5 * (mu_p + mu_m)) * dt_sub
                         + 0.25 * (mu_p - mu_m) * dt_sub * z_corr
                         + 0.25 * (lv_p + lv_m + 2.0 * lv0) * sqrt_dt * z_corr
-                        + 0.25 * (lv_p - lv_m) * (z_corr * z_corr - 1.0) * sqrt_dt
+                        + 0.25 * lam_dt * (lv_p - lv_m) * (z_corr * z_corr - 1.0) * sqrt_dt
                     )
 
                 lx_f64 = lx.to(tl.float64)
@@ -6243,11 +6255,14 @@ class GpuTorchDupireQMC:
                             mu_p = -0.5 * (lv_p * lv_p)
                             mu_m = -0.5 * (lv_m * lv_m)
                             z_s = z_steps_corr[:, :, s, :].to(step_dtype)
+                            lam_dt = 1.0 + max(0.0, min(1.0, (0.0330 - dt_sub) * 250.0)) * (
+                                max(-1.0, min(1.0, 1.0 - 1.0 / max(0.375, 73.0 * dt_sub))) - 1.0
+                            )
                             log_x = log_x + (
                                 0.5 * (mu0 + 0.5 * (mu_p + mu_m)) * dt_sub
                                 + 0.25 * (mu_p - mu_m) * dt_sub * z_s
                                 + 0.25 * (lv_p + lv_m + 2.0 * lv0) * sqrt_dt_sub * z_s
-                                + 0.25 * (lv_p - lv_m) * (z_s * z_s - 1.0) * sqrt_dt_sub
+                                + 0.25 * lam_dt * (lv_p - lv_m) * (z_s * z_s - 1.0) * sqrt_dt_sub
                             )
                             if p_noki_cont is not None and perf_sub_prev is not None and corr_64 is not None:
                                 if s == n_sub - 1:
@@ -7677,11 +7692,14 @@ class GpuTorchDupireQMC:
                     mu_p = -0.5 * lv_p * lv_p
                     mu_m = -0.5 * lv_m * lv_m
                     z_s = z_steps_corr[:, :, :, s, :]
+                    lam_dt_t = 1.0 + torch.clamp((0.0330 - dt_sub_t) * 250.0, min=0.0, max=1.0) * (
+                        torch.clamp(1.0 - 1.0 / torch.clamp(73.0 * dt_sub_t, min=0.375), min=-1.0, max=1.0) - 1.0
+                    )
                     log_x = log_x + (
                         0.5 * (mu0 + 0.5 * (mu_p + mu_m)) * dt_sub_t
                         + 0.25 * (mu_p - mu_m) * dt_sub_t * z_s
                         + 0.25 * (lv_p + lv_m + 2.0 * lv0) * sqrt_dt_t * z_s
-                        + 0.25 * (lv_p - lv_m) * (z_s * z_s - 1.0) * sqrt_dt_t
+                        + 0.25 * lam_dt_t * (lv_p - lv_m) * (z_s * z_s - 1.0) * sqrt_dt_t
                     )
 
             # Martingale renormalization per (b, d, r) with zero-copy SoA perf_m (B_c, D, N_tot)

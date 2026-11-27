@@ -4465,6 +4465,9 @@ void crn_step_1d_trajectories_cpp(
                     const double d_tau = std::max(t_cur - t_prev, 1e-10);
                     const double dt = d_tau / static_cast<double>(n_sub);
                     const double sqrt_dt = std::sqrt(dt);
+                    const double g_mo = std::clamp((0.0330 - dt) * 250.0, 0.0, 1.0);
+                    const double lam_raw = std::clamp(1.0 - 1.0 / std::max(0.375, 73.0 * dt), -1.0, 1.0);
+                    const double lam_sqrt_dt = (1.0 + g_mo * (lam_raw - 1.0)) * sqrt_dt;
                     const double drt = rt_cur - rt_prev;
                     const double drn = rn_cur - rn_prev;
 
@@ -4493,6 +4496,7 @@ void crn_step_1d_trajectories_cpp(
                         const __m256d v_q_mid = _mm256_set1_pd(has_q ? q_shift_mid : 0.0);
                         const __m256d v_dt = _mm256_set1_pd(dt);
                         const __m256d v_sqrt_dt = _mm256_set1_pd(sqrt_dt);
+                        const __m256d v_lam_sqrt_dt = _mm256_set1_pd(lam_sqrt_dt);
                         const __m256d v_half = _mm256_set1_pd(0.5);
                         const __m256d v_neg_half = _mm256_set1_pd(-0.5);
                         const __m256d v_quarter = _mm256_set1_pd(0.25);
@@ -4529,7 +4533,7 @@ void crn_step_1d_trajectories_cpp(
                             __m256d z2m1 = _mm256_fmsub_pd(zd, zd, v_one);
                             __m256d mil_term = _mm256_mul_pd(
                                 v_quarter,
-                                _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_sqrt_dt, z2m1))
+                                _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_lam_sqrt_dt, z2m1))
                             );
                             _mm256_storeu_pd(log_x + n, _mm256_add_pd(lx, _mm256_add_pd(drift_term, _mm256_add_pd(diff_term, mil_term))));
                         }
@@ -4556,7 +4560,7 @@ void crn_step_1d_trajectories_cpp(
                             const double ah = -0.5 * sigh * sigh;
                             log_x[n] += 0.5 * (a0 + ah) * dt
                                 + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
-                                + 0.25 * (sigp - sigm) * sqrt_dt * (zd * zd - 1.0);
+                                + 0.25 * (sigp - sigm) * lam_sqrt_dt * (zd * zd - 1.0);
                         }
                     }
 
@@ -4755,6 +4759,9 @@ std::int32_t crn_step_spot_bumps_cpp(
                     const double d_tau = std::max(t_cur - t_prev, 1e-10);
                     const double dt = d_tau / static_cast<double>(S);
                     const double sqrt_dt = std::sqrt(dt);
+                    const double g_mo = std::clamp((0.0330 - dt) * 250.0, 0.0, 1.0);
+                    const double lam_raw = std::clamp(1.0 - 1.0 / std::max(0.375, 73.0 * dt), -1.0, 1.0);
+                    const double lam_sqrt_dt = (1.0 + g_mo * (lam_raw - 1.0)) * sqrt_dt;
                     const double drt = rt_cur - rt_prev;
                     const double drn = rn_cur - rn_prev;
 
@@ -4792,6 +4799,7 @@ std::int32_t crn_step_spot_bumps_cpp(
                         const __m256d v_q_mid = _mm256_set1_pd(q_shift_mid);
                         const __m256d v_dt = _mm256_set1_pd(dt);
                         const __m256d v_sqrt_dt = _mm256_set1_pd(sqrt_dt);
+                        const __m256d v_lam_sqrt_dt = _mm256_set1_pd(lam_sqrt_dt);
                         const __m256d v_half = _mm256_set1_pd(0.5);
                         const __m256d v_neg_half = _mm256_set1_pd(-0.5);
                         const __m256d v_quarter = _mm256_set1_pd(0.25);
@@ -4814,7 +4822,7 @@ std::int32_t crn_step_spot_bumps_cpp(
                             const __m256d zd = _mm256_loadu_pd(zd_ptr_pm + n);
                             const __m256d dw = _mm256_mul_pd(v_sqrt_dt, zd);
                             const __m256d z2m1 = _mm256_fmsub_pd(zd, zd, v_one);
-                            const __m256d sdt_z2m1 = _mm256_mul_pd(v_sqrt_dt, z2m1);
+                            const __m256d sdt_z2m1 = _mm256_mul_pd(v_lam_sqrt_dt, z2m1);
 
                             // +bump
                             {
@@ -4878,7 +4886,7 @@ std::int32_t crn_step_spot_bumps_cpp(
                                 lx_p_ptr[nu] = lxv
                                     + 0.5 * (a0 - 0.5 * sigh * sigh) * dt
                                     + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
-                                    + 0.25 * (sigp - sigm) * sqrt_dt * z2m1;
+                                    + 0.25 * (sigp - sigm) * lam_sqrt_dt * z2m1;
                             }
                             {
                                 const double lxv = lx_m_ptr[nu];
@@ -4891,7 +4899,7 @@ std::int32_t crn_step_spot_bumps_cpp(
                                 lx_m_ptr[nu] = lxv
                                     + 0.5 * (a0 - 0.5 * sigh * sigh) * dt
                                     + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
-                                    + 0.25 * (sigp - sigm) * sqrt_dt * z2m1;
+                                    + 0.25 * (sigp - sigm) * lam_sqrt_dt * z2m1;
                             }
                         }
                     }
@@ -6650,6 +6658,9 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                         const double d_tau = std::max(t_cur - t_prev, 1e-10);
                         const double dt = d_tau / static_cast<double>(n_sub);
                         const double sqrt_dt = std::sqrt(dt);
+                        const double g_mo = std::clamp((0.0330 - dt) * 250.0, 0.0, 1.0);
+                        const double lam_raw = std::clamp(1.0 - 1.0 / std::max(0.375, 73.0 * dt), -1.0, 1.0);
+                        const double lam_sqrt_dt = (1.0 + g_mo * (lam_raw - 1.0)) * sqrt_dt;
                         const double rt_cur = has_q_sub ? 0.0 : args->r_tot_obs[du * Mu + mu];
                         const double rn_cur = has_q_sub ? 0.0 : args->r_native_obs[du * Mu + mu];
                         const double drt = rt_cur - rt_prev;
@@ -6726,6 +6737,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                             const __m256d v_q_mid = _mm256_set1_pd(q_mid);
                             const __m256d v_dt = _mm256_set1_pd(dt);
                             const __m256d v_sdt = _mm256_set1_pd(sqrt_dt);
+                            const __m256d v_lam_sdt = _mm256_set1_pd(lam_sqrt_dt);
                             const __m256d v_half = _mm256_set1_pd(0.5);
                             const __m256d v_nhalf = _mm256_set1_pd(-0.5);
                             const __m256d v_quarter = _mm256_set1_pd(0.25);
@@ -6763,7 +6775,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                     __m256d diff = _mm256_mul_pd(v_quarter, _mm256_mul_pd(sum_sig, dw));
                                     __m256d mil = _mm256_mul_pd(
                                         v_quarter,
-                                        _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_sdt, _mm256_fmsub_pd(zd, zd, v_one)))
+                                        _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_lam_sdt, _mm256_fmsub_pd(zd, zd, v_one)))
                                     );
                                     _mm256_storeu_pd(lx_ptr + n, _mm256_add_pd(lx_v, _mm256_add_pd(drift, _mm256_add_pd(diff, mil))));
                                 }
@@ -6811,7 +6823,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                     __m256d drift = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_add_pd(a0, ah), v_dt));
                                     __m256d sum_sig = _mm256_add_pd(_mm256_add_pd(sigp, sigm), _mm256_mul_pd(v_two, sig0));
                                     __m256d diff = _mm256_mul_pd(v_quarter, _mm256_mul_pd(sum_sig, dw));
-                                    __m256d mil = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_sdt, zc2m1)));
+                                    __m256d mil = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_lam_sdt, zc2m1)));
                                     _mm256_storeu_pd(lx_ptr + n, _mm256_add_pd(lx_v, _mm256_add_pd(drift, _mm256_add_pd(diff, mil))));
 
                                     __m256d d_a0_dx = _mm256_mul_pd(_mm256_sub_pd(v_zero, sig0), d0);
@@ -6823,7 +6835,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                     __m256d dm_x = _mm256_mul_pd(dm, d_m_dx);
                                     __m256d j_t1 = _mm256_mul_pd(v_half, _mm256_mul_pd(_mm256_fnmadd_pd(_mm256_mul_pd(sigh, dh), d_hat_dx, d_a0_dx), v_dt));
                                     __m256d j_t2 = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_add_pd(_mm256_add_pd(dp_x, dm_x), _mm256_mul_pd(v_two, d0)), dw));
-                                    __m256d j_t3 = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_sub_pd(dp_x, dm_x), _mm256_mul_pd(v_sdt, zc2m1)));
+                                    __m256d j_t3 = _mm256_mul_pd(v_quarter, _mm256_mul_pd(_mm256_sub_pd(dp_x, dm_x), _mm256_mul_pd(v_lam_sdt, zc2m1)));
                                     __m256d step_j = _mm256_add_pd(v_one, _mm256_add_pd(j_t1, _mm256_add_pd(j_t2, j_t3)));
                                     if (clamp_vib_j) {
                                         step_j = _mm256_min_pd(_mm256_max_pd(step_j, _mm256_set1_pd(0.25)), _mm256_set1_pd(2.5));
@@ -6852,7 +6864,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                     lx_ptr[static_cast<std::size_t>(n)] = lx_v
                                         + 0.5 * (a0 + ah) * dt
                                         + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
-                                        + 0.25 * (sigp - sigm) * sqrt_dt * zc2m1;
+                                        + 0.25 * (sigp - sigm) * lam_sqrt_dt * zc2m1;
                                 } else {
                                     double d0 = 0.0, dh = 0.0, dp = 0.0, dm = 0.0;
                                     const double sig0 = lookup_scalar_with_deriv(sl0, lx_v + q_mid, d0);
@@ -6871,7 +6883,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                     lx_ptr[static_cast<std::size_t>(n)] = lx_v
                                         + 0.5 * (a0 + ah) * dt
                                         + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
-                                        + 0.25 * (sigp - sigm) * sqrt_dt * zc2m1;
+                                        + 0.25 * (sigp - sigm) * lam_sqrt_dt * zc2m1;
 
                                     const double d_a0_dx = -sig0 * d0;
                                     const double d_hat_dx = 1.0 + d_a0_dx * dt + d0 * dw;
@@ -6880,7 +6892,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                     double step_j = 1.0
                                         + 0.5 * (d_a0_dx - sigh * dh * d_hat_dx) * dt
                                         + 0.25 * (dp * d_p_dx + dm * d_m_dx + 2.0 * d0) * dw
-                                        + 0.25 * (dp * d_p_dx - dm * d_m_dx) * sqrt_dt * zc2m1;
+                                        + 0.25 * (dp * d_p_dx - dm * d_m_dx) * lam_sqrt_dt * zc2m1;
                                     if (clamp_vib_j) {
                                         step_j = std::clamp(step_j, 0.25, 2.5);
                                     }
@@ -7026,6 +7038,9 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                         const double d_tau = std::max(t_cur - t_prev, 1e-10);
                         const double dt = d_tau / static_cast<double>(n_sub);
                         const double sqrt_dt = std::sqrt(dt);
+                        const double g_mo = std::clamp((0.0330 - dt) * 250.0, 0.0, 1.0);
+                        const double lam_raw = std::clamp(1.0 - 1.0 / std::max(0.375, 73.0 * dt), -1.0, 1.0);
+                        const double lam_sqrt_dt = (1.0 + g_mo * (lam_raw - 1.0)) * sqrt_dt;
 
                         const double rt_prev = (has_q_sub || m == 0) ? 0.0 : args->r_tot_obs[du * Mu + static_cast<std::size_t>(m - 1)];
                         const double rt_cur = has_q_sub ? 0.0 : args->r_tot_obs[du * Mu + mu];
@@ -7090,6 +7105,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                             const __m256d v_q_mid = _mm256_set1_pd(q_mid);
                             const __m256d v_dt = _mm256_set1_pd(dt);
                             const __m256d v_sdt = _mm256_set1_pd(sqrt_dt);
+                            const __m256d v_lam_sdt = _mm256_set1_pd(lam_sqrt_dt);
                             const __m256d v_half = _mm256_set1_pd(0.5);
                             const __m256d v_nhalf = _mm256_set1_pd(-0.5);
                             const __m256d v_quarter = _mm256_set1_pd(0.25);
@@ -7126,7 +7142,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                 __m256d diff = _mm256_mul_pd(v_quarter, _mm256_mul_pd(sum_sig, dw));
                                 __m256d mil = _mm256_mul_pd(
                                     v_quarter,
-                                    _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_sdt, _mm256_fmsub_pd(zd, zd, v_one)))
+                                    _mm256_mul_pd(_mm256_sub_pd(sigp, sigm), _mm256_mul_pd(v_lam_sdt, _mm256_fmsub_pd(zd, zd, v_one)))
                                 );
                                 _mm256_storeu_pd(lx_run_ptr + n, _mm256_add_pd(lxv, _mm256_add_pd(drift, _mm256_add_pd(diff, mil))));
                             }
@@ -7152,7 +7168,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                 lx_run_ptr[static_cast<std::size_t>(n)] = lxv
                                     + 0.5 * (a0 - 0.5 * sigh * sigh) * dt
                                     + 0.25 * (sigp + sigm + 2.0 * sig0) * dw
-                                    + 0.25 * (sigp - sigm) * sqrt_dt * (zd * zd - 1.0);
+                                    + 0.25 * (sigp - sigm) * lam_sqrt_dt * (zd * zd - 1.0);
                             }
                         }
 
@@ -7191,6 +7207,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                             const __m256d v_q_mid = _mm256_set1_pd(q_mid);
                             const __m256d v_dt = _mm256_set1_pd(dt);
                             const __m256d v_sdt = _mm256_set1_pd(sqrt_dt);
+                            const __m256d v_lam_sdt = _mm256_set1_pd(lam_sqrt_dt);
                             const __m256d v_half = _mm256_set1_pd(0.5);
                             const __m256d v_nhalf = _mm256_set1_pd(-0.5);
                             const __m256d v_quarter = _mm256_set1_pd(0.25);
@@ -7252,7 +7269,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                 const __m256d bx = _mm256_loadu_pd(bar_x_ptr + n);
                                 const __m256d zc2m1 = _mm256_fmsub_pd(zd, zd, v_one);
                                 const __m256d bar_lvh = _mm256_mul_pd(bx, _mm256_mul_pd(v_nhalf, _mm256_mul_pd(v_dt, sigh)));
-                                const __m256d sdt_z = _mm256_mul_pd(v_sdt, zc2m1);
+                                const __m256d sdt_z = _mm256_mul_pd(v_lam_sdt, zc2m1);
                                 const __m256d bar_lvp = _mm256_mul_pd(bx, _mm256_mul_pd(v_quarter, _mm256_add_pd(dw, sdt_z)));
                                 const __m256d bar_lvm = _mm256_mul_pd(bx, _mm256_mul_pd(v_quarter, _mm256_sub_pd(dw, sdt_z)));
                                 const __m256d bar_lv0_dir = _mm256_mul_pd(bx, _mm256_fmadd_pd(_mm256_mul_pd(v_nhalf, v_dt), sig0, _mm256_mul_pd(v_half, dw)));
@@ -7266,7 +7283,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                     const __m256d diff_pm = _mm256_sub_pd(sigp, sigm);
                                     const __m256d t_zc = _mm256_fmadd_pd(
                                         _mm256_mul_pd(v_quarter, sum_pm), v_sdt,
-                                        _mm256_mul_pd(_mm256_mul_pd(v_half, diff_pm), _mm256_mul_pd(v_sdt, zd))
+                                        _mm256_mul_pd(_mm256_mul_pd(v_half, diff_pm), _mm256_mul_pd(v_lam_sdt, zd))
                                     );
                                     const __m256d bar_zc = _mm256_fmadd_pd(bx, t_zc, _mm256_mul_pd(bar_lx_hat, sig0_sdt));
                                     alignas(32) double bzc_arr[4];
@@ -7383,8 +7400,8 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
                                 const double bx = bar_x_ptr[static_cast<std::size_t>(n)];
                                 const double zc2m1 = zd * zd - 1.0;
                                 const double bar_lvh = bx * (-0.5 * dt * sigh);
-                                const double bar_lvp = bx * (0.25 * (dw + sqrt_dt * zc2m1));
-                                const double bar_lvm = bx * (0.25 * (dw - sqrt_dt * zc2m1));
+                                const double bar_lvp = bx * (0.25 * (dw + lam_sqrt_dt * zc2m1));
+                                const double bar_lvm = bx * (0.25 * (dw - lam_sqrt_dt * zc2m1));
                                 const double bar_lv0_dir = bx * (-0.5 * dt * sig0 + 0.5 * dw);
 
                                 const double bar_lx_hat = bar_lvh * dyh;
@@ -7393,7 +7410,7 @@ std::int32_t crn_platen_sde_aad_cpp(const PlatenSdeAadArgs* args) noexcept {
 
                                 if (compute_chol) {
                                     const double bar_zc =
-                                        bx * (0.25 * (sigp + sigm + 2.0 * sig0) * sqrt_dt + 0.5 * (sigp - sigm) * sqrt_dt * zd)
+                                        bx * (0.25 * (sigp + sigm + 2.0 * sig0) * sqrt_dt + 0.5 * (sigp - sigm) * lam_sqrt_dt * zd)
                                         + bar_lx_hat * (sig0 * sqrt_dt);
                                     const double* zin_n = zin_step + static_cast<std::size_t>(n) * Du;
                                     double* chol_row = thr_chol + du * Du;
